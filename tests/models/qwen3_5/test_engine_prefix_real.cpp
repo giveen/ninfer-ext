@@ -127,6 +127,13 @@ ninfer::EngineOptions private_long_anchor_engine_options(const char* artifact) {
     return options;
 }
 
+ninfer::EngineOptions automatic_long_anchor_engine_options(const char* artifact) {
+    ninfer::EngineOptions options = private_long_anchor_engine_options(artifact);
+    options.context_cache.device_state_slots               = 8;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    return options;
+}
+
 ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                        = artifact;
@@ -1096,6 +1103,76 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
                   << " prompt=" << replaced.prompt.prompt_tokens
                   << " captures=" << stats.active_captures_completed
                   << " capture_aborts=" << stats.active_captures_aborted << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_engine_automatic_long_anchor_capture(const char* artifact) {
+    ninfer::Engine engine(automatic_long_anchor_engine_options(artifact));
+
+    const auto input = [](std::vector<std::string> turns) {
+        ninfer::PromptInput prompt;
+        for (std::string& text : turns) {
+            ninfer::ChatMessage message;
+            message.role = ninfer::ChatRole::User;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+            prompt.messages.push_back(std::move(message));
+        }
+        prompt.options.enable_thinking = false;
+        return prompt;
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    constexpr std::string_view stable =
+        "This is the stable conversation prefix retained for a later branch.";
+    constexpr std::string_view branch = "Continue through the shared middle branch.";
+
+    // No markers anywhere: the engine synthesizes the anchors at the last two message
+    // boundaries of each request, so the first request must complete from Root and leave
+    // the middle-boundary anchor behind for the later branches.
+    const ninfer::GenerationResult source = engine.generate(
+        engine.prepare(input({std::string(stable), std::string(branch), "First unique suffix."})),
+        request);
+    if (source.generated_token_ids.size() != 1 ||
+        source.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        std::cerr << "first engine-automatic long-anchor capture did not complete from Root\n";
+        return 1;
+    }
+
+    const auto followup = [&](std::string_view suffix) {
+        ninfer::PromptInput prompt = input({std::string(stable), std::string(branch),
+                                           std::string(suffix)});
+        prompt.context_cache.session_key = "engine-automatic-long-anchor";
+        prompt.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return engine.generate(engine.prepare(std::move(prompt)), request);
+    };
+    const ninfer::GenerationResult second = followup("Second unique suffix.");
+    if (second.generated_token_ids.size() != 1 ||
+        second.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        second.reused_prompt_tokens == 0 ||
+        second.reused_prompt_tokens >= second.prompt.prompt_tokens) {
+        std::cerr << "engine-automatic long anchor was not selected: path="
+                  << static_cast<int>(second.prefix_reuse_path)
+                  << " reused=" << second.reused_prompt_tokens
+                  << " prompt=" << second.prompt.prompt_tokens << '\n';
+        return 1;
+    }
+    // The third branch shares only the middle boundary with the first request; it must resume
+    // from the same retained anchor rather than from the second request's deeper state.
+    const ninfer::GenerationResult third = followup("Third unique suffix.");
+    if (third.generated_token_ids.size() != 1 ||
+        third.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        third.reused_prompt_tokens != second.reused_prompt_tokens) {
+        std::cerr << "engine-automatic long anchor did not serve the third branch: path="
+                  << static_cast<int>(third.prefix_reuse_path)
+                  << " second_reused=" << second.reused_prompt_tokens
+                  << " third_reused=" << third.reused_prompt_tokens << '\n';
         return 1;
     }
     return 0;
@@ -2116,6 +2193,10 @@ int exercise_artifact(const char* artifact) {
         result != 0) {
         return result;
     }
+    if (const int result = exercise_engine_automatic_long_anchor_capture(artifact);
+        result != 0) {
+        return result;
+    }
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
     }
@@ -2155,6 +2236,8 @@ int main() {
         result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
     } else if (scenario == "private-long-anchor") {
         result = exercise_private_long_anchor_capture_and_replacement(artifact);
+    } else if (scenario == "engine-automatic-long-anchor") {
+        result = exercise_engine_automatic_long_anchor_capture(artifact);
     } else if (scenario == "rewrite-checkpoint-shared") {
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::SharedAlias);

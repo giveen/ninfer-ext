@@ -25,6 +25,10 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // Per-continuation long-anchor capacity L. When nonzero, preparation synthesizes
+    // engine-automatic PrivateLongAnchor opportunities at the last L message boundaries so a
+    // later history rewrite diverging there resumes from the retained anchor instead of root.
+    std::uint32_t max_long_anchors_per_continuation = 0;
 };
 
 struct FrontendResources;

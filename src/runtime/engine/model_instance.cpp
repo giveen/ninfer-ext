@@ -114,7 +114,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
     cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(std::max(
         concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest)));
-    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
+    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(4U);
 
     if (*cache.max_private_continuations < concurrency) {
         throw std::invalid_argument(
@@ -148,7 +148,10 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .max_context              = options.max_context,
                                .media_cache_bytes        = options.media_cache_bytes,
                                .media_live_bytes         = options.media_live_bytes,
-                               .media_preprocess_threads = options.media_preprocess_threads})),
+                               .media_preprocess_threads = options.media_preprocess_threads,
+                               .max_long_anchors_per_continuation =
+                                   options.context_cache.max_long_anchors_per_continuation.value_or(
+                                       0U)})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

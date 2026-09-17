@@ -34,6 +34,7 @@ namespace {
 
 using Frontend        = ninfer::models::qwen3_5::Frontend;
 using FrontendFactory = ninfer::models::qwen3_5::FrontendTestAccess;
+using FrontendOptions = ninfer::models::qwen3_5::FrontendOptions;
 
 struct FrontendResources {
     std::string tokenizer_json, tokenizer_config_json, chat_template_jinja, generation_config_json;
@@ -1395,6 +1396,116 @@ int test_explicit_leading_instruction_cache_boundary() {
                  "full-system marker");
 }
 
+int test_engine_automatic_long_anchor_opportunities() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled                    = false;
+    options.max_context                       = std::numeric_limits<std::uint32_t>::max();
+    options.max_long_anchors_per_continuation = 2;
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto user_message = [](std::string_view text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::string(text), .media = {}});
+        return message;
+    };
+    auto input = [&](std::initializer_list<std::string_view> turns) {
+        ninfer::PromptInput prompt;
+        for (std::string_view turn : turns) { prompt.messages.push_back(user_message(turn)); }
+        prompt.options.enable_thinking = false;
+        return prompt;
+    };
+    auto anchor_frontiers = [](const ninfer::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        // Synthesis visits the boundaries deepest first; compare as an ordered set.
+        std::sort(frontiers.begin(), frontiers.end());
+        return frontiers;
+    };
+
+    int failures = 0;
+    const auto prepared =
+        frontend.prepare(input({"first message body", "second message body", "third message body"}));
+    const auto& data = FrontendFactory::inspect(prepared);
+    const auto anchors = anchor_frontiers(data);
+    for (const auto& opportunity : data.context_cache.opportunities) {
+        if (opportunity.kind != ninfer::PromptCacheMarkerKind::PrivateLongAnchor) { continue; }
+        failures += check(
+            ninfer::has_shared_candidate_evidence(
+                opportunity.evidence, ninfer::SharedCandidateEvidence::EngineStructural) &&
+                !ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence,
+                    ninfer::SharedCandidateEvidence::ExplicitBoundary) &&
+                opportunity.frontier > 0 && opportunity.frontier < data.token_ids.size(),
+            "engine automatic long anchor is not a structural interior message boundary");
+    }
+    failures += check(anchors.size() == 2 && anchors.front() < anchors.back(),
+                      "engine did not anchor the last two message boundaries in order");
+    if (anchors.size() == 2) {
+        // The first anchored boundary is after the second message: the full prompt and the
+        // two-message preparation share exactly that prefix.
+        const auto truncated =
+            frontend.prepare(input({"first message body", "second message body"}));
+        const auto& truncated_data = FrontendFactory::inspect(truncated);
+        const std::uint32_t boundary = anchors.front();
+        failures += check(
+            boundary < truncated_data.token_ids.size() &&
+                std::equal(data.token_ids.begin(),
+                           data.token_ids.begin() + std::ptrdiff_t(boundary),
+                           truncated_data.token_ids.begin()),
+            "first engine long anchor is not the second message boundary");
+        if (data.identity.rewrite_checkpoint) {
+            failures += check(anchors.back() == data.identity.rewrite_checkpoint->frontier,
+                              "last engine long anchor is not the final message boundary");
+        }
+    }
+
+    if (anchors.size() == 2) {
+        // An explicit marker at an engine boundary takes over that frontier instead of adding
+        // a duplicate; the remaining engine boundary is still synthesized.
+        auto marked =
+            input({"first message body", "second message body", "third message body"});
+        marked.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 2,
+            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+            .location             = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        const auto marked_prepared = frontend.prepare(std::move(marked));
+        const auto& marked_data = FrontendFactory::inspect(marked_prepared);
+        const auto marked_anchors = anchor_frontiers(marked_data);
+        const auto explicit_at = std::find_if(
+            marked_data.context_cache.opportunities.begin(),
+            marked_data.context_cache.opportunities.end(),
+            [&](const auto& opportunity) {
+                return opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                       opportunity.frontier == anchors.front() &&
+                       ninfer::has_shared_candidate_evidence(
+                           opportunity.evidence,
+                           ninfer::SharedCandidateEvidence::ExplicitBoundary);
+            });
+        failures += check(
+            marked_anchors == anchors &&
+                explicit_at != marked_data.context_cache.opportunities.end(),
+            "an explicit marker at an engine boundary did not take over that frontier");
+    }
+
+    FrontendOptions disabled = options;
+    disabled.max_long_anchors_per_continuation = 0;
+    const Frontend plain_frontend = make_frontend(resources(), disabled);
+    const auto plain_prepared =
+        plain_frontend.prepare(input({"first message body", "second message body",
+                                      "third message body"}));
+    const auto& plain_data = FrontendFactory::inspect(plain_prepared);
+    failures += check(anchor_frontiers(plain_data).empty(),
+                      "long anchors were synthesized with a zero capacity");
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -2316,6 +2427,7 @@ int main() {
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
+    failures += test_engine_automatic_long_anchor_opportunities();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
