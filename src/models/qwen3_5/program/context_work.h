@@ -29,6 +29,13 @@ void validate_long_anchor_ordinals(std::span<const LongAnchorCheckpoint> anchors
 void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
                           std::uint32_t prefill_chunk);
 
+// Exact root rebuild work for a frontier: full prefill from root to the frontier with the
+// prompt's fully consumed vision features and the capture/rewrite segment boundaries.
+runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
+                                              std::uint32_t frontier, std::uint32_t prefill_chunk,
+                                              std::span<const CaptureGroup> captures,
+                                              std::span<const std::uint32_t> rewrite_frontiers);
+
 std::optional<qwen3_5::TargetKVRequirement>
 retained_requirement_after_drops(const qwen3_5::ContinuationSummary& summary,
                                  std::span<const runtime::CheckpointRef> dropped) noexcept;

@@ -670,6 +670,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                                         current.active_captures_completed)},
                           {"aborted", monotonic_delta(previous.active_captures_aborted,
                                                       current.active_captures_aborted)}}},
+        {"salvage", Json{{"published", monotonic_delta(previous.salvaged_continuations,
+                                                       current.salvaged_continuations)}}},
         {"selections",
          Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
               {"private_endpoint", monotonic_delta(previous.private_endpoint_selections,

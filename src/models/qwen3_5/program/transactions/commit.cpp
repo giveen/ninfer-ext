@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 
@@ -607,9 +608,6 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     // discard if that publication invariant was not established.
     if (state.state.fork_pending && state.state.borrows_read()) { return out; }
     try {
-        out.summary.long_anchors.reserve(state.long_anchors.size());
-    } catch (...) { return out; }
-    try {
         if (state.state.fork_pending) {
             const StateImageHandle source      = state.state.read;
             const StateImageHandle destination = state.state.write;
@@ -620,12 +618,32 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             // still prevent exclusive attribution and release.
             state.state = ActiveStateBinding{.read = source, .write = source};
         }
+    } catch (...) { return out; }
+    if (!publish_active_continuation(state, request, lane, continuation_index, out.summary)) {
+        return out;
+    }
+    out.continuation.emplace(ContractAccess::make_continuation(
+        this, continuation_index, continuation_slots[continuation_index].generation));
+    out.timings     = request.timings;
+    out.speculative = std::move(request.speculative_stats);
+    out.disposition = runtime::FinishDisposition::Catalogued;
+    out.status      = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestControl& request,
+                                              std::uint32_t lane, std::uint32_t continuation_index,
+                                              qwen3_5::ContinuationSummary& summary) noexcept {
+    try {
+        summary.long_anchors.reserve(state.long_anchors.size());
+    } catch (...) { return false; }
+    try {
         if (state.reserved_state) {
-            if (!state_store->release(*state.reserved_state)) { return out; }
+            if (!state_store->release(*state.reserved_state)) { return false; }
             state.reserved_state.reset();
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
-            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
+            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return false; }
             state_store->release_checkpoint_reference(*state.rewrite_state);
             state.rewrite_state.reset();
             state.rewrite_checkpoint = {};
@@ -633,7 +651,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
             state_store->freeze(state.state.read);
         } else if (state_store->role(state.state.read) != StateImageRole::CheckpointImmutable) {
-            return out;
+            return false;
         }
         state.endpoint_valid = true;
         refresh_state_views(state);
@@ -642,9 +660,9 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
                                                              backend_kv_valid(state));
         }
-        populate_continuation_summary(state, out.summary);
-        out.summary.active_references = 0;
-    } catch (...) { return out; }
+        populate_continuation_summary(state, summary);
+        summary.active_references = 0;
+    } catch (...) { return false; }
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
@@ -655,14 +673,72 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);
+    advance_resource_revision();
+    return true;
+}
+
+bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& request,
+                                       std::uint32_t lane, std::uint32_t continuation_index,
+                                       qwen3_5::AbortResult& out) noexcept {
+    // Salvage publishes the in-place active state as the continuation endpoint. A pending
+    // materialization Fork is skipped: its read source belongs to an external owner and the
+    // destination copy duplicates a checkpoint the catalog already holds.
+    if (!request.publish_continuation || state.state.fork_pending ||
+        state.state.read != state.state.write || !state.kv) {
+        return false;
+    }
+    const Lifecycle lifecycle = request.lifecycle;
+    std::uint32_t frontier    = 0;
+    if (lifecycle == Lifecycle::Prefilling) {
+        if (!request.prefill || request.prefill->pending_capture_offer != 0) { return false; }
+        frontier = request.prefill->cursor;
+        if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier ||
+            frontier > request.prefill->prompt_tokens) {
+            return false;
+        }
+        // Staged prefill keeps the committed frontier and rebuild work at the materialization
+        // base; bring both to the salvaged cursor before publishing.
+        try {
+            state.rebuild_work = rebuild_work_at_frontier(
+                request.prefill->prompt, frontier, prefill_chunk, request.prefill->capture_groups,
+                request.prefill->prompt.identity.rewrite_execution_frontiers);
+            std::uint32_t tail_begin = 0;
+            for (const CaptureGroup& group : request.prefill->capture_groups) {
+                runtime_support::include_rebuild_boundary(tail_begin, group.frontier, frontier);
+            }
+            for (const std::uint32_t boundary :
+                 request.prefill->prompt.identity.rewrite_execution_frontiers) {
+                runtime_support::include_rebuild_boundary(tail_begin, boundary, frontier);
+            }
+            state.rebuild_tail_begin = tail_begin;
+            state.execution_frontier = frontier;
+        } catch (...) { return false; }
+        // A DFlash draft context that lags the salvaged frontier cannot be truncated to it on
+        // materialization, so only a caught-up backend can be published.
+        if (speculative_backend == SpeculativeBackend::DFlash &&
+            state.dflash_context_frontier < frontier) {
+            return false;
+        }
+    } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
+        frontier = state.execution_frontier;
+        if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (state.mtp_kv_valid + 1 < frontier) { return false; }
+        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (state.dflash_context_frontier < frontier) { return false; }
+        }
+    } else {
+        return false;
+    }
+    if (!publish_active_continuation(state, request, lane, continuation_index, out.summary)) {
+        return false;
+    }
     out.continuation.emplace(ContractAccess::make_continuation(
         this, continuation_index, continuation_slots[continuation_index].generation));
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
-    out.disposition = runtime::FinishDisposition::Catalogued;
-    advance_resource_revision();
-    out.status = runtime::ConsumeStatus::Consumed;
-    return out;
+    out.salvaged    = true;
+    return true;
 }
 
 AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
@@ -671,11 +747,16 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     const std::uint32_t lane = ContractAccess::lane(sequence).value;
-    RequestControl& request  = requests[lane];
+    RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Pending || request.lifecycle == Lifecycle::Empty) {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    const std::uint32_t continuation_index = active_continuations[lane];
+    if (salvage_continuation(state, request, lane, continuation_index, out)) {
+        out.status = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

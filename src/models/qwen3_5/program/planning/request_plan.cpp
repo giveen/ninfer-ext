@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/context_work.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -128,6 +129,8 @@ std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead prop
            (static_cast<std::uint32_t>(storage) << 16U);
 }
 
+} // namespace
+
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
                                               std::uint32_t frontier, std::uint32_t prefill_chunk,
                                               std::span<const CaptureGroup> captures,
@@ -156,6 +159,8 @@ runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
     return scheduled_prefill_work(0, frontier, vision_items, vision_patches, prefill_chunk,
                                   captures, rewrite_frontiers);
 }
+
+namespace {
 
 detail::PhysicalDeviceResources
 convertible_source_resources(detail::PhysicalDeviceResources active,

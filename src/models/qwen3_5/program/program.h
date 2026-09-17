@@ -834,6 +834,11 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // True when the aborted lane's live state was published as a continuation endpoint at its
+    // last committed frontier instead of being discarded.
+    bool salvaged = false;
+    ContinuationSummary summary;
+    std::optional<ContinuationHandle> continuation;
 };
 
 struct ReleaseResult {

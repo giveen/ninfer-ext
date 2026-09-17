@@ -504,6 +504,9 @@ struct FakeAbortResult {
     ConsumeStatus status = ConsumeStatus::InvariantMismatch;
     FakeTimings timings;
     FakeSpeculativeStats speculative;
+    bool salvaged = false;
+    FakeContinuationSummary summary;
+    std::optional<FakeContinuationHandle> continuation;
 };
 
 struct FakeReleaseResult {
@@ -1108,12 +1111,20 @@ public:
         return result;
     }
 
-    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle) noexcept {
+    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle sequence) noexcept {
         ++abort_calls;
         advance_revision();
-        return FakeAbortResult{.status      = ConsumeStatus::Consumed,
+        FakeAbortResult result{.status      = ConsumeStatus::Consumed,
                                .timings     = FakeTimings{.value = 7},
                                .speculative = FakeSpeculativeStats{.value = 9}};
+        if (abort_salvage_next) {
+            abort_salvage_next = false;
+            const std::uint32_t key = sequence_content_keys_[sequence.id];
+            result.salvaged        = true;
+            result.summary.endpoint = endpoint(key, finish_frontier);
+            result.continuation.emplace(sequence.id, key);
+        }
+        return result;
     }
 
     [[nodiscard]] FakeReleaseResult
@@ -1153,6 +1164,7 @@ public:
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    bool abort_salvage_next                              = false;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -3210,6 +3222,73 @@ void test_terminal_fallback_releases_failed_retention() {
             "terminal fallback did not free every logical owner");
 }
 
+void test_abort_salvage_publishes_reusable_endpoint() {
+    FakeManager manager = make_manager(1, 1);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 41, make_base(41), 1);
+
+    program.abort_salvage_next = true;
+    const FakeAbortResult result = manager.abort(program, active.lane, active.sequence);
+    require(result.status == ConsumeStatus::Consumed && result.salvaged,
+            "abort did not report its salvaged continuation");
+    require(result.timings.value == 7 && result.speculative.value == 9,
+            "salvage did not carry abort accounting");
+    require(program.abort_calls == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "salvaged abort did not free the lane or catalogue its endpoint");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{41}, make_base(41), 2);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+            "salvaged endpoint was not reusable by the retrying prompt");
+}
+
+void test_terminal_fallback_salvage_catalogues() {
+    FakeManager manager = make_manager(1, 1);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 42, make_base(42), 1);
+    manager.mark_terminal_pending(active.lane);
+    program.finish_fail_next   = true;
+    program.abort_salvage_next = true;
+    const FakeFinishResult result = manager.finish(program, active.lane, active.sequence);
+    require(result.status == ConsumeStatus::Consumed &&
+                result.disposition == FinishDisposition::Catalogued,
+            "salvaged terminal fallback was not catalogued");
+    require(result.timings.value == 7 && result.speculative.value == 9,
+            "salvaged terminal fallback lost abort accounting");
+    require(program.abort_calls == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "salvaged terminal fallback did not free every logical owner");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{42}, make_base(42), 2);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+            "salvaged terminal fallback endpoint was not reusable");
+}
+
+void test_abort_salvage_earns_disposable_retention_under_pressure() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest salvaged = start_active(
+        manager, program, 1, make_base(1, FakeCacheSessionKey{1}, RetentionClass::LiveSession), 1);
+    program.abort_salvage_next = true;
+    (void)manager.abort(program, salvaged.lane, salvaged.sequence);
+    const ActiveRequest recent = start_active(
+        manager, program, 2, make_base(2, std::nullopt, RetentionClass::RecentPrivate), 2);
+    (void)finish_active(manager, program, recent);
+
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base(3), 3);
+    require(inspection.choice.has_value(),
+            "salvage retention pressure did not find a feasible prefix");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{3}, {});
+    require(program.started_action_ids.size() == 1 &&
+                program.started_action_ids.front() == 1000U + salvaged.sequence.id,
+            "salvage did not earn Disposable retention below LiveSession");
+}
+
 void test_terminal_settlement_waits_for_open_resource_transaction() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3525,6 +3604,11 @@ int main() {
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
+    run_test("abort salvage publishes reusable endpoint",
+             test_abort_salvage_publishes_reusable_endpoint);
+    run_test("terminal fallback salvage", test_terminal_fallback_salvage_catalogues);
+    run_test("abort salvage earns disposable retention",
+             test_abort_salvage_earns_disposable_retention_under_pressure);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);

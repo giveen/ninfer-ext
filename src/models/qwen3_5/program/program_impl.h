@@ -1137,6 +1137,11 @@ private:
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);
+    bool publish_active_continuation(SequenceState& state, RequestControl& request,
+                                     std::uint32_t lane, std::uint32_t continuation_index,
+                                     qwen3_5::ContinuationSummary& summary) noexcept;
+    bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                              std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,

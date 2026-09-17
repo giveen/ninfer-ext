@@ -923,6 +923,8 @@ struct RuntimeStats {
     std::uint64_t shared_stable_prefix_selections    = 0;
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
+    // Aborted requests whose live state was published as a continuation endpoint.
+    std::uint64_t salvaged_continuations             = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

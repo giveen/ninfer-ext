@@ -922,6 +922,37 @@ public:
         lanes_[lane.value] = LogicalLaneState::TerminalPending;
     }
 
+    // Publish a program-salvaged continuation: the same publication as a catalogued finish,
+    // except the interrupted partial response earns only Disposable retention.
+    void publish_salvaged_continuation(Program& program, LaneId lane, AbortResult& result) {
+        ActiveEntry& active = active_[lane.value];
+        CatalogEntry& publication = catalog_.at(active.publication_slot);
+        if (!result.continuation || !valid_continuation_summary(result.summary) ||
+            publication.state != CatalogState::ReservedForActive ||
+            publication.id != active.continuation_id) {
+            if (result.continuation) {
+                (void)program.release_continuation(std::move(*result.continuation));
+                result.continuation.reset();
+            }
+            throw std::logic_error("Program salvaged an invalid terminal continuation");
+        }
+        release_active_references(lane);
+        publication.state = CatalogState::Catalogued;
+        assign_continuation_summary(publication.summary, result.summary);
+        publication.handle.emplace(std::move(*result.continuation));
+        result.continuation.reset();
+        publication.session   = active.session;
+        publication.retention = RetentionClass::Disposable;
+        migrate_observations(publication, result.summary, publication.retention);
+        advance_revision(publication.revision);
+        if (publication.session && active.update_session_index) {
+            if (!publish_session(*publication.session, active.publication_slot, publication.id,
+                                 publication.revision, active.publication_order)) {
+                publication.session.reset();
+            }
+        }
+    }
+
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
@@ -935,6 +966,18 @@ public:
             if (discarded.status != ConsumeStatus::Consumed) {
                 throw std::logic_error(
                     "Program could neither retain nor discard terminal sequence");
+            }
+            if (discarded.salvaged) {
+                publish_salvaged_continuation(program, lane, discarded);
+                reset_active_entry(active);
+                lanes_[lane.value] = LogicalLaneState::Free;
+
+                FinishResult salvaged;
+                salvaged.status      = ConsumeStatus::Consumed;
+                salvaged.disposition = FinishDisposition::Catalogued;
+                salvaged.timings     = discarded.timings;
+                salvaged.speculative = std::move(discarded.speculative);
+                return salvaged;
             }
             release_active_references(lane);
             clear_catalog_entry(catalog_.at(active.publication_slot));
@@ -1004,8 +1047,12 @@ public:
         if (result.status != ConsumeStatus::Consumed) {
             throw std::logic_error("Program did not consume aborted sequence");
         }
-        release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        if (result.salvaged) {
+            publish_salvaged_continuation(program, lane, result);
+        } else {
+            release_active_references(lane);
+            clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        }
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
