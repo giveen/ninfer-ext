@@ -668,6 +668,11 @@ bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestContr
     unbind_sequence_kv(state);
     request.active_resources                    = {};
     request.optional_resources                  = {};
+    // A published lane is free: any staged prefill bookkeeping belongs to the
+    // finished request. The abort/salvage path publishes without going through
+    // the commit decision loop that clears it on normal completion, so the
+    // release itself must leave none behind.
+    request.prefill.reset();
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
