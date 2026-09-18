@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -131,6 +132,26 @@ ninfer::EngineOptions automatic_long_anchor_engine_options(const char* artifact)
     ninfer::EngineOptions options = private_long_anchor_engine_options(artifact);
     options.context_cache.device_state_slots               = 8;
     options.context_cache.max_long_anchors_per_continuation = 2;
+    return options;
+}
+
+ninfer::EngineOptions salvage_mid_prefill_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 8192;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    // One 1024-token chunk commits exactly kSalvageMinFrontier, so a cancel sampled at the
+    // first chunk boundary lands mid-prefill at a salvage-eligible frontier.
+    options.prefill_chunk                    = 1024;
+    options.speculative.backend              = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                  = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 8;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
     return options;
 }
 
@@ -1178,6 +1199,83 @@ int exercise_engine_automatic_long_anchor_capture(const char* artifact) {
     return 0;
 }
 
+int exercise_salvage_mid_prefill(const char* artifact) {
+    ninfer::Engine engine(salvage_mid_prefill_engine_options(artifact));
+
+    const auto input = [](std::string text) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        prompt.messages.push_back(std::move(user));
+        prompt.options.enable_thinking = false;
+        return prompt;
+    };
+    const auto token_count = [&](const std::string& text) {
+        return engine.count_tokens(input(text));
+    };
+
+    // Grow the prompt until prefill spans at least two full 1024-token chunks, so a cancel
+    // sampled at a chunk boundary lands mid-prefill with a committed frontier of at least
+    // kSalvageMinFrontier.
+    std::string prompt_text;
+    for (std::uint32_t index = 0; index < 800; ++index) { prompt_text += "alpha "; }
+    while (token_count(prompt_text) < 2048) { prompt_text += "beta gamma delta epsilon zeta; "; }
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    ninfer::PromptInput cancelled_input = input(prompt_text);
+    cancelled_input.context_cache.session_key = "salvage-mid-prefill";
+    cancelled_input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+
+    // The engine samples the flag once per execution unit. Admission takes milliseconds, while
+    // the first 1024-token chunk takes well over 100 ms, so a deadline after 75 ms cancels the
+    // request mid-prefill rather than before admission or after the prompt is fully prefilled.
+    const auto cancel_deadline     = std::chrono::steady_clock::now() + std::chrono::milliseconds(75);
+    const ninfer::CancellationView cancellation{[cancel_deadline] {
+        return std::chrono::steady_clock::now() >= cancel_deadline;
+    }};
+
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    const ninfer::GenerationResult cancelled =
+        engine.generate(engine.prepare(std::move(cancelled_input)), request, nullptr, cancellation);
+    const ninfer::RuntimeStats after_cancel = engine.runtime_stats();
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled ||
+        cancelled.prompt.prompt_tokens < 2048 ||
+        after_cancel.salvaged_continuations != before.salvaged_continuations + 1) {
+        std::cerr << "mid-prefill cancel did not salvage the committed frontier: reason="
+                  << static_cast<int>(cancelled.finish_reason) << " prompt="
+                  << cancelled.prompt.prompt_tokens << " salvaged="
+                  << before.salvaged_continuations << '/' << after_cancel.salvaged_continuations
+                  << '\n';
+        return 1;
+    }
+
+    // The retry names the same session, so it must resume from the salvaged endpoint instead of
+    // reprefilling from Root.
+    ninfer::PromptInput retry_input = input(prompt_text);
+    retry_input.context_cache.session_key = "salvage-mid-prefill";
+    retry_input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    const ninfer::GenerationResult retry =
+        engine.generate(engine.prepare(std::move(retry_input)), request);
+    if (retry.generated_token_ids.size() != 1 ||
+        retry.prefix_reuse_path == ninfer::PrefixReusePath::Root ||
+        retry.reused_prompt_tokens < 1024 ||
+        retry.reused_prompt_tokens >= retry.prompt.prompt_tokens) {
+        std::cerr << "retry did not reuse the salvaged frontier: path="
+                  << static_cast<int>(retry.prefix_reuse_path) << " reused="
+                  << retry.reused_prompt_tokens << " prompt=" << retry.prompt.prompt_tokens
+                  << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_last_private_alias_eviction(const char* artifact) {
     ninfer::Engine engine(last_alias_engine_options(artifact));
     std::string prompt_text;
@@ -2197,6 +2295,9 @@ int exercise_artifact(const char* artifact) {
         result != 0) {
         return result;
     }
+    if (const int result = exercise_salvage_mid_prefill(artifact); result != 0) {
+        return result;
+    }
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
     }
@@ -2238,6 +2339,8 @@ int main() {
         result = exercise_private_long_anchor_capture_and_replacement(artifact);
     } else if (scenario == "engine-automatic-long-anchor") {
         result = exercise_engine_automatic_long_anchor_capture(artifact);
+    } else if (scenario == "salvage-mid-prefill") {
+        result = exercise_salvage_mid_prefill(artifact);
     } else if (scenario == "rewrite-checkpoint-shared") {
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::SharedAlias);
