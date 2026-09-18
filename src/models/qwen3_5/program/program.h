@@ -826,6 +826,9 @@ struct FinishResult {
     runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // True when the terminal finish fell back to abort and the lane's live state was published
+    // as a continuation endpoint at its last committed frontier instead of being discarded.
+    bool salvaged = false;
     ContinuationSummary summary;
     std::optional<ContinuationHandle> continuation;
 };
