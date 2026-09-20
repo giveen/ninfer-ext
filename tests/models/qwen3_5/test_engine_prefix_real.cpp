@@ -286,6 +286,78 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
+// ---------------------------------------------------------------------------
+// Realistic agent-scenario helpers. The production agent (E:\NInfer-Deploy-V3\log.json) runs
+// long multi-turn OpenAI-chat conversations: a leading system prompt + a fixed tool set (the
+// shared stable prefix), a growing conversation with tool calls, thinking enabled and
+// preserved, streaming. These helpers build that shape with small caches so the 36h caching
+// fixes (shared replacement, #251 reclaim, preserved-recent, cost-scaled search budget,
+// checkpoint eviction, stats publication) are exercised under contention.
+
+ninfer::EngineOptions agent_engine_options(const char* artifact, std::uint32_t shared_prefixes,
+                                           std::uint32_t private_continuations,
+                                           std::uint32_t device_slots, std::uint32_t preserved,
+                                           std::uint32_t kv_capacity) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 4096;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(kv_capacity);
+    options.prefill_chunk                    = 256;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 2;
+    options.context_cache.device_state_slots = device_slots;
+    options.context_cache.host_state_slots   = 8;
+    options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
+    options.context_cache.max_private_continuations         = private_continuations;
+    options.context_cache.max_shared_prefixes               = shared_prefixes;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.preserved_recent_prefixes         = preserved;
+    return options;
+}
+
+std::string agent_tool_json(std::string_view name, std::string_view description) {
+    std::string json = "{\"type\":\"function\",\"function\":{\"name\":\"";
+    json += name;
+    json += "\",\"description\":\"";
+    json += description;
+    json += "\",\"parameters\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"]}}}";
+    return json;
+}
+
+ninfer::ChatMessage agent_text_message(ninfer::ChatRole role, std::string text) {
+    ninfer::ChatMessage message;
+    message.role = role;
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    return message;
+}
+
+// Builds a realistic agent prompt: a leading System message + the tool definitions (the shared
+// stable prefix, marked at the ToolBoundary after the last tool) + a multi-turn conversation.
+// Thinking is on and preserved, mirroring the production agent.
+ninfer::PromptInput agent_prompt(std::string system, std::vector<std::string> tools,
+                                 std::vector<ninfer::ChatMessage> conversation,
+                                 bool enable_thinking) {
+    ninfer::PromptInput input;
+    input.messages.push_back(agent_text_message(ninfer::ChatRole::System, std::move(system)));
+    for (auto& turn : conversation) { input.messages.push_back(std::move(turn)); }
+    input.options.enable_thinking   = enable_thinking;
+    input.options.preserve_thinking = true;
+    for (auto& tool : tools) { input.options.tool_jsons.push_back(std::move(tool)); }
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+        .after_tool_count = static_cast<std::uint32_t>(tools.size()),
+    });
+    input.context_cache.session_key = "agent-session";
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    return input;
+}
+
 int exercise_registered_frontend(const ninfer::Engine& engine) {
     if (engine.count_tokens(chinese_chat(true)) != 16) {
         std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
@@ -2537,6 +2609,353 @@ int exercise_preserved_recent_prefixes(const char* artifact) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Realistic agent scenarios. Each mirrors a production agent traffic shape -- a shared system +
+// tools prefix, a growing multi-turn conversation with tool calls, thinking on and preserved
+// (the exact shape in E:\NInfer-Deploy-V3\log.json) -- and drives the 36h caching fixes into
+// contention: a full shared catalog, saturated private continuations, KV-capacity pressure, and
+// concurrent requests. The deterministic guarantees asserted here are the observable ones:
+// shared-prefix reuse, pressure evictions, and zero leaked shared_active_references after every
+// completed request (the stats-publication fix, d9d110e3).
+
+// 1. A multi-turn agent conversation reuses its shared system + tools prefix on every turn after
+//    the first. The released-lane snapshot is published before the caller wakes, so a fresh
+//    runtime_stats() read after each completed turn must show zero active references.
+//    prefix_reuse_path is the whole-prompt reuse path: for a growing conversation the shared
+//    head is replayed under the private response-replay checkpoint, so assert the observable
+//    guarantee (tokens actually reused, non-Root path) rather than a specific shared path.
+int exercise_agent_multi_turn(const char* artifact) {
+    std::cout << "agent-multi-turn: shared system+tools prefix across 4 tool-calling turns\n";
+    ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/4, /*private=*/4,
+                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+    const std::string system = "You are a concise weather assistant. Always call a tool first.";
+    std::vector<std::string> tools = {
+        agent_tool_json("get_current_weather", "Get the current weather for a city."),
+        agent_tool_json("get_forecast", "Get the forecast for a city and a date."),
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    std::vector<ninfer::ChatMessage> history;
+    bool saw_shared_reuse = false;
+    for (std::uint32_t turn = 1; turn <= 4; ++turn) {
+        history.push_back(agent_text_message(
+            ninfer::ChatRole::User,
+            "What is the weather in city " + std::to_string(turn) + "?"));
+        auto prepared = engine.prepare(agent_prompt(system, tools, history, true));
+        const auto result = engine.generate(std::move(prepared), request);
+        if (result.generated_token_ids.size() != 1) {
+            std::cerr << "agent-multi-turn: turn " << turn
+                      << " did not produce its deterministic token\n";
+            return 1;
+        }
+        history.push_back(agent_text_message(
+            ninfer::ChatRole::Assistant,
+            "Calling get_current_weather for city " + std::to_string(turn) + "."));
+        const auto stats = engine.runtime_stats();
+        if (turn >= 2) {
+            if (result.reused_prompt_tokens == 0 ||
+                result.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+                std::cerr << "agent-multi-turn: turn " << turn
+                          << " did not reuse the shared stable prefix: path="
+                          << static_cast<int>(result.prefix_reuse_path)
+                          << " reused=" << result.reused_prompt_tokens << '\n';
+                return 1;
+            }
+            saw_shared_reuse = true;
+        }
+        if (stats.shared_active_references != 0) {
+            std::cerr << "agent-multi-turn: turn " << turn
+                      << " leaked active references: " << stats.shared_active_references << '\n';
+            return 1;
+        }
+    }
+    if (!saw_shared_reuse) {
+        std::cerr << "agent-multi-turn: no turn reused the shared stable prefix\n";
+        return 1;
+    }
+    std::cout << "agent-multi-turn: OK -- shared prefix reused on turns 2-4, no leaked references\n";
+    return 0;
+}
+
+// 2. Five long, distinct agent conversations saturate a small KV capacity (the real contention
+//    axis in the production agent is private/host continuations under KV pressure). The pressure
+//    path evicts the lowest-value prefixes; the recency-ladder escape hatch (preserved-recent,
+//    N=1) protects the most recent conversation, which must remain reusable. No references leak.
+int exercise_agent_private_continuations(const char* artifact) {
+    std::cout << "agent-private-continuations: saturate the private cache, preserve the most recent\n";
+    ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/2, /*private=*/3,
+                                               /*device=*/2, /*preserved=*/1, /*kv=*/4096));
+    const std::string system = "You are a research assistant that reads files and summarizes them.";
+    const std::string read_tool = agent_tool_json("read_file", "Read a file by path.");
+    std::vector<std::string> tools = {read_tool};
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // Five long, distinct conversations (each a new private continuation). Their combined KV
+    // overflows the 4096 capacity, so the cache runs out of room to merely degrade and must fully
+    // evict owners through the value-based (and preserved-recent-protected) pressure path.
+    std::vector<std::string> conversations;
+    for (std::uint32_t doc = 0; doc < 5; ++doc) {
+        std::string body;
+        for (std::uint32_t line = 0; line < 160; ++line) {
+            body += "file-" + std::to_string(doc) + " line " + std::to_string(line) +
+                    " describes a deterministic datum. ";
+        }
+        conversations.push_back(std::move(body));
+    }
+    const auto stats_before = engine.runtime_stats();
+    for (std::size_t doc = 0; doc < conversations.size(); ++doc) {
+        std::vector<ninfer::ChatMessage> history = {
+            agent_text_message(ninfer::ChatRole::User, "Summarize this file:\n" + conversations[doc]),
+        };
+        const auto result =
+            engine.generate(engine.prepare(agent_prompt(system, tools, history, true)), request);
+        if (result.generated_token_ids.size() != 1) {
+            std::cerr << "agent-private-continuations: document " << doc
+                      << " did not produce its deterministic token\n";
+            return 1;
+        }
+        if (engine.runtime_stats().shared_active_references != 0) {
+            std::cerr << "agent-private-continuations: document " << doc
+                      << " leaked active references: "
+                      << engine.runtime_stats().shared_active_references << '\n';
+            return 1;
+        }
+    }
+    const auto stats_after = engine.runtime_stats();
+    const std::uint64_t evicted_delta =
+        stats_after.pressure_private_owners_evicted - stats_before.pressure_private_owners_evicted;
+    if (evicted_delta == 0) {
+        std::cerr << "agent-private-continuations: the saturated private cache evicted nothing "
+                     "(fixture did not overflow)\n";
+        return 1;
+    }
+    // The most recent conversation must still be reusable (it is the recency-ladder protected one).
+    std::vector<ninfer::ChatMessage> recent = {
+        agent_text_message(ninfer::ChatRole::User, "Summarize this file:\n" + conversations.back()),
+    };
+    const auto recent_reuse =
+        engine.generate(engine.prepare(agent_prompt(system, tools, recent, true)), request);
+    if (recent_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "agent-private-continuations: the most recent conversation was not retained "
+                     "under pressure (reused="
+                  << recent_reuse.reused_prompt_tokens << ")\n";
+        return 1;
+    }
+    if (engine.runtime_stats().shared_active_references != 0) {
+        std::cerr << "agent-private-continuations: leaked active references after the final reuse: "
+                      << engine.runtime_stats().shared_active_references << '\n';
+        return 1;
+    }
+    std::cout << "agent-private-continuations: OK -- evicted " << evicted_delta
+              << " private prefix(es), most recent still reusable, no leaked references\n";
+    return 0;
+}
+
+// 3. Two concurrent agent requests (max_concurrency = 2, the production value) with a shared
+//    system + tools prefix and distinct conversations settle at terminal boundaries. After both
+//    complete, the published stats must show no live logical membership and zero leaked references
+//    (the stats-publication fix under concurrent settlement).
+int exercise_agent_concurrent(const char* artifact) {
+    std::cout << "agent-concurrent: two concurrent agent requests settle without leaked references\n";
+    ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/4, /*private=*/4,
+                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+    const std::string system = "You are a code-review assistant.";
+    std::vector<std::string> tools = {
+        agent_tool_json("read_file", "Read a file by path."),
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // Two concurrent requests share the same system + tools prefix (the shared stable prefix) but
+    // have distinct conversations. Both are submitted before either completes.
+    std::vector<ninfer::ChatMessage> alpha = {
+        agent_text_message(ninfer::ChatRole::User, "Review this snippet:\nint a = 1;"),
+    };
+    std::vector<ninfer::ChatMessage> bravo = {
+        agent_text_message(ninfer::ChatRole::User, "Review this snippet:\nint b = 2;"),
+    };
+    auto alpha_handle =
+        engine.submit(engine.prepare(agent_prompt(system, tools, alpha, true)), request);
+    auto bravo_handle =
+        engine.submit(engine.prepare(agent_prompt(system, tools, bravo, true)), request);
+    const auto alpha_result = alpha_handle.wait();
+    const auto bravo_result = bravo_handle.wait();
+    if (alpha_result.generated_token_ids.size() != 1 ||
+        bravo_result.generated_token_ids.size() != 1) {
+        std::cerr << "agent-concurrent: a concurrent request did not produce its deterministic token\n";
+        return 1;
+    }
+    const auto settled = engine.runtime_stats();
+    if (settled.running_requests != 0 || settled.prefilling_requests != 0 ||
+        settled.decode_ready_requests != 0 || settled.terminal_pending_requests != 0) {
+        std::cerr << "agent-concurrent: concurrent settlement left live logical membership: running="
+                  << settled.running_requests << " prefill=" << settled.prefilling_requests
+                  << " decode=" << settled.decode_ready_requests
+                  << " terminal=" << settled.terminal_pending_requests << '\n';
+        return 1;
+    }
+    if (settled.shared_active_references != 0) {
+        std::cerr << "agent-concurrent: concurrent settlement leaked active references: "
+                      << settled.shared_active_references << '\n';
+        return 1;
+    }
+    std::cout << "agent-concurrent: OK -- two concurrent agent requests settled cleanly\n";
+    return 0;
+}
+
+// 4. Four long, distinct agent conversations overflow a very small KV capacity, driving the
+//    pressure-eviction and salvage paths. The observable guarantee: pressure evictions occur and
+//    no references leak after the settled requests.
+int exercise_agent_kv_pressure(const char* artifact) {
+    std::cout << "agent-kv-pressure: long agent conversations overflow the KV capacity\n";
+    ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/2, /*private=*/4,
+                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+    const std::string system = "You are a log-analysis assistant.";
+    std::vector<std::string> tools = {
+        agent_tool_json("query_logs", "Query the log stream by a filter."),
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // The engine requires kv_capacity >= max_context (4096). Four long, distinct conversations
+    // (~2000 tokens each, ~8000 total) overflow that 4096-token KV capacity; the pressure path
+    // evicts the lowest-value prefixes and salvages what it can.
+    const auto stats_before = engine.runtime_stats();
+    for (std::uint32_t doc = 0; doc < 4; ++doc) {
+        std::string body;
+        for (std::uint32_t line = 0; line < 200; ++line) {
+            body += "log-" + std::to_string(doc) + " entry " + std::to_string(line) +
+                    " records a deterministic event. ";
+        }
+        std::vector<ninfer::ChatMessage> history = {
+            agent_text_message(ninfer::ChatRole::User, "Analyze these logs:\n" + body),
+        };
+        const auto result =
+            engine.generate(engine.prepare(agent_prompt(system, tools, history, true)), request);
+        if (result.generated_token_ids.size() != 1) {
+            std::cerr << "agent-kv-pressure: document " << doc
+                      << " did not produce its deterministic token\n";
+            return 1;
+        }
+    }
+    const auto stats_after = engine.runtime_stats();
+    if (stats_after.shared_active_references != 0) {
+        std::cerr << "agent-kv-pressure: leaked active references under KV pressure: "
+                      << stats_after.shared_active_references << '\n';
+        return 1;
+    }
+    const std::uint64_t private_evicted =
+        stats_after.pressure_private_owners_evicted - stats_before.pressure_private_owners_evicted;
+    const std::uint64_t shared_evicted =
+        stats_after.pressure_shared_owners_evicted - stats_before.pressure_shared_owners_evicted;
+    if (private_evicted == 0 && shared_evicted == 0) {
+        std::cerr << "agent-kv-pressure: KV overflow evicted nothing (fixture did not overflow)\n";
+        return 1;
+    }
+    std::cout << "agent-kv-pressure: OK -- evicted private=" << private_evicted
+              << " shared=" << shared_evicted << ", no leaked references\n";
+    return 0;
+}
+
+// 5. Two agent conversations saturate the shared stable-prefix catalog (max_shared_prefixes = 1).
+//    The system + tool prefix is a marker-free (automatic) shared candidate, so the issue #251
+//    reclaim fires when the second automatic prefix must be catalogued against a full catalog:
+//    the oldest automatic entry is reclaimed to make room, and the newest is reusable.
+int exercise_agent_shared_catalog(const char* artifact) {
+    std::cout << "agent-shared-catalog: automatic agent prefixes against a 1-slot catalog\n";
+    ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/1, /*private=*/2,
+                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+    const std::string system = "You are a deterministic tool dispatcher.";
+    const std::string alpha_tool =
+        agent_tool_json("alpha_tool", "Perform the alpha operation.");
+    const std::string bravo_tool =
+        agent_tool_json("bravo_tool", "Perform the bravo operation.");
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // No explicit shared-prefix marker: the system + tool prefix is an automatic shared candidate
+    // (the exact traffic the #251 reclaim serves).
+    const auto gen = [&](std::string tool, std::string question) {
+        ninfer::PromptInput input;
+        input.messages.push_back(agent_text_message(ninfer::ChatRole::System, system));
+        input.messages.push_back(agent_text_message(ninfer::ChatRole::User, std::move(question)));
+        input.options.enable_thinking   = true;
+        input.options.preserve_thinking = true;
+        input.options.tool_jsons.push_back(std::move(tool));
+        input.context_cache.session_key = "agent-session";
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return engine.generate(engine.prepare(std::move(input)), request);
+    };
+
+    // Prefix A (alpha tool) captures and becomes the single shared catalog entry. The whole-prompt
+    // private endpoint is also resident (LiveSession + session_key), so the 4th alpha call is served
+    // via that endpoint (the System+tool head is reused, but the User tail makes the private endpoint
+    // the cheaper whole-prompt candidate) -- the whole-prompt reuse path is PrivateEndpoint, not
+    // SharedStablePrefix. Admission of the automatic System+tool prefix to the shared catalog is
+    // verified by the phase-2 reclaim below: the bravo prefix can only be catalogued by reclaiming
+    // the alpha entry (issue #251).
+    (void)gen(alpha_tool, "Dispatch the alpha operation.");
+    (void)gen(alpha_tool, "Dispatch the alpha operation.");
+    (void)gen(alpha_tool, "Dispatch the alpha operation once more.");
+    const auto alpha_reuse = gen(alpha_tool, "Dispatch the alpha operation.");
+    if (alpha_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "agent-shared-catalog: first automatic agent prefix was not reused: path="
+                  << static_cast<int>(alpha_reuse.prefix_reuse_path)
+                  << " reused=" << alpha_reuse.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    // The catalog is now full. Prefix B (bravo tool, also automatic) can only be catalogued by
+    // reclaiming A; without the reclaim B is dropped and its shared-prefix reuse freezes (#251).
+    const auto before_b = engine.runtime_stats();
+    (void)gen(bravo_tool, "Dispatch the bravo operation.");
+    (void)gen(bravo_tool, "Dispatch the bravo operation.");
+    (void)gen(bravo_tool, "Dispatch the bravo operation once more.");
+    const auto bravo_reuse = gen(bravo_tool, "Dispatch the bravo operation.");
+    const auto after_b = engine.runtime_stats();
+    // As with the alpha phase, the 4th bravo call is served via its whole-prompt private endpoint
+    // (PrivateEndpoint), not the shared catalog. The #251 guarantee is that the bravo prefix was
+    // admitted by reclaiming the alpha entry (pressure_shared_owners_evicted delta), not that this
+    // particular request's whole-prompt path is SharedStablePrefix.
+    if (bravo_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "agent-shared-catalog: second automatic agent prefix was not reused: path="
+                  << static_cast<int>(bravo_reuse.prefix_reuse_path)
+                  << " reused=" << bravo_reuse.reused_prompt_tokens
+                  << " shared_evicted=" << after_b.pressure_shared_owners_evicted << '\n';
+        return 1;
+    }
+    if (after_b.pressure_shared_owners_evicted <= before_b.pressure_shared_owners_evicted) {
+        std::cerr << "agent-shared-catalog: no shared entry was reclaimed for the second "
+                     "automatic prefix: shared_evicted="
+                  << after_b.pressure_shared_owners_evicted << '\n';
+        return 1;
+    }
+    if (after_b.shared_active_references != 0) {
+        std::cerr << "agent-shared-catalog: leaked active references: "
+                      << after_b.shared_active_references << '\n';
+        return 1;
+    }
+    std::cout << "agent-shared-catalog: OK -- second automatic agent prefix reclaimed the first\n";
+    return 0;
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -2546,6 +2965,7 @@ int main() {
     const char* selected            = std::getenv("NINFER_PREFIX_REAL_SCENARIO");
     const std::string_view scenario = selected ? selected : "all";
     int result                      = 0;
+    try {
     if (scenario == "vision") {
         ninfer::Engine engine(engine_options(artifact));
         result = exercise_vision(engine);
@@ -2590,8 +3010,23 @@ int main() {
         options.context_cache = ninfer::ContextCacheOptions{.enabled = false};
         ninfer::Engine engine(std::move(options));
         result = exercise_stream_observations(engine);
+    } else if (scenario == "agent-multi-turn") {
+        result = exercise_agent_multi_turn(artifact);
+    } else if (scenario == "agent-private-continuations") {
+        result = exercise_agent_private_continuations(artifact);
+    } else if (scenario == "agent-concurrent") {
+        result = exercise_agent_concurrent(artifact);
+    } else if (scenario == "agent-kv-pressure") {
+        result = exercise_agent_kv_pressure(artifact);
+    } else if (scenario == "agent-shared-catalog") {
+        result = exercise_agent_shared_catalog(artifact);
     } else {
         throw std::invalid_argument("unknown prefix integration scenario");
+    }
+    } catch (const std::exception& e) {
+        std::cerr << "uncaught exception in scenario '" << scenario << "': " << e.what() << '\n';
+        std::cerr.flush();
+        return 1;
     }
     if (result == 0) { std::cout << "ok\n"; }
     return result;
