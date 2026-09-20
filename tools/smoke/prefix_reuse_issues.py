@@ -9,7 +9,7 @@ Covered changes:
   1. --preserved-recent-prefixes escape hatch     -> scenario "preserved-recent-prefixes"
   2. Issue #229 cost-scaled materialization budget -> ninfer_resource_manager_test (unit)
   3. Issue #251 shared-catalog saturation reclaim  -> scenario "shared-saturation-reclaim"
-     plus "shared-replacement-and-full-capacity-reuse" as the adjacent capacity path.
+     plus "shared-replacement" as the adjacent explicit-candidate capacity path.
 
 Usage:
   python tools/smoke/prefix_reuse_issues.py \
@@ -44,7 +44,7 @@ class Issue:
 ISSUES = [
     Issue("preserved-recent-prefixes escape hatch", "e2e", "preserved-recent-prefixes"),
     Issue("issue #251 shared-catalog saturation reclaim", "e2e", "shared-saturation-reclaim"),
-    Issue("issue #251 shared reuse at full capacity", "e2e", "shared-replacement-and-full-capacity-reuse"),
+    Issue("issue #251 shared reuse at full capacity", "e2e", "shared-replacement"),
     Issue("issue #229 cost-scaled search budget (+ #251 reclaim) [unit]", "unit", "all"),
 ]
 
