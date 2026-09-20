@@ -581,17 +581,26 @@ public:
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
         if (candidate.publishes_shared) {
-            const bool pressure_evidence =
+            // Declared credit means the client (ExplicitBoundary) or a system default
+            // (RequestedAutomatic) gave this candidate an explicit retention standing. Automatic
+            // (EngineObserved) candidates carry no such contract and are therefore reclaimable.
+            const bool declared_credit =
                 has_shared_candidate_evidence(candidate.shared_evidence,
                                               SharedCandidateEvidence::ExplicitBoundary) ||
                 has_shared_candidate_evidence(candidate.shared_evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic) ||
-                matching_reuse_domains(candidate.shortlist_key) >= 2U;
-            if (!pressure_evidence) {
+                                              SharedCandidateEvidence::RequestedAutomatic);
+            const bool pressure_evidence =
+                declared_credit || matching_reuse_domains(candidate.shortlist_key) >= 2U;
+            if (!declared_credit) {
                 // Automatic-evidence candidates can only claim a vacant slot. Reclaim the oldest
                 // eligible automatic entry first so a saturated catalog cannot freeze them out
                 // permanently: without this, once every slot holds a resident entry, every later
                 // ordinary client loses shared-prefix reuse until an engine restart (issue #251).
+                // Gate on the *absence of declared credit*, not on pressure_evidence: a repeated
+                // automatic candidate's own committed demand record already pushes its window-only
+                // matching_reuse_domains count to >= 2 by capture time (the very gate that made it a
+                // shared-capture candidate), so a pressure_evidence gate would make this reclaim
+                // unreachable for exactly the traffic it exists to serve.
                 const bool has_vacant_shared_slot =
                     std::any_of(shared_catalog_.begin(), shared_catalog_.end(),
                                 [](const SharedCatalogEntry& entry) {
