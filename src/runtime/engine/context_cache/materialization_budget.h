@@ -21,7 +21,7 @@ template <class Clock = std::chrono::steady_clock>
 // sealing cannot be cancelled by this allowance, but their elapsed time reduces optional headroom.
 struct PlanningAllowance {
     std::uint64_t started_ns              = planning_now_ns();
-    std::uint64_t limit_ns                = 50'000'000;
+    std::uint64_t limit_ns                = 250'000'000;
     std::uint32_t affected_requests       = 1;
     const std::atomic<bool>* cancellation = nullptr;
     std::uint64_t control_deadline_ns     = std::numeric_limits<std::uint64_t>::max();
@@ -29,7 +29,7 @@ struct PlanningAllowance {
     [[nodiscard]] static PlanningAllowance
     boundary(std::uint32_t other_runnable, std::uint64_t now = planning_now_ns()) noexcept {
         return {.started_ns        = now,
-                .limit_ns          = other_runnable == 0 ? 50'000'000ULL : 10'000'000ULL,
+                .limit_ns          = other_runnable == 0 ? 250'000'000ULL : 50'000'000ULL,
                 .affected_requests = 1U + other_runnable};
     }
 
