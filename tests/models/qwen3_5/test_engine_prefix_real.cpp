@@ -760,6 +760,86 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     return 0;
 }
 
+// Issue #251: the shared stable-prefix catalog saturated by automatic (marker-free) traffic.
+// With max_shared_prefixes == 1, a second automatic prefix can only be catalogued by reclaiming
+// the first; without that reclamation the second is dropped and its shared-prefix reuse freezes
+// for the life of the engine. Both prefixes here carry no cache marker, so they are
+// automatic-evidence (not explicit-credit) -- the exact traffic the reclaim path serves.
+int exercise_shared_saturation_reclaim(const char* artifact) {
+    std::cout << "shared-saturation-reclaim: two automatic prefixes against a 1-slot catalog\n";
+    ninfer::EngineOptions engine_options = shared_replacement_engine_options(artifact);
+    engine_options.max_context                          = 1024;
+    engine_options.kv_capacity                          =
+        ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    engine_options.context_cache.max_private_continuations = 1;
+    ninfer::Engine engine(std::move(engine_options));
+    ninfer::RequestOptions capture_request;
+    capture_request.execution.requested_output_tokens = 1;
+    capture_request.execution.sampling.temperature    = 0.0F;
+    capture_request.execution.allow_prefix_reuse      = true;
+    capture_request.stop.include_model_defaults       = false;
+
+    const auto plain_prompt = [](std::string text) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking = false;
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
+
+    std::string prefix_a;
+    for (std::uint32_t index = 0; index < 40; ++index) { prefix_a += "alpha-stable "; }
+    std::string prefix_b;
+    for (std::uint32_t index = 0; index < 40; ++index) { prefix_b += "bravo-stable "; }
+
+    const auto gen = [&](const std::string& text) {
+        return engine.generate(engine.prepare(plain_prompt(text)), capture_request);
+    };
+
+    // Prefix A captures and becomes the single shared catalog entry.
+    (void)gen(prefix_a);
+    (void)gen(prefix_a);
+    (void)gen("private filler endpoint one.");
+    const auto a_reuse = gen(prefix_a);
+    if (a_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        a_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "shared-saturation: first automatic prefix did not reach the shared catalog: "
+                  << "path=" << static_cast<int>(a_reuse.prefix_reuse_path)
+                  << " reused=" << a_reuse.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    // The catalog is now full. Prefix B (also automatic) can only be catalogued by reclaiming A;
+    // without the reclaim B is dropped and its shared-prefix reuse freezes (issue #251).
+    const ninfer::RuntimeStats before_b = engine.runtime_stats();
+    (void)gen(prefix_b);
+    (void)gen(prefix_b);
+    (void)gen("private filler endpoint two.");
+    const auto b_reuse = gen(prefix_b);
+    const ninfer::RuntimeStats after_b = engine.runtime_stats();
+
+    if (b_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        b_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "shared-saturation: second automatic prefix froze out after catalog "
+                  << "saturation (issue #251): path=" << static_cast<int>(b_reuse.prefix_reuse_path)
+                  << " reused=" << b_reuse.reused_prompt_tokens
+                  << " shared_evicted=" << after_b.pressure_shared_owners_evicted << '\n';
+        return 1;
+    }
+    if (after_b.pressure_shared_owners_evicted <= before_b.pressure_shared_owners_evicted) {
+        std::cerr << "shared-saturation: no shared entry was reclaimed to make room for the "
+                  << "second automatic prefix: shared_evicted="
+                  << after_b.pressure_shared_owners_evicted << '\n';
+        return 1;
+    }
+    std::cout << "shared-saturation-reclaim: OK -- second automatic prefix reclaimed the first\n";
+    return 0;
+}
+
 int exercise_anthropic_prefix_regression(const char* artifact) {
     ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
     if (!engine.options().context_cache.max_shared_prefixes ||
@@ -2487,6 +2567,8 @@ int main() {
         result = exercise_materialization_source_pressure_protection(artifact);
     } else if (scenario == "shared-replacement") {
         result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
+    } else if (scenario == "shared-saturation-reclaim") {
+        result = exercise_shared_saturation_reclaim(artifact);
     } else if (scenario == "private-long-anchor") {
         result = exercise_private_long_anchor_capture_and_replacement(artifact);
     } else if (scenario == "engine-automatic-long-anchor") {
