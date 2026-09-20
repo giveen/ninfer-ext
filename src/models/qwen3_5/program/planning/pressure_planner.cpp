@@ -32,7 +32,8 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,
     std::span<const SharedPrefixHandle* const> shared_owners,
-    std::span<const runtime::PlanningOwnerId> shared_owner_ids)
+    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+    std::span<const runtime::PlanningOwnerId> protected_owner_ids)
     : program(&owner), resource_revision(owner.resource_revision()) {
     if (physical_candidates.empty() ||
         physical_candidates.size() != admission_candidate_ids.size() ||
@@ -73,6 +74,21 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     for (std::size_t index = 1; index < owners.size(); ++index) {
         if (owners[index - 1].id == owners[index].id) {
             throw std::logic_error("pressure planning owner ID is duplicated");
+        }
+    }
+    protected_owner_mask_.assign(owners.size(), false);
+    protected_recency_rank_.assign(owners.size(), -1);
+    // `protected_owner_ids` is ordered most-recent-first by the caller
+    // (select_preserved_recent_prefixes), so its index is the recency rank used to order the
+    // escape-hatch sacrifice (the oldest preserved owner has the highest rank).
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        const auto found = std::find(protected_owner_ids.begin(), protected_owner_ids.end(),
+                                     owners[index].id);
+        if (found != protected_owner_ids.end()) {
+            protected_owner_mask_[index] = true;
+            protected_recency_rank_[index] =
+                static_cast<std::int32_t>(found - protected_owner_ids.begin());
+            ++protected_owner_count_;
         }
     }
 
@@ -400,18 +416,40 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
                 throw std::logic_error("shared pressure owner has no maximal outcome");
             }
             decisions.push_back(std::move(eviction));
+            victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
         } else {
-            PressureDecision eviction = program->inspect_eviction_option(
-                program->continuation_states[PlanningContractAccess::index(*owner.private_handle)]);
+            const SequenceState& sequence =
+                program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+            PressureDecision eviction = program->inspect_eviction_option(sequence);
             if (!eviction.evicts_continuation || eviction.shared_owner) {
                 throw std::logic_error("private pressure owner has no maximal outcome");
             }
             decisions.push_back(std::move(eviction));
+            victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
+            // A protected prefix survives the escape hatch on host: free its device KV through a
+            // demote-to-host outcome instead of dropping it entirely. The assessor settles actual
+            // host fit jointly across every victim, and if it cannot be satisfied the escape hatch
+            // falls back to full eviction. Only store the preserve outcome when it genuinely
+            // frees a device resource; otherwise leave it at zero so this owner is evicted.
+            if (owner_protected(victim.owner_index)) {
+                detail::PhysicalResources preserve_deficit;
+                preserve_deficit.device.state_slots       = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.main_kv_pages     = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.backend_kv_pages  = std::numeric_limits<std::uint32_t>::max();
+                if (auto preserve = program->inspect_pressure_option(
+                        sequence, preserve_deficit, protection ? &*protection : nullptr);
+                    preserve && !preserve->evicts_continuation &&
+                    (preserve->effect.removed.device.state_slots != 0 ||
+                     preserve->effect.removed.device.main_kv_pages != 0 ||
+                     preserve->effect.removed.device.backend_kv_pages != 0)) {
+                    decisions.push_back(std::move(*preserve));
+                    victim.preserve_choice = static_cast<std::uint16_t>(decisions.size());
+                }
+            }
         }
         if (decisions.size() > std::numeric_limits<std::uint16_t>::max()) {
             throw std::overflow_error("pressure owner target count is not representable");
         }
-        victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
     }
     options.populated = true;
 }
@@ -444,7 +482,10 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     }
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
-    if (std::ranges::find(successors, eviction) == successors.end()) {
+    // Eviction stays registered (invariants and the maximal-target escape hatch need it) but is
+    // unreachable from incremental enumeration for protected owners.
+    if (!owner_protected(victim_options.owner_index) &&
+        std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
         successors.push_back(eviction);
     }
     return successors;
@@ -479,6 +520,44 @@ PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
         choice_scratch.push_back(victim.eviction_choice);
     }
     const auto index = intern_target(selected, choice_scratch);
+    qwen3_5::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = index;
+    return result;
+}
+
+std::uint32_t PressurePlanningSessionImpl::protected_owner_count() const {
+    return protected_owner_count_;
+}
+
+qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::protected_maximal_target(
+    runtime::PlanningCandidateId id, std::uint32_t sacrifice_oldest) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    // The rung fully evicts the `sacrifice_oldest` oldest preserved owners (highest recency
+    // rank) and every non-preserved owner, and demotes the (P - sacrifice) most-recent
+    // preserved owners to host. `sacrifice_oldest` >= P means demote nothing (== clear all),
+    // which the caller instead routes through `root_maximal_target`.
+    const std::uint32_t preserved_count = protected_owner_count_;
+    const std::uint32_t demote_count     = sacrifice_oldest < preserved_count
+                                               ? preserved_count - sacrifice_oldest
+                                               : 0;
+    choice_scratch.clear();
+    for (const auto& victim : candidate_options[selected].victims) {
+        const std::int32_t rank = protected_recency_rank_[victim.owner_index];
+        // A preserved owner keeps its host copy (demote) only while it is among the
+        // `demote_count` most-recent; once sacrificed (older), or if it has no preserve
+        // outcome, it is fully evicted like every non-preserved owner.
+        const bool demote =
+            rank >= 0 && static_cast<std::uint32_t>(rank) < demote_count &&
+            victim.preserve_choice != 0;
+        choice_scratch.push_back(demote ? victim.preserve_choice : victim.eviction_choice);
+    }
+    // This is a rung of the root escape-hatch fallback, so it carries the same "maximal
+    // fallback" diagnostic marking as `root_maximal_target`.
+    const auto index = intern_target(selected, choice_scratch, true);
     qwen3_5::PressureTargetHandle result;
     result.session_    = this;
     result.generation_ = generation;

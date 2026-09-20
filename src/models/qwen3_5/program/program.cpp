@@ -134,6 +134,17 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+PressureTargetHandle PressurePlanningSession::protected_maximal_target(
+    runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->protected_maximal_target(candidate, sacrifice_oldest);
+}
+
+std::uint32_t PressurePlanningSession::protected_owner_count() const {
+    if (impl_ == nullptr) { return 0; }
+    return impl_->protected_owner_count();
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);
@@ -292,7 +303,8 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
                                  std::span<const ContinuationHandle* const> private_owners,
                                  std::span<const runtime::PlanningOwnerId> private_owner_ids,
                                  std::span<const SharedPrefixHandle* const> shared_owners,
-                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+                                 std::span<const runtime::PlanningOwnerId> protected_owner_ids) {
     using SessionImpl = detail::PressurePlanningSessionImpl;
     std::vector<SessionImpl::PhysicalCandidateBinding> physical_candidates;
     physical_candidates.reserve(candidates.size());
@@ -307,7 +319,7 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
     }
     return PressurePlanningSession(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, protected_owner_ids));
 }
 
 runtime::PrefillWork
@@ -374,7 +386,8 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const CaptureAssessment& assessment, std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,
     std::span<const SharedPrefixHandle* const> shared_owners,
-    std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+    std::span<const runtime::PlanningOwnerId> protected_owner_ids) {
     CapturePressureCandidate candidate(impl_->make_capture_physical_candidate(assessment));
     using SessionImpl = detail::PressurePlanningSessionImpl;
     const std::array physical_candidates{SessionImpl::PhysicalCandidateBinding{
@@ -384,7 +397,7 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const std::array candidate_ids{CapturePressurePlanningSession::candidate_id()};
     PressurePlanningSession session(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, protected_owner_ids));
     return CapturePressurePlanningSession(std::move(candidate), std::move(session));
 }
 

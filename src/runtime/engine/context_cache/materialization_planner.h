@@ -39,6 +39,30 @@ struct MaterializationOwnerPolicy {
     bool explicit_shared_credit            = false;
 };
 
+// The `count` most recently hit private conversation prefixes (by `last_hit_epoch`, ties broken
+// by catalog order) are eviction-immune until capacity leaves nothing else to evict.
+template <class Policy>
+[[nodiscard]] inline std::vector<PlanningOwnerId> select_preserved_recent_prefixes(
+    std::span<const Policy> policies, std::span<const PlanningOwnerId> private_owner_ids,
+    std::uint32_t count) {
+    std::vector<PlanningOwnerId> preserved;
+    if (count == 0 || private_owner_ids.empty()) { return preserved; }
+    std::vector<std::pair<std::uint64_t, PlanningOwnerId>> ranked;
+    ranked.reserve(private_owner_ids.size());
+    for (const auto& policy : policies) {
+        const bool is_private =
+            std::find(private_owner_ids.begin(), private_owner_ids.end(), policy.owner) !=
+            private_owner_ids.end();
+        if (is_private) { ranked.push_back({policy.last_hit_epoch, policy.owner}); }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const auto& left, const auto& right) { return left.first > right.first; });
+    const std::size_t take = std::min<std::size_t>(count, ranked.size());
+    preserved.reserve(take);
+    for (std::size_t index = 0; index < take; ++index) { preserved.push_back(ranked[index].second); }
+    return preserved;
+}
+
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
 public:
@@ -70,6 +94,7 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const MaterializationOwnerPolicy> owner_policy;
         std::span<const MaterializationCheckpointPolicy> checkpoint_policy;
+        std::span<const PlanningOwnerId> protected_owner_ids;
     };
 
     struct Result {
@@ -221,7 +246,7 @@ public:
         }
         auto session = program.begin_pressure_planning(
             candidate_handles, candidate_ids, pressure.private_owners, pressure.private_owner_ids,
-            pressure.shared_owners, pressure.shared_owner_ids);
+            pressure.shared_owners, pressure.shared_owner_ids, pressure.protected_owner_ids);
         const auto candidate_index_for = [&](PlanningCandidateId id) -> std::uint32_t {
             const auto found = std::ranges::find_if(
                 candidates, [&](const CandidateInput& input) { return input.id == id; });
@@ -237,13 +262,45 @@ public:
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
-            const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
+            // Escape hatch: find the smallest count of oldest preserved prefixes that must be
+            // evicted for the rung to fit; the (P-k) newer preserved prefixes are demoted to
+            // host and every non-preserved owner is evicted. Every rung frees the same device KV
+            // (all preserved prefixes leave the device whether demoted or evicted); evicting one
+            // more oldest prefix only frees additional host, so feasibility is monotonic
+            // non-decreasing in the evict-count. Binary-search the smallest feasible count in
+            // O(log P) projections; if even the top rung (evict all preserved) cannot fit, the
+            // terminal clear-all target (evict everything) is the guaranteed liveness backstop.
+            const std::uint32_t preserved = session.protected_owner_count();
+            std::uint32_t lo = 0, hi = preserved;   // smallest feasible count in [lo, hi)
+            while (lo < hi) {
+                const std::uint32_t mid = lo + (hi - lo) / 2U;
+                const std::optional<AssessedPressureTarget> probe =
+                    session.assess(
+                        session.protected_maximal_target(candidates[root_candidate_index].id, mid));
+                const PressureTargetAssessment& status = probe->assessment();
+                if (status.candidate != candidates[root_candidate_index].id) {
+                    throw std::logic_error("maximal pressure target changed admission candidate");
+                }
+                if (status.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1U;
+                }
+            }
+            PressureTargetHandle escape;
+            std::optional<AssessedPressureTarget> assessed;
+            if (lo < preserved) {
+                // Smallest evict-count that fits; the newer preserved prefixes stay on host.
+                escape   = session.protected_maximal_target(candidates[root_candidate_index].id, lo);
+                assessed = session.assess(escape);
+            } else {
+                escape   = session.root_maximal_target(candidates[root_candidate_index].id);
+                assessed = session.assess(escape);
+            }
+            if (assessed->assessment().candidate != candidates[root_candidate_index].id) {
                 throw std::logic_error("maximal pressure target changed admission candidate");
             }
+            const PressureTargetAssessment& assessment = assessed->assessment();
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
@@ -255,8 +312,8 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
+            incumbent = make_incumbent(escape, root_candidate_index, assessment,
+                                       std::move(*assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 

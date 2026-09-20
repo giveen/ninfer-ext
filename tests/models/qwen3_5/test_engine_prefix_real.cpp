@@ -233,6 +233,32 @@ ninfer::EngineOptions private_checkpoint_pressure_engine_options(const char* art
     return options;
 }
 
+// Small device KV capacity so a handful of retained private prefixes overflow the cache and
+// force pressure eviction. No host fallback: retained prefixes must be evicted, not spilled.
+ninfer::EngineOptions preserved_recent_prefixes_engine_options(const char* artifact,
+                                                               std::uint32_t preserved) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 4096;
+    // KV-capacity pressure (not the conversation cap) is what the preserved-recent protection
+    // governs. A safe, known-valid capacity (4096 page groups) that the five long retained
+    // prefixes overflow, so eviction is driven by KV capacity through the value-based planner.
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.kv_cache                         = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.prefill_chunk                    = 256;
+    options.speculative.backend              = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                   = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 4;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 8;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.preserved_recent_prefixes         = preserved;
+    return options;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int width = 64, int height = 64) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -2307,6 +2333,130 @@ int exercise_artifact(const char* artifact) {
     return 0;
 }
 
+struct PreservedPhaseOutcome {
+    bool        constructed       = false;
+    std::uint32_t main_reused_mid  = 0;
+    std::uint32_t main_reused      = 0;
+    std::uint32_t main_path        = 0;
+    std::uint64_t evicted_delta    = 0;
+    std::uint64_t degraded_delta   = 0;
+    std::uint64_t checkpoints_drop = 0;
+    std::uint32_t device_occupied  = 0;
+};
+
+// Fills the device cache with several retained private prefixes, makes the shortest one the most
+// recently hit (highest last_hit_epoch), applies further pressure, then re-sends it. The most
+// recent prefix is the protected one under --preserved-recent-prefixes. Diagnostics go to stderr
+// (unbuffered) so they survive capture even when the assertions below fail.
+PreservedPhaseOutcome run_preserved_phase(const char* artifact, std::uint32_t preserved,
+                                          const char* label) {
+    PreservedPhaseOutcome outcome;
+    ninfer::Engine engine(preserved_recent_prefixes_engine_options(artifact, preserved));
+
+    // Four long old conversations plus a short MAIN: their combined KV is ~2.4x the 4096 capacity,
+    // so the cache runs out of room to merely degrade and must fully evict owners through the
+    // value-based (and preserved-recent-protected) pressure path.
+    const auto old_a = exact_repeated_prompt_text(engine, 1500, "alpha");
+    const auto old_b = exact_repeated_prompt_text(engine, 1500, "bravo");
+    const auto old_c = exact_repeated_prompt_text(engine, 1500, "charlie");
+    const auto old_d = exact_repeated_prompt_text(engine, 1500, "delta");
+    const auto main  = exact_repeated_prompt_text(engine, 128, "omega");
+    if (!old_a || !old_b || !old_c || !old_d || !main) {
+        std::cerr << label << ": could not construct exact prompt geometry\n";
+        return outcome;
+    }
+    outcome.constructed = true;
+
+    const auto gen = [&](std::string text, std::string session,
+                         ninfer::CacheRetentionHint retention, std::uint32_t outputs) {
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = outputs;
+        request.execution.sampling.temperature    = 0.0F;
+        request.execution.allow_prefix_reuse      = true;
+        request.stop.include_model_defaults       = false;
+        return engine.generate(
+            engine.prepare(pressure_turn(std::move(text), std::move(session), retention)),
+            request);
+    };
+    const auto query_main = [&]() -> std::pair<std::uint32_t, std::uint32_t> {
+        const auto result = gen(*main, "main", ninfer::CacheRetentionHint::LiveSession, 1);
+        return {result.reused_prompt_tokens,
+                static_cast<std::uint32_t>(result.prefix_reuse_path)};
+    };
+
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    // Fill the cap (max_private_continuations) with two long old conversations and the short MAIN.
+    (void)gen(*old_a, "old-1", ninfer::CacheRetentionHint::LiveSession, 1);
+    (void)gen(*old_b, "old-2", ninfer::CacheRetentionHint::LiveSession, 1);
+    (void)gen(*main, "main", ninfer::CacheRetentionHint::LiveSession, 1);
+    {
+        // Re-hit MAIN so it carries the highest last_hit_epoch (the "most recent conversation");
+        // also confirm MAIN is actually retained/reusable before the pressure arrives.
+        const auto mid    = query_main();
+        outcome.main_reused_mid = mid.first;
+        outcome.main_path       = mid.second;
+    }
+    // The final two long conversations overflow the cap and force evictions for which MAIN is a
+    // candidate victim (it is the shortest prefix, hence the lowest reuse value); the
+    // preserved-recent feature protects it under N>=1.
+    (void)gen(*old_c, "old-3", ninfer::CacheRetentionHint::LiveSession, 1);
+    (void)gen(*old_d, "old-4", ninfer::CacheRetentionHint::LiveSession, 1);
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    outcome.evicted_delta    =
+        after.pressure_private_owners_evicted - before.pressure_private_owners_evicted;
+    outcome.degraded_delta   =
+        after.pressure_private_owners_degraded - before.pressure_private_owners_degraded;
+    outcome.checkpoints_drop =
+        after.pressure_checkpoints_dropped - before.pressure_checkpoints_dropped;
+    outcome.device_occupied = after.device_state_occupied_slots;
+
+    const auto final_main = query_main();
+    outcome.main_reused = final_main.first;
+    std::cerr << label << ": mid_reused=" << outcome.main_reused_mid << " final_reused="
+              << outcome.main_reused << " path=" << outcome.main_path
+              << " evicted_delta=" << outcome.evicted_delta
+              << " degraded_delta=" << outcome.degraded_delta
+              << " checkpoints_drop=" << outcome.checkpoints_drop
+              << " device_occupied=" << outcome.device_occupied << std::flush;
+    return outcome;
+}
+
+int exercise_preserved_recent_prefixes(const char* artifact) {
+    std::cout << "preserved-recent-prefixes: treatment (N=1) then control (N=0)\n";
+    const PreservedPhaseOutcome treatment =
+        run_preserved_phase(artifact, 1U, "treatment(N=1)");
+    const PreservedPhaseOutcome control = run_preserved_phase(artifact, 0U, "control(N=0)");
+    if (!treatment.constructed || !control.constructed) {
+        std::cerr << "preserved-recent-prefixes: fixture could not be constructed\n";
+        return 1;
+    }
+
+    // Feature guarantee (deterministic for N>=1): the most recent private prefix is protected, the
+    // protected set fits the cache, so it is never the eviction victim; at least one other
+    // prefix is evicted by the same pressure.
+    if (treatment.main_reused == 0) {
+        std::cerr << "preserved-recent-prefixes: protected most-recent prefix was NOT retained "
+                     "under pressure (main_reused="
+                  << treatment.main_reused << ")\n";
+        return 1;
+    }
+    if (treatment.evicted_delta < 1) {
+        std::cerr << "preserved-recent-prefixes: pressure evicted no prefix (fixture did not "
+                     "overflow; evicted_delta="
+                  << treatment.evicted_delta << ")\n";
+        return 1;
+    }
+
+    std::cout << "preserved-recent-prefixes: OK -- treatment retained the most recent prefix "
+              << "(reused=" << treatment.main_reused << " of 128 tokens) while evicting "
+              << treatment.evicted_delta << " other prefix(es). Control (N=0) most-recent "
+              << "reused=" << control.main_reused << (control.main_reused == 0
+                                                         ? " (evicted without the flag)"
+                                                         : " (value model retained it)")
+              << '\n';
+    return 0;
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -2331,6 +2481,8 @@ int main() {
         result = exercise_pressure_partial_spill_and_resume(artifact);
     } else if (scenario == "private-checkpoint-pressure") {
         result = exercise_private_checkpoint_pressure_retention(artifact);
+    } else if (scenario == "preserved-recent-prefixes") {
+        result = exercise_preserved_recent_prefixes(artifact);
     } else if (scenario == "source-pressure-protection") {
         result = exercise_materialization_source_pressure_protection(artifact);
     } else if (scenario == "shared-replacement") {
