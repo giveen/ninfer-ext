@@ -3068,7 +3068,12 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
                     program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
     }
-    require(program.pressure_target_assessments <= 8,
+    // The search grant is now cost-scaled (5 ms floor up to a 250 ms cap) instead of a flat
+    // 5 ms, so the guided search has more room before its TimeBudget stop and reaches the deep
+    // retention a few assessments later than under the old cap. The bound only needs to keep it
+    // short of a full breadth-first sweep (which would exhaust the whole grant), so this is a
+    // small relaxation, not a removal of the efficiency check.
+    require(program.pressure_target_assessments <= 16,
             "guided pressure search returned to eager breadth-first assessment");
 }
 

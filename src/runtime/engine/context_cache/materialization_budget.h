@@ -50,8 +50,7 @@ public:
     MaterializationSearchBudget(PlanningAllowance allowance, std::uint64_t started,
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
-          granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+          granted_(std::min(base_grant(initial_cost), allowance.remaining(started))) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,
@@ -112,9 +111,23 @@ public:
     }
 
 private:
+    // Base search grant in ns. Scales with the incumbent's value at stake (its total machine-work
+    // cost) instead of a fixed 5 ms, so an expensive incumbent -- where a better eviction plan
+    // saves a lot -- earns a longer search, while a cheap one still gets the 5 ms floor. A
+    // saturated (UINT64_MAX) cost is not evidence of large value, so it earns no base grant.
+    static constexpr std::uint64_t kMinSearchGrantNs  = 5'000'000;   // 5 ms floor
+    static constexpr std::uint64_t kMaxSearchGrantNs  = 250'000'000; // 250 ms cap
+    static constexpr std::uint64_t kSearchCostDivisor = 20;
+
+    [[nodiscard]] static std::uint64_t base_grant(std::uint64_t incumbent_cost) noexcept {
+        if (incumbent_cost == std::numeric_limits<std::uint64_t>::max()) { return 0; }
+        const std::uint64_t scaled = incumbent_cost / kSearchCostDivisor;
+        return std::min(kMaxSearchGrantNs, std::max(kMinSearchGrantNs, scaled));
+    }
+
     [[nodiscard]] std::uint64_t economic(std::uint64_t gain) const noexcept {
         if (gain == std::numeric_limits<std::uint64_t>::max()) { return 0; }
-        return gain / 20U / std::max(1U, allowance_.affected_requests);
+        return gain / kSearchCostDivisor / std::max(1U, allowance_.affected_requests);
     }
 
     bool boundary_limited_ = false;
