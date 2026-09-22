@@ -22,6 +22,7 @@
 #include "models/qwen3_5/program/vision_prefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <array>
 #include <limits>
@@ -501,6 +502,8 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
@@ -725,6 +728,12 @@ private:
 
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
+
+    // Serializes the materialization seal window (final assess -> seal) so a concurrent
+    // demote cannot steal the incumbent's allocation and bump a victim's slot generation
+    // between assess and seal. Claimed by the planner, released after seal (success or
+    // failure) or on the planner's early exit.
+    std::atomic<bool> seal_window_claimed_ = false;
 
     enum class PressureTransitionPhase : std::uint8_t {
         HostReleases,

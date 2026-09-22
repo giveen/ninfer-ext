@@ -592,6 +592,11 @@ public:
                                                    runtime::FinalScheduleIntent intent);
     [[nodiscard]] std::optional<CapturePressurePlan>
     seal_capture(AssessedPressureTarget&& assessed);
+    // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+    // between this session's final assess and seal. Returns false if another session already
+    // claims it; the caller must back off. release_seal_window is idempotent.
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     explicit PressurePlanningSession(

@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -693,6 +694,33 @@ public:
             ++search_work;
         }
 
+        // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+        // between the final assess and the seal (which would fail the seal's revalidate and
+        // force a re-prefill). Back off briefly on contention; if we cannot claim within the
+        // budget, fall through to the re-prefill fallback below (the concurrent materialization
+        // makes the room, and our next admission restores the checkpoint).
+        struct SealWindowClaim {
+            bool             claimed = false;
+            decltype(session)& s;
+            explicit SealWindowClaim(decltype(session)& ref) noexcept : s(ref) {
+                for (std::uint32_t attempt = 0; attempt < 32U; ++attempt) {
+                    if (ref.try_claim_seal_window()) { claimed = true; break; }
+                    std::this_thread::sleep_for(std::chrono::microseconds(125));
+                }
+            }
+            // Release as soon as the seal (and its fallback) is done, before the result is
+            // constructed. Holding it through the result bookkeeping would starve concurrent
+            // materializations that are waiting to seal.
+            void release() noexcept {
+                if (claimed) {
+                    s.release_seal_window();
+                    claimed = false;
+                }
+            }
+            ~SealWindowClaim() { release(); }
+        };
+        SealWindowClaim seal_claim(session);
+
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
@@ -713,10 +741,33 @@ public:
         };
         std::vector<std::uint32_t> shared_frontiers =
             final_schedule(selected.id, selected.candidate->summary(), price_split);
-        std::optional<ResourcePlan> sealed =
-            session.seal(std::move(*incumbent.assessed), prompt,
-                         FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        std::optional<ResourcePlan> sealed;
+        if (seal_claim.claimed) {
+            sealed = session.seal(std::move(*incumbent.assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+        }
+        if (!sealed) {
+            // The selected preserving target lost its allocation to a concurrent demote
+            // between assess and seal (or the seal window was never claimed). Fall back to the
+            // root-maximal eviction target, which needs no host and is always sealable, so the
+            // re-touch re-prefills instead of failing admission.
+            const PressureTargetHandle root =
+                session.root_maximal_target(candidates[incumbent.candidate_index].id);
+            AssessedPressureTarget root_assessed = session.assess(root);
+            if (root_assessed.assessment().physical_status !=
+                MaterializationPhysicalStatus::Feasible) {
+                throw std::logic_error("eviction fallback target lost feasibility");
+            }
+            sealed = session.seal(std::move(root_assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+            if (!sealed) {
+                throw std::logic_error("eviction fallback target could not be sealed");
+            }
+            incumbent.root_maximal = true;
+        }
+        // The seal (and any fallback) is committed; release the claim so a concurrent
+        // materialization can seal immediately, before this one builds its result.
+        seal_claim.release();
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
