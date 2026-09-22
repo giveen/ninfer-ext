@@ -659,6 +659,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_,
                         program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                    .unreachable = false,
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -730,6 +731,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = false,
                 });
             }
 
@@ -1844,12 +1846,18 @@ private:
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
+            // A checkpoint whose frontier this request cannot reach is not a hit it can take, so
+            // the portfolio must not price it as one when it weighs what retention is worth.
+            const std::optional<PrefixShortlistKey> incoming =
+                base.prefix_shortlist_key(checkpoint.shortlist_key.frontier);
+            const bool unreachable = !incoming || *incoming != checkpoint.shortlist_key;
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
                 .owner       = owner,
                 .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
                 .rebuild_ns  = rebuild,
                 .baseline_recovery_ns = recovery,
                 .target_recovery_ns   = recovery,
+                .unreachable          = unreachable,
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -2029,6 +2037,9 @@ private:
                         throw std::logic_error("catalogued checkpoint has no policy observation");
                     }
                     selected_hits = std::max(selected_hits, observation->selected_hit_count);
+                    const std::optional<PrefixShortlistKey> incoming =
+                        base.prefix_shortlist_key(checkpoint.shortlist_key.frontier);
+                    const bool unreachable = !incoming || *incoming != checkpoint.shortlist_key;
                     checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                         .owner              = owner,
                         .checkpoint         = checkpoint.ref,
@@ -2041,6 +2052,7 @@ private:
                         .baseline_recovery_ns = price_checkpoint_recovery_work(
                             cost_model_,
                             program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                        .unreachable          = unreachable,
                     });
                 };
                 if (entry.summary.endpoint) { append_checkpoint(*entry.summary.endpoint); }
@@ -2087,6 +2099,10 @@ private:
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
+                const std::optional<PrefixShortlistKey> incoming =
+                    base.prefix_shortlist_key(entry.summary.checkpoint.shortlist_key.frontier);
+                const bool unreachable =
+                    !incoming || *incoming != entry.summary.checkpoint.shortlist_key;
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner              = owner,
                     .checkpoint         = entry.summary.checkpoint.ref,
@@ -2099,6 +2115,7 @@ private:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = unreachable,
                 });
             }
 

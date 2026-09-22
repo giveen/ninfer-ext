@@ -24,6 +24,9 @@ struct ContextPortfolioCheckpointValue {
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
     std::uint64_t target_recovery_ns   = 0;
+    // The incoming request cannot reach this checkpoint's frontier, so it is not a hit the owner
+    // can be credited with retaining.
+    bool unreachable = false;
 };
 
 struct ContextPortfolioValueResult {
@@ -59,6 +62,7 @@ public:
         }
 
         for (const ContextPortfolioCheckpointValue& checkpoint : checkpoints) {
+            if (checkpoint.unreachable) { continue; }
             const auto owner = std::ranges::find_if(owner_scratch_, [&](const OwnerValue& item) {
                 return item.owner == checkpoint.owner;
             });

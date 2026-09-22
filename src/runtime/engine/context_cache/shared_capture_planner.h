@@ -44,6 +44,9 @@ public:
         std::uint32_t demand_mask          = 0;
         std::uint64_t rebuild_ns           = 0;
         std::uint64_t baseline_recovery_ns = 0;
+        // The incoming request cannot reach this checkpoint's frontier, so it is not a hit the
+        // owner can be credited with retaining.
+        bool unreachable = false;
     };
 
     struct Input {
@@ -342,6 +345,7 @@ private:
                 .rebuild_ns           = policy.rebuild_ns,
                 .baseline_recovery_ns = policy.baseline_recovery_ns,
                 .target_recovery_ns   = target_recovery,
+                .unreachable          = policy.unreachable,
             });
         }
         checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
