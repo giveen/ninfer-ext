@@ -425,16 +425,21 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
             }
             decisions.push_back(std::move(eviction));
             victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
-            // A protected prefix survives the escape hatch on host: free its device KV through a
-            // demote-to-host outcome instead of dropping it entirely. The assessor settles actual
-            // host fit jointly across every victim, and if it cannot be satisfied the escape hatch
-            // falls back to full eviction. Only store the preserve outcome when it genuinely
-            // frees a device resource; otherwise leave it at zero so this owner is evicted.
-            if (owner_protected(victim.owner_index)) {
+            // A prefix survives pressure on host whenever the Host tier can take it: free its
+            // device KV through a demote-to-host outcome instead of dropping it entirely. The
+            // assessor settles actual host fit jointly across every victim, and if it cannot be
+            // satisfied the outcome falls back to full eviction. Only store the preserve outcome
+            // when it genuinely frees a device resource; otherwise leave it at zero so this owner
+            // is evicted.
+            //
+            // This is offered for every private owner. Whether an owner can be spared is a
+            // Host-capacity question, so gating it on the preserved set made a saturated Device
+            // tier destroy host-reusable content that Host still had room for.
+            {
                 detail::PhysicalResources preserve_deficit;
-                preserve_deficit.device.state_slots       = std::numeric_limits<std::uint32_t>::max();
-                preserve_deficit.device.main_kv_pages     = std::numeric_limits<std::uint32_t>::max();
-                preserve_deficit.device.backend_kv_pages  = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.state_slots      = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.main_kv_pages    = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.backend_kv_pages = std::numeric_limits<std::uint32_t>::max();
                 if (auto preserve = program->inspect_pressure_option(
                         sequence, preserve_deficit, protection ? &*protection : nullptr);
                     preserve && !preserve->evicts_continuation &&
@@ -482,8 +487,10 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
     // Eviction stays registered (invariants and the maximal-target escape hatch need it) but is
-    // unreachable from incremental enumeration for protected owners.
-    if (!owner_protected(victim_options.owner_index) &&
+    // unreachable from incremental enumeration for protected owners, and for any owner the Host
+    // tier can take: a demote frees the same device KV and leaves the prefix matchable, so
+    // destroying it would trade a restore for a full re-prefill.
+    if (!owner_protected(victim_options.owner_index) && victim_options.preserve_choice == 0 &&
         std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
         successors.push_back(eviction);
     }
