@@ -108,8 +108,12 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
            report.current.device_main_kv_occupied_pages !=
                report.previous.device_main_kv_occupied_pages ||
+           report.current.device_main_kv_lease_pages !=
+               report.previous.device_main_kv_lease_pages ||
            report.current.device_backend_kv_occupied_pages !=
                report.previous.device_backend_kv_occupied_pages ||
+           report.current.device_backend_kv_lease_pages !=
+               report.previous.device_backend_kv_lease_pages ||
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
            report.current.shared_active_references != report.previous.shared_active_references ||
            report.current.host_work.engine_boundary_ns !=

@@ -579,6 +579,11 @@ int main() {
     throughput.current.state_h2d_seconds                = 0.25;
     throughput.current.device_state_occupied_slots      = 3;
     throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.device_main_kv_occupied_pages    = 9;
+    throughput.current.device_main_kv_lease_pages       = 4;
+    throughput.current.device_backend_kv_occupied_pages = 5;
+    throughput.current.device_backend_kv_lease_pages    = 2;
+    throughput.current.active_captures_skipped          = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
@@ -680,6 +685,21 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
+
+    // An active request holding 9 Main page-groups of which 4 are still unmaterialized leaves the
+    // context cache only 5. Occupancy alone cannot show that, so the growth lease must be a
+    // separate published quantity.
+    failures +=
+        check(throughput_json.at("context_cache").at("occupancy").at("device_main_kv_pages") == 9 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_main_kv_lease_pages") == 4 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_backend_kv_pages") == 5 &&
+                  throughput_json.at("context_cache").at("occupancy")
+                          .at("device_backend_kv_lease_pages") == 2,
+              "Device KV growth lease is not reported separately from occupied pages");
+    failures += check(throughput_json.at("context_cache").at("captures").at("skipped") == 1,
+                      "feasibility-skipped captures must be counted and published");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /

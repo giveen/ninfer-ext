@@ -1183,6 +1183,8 @@ public:
         out.host_state_occupied_slots        = usage.host_state_slots;
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
+        out.device_main_kv_lease_pages       = usage.device_main_kv_lease_pages;
+        out.device_backend_kv_lease_pages    = usage.device_backend_kv_lease_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {

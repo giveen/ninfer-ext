@@ -1356,7 +1356,10 @@ private:
         const auto reserved = resources_.reserve_active_capture(
             *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
             CancellationFlagView{&request->cancelled});
-        if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
+        if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) {
+            ++cumulative_stats_.active_captures_skipped;
+            return;
+        }
         request->capture_pending    = true;
         request->post_capture_state = post_capture_state;
         (void)progress_context_transaction(false);

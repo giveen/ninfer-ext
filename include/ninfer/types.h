@@ -917,6 +917,9 @@ struct RuntimeStats {
     std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
+    // A capture the Program declined because the offer was not physically feasible. Unlike an
+    // abort this is a silent retention loss, so it needs its own counter to be observable.
+    std::uint64_t active_captures_skipped   = 0;
 
     std::uint64_t root_selections                    = 0;
     std::uint64_t private_endpoint_selections        = 0;
@@ -967,6 +970,11 @@ struct RuntimeStats {
     std::uint32_t host_state_occupied_slots            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
+    // Un-written growth reservation held by active requests, split out of the occupied totals
+    // above. Occupancy alone cannot distinguish KV that exists from KV a request is merely still
+    // entitled to, which is what made context-cache starvation invisible in the request log.
+    std::uint32_t device_main_kv_lease_pages           = 0;
+    std::uint32_t device_backend_kv_lease_pages        = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
