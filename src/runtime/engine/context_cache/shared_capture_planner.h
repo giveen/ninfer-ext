@@ -162,9 +162,16 @@ public:
             if (!assessment.expandable || target_marked(queued.ordinal, kTargetExpanded)) {
                 continue;
             }
-            auto prepared                 = session.prepare_expansion(queued.target);
             const std::uint32_t remaining = input.target_budget - canonical_targets;
-            if (prepared.new_canonical_count() > remaining) {
+            if (remaining == 0) { continue; }
+            // The session arena also holds targets this scenario does not budget (identity
+            // target, maximal fallback), so bound the commit by the arena's true remaining
+            // capacity; commit_expansion rejects a commit that overflows it.
+            const std::uint32_t commit_capacity =
+                std::min(remaining, session.optional_targets_remaining());
+            if (commit_capacity == 0) { continue; }
+            auto prepared = session.prepare_expansion(queued.target);
+            if (prepared.new_canonical_count() > commit_capacity) {
                 session.discard_expansion(std::move(prepared));
                 continue;
             }

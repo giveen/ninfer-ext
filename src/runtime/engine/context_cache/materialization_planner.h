@@ -261,6 +261,9 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        // Arena targets interned by the escape-hatch ladder (one per rung) that the
+        // optional-target budget must account for; zero when the identity target is feasible.
+        std::uint32_t ladder_targets = 0;
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
@@ -274,6 +277,7 @@ public:
             // O(log P) projections; if even the top rung (evict all preserved) cannot fit, the
             // terminal clear-all target (evict everything) is the guaranteed liveness backstop.
             const std::uint32_t preserved = session.protected_owner_count();
+            const std::uint32_t ladder_remaining_before = session.optional_targets_remaining();
             std::uint32_t lo = 0, hi = preserved;   // smallest feasible count in [lo, hi)
             while (lo < hi) {
                 const std::uint32_t mid = lo + (hi - lo) / 2U;
@@ -305,6 +309,7 @@ public:
             }
             const PressureTargetAssessment& assessment = assessed->assessment();
             ++targets_evaluated;
+            ladder_targets = ladder_remaining_before - session.optional_targets_remaining();
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
@@ -334,7 +339,7 @@ public:
         std::uint64_t search_work       = 0;
         const auto work_limit           = static_cast<std::uint64_t>(kTargetBudget) *
                                 (16U + 16ULL * pressure.owner_policy.size());
-        std::uint32_t optional_targets        = 0;
+        std::uint32_t optional_targets        = ladder_targets;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
@@ -445,8 +450,15 @@ public:
         const auto expand_target = [&](const QueueEntry& parent) {
             if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
             if (optional_targets >= kTargetBudget) { return false; }
+            // The session arena also holds targets this layer does not budget (identity
+            // targets, escape-hatch rungs beyond the counted ladder), so bound the commit by
+            // the arena's true remaining capacity; commit_expansion rejects a commit that
+            // overflows it.
+            const std::uint32_t commit_capacity =
+                std::min(kTargetBudget - optional_targets, session.optional_targets_remaining());
+            if (commit_capacity == 0) { return false; }
             auto prepared = session.prepare_expansion(parent.target, 8);
-            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
+            if (prepared.new_canonical_count() > commit_capacity) {
                 session.discard_expansion(std::move(prepared));
                 return false;
             }

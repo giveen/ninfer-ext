@@ -578,6 +578,11 @@ public:
     protected_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
     // Number of preserved owners; bounds the escape-hatch ladder.
     [[nodiscard]] std::uint32_t protected_owner_count() const;
+    // Canonical target slots this session's arena can still hold. The arena also holds targets
+    // a planning layer does not count in its own budget (identity targets, escape-hatch
+    // maximal rungs), so expansion commits must be bounded by this value; commit_expansion
+    // rejects a commit that overflows the arena.
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -632,6 +637,9 @@ public:
     [[nodiscard]] PressureTargetHandle identity_target() const;
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
+    // Canonical target slots the underlying session's arena can still hold; bound expansion
+    // commits by this value (see PressurePlanningSession::optional_targets_remaining).
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] PreparedPressureExpansion prepare_expansion(PressureTargetHandle parent);
     [[nodiscard]] PressureExpansionView commit_expansion(PreparedPressureExpansion&& prepared);
     void discard_expansion(PreparedPressureExpansion&& prepared) noexcept;

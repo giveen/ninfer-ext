@@ -1344,6 +1344,12 @@ struct PressurePlanningSessionImpl {
                              runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     construction_target(const qwen3_5::PressureConstructionCursor& cursor);
+    // Canonical target slots the arena can still hold. The arena also holds targets a planning
+    // layer does not count in its own budget (identity targets, escape-hatch maximal rungs), so
+    // layers must bound expansion commits by optional_targets_remaining, not by their own
+    // budget, or commit_expansion rejects a commit the layer approved.
+    [[nodiscard]] std::size_t target_arena_maximum() const noexcept;
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] ConstructionSlot&
     construction_slot(const qwen3_5::PressureConstructionCursor& cursor);
     static void release_construction(const void*, std::uint32_t, std::uint32_t) noexcept;

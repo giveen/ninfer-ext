@@ -1759,8 +1759,20 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head, allowance);
-            if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
+            // Inspection is read-only: a throw here (e.g. a planning invariant or an arena
+            // overflow) must fail only this waiting request, not the whole Engine. A single
+            // bad admission must never accumulate worker recoveries into a global fail-all.
+            // The inspection result is move-only, so it is emplaced in place rather than
+            // assigned after a default construction.
+            std::optional<ResourceInspection> head_inspection;
+            try {
+                head_inspection.emplace(inspect_admission(head, allowance));
+            } catch (...) {
+                (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
+            if (head_inspection->readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -1768,14 +1780,14 @@ private:
                 control_progress = true;
                 continue;
             }
-            if (head_inspection.readiness == Readiness::Ready ||
-                head_inspection.readiness == Readiness::NeedsTransfer) {
-                if (!head_inspection.choice) {
+            if (head_inspection->readiness == Readiness::Ready ||
+                head_inspection->readiness == Readiness::NeedsTransfer) {
+                if (!head_inspection->choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
                 AdmissionGrant grant = scheduler_.grant_head(
-                    head->id, head_inspection.choice->summary().service_work_quanta);
-                return admit_planned_request(head, std::move(*head_inspection.choice),
+                    head->id, head_inspection->choice->summary().service_work_quanta);
+                return admit_planned_request(head, std::move(*head_inspection->choice),
                                              std::move(grant));
             }
 
@@ -1833,8 +1845,18 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate, allowance);
-                if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
+                // Same per-request isolation as the FIFO head: a throwing inspection rejects
+                // only this backfill candidate and leaves the rest of the Engine running.
+                // Move-only inspection result, so emplaced in place.
+                std::optional<ResourceInspection> candidate_inspection;
+                try {
+                    candidate_inspection.emplace(inspect_admission(candidate, allowance));
+                } catch (...) {
+                    (void)remove_pending_error(candidate, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                if (candidate_inspection->readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::ContextLengthExceeded,
@@ -1842,22 +1864,23 @@ private:
                     control_progress = true;
                     continue;
                 }
-                if ((candidate_inspection.readiness != Readiness::Ready &&
-                     candidate_inspection.readiness != Readiness::NeedsTransfer) ||
-                    !candidate_inspection.choice) {
+                if ((candidate_inspection->readiness != Readiness::Ready &&
+                     candidate_inspection->readiness != Readiness::NeedsTransfer) ||
+                    !candidate_inspection->choice) {
                     continue;
                 }
                 const auto proof = resources_.prove_persistent_backfill(
-                    *instance_.program, *head->base_plan, *candidate_inspection.choice,
+                    *instance_.program, *head->base_plan, *candidate_inspection->choice,
                     std::span<const SequenceHandle>(persistent_borrowers.data(),
                                                     persistent_borrower_count));
                 if (!proof) { continue; }
-                const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
+                const RequestPlanSummary& candidate_plan =
+                    candidate_inspection->choice->summary();
                 auto grant =
                     scheduler_.qualify_backfill(candidate->id, candidate_plan.service_work_quanta,
                                                 active.span(), proof->resource_revision());
                 if (grant) {
-                    return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
+                    return admit_planned_request(candidate, std::move(*candidate_inspection->choice),
                                                  std::move(*grant));
                 }
             }

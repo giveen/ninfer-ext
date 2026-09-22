@@ -572,6 +572,8 @@ public:
     next_construction_option(Cursor& cursor);
     void choose_construction(Cursor& cursor, ninfer::runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<FakePressureTargetHandle> construction_target(const Cursor& cursor);
+    // Mirrors the real session's arena accounting (same formula as the commit_expansion guard).
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion
@@ -1543,6 +1545,16 @@ FakePressurePlanningSession::construction_target(const Cursor& cursor) {
     }
     return FakePressureTargetHandle{.generation = generation_,
                                     .index = static_cast<std::uint32_t>(found - targets_.begin())};
+}
+
+std::uint32_t FakePressurePlanningSession::optional_targets_remaining() const noexcept {
+    if (program_ == nullptr) { return 0; }
+    const std::size_t maximum = program_->pressure_optional_target_capacity
+                                    ? candidates_.size() + 1U + *program_->pressure_optional_target_capacity
+                                    : candidates_.size() + 1U + 4096U;
+    return targets_.size() >= maximum
+               ? 0U
+               : static_cast<std::uint32_t>(maximum - targets_.size());
 }
 
 ninfer::runtime::PressureTargetGuidance
@@ -2961,6 +2973,125 @@ void test_preserved_prefix_escape_hatch_clears_all_when_nothing_fits() {
     require(evicted(a) && evicted(b) && evicted(c), "terminal clear-all did not evict every owner");
 }
 
+void test_preserved_prefix_ladder_targets_fit_the_committed_target_budget() {
+    // Regression (2026-09-22 production 503 wall): the escape-hatch recency ladder interns one
+    // arena target per rung that the planner's optional-target budget does not count. When the
+    // pressure search then exhausts its target budget, the final expansion commit crossed the
+    // session arena limit and threw std::length_error; the worker treated the consecutive
+    // occurrences as fatal (fail-all) and rejected every subsequent request until restart. The
+    // planner must count ladder rungs in its budget and bound expansion commits by the
+    // session's true remaining capacity, so a budget-exhausting search degrades to an early
+    // stop instead of throwing.
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+
+    constexpr std::size_t arena_capacity = 24;  // small arena: the overflow is reachable quickly
+
+    FakeProgram program;
+    program.ladder_feasibility_mode           = true;
+    program.min_feasible_sacrifice            = 1;  // rung 1 (sacrifice the oldest preserved) fits
+    program.required_pressure_actions         = 5;  // above the search's max pressure -> it fails
+    program.eviction_pressure_action_units    = 1;
+    program.private_pressure_alternatives     = 4;  // wide per-owner target space
+    program.pressure_optional_target_capacity = arena_capacity;
+
+    FakeAdmissionCandidate root;
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 301;
+
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate      = &root,
+                                .id             = PlanningCandidateId{.value = 0},
+                                .stable_ordinal = 0}};
+
+    // Three preserved recent prefixes (most-recent first: handle ids 1, 2, 3) plus one
+    // unprotected owner (handle id 4).
+    std::array<FakeContinuationHandle, 4> handles{};
+    std::array<const FakeContinuationHandle*, 4> private_owners{};
+    std::array<PlanningOwnerId, 4> private_owner_ids{};
+    for (std::size_t index = 0; index < handles.size(); ++index) {
+        handles[index]         = FakeContinuationHandle(static_cast<std::uint32_t>(index + 1U), 0);
+        private_owners[index]  = &handles[index];
+        private_owner_ids[index] = PlanningOwnerId{.value = static_cast<std::uint32_t>(index)};
+    }
+    const std::array<PlanningOwnerId, 3> protected_owner_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 4> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 0}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 1}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 2}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 3}},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 4> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 1},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 2},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 3},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+    };
+
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners      = private_owners,
+            .private_owner_ids   = private_owner_ids,
+            .shared_owners       = {},
+            .shared_owner_ids    = {},
+            .owner_policy        = owner_policy,
+            .checkpoint_policy   = checkpoint_policy,
+            .protected_owner_ids = protected_owner_ids,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+
+    Planner planner;
+    const auto result =
+        planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                     pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->candidate == PlanningCandidateId{.value = 0},
+            "ladder rung did not survive the budget-exhausting search");
+    require(result->diagnostics.budget_exhausted &&
+                result->diagnostics.stop_reason ==
+                        ninfer::MaterializationStopReason::ExpansionCapacity,
+            "budget-exhausting search must stop on the arena capacity instead of running past it");
+    require(program.pressure_target_count_peak <= 1U + 1U + arena_capacity,
+            "search committed more canonical targets than the arena can hold");
+    // The escape-hatch rung evicts the non-preserved owner (handle id 4) to free device KV and
+    // keeps the most-recent preserved prefix (handle id 1) on host; the pressure search must
+    // preserve that disposition when it stops on capacity.
+    const auto evicted = [&result](std::uint32_t handle_id) {
+        return std::any_of(result->plan->private_actions.begin(),
+                           result->plan->private_actions.end(),
+                           [&](const auto& action) { return action.id == 2000U + handle_id; });
+    };
+    require(evicted(4) && !evicted(1),
+            "capacity stop changed the ladder's preserved/non-preserved disposition");
+}
+
 void test_materialization_result_is_validated_before_any_adoption() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -3965,6 +4096,8 @@ int main() {
              test_preserved_prefix_escape_hatch_sacrifices_oldest_first);
     run_test("preserved prefix escape hatch clears all when nothing fits",
              test_preserved_prefix_escape_hatch_clears_all_when_nothing_fits);
+    run_test("preserved prefix ladder fits the committed target budget",
+             test_preserved_prefix_ladder_targets_fit_the_committed_target_budget);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

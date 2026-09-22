@@ -93,8 +93,7 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     }
 
     candidate_options.resize(candidates.size());
-    const std::size_t maximum_targets =
-        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum_targets = target_arena_maximum();
     const std::size_t maximum_successors_per_owner =
         11U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (!owners.empty() &&
@@ -332,7 +331,7 @@ std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_
         existing->root_maximal = existing->root_maximal || root_maximal;
         return static_cast<std::uint32_t>(existing - targets.data());
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = target_arena_maximum();
     if (targets.size() >= maximum || targets.size() == targets.capacity() ||
         choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
         target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -717,7 +716,7 @@ std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::constr
     const qwen3_5::PressureConstructionCursor& cursor) {
     auto& slot = construction_slot(cursor);
     if (!find_target(slot.candidate_index, slot.choices) &&
-        targets.size() >= candidates.size() + 1U + planning_detail::kOptionalTargetCapacity) {
+        targets.size() >= target_arena_maximum()) {
         return std::nullopt;
     }
     const auto index = intern_target(slot.candidate_index, slot.choices);
@@ -726,6 +725,17 @@ std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::constr
     result.generation_ = generation;
     result.index_      = index;
     return result;
+}
+
+std::size_t PressurePlanningSessionImpl::target_arena_maximum() const noexcept {
+    return candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+}
+
+std::uint32_t PressurePlanningSessionImpl::optional_targets_remaining() const noexcept {
+    const std::size_t maximum = target_arena_maximum();
+    return targets.size() >= maximum
+               ? 0U
+               : static_cast<std::uint32_t>(maximum - targets.size());
 }
 
 runtime::PressureTargetGuidance
@@ -1309,7 +1319,7 @@ PressurePlanningSessionImpl::commit_expansion(qwen3_5::PreparedPressureExpansion
         prepared.parent_index_ >= targets.size()) {
         throw std::logic_error("prepared pressure expansion is stale");
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = target_arena_maximum();
     if (prepared_new_count > maximum - std::min(maximum, targets.size())) {
         throw std::length_error("prepared pressure expansion exceeds the target arena");
     }

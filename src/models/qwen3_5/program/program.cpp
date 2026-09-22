@@ -145,6 +145,10 @@ std::uint32_t PressurePlanningSession::protected_owner_count() const {
     return impl_->protected_owner_count();
 }
 
+std::uint32_t PressurePlanningSession::optional_targets_remaining() const noexcept {
+    return impl_ != nullptr ? impl_->optional_targets_remaining() : 0;
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);
@@ -238,6 +242,10 @@ CapturePressurePlanningSession::guidance(PressureTargetHandle target) {
 
 AssessedPressureTarget CapturePressurePlanningSession::assess(PressureTargetHandle target) {
     return session_.assess(target);
+}
+
+std::uint32_t CapturePressurePlanningSession::optional_targets_remaining() const noexcept {
+    return session_.optional_targets_remaining();
 }
 
 PreparedPressureExpansion
