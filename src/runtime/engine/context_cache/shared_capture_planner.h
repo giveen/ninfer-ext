@@ -57,7 +57,7 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const OwnerPolicy> owner_policies;
         std::span<const CheckpointPolicy> checkpoint_policies;
-        // Private owners ranked by recency, most recently hit first.
+        // Private owners ranked by recency (latest hit or publication), most recent first.
         std::span<const PlanningOwnerId> recency_owner_ids;
         std::optional<PlanningOwnerId> direct_shared_victim;
         std::uint32_t candidate_demand_mask         = 0;

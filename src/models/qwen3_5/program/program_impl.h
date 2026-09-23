@@ -1473,9 +1473,9 @@ struct PressurePlanningSessionImpl {
     std::vector<PhysicalCandidateBinding> candidates;
     std::vector<runtime::PlanningCandidateId> candidate_ids;
     std::vector<Owner> owners;
-    // Parallel to `owners`; recency rank among the private owners (0 = most recently hit), or
-    // -1 for a shared owner, which has no recency order. Orders the escape-hatch sacrifice: the
-    // oldest private owner (highest rank) gives up its host copy first.
+    // Parallel to `owners`; recency rank among the private owners (0 = most recently hit or
+    // published), or -1 for a shared owner, which has no recency order. Orders the escape-hatch
+    // sacrifice: the oldest private owner (highest rank) gives up its host copy first.
     std::vector<std::int32_t> private_recency_rank_;
     // Number of ranked private owners; the escape-hatch ladder has this many sacrifice rungs
     // plus the clear-all terminal.

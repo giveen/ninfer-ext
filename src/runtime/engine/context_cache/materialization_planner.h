@@ -42,10 +42,13 @@ struct MaterializationOwnerPolicy {
     bool explicit_shared_credit            = false;
 };
 
-// Every private conversation prefix, most recently hit first (`last_hit_epoch` descending, ties
-// keep catalog order). The order is the retention tier's recency ranking: the escape-hatch
-// ladder sacrifices a suffix of it (oldest first), and incremental eviction is licensed only
-// inside the suffix the ladder had to give up.
+// Every private conversation prefix, most recently used first (`last_hit_epoch` descending, ties
+// keep catalog order). For an owner policy `last_hit_epoch` is the owner's recency epoch: the
+// later of its newest checkpoint hit and its last publication, so a continuation that has just
+// been published ranks as recent even though none of its checkpoints has been hit yet. The order
+// is the retention tier's recency ranking: the escape-hatch ladder sacrifices a suffix of it
+// (oldest first), and incremental eviction is licensed only inside the suffix the ladder had to
+// give up.
 template <class Policy>
 [[nodiscard]] inline std::vector<PlanningOwnerId> rank_private_owners_by_recency(
     std::span<const Policy> policies, std::span<const PlanningOwnerId> private_owner_ids) {
@@ -97,7 +100,7 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const MaterializationOwnerPolicy> owner_policy;
         std::span<const MaterializationCheckpointPolicy> checkpoint_policy;
-        // Private owners ranked by recency, most recently hit first.
+        // Private owners ranked by recency (latest hit or publication), most recent first.
         std::span<const PlanningOwnerId> recency_owner_ids;
     };
 

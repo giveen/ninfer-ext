@@ -1211,6 +1211,9 @@ public:
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
+    // Continuation ids of the private owners in the recency order handed to the most recent
+    // pressure planning session (most recent first).
+    std::vector<std::uint32_t> observed_recency_ids;
     std::uint64_t pressure_target_assessments = 0;
     std::uint64_t start_calls                 = 0;
     std::uint64_t finish_calls                = 0;
@@ -1283,6 +1286,14 @@ FakePressurePlanningSession::FakePressurePlanningSession(
             private_recency_rank_[index] =
                 static_cast<std::int32_t>(found - private_recency_order.begin());
             ++private_owner_count_;
+        }
+    }
+    program.observed_recency_ids.clear();
+    for (const PlanningOwnerId ranked : private_recency_order) {
+        for (std::size_t index = 0; index < private_owner_ids.size(); ++index) {
+            if (private_owner_ids[index] == ranked) {
+                program.observed_recency_ids.push_back(private_owners[index]->id);
+            }
         }
     }
     // Mirror the real session default: the whole recency order is evictable until the
@@ -2898,6 +2909,32 @@ void test_rank_private_owners_by_recency_ranks_every_private_owner() {
             "no private owner must rank nothing");
 }
 
+void test_publication_counts_as_recency_for_the_ladder() {
+    // A finished request's continuation has no hit history yet: a publication starts its
+    // checkpoint observations at zero, and the normal ConsumeToActive continuation clears the
+    // consumed source's history. The ladder must still rank it as the most recently used owner,
+    // otherwise the conversation most likely to be continued next is sacrificed first.
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const ActiveRequest a = start_active(manager, program, 1, make_base(1), 1);
+    (void)finish_active(manager, program, a);
+    const ActiveRequest b = start_active(manager, program, 2, make_base(2), 2);
+    (void)finish_active(manager, program, b);
+    // Continue `a` (endpoint hit, consumed into the active lane) and publish its next turn.
+    const ActiveRequest a_next = start_active(manager, program, 1, make_base(1), 3);
+    (void)finish_active(manager, program, a_next, 24);
+    const ActiveRequest c = start_active(manager, program, 3, make_base(3), 4);
+    (void)finish_active(manager, program, c);
+
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{4}, make_base(4), 5);
+    require(inspection.choice.has_value(), "pressure admission found no choice");
+    require(program.pressure_planning_sessions != 0, "admission did not plan under pressure");
+    const std::vector<std::uint32_t> expected{c.sequence.id, a_next.sequence.id, b.sequence.id};
+    require(program.observed_recency_ids == expected,
+            "recency order did not rank owners by their latest publication or hit");
+}
+
 void test_incremental_eviction_is_licensed_by_the_lru_tail() {
     // The admission planner licenses incremental full eviction only over the LRU tail its
     // escape-hatch ladder had to sacrifice. Inside the session, a construction step must not
@@ -2959,10 +2996,11 @@ void test_incremental_eviction_is_licensed_by_the_lru_tail() {
 }
 
 void test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest() {
-    // Three catalogued private owners, ranked by recency as a=0 (most recent), b=1, c=2. The
-    // pressure search fails, so the escape-hatch recency ladder runs. Host fits only after the
-    // oldest owner is given up, so rung 1 demotes a and b (kept on host) and fully evicts c: the
-    // ladder sacrifices a suffix of the recency order and keeps every more recent prefix.
+    // Three catalogued private owners published in the order a, b, c, so their recency ranks are
+    // c=0 (most recent), b=1, a=2. The pressure search fails, so the escape-hatch recency ladder
+    // runs. Host fits only after the oldest owner is given up, so rung 1 demotes c and b (kept on
+    // host) and fully evicts a: the ladder sacrifices a suffix of the recency order and keeps
+    // every more recent prefix.
     FakeManager manager = make_manager(1, 3, 0, true);
     FakeProgram program;
     const ActiveRequest a = start_active(manager, program, 151, make_base(151), 1);
@@ -2987,7 +3025,7 @@ void test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest() {
         return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
                          2000U + request.sequence.id) != program.started_action_ids.end();
     };
-    require(!evicted(a) && !evicted(b) && evicted(c),
+    require(evicted(a) && !evicted(b) && !evicted(c),
             "escape-hatch rung evicted a more recent owner instead of the oldest");
 }
 
@@ -4148,6 +4186,8 @@ int main() {
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
     run_test("private owner recency ranking", test_rank_private_owners_by_recency_ranks_every_private_owner);
+    run_test("publication counts as recency for the ladder",
+             test_publication_counts_as_recency_for_the_ladder);
     run_test("incremental eviction is LRU-licensed",
              test_incremental_eviction_is_licensed_by_the_lru_tail);
     run_test("escape hatch sacrifices oldest first and demotes the rest",
