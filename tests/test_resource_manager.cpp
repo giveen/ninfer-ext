@@ -4156,6 +4156,69 @@ void test_explicit_credit_shared_entry_survives_automatic_reclaim() {
                          "explicit-credit shared prefix lost reuse after reclaim");
 }
 
+void test_automatic_reclaim_picks_the_least_recently_used_entry() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    // A later conversation reuses 71, so 72 is now the least recently used entry even though
+    // 71 was published first.
+    const ActiveRequest reuse = start_active(manager, program, 71, make_base(71), 3);
+    (void)finish_active(manager, program, reuse);
+
+    publish_shared_prefix(manager, program, 73, 4, 3,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    require(program.released_shared_prefix_keys == std::vector<std::uint32_t>{72},
+            "automatic reclaim chose by publication order instead of by use");
+}
+
+void test_automatic_reclaim_waits_for_a_planned_capture() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+
+    // A third conversation's capture cannot fit, so no scenario plans. The saturated catalog
+    // must not give up an entry for a publication that never happens.
+    FakeRequestBasePlan base        = make_base(73);
+    base.value.publish_continuation = false;
+    base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+        .frontier = 64,
+    });
+    const ActiveRequest active = start_active(manager, program, 73, base, 3);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 73, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
+    };
+    program.required_pressure_actions = 1;  // the capture only fits with pressure it cannot get
+    const auto reserved = manager.reserve_active_capture(program, active.lane,
+                                                         FakeCaptureOffer{.id = 3}, 0, {});
+    program.required_pressure_actions = 0;
+    if (reserved == FakeManager::ActiveCaptureReserveResult::Reserved) {
+        // Only the private baseline can proceed; the shared publication did not plan.
+        auto progress      = manager.progress_context_transaction(program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published,
+                "private baseline capture was not published");
+    }
+    require(program.released_shared_prefix_keys.empty(),
+            "automatic reclaim released a prefix for a capture that did not plan");
+    (void)finish_active(manager, program, active);
+    require_shared_reuse(manager, program, 71, 4, true,
+                         "shared prefix was lost to a capture that never published");
+}
+
 } // namespace
 
 int main() {
@@ -4247,6 +4310,10 @@ int main() {
              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
     run_test("escape hatch ranks shared prefixes with private owners",
              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
+    run_test("automatic reclaim picks the least recently used entry",
+             test_automatic_reclaim_picks_the_least_recently_used_entry);
+    run_test("automatic reclaim waits for a planned capture",
+             test_automatic_reclaim_waits_for_a_planned_capture);
     run_test("escape hatch clears all when nothing fits",
              test_escape_hatch_clears_all_when_nothing_fits);
     run_test("escape hatch ladder fits the committed target budget",
