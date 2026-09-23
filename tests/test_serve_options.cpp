@@ -220,6 +220,38 @@ int main() {
                           context_cache.context_cache.max_shared_prefixes == 4 &&
                           context_cache.context_cache.max_long_anchors_per_continuation == 2,
                       "context-cache capacities did not reach serving options");
+    const ServeOptions host_cache_budget = parse(
+        {"ninfer-serve", "model.ninfer", "--host-cache-mib", "24576",
+         "--max-private-continuations", "32", "--max-long-anchors-per-continuation", "8"});
+    failures += check(
+        host_cache_budget.context_cache.enabled &&
+            host_cache_budget.context_cache.host_cache_budget_bytes == (24576ULL << 20) &&
+            // The budget mode owns the two RAM components; the parse layer must leave them at
+            // their defaults rather than half-apply a rejected alternative.
+            host_cache_budget.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
+            host_cache_budget.context_cache.host_kv_capacity_bytes ==
+                ninfer::kDefaultHostKvCapacityBytes,
+        "host cache budget did not reach serving options");
+    bool budget_with_state_slots_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-cache-mib", "64",
+                     "--host-state-slots", "5"});
+    } catch (const std::invalid_argument&) { budget_with_state_slots_rejected = true; }
+    failures += check(budget_with_state_slots_rejected,
+                      "host cache budget accepted --host-state-slots");
+    bool budget_with_host_kv_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-cache-mib", "64", "--host-kv-mib",
+                     "64"});
+    } catch (const std::invalid_argument&) { budget_with_host_kv_rejected = true; }
+    failures += check(budget_with_host_kv_rejected, "host cache budget accepted --host-kv-mib");
+    bool disabled_budget_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-cache-mib",
+                     "64"});
+    } catch (const std::invalid_argument&) { disabled_budget_rejected = true; }
+    failures += check(disabled_budget_rejected,
+                      "root-only server mode accepted a host cache budget");
     bool disabled_cache_capacity_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-kv-mib", "64"});

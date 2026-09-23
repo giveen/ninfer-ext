@@ -141,6 +141,11 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Single host RAM ceiling for the whole retention tier. When engaged it is authoritative:
+    // the Program sizes the Host state pool from the configured checkpoint inventory and gives
+    // Host KV the remainder, rejecting a plan whose state footprint exceeds half the budget.
+    // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
+    std::optional<std::size_t> host_cache_budget_bytes;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -867,6 +872,12 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host retention-tier unit costs. Every Host StateImage slot pins image_bytes regardless of
+    // the prefix depth it resumes, and Host KV pins bytes per page group, so the split of a
+    // budget between the two is the depth-versus-positions trade made visible.
+    std::size_t host_state_image_bytes            = 0;
+    // Engaged only when the single host RAM budget mode is active.
+    std::size_t host_cache_budget_bytes           = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

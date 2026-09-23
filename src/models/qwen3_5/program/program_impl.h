@@ -569,7 +569,10 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
-    const ContextCacheOptions context_cache;
+    // Non-const: an engaged host-cache budget resolves host_state_slots and
+    // host_kv_capacity_bytes from the persistent layout's StateImage geometry at the top of
+    // construction, before any Host allocation reads them.
+    ContextCacheOptions context_cache;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;

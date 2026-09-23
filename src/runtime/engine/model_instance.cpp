@@ -97,7 +97,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
             (cache.max_long_anchors_per_continuation &&
              *cache.max_long_anchors_per_continuation != 0) ||
-            (cache.preserved_recent_prefixes && *cache.preserved_recent_prefixes != 0)) {
+            (cache.preserved_recent_prefixes && *cache.preserved_recent_prefixes != 0) ||
+            cache.host_cache_budget_bytes) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
         cache.device_state_slots                = 0;

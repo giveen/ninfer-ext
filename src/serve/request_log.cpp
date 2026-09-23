@@ -516,6 +516,8 @@ std::string format_server_start_json(
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_state_image_bytes", memory.host_state_image_bytes},
+             {"host_cache_budget_bytes", memory.host_cache_budget_bytes},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =

@@ -78,6 +78,37 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
+    if (plan.context_cache.host_cache_budget_bytes) {
+        // Single host RAM budget: the tier's two pinning costs are (2 + anchors) images per
+        // private owner plus one per shared entry — the checkpoint inventory the capture path
+        // will actually create — with Host KV taking the remainder. StateImages are the fixed
+        // per-position cost and Host KV the per-token cost, so the state footprint is bounded by
+        // half the budget: beyond that, positions are being bought at the expense of the depth
+        // that makes them worth restoring.
+        const std::uint64_t image_bytes  = plan.persistent.state_images.host.image_bytes;
+        const std::uint64_t anchors      = context_cache.max_long_anchors_per_continuation.value_or(0U);
+        const std::uint64_t budget       = *plan.context_cache.host_cache_budget_bytes;
+        const std::uint64_t state_slots  = (2ULL + anchors) * continuation_capacity +
+                                          static_cast<std::uint64_t>(shared_prefix_capacity);
+        if (state_slots > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("Qwen3.5 derived Host state capacity exceeds uint32");
+        }
+        const std::uint64_t state_bytes = state_slots * image_bytes;
+        if (state_bytes > budget / 2) {
+            throw std::invalid_argument(
+                "host cache budget is too small for the configured checkpoint inventory: " +
+                std::to_string(state_slots) + " Host state images x " +
+                std::to_string(image_bytes) + " B = " + std::to_string(state_bytes) +
+                " B exceeds half the " + std::to_string(budget) +
+                " B budget (private continuations " + std::to_string(continuation_capacity) +
+                ", shared prefixes " + std::to_string(shared_prefix_capacity) + ", anchors " +
+                std::to_string(anchors) +
+                "); reduce --max-private-continuations / --max-long-anchors-per-continuation or "
+                "raise --host-cache-mib");
+        }
+        context_cache.host_state_slots       = static_cast<std::uint32_t>(state_slots);
+        context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(budget - state_bytes);
+    }
     if (workspace_plan.general_capacity == 0 ||
         workspace_plan.vision.has_value() != vision_enabled ||
         causal_scoring != plan.persistent.score_hidden.has_value() ||
@@ -106,8 +137,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
         const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
-        const std::uint64_t host_pages =
-            plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
+        const std::uint64_t host_pages = context_cache.host_kv_capacity_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
         if (total > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 logical KV page capacity exceeds uint32");
@@ -125,19 +155,18 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
-    if (plan.context_cache.host_state_slots != 0) {
+    if (context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-            plan.context_cache.host_state_slots;
+            context_cache.host_state_slots;
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+            state_images->host_layout(), context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
-        static_cast<std::uint64_t>(state_images->slot_count()) +
-        plan.context_cache.host_state_slots;
+        static_cast<std::uint64_t>(state_images->slot_count()) + context_cache.host_state_slots;
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
@@ -205,7 +234,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
         pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
-    if (plan.context_cache.host_kv_capacity_bytes != 0) {
+    if (context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
         layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
         if (const qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
@@ -215,19 +244,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         StartupPhaseScope host_kv_phase(
             startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+            static_cast<std::uint64_t>(context_cache.host_kv_capacity_bytes));
         host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
+            context_cache.host_kv_capacity_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
-        host_kv_phase.complete(
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+        host_kv_phase.complete(static_cast<std::uint64_t>(context_cache.host_kv_capacity_bytes),
+                               static_cast<std::uint64_t>(context_cache.host_kv_capacity_bytes));
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
         }
-        const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
+        const std::size_t extent_capacity = context_cache.host_kv_capacity_bytes / minimum_stride;
         if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 Host KV extent capacity exceeds uint32");
         }
@@ -565,6 +592,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.host_state_image_bytes       = state_images->host_layout().image_bytes;
+    out.host_cache_budget_bytes      = context_cache.host_cache_budget_bytes.value_or(0);
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
