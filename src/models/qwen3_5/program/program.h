@@ -574,16 +574,20 @@ public:
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
-    // Escape-hatch recency-ladder rung: fully evict the `sacrifice_oldest` oldest preserved
-    // owners, demote the remaining most-recent preserved owners to host (keeping their host
-    // copy), and evict every non-preserved owner. All victims free device KV, so the active
-    // context always fits; rungs differ only in how much host they keep. The caller walks
-    // sacrifice 0..`protected_owner_count()`-1 (most-preserving first) and, if none is feasible,
-    // falls back to `root_maximal_target` (clear everything).
+    // Escape-hatch recency-ladder rung: fully evict the `sacrifice_oldest` oldest private owners and
+    // every shared owner, and keep every other owner (demoting a kept private owner to host
+    // wherever Host can take it, which frees its device KV while keeping the prefix). Rungs differ
+    // only in how many of the oldest private owners they give up; whether a rung frees enough is
+    // what its adoption check decides. The caller walks sacrifice 0..`private_owner_count()`-1
+    // (most-preserving first) and, if none is adoptable, falls back to `root_maximal_target`
+    // (clear everything).
     [[nodiscard]] PressureTargetHandle
-    protected_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
-    // Number of preserved owners; bounds the escape-hatch ladder.
-    [[nodiscard]] std::uint32_t protected_owner_count() const;
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
+    // Number of ranked private owners; bounds the escape-hatch ladder.
+    [[nodiscard]] std::uint32_t private_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest private owners; see
+    // PressurePlanningSessionImpl::owner_eviction_licensed.
+    void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
     // Canonical target slots this session's arena can still hold. The arena also holds targets
     // a planning layer does not count in its own budget (identity targets, escape-hatch
     // maximal rungs), so expansion commits must be bounded by this value; commit_expansion
@@ -901,7 +905,7 @@ public:
                             std::span<const runtime::PlanningOwnerId> private_owner_ids,
                             std::span<const SharedPrefixHandle* const> shared_owners,
                             std::span<const runtime::PlanningOwnerId> shared_owner_ids,
-                            std::span<const runtime::PlanningOwnerId> protected_owner_ids);
+                            std::span<const runtime::PlanningOwnerId> private_recency_order);
     [[nodiscard]] runtime::PrefillWork
     shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
                                       const PreparedPrompt& prompt,
@@ -935,7 +939,7 @@ public:
                                     std::span<const runtime::PlanningOwnerId> private_owner_ids,
                                     std::span<const SharedPrefixHandle* const> shared_owners,
                                     std::span<const runtime::PlanningOwnerId> shared_owner_ids,
-                                    std::span<const runtime::PlanningOwnerId> protected_owner_ids);
+                                    std::span<const runtime::PlanningOwnerId> private_recency_order);
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);

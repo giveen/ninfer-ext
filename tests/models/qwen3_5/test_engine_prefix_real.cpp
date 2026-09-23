@@ -235,14 +235,13 @@ ninfer::EngineOptions private_checkpoint_pressure_engine_options(const char* art
 
 // Small device KV capacity so a handful of retained private prefixes overflow the cache and
 // force pressure eviction. No host fallback: retained prefixes must be evicted, not spilled.
-ninfer::EngineOptions preserved_recent_prefixes_engine_options(const char* artifact,
-                                                               std::uint32_t preserved) {
+ninfer::EngineOptions recency_retention_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                    = artifact;
     options.max_context                      = 4096;
-    // KV-capacity pressure (not the conversation cap) is what the preserved-recent protection
-    // governs. A safe, known-valid capacity (4096 page groups) that the five long retained
-    // prefixes overflow, so eviction is driven by KV capacity through the value-based planner.
+    // KV-capacity pressure (not the conversation cap) is what the retention order governs. A safe,
+    // known-valid capacity (4096 page groups) that the five long retained prefixes overflow, so
+    // eviction is driven by KV capacity through the value-based planner.
     options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.kv_cache                         = ninfer::KvCacheStorage::Fp8E4M3Row256;
     options.prefill_chunk                    = 256;
@@ -255,7 +254,6 @@ ninfer::EngineOptions preserved_recent_prefixes_engine_options(const char* artif
     options.context_cache.max_private_continuations         = 8;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.preserved_recent_prefixes         = preserved;
     return options;
 }
 
@@ -291,12 +289,12 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
 // long multi-turn OpenAI-chat conversations: a leading system prompt + a fixed tool set (the
 // shared stable prefix), a growing conversation with tool calls, thinking enabled and
 // preserved, streaming. These helpers build that shape with small caches so the 36h caching
-// fixes (shared replacement, #251 reclaim, preserved-recent, cost-scaled search budget,
+// fixes (shared replacement, #251 reclaim, recency-ordered retention, cost-scaled search budget,
 // checkpoint eviction, stats publication) are exercised under contention.
 
 ninfer::EngineOptions agent_engine_options(const char* artifact, std::uint32_t shared_prefixes,
                                            std::uint32_t private_continuations,
-                                           std::uint32_t device_slots, std::uint32_t preserved,
+                                           std::uint32_t device_slots,
                                            std::uint32_t kv_capacity) {
     ninfer::EngineOptions options;
     options.artifact_path                    = artifact;
@@ -314,7 +312,6 @@ ninfer::EngineOptions agent_engine_options(const char* artifact, std::uint32_t s
     options.context_cache.max_private_continuations         = private_continuations;
     options.context_cache.max_shared_prefixes               = shared_prefixes;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.preserved_recent_prefixes         = preserved;
     return options;
 }
 
@@ -2485,7 +2482,7 @@ int exercise_artifact(const char* artifact) {
     return 0;
 }
 
-struct PreservedPhaseOutcome {
+struct RecencyPhaseOutcome {
     bool        constructed       = false;
     std::uint32_t main_reused_mid  = 0;
     std::uint32_t main_reused      = 0;
@@ -2497,17 +2494,17 @@ struct PreservedPhaseOutcome {
 };
 
 // Fills the device cache with several retained private prefixes, makes the shortest one the most
-// recently hit (highest last_hit_epoch), applies further pressure, then re-sends it. The most
-// recent prefix is the protected one under --preserved-recent-prefixes. Diagnostics go to stderr
-// (unbuffered) so they survive capture even when the assertions below fail.
-PreservedPhaseOutcome run_preserved_phase(const char* artifact, std::uint32_t preserved,
-                                          const char* label) {
-    PreservedPhaseOutcome outcome;
-    ninfer::Engine engine(preserved_recent_prefixes_engine_options(artifact, preserved));
+// recently hit (highest last_hit_epoch), applies further pressure, then re-sends it. The escape
+// hatch ranks private owners by recency and sacrifices the oldest first, so the most recent
+// prefix is never the eviction victim. Diagnostics go to stderr (unbuffered) so they survive
+// capture even when the assertions below fail.
+RecencyPhaseOutcome run_recency_phase(const char* artifact, const char* label) {
+    RecencyPhaseOutcome outcome;
+    ninfer::Engine engine(recency_retention_engine_options(artifact));
 
     // Four long old conversations plus a short MAIN: their combined KV is ~2.4x the 4096 capacity,
     // so the cache runs out of room to merely degrade and must fully evict owners through the
-    // value-based (and preserved-recent-protected) pressure path.
+    // value-based pressure path.
     const auto old_a = exact_repeated_prompt_text(engine, 1500, "alpha");
     const auto old_b = exact_repeated_prompt_text(engine, 1500, "bravo");
     const auto old_c = exact_repeated_prompt_text(engine, 1500, "charlie");
@@ -2549,8 +2546,8 @@ PreservedPhaseOutcome run_preserved_phase(const char* artifact, std::uint32_t pr
         outcome.main_path       = mid.second;
     }
     // The final two long conversations overflow the cap and force evictions for which MAIN is a
-    // candidate victim (it is the shortest prefix, hence the lowest reuse value); the
-    // preserved-recent feature protects it under N>=1.
+    // candidate victim (it is the shortest prefix, hence the lowest reuse value); the recency
+    // order is what keeps it: the older conversations are sacrificed first.
     (void)gen(*old_c, "old-3", ninfer::CacheRetentionHint::LiveSession, 1);
     (void)gen(*old_d, "old-4", ninfer::CacheRetentionHint::LiveSession, 1);
     const ninfer::RuntimeStats after = engine.runtime_stats();
@@ -2573,39 +2570,33 @@ PreservedPhaseOutcome run_preserved_phase(const char* artifact, std::uint32_t pr
     return outcome;
 }
 
-int exercise_preserved_recent_prefixes(const char* artifact) {
-    std::cout << "preserved-recent-prefixes: treatment (N=1) then control (N=0)\n";
-    const PreservedPhaseOutcome treatment =
-        run_preserved_phase(artifact, 1U, "treatment(N=1)");
-    const PreservedPhaseOutcome control = run_preserved_phase(artifact, 0U, "control(N=0)");
-    if (!treatment.constructed || !control.constructed) {
-        std::cerr << "preserved-recent-prefixes: fixture could not be constructed\n";
+int exercise_recency_retention(const char* artifact) {
+    std::cout << "recency-retention: the most recent prefix survives cache pressure\n";
+    const RecencyPhaseOutcome phase = run_recency_phase(artifact, "recency");
+    if (!phase.constructed) {
+        std::cerr << "recency-retention: fixture could not be constructed\n";
         return 1;
     }
 
-    // Feature guarantee (deterministic for N>=1): the most recent private prefix is protected, the
-    // protected set fits the cache, so it is never the eviction victim; at least one other
-    // prefix is evicted by the same pressure.
-    if (treatment.main_reused == 0) {
-        std::cerr << "preserved-recent-prefixes: protected most-recent prefix was NOT retained "
-                     "under pressure (main_reused="
-                  << treatment.main_reused << ")\n";
+    // The escape hatch sacrifices the oldest private owners first, so the most recent prefix is
+    // never the eviction victim while an older one can be given up; the same pressure must still
+    // evict at least one owner, or the fixture did not overflow.
+    if (phase.main_reused == 0) {
+        std::cerr << "recency-retention: the most recent prefix was NOT retained under pressure "
+                     "(main_reused="
+                  << phase.main_reused << ")\n";
         return 1;
     }
-    if (treatment.evicted_delta < 1) {
-        std::cerr << "preserved-recent-prefixes: pressure evicted no prefix (fixture did not "
-                     "overflow; evicted_delta="
-                  << treatment.evicted_delta << ")\n";
+    if (phase.evicted_delta < 1) {
+        std::cerr << "recency-retention: pressure evicted no prefix (fixture did not overflow; "
+                     "evicted_delta="
+                  << phase.evicted_delta << ")\n";
         return 1;
     }
 
-    std::cout << "preserved-recent-prefixes: OK -- treatment retained the most recent prefix "
-              << "(reused=" << treatment.main_reused << " of 128 tokens) while evicting "
-              << treatment.evicted_delta << " other prefix(es). Control (N=0) most-recent "
-              << "reused=" << control.main_reused << (control.main_reused == 0
-                                                         ? " (evicted without the flag)"
-                                                         : " (value model retained it)")
-              << '\n';
+    std::cout << "recency-retention: OK -- the most recent prefix survived (reused="
+              << phase.main_reused << " of 128 tokens) while evicting " << phase.evicted_delta
+              << " older prefix(es)\n";
     return 0;
 }
 
@@ -2627,7 +2618,7 @@ int exercise_preserved_recent_prefixes(const char* artifact) {
 int exercise_agent_multi_turn(const char* artifact) {
     std::cout << "agent-multi-turn: shared system+tools prefix across 4 tool-calling turns\n";
     ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/4, /*private=*/4,
-                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+                                               /*device=*/2, /*kv=*/4096));
     const std::string system = "You are a concise weather assistant. Always call a tool first.";
     std::vector<std::string> tools = {
         agent_tool_json("get_current_weather", "Get the current weather for a city."),
@@ -2683,12 +2674,12 @@ int exercise_agent_multi_turn(const char* artifact) {
 
 // 2. Five long, distinct agent conversations saturate a small KV capacity (the real contention
 //    axis in the production agent is private/host continuations under KV pressure). The pressure
-//    path evicts the lowest-value prefixes; the recency-ladder escape hatch (preserved-recent,
-//    N=1) protects the most recent conversation, which must remain reusable. No references leak.
+//    path evicts the lowest-value prefixes; the recency-ladder escape hatch sacrifices the oldest
+//    private owners first, which keeps the most recent conversation reusable. No references leak.
 int exercise_agent_private_continuations(const char* artifact) {
     std::cout << "agent-private-continuations: saturate the private cache, preserve the most recent\n";
     ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/2, /*private=*/3,
-                                               /*device=*/2, /*preserved=*/1, /*kv=*/4096));
+                                               /*device=*/2, /*kv=*/4096));
     const std::string system = "You are a research assistant that reads files and summarizes them.";
     const std::string read_tool = agent_tool_json("read_file", "Read a file by path.");
     std::vector<std::string> tools = {read_tool};
@@ -2700,7 +2691,7 @@ int exercise_agent_private_continuations(const char* artifact) {
 
     // Five long, distinct conversations (each a new private continuation). Their combined KV
     // overflows the 4096 capacity, so the cache runs out of room to merely degrade and must fully
-    // evict owners through the value-based (and preserved-recent-protected) pressure path.
+    // evict owners through the value-based pressure path.
     std::vector<std::string> conversations;
     for (std::uint32_t doc = 0; doc < 5; ++doc) {
         std::string body;
@@ -2737,7 +2728,7 @@ int exercise_agent_private_continuations(const char* artifact) {
                      "(fixture did not overflow)\n";
         return 1;
     }
-    // The most recent conversation must still be reusable (it is the recency-ladder protected one).
+    // The most recent conversation must still be reusable (the ladder sacrifices the older ones).
     std::vector<ninfer::ChatMessage> recent = {
         agent_text_message(ninfer::ChatRole::User, "Summarize this file:\n" + conversations.back()),
     };
@@ -2766,7 +2757,7 @@ int exercise_agent_private_continuations(const char* artifact) {
 int exercise_agent_concurrent(const char* artifact) {
     std::cout << "agent-concurrent: two concurrent agent requests settle without leaked references\n";
     ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/4, /*private=*/4,
-                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+                                               /*device=*/2, /*kv=*/4096));
     const std::string system = "You are a code-review assistant.";
     std::vector<std::string> tools = {
         agent_tool_json("read_file", "Read a file by path."),
@@ -2820,7 +2811,7 @@ int exercise_agent_concurrent(const char* artifact) {
 int exercise_agent_kv_pressure(const char* artifact) {
     std::cout << "agent-kv-pressure: long agent conversations overflow the KV capacity\n";
     ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/2, /*private=*/4,
-                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+                                               /*device=*/2, /*kv=*/4096));
     const std::string system = "You are a log-analysis assistant.";
     std::vector<std::string> tools = {
         agent_tool_json("query_logs", "Query the log stream by a filter."),
@@ -2878,7 +2869,7 @@ int exercise_agent_kv_pressure(const char* artifact) {
 int exercise_agent_shared_catalog(const char* artifact) {
     std::cout << "agent-shared-catalog: automatic agent prefixes against a 1-slot catalog\n";
     ninfer::Engine engine(agent_engine_options(artifact, /*shared=*/1, /*private=*/2,
-                                               /*device=*/2, /*preserved=*/0, /*kv=*/4096));
+                                               /*device=*/2, /*kv=*/4096));
     const std::string system = "You are a deterministic tool dispatcher.";
     const std::string alpha_tool =
         agent_tool_json("alpha_tool", "Perform the alpha operation.");
@@ -2981,8 +2972,8 @@ int main() {
         result = exercise_pressure_partial_spill_and_resume(artifact);
     } else if (scenario == "private-checkpoint-pressure") {
         result = exercise_private_checkpoint_pressure_retention(artifact);
-    } else if (scenario == "preserved-recent-prefixes") {
-        result = exercise_preserved_recent_prefixes(artifact);
+    } else if (scenario == "recency-retention") {
+        result = exercise_recency_retention(artifact);
     } else if (scenario == "source-pressure-protection") {
         result = exercise_materialization_source_pressure_protection(artifact);
     } else if (scenario == "shared-replacement") {

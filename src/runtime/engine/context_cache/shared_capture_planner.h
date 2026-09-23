@@ -57,7 +57,8 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const OwnerPolicy> owner_policies;
         std::span<const CheckpointPolicy> checkpoint_policies;
-        std::span<const PlanningOwnerId> protected_owner_ids;
+        // Private owners ranked by recency, most recently hit first.
+        std::span<const PlanningOwnerId> recency_owner_ids;
         std::optional<PlanningOwnerId> direct_shared_victim;
         std::uint32_t candidate_demand_mask         = 0;
         std::uint64_t candidate_rebuild_ns          = 0;
@@ -95,7 +96,7 @@ public:
 
         auto session = program.begin_capture_pressure_planning(
             *input.capture, input.private_owners, input.private_owner_ids, input.shared_owners,
-            input.shared_owner_ids, input.protected_owner_ids);
+            input.shared_owner_ids, input.recency_owner_ids);
         const PlanningCandidateId candidate_id = session.candidate_id();
 
         const PressureTargetHandle identity         = session.identity_target();

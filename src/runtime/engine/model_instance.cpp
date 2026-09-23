@@ -97,7 +97,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
             (cache.max_long_anchors_per_continuation &&
              *cache.max_long_anchors_per_continuation != 0) ||
-            (cache.preserved_recent_prefixes && *cache.preserved_recent_prefixes != 0) ||
             cache.host_cache_budget_bytes) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
@@ -107,7 +106,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
-        cache.preserved_recent_prefixes         = 0;
         return options;
     }
 
@@ -118,7 +116,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(std::max(
         concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest)));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(4U);
-    cache.preserved_recent_prefixes         = cache.preserved_recent_prefixes.value_or(0U);
 
     if (*cache.max_private_continuations < concurrency) {
         throw std::invalid_argument(

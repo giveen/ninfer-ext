@@ -150,9 +150,6 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
-    // The N most recently hit private conversation prefixes are eviction-immune (they may
-    // still be degraded/spilled) until capacity leaves nothing else to evict; 0 disables.
-    std::optional<std::uint32_t> preserved_recent_prefixes;
 };
 
 struct ContextCostOptions {

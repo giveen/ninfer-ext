@@ -1361,11 +1361,22 @@ struct PressurePlanningSessionImpl {
         std::span<const runtime::PlanningOwnerId> private_owner_ids,
         std::span<const SharedPrefixHandle* const> shared_owners,
         std::span<const runtime::PlanningOwnerId> shared_owner_ids,
-        std::span<const runtime::PlanningOwnerId> protected_owner_ids);
+        std::span<const runtime::PlanningOwnerId> private_recency_order);
     ~PressurePlanningSessionImpl() noexcept;
 
-    [[nodiscard]] bool owner_protected(std::size_t owner_index) const {
-        return owner_index < protected_owner_mask_.size() && protected_owner_mask_[owner_index];
+    // Full eviction of an owner is reachable from incremental enumeration only inside the LRU tail
+    // the admission planner had to sacrifice. For a private owner that means one of the
+    // `eviction_licence_count_` oldest ranks; every other private owner is either demoted to
+    // Host (leaving its prefix matchable) or kept, so a plan can never trade a more recent
+    // prefix's content for an older one's device KV. A shared owner has no recency order and
+    // every escape-hatch rung evicts it, so it is licensed whenever any sacrifice is licensed.
+    [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const {
+        if (owner_index >= private_recency_rank_.size() || eviction_licence_count_ == 0) {
+            return false;
+        }
+        const std::int32_t rank = private_recency_rank_[owner_index];
+        if (rank < 0) { return true; }
+        return static_cast<std::uint32_t>(rank) >= private_owner_count_ - eviction_licence_count_;
     }
 
     [[nodiscard]] qwen3_5::PressureTargetHandle
@@ -1374,18 +1385,23 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
-    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest preserved
-    // owners (by recency rank) are fully evicted while the remaining (P-k) most-recent preserved
-    // owners free their device KV via a demote-to-host outcome (keeping their host copy). Every
-    // non-preserved owner is fully evicted. Every victim therefore frees device KV, so the
-    // active context always fits; rungs differ only in how much host they keep. The ladder
-    // walks k = 0..P-1 (most-preserving first) and, if no rung is physically feasible, the
-    // caller falls back to `root_maximal_target` (k = P: clear everything), the guaranteed
-    // liveness backstop.
+    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest private owners
+    // (by recency rank) and every shared owner are fully evicted, and every other owner is kept —
+    // a kept private owner frees its device KV through a demote-to-host outcome wherever Host can
+    // take it (keeping its host copy). Whether the sacrifice frees enough device and host capacity
+    // is the rung's adoption check, so a pool without a host tier still expresses "evict the k
+    // oldest and keep the rest". The ladder walks k = 0..P-1 (most-preserving first) and, if no
+    // rung is adoptable, the caller falls back to `root_maximal_target` (k = P: clear everything),
+    // the guaranteed liveness backstop.
     [[nodiscard]] qwen3_5::PressureTargetHandle
-    protected_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
-    // Number of preserved owners; bounds the escape-hatch ladder (rungs 0..P-1, then terminal).
-    [[nodiscard]] std::uint32_t protected_owner_count() const;
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
+    // Number of ranked private owners; bounds the escape-hatch ladder (rungs 0..P-1, then
+    // terminal).
+    [[nodiscard]] std::uint32_t private_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest private owners. Set once per
+    // admission, from the escape-hatch ladder's smallest feasible sacrifice count (0 when the
+    // identity target is feasible, i.e. nothing needs to be evicted).
+    void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -1458,15 +1474,16 @@ struct PressurePlanningSessionImpl {
     std::vector<PhysicalCandidateBinding> candidates;
     std::vector<runtime::PlanningCandidateId> candidate_ids;
     std::vector<Owner> owners;
-    // Parallel to `owners`; true when the owner is eviction-immune (recent-prefix preservation).
-    std::vector<bool> protected_owner_mask_;
-    // Parallel to `owners`; recency rank among the preserved prefixes (0 = most recent), or
-    // -1 when the owner is not preserved. Orders the escape-hatch sacrifice: the oldest
-    // preserved owner (highest rank) gives up its host copy first.
-    std::vector<std::int32_t> protected_recency_rank_;
-    // Count of preserved owners; the escape-hatch ladder has this many rungs plus a clear-all
-    // terminal.
-    std::uint32_t protected_owner_count_ = 0;
+    // Parallel to `owners`; recency rank among the private owners (0 = most recently hit), or
+    // -1 for a shared owner, which has no recency order. Orders the escape-hatch sacrifice: the
+    // oldest private owner (highest rank) gives up its host copy first.
+    std::vector<std::int32_t> private_recency_rank_;
+    // Number of ranked private owners; the escape-hatch ladder has this many sacrifice rungs
+    // plus the clear-all terminal.
+    std::uint32_t private_owner_count_ = 0;
+    // Private owners the escape-hatch ladder had to sacrifice for the current admission, oldest
+    // first. Full eviction is reachable from incremental enumeration only inside this LRU tail.
+    std::uint32_t eviction_licence_count_ = 0;
     std::vector<CandidateOptions> candidate_options;
     std::vector<TargetNode> targets;
     std::vector<std::uint16_t> target_choice_arena;

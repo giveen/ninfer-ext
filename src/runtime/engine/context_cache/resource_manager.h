@@ -246,16 +246,14 @@ public:
 
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
-                    std::uint32_t max_long_anchors, std::uint32_t preserved_recent_prefixes,
-                    ContextMachineCostModel cost_model)
+                    std::uint32_t max_long_anchors, ContextMachineCostModel cost_model)
         : lane_count_(lane_count), catalog_count_(private_catalog_capacity),
           shared_catalog_count_(shared_catalog_capacity), cache_enabled_(cache_enabled),
           catalog_(private_catalog_capacity), shared_catalog_(shared_catalog_capacity),
           session_index_(private_catalog_capacity),
           prefix_index_(checked_prefix_index_capacity(private_catalog_capacity,
                                                       shared_catalog_capacity, max_long_anchors)),
-          max_long_anchors_(max_long_anchors),
-          preserved_recent_prefixes_(preserved_recent_prefixes), cost_model_(std::move(cost_model)) {
+          max_long_anchors_(max_long_anchors), cost_model_(std::move(cost_model)) {
         if (lane_count == 0 || lane_count > kMaximumConcurrency ||
             private_catalog_capacity < lane_count) {
             throw std::invalid_argument("logical resource-manager bounds are invalid");
@@ -784,11 +782,10 @@ public:
                             owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
                     }
                 }
-                std::vector<PlanningOwnerId> protected_owner_ids =
-                    select_preserved_recent_prefixes(
+                std::vector<PlanningOwnerId> recency_owner_ids =
+                    rank_private_owners_by_recency(
                         std::span<const typename CapturePlanner::OwnerPolicy>(owner_policies),
-                        std::span<const PlanningOwnerId>(private_owner_ids),
-                        preserved_recent_prefixes_);
+                        std::span<const PlanningOwnerId>(private_owner_ids));
                 const typename CapturePlanner::Input input{
                     .capture             = &scenario.assessment,
                     .private_owners      = private_owners,
@@ -797,7 +794,7 @@ public:
                     .shared_owner_ids    = shared_owner_ids,
                     .owner_policies      = owner_policies,
                     .checkpoint_policies = checkpoint_policies,
-                    .protected_owner_ids = protected_owner_ids,
+                    .recency_owner_ids   = recency_owner_ids,
                     .direct_shared_victim =
                         scenario.replacement == nullptr
                             ? std::nullopt
@@ -1979,7 +1976,7 @@ private:
         std::vector<PlanningOwnerRecord> owner_records;
         std::vector<MaterializationOwnerPolicy> owner_policies;
         std::vector<MaterializationCheckpointPolicy> checkpoint_policies;
-        std::vector<PlanningOwnerId> protected_owner_ids;
+        std::vector<PlanningOwnerId> recency_owner_ids;
         candidate_inputs.reserve(candidates.size());
 
         for (std::size_t index = 0; index < candidates.size(); ++index) {
@@ -2121,9 +2118,9 @@ private:
                 });
             }
 
-            protected_owner_ids = select_preserved_recent_prefixes(
+            recency_owner_ids = rank_private_owners_by_recency(
                 std::span<const MaterializationOwnerPolicy>(owner_policies),
-                std::span<const PlanningOwnerId>(private_owner_ids), preserved_recent_prefixes_);
+                std::span<const PlanningOwnerId>(private_owner_ids));
             return typename Planner::PressureInputs{
                 .private_owners      = private_owners,
                 .private_owner_ids   = private_owner_ids,
@@ -2131,7 +2128,7 @@ private:
                 .shared_owner_ids    = shared_owner_ids,
                 .owner_policy        = owner_policies,
                 .checkpoint_policy   = checkpoint_policies,
-                .protected_owner_ids = protected_owner_ids,
+                .recency_owner_ids   = recency_owner_ids,
             };
         };
 
@@ -3519,7 +3516,6 @@ private:
     std::vector<CheckpointObservation> observation_scratch_;
     std::vector<PrefixDemandRecord> demand_window_;
     std::uint32_t max_long_anchors_ = 0;
-    std::uint32_t preserved_recent_prefixes_ = 0;
     std::array<ActiveEntry, kMaximumConcurrency> active_{};
     using ContextTransaction =
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;

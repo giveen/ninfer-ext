@@ -59,36 +59,6 @@ int main() {
                           "disabled context cache did not normalize shared-prefix capacity to zero");
     }
 
-    // The preserved-recent-prefixes policy defaults to off and is preserved verbatim.
-    {
-        EngineOptions options;
-        options.max_concurrency = 1;
-        const EngineOptions normalized = normalize_engine_options(options);
-        failures += check(*normalized.context_cache.preserved_recent_prefixes == 0,
-                          "preserved_recent_prefixes default was not zero");
-
-        EngineOptions explicit_options;
-        explicit_options.max_concurrency                           = 1;
-        explicit_options.context_cache.preserved_recent_prefixes = 6;
-        const EngineOptions explicit_normalized = normalize_engine_options(explicit_options);
-        failures += check(*explicit_normalized.context_cache.preserved_recent_prefixes == 6,
-                          "explicit preserved_recent_prefixes override was not preserved");
-    }
-
-    // A disabled context cache rejects a nonzero preserved_recent_prefixes.
-    {
-        EngineOptions options;
-        options.max_concurrency                             = 1;
-        options.context_cache.enabled                       = false;
-        options.context_cache.preserved_recent_prefixes = 4;
-        bool threw = false;
-        try { (void)normalize_engine_options(options); } catch (const std::invalid_argument&) {
-            threw = true;
-        }
-        failures += check(threw,
-                          "disabled context cache accepted a nonzero preserved_recent_prefixes");
-    }
-
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
