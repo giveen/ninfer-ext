@@ -1360,22 +1360,22 @@ struct PressurePlanningSessionImpl {
         std::span<const runtime::PlanningOwnerId> private_owner_ids,
         std::span<const SharedPrefixHandle* const> shared_owners,
         std::span<const runtime::PlanningOwnerId> shared_owner_ids,
-        std::span<const runtime::PlanningOwnerId> private_recency_order);
+        std::span<const runtime::PlanningOwnerId> recency_order);
     ~PressurePlanningSessionImpl() noexcept;
 
     // Full eviction of an owner is reachable from incremental enumeration only inside the LRU tail
-    // the admission planner had to sacrifice. For a private owner that means one of the
-    // `eviction_licence_count_` oldest ranks; every other private owner is either demoted to
-    // Host (leaving its prefix matchable) or kept, so a plan can never trade a more recent
-    // prefix's content for an older one's device KV. A shared owner has no recency order and
-    // every escape-hatch rung evicts it, so it is licensed whenever any sacrifice is licensed.
+    // the admission planner had to sacrifice: one of the `eviction_licence_count_` oldest ranks.
+    // Every other ranked owner, private or shared, is either demoted to Host (leaving its prefix
+    // matchable) or kept, so a plan can never trade a more recent prefix's content for an older
+    // one's device KV. An owner the caller left out of the recency order (rank -1) is sacrificed
+    // by every escape-hatch rung, so it is licensed whenever any sacrifice is licensed.
     [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const {
-        if (owner_index >= private_recency_rank_.size() || eviction_licence_count_ == 0) {
+        if (owner_index >= recency_rank_.size() || eviction_licence_count_ == 0) {
             return false;
         }
-        const std::int32_t rank = private_recency_rank_[owner_index];
+        const std::int32_t rank = recency_rank_[owner_index];
         if (rank < 0) { return true; }
-        return static_cast<std::uint32_t>(rank) >= private_owner_count_ - eviction_licence_count_;
+        return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_;
     }
 
     [[nodiscard]] qwen3_5::PressureTargetHandle
@@ -1384,20 +1384,20 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
-    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest private owners
-    // (by recency rank) and every shared owner are fully evicted, and every other owner is kept —
-    // a kept private owner frees its device KV through a demote-to-host outcome wherever Host can
+    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest ranked owners
+    // (private and shared, by recency rank) are fully evicted, and every other owner is kept — a
+    // kept owner frees its device resources through a demote-to-host outcome wherever Host can
     // take it (keeping its host copy). Whether the sacrifice frees enough device and host capacity
     // is the rung's adoption check, so a pool without a host tier still expresses "evict the k
-    // oldest and keep the rest". The ladder walks k = 0..P-1 (most-preserving first) and, if no
-    // rung is adoptable, the caller falls back to `root_maximal_target` (k = P: clear everything),
+    // oldest and keep the rest". The ladder walks k = 0..R-1 (most-preserving first) and, if no
+    // rung is adoptable, the caller falls back to `root_maximal_target` (k = R: clear everything),
     // the guaranteed liveness backstop.
     [[nodiscard]] qwen3_5::PressureTargetHandle
     recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
-    // Number of ranked private owners; bounds the escape-hatch ladder (rungs 0..P-1, then
+    // Number of owners in the recency order; bounds the escape-hatch ladder (rungs 0..R-1, then
     // terminal).
-    [[nodiscard]] std::uint32_t private_owner_count() const;
-    // Licences incremental eviction of the `oldest_licensed` oldest private owners. Set once per
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners. Set once per
     // admission, from the escape-hatch ladder's smallest feasible sacrifice count (0 when the
     // identity target is feasible, i.e. nothing needs to be evicted).
     void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
@@ -1473,14 +1473,14 @@ struct PressurePlanningSessionImpl {
     std::vector<PhysicalCandidateBinding> candidates;
     std::vector<runtime::PlanningCandidateId> candidate_ids;
     std::vector<Owner> owners;
-    // Parallel to `owners`; recency rank among the private owners (0 = most recently hit or
-    // published), or -1 for a shared owner, which has no recency order. Orders the escape-hatch
-    // sacrifice: the oldest private owner (highest rank) gives up its host copy first.
-    std::vector<std::int32_t> private_recency_rank_;
-    // Number of ranked private owners; the escape-hatch ladder has this many sacrifice rungs
+    // Parallel to `owners`; recency rank in the caller's order over private and shared owners
+    // (0 = most recently hit or published), or -1 for an owner left out of it. Orders the
+    // escape-hatch sacrifice: the oldest ranked owner (highest rank) gives up its host copy first.
+    std::vector<std::int32_t> recency_rank_;
+    // Number of ranked owners; the escape-hatch ladder has this many sacrifice rungs
     // plus the clear-all terminal.
-    std::uint32_t private_owner_count_ = 0;
-    // Private owners the escape-hatch ladder had to sacrifice for the current admission, oldest
+    std::uint32_t ranked_owner_count_ = 0;
+    // Ranked owners the escape-hatch ladder had to sacrifice for the current admission, oldest
     // first. Full eviction is reachable from incremental enumeration only inside this LRU tail.
     std::uint32_t eviction_licence_count_ = 0;
     std::vector<CandidateOptions> candidate_options;

@@ -549,7 +549,7 @@ public:
                                 std::span<const PlanningOwnerId> private_owner_ids,
                                 std::span<const FakeSharedPrefixHandle* const> shared_owners,
                                 std::span<const PlanningOwnerId> shared_owner_ids,
-                                std::span<const PlanningOwnerId> private_recency_order);
+                                std::span<const PlanningOwnerId> recency_order);
 
     FakePressurePlanningSession(FakePressurePlanningSession&&) noexcept            = default;
     FakePressurePlanningSession& operator=(FakePressurePlanningSession&&) noexcept = default;
@@ -566,7 +566,7 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] FakePressureTargetHandle
     recency_maximal_target(PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
-    [[nodiscard]] std::uint32_t private_owner_count() const;
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
     void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
@@ -644,8 +644,8 @@ private:
     std::vector<const FakeAdmissionCandidate*> candidates_;
     std::vector<PlanningCandidateId> candidate_ids_;
     std::vector<Owner> owners_;
-    std::vector<std::int32_t> private_recency_rank_;
-    std::uint32_t private_owner_count_    = 0;
+    std::vector<std::int32_t> recency_rank_;
+    std::uint32_t ranked_owner_count_    = 0;
     std::uint32_t eviction_licence_count_ = 0;
     // Mirrors the real session's LRU gate on incremental eviction.
     [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const;
@@ -765,7 +765,7 @@ public:
                             std::span<const PlanningOwnerId> private_owner_ids,
                             std::span<const FakeSharedPrefixHandle* const> shared_owners,
                             std::span<const PlanningOwnerId> shared_owner_ids,
-                            std::span<const PlanningOwnerId> private_recency_order);
+                            std::span<const PlanningOwnerId> recency_order);
 
     [[nodiscard]] PrefillWork
     shared_capture_split_prefill_work(const FakeAdmissionCandidate& candidate,
@@ -1037,7 +1037,7 @@ public:
                                     std::span<const PlanningOwnerId> private_owner_ids,
                                     std::span<const FakeSharedPrefixHandle* const> shared_owners,
                                     std::span<const PlanningOwnerId> shared_owner_ids,
-                                    std::span<const PlanningOwnerId> private_recency_order) {
+                                    std::span<const PlanningOwnerId> recency_order) {
         capture_pressure_candidate_       = std::make_unique<FakeAdmissionCandidate>();
         FakeAdmissionCandidate& candidate = *capture_pressure_candidate_;
         candidate.value.prompt_tokens     = assessment.shortlist_key.frontier;
@@ -1065,7 +1065,7 @@ public:
         return begin_pressure_planning(
             std::span<const FakeAdmissionCandidate* const>(&candidate_handle, 1), candidate_ids,
             private_owners, private_owner_ids, shared_owners, shared_owner_ids,
-            private_recency_order);
+            recency_order);
     }
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
@@ -1255,7 +1255,7 @@ FakePressurePlanningSession::FakePressurePlanningSession(
     std::span<const PlanningOwnerId> private_owner_ids,
     std::span<const FakeSharedPrefixHandle* const> shared_owners,
     std::span<const PlanningOwnerId> shared_owner_ids,
-    std::span<const PlanningOwnerId> private_recency_order)
+    std::span<const PlanningOwnerId> recency_order)
     : program_(&program), revision_(program.resource_revision()) {
     require(!candidates.empty() && candidates.size() == candidate_ids.size(),
             "fake pressure session has no candidate identity");
@@ -1275,21 +1275,21 @@ FakePressurePlanningSession::FakePressurePlanningSession(
     }
     std::sort(owners_.begin(), owners_.end(),
               [](const Owner& left, const Owner& right) { return left.id.value < right.id.value; });
-    private_recency_rank_.assign(owners_.size(), -1);
-    // `private_recency_order` is most-recent-first (like the real
-    // rank_private_owners_by_recency), so its index is the recency rank (0 = most recent) that
+    recency_rank_.assign(owners_.size(), -1);
+    // `recency_order` is most-recent-first (like the real
+    // rank_owners_by_recency), so its index is the recency rank (0 = most recent) that
     // orders the ladder sacrifice.
     for (std::size_t index = 0; index < owners_.size(); ++index) {
-        const auto found = std::find(private_recency_order.begin(), private_recency_order.end(),
+        const auto found = std::find(recency_order.begin(), recency_order.end(),
                                      owners_[index].id);
-        if (found != private_recency_order.end()) {
-            private_recency_rank_[index] =
-                static_cast<std::int32_t>(found - private_recency_order.begin());
-            ++private_owner_count_;
+        if (found != recency_order.end()) {
+            recency_rank_[index] =
+                static_cast<std::int32_t>(found - recency_order.begin());
+            ++ranked_owner_count_;
         }
     }
     program.observed_recency_ids.clear();
-    for (const PlanningOwnerId ranked : private_recency_order) {
+    for (const PlanningOwnerId ranked : recency_order) {
         for (std::size_t index = 0; index < private_owner_ids.size(); ++index) {
             if (private_owner_ids[index] == ranked) {
                 program.observed_recency_ids.push_back(private_owners[index]->id);
@@ -1298,7 +1298,7 @@ FakePressurePlanningSession::FakePressurePlanningSession(
     }
     // Mirror the real session default: the whole recency order is evictable until the
     // admission planner narrows it.
-    eviction_licence_count_ = private_owner_count_;
+    eviction_licence_count_ = ranked_owner_count_;
     options_.resize(candidates_.size());
     options_populated_.resize(candidates_.size());
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
@@ -1443,21 +1443,21 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
     return target;
 }
 
-std::uint32_t FakePressurePlanningSession::private_owner_count() const {
-    return private_owner_count_;
+std::uint32_t FakePressurePlanningSession::ranked_owner_count() const {
+    return ranked_owner_count_;
 }
 
 void FakePressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed) noexcept {
-    eviction_licence_count_ = std::min(oldest_licensed, private_owner_count_);
+    eviction_licence_count_ = std::min(oldest_licensed, ranked_owner_count_);
 }
 
 bool FakePressurePlanningSession::owner_eviction_licensed(std::uint32_t owner_index) const {
-    if (owner_index >= private_recency_rank_.size() || eviction_licence_count_ == 0) {
+    if (owner_index >= recency_rank_.size() || eviction_licence_count_ == 0) {
         return false;
     }
-    const std::int32_t rank = private_recency_rank_[owner_index];
+    const std::int32_t rank = recency_rank_[owner_index];
     if (rank < 0) { return true; }
-    return static_cast<std::uint32_t>(rank) >= private_owner_count_ - eviction_licence_count_;
+    return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_;
 }
 
 FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
@@ -1465,7 +1465,7 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
     const std::uint32_t selected       = candidate_index(candidate);
     populate_options(selected);
     const std::uint32_t demote_count =
-        sacrifice_oldest < private_owner_count_ ? private_owner_count_ - sacrifice_oldest : 0;
+        sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
     Target rung{
         .candidate_index  = selected,
         .choices          = std::vector<std::uint16_t>(owners_.size(), 0),
@@ -1474,9 +1474,9 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
     };
     for (std::size_t index = 0; index < owners_.size(); ++index) {
         const auto& alternatives = options_[selected][index];
-        const std::int32_t rank   = private_recency_rank_[index];
-        // The rung fully evicts the sacrificed (oldest, or shared) owners, keeps every other
-        // owner as it is, and demotes a kept private owner when a non-evict (demote) outcome
+        const std::int32_t rank   = recency_rank_[index];
+        // The rung fully evicts the sacrificed (oldest ranked, or unranked) owners, keeps every
+        // other owner as it is, and demotes a kept private owner when a non-evict (demote) outcome
         // exists. Keeping is choice 0: whether the sacrifice frees enough is what adoption
         // decides.
         const bool sacrificed =
@@ -1956,10 +1956,10 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
                                      std::span<const PlanningOwnerId> private_owner_ids,
                                      std::span<const FakeSharedPrefixHandle* const> shared_owners,
                                      std::span<const PlanningOwnerId> shared_owner_ids,
-                                     std::span<const PlanningOwnerId> private_recency_order) {
+                                     std::span<const PlanningOwnerId> recency_order) {
     return FakePressurePlanningSession(*this, candidates, candidate_ids, private_owners,
                                        private_owner_ids, shared_owners, shared_owner_ids,
-                                       private_recency_order);
+                                       recency_order);
 }
 
 struct FakeModelContract {
@@ -2898,12 +2898,12 @@ void test_rank_private_owners_by_recency_ranks_every_private_owner() {
     std::span<const MaterializationOwnerPolicy> policy_span(policies);
     std::span<const PlanningOwnerId> id_span(private_ids);
 
-    const auto ranked = rank_private_owners_by_recency(policy_span, id_span);
+    const auto ranked = rank_owners_by_recency(policy_span, id_span);
     require(ranked.size() == 3 && ranked[0] == PlanningOwnerId{.value = 1} &&
                 ranked[1] == PlanningOwnerId{.value = 2} &&
                 ranked[2] == PlanningOwnerId{.value = 0},
             "every private owner must be ranked by last hit epoch, most recent first");
-    require(rank_private_owners_by_recency(
+    require(rank_owners_by_recency(
                 policy_span, std::span<const PlanningOwnerId>(private_ids).first(0))
                 .empty(),
             "no private owner must rank nothing");
@@ -4015,19 +4015,20 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 // (publish_continuation cleared) so reuse can only come from the shared catalog.
 void publish_shared_prefix(FakeManager& manager, FakeProgram& program, std::uint32_t digest,
                            std::uint64_t publication_order, std::uint32_t offer_id,
-                           ninfer::SharedCandidateEvidence evidence) {
+                           ninfer::SharedCandidateEvidence evidence,
+                           std::uint32_t frontier = 64) {
     FakeRequestBasePlan base = make_base(digest);
     base.value.publish_continuation = false;
     base.cache.opportunities.push_back(FakeContextCache::Opportunity{
         .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
         .evidence = evidence,
-        .frontier = 64,
+        .frontier = frontier,
     });
     const ActiveRequest active = start_active(manager, program, digest, base, publication_order);
     program.capture_assessment = FakeCaptureAssessment{
-        .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = 64},
+        .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = frontier},
         .shared_evidence        = evidence,
-        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .protected_rebuild_work = PrefillWork{.tokens = frontier},
         .publishes_shared       = true,
         .physically_feasible    = true,
     };
@@ -4051,6 +4052,58 @@ void require_shared_reuse(FakeManager& manager, FakeProgram& program, std::uint3
                             ninfer::PrefixReusePath::SharedStablePrefix &&
                         inspection.choice->summary().reusable_prompt_tokens == 64;
     require(reused == expected, message);
+}
+
+void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
+    // Shared prefixes share the private owners' recency order and get a demote-to-host outcome,
+    // so a ladder rung sacrifices the oldest owner of either kind instead of destroying every
+    // shared prefix unconditionally. The shared prefix is published at the fake's finish frontier
+    // because the fake pressure assessment reports every owner's checkpoint at that frontier.
+    const auto run = [](bool shared_first) {
+        FakeManager manager = make_manager(1, 4, 1);
+        FakeProgram program;
+        std::uint64_t order = 1;
+        if (shared_first) {
+            publish_shared_prefix(manager, program, 71, order++, 1,
+                                  ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                                  program.finish_frontier);
+        }
+        const ActiveRequest a = start_active(manager, program, 161, make_base(161), order++);
+        (void)finish_active(manager, program, a);
+        const ActiveRequest b = start_active(manager, program, 162, make_base(162), order++);
+        (void)finish_active(manager, program, b);
+        if (!shared_first) {
+            publish_shared_prefix(manager, program, 71, order++, 1,
+                                  ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                                  program.finish_frontier);
+        }
+        const ActiveRequest c = start_active(manager, program, 163, make_base(163), order++);
+        (void)finish_active(manager, program, c);
+
+        program.ladder_feasibility_mode        = true;
+        program.min_feasible_sacrifice         = 1;
+        program.required_pressure_actions      = 16;  // above the search's max pressure
+        program.eviction_pressure_action_units = 1;
+        program.private_pressure_alternatives  = 1;
+        auto inspection = manager.inspect(program, FakePreparedPrompt{164}, make_base(164), order);
+        require(inspection.choice.has_value(), "escape-hatch recency ladder found no rung");
+        program.abort_start = true;
+        (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                              FakePreparedPrompt{164}, {});
+        const auto private_evicted = [&program](const ActiveRequest& request) {
+            return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                             2000U + request.sequence.id) != program.started_action_ids.end();
+        };
+        const bool shared_evicted =
+            std::any_of(program.started_action_ids.begin(), program.started_action_ids.end(),
+                        [](std::uint64_t id) { return id >= 4000U && id < 5000U; });
+        return std::array<bool, 4>{shared_evicted, private_evicted(a), private_evicted(b),
+                                   private_evicted(c)};
+    };
+    require(run(false) == std::array<bool, 4>{false, true, false, false},
+            "rung destroyed a recent shared prefix instead of the oldest private owner");
+    require(run(true) == std::array<bool, 4>{true, false, false, false},
+            "rung did not sacrifice the oldest owner when it was a shared prefix");
 }
 
 void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {
@@ -4192,6 +4245,8 @@ int main() {
              test_incremental_eviction_is_licensed_by_the_lru_tail);
     run_test("escape hatch sacrifices oldest first and demotes the rest",
              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
+    run_test("escape hatch ranks shared prefixes with private owners",
+             test_escape_hatch_ranks_shared_prefixes_with_private_owners);
     run_test("escape hatch clears all when nothing fits",
              test_escape_hatch_clears_all_when_nothing_fits);
     run_test("escape hatch ladder fits the committed target budget",

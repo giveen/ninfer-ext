@@ -748,10 +748,11 @@ Materialization 与 shared capture 使用两个 typed entrypoint。Materializati
 identity，或 escape-hatch recency ladder 中「sacrifice 最少且可 adoption」的一级 rung，或 root maximal
 （clear-all，liveness backstop）；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
 
-Escape-hatch rung 按 private owner 的 recency（最近一次命中或发布优先——刚发布、尚未被命中的
-continuation 也算最近使用；tie 保持 catalog 顺序）排名：rung k 完全
-evict 最旧的 k 个 private owner 与全部 shared owner，其余 owner 保持不变——其中仍可由 Host 承载的 private
-owner 通过 demote-to-host 释放 device KV 并保留 host copy。Rung 只有在 *physical 可行且 logical adoption
+Escape-hatch rung 把 private owner 与 shared owner 放进同一个 recency 排名（最近一次命中或发布优先——
+刚发布、尚未被命中的 continuation 或 shared prefix 也算最近使用；tie 保持输入顺序）：rung k 完全 evict
+最旧的 k 个 owner，其余 owner 保持不变——其中仍可由 Host 承载的 owner（private 或 shared）通过
+demote-to-host 释放 device 资源并保留 host copy。Shared prefix 不再被每一级 rung 无条件销毁：一个仍被
+新会话频繁命中的 shared prefix 会比闲置的会话活得更久。Rung 只有在 *physical 可行且 logical adoption
 成功* 时才算数，因此 publication-only 这类物理上放得下、但需要一个 released owner 的 admission 也能找到
 最小 sacrifice；没有 host tier 的池同样能表达「evict 最旧的 k 个、其余保留」。该最小 sacrifice 同时 licence
 增量搜索：incremental enumeration 只能完全 evict 这条 LRU tail，tail 之外的 owner 只能被 demote/degrade/

@@ -42,19 +42,20 @@ struct MaterializationOwnerPolicy {
     bool explicit_shared_credit            = false;
 };
 
-// Every private conversation prefix, most recently used first (`last_hit_epoch` descending, ties
-// keep catalog order). For an owner policy `last_hit_epoch` is the owner's recency epoch: the
+// The given pressure owners (the ResourceManager passes every private conversation prefix and
+// every shared prefix), most recently used first (`last_hit_epoch` descending, ties keep input
+// order). For an owner policy `last_hit_epoch` is the owner's recency epoch: the
 // later of its newest checkpoint hit and its last publication, so a continuation that has just
 // been published ranks as recent even though none of its checkpoints has been hit yet. The order
 // is the retention tier's recency ranking: the escape-hatch ladder sacrifices a suffix of it
 // (oldest first), and incremental eviction is licensed only inside the suffix the ladder had to
 // give up.
 template <class Policy>
-[[nodiscard]] inline std::vector<PlanningOwnerId> rank_private_owners_by_recency(
-    std::span<const Policy> policies, std::span<const PlanningOwnerId> private_owner_ids) {
+[[nodiscard]] inline std::vector<PlanningOwnerId> rank_owners_by_recency(
+    std::span<const Policy> policies, std::span<const PlanningOwnerId> owner_ids) {
     std::vector<std::pair<std::uint64_t, PlanningOwnerId>> ranked;
-    ranked.reserve(private_owner_ids.size());
-    for (const PlanningOwnerId owner : private_owner_ids) {
+    ranked.reserve(owner_ids.size());
+    for (const PlanningOwnerId owner : owner_ids) {
         const auto policy =
             std::find_if(policies.begin(), policies.end(),
                          [owner](const Policy& candidate) { return candidate.owner == owner; });
@@ -100,7 +101,8 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const MaterializationOwnerPolicy> owner_policy;
         std::span<const MaterializationCheckpointPolicy> checkpoint_policy;
-        // Private owners ranked by recency (latest hit or publication), most recent first.
+        // Private and shared owners ranked by recency (latest hit or publication), most recent
+        // first.
         std::span<const PlanningOwnerId> recency_owner_ids;
     };
 
@@ -268,22 +270,22 @@ public:
         // Arena targets interned by the escape-hatch ladder (one per rung) that the
         // optional-target budget must account for; zero when the identity target is feasible.
         std::uint32_t ladder_targets = 0;
-        // Private owners the ladder had to sacrifice, oldest first; the incremental search may
+        // Ranked owners the ladder had to sacrifice, oldest first; the incremental search may
         // fully evict an owner only inside this LRU tail.
         std::uint32_t eviction_licence = 0;
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            // Escape hatch: find the smallest count of oldest private prefixes that must be
-            // evicted for the rung to be adoptable; the remaining more recent private prefixes are
-            // kept, freeing their device KV through a demote-to-host outcome wherever Host can
-            // take them, and every shared owner is evicted. Sacrificing one more oldest prefix can
-            // only free more device and host capacity, so adoptability is monotonic non-decreasing
-            // in the sacrifice count. Binary-search the smallest adoptable count in O(log P)
-            // projections; if even the top rung (sacrifice every private owner) cannot fit, the
-            // terminal clear-all target (evict everything) is the guaranteed liveness backstop.
-            const std::uint32_t ranked = session.private_owner_count();
+            // Escape hatch: find the smallest count of oldest prefixes (private and shared share
+            // one recency order) that must be evicted for the rung to be adoptable; the remaining
+            // more recent prefixes are kept, freeing their device resources through a
+            // demote-to-host outcome wherever Host can take them. Sacrificing one more oldest
+            // prefix can only free more device and host capacity, so adoptability is monotonic
+            // non-decreasing in the sacrifice count. Binary-search the smallest adoptable count in
+            // O(log R) projections; if even the top rung (sacrifice every ranked owner) cannot fit,
+            // the terminal clear-all target (evict everything) is the guaranteed liveness backstop.
+            const std::uint32_t ranked = session.ranked_owner_count();
             const std::uint32_t ladder_remaining_before = session.optional_targets_remaining();
             std::uint32_t lo = 0, hi = ranked;   // smallest feasible count in [lo, hi)
             while (lo < hi) {
@@ -312,7 +314,7 @@ public:
             PressureTargetHandle escape;
             std::optional<AssessedPressureTarget> assessed;
             if (lo < ranked) {
-                // Smallest sacrifice count that fits; the more recent private prefixes stay on
+                // Smallest sacrifice count that fits; the more recent prefixes stay on
                 // host.
                 escape = session.recency_maximal_target(candidates[root_candidate_index].id, lo);
                 assessed = session.assess(escape);

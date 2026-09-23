@@ -716,7 +716,7 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
-                    .last_hit_epoch           = entry.observation.last_hit_epoch,
+                    .last_hit_epoch           = shared_recency_epoch(entry),
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
@@ -782,10 +782,10 @@ public:
                             owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
                     }
                 }
-                std::vector<PlanningOwnerId> recency_owner_ids =
-                    rank_private_owners_by_recency(
-                        std::span<const typename CapturePlanner::OwnerPolicy>(owner_policies),
-                        std::span<const PlanningOwnerId>(private_owner_ids));
+                std::vector<PlanningOwnerId> recency_owner_ids = rank_pressure_owners(
+                    std::span<const typename CapturePlanner::OwnerPolicy>(owner_policies),
+                    std::span<const PlanningOwnerId>(private_owner_ids),
+                    std::span<const PlanningOwnerId>(shared_owner_ids));
                 const typename CapturePlanner::Input input{
                     .capture             = &scenario.assessment,
                     .private_owners      = private_owners,
@@ -1259,6 +1259,8 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        // Retention epoch at which this prefix was published; see CatalogEntry::last_touch_epoch.
+        std::uint64_t last_touch_epoch = 0;
     };
 
     enum class SessionIndexState : std::uint8_t {
@@ -1662,6 +1664,7 @@ private:
         entry.transaction_pins    = 0;
         entry.explicit_credit     = false;
         entry.credit_expiry_epoch = 0;
+        entry.last_touch_epoch    = 0;
         advance_revision(entry.revision);
     }
 
@@ -1777,6 +1780,27 @@ private:
 
     void touch_catalog_entry(CatalogEntry& entry) noexcept {
         entry.last_touch_epoch = ++retention_epoch_;
+    }
+
+    [[nodiscard]] static std::uint64_t
+    shared_recency_epoch(const SharedCatalogEntry& entry) noexcept {
+        return std::max(entry.observation.last_hit_epoch, entry.last_touch_epoch);
+    }
+
+    // One recency order over every pressure owner, private and shared alike. Shared prefixes used
+    // to sit outside it and every escape-hatch rung evicted all of them; ranking them with the
+    // private owners lets a recently hit shared prefix outlive an idle conversation and be
+    // demoted to Host like one.
+    template <class Policy>
+    [[nodiscard]] static std::vector<PlanningOwnerId>
+    rank_pressure_owners(std::span<const Policy> policies,
+                         std::span<const PlanningOwnerId> private_owner_ids,
+                         std::span<const PlanningOwnerId> shared_owner_ids) {
+        std::vector<PlanningOwnerId> owners;
+        owners.reserve(private_owner_ids.size() + shared_owner_ids.size());
+        owners.insert(owners.end(), private_owner_ids.begin(), private_owner_ids.end());
+        owners.insert(owners.end(), shared_owner_ids.begin(), shared_owner_ids.end());
+        return rank_owners_by_recency(policies, std::span<const PlanningOwnerId>(owners));
     }
 
     template <class SplitCostFn>
@@ -2112,7 +2136,7 @@ private:
                     .owner                    = owner,
                     .retention_class          = RetentionClass::SharedStable,
                     .selected_hit_count       = entry.observation.selected_hit_count,
-                    .last_hit_epoch           = entry.observation.last_hit_epoch,
+                    .last_hit_epoch           = shared_recency_epoch(entry),
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
@@ -2136,9 +2160,10 @@ private:
                 });
             }
 
-            recency_owner_ids = rank_private_owners_by_recency(
+            recency_owner_ids = rank_pressure_owners(
                 std::span<const MaterializationOwnerPolicy>(owner_policies),
-                std::span<const PlanningOwnerId>(private_owner_ids));
+                std::span<const PlanningOwnerId>(private_owner_ids),
+                std::span<const PlanningOwnerId>(shared_owner_ids));
             return typename Planner::PressureInputs{
                 .private_owners      = private_owners,
                 .private_owner_ids   = private_owner_ids,
@@ -3255,6 +3280,7 @@ private:
             publication.handle.emplace(std::move(result.shared->handle));
             publication.observation =
                 RetentionObservation{.retention_class = RetentionClass::SharedStable};
+            publication.last_touch_epoch = ++retention_epoch_;
             publication.transaction_pins = 0;
             publication.explicit_credit =
                 has_shared_candidate_evidence(record->shared_evidence,
