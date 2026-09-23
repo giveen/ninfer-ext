@@ -295,7 +295,8 @@ public:
         // with shared and private owners in one order, a catalog-slot shortage that only a released
         // private owner can relieve would otherwise also destroy every older shared prefix in the
         // tail. Each sacrificed owner is therefore tried as spared, most recent first, and stays
-        // spared (left exactly as it is) whenever the rung remains adoptable without it.
+        // spared (treated like any other kept owner) whenever the rung remains adoptable without
+        // it.
         enum class RungFit : std::uint8_t { Adoptable, LogicallyShort, PhysicallyShort };
         struct LadderRung {
             std::uint32_t sacrifice = 0;
@@ -340,7 +341,11 @@ public:
                     lo = mid + 1U;
                 }
             }
-            if (lo >= ranked) { return std::nullopt; }
+            // The top rung (every ranked owner sacrificed) is still a rung: when the owner the
+            // admission needs released is the most recent one, it is the only adoptable count, and
+            // sparing then keeps every older owner the admission does not need. Only when even it
+            // cannot be adopted does the caller fall back to the clear-all backstop.
+            if (lo == ranked && (ranked == 0 || !adoptable_any(ranked))) { return std::nullopt; }
             LadderRung rung;
             rung.sacrifice   = lo;
             rung.demote_kept = demote_adoptable[lo] >= 0
@@ -349,9 +354,17 @@ public:
             for (std::uint32_t rank = ranked - lo; rank < ranked; ++rank) {
                 if (session.optional_targets_remaining() == 0) { break; }
                 rung.spared.push_back(rank);
-                if (rung_fit(id, lo, rung.spared, rung.demote_kept) != RungFit::Adoptable) {
-                    rung.spared.pop_back();
+                const RungFit fit = rung_fit(id, lo, rung.spared, rung.demote_kept);
+                if (fit == RungFit::Adoptable) { continue; }
+                // Keeping one more owner can be what makes the demote variant physically short
+                // (Host cannot take them all) while leaving the kept owners in place still fits.
+                if (fit == RungFit::PhysicallyShort && rung.demote_kept &&
+                    session.optional_targets_remaining() != 0 &&
+                    rung_fit(id, lo, rung.spared, false) == RungFit::Adoptable) {
+                    rung.demote_kept = false;
+                    continue;
                 }
+                rung.spared.pop_back();
             }
             return rung;
         };

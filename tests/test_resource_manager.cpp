@@ -1504,6 +1504,9 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
         const bool spared  = in_tail && rank >= 0 &&
                             std::find(spared_ranks.begin(), spared_ranks.end(),
                                       static_cast<std::uint32_t>(rank)) != spared_ranks.end();
+        // A spared owner stays at the baseline here. (The real session demotes it with the other
+        // kept owners; this fake's expansion ignores the eviction licence, so a costlier spared
+        // owner would let it reach evictions the real search cannot.)
         std::uint16_t choice = static_cast<std::uint16_t>(alternatives.size());
         if (spared) {
             choice = 0U;

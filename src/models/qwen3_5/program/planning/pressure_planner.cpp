@@ -591,12 +591,10 @@ qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::recency_maximal_targe
         // Keeping an owner is a legal rung outcome: whether the sacrifice frees enough device and
         // host capacity is what the rung's adoption check decides, so a pool without a host tier
         // can still express "evict the k oldest and keep the rest" instead of clearing everything.
-        // A spared owner is left exactly as it is: it was spared because the rung does not need
-        // its resources, so moving it would only add work and host pressure.
+        // A spared owner is treated like any other kept owner: demoted with them, or left in
+        // place with them.
         std::uint16_t choice = victim.eviction_choice;
-        if (spared) {
-            choice = 0U;
-        } else if (!in_tail) {
+        if (spared || !in_tail) {
             choice = demote_kept && victim.preserve_choice != 0 ? victim.preserve_choice : 0U;
         }
         choice_scratch.push_back(choice);
