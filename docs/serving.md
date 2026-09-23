@@ -31,6 +31,15 @@ With `C=2` and two extra Device checkpoint slots, the process owns two active St
 plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
 pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
 
+`--host-state-slots` and `--host-kv-mib` are independent allocations, so their sum — not
+`--host-kv-mib` alone — is the Host RAM the process pins: a Host StateImage costs one
+`memory.host_state_image_bytes` regardless of the prefix depth it resumes. `--host-cache-mib N`
+replaces both with a single ceiling: the engine sizes the Host state pool from the checkpoint
+inventory the capture path creates, `(2 + max-long-anchors-per-continuation) * private
+continuations + shared prefixes` images, gives Host KV the remaining bytes, and refuses to start if
+that state footprint would exceed half the budget. Both unit costs and the derived split are
+reported in the `server_start` memory ledger.
+
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
@@ -861,6 +870,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-cache-mib N` | single pinned Host RAM ceiling for the whole retention tier in MiB; the engine derives the Host StateImage slot count from the configured checkpoint inventory and gives Host KV the remainder. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. | unset (component flags used) |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation; the engine anchors the last N message boundaries automatically | `4` |
