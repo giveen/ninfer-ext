@@ -28,6 +28,7 @@ struct FrontendOptions {
     // Per-continuation long-anchor capacity L. When nonzero, preparation synthesizes
     // engine-automatic PrivateLongAnchor opportunities at the last L message boundaries so a
     // later history rewrite diverging there resumes from the retained anchor instead of root.
+    // The Engine may raise it after startup through Frontend::publish_long_anchor_limit.
     std::uint32_t max_long_anchors_per_continuation = 0;
 };
 
@@ -82,6 +83,10 @@ public:
                         const ThinkingControlOptions& thinking = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence
+    // plan exists, so the Engine hands the host-cache-resolved value to the grid the capture path
+    // will create checkpoints for, before any request is prepared.
+    void publish_long_anchor_limit(std::uint32_t anchors) noexcept;
 
 private:
     class Impl;

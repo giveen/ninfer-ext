@@ -42,8 +42,14 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
-    std::size_t bytes            = 0;
-    std::size_t kv_payload_bytes = 0;
+    // Pinned Host cost of one complete Main Text KV page group, taken from the same planned
+    // geometry the Device pool binds. The Host RAM budget compares one StateImage against the Main
+    // pages a re-prefill of the gap it covers would pin, and that comparison is denominated in
+    // Main Text pages: the stride's plane inventory (and therefore its group-scale term) follows
+    // --kv-dtype, so it is carried rather than re-derived from configuration.
+    std::size_t host_kv_text_page_stride = 0;
+    std::size_t bytes                    = 0;
+    std::size_t kv_payload_bytes         = 0;
 };
 
 struct VisionWorkspacePlan {
@@ -130,5 +136,26 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);
+
+// Resolves the single Host RAM budget into the plan's context-cache shape: one StateImage per
+// position it retains and Host KV for everything else. StateImages are the fixed per-position cost
+// of a checkpoint and Host KV the per-token cost, so the budget first covers the inventory the
+// capture path creates — 2 + A images per private owner plus one per shared entry — then spends
+// the remaining StateImage headroom under the half-budget cap on extra long anchors per owner, and
+// gives Host KV the remainder. Growing A without re-sizing the pool in the same pass would leave
+// the Host StateImage pool undersized for the anchors the capture path then creates, so both are
+// resolved together.
+//
+// A never drops below the configured count (or the default when unset): the budget adds anchors,
+// it does not remove them. One extra anchor pays for itself only while the gap it covers exceeds
+// the Main KV pages one StateImage is worth, which bounds the useful count by the logical page
+// space; when even the mandatory inventory exceeds half the budget, the configured count is kept
+// so the caller's rejection reports the real shortfall.
+//
+// `state_image_bytes` is one complete Host StateImage, `host_kv_group_bytes` one Main Text Host KV
+// page group, and the capacities are the already-normalized private/shared continuation catalogs.
+void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private_capacity,
+                               std::uint32_t shared_capacity, std::uint32_t capacity,
+                               std::uint64_t state_image_bytes, std::uint64_t host_kv_group_bytes);
 
 } // namespace ninfer::models::qwen3_5::detail

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstddef>
@@ -652,7 +653,10 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
-    std::uint32_t max_long_anchors_per_continuation = 0;
+    // Startup-fixed, published once through Frontend::publish_long_anchor_limit while the Engine
+    // is still single-threaded; atomic so the request threads that read it see the published value
+    // without a data race on a const shared implementation.
+    mutable std::atomic<std::uint32_t> max_long_anchors_per_continuation{0};
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -712,6 +716,10 @@ Frontend::~Frontend()                              = default;
 
 const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
+}
+
+void Frontend::publish_long_anchor_limit(std::uint32_t anchors) noexcept {
+    impl_->max_long_anchors_per_continuation.store(anchors, std::memory_order_relaxed);
 }
 
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
@@ -838,7 +846,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()),
-        impl_->max_long_anchors_per_continuation);
+        impl_->max_long_anchors_per_continuation.load(std::memory_order_relaxed));
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

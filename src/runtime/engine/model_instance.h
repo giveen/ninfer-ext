@@ -33,6 +33,11 @@ struct ConstructedModel {
     LoadSummary load;
     ModelMetadata model_metadata;
     ContextMachineCostModel context_cost;
+    // The options this instance was built from, with any value the model had to resolve (today the
+    // single host RAM budget's Host split and long-anchor count) replaced by what the plan actually
+    // uses. Carrying it keeps the Engine's copy, its ResourceManager and the frontend grid on one
+    // resolved value instead of a plan that silently differs from the reported options.
+    EngineOptions options;
 };
 
 [[nodiscard]] ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device);

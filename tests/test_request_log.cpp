@@ -134,6 +134,7 @@ int main() {
     memory.host_state_capacity_slots         = 3;
     memory.host_state_occupied_slots         = 1;
     memory.host_state_image_bytes            = 195897344;
+    memory.host_kv_page_group_bytes          = 4194304;
     memory.host_cache_budget_bytes           = 24ULL << 20;
     memory.host_kv_capacity_bytes            = 12ULL << 20;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
@@ -245,6 +246,7 @@ int main() {
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
                           server.at("memory").at("host_state_occupied_slots") == 1 &&
                           server.at("memory").at("host_state_image_bytes") == 195897344 &&
+                          server.at("memory").at("host_kv_page_group_bytes") == 4194304 &&
                           server.at("memory").at("host_cache_budget_bytes") == (24ULL << 20) &&
                           server.at("memory").at("host_kv_capacity_bytes") == (12ULL << 20) &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),

@@ -159,6 +159,10 @@ public:
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    // The context-cache shape this plan was frozen with. An engaged host RAM budget has already
+    // resolved the Host state slots, Host KV bytes and long-anchor count here, so a reader that
+    // reports or enforces capacity must take them from the plan rather than from raw options.
+    [[nodiscard]] const ContextCacheOptions& context_cache_options() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.

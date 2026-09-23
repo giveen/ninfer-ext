@@ -37,6 +37,11 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
+    static const ContextCacheOptions empty;
+    return impl_ != nullptr ? impl_->context_cache : empty;
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 

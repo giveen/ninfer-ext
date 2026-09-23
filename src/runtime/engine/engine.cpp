@@ -156,6 +156,11 @@ public:
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = runtime::construct_model(options, device);
+        // construct_model returns the resolved options for this instance. Anything the model had
+        // to derive (the single host RAM budget's Host split and long-anchor count) is only known
+        // after planning, so the Engine adopts the resolved copy here — before the core that
+        // sizes its admission capacity from it exists — and reports it through options().
+        options           = std::move(constructed.options);
         active            = std::move(constructed.instance);
         load              = std::move(constructed.load);
         model_metadata    = std::move(constructed.model_metadata);
