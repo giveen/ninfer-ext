@@ -897,20 +897,24 @@ public:
         if (!sealed) {
             // The selected preserving target lost its allocation to a concurrent demote
             // between assess and seal (or the seal window was never claimed). Fall back to the
-            // root-maximal eviction target, which needs no host and is always sealable, so the
-            // re-touch re-prefills instead of failing admission.
+            // root-maximal eviction target so the re-touch re-prefills instead of failing
+            // admission.
             const PressureTargetHandle root =
                 session.root_maximal_target(candidates[incumbent.candidate_index].id);
             AssessedPressureTarget root_assessed = session.assess(root);
-            if (root_assessed.assessment().physical_status !=
+            if (root_assessed.assessment().physical_status ==
                 MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("eviction fallback target lost feasibility");
+                sealed = session.seal(std::move(root_assessed), prompt,
+                                      FinalScheduleIntent{.shared_capture_frontiers =
+                                                              shared_frontiers});
             }
-            sealed = session.seal(std::move(root_assessed), prompt,
-                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-            if (!sealed) {
-                throw std::logic_error("eviction fallback target could not be sealed");
-            }
+            // The clear-all target is not always sealable either: while another lane's pressure
+            // transition is still moving pages it can fail the same revalidation. That is a
+            // transient resource race, not a broken invariant, so this admission yields no choice
+            // now and is re-planned on a later scheduling pass, exactly like any other admission
+            // that does not fit yet. Throwing here escaped to the worker loop and failed every
+            // request (private-checkpoint-pressure scenario).
+            if (!sealed) { return std::nullopt; }
             incumbent.root_maximal = true;
         }
         // The seal (and any fallback) is committed; release the claim so a concurrent
