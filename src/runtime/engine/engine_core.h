@@ -1903,6 +1903,23 @@ private:
         publish_runtime_stats();
     }
 
+    // A sequence whose Device KV lease can no longer grow finishes at the frontier its lease
+    // covers. Bound its remaining budget now so that finish carries the request's generation
+    // limit reason, instead of the sequence running past its lease and failing a launch.
+    void apply_device_kv_lease_settlements() {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr || !request->is_decode_ready() || !request->sequence ||
+                !request->budget) {
+                continue;
+            }
+            const std::uint32_t control = request->output.control_suffix_tokens();
+            const std::optional<std::uint32_t> limit =
+                instance_.program->device_kv_lease_settlement_tokens(*request->sequence, control);
+            if (limit) { request->budget->cap_remaining(*limit); }
+        }
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2089,6 +2106,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                apply_device_kv_lease_settlements();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =

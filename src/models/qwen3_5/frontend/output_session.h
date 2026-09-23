@@ -62,6 +62,9 @@ public:
     [[nodiscard]] std::uint32_t
     model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
     [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
+    // Tokens of the thinking-control suffix which may still be forced through the output budget.
+    // Zero once this session can no longer apply one.
+    [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept;
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;

@@ -577,6 +577,16 @@ std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept 
     return *impl_->thinking_control_tokens;
 }
 
+std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
+    if (impl_ == nullptr || !impl_->thinking_control_tokens || !impl_->semantic.budget ||
+        impl_->semantic.applied) {
+        return 0;
+    }
+    return impl_->semantic.control_pending || impl_->semantic.in_reasoning
+               ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
+               : 0U;
+}
+
 runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> tokens,
                                                        std::uint32_t total_budget_remaining) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }

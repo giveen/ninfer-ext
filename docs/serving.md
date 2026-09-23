@@ -1042,8 +1042,12 @@ pool used by active requests and retained prefixes. `auto` accounts for the comp
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
 
-Admission reserves the full prompt-plus-effective-output page entitlement through request
-completion. A request remains queued until a legal resource plan can satisfy that entitlement.
+Admission reserves a bounded Device KV window over the request's remaining output and extends it at
+each decode-round boundary; the window is never the whole `max_tokens` budget, so a client that asks
+for far more output than it generates does not hold the prefix cache out of the pool. A request
+remains queued until a legal resource plan can satisfy its prompt plus that window. If the pool can
+no longer extend the window, the request completes at the frontier its window covers and reports
+`finish_reason=length`.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

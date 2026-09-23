@@ -968,6 +968,15 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    // The Device KV lease of an active sequence is extended on demand at a decode-round boundary.
+    // When the pool can no longer extend it, the sequence finishes at the frontier its lease
+    // covers with its generation limit reason instead of failing a launch on coverage: this
+    // reports how many further model tokens that finish licenses, so the caller can bound the
+    // sequence's remaining generation budget. `forced_span_tokens` is the largest forced control
+    // span the caller may still apply through the same budget. Absent while the lease can grow.
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;

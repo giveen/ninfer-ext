@@ -444,10 +444,11 @@ Active truncate 或 speculative rollback 可以解除 mappings，但对应容量
 只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
 
 Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
-exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
-再次计费：它若由其他 surviving owner 保留则只存在于全局 physical occupancy，若由 active lineage 的
-optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
-Fork 错判为超出 active guarantee。
+exclusive optional resources。私有增长 reservation 是按需扩充的有界 Device page window，而不是 request
+尚未取得的整个 output budget（见 [Paged KV cache](paged-kv-cache.md) §6.2）。Fork 期间借用的 immutable
+StateImage/KV source 不能通过 primary binding 再次计费：它若由其他 surviving owner 保留则只存在于全局
+physical occupancy，若由 active lineage 的 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一
+allocation 会被重复收费，并把合法的 Fork 错判为超出 active guarantee。
 
 ### 6.2 Terminal 与 capture
 

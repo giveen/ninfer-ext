@@ -476,6 +476,11 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->f
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
 
+std::optional<std::uint32_t> Program::device_kv_lease_settlement_tokens(
+    SequenceHandle sequence, std::uint32_t forced_span_tokens) const noexcept {
+    return impl_->device_kv_lease_settlement_tokens(sequence, forced_span_tokens);
+}
+
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));
 }

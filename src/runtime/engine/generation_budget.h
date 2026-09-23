@@ -26,6 +26,12 @@ public:
         remaining_ -= tokens;
     }
 
+    // Narrows the licensed output to a bounded completion. The limit reason is already the one
+    // this budget would report when it runs out.
+    void cap_remaining(std::uint32_t limit) noexcept {
+        if (limit < remaining_) { remaining_ = limit; }
+    }
+
 private:
     std::uint32_t remaining_   = 0;
     FinishReason limit_reason_ = FinishReason::None;
