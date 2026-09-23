@@ -24,8 +24,9 @@ struct ContextPortfolioCheckpointValue {
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
     std::uint64_t target_recovery_ns   = 0;
-    // The incoming request cannot reach this checkpoint's frontier, so it is not a hit the owner
-    // can be credited with retaining.
+    // The incoming request continues this checkpoint's own lineage (same session) and diverges
+    // from it, so no later prompt of that conversation can reuse it (issue #178). Only then is it
+    // worth nothing; a checkpoint that merely cannot serve this request keeps its value.
     bool unreachable = false;
 };
 
