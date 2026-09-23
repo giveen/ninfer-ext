@@ -253,6 +253,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
+        } else if (arg == "--long-anchor-spacing") {
+            options.context_cache.long_anchor_min_spacing_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--long-anchor-spacing"),
+                                      "long-anchor-spacing"));
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {

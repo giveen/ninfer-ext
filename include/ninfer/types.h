@@ -153,6 +153,12 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Minimum token gap between the engine-automatic long anchors of one request, doubling per
+    // anchor walking back from the prompt end (gap k >= spacing * 2^k). Anchors closer than that
+    // cost a prefill split and a full StateImage each while covering little the endpoint and
+    // rewrite checkpoints do not, so the grid is sparse near the end and reaches deep history.
+    // Zero disables the spacing rule (every one of the last L message boundaries is anchored).
+    std::uint32_t long_anchor_min_spacing_tokens = 1024;
 };
 
 struct ContextCostOptions {

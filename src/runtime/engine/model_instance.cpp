@@ -152,7 +152,9 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .media_preprocess_threads = options.media_preprocess_threads,
                                .max_long_anchors_per_continuation =
                                    options.context_cache.max_long_anchors_per_continuation.value_or(
-                                       0U)})),
+                                       0U),
+                               .long_anchor_min_spacing_tokens =
+                                   options.context_cache.long_anchor_min_spacing_tokens})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

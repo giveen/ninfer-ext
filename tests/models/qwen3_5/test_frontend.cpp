@@ -1506,6 +1506,80 @@ int test_engine_automatic_long_anchor_opportunities() {
     return failures;
 }
 
+int test_engine_automatic_long_anchor_spacing() {
+    // With a spacing S, walking back from the prompt end a boundary joins the anchor grid only
+    // when it lies at least S * 2^k below the previous grid point (k = anchors already placed).
+    // Oracle: the unspaced run anchors every interior boundary; the spaced run must equal the
+    // greedy selection over those boundaries.
+    const auto make = [](std::uint32_t spacing) {
+        ninfer::models::qwen3_5::FrontendOptions options;
+        options.vision_enabled                    = false;
+        options.max_context                       = std::numeric_limits<std::uint32_t>::max();
+        options.max_long_anchors_per_continuation = 16;
+        options.long_anchor_min_spacing_tokens    = spacing;
+        return make_frontend(resources(), options);
+    };
+    const auto prompt = [] {
+        ninfer::PromptInput input;
+        std::string long_text;
+        for (int index = 0; index < 200; ++index) { long_text += "alpha "; }
+        const std::array<std::string, 9> turns{long_text, "short one", "short two",
+                                               std::string(120, 'b'), "short three",
+                                               "short four", "short five", "short six",
+                                               "final question"};
+        for (const std::string& text : turns) {
+            ninfer::ChatMessage message;
+            message.role = ninfer::ChatRole::User;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+            input.messages.push_back(std::move(message));
+        }
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto anchors_of = [](const ninfer::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        std::sort(frontiers.begin(), frontiers.end());
+        return frontiers;
+    };
+
+    int failures = 0;
+    const Frontend unspaced_frontend = make(0);
+    const auto unspaced              = unspaced_frontend.prepare(prompt());
+    const auto& unspaced_data        = FrontendFactory::inspect(unspaced);
+    const std::vector<std::uint32_t> boundaries = anchors_of(unspaced_data);
+    failures +=
+        check(boundaries.size() >= 8, "unspaced run did not anchor every interior boundary");
+
+    constexpr std::uint32_t kSpacing = 8;
+    std::vector<std::uint32_t> expected;
+    std::uint32_t grid_point = static_cast<std::uint32_t>(unspaced_data.token_ids.size());
+    std::uint64_t spacing    = kSpacing;
+    for (auto it = boundaries.rbegin(); it != boundaries.rend(); ++it) {
+        if (grid_point - *it < spacing) { continue; }
+        expected.push_back(*it);
+        grid_point = *it;
+        spacing *= 2U;
+    }
+    std::sort(expected.begin(), expected.end());
+
+    const Frontend spaced_frontend = make(kSpacing);
+    const auto spaced              = spaced_frontend.prepare(prompt());
+    const std::vector<std::uint32_t> anchors = anchors_of(FrontendFactory::inspect(spaced));
+    failures += check(anchors == expected,
+                      "spaced anchors do not follow the geometric grid from the prompt end");
+    // The prompt is a few hundred tokens and the spacing reaches 8 * 2^8 tokens within nine
+    // anchors, so the grid must skip some of the short tail messages.
+    failures += check(!anchors.empty() && anchors.size() < boundaries.size(),
+                      "spacing did not thin the anchor grid");
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -2428,6 +2502,7 @@ int main() {
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_engine_automatic_long_anchor_opportunities();
+    failures += test_engine_automatic_long_anchor_spacing();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);

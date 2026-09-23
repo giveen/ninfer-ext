@@ -412,7 +412,7 @@ PreparedContextCache prepare_context_cache(
     std::span<const std::optional<std::uint32_t>> cache_boundaries,
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
-    std::uint32_t max_long_anchors) {
+    std::uint32_t max_long_anchors, std::uint32_t long_anchor_min_spacing) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
@@ -542,19 +542,30 @@ PreparedContextCache prepare_context_cache(
                         SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
                         engine_order);
     }
-    // Engine-automatic private long anchors: the last L message boundaries are the sparse grid
-    // where history rewrites diverge. A request matching an earlier boundary resumes from the
-    // retained anchor instead of root. A boundary already carried as an opportunity (explicit
-    // marker or engine shared candidate) keeps its existing opportunity and still occupies its
-    // grid position, so a marker never displaces a deeper engine anchor; a boundary at the full
-    // prompt frontier is redundant with the session endpoint.
-    std::size_t grid_positions = 0;
+    // Engine-automatic private long anchors: message boundaries are the sparse grid where history
+    // rewrites diverge. A request matching an earlier boundary resumes from the retained anchor
+    // instead of root. Walking back from the prompt end, a boundary joins the grid only when it
+    // lies at least the current spacing below the previous grid point (the prompt end first), and
+    // the spacing doubles with every grid point: tool-loop turns of a few hundred tokens would
+    // otherwise put every anchor next to the endpoint, each costing a prefill split and a full
+    // StateImage for almost no coverage, while deep history stayed unanchored. A boundary already
+    // carried as an opportunity (explicit marker or engine shared candidate) keeps its existing
+    // opportunity and still occupies its grid position, so a marker never displaces a deeper
+    // engine anchor; a boundary at the full prompt frontier is redundant with the session
+    // endpoint.
+    std::size_t grid_positions   = 0;
+    std::uint32_t grid_point     = full_prompt_frontier;
+    std::uint64_t anchor_spacing = long_anchor_min_spacing;
     for (std::size_t index = message_boundaries.size(); index > 0 &&
                       grid_positions < max_long_anchors;
          --index) {
         const auto boundary = message_boundaries[index - 1];
         if (!boundary || *boundary == 0 || *boundary >= full_prompt_frontier) { continue; }
+        if (static_cast<std::uint64_t>(grid_point - *boundary) < anchor_spacing) { continue; }
         ++grid_positions;
+        grid_point     = *boundary;
+        anchor_spacing = std::min<std::uint64_t>(anchor_spacing * 2U,
+                                                 std::numeric_limits<std::uint32_t>::max());
         if (std::any_of(out.opportunities.begin(), out.opportunities.end(),
                         [&](const auto& existing) { return existing.frontier == *boundary; })) {
             continue;
@@ -591,7 +602,8 @@ public:
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
-          max_long_anchors_per_continuation(options.max_long_anchors_per_continuation) {
+          max_long_anchors_per_continuation(options.max_long_anchors_per_continuation),
+          long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -657,6 +669,7 @@ public:
     // is still single-threaded; atomic so the request threads that read it see the published value
     // without a data race on a const shared implementation.
     mutable std::atomic<std::uint32_t> max_long_anchors_per_continuation{0};
+    std::uint32_t long_anchor_min_spacing_tokens = 0;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -846,7 +859,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()),
-        impl_->max_long_anchors_per_continuation.load(std::memory_order_relaxed));
+        impl_->max_long_anchors_per_continuation.load(std::memory_order_relaxed),
+        impl_->long_anchor_min_spacing_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

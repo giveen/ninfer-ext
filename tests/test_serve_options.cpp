@@ -232,6 +232,14 @@ int main() {
             host_cache_budget.context_cache.host_kv_capacity_bytes ==
                 ninfer::kDefaultHostKvCapacityBytes,
         "host cache budget did not reach serving options");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer"}).context_cache.long_anchor_min_spacing_tokens ==
+                1024U &&
+            parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "0"})
+                    .context_cache.long_anchor_min_spacing_tokens == 0U &&
+            parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "4096"})
+                    .context_cache.long_anchor_min_spacing_tokens == 4096U,
+        "long-anchor spacing did not reach serving options");
     bool budget_with_state_slots_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--host-cache-mib", "64",

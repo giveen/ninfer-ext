@@ -132,6 +132,9 @@ ninfer::EngineOptions automatic_long_anchor_engine_options(const char* artifact)
     ninfer::EngineOptions options = private_long_anchor_engine_options(artifact);
     options.context_cache.device_state_slots               = 8;
     options.context_cache.max_long_anchors_per_continuation = 2;
+    // The scenario's messages are a few dozen tokens; disable the anchor spacing so both
+    // interior boundaries are anchored, as the scenario asserts.
+    options.context_cache.long_anchor_min_spacing_tokens = 0;
     return options;
 }
 

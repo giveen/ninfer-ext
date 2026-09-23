@@ -1011,13 +1011,13 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
-    [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
-                                                        const FakeSharedPrefixHandle*,
-                                                        const FakeSharedPrefixHandle*,
-                                                        std::optional<CheckpointRef>,
-                                                        bool permit_shared_publication) const {
+    [[nodiscard]] FakeCaptureAssessment
+    inspect_capture(const FakeCaptureOffer&, const FakeSharedPrefixHandle*,
+                    const FakeSharedPrefixHandle*, std::optional<CheckpointRef> private_replacement,
+                    bool permit_shared_publication) const {
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
+        last_capture_private_replacement = private_replacement;
         return assessment;
     }
 
@@ -1201,6 +1201,8 @@ public:
     bool deny_seal_window                                = false;
     bool fail_capture_seal                               = false;
     std::uint64_t seal_window_claims                     = 0;
+    // The private replacement the most recent capture inspection was asked to price.
+    mutable std::optional<CheckpointRef> last_capture_private_replacement;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
     bool abort_salvage_next                              = false;
@@ -4209,6 +4211,30 @@ void test_shared_capture_seal_failure_skips_instead_of_throwing() {
     run(false);
 }
 
+void test_full_anchor_set_replaces_the_least_coverage_anchor() {
+    // Anchors at 1000, 5000, 5200 and 9000 with a new capture at 12000. Dropping 5200 costs
+    // (5200 - 5000) * (9000 - 5200); every other anchor covers more. The old rule always gave up
+    // the deepest anchor (1000), letting the set drift towards the endpoint.
+    FakeManager manager = make_manager(1, 4, 0);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 91, make_base(91), 1);
+    const auto anchor = [](std::uint32_t frontier, std::uint32_t ordinal) {
+        return CheckpointRef{
+            .kind = CheckpointKind::LongAnchor, .frontier = frontier, .ordinal = ordinal};
+    };
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 91, .frontier = 12000},
+        .protected_rebuild_work = PrefillWork{.tokens = 12000},
+        .private_replacement_candidates = {anchor(1000, 1), anchor(5000, 2), anchor(5200, 3),
+                                           anchor(9000, 4)},
+        .publishes_private   = true,
+        .physically_feasible = true,
+    };
+    (void)manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 1}, 0, {});
+    require(program.last_capture_private_replacement == anchor(5200, 3),
+            "full anchor set did not give up the anchor whose loss costs the least coverage");
+}
+
 void test_automatic_reclaim_picks_the_least_recently_used_entry() {
     FakeManager manager = make_manager(1, 4, 2);
     FakeProgram program;
@@ -4365,6 +4391,8 @@ int main() {
              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
     run_test("shared capture seal failure skips instead of throwing",
              test_shared_capture_seal_failure_skips_instead_of_throwing);
+    run_test("full anchor set replaces the least-coverage anchor",
+             test_full_anchor_set_replaces_the_least_coverage_anchor);
     run_test("automatic reclaim picks the least recently used entry",
              test_automatic_reclaim_picks_the_least_recently_used_entry);
     run_test("automatic reclaim waits for a planned capture",
