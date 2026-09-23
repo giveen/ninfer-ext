@@ -14,6 +14,16 @@
 
 namespace {
 
+// The anchor-spacing option only exists from the spacing commit on. Setting it through this
+// helper lets the same scenarios build against the pre-fix tree for an A/B baseline, where the
+// spacing silently stays at the old last-L rule.
+template <class CacheOptions>
+void set_anchor_spacing(CacheOptions& cache, std::uint32_t spacing) {
+    if constexpr (requires { cache.long_anchor_min_spacing_tokens; }) {
+        cache.long_anchor_min_spacing_tokens = spacing;
+    }
+}
+
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                    = artifact;
@@ -134,7 +144,7 @@ ninfer::EngineOptions automatic_long_anchor_engine_options(const char* artifact)
     options.context_cache.max_long_anchors_per_continuation = 2;
     // The scenario's messages are a few dozen tokens; disable the anchor spacing so both
     // interior boundaries are anchored, as the scenario asserts.
-    options.context_cache.long_anchor_min_spacing_tokens = 0;
+    set_anchor_spacing(options.context_cache, 0);
     return options;
 }
 
@@ -2950,6 +2960,369 @@ int exercise_agent_shared_catalog(const char* artifact) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Prefix-cache review fixes (2026-09-23). One scenario per fix, each asserting the observable
+// behaviour the fix changes. Every scenario prints its measurements on one "review-*" line so the
+// runner log records the numbers even when an assertion passes.
+
+namespace review {
+
+ninfer::RequestOptions one_token() { return fixed_output(1); }
+
+ninfer::PromptInput user_turns(std::vector<std::string> turns, std::string session = {}) {
+    ninfer::PromptInput input;
+    for (std::string& text : turns) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(message));
+    }
+    input.options.enable_thinking = false;
+    if (!session.empty()) {
+        input.context_cache.session_key = std::move(session);
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    }
+    return input;
+}
+
+std::string repeated(std::string_view word, std::uint32_t count) {
+    std::string text;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (index != 0) { text.push_back(' '); }
+        text.append(word);
+    }
+    return text;
+}
+
+} // namespace review
+
+// Fix 1: a conversation that has only been *published* (never hit since) is recent. Old code
+// ranked every never-hit owner at epoch 0, i.e. in catalog-slot order, so the ladder licence could
+// give up the newest conversation. MAIN is published after two long conversations and never
+// re-hit; two more long conversations then overflow the device KV (no Host tier, so pressure must
+// evict). MAIN must still be reusable, and at least one older conversation must have been evicted.
+int exercise_review_publication_recency(const char* artifact) {
+    std::cout << "review-publication-recency: a just-published conversation outranks older ones\n";
+    ninfer::Engine engine(recency_retention_engine_options(artifact));
+    const auto old_a = exact_repeated_prompt_text(engine, 1500, "alpha");
+    const auto old_b = exact_repeated_prompt_text(engine, 1500, "bravo");
+    const auto old_c = exact_repeated_prompt_text(engine, 1500, "charlie");
+    const auto old_d = exact_repeated_prompt_text(engine, 1500, "delta");
+    const auto main  = exact_repeated_prompt_text(engine, 128, "omega");
+    if (!old_a || !old_b || !old_c || !old_d || !main) {
+        std::cerr << "review-publication-recency: could not construct exact prompt geometry\n";
+        return 1;
+    }
+    const auto gen = [&](const std::string& text, const char* session) {
+        return engine.generate(engine.prepare(pressure_turn(text, session,
+                                                            ninfer::CacheRetentionHint::LiveSession)),
+                               review::one_token());
+    };
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    (void)gen(*old_a, "old-1");
+    (void)gen(*old_b, "old-2");
+    (void)gen(*main, "main");  // published, never hit again before the pressure
+    (void)gen(*old_c, "old-3");
+    (void)gen(*old_d, "old-4");
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    const std::uint64_t evicted =
+        after.pressure_private_owners_evicted - before.pressure_private_owners_evicted;
+    const auto final_main = gen(*main, "main");
+    std::cout << "review-publication-recency: main_reused=" << final_main.reused_prompt_tokens
+              << " path=" << static_cast<int>(final_main.prefix_reuse_path)
+              << " private_evicted=" << evicted << '\n';
+    if (evicted < 1) {
+        std::cerr << "review-publication-recency: pressure evicted nothing; fixture did not "
+                     "overflow\n";
+        return 1;
+    }
+    if (final_main.reused_prompt_tokens == 0) {
+        std::cerr << "review-publication-recency: the most recently published conversation was "
+                     "evicted while older ones survived\n";
+        return 1;
+    }
+    std::cout << "review-publication-recency: OK\n";
+    return 0;
+}
+
+// Fix 2: the escape-hatch ladder used to evict every shared prefix on every rung. A client-marked
+// system+tools prefix is captured, then long private conversations overflow the device KV so each
+// admission plans under pressure (with a Host tier to demote into). A new conversation with the
+// same system+tools must still reuse the shared prefix, and no shared owner may have been evicted.
+int exercise_review_shared_survives_ladder(const char* artifact) {
+    std::cout << "review-shared-survives-ladder: private pressure keeps the shared prefix\n";
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 4096;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.kv_cache                             = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 2;
+    options.context_cache.host_state_slots       = 8;
+    options.context_cache.host_kv_capacity_bytes = 64ULL << 20;
+    options.context_cache.max_private_continuations         = 6;
+    options.context_cache.max_shared_prefixes               = 2;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    const std::string system =
+        "You are a careful operations assistant. " + review::repeated("Follow the runbook.", 40);
+    const std::vector<std::string> tools = {
+        agent_tool_json("lookup_host", "Look up a host in the inventory."),
+        agent_tool_json("restart_service", "Restart a service on a host."),
+    };
+    std::uint32_t conversation = 0;
+    const auto agent = [&](std::string question) {
+        std::vector<ninfer::ChatMessage> history;
+        history.push_back(agent_text_message(ninfer::ChatRole::User, std::move(question)));
+        auto prompt = agent_prompt(system, tools, std::move(history), false);
+        prompt.context_cache.session_key = "review-agent-" + std::to_string(++conversation);
+        return engine.generate(engine.prepare(std::move(prompt)), review::one_token());
+    };
+    (void)agent("First question about host alpha.");
+    const auto warm = agent("Second question about host bravo.");
+    if (warm.reused_prompt_tokens == 0) {
+        std::cerr << "review-shared-survives-ladder: shared prefix was never captured (path="
+                  << static_cast<int>(warm.prefix_reuse_path) << ")\n";
+        return 1;
+    }
+
+    const auto long_a = exact_repeated_prompt_text(engine, 1500, "kilo");
+    const auto long_b = exact_repeated_prompt_text(engine, 1500, "lima");
+    const auto long_c = exact_repeated_prompt_text(engine, 1500, "mike");
+    if (!long_a || !long_b || !long_c) {
+        std::cerr << "review-shared-survives-ladder: could not construct exact prompt geometry\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    for (const auto* text : {&*long_a, &*long_b, &*long_c}) {
+        (void)engine.generate(engine.prepare(pressure_turn(*text, "",
+                                                           ninfer::CacheRetentionHint::Default)),
+                              review::one_token());
+    }
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    const auto final_result = agent("Third question about host charlie.");
+    const std::uint64_t private_pressure =
+        (after.pressure_private_owners_evicted - before.pressure_private_owners_evicted) +
+        (after.pressure_private_owners_degraded - before.pressure_private_owners_degraded);
+    const std::uint64_t shared_evicted =
+        after.pressure_shared_owners_evicted - before.pressure_shared_owners_evicted;
+    std::cout << "review-shared-survives-ladder: warm_reused=" << warm.reused_prompt_tokens
+              << " final_reused=" << final_result.reused_prompt_tokens
+              << " final_path=" << static_cast<int>(final_result.prefix_reuse_path)
+              << " private_pressure=" << private_pressure << " shared_evicted=" << shared_evicted
+              << " shared_degraded="
+              << (after.pressure_shared_owners_degraded - before.pressure_shared_owners_degraded)
+              << '\n';
+    if (private_pressure == 0) {
+        std::cerr << "review-shared-survives-ladder: no private pressure; fixture did not "
+                     "overflow\n";
+        return 1;
+    }
+    if (shared_evicted != 0 || final_result.reused_prompt_tokens < warm.reused_prompt_tokens) {
+        std::cerr << "review-shared-survives-ladder: the shared prefix was destroyed by private "
+                     "pressure\n";
+        return 1;
+    }
+    std::cout << "review-shared-survives-ladder: OK\n";
+    return 0;
+}
+
+// Fix 3: automatic shared-prefix reclaim picks the least recently *used* entry. Two automatic
+// prefixes fill a 2-slot catalog, the first is hit again, then a third needs a slot: the second
+// (least recently used) must be reclaimed and the first must stay reusable. Old code reclaimed the
+// first-published entry.
+int exercise_review_shared_reclaim_lru(const char* artifact) {
+    std::cout << "review-shared-reclaim-lru: the least recently used automatic prefix goes\n";
+    ninfer::EngineOptions engine_options = shared_replacement_engine_options(artifact);
+    // KV room for the active lease plus the shared snapshots. With kv_capacity == max_context the
+    // Device KV lease (prompt + max(prefill_chunk, 4096) output tokens, capped at max_context)
+    // takes the whole pool and every shared capture is skipped; a second context of pages (which
+    // requires max_concurrency 2) leaves room for the catalog.
+    engine_options.max_context          = 4096;
+    engine_options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    engine_options.max_concurrency      = 2;
+    engine_options.max_pending_requests = 2;
+    engine_options.context_cache.max_private_continuations = 2;
+    engine_options.context_cache.max_shared_prefixes       = 2;
+    // Room for every StateImage the fixture keeps (2 per private continuation, 1 per shared
+    // prefix) so no state-slot pressure competes with the catalog-slot reclaim under test.
+    engine_options.context_cache.host_state_slots          = 16;
+    engine_options.context_cache.device_state_slots        = 16;
+    ninfer::Engine engine(std::move(engine_options));
+    const auto plain = [](const std::string& text) {
+        auto input = review::user_turns({text});
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
+    const auto gen = [&](const std::string& text) {
+        auto result = engine.generate(engine.prepare(plain(text)), review::one_token());
+        if (std::getenv("NINFER_REVIEW_TRACE") != nullptr) {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            std::cout << "  trace: '" << text.substr(0, 14) << "' path="
+                      << static_cast<int>(result.prefix_reuse_path)
+                      << " reused=" << result.reused_prompt_tokens
+                      << " prompt=" << result.prompt.prompt_tokens
+                      << " captures=" << stats.active_captures_completed
+                      << " shared_evicted=" << stats.pressure_shared_owners_evicted
+                      << " shared_degraded=" << stats.pressure_shared_owners_degraded
+                      << " private_evicted=" << stats.pressure_private_owners_evicted
+                      << " searches=" << stats.pressure_searches
+                      << " maximal=" << stats.pressure_maximal_fallback_selections
+                      << " dev_state=" << stats.device_state_occupied_slots
+                      << " host_state=" << stats.host_state_occupied_slots
+                      << " dev_kv=" << stats.device_main_kv_occupied_pages
+                      << " lease=" << stats.device_main_kv_lease_pages << '\n';
+        }
+        return result;
+    };
+    // Two private continuation slots: two distinct fillers push a prefix's private endpoint out,
+    // so a later reuse of the prefix can only come from the shared catalog.
+    std::uint32_t filler_index = 0;
+    const auto flush_private = [&] {
+        for (int index = 0; index < 2; ++index) {
+            (void)gen("private filler endpoint " + std::to_string(++filler_index) + ".");
+        }
+    };
+    const auto publish = [&](const std::string& prefix) {
+        (void)gen(prefix);
+        (void)gen(prefix);
+        flush_private();
+    };
+    const std::string a = review::repeated("alpha-stable", 40);
+    const std::string b = review::repeated("bravo-stable", 40);
+    const std::string c = review::repeated("charlie-stable", 40);
+    publish(a);
+    publish(b);
+    const auto a_hit = gen(a);  // A becomes the most recently used shared entry
+    flush_private();
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    publish(c);
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    const auto c_reuse = gen(c);
+    flush_private();
+    const auto a_reuse = gen(a);
+    flush_private();
+    const auto b_reuse = gen(b);
+    const auto shared = [](const ninfer::GenerationResult& result) {
+        return result.prefix_reuse_path == ninfer::PrefixReusePath::SharedStablePrefix &&
+               result.reused_prompt_tokens != 0;
+    };
+    const ninfer::RuntimeStats final_stats = engine.runtime_stats();
+    std::cout << "review-shared-reclaim-lru: captures_completed="
+              << final_stats.active_captures_completed
+              << " captures_skipped=" << final_stats.active_captures_skipped
+              << " a_hit_path=" << static_cast<int>(a_hit.prefix_reuse_path)
+              << " a_hit=" << shared(a_hit) << " c_shared=" << shared(c_reuse)
+              << " a_shared=" << shared(a_reuse) << " b_shared=" << shared(b_reuse)
+              << " shared_evicted="
+              << (after.pressure_shared_owners_evicted - before.pressure_shared_owners_evicted)
+              << '\n';
+    if (!shared(a_hit)) {
+        std::cerr << "review-shared-reclaim-lru: prefix A never reached the shared catalog\n";
+        return 1;
+    }
+    if (!shared(c_reuse) || !shared(a_reuse) || shared(b_reuse)) {
+        std::cerr << "review-shared-reclaim-lru: reclaim did not give up the least recently used "
+                     "entry (B)\n";
+        return 1;
+    }
+    std::cout << "review-shared-reclaim-lru: OK\n";
+    return 0;
+}
+
+// Fix 5: automatic long anchors are spaced geometrically back from the prompt end. A conversation
+// of two ~1500-token messages followed by four short ones is prefilled from Root, then re-sent
+// with the second long message rewritten. With the default spacing the boundary after the first
+// long message is anchored, so the rewrite resumes from it; with spacing 0 (the old rule: last L
+// boundaries) only the short tail is anchored and the rewrite falls back further. The same
+// fixture runs on both engines and records the capture counts.
+struct AnchorArmOutcome {
+    std::uint64_t captures_first = 0;
+    std::uint32_t rewrite_reused = 0;
+    ninfer::PrefixReusePath rewrite_path = ninfer::PrefixReusePath::Root;
+    std::uint32_t first_long_tokens = 0;
+    std::uint32_t prompt_tokens = 0;
+};
+
+AnchorArmOutcome run_anchor_arm(const char* artifact, std::uint32_t spacing) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 8192;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    options.prefill_chunk                        = 1024;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 8;
+    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 4;
+    set_anchor_spacing(options.context_cache, spacing);
+    ninfer::Engine engine(std::move(options));
+
+    const std::string first_long  = review::repeated("alpha", 1500);
+    const std::string second_long = review::repeated("bravo", 1500);
+    const std::string rewritten   = review::repeated("zulu", 1500);
+    const std::vector<std::string> tail = {"Short note one.", "Short note two.",
+                                           "Short note three.", "Short note four."};
+    const auto conversation = [&](const std::string& second) {
+        std::vector<std::string> turns{first_long, second};
+        turns.insert(turns.end(), tail.begin(), tail.end());
+        return review::user_turns(std::move(turns), "review-anchor");
+    };
+    AnchorArmOutcome outcome;
+    outcome.first_long_tokens = engine.count_tokens(review::user_turns({first_long}));
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    const auto first = engine.generate(engine.prepare(conversation(second_long)),
+                                       review::one_token());
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    outcome.captures_first = after.active_captures_completed - before.active_captures_completed;
+    outcome.prompt_tokens  = first.prompt.prompt_tokens;
+    const auto rewrite = engine.generate(engine.prepare(conversation(rewritten)),
+                                         review::one_token());
+    outcome.rewrite_reused = rewrite.reused_prompt_tokens;
+    outcome.rewrite_path   = rewrite.prefix_reuse_path;
+    return outcome;
+}
+
+int exercise_review_anchor_spacing(const char* artifact) {
+    std::cout << "review-anchor-spacing: spaced anchors reach deep history\n";
+    const AnchorArmOutcome spaced   = run_anchor_arm(artifact, 1024);
+    const AnchorArmOutcome unspaced = run_anchor_arm(artifact, 0);
+    std::cout << "review-anchor-spacing: prompt=" << spaced.prompt_tokens
+              << " first_long_tokens~" << spaced.first_long_tokens
+              << " | spaced: captures=" << spaced.captures_first
+              << " rewrite_reused=" << spaced.rewrite_reused
+              << " rewrite_path=" << static_cast<int>(spaced.rewrite_path)
+              << " | unspaced: captures=" << unspaced.captures_first
+              << " rewrite_reused=" << unspaced.rewrite_reused
+              << " rewrite_path=" << static_cast<int>(unspaced.rewrite_path) << '\n';
+    if (spaced.rewrite_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        spaced.rewrite_reused + 64U < spaced.first_long_tokens) {
+        std::cerr << "review-anchor-spacing: the rewrite did not resume from the deep anchor\n";
+        return 1;
+    }
+    if (unspaced.rewrite_reused >= spaced.rewrite_reused) {
+        std::cerr << "review-anchor-spacing: spacing did not improve deep-rewrite reuse over the "
+                     "last-L rule (fixture does not discriminate)\n";
+        return 1;
+    }
+    if (spaced.captures_first >= unspaced.captures_first) {
+        std::cerr << "review-anchor-spacing: spacing did not reduce the captures on the first "
+                     "prefill\n";
+        return 1;
+    }
+    std::cout << "review-anchor-spacing: OK\n";
+    return 0;
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -3014,6 +3387,14 @@ int main() {
         result = exercise_agent_kv_pressure(artifact);
     } else if (scenario == "agent-shared-catalog") {
         result = exercise_agent_shared_catalog(artifact);
+    } else if (scenario == "review-publication-recency") {
+        result = exercise_review_publication_recency(artifact);
+    } else if (scenario == "review-shared-survives-ladder") {
+        result = exercise_review_shared_survives_ladder(artifact);
+    } else if (scenario == "review-shared-reclaim-lru") {
+        result = exercise_review_shared_reclaim_lru(artifact);
+    } else if (scenario == "review-anchor-spacing") {
+        result = exercise_review_anchor_spacing(artifact);
     } else {
         throw std::invalid_argument("unknown prefix integration scenario");
     }
