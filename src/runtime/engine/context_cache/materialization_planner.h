@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/resource_search.h"
+#include "runtime/engine/context_cache/seal_window_claim.h"
 
 #include <algorithm>
 #include <array>
@@ -793,27 +794,7 @@ public:
         // force a re-prefill). Back off briefly on contention; if we cannot claim within the
         // budget, fall through to the re-prefill fallback below (the concurrent materialization
         // makes the room, and our next admission restores the checkpoint).
-        struct SealWindowClaim {
-            bool             claimed = false;
-            decltype(session)& s;
-            explicit SealWindowClaim(decltype(session)& ref) noexcept : s(ref) {
-                for (std::uint32_t attempt = 0; attempt < 32U; ++attempt) {
-                    if (ref.try_claim_seal_window()) { claimed = true; break; }
-                    std::this_thread::sleep_for(std::chrono::microseconds(125));
-                }
-            }
-            // Release as soon as the seal (and its fallback) is done, before the result is
-            // constructed. Holding it through the result bookkeeping would starve concurrent
-            // materializations that are waiting to seal.
-            void release() noexcept {
-                if (claimed) {
-                    s.release_seal_window();
-                    claimed = false;
-                }
-            }
-            ~SealWindowClaim() { release(); }
-        };
-        SealWindowClaim seal_claim(session);
+        SealWindowClaim<decltype(session)> seal_claim(session);
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
         if (!incumbent.assessed) {
@@ -836,7 +817,7 @@ public:
         std::vector<std::uint32_t> shared_frontiers =
             final_schedule(selected.id, selected.candidate->summary(), price_split);
         std::optional<ResourcePlan> sealed;
-        if (seal_claim.claimed) {
+        if (seal_claim.claimed()) {
             sealed = session.seal(std::move(*incumbent.assessed), prompt,
                                   FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
         }

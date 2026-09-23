@@ -1197,6 +1197,10 @@ public:
     bool reverse_pressure_results                        = false;
     bool progress_in_progress_once                       = false;
     bool finish_fail_next                                = false;
+    // Seal-window and capture-seal failure injection.
+    bool deny_seal_window                                = false;
+    bool fail_capture_seal                               = false;
+    std::uint64_t seal_window_claims                     = 0;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
     bool abort_salvage_next                              = false;
@@ -1937,6 +1941,7 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed, const F
 
 std::optional<FakeResourcePlan>
 FakePressurePlanningSession::seal_capture(FakeAssessedPressureTarget&& assessed) {
+    if (program_->fail_capture_seal) { return std::nullopt; }
     return seal(std::move(assessed), FakePreparedPrompt{}, {});
 }
 
@@ -1945,7 +1950,10 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed) {
     return seal_capture(std::move(assessed));
 }
 
-bool FakePressurePlanningSession::try_claim_seal_window() noexcept { return true; }
+bool FakePressurePlanningSession::try_claim_seal_window() noexcept {
+    ++program_->seal_window_claims;
+    return !program_->deny_seal_window;
+}
 
 void FakePressurePlanningSession::release_seal_window() noexcept {}
 
@@ -4156,6 +4164,51 @@ void test_explicit_credit_shared_entry_survives_automatic_reclaim() {
                          "explicit-credit shared prefix lost reuse after reclaim");
 }
 
+void test_shared_capture_seal_failure_skips_instead_of_throwing() {
+    // A shared capture is optional. When the seal window cannot be claimed, or the seal's
+    // revalidation fails anyway, the scenario must not plan: the capture falls back to its private
+    // baseline or is skipped, and nothing is published -- it must not throw out of the worker.
+    const auto run = [](bool deny_window) {
+        FakeManager manager = make_manager(1, 4, 2);
+        FakeProgram program;
+        FakeRequestBasePlan base        = make_base(81);
+        base.value.publish_continuation = false;
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, 81, base, 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 81, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        program.deny_seal_window  = deny_window;
+        program.fail_capture_seal = !deny_window;
+        const std::uint64_t claims_before = program.seal_window_claims;
+        const auto reserved = manager.reserve_active_capture(program, active.lane,
+                                                             FakeCaptureOffer{.id = 1}, 0, {});
+        require(program.seal_window_claims > claims_before,
+                "shared capture sealed without claiming the seal window");
+        program.deny_seal_window  = false;
+        program.fail_capture_seal = false;
+        if (reserved == FakeManager::ActiveCaptureReserveResult::Reserved) {
+            auto progress      = manager.progress_context_transaction(program, {});
+            const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+            require(outcome.status == ContextTransactionStatus::Published,
+                    "private baseline capture was not published");
+        }
+        (void)finish_active(manager, program, active);
+        require_shared_reuse(manager, program, 81, 2, false,
+                             "unsealed shared capture was published");
+    };
+    run(true);
+    run(false);
+}
+
 void test_automatic_reclaim_picks_the_least_recently_used_entry() {
     FakeManager manager = make_manager(1, 4, 2);
     FakeProgram program;
@@ -4310,6 +4363,8 @@ int main() {
              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
     run_test("escape hatch ranks shared prefixes with private owners",
              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
+    run_test("shared capture seal failure skips instead of throwing",
+             test_shared_capture_seal_failure_skips_instead_of_throwing);
     run_test("automatic reclaim picks the least recently used entry",
              test_automatic_reclaim_picks_the_least_recently_used_entry);
     run_test("automatic reclaim waits for a planned capture",

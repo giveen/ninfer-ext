@@ -5,6 +5,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/resource_search.h"
+#include "runtime/engine/context_cache/seal_window_claim.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -195,10 +196,17 @@ public:
         }
 
         if (!incumbent) { return std::nullopt; }
-        std::optional<CapturePressurePlan> pressure = session.seal(std::move(*incumbent->assessed));
-        if (!pressure) {
-            throw std::logic_error("selected shared capture target could not be sealed");
+        // Seal under the same window claim materialization uses, so a concurrent demote cannot
+        // invalidate the selected target between its assessment and the seal. A capture is
+        // optional: if the window cannot be claimed or the seal's revalidation fails anyway, this
+        // scenario simply does not plan and the caller falls back to its private baseline or
+        // skips the capture, instead of throwing out of the worker loop.
+        std::optional<CapturePressurePlan> pressure;
+        {
+            SealWindowClaim<decltype(session)> seal_claim(session);
+            if (seal_claim.claimed()) { pressure = session.seal(std::move(*incumbent->assessed)); }
         }
+        if (!pressure) { return std::nullopt; }
         return Result{
             .pressure                = std::move(*pressure),
             .owner_outcomes          = std::move(incumbent->owner_outcomes),

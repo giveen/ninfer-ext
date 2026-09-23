@@ -658,6 +658,10 @@ public:
     [[nodiscard]] PressureExpansionView commit_expansion(PreparedPressureExpansion&& prepared);
     void discard_expansion(PreparedPressureExpansion&& prepared) noexcept;
     [[nodiscard]] std::optional<CapturePressurePlan> seal(AssessedPressureTarget&& assessed);
+    // The Program's seal window, as on PressurePlanningSession: claimed around `seal` so a
+    // concurrent demote cannot invalidate the selected target between assess and seal.
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
     [[nodiscard]] static constexpr runtime::PlanningCandidateId candidate_id() noexcept {
         return runtime::PlanningCandidateId{.value = 0};

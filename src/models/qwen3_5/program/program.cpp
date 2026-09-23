@@ -277,6 +277,14 @@ CapturePressurePlanningSession::seal(AssessedPressureTarget&& assessed) {
     return session_.seal_capture(std::move(assessed));
 }
 
+bool CapturePressurePlanningSession::try_claim_seal_window() noexcept {
+    return session_.try_claim_seal_window();
+}
+
+void CapturePressurePlanningSession::release_seal_window() noexcept {
+    session_.release_seal_window();
+}
+
 Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
 
 Program::~Program() noexcept = default;
