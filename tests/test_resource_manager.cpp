@@ -565,9 +565,12 @@ public:
 
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] FakePressureTargetHandle
-    recency_maximal_target(PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
+    recency_maximal_target(PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
     [[nodiscard]] std::uint32_t ranked_owner_count() const;
-    void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
@@ -647,6 +650,7 @@ private:
     std::vector<std::int32_t> recency_rank_;
     std::uint32_t ranked_owner_count_    = 0;
     std::uint32_t eviction_licence_count_ = 0;
+    std::vector<std::uint32_t> licence_spared_ranks_;
     // Mirrors the real session's LRU gate on incremental eviction.
     [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const;
     std::vector<std::vector<std::vector<FakeTargetDecision>>> options_;
@@ -1453,8 +1457,10 @@ std::uint32_t FakePressurePlanningSession::ranked_owner_count() const {
     return ranked_owner_count_;
 }
 
-void FakePressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed) noexcept {
+void FakePressurePlanningSession::set_eviction_licence(
+    std::uint32_t oldest_licensed, std::span<const std::uint32_t> spared_ranks) {
     eviction_licence_count_ = std::min(oldest_licensed, ranked_owner_count_);
+    licence_spared_ranks_.assign(spared_ranks.begin(), spared_ranks.end());
 }
 
 bool FakePressurePlanningSession::owner_eviction_licensed(std::uint32_t owner_index) const {
@@ -1463,20 +1469,29 @@ bool FakePressurePlanningSession::owner_eviction_licensed(std::uint32_t owner_in
     }
     const std::int32_t rank = recency_rank_[owner_index];
     if (rank < 0) { return true; }
-    return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_;
+    return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
+           std::find(licence_spared_ranks_.begin(), licence_spared_ranks_.end(),
+                     static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
 }
 
 FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
-    PlanningCandidateId candidate, std::uint32_t sacrifice_oldest) {
+    PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
     const std::uint32_t selected       = candidate_index(candidate);
     populate_options(selected);
     const std::uint32_t demote_count =
         sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
+    // `sacrifice_oldest` on the target records how many ranked owners the rung actually gives up
+    // (the requested tail less the spared ranks), which is what ladder-feasibility mode tests.
+    const auto spared_in_tail = static_cast<std::uint32_t>(std::count_if(
+        spared_ranks.begin(), spared_ranks.end(),
+        [&](std::uint32_t rank) { return rank >= demote_count && rank < ranked_owner_count_; }));
     Target rung{
         .candidate_index  = selected,
         .choices          = std::vector<std::uint16_t>(owners_.size(), 0),
         .root_maximal     = true,
-        .sacrifice_oldest = static_cast<std::int32_t>(sacrifice_oldest),
+        .sacrifice_oldest = static_cast<std::int32_t>(
+            std::min(sacrifice_oldest, ranked_owner_count_) - spared_in_tail),
     };
     for (std::size_t index = 0; index < owners_.size(); ++index) {
         const auto& alternatives = options_[selected][index];
@@ -1485,11 +1500,16 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
         // other owner as it is, and demotes a kept private owner when a non-evict (demote) outcome
         // exists. Keeping is choice 0: whether the sacrifice frees enough is what adoption
         // decides.
-        const bool sacrificed =
-            rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool spared  = in_tail && rank >= 0 &&
+                            std::find(spared_ranks.begin(), spared_ranks.end(),
+                                      static_cast<std::uint32_t>(rank)) != spared_ranks.end();
         std::uint16_t choice = static_cast<std::uint16_t>(alternatives.size());
-        if (!sacrificed) {
-            choice = alternatives.size() > 1U && !alternatives[0].evicts_continuation
+        if (spared) {
+            choice = 0U;
+        } else if (!in_tail) {
+            choice = demote_kept && alternatives.size() > 1U &&
+                             !alternatives[0].evicts_continuation
                          ? static_cast<std::uint16_t>(1)
                          : 0U;
         }
@@ -4066,9 +4086,10 @@ void require_shared_reuse(FakeManager& manager, FakeProgram& program, std::uint3
 
 void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
     // Shared prefixes share the private owners' recency order and get a demote-to-host outcome,
-    // so a ladder rung sacrifices the oldest owner of either kind instead of destroying every
-    // shared prefix unconditionally. The shared prefix is published at the fake's finish frontier
-    // because the fake pressure assessment reports every owner's checkpoint at that frontier.
+    // so a ladder rung sacrifices the oldest owners of either kind instead of destroying every
+    // shared prefix unconditionally, and spares any sacrificed owner the rung does not need. The
+    // shared prefix is published at the fake's finish frontier because the fake pressure
+    // assessment reports every owner's checkpoint at that frontier.
     const auto run = [](bool shared_first) {
         FakeManager manager = make_manager(1, 4, 1);
         FakeProgram program;
@@ -4112,8 +4133,13 @@ void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
     };
     require(run(false) == std::array<bool, 4>{false, true, false, false},
             "rung destroyed a recent shared prefix instead of the oldest private owner");
-    require(run(true) == std::array<bool, 4>{true, false, false, false},
-            "rung did not sacrifice the oldest owner when it was a shared prefix");
+    // With the shared prefix published first it is the oldest owner, but this admission's
+    // pressure is a private catalog slot: only a released private owner relieves it. The smallest
+    // adoptable rung gives up the shared prefix and the oldest private owner (the shared
+    // publisher's own continuation); sparing then keeps the shared prefix, whose eviction the rung
+    // does not need, so no shared prefix and none of a, b, c are evicted.
+    require(run(true) == std::array<bool, 4>{false, false, false, false},
+            "rung destroyed a shared prefix whose eviction the admission did not need");
 }
 
 void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {

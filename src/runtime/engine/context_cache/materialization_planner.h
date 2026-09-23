@@ -274,50 +274,105 @@ public:
         // Ranked owners the ladder had to sacrifice, oldest first; the incremental search may
         // fully evict an owner only inside this LRU tail.
         std::uint32_t eviction_licence = 0;
-        if (identity_best) {
-            incumbent        = std::move(*identity_best);
-            incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
-        } else {
-            // Escape hatch: find the smallest count of oldest prefixes (private and shared share
-            // one recency order) that must be evicted for the rung to be adoptable; the remaining
-            // more recent prefixes are kept, freeing their device resources through a
-            // demote-to-host outcome wherever Host can take them. Sacrificing one more oldest
-            // prefix can only free more device and host capacity, so adoptability is monotonic
-            // non-decreasing in the sacrifice count. Binary-search the smallest adoptable count in
-            // O(log R) projections; if even the top rung (sacrifice every ranked owner) cannot fit,
-            // the terminal clear-all target (evict everything) is the guaranteed liveness backstop.
+        std::vector<std::uint32_t> eviction_spared;
+
+        // The escape-hatch ladder for one admission candidate. A rung sacrifices the oldest
+        // `sacrifice` ranked owners (private and shared share one recency order), keeps the rest,
+        // and demotes a kept owner to host wherever Host can take it. It counts only when it is
+        // adoptable: physical fit alone is not enough, because an admission that competes for a
+        // catalogued owner (publication-only pressure) needs one released even when the device
+        // tier fits. Sacrificing one more oldest owner can only free more capacity, so
+        // adoptability is monotonic non-decreasing in the count and the smallest adoptable count is
+        // found in O(log R) projections.
+        //
+        // The demote variant can be physically infeasible on its own -- a kept owner Host cannot
+        // take -- while the sacrifice alone already fits; before, that dropped straight to the
+        // clear-all target. So a physically short rung is retried with the kept owners left where
+        // they are. (A logically short rung is not: keeping owners in place cannot release a
+        // catalogued owner.) Both variants are monotonic, so their union is.
+        //
+        // The smallest adoptable count proves the oldest owners suffice, not that each is needed:
+        // with shared and private owners in one order, a catalog-slot shortage that only a released
+        // private owner can relieve would otherwise also destroy every older shared prefix in the
+        // tail. Each sacrificed owner is therefore tried as spared, most recent first, and stays
+        // spared (left exactly as it is) whenever the rung remains adoptable without it.
+        enum class RungFit : std::uint8_t { Adoptable, LogicallyShort, PhysicallyShort };
+        struct LadderRung {
+            std::uint32_t sacrifice = 0;
+            std::vector<std::uint32_t> spared;
+            bool demote_kept = true;
+        };
+        const auto rung_fit = [&](PlanningCandidateId id, std::uint32_t sacrifice,
+                                  std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+            const std::optional<AssessedPressureTarget> probe = session.assess(
+                session.recency_maximal_target(id, sacrifice, spared_ranks, demote_kept));
+            const PressureTargetAssessment& status = probe->assessment();
+            if (status.candidate != id) {
+                throw std::logic_error("maximal pressure target changed admission candidate");
+            }
+            if (status.physical_status != MaterializationPhysicalStatus::Feasible) {
+                return RungFit::PhysicallyShort;
+            }
+            return logical_goal(status.candidate, status.source_mode, status.owner_outcomes)
+                           .has_value()
+                       ? RungFit::Adoptable
+                       : RungFit::LogicallyShort;
+        };
+        const auto find_ladder_rung =
+            [&](PlanningCandidateId id) -> std::optional<LadderRung> {
             const std::uint32_t ranked = session.ranked_owner_count();
-            const std::uint32_t ladder_remaining_before = session.optional_targets_remaining();
+            // Whether each probed rung's demote variant was itself adoptable, so the chosen
+            // rung's variant is known without assessing it again.
+            std::vector<std::int8_t> demote_adoptable(static_cast<std::size_t>(ranked) + 1U, -1);
+            const auto adoptable_any = [&](std::uint32_t sacrifice) {
+                const RungFit demoted = rung_fit(id, sacrifice, {}, true);
+                demote_adoptable[sacrifice] = demoted == RungFit::Adoptable ? 1 : 0;
+                return demoted == RungFit::Adoptable ||
+                       (demoted == RungFit::PhysicallyShort &&
+                        rung_fit(id, sacrifice, {}, false) == RungFit::Adoptable);
+            };
             std::uint32_t lo = 0, hi = ranked;   // smallest feasible count in [lo, hi)
             while (lo < hi) {
                 const std::uint32_t mid = lo + (hi - lo) / 2U;
-                const std::optional<AssessedPressureTarget> probe =
-                    session.assess(
-                        session.recency_maximal_target(candidates[root_candidate_index].id, mid));
-                const PressureTargetAssessment& status = probe->assessment();
-                if (status.candidate != candidates[root_candidate_index].id) {
-                    throw std::logic_error("maximal pressure target changed admission candidate");
-                }
-                // A rung counts only when it is adoptable: physical fit alone is not enough,
-                // because an admission that competes for a catalogued owner (publication-only
-                // pressure) needs one released even when the device tier fits. Both conditions
-                // are monotonic non-decreasing in the sacrifice count.
-                const bool adoptable =
-                    status.physical_status == MaterializationPhysicalStatus::Feasible &&
-                    logical_goal(status.candidate, status.source_mode, status.owner_outcomes)
-                        .has_value();
-                if (adoptable) {
+                if (adoptable_any(mid)) {
                     hi = mid;
                 } else {
                     lo = mid + 1U;
                 }
             }
+            if (lo >= ranked) { return std::nullopt; }
+            LadderRung rung;
+            rung.sacrifice   = lo;
+            rung.demote_kept = demote_adoptable[lo] >= 0
+                                   ? demote_adoptable[lo] == 1
+                                   : rung_fit(id, lo, {}, true) == RungFit::Adoptable;
+            for (std::uint32_t rank = ranked - lo; rank < ranked; ++rank) {
+                if (session.optional_targets_remaining() == 0) { break; }
+                rung.spared.push_back(rank);
+                if (rung_fit(id, lo, rung.spared, rung.demote_kept) != RungFit::Adoptable) {
+                    rung.spared.pop_back();
+                }
+            }
+            return rung;
+        };
+
+        if (identity_best) {
+            incumbent        = std::move(*identity_best);
+            incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
+        } else {
+            // Escape hatch: the smallest adoptable ladder rung for the root candidate; if even the
+            // top rung (sacrifice every ranked owner) cannot fit, the terminal clear-all target
+            // (evict everything) is the guaranteed liveness backstop.
+            const std::uint32_t ladder_remaining_before = session.optional_targets_remaining();
+            const PlanningCandidateId root_id = candidates[root_candidate_index].id;
             PressureTargetHandle escape;
             std::optional<AssessedPressureTarget> assessed;
-            if (lo < ranked) {
-                // Smallest sacrifice count that fits; the more recent prefixes stay on
-                // host.
-                escape = session.recency_maximal_target(candidates[root_candidate_index].id, lo);
+            std::optional<LadderRung> rung = find_ladder_rung(root_id);
+            if (rung) {
+                // Smallest sacrifice that fits; the more recent prefixes and every spared one stay
+                // on host.
+                escape = session.recency_maximal_target(root_id, rung->sacrifice, rung->spared,
+                                                        rung->demote_kept);
                 assessed = session.assess(escape);
             } else {
                 escape   = session.root_maximal_target(candidates[root_candidate_index].id);
@@ -342,11 +397,17 @@ public:
             incumbent = make_incumbent(escape, root_candidate_index, assessment,
                                        std::move(*assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
-            eviction_licence = lo;
+            if (rung) {
+                eviction_licence = rung->sacrifice;
+                eviction_spared  = std::move(rung->spared);
+            } else {
+                eviction_licence = session.ranked_owner_count();
+            }
         }
-        // Only the LRU tail this ladder proved it must give up may be fully evicted
-        // incrementally; a feasible identity plan needs no eviction at all, so it licenses none.
-        session.set_eviction_licence(eviction_licence);
+        // Only the LRU tail this ladder proved it must give up, less the owners it spared, may be
+        // fully evicted incrementally; a feasible identity plan needs no eviction at all, so it
+        // licenses none.
+        session.set_eviction_licence(eviction_licence, eviction_spared);
 
         if (!identity_best) { search_started = Clock::now(); }
         const auto search_origin_ns = static_cast<std::uint64_t>(
@@ -592,13 +653,25 @@ public:
                             incumbent.cost.total_ns - identity_costs_[candidate].lower_bound_ns;
                         search_phase = MaterializationSearchPhase::Assessment;
                         if (allow_work(assessment_step_ns, assessment_step_ns, gain, false)) {
-                            const auto rescue = session.maximal_target(candidates[candidate].id);
-                            const auto guide  = session.guidance(rescue);
+                            // The rescue probe is this candidate's own smallest adoptable ladder
+                            // rung, not a clear-all: a candidate with a different source may give
+                            // up a different owner than the root ladder did, but still only the
+                            // oldest ones it needs, and never a prefix it can do without. (A
+                            // clear-all rescue destroyed every prefix the current request cannot
+                            // reach, since those carry no portfolio value for it.)
+                            const PlanningCandidateId rescue_id = candidates[candidate].id;
+                            const std::uint32_t arena_before = session.optional_targets_remaining();
+                            const std::optional<LadderRung> rescue_rung =
+                                find_ladder_rung(rescue_id);
+                            const auto rescue =
+                                rescue_rung
+                                    ? session.recency_maximal_target(
+                                          rescue_id, rescue_rung->sacrifice, rescue_rung->spared,
+                                          rescue_rung->demote_kept)
+                                    : session.maximal_target(rescue_id);
+                            optional_targets += arena_before - session.optional_targets_remaining();
+                            const auto guide = session.guidance(rescue);
                             if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
-                                if (!target_marked(guide.stable_target_ordinal,
-                                                   kTargetDiscovered)) {
-                                    ++optional_targets;
-                                }
                                 const auto started = Clock::now();
                                 (void)assess_target(rescue, candidate, guide.stable_target_ordinal);
                                 observe_step(assessment_step_ns, started);

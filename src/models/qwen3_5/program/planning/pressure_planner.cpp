@@ -561,34 +561,43 @@ std::uint32_t PressurePlanningSessionImpl::ranked_owner_count() const {
     return ranked_owner_count_;
 }
 
-void PressurePlanningSessionImpl::set_eviction_licence(std::uint32_t oldest_licensed) noexcept {
+void PressurePlanningSessionImpl::set_eviction_licence(
+    std::uint32_t oldest_licensed, std::span<const std::uint32_t> spared_ranks) {
     eviction_licence_count_ = std::min(oldest_licensed, ranked_owner_count_);
+    licence_spared_ranks_.assign(spared_ranks.begin(), spared_ranks.end());
 }
 
 qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::recency_maximal_target(
-    runtime::PlanningCandidateId id, std::uint32_t sacrifice_oldest) {
+    runtime::PlanningCandidateId id, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
     const auto selected = candidate_index(id);
     populate_options(selected);
     // The rung fully evicts the `sacrifice_oldest` oldest ranked owners (highest recency rank;
     // private and shared share one order), keeps every other owner as it is, and demotes a kept
     // owner to host when that frees its device resources while keeping the prefix. An owner the
-    // caller left out of the recency order (rank -1) is always sacrificed. `sacrifice_oldest` >= R
-    // means sacrifice every ranked owner, which the caller instead routes through
-    // `root_maximal_target`.
+    // caller left out of the recency order (rank -1) is always sacrificed, and a rank listed in
+    // `spared_ranks` is kept even inside the sacrificed tail. `sacrifice_oldest` >= R means
+    // sacrifice every ranked owner, which the caller instead routes through `root_maximal_target`.
     const std::uint32_t demote_count =
         sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
     choice_scratch.clear();
     for (const auto& victim : candidate_options[selected].victims) {
         const std::int32_t rank = recency_rank_[victim.owner_index];
-        const bool sacrificed =
-            rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool spared  = in_tail && rank >= 0 &&
+                            std::find(spared_ranks.begin(), spared_ranks.end(),
+                                      static_cast<std::uint32_t>(rank)) != spared_ranks.end();
         // Keeping an owner is a legal rung outcome: whether the sacrifice frees enough device and
         // host capacity is what the rung's adoption check decides, so a pool without a host tier
         // can still express "evict the k oldest and keep the rest" instead of clearing everything.
+        // A spared owner is left exactly as it is: it was spared because the rung does not need
+        // its resources, so moving it would only add work and host pressure.
         std::uint16_t choice = victim.eviction_choice;
-        if (!sacrificed) {
-            choice = victim.preserve_choice != 0 ? victim.preserve_choice : 0U;
+        if (spared) {
+            choice = 0U;
+        } else if (!in_tail) {
+            choice = demote_kept && victim.preserve_choice != 0 ? victim.preserve_choice : 0U;
         }
         choice_scratch.push_back(choice);
     }

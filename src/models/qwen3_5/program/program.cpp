@@ -140,9 +140,10 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
 }
 
 PressureTargetHandle PressurePlanningSession::recency_maximal_target(
-    runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest) {
+    runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->recency_maximal_target(candidate, sacrifice_oldest);
+    return impl_->recency_maximal_target(candidate, sacrifice_oldest, spared_ranks, demote_kept);
 }
 
 std::uint32_t PressurePlanningSession::ranked_owner_count() const {
@@ -150,8 +151,9 @@ std::uint32_t PressurePlanningSession::ranked_owner_count() const {
     return impl_->ranked_owner_count();
 }
 
-void PressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed) noexcept {
-    if (impl_ != nullptr) { impl_->set_eviction_licence(oldest_licensed); }
+void PressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed,
+                                                   std::span<const std::uint32_t> spared_ranks) {
+    if (impl_ != nullptr) { impl_->set_eviction_licence(oldest_licensed, spared_ranks); }
 }
 
 std::uint32_t PressurePlanningSession::optional_targets_remaining() const noexcept {

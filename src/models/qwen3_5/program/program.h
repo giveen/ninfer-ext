@@ -585,13 +585,19 @@ public:
     // frees enough is what its adoption check decides. The caller walks sacrifice
     // 0..`ranked_owner_count()`-1 (most-preserving first) and, if none is adoptable, falls back to
     // `root_maximal_target` (clear everything).
+    // `spared_ranks` lists recency ranks inside the sacrificed tail that the rung keeps anyway:
+    // the admission planner spares every sacrificed owner whose eviction the rung does not need.
+    // With `demote_kept` false, owners outside the tail are left in place instead of demoted.
     [[nodiscard]] PressureTargetHandle
-    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
     // Number of owners in the recency order; bounds the escape-hatch ladder.
     [[nodiscard]] std::uint32_t ranked_owner_count() const;
-    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners; see
-    // PressurePlanningSessionImpl::owner_eviction_licensed.
-    void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
+    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners except
+    // `spared_ranks`; see PressurePlanningSessionImpl::owner_eviction_licensed.
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     // Canonical target slots this session's arena can still hold. The arena also holds targets
     // a planning layer does not count in its own budget (identity targets, escape-hatch
     // maximal rungs), so expansion commits must be bounded by this value; commit_expansion

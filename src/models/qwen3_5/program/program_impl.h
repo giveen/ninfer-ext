@@ -1375,7 +1375,9 @@ struct PressurePlanningSessionImpl {
         }
         const std::int32_t rank = recency_rank_[owner_index];
         if (rank < 0) { return true; }
-        return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_;
+        return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
+               std::find(licence_spared_ranks_.begin(), licence_spared_ranks_.end(),
+                         static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
     }
 
     [[nodiscard]] qwen3_5::PressureTargetHandle
@@ -1393,14 +1395,17 @@ struct PressurePlanningSessionImpl {
     // rung is adoptable, the caller falls back to `root_maximal_target` (k = R: clear everything),
     // the guaranteed liveness backstop.
     [[nodiscard]] qwen3_5::PressureTargetHandle
-    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest);
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
     // Number of owners in the recency order; bounds the escape-hatch ladder (rungs 0..R-1, then
     // terminal).
     [[nodiscard]] std::uint32_t ranked_owner_count() const;
     // Licences incremental eviction of the `oldest_licensed` oldest ranked owners. Set once per
     // admission, from the escape-hatch ladder's smallest feasible sacrifice count (0 when the
     // identity target is feasible, i.e. nothing needs to be evicted).
-    void set_eviction_licence(std::uint32_t oldest_licensed) noexcept;
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -1483,6 +1488,8 @@ struct PressurePlanningSessionImpl {
     // Ranked owners the escape-hatch ladder had to sacrifice for the current admission, oldest
     // first. Full eviction is reachable from incremental enumeration only inside this LRU tail.
     std::uint32_t eviction_licence_count_ = 0;
+    // Ranks inside that tail the ladder proved it did not need to sacrifice.
+    std::vector<std::uint32_t> licence_spared_ranks_;
     std::vector<CandidateOptions> candidate_options;
     std::vector<TargetNode> targets;
     std::vector<std::uint16_t> target_choice_arena;
