@@ -88,6 +88,10 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
         launch_grouped<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32K128S2:
+        launch_grouped<GemmCfg<32, 32, 128, 16, 16, 2, 1, false, true, true>>(
+            x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
         launch_grouped<GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);

@@ -20,6 +20,9 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+// Explicit markers plus the engine's automatic tool/leading-instruction/full-prompt candidates;
+// one request's shared-prefix opportunities never exceed this (frontend.cpp opportunities.reserve).
+inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -127,7 +130,7 @@ struct StartupObserver {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=2;
     // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
@@ -328,11 +331,12 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
-    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    bool marker_seen                              = false;
+    std::uint32_t structured_call_count           = 0;
+    std::uint32_t empty_arguments_omitted         = 0;
+    std::uint32_t schema_mismatch_arguments       = 0;
+    std::uint32_t duplicate_parameters_repaired   = 0;
+    ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -991,6 +995,22 @@ struct ContextCostSummary {
     std::string hardware_class;
     std::string prefill_signature;
     std::filesystem::path preset_path;
+};
+
+// Static facts about the loaded model, independent of the current request context and memory
+// layout. The Engine derives the model identity (model_id) and the dimension facts
+// (vocab_size, embedding_size, native_context) from the loaded model, and measures the
+// parameters, weight bytes, and weights profile from the artifact's tensor inventory. Serving
+// renders these into the OpenAI-compatible /v1/models model object and its llama.cpp-compatible
+// `meta` field.
+struct ModelMetadata {
+    std::string model_id;    // Artifact model name (directory metadata "name").
+    std::string weights_id;  // Encoded formats of the artifact tensors (meta ftype).
+    std::uint64_t vocab_size     = 0; // Tokenizer token domain (meta n_vocab).
+    std::uint64_t embedding_size = 0; // Model embedding width (meta n_embd).
+    std::uint64_t native_context = 0; // Model native/training context (meta n_ctx_train).
+    std::uint64_t parameters     = 0; // Total logical weight elements (meta n_params).
+    std::uint64_t weight_bytes   = 0; // Encoded weight payload bytes (meta size).
 };
 
 struct LoadSummary {

@@ -578,6 +578,25 @@ int test_stops_and_ranges() {
     failures +=
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
+    body = base_request();
+    failures += check(options(parse(body).generation).stop.include_model_defaults,
+                      "an omitted ignore_eos keeps the checkpoint's own stop tokens");
+    body["ignore_eos"] = false;
+    failures += check(options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos false keeps the checkpoint's own stop tokens");
+    body["ignore_eos"] = true;
+    failures += check(parse(body).generation.ignore_eos &&
+                          !options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos suppresses the checkpoint's own stop tokens");
+    body["stop"] = Json::array({"A"});
+    failures += check(options(parse(body).generation).stop.strings.size() == 2 &&
+                          !options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos leaves caller stop strings in place");
+    body.erase("stop");
+    body["ignore_eos"] = "true";
+    failures += check(api_error([&] { (void)parse(body); }).param == "ignore_eos",
+                      "a non-boolean ignore_eos is rejected");
+
     body                                  = base_request();
     body["top_k"]                         = 21;
     const GenerationRequest invalid_top_k = parse(body).generation;
@@ -719,6 +738,10 @@ int test_stream_observations() {
                   initial["prompt_progress"]["processed"] == 12 &&
                   initial["prompt_progress"]["time_ms"] == 0,
               "initial prompt progress begins at the admitted cache frontier");
+    failures += check(initial["timings"]["prompt_n"] == 20 && initial["timings"]["prompt_ms"] == 0.0 &&
+                          initial["timings"]["prompt_per_second"] == 0.0 &&
+                          initial["timings"]["predicted_n"] == 0,
+                      "initial prompt progress carries a zero prompt-only timing snapshot");
 
     const Json middle = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
         .total_prompt_tokens     = 32,
@@ -729,6 +752,11 @@ int test_stream_observations() {
     failures += check(middle["prompt_progress"]["processed"] == 20 &&
                           middle["prompt_progress"]["time_ms"] == 57,
                       "prompt progress exposes a cumulative completed frontier");
+    failures += check(middle["timings"]["prompt_ms"] == 57.0 &&
+                          middle["timings"]["prompt_per_token_ms"] == 7.125 &&
+                          middle["timings"]["prompt_per_second"] == 1000.0 * 8.0 / 57.0 &&
+                          middle["timings"]["predicted_n"] == 0,
+                      "prompt progress timings observe the processed suffix so far");
     const Json complete = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
         .total_prompt_tokens     = 32,
         .reused_prompt_tokens    = 12,
@@ -738,6 +766,17 @@ int test_stream_observations() {
     failures +=
         check(complete["prompt_progress"]["processed"] == complete["prompt_progress"]["total"],
               "final prompt progress reaches the complete prompt");
+    failures += check(complete["timings"]["prompt_per_token_ms"] == 5.0 &&
+                          complete["timings"]["prompt_per_second"] == 200.0,
+                      "final prompt progress timings span the complete prompt suffix");
+
+    OpenAIChatStream plain(identity(), false, false, true);
+    (void)plain.start();
+    plain.note_start(
+        ninfer::GenerationStart{.prompt = {.prompt_tokens = 8}, .reused_prompt_tokens = 0});
+    const Json plain_progress = parse_sse(plain.initial_prompt_progress());
+    failures += check(!plain_progress.contains("timings"),
+                      "prompt progress omits timings without timings_per_token");
 
     stream.note_timing(ninfer::GenerationTimingObservation{
         .generated_tokens = 1, .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 0});
@@ -762,13 +801,32 @@ int test_stream_observations() {
 
 int test_common_objects() {
     int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    const ninfer::ModelMetadata metadata{
+        .model_id       = "qwen3.6-27b",
+        .weights_id     = "groupwise-int",
+        .vocab_size     = 248077,
+        .embedding_size = 5120,
+        .native_context = 262144,
+        .parameters     = 27000000000ULL,
+        .weight_bytes   = 17000000000ULL,
+    };
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000, metadata));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    const Json list_meta = models["data"][0]["meta"];
+    failures += check(list_meta["n_vocab"] == 248077 && list_meta["n_ctx"] == 240000 &&
+                          list_meta["n_ctx_train"] == 262144 && list_meta["n_embd"] == 5120 &&
+                          list_meta["n_params"] == 27000000000ULL &&
+                          list_meta["size"] == 17000000000ULL &&
+                          list_meta["ftype"] == "groupwise-int",
+                      "models list exposes the llama.cpp-compatible model meta");
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000, metadata));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+    failures += check(model["meta"]["n_embd"] == 5120 && model["meta"]["n_ctx_train"] == 262144 &&
+                          model["meta"]["ftype"] == "groupwise-int",
+                      "model lookup exposes the llama.cpp-compatible model meta");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

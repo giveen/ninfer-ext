@@ -2,8 +2,8 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-> **ninfer-ext** is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer) that builds
-> as C++23.
+> **ninfer-ext** is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer). It is
+> not the upstream project. See [About this fork](#about-this-fork) for what differs.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
@@ -28,6 +28,40 @@ recipe or choose another supported mixture of formats.
 The current engine requires v3 artifacts. Existing official v2 downloads can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
 the weights again.
+
+## About this fork
+
+ninfer-ext tracks [Neroued/ninfer](https://github.com/Neroued/ninfer) `master`
+(`594930e7`, the `upstream` remote) and adds the following. Upstream owns the architecture and
+the official artifacts; the engine design, artifact format and product scope are unchanged.
+
+- **C++23.** The whole tree builds as C++23 and uses `std::format`/`std::println`,
+  `std::ranges`, `std::flat_map`, `std::move_only_function` and deducing `this`. CMake has no
+  CUDA23 dialect for nvcc, so `CMakeLists.txt` keeps `CUDA_STANDARD 20` and passes `-std=c++23`
+  explicitly.
+- **One chat template.** A single template, [`tools/chat_templates/qwen.jinja`](tools/chat_templates/qwen.jinja),
+  serves every Qwen model. It derives from froggeric's v22.5 template with NInfer patches for
+  continuation and tool results. Artifacts converted by this fork embed it; the default effort is
+  `medium` and reasoning is retained.
+- **Open upstream PRs, merged ahead of upstream.** Each is a merge commit on `master`:
+  - NVFP4 sparse-MoE stack (#286–#290), so `Qwen3.6-35B-A3B` NVFP4 artifacts load and run.
+  - GGUF as a conversion source (#282).
+  - Kernels: Q5 K-split MMA for small batches (#292), Q4/Q5 group pipelining at T32 (#311),
+    single-pass logsumexp for `target_logprobs` (#307), fused attention RMSNorm + NVFP4
+    quantization (#305), NVFP4 SwiGLU partial last tile (#264), `rmsnorm_rope` text profile (#273),
+    Q6 fused gate/up shape (#284), and two Q4 quads in flight in the sparse-MoE decode kernel
+    (#199, re-ported onto the codec-based kernel).
+  - Serving and frontend: `/v1/models` metadata (#162), prompt-progress timings (#163),
+    `ignore_eos` (#197), `reasoning.summary` (#295), tool-call parser fixes (#299, #309), and a
+    default shared-prefix catalog capacity (#274).
+  - Workspace-layout fix (#297) and an inference speed-of-light estimator (#304).
+- **Deliberately not merged.** #268 (sigmoid gate folded into the attention reduce epilogue)
+  breaks CUDA Graph updates when MTP or ordinary profiles share a topology class, so it is
+  excluded until the graph planner can tell fusable from non-fusable attention routes.
+
+Model-quality claims, evaluation scores and the published concurrency tables below come from
+upstream's runs; only the [fork versus upstream](#fork-versus-upstream) table was measured on this
+fork's builds.
 
 ## Quick start
 
@@ -165,6 +199,44 @@ linked from each model below.
 | [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,274.7 tok/s | 1,609.7 tok/s | 224.4 tok/s |
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 8,340.4 tok/s | 2,203.1 tok/s | 219.8 tok/s |
+
+### Fork versus upstream
+
+Head-to-head runs of `ninfer_bench` on one RTX 5090: upstream `594930e7` against this fork's
+`master`, both built Release for `sm_120a` with CUDA 13.3 and CUDA Graphs on. Each row is the mean
+of two runs per build, interleaved stock, fork, fork, stock, with 5 repetitions after 1 warmup. The
+tests are `-n 128` (`tg128`) and `-pg 2048,128` (`pp2048+tg128`, decode phase reported); the
+artifacts are the fork-converted local ones, and the chat template does not affect these numbers.
+Speeds are decode tok/s; prefill is within ±0.4% everywhere.
+
+Single-token decode, no speculation:
+
+| Artifact | Test | Upstream | Fork | Change |
+|---|---|---:|---:|---:|
+| Qwen3.6-35B-A3B `groupwise-int` | tg128 | 362.9 | 372.1 | +2.5% |
+| Qwen3.6-35B-A3B `groupwise-int` | pp2048+tg128 | 359.2 | 365.5 | +1.7% |
+| Qwen3.8-27B `groupwise-int` | tg128 | 81.8 | 82.0 | +0.3% |
+| Qwen3.8-27B NVFP4 | tg128 | 76.1 | 76.3 | +0.3% |
+
+MTP (K=3) and DFlash (K=7):
+
+| Artifact | Backend | Test | Upstream | Fork | Change |
+|---|---|---|---:|---:|---:|
+| Qwen3.8-27B `groupwise-int` | MTP3 | tg128 | 94.8 | 103.5 | +9.2% |
+| Qwen3.8-27B `groupwise-int` | MTP3 | pp2048+tg128 | 191.4 | 212.8 | +11.2% |
+| Qwen3.8-27B NVFP4 | MTP3 | tg128 | 114.1 | 114.4 | +0.3% |
+| Qwen3.8-27B NVFP4 | MTP3 | pp2048+tg128 | 210.4 | 211.2 | +0.4% |
+| Qwen3.6-35B-A3B `groupwise-int` | MTP3 | tg128 | 515.7 | 523.3 | +1.5% |
+| Qwen3.6-35B-A3B `groupwise-int` | MTP3 | pp2048+tg128 | 738.1 | 745.0 | +0.9% |
+| Qwen3.6-35B-A3B `groupwise-int` | DFlash7 | tg128 | 370.8 | 374.6 | +1.0% |
+| Qwen3.6-35B-A3B `groupwise-int` | DFlash7 | pp2048+tg128 | 1,100.3 | 1,112.0 | +1.1% |
+
+The MTP gain on Qwen3.8-27B `groupwise-int` matches PR #292's claim (+11% MTP3 decode); it applies
+to Q5 small-batch projections, so NVFP4 artifacts do not see it. MTP acceptance is identical to
+upstream everywhere except Qwen3.8-27B `groupwise-int` `tg128`, where the fork accepts 29.2% of
+drafts against 30.2% (340 speculative rounds against 335); the cause is not yet attributed. These
+are single-request Op-and-engine numbers on short prompts, not a replacement for the serving
+corpus above. DFlash2, concurrency above one and NVFP4 35B-A3B were not measured.
 
 ## Evaluation
 

@@ -563,11 +563,6 @@ int test_strict_structure_and_active_tool_set() {
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
                                "missing parameter close was repaired");
 
-    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
-    failures +=
-        check_rejected(duplicate, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
-                       "duplicate parameter was silently overwritten");
-
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
     failures +=
         check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
@@ -640,6 +635,74 @@ int test_all_or_nothing_structural_commit() {
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
     return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
                           "partially valid tool-call region was partially committed");
+}
+
+int test_quoted_marker_before_real_call() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nprintf broken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text = "explaining " + quoted + " then the real turn\n" +
+                             tool_call("bash", {{"command", "echo ok"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "bash",
+                      "a quoted marker before the real call demoted the structured turn");
+    failures += check(parsed.content == "explaining " + quoted + " then the real turn",
+                      "quoted marker or intervening prose was not retained as content");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "echo ok", "recovered call arguments changed");
+    }
+    return failures;
+}
+
+int test_later_candidate_must_consume_the_end() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<parameter=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text =
+        quoted + "\n" + tool_call("bash", {{"command", "echo ok"}}) + "\nstill explaining";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                          parsed.content == text && parsed.diagnostics.marker_seen &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "a quoted marker before a non-terminal call was partially committed");
+    return failures;
+}
+
+int test_incremental_quoted_marker_preserves_bytes() {
+    auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text = "explaining " + quoted + " then the real turn\n" +
+                             tool_call("bash", {{"command", "echo ok"}});
+
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible;
+    constexpr std::size_t kChunk = 5;
+    for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
+        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+    }
+    auto terminal = decoder.finish();
+
+    int failures = 0;
+    failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "bash",
+                      "incremental quoted marker hid the real tool call");
+    failures += check(visible + terminal.content == "explaining " + quoted + " then the real turn",
+                      "incremental quoted marker lost or duplicated bytes");
+    failures +=
+        check(terminal.diagnostics.marker_seen && terminal.diagnostics.structured_call_count == 1 &&
+                  terminal.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+              "incremental quoted marker changed terminal diagnostics");
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -735,8 +798,31 @@ int test_incremental_embedded_parameter_markup() {
 
 } // namespace
 
+int test_duplicate_parameter_keeps_last_value() {
+    int failures = 0;
+    const fi::ToolCallOutputContract contract =
+        contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(duplicate, 64, contract);
+
+    failures += check(parsed.is_tool_call_response, "duplicate parameter still fell back to text");
+    failures += check(parsed.content.empty(), "duplicate parameter left prose behind");
+    failures += check(parsed.tool_calls.size() == 1, "duplicate parameter did not yield one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls.front().arguments_json == R"({"value":"second"})",
+                          "duplicate parameter did not keep the last value");
+    }
+    failures += check(parsed.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::None,
+                      "duplicate parameter still reported a fallback reason");
+    failures += check(parsed.diagnostics.duplicate_parameters_repaired == 1,
+                      "duplicate parameter repair was not recorded in diagnostics");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_duplicate_parameter_keeps_last_value();
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
@@ -753,6 +839,9 @@ int main() {
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();
+    failures += test_quoted_marker_before_real_call();
+    failures += test_later_candidate_must_consume_the_end();
+    failures += test_incremental_quoted_marker_preserves_bytes();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();

@@ -55,8 +55,8 @@ selected for this process.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Engine readiness |
-| `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
-| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
+| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object |
+| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -81,6 +81,26 @@ a dead or unacknowledging peer is normally cancelled within about 20 seconds, in
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
 connection when the downstream client disappears.
+
+## Models
+
+`GET /v1/models` and `GET /v1/models/{id}` return the configured public OpenAI model alias
+(defaults to the artifact `metadata.name`, overridable with `--model-id`) together with the
+effective `max_model_len` (the `--max-context` ceiling) and a `meta` object in the shape exposed by
+`llama.cpp`. The `meta` facts describe the registered artifact behind the alias:
+
+| Field | Meaning |
+|---|---|
+| `n_vocab` | tokenizer token domain |
+| `n_ctx` | configured per-request context ceiling (equal to `max_model_len`) |
+| `n_ctx_train` | model native/training context |
+| `n_embd` | model embedding width |
+| `n_params` | total logical weight elements across the registered artifact tensors |
+| `size` | encoded weight payload bytes of the registered artifact |
+| `ftype` | encoded tensor formats of the artifact, joined with `+` when mixed |
+
+`GET /v1/models/{id}` returns the same object for the single configured alias and a `404` for any
+other id.
 
 ## OpenAI Chat Completions
 
@@ -109,6 +129,9 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
+- the boolean `ignore_eos` extension: `true` suppresses the checkpoint's own stop tokens so
+  generation runs to the requested token budget, while caller-supplied stop strings and stop token
+  ids still apply; omitted or `false` keeps them;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
@@ -172,7 +195,9 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+unambiguously; either makes that tool-call region ordinary content. Later content is still examined:
+the first complete `<tool_call>` region that consumes the remainder of the response becomes the
+structured turn, and any quoted markup before it stays ordinary content.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.
@@ -261,11 +286,15 @@ cases report finite zero rates rather than `NaN` or infinity. Speculative reques
 include terminal `draft_n` and `draft_n_accepted` when draft work occurred.
 
 Set top-level `timings_per_token: true` on a streaming request to attach the latest cumulative
-timing snapshot to each visible reasoning or content chunk. This does not enable terminal timings,
-which are always present. A model commit that is temporarily hidden by UTF-8, stop-string,
-reasoning, or tool-call buffering still advances the cumulative token count; the next visible chunk
-observes that committed frontier. The option increases response serialization and transport volume
-and is off by default.
+timing snapshot to each visible reasoning or content chunk and, when `return_progress` is also
+enabled, to each prompt-processing chunk. During prompt processing that snapshot is prompt-only:
+`predicted_n`, `predicted_ms`, `predicted_per_token_ms`, and `predicted_per_second` remain zero
+until the first output commit, `prompt_ms` is the elapsed wall time since committed admission, and
+the prompt rates span the processed suffix (`processed - cache`) tokens rather than the complete
+prompt. This does not enable terminal timings, which are always present. A model commit that is
+temporarily hidden by UTF-8, stop-string, reasoning, or tool-call buffering still advances the
+cumulative token count; the next visible chunk observes that committed frontier. The option
+increases response serialization and transport volume and is off by default.
 
 Set top-level `return_progress: true` together with `stream: true` to receive prompt-processing
 chunks:
@@ -277,9 +306,25 @@ chunks:
     "cache": 4096,
     "processed": 6144,
     "time_ms": 41
+  },
+  "timings": {
+    "cache_n": 4096,
+    "prompt_n": 4096,
+    "prompt_ms": 41.5,
+    "prompt_per_token_ms": 0.020263671875,
+    "prompt_per_second": 49349.39759036145,
+    "predicted_n": 0,
+    "predicted_ms": 0.0,
+    "predicted_per_token_ms": 0.0,
+    "predicted_per_second": 0.0
   }
 }
 ```
+
+The `timings` object appears only when `timings_per_token: true` is also set. It reports the same
+prompt-only live snapshot described above: `time_ms` is integral milliseconds while
+`timings.prompt_ms` keeps sub-millisecond precision, and the prompt rates cover the 2,048
+processed suffix tokens so far.
 
 The initial event has `processed == cache`. Later cumulative events are published only after the
 corresponding prefill unit commits, may be coalesced when the consumer is slower than prefill, and
@@ -410,6 +455,7 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` requests disabled thinking; other standard effort values pass to the selected template |
+| `reasoning.summary` | omitted, `null`, or any string; every string requests the same fixed protocol placeholder without changing model execution, and the original value is echoed in the response |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -421,7 +467,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -522,9 +568,14 @@ invocation are also rejected because their semantics cannot be honored.
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
 `cancelled` in `status`, and a typed `output` array. NInfer may emit:
 
-- a `reasoning` Item containing raw `reasoning_text` and an empty summary;
+- a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
+  `reasoning.summary` is requested;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
+
+When `include:["reasoning.encrypted_content"]` is requested, reasoning Items also
+carries en `encrypted_content` equal to its raw `reasoning_text`. This field is **not**
+**encrypted** and provides no confidentiality.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
@@ -568,6 +619,19 @@ The normal lifecycle is:
 3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
+
+For a reasoning Item requested with any string-valued `reasoning.summary`, its
+`response.output_item.added` and `.done` payloads carry the same placeholder summary. Immediately
+after the Item is added, the stream emits `response.reasoning_summary_part.added`,
+`response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, and
+`response.reasoning_summary_part.done` with `summary_index:0`, then continues with the raw
+`reasoning_text` content lifecycle. Omitted or `null` summary requests emit none of these summary
+events and retain an empty Item `summary` array.
+
+For `include:["reasoning.encrypted_content"]`, the in-progress
+`response.output_item.added` Item omits `encrypted_content` because the complete reasoning text is
+not available yet. `response.output_item.done` and the terminal Response output contain the same
+complete raw mirror. A response with no reasoning Item emits no encrypted placeholder.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
@@ -633,9 +697,10 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
-accepted placeholders.
+moderation, Structured Outputs/JSON mode, `include` values other than
+`reasoning.encrypted_content`, background execution, compaction, files/audio, and
+OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
+these are compatibility boundaries rather than silently accepted approximations.
 
 ## Anthropic Messages
 
@@ -785,7 +850,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
-| `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
+| `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
