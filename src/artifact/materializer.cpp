@@ -6,9 +6,16 @@
 
 #include <cuda_runtime.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstring>
+#include <future>
+#include <thread>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -104,7 +111,86 @@ float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeomet
     return std::bit_cast<float>(read_u32_le(words.data()));
 }
 
+constexpr std::uint64_t kPinnedReadChunk = 64ULL * 1024 * 1024;
+
+// Read every byte of [offset, offset+bytes) of the artifact into `destination` with a few
+// concurrent buffered readers; files are opened beforehand so readers never race a lazy open.
+void parallel_read(const Reader& reader, std::uint64_t offset, std::span<std::byte> destination) {
+    const std::uint64_t bytes  = destination.size();
+    const std::uint64_t chunks = (bytes + kPinnedReadChunk - 1) / kPinnedReadChunk;
+    const unsigned workers     = static_cast<unsigned>(std::min<std::uint64_t>(
+        chunks, std::max(1U, std::min(8U, std::thread::hardware_concurrency()))));
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(workers);
+    for (unsigned worker = 0; worker < workers; ++worker) {
+        tasks.push_back(std::async(std::launch::async, [&, worker] {
+            for (std::uint64_t chunk = worker; chunk < chunks; chunk += workers) {
+                const std::uint64_t begin = chunk * kPinnedReadChunk;
+                const std::uint64_t count = std::min(kPinnedReadChunk, bytes - begin);
+                reader.read_into(offset + begin,
+                                 destination.subspan(static_cast<std::size_t>(begin),
+                                                     static_cast<std::size_t>(count)));
+            }
+        }));
+    }
+    for (auto& task : tasks) { task.get(); }
+}
+
 } // namespace
+
+// Read-only shared mapping of one file range; the page cache owns residency.
+class FileMapping {
+public:
+    FileMapping(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t bytes) {
+        const auto page             = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+        const std::uint64_t aligned = offset / page * page;
+        length_                     = static_cast<std::size_t>(offset - aligned + bytes);
+        const int fd                = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { throw ArtifactError(path.string() + ": cannot open for mapping"); }
+        base_ = ::mmap(nullptr, length_, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(aligned));
+        ::close(fd);
+        if (base_ == MAP_FAILED) {
+            base_ = nullptr;
+            throw ArtifactError(path.string() + ": mmap failed");
+        }
+        (void)::madvise(base_, length_, MADV_RANDOM);
+        data_ = static_cast<const std::byte*>(base_) + (offset - aligned);
+    }
+
+    ~FileMapping() {
+        if (base_ != nullptr) { ::munmap(base_, length_); }
+    }
+
+    FileMapping(const FileMapping&)            = delete;
+    FileMapping& operator=(const FileMapping&) = delete;
+
+    [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+
+private:
+    void* base_            = nullptr;
+    std::size_t length_    = 0;
+    const std::byte* data_ = nullptr;
+};
+
+MaterializedArtifact::MaterializedArtifact()                                           = default;
+MaterializedArtifact::~MaterializedArtifact()                                          = default;
+MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
+MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&&) noexcept = default;
+
+const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].pinned) {
+        throw ArtifactError("object has no pinned Host weight backing");
+    }
+    return *objects_[handle.index].pinned;
+}
+
+std::span<const MappedObjectSegment>
+MaterializedArtifact::file_segments(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].file.empty()) {
+        throw ArtifactError("object has no file mapping");
+    }
+    return objects_[handle.index].file;
+}
 
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
     if (!has_device(handle)) { throw ArtifactError("object has no device weight backing"); }
@@ -179,6 +265,39 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
         }
+    }
+    if (!plan.pinned_objects.empty()) { reader.open_all(); }
+    for (const auto handle : plan.pinned_objects) {
+        reader.validate_object(handle);
+        auto& storage        = out.objects_.at(handle.index);
+        const auto& object   = reader.directory().tensor(handle);
+        const auto& geometry = reader.geometry(handle);
+        if (storage.pinned || object.bytes > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError("invalid or duplicate pinned placement");
+        }
+        storage.pinned_data.emplace(static_cast<std::size_t>(object.bytes));
+        auto* data = static_cast<std::byte*>(storage.pinned_data->data());
+        parallel_read(reader, object.offset,
+                      std::span(data, static_cast<std::size_t>(object.bytes)));
+        out.stats_.read_bytes = checked_add(out.stats_.read_bytes, object.bytes, "read bytes");
+        out.stats_.pinned_host_bytes =
+            checked_add(out.stats_.pinned_host_bytes, object.bytes, "pinned bytes");
+        const auto divisor = read_divisor(
+            reader, handle, geometry, std::span<const std::byte>(data, object.bytes), out.stats_);
+        storage.pinned = WeightParent{geometry, data, divisor};
+    }
+    for (const auto handle : plan.file_objects) {
+        reader.validate_object(handle);
+        auto& storage      = out.objects_.at(handle.index);
+        const auto& object = reader.directory().object(handle);
+        for (const auto& segment : reader.segments(object_offset(object), object_bytes(object))) {
+            auto mapping = std::make_unique<FileMapping>(reader.file_path(segment.file_index),
+                                                         segment.file_offset, segment.bytes);
+            storage.file.push_back({segment.destination_offset, segment.bytes, mapping->data()});
+            out.mappings_.push_back(std::move(mapping));
+        }
+        out.stats_.mapped_file_bytes =
+            checked_add(out.stats_.mapped_file_bytes, object_bytes(object), "mapped bytes");
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {

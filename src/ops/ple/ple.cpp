@@ -28,51 +28,6 @@ void require_lanes(const Tensor& slots, std::int32_t lanes, const char* op, cons
 
 } // namespace
 
-void ngram_hash_rows(const Tensor& tokens, const Tensor& history, const Tensor& source_slots,
-                     const NgramHashTable& table, Tensor& rows, cudaStream_t stream) {
-    constexpr const char* op = "ngram_hash_rows";
-    require(table.ngram_size >= 2 && table.ngram_size <= kNgramMaximumSize &&
-                table.heads_per_ngram > 0 && table.heads() <= kNgramMaximumHeads,
-            op, "n-gram geometry exceeds the supported table");
-    require_dense(tokens, DType::I32, op, "tokens");
-    require(tokens.ne[2] == 1 && tokens.ne[3] == 1, op, "tokens must be [W,B]");
-    require_dense(history, DType::I32, op, "history");
-    require(history.ne[0] == table.ngram_size - 1, op, "history rows must be ngram_size-1");
-    require_lanes(source_slots, tokens.ne[1], op, "source_slots");
-    require_dense(rows, DType::I32, op, "rows");
-    require(rows.ne[0] == table.heads() && rows.numel() == tokens.numel() * table.heads(), op,
-            "rows must be [heads,W,B]");
-    detail::ngram_hash_rows_launch(tokens, history, source_slots, table, rows, stream);
-}
-
-void ngram_history_advance(const Tensor& tokens, const Tensor* valid_columns, Tensor& history,
-                           const Tensor& source_slots, const Tensor& destination_slots,
-                           cudaStream_t stream) {
-    constexpr const char* op = "ngram_history_advance";
-    require_dense(tokens, DType::I32, op, "tokens");
-    require_dense(history, DType::I32, op, "history");
-    require(history.ne[0] >= 1 && history.ne[0] < kNgramMaximumSize, op, "invalid history rows");
-    require_lanes(source_slots, tokens.ne[1], op, "source_slots");
-    require_lanes(destination_slots, tokens.ne[1], op, "destination_slots");
-    if (valid_columns != nullptr) { require_lanes(*valid_columns, tokens.ne[1], op, "valid"); }
-    detail::ngram_history_advance_launch(tokens, valid_columns, history, source_slots,
-                                         destination_slots, stream);
-}
-
-void gather_scaled_fp8_rows(const Weight& table, const Tensor& rows, Tensor& out,
-                            cudaStream_t stream) {
-    constexpr const char* op = "gather_scaled_fp8_rows";
-    require(table.qtype == QType::FP8_E4M3FN_ROW_BF16 && table.qdata != nullptr &&
-                table.scales != nullptr && table.n > 0 && table.k > 0,
-            op, "table must be a complete row-scaled FP8 weight");
-    require_dense(rows, DType::I32, op, "rows");
-    require(rows.ne[2] == 1 && rows.ne[3] == 1, op, "rows must be [heads,T]");
-    require_dense(out, DType::BF16, op, "out");
-    require(out.ne[0] == rows.ne[0] * table.k && out.ne[1] == rows.ne[1], op,
-            "out must be [heads*width,T]");
-    detail::gather_scaled_fp8_rows_launch(table, rows, out, stream);
-}
-
 void ple_gate(const Tensor& key, const Tensor& query, const Tensor& value, std::int32_t streams,
               Tensor& gated, cudaStream_t stream) {
     constexpr const char* op = "ple_gate";

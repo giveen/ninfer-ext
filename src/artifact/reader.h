@@ -43,6 +43,10 @@ public:
     [[nodiscard]] std::vector<std::byte> read_object(ObjectHandle handle) const;
     [[nodiscard]] std::size_t read_direct(std::size_t file_index, std::uint64_t file_offset,
                                           std::span<std::byte> destination) const;
+    // Filesystem path of the entry (index 0) or of one continuation file.
+    [[nodiscard]] std::filesystem::path file_path(std::size_t file_index) const;
+    // Open every file of the set so concurrent reads never race a lazy open.
+    void open_all() const;
 
 private:
     struct Impl;

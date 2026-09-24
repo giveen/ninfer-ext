@@ -174,4 +174,18 @@ std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offse
     return impl_->file(file_index).read_direct(file_offset, destination);
 }
 
+std::filesystem::path Reader::file_path(std::size_t file_index) const {
+    if (file_index >= impl_->directory.files.size()) {
+        throw ArtifactError("invalid continuation index");
+    }
+    if (file_index == 0) { return impl_->entry; }
+    return impl_->entry.parent_path() / *impl_->directory.files[file_index].path;
+}
+
+void Reader::open_all() const {
+    for (std::size_t index = 0; index < impl_->directory.files.size(); ++index) {
+        (void)impl_->file(index);
+    }
+}
+
 } // namespace ninfer::artifact

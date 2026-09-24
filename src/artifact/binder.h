@@ -10,7 +10,10 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
+// Device: VRAM parent. Host: owning pageable bytes (resources, small values). Values: owning
+// numeric copies. HostPinned: page-locked host parent that kernels address directly (UVA).
+// HostFile: read-only file mapping, paged in on access by host code; no device access.
+enum class Residency { Device, Host, Values, HostPinned, HostFile };
 
 struct ParameterReference {
     std::string name;
@@ -55,6 +58,8 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool pinned             = false;
+        bool file               = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;
     };
