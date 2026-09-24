@@ -66,6 +66,24 @@ struct KvCapacityPolicy {
     }
 };
 
+enum class ExpertCacheMode : std::uint8_t {
+    Automatic,
+    Explicit,
+};
+
+// Device cache of host-resident routed experts. Architectures that keep every routed expert in
+// device memory ignore it. Automatic sizing reserves the KV floor first (the explicit KV capacity,
+// or one max_context per the automatic KV minimum) and gives the remaining device memory, less
+// headroom, to the cache.
+struct ExpertCachePolicy {
+    ExpertCacheMode mode       = ExpertCacheMode::Automatic;
+    std::size_t explicit_bytes = 0;
+
+    [[nodiscard]] static constexpr ExpertCachePolicy explicit_cache(std::size_t bytes) noexcept {
+        return ExpertCachePolicy{ExpertCacheMode::Explicit, bytes};
+    }
+};
+
 enum class ProposalHead : std::uint8_t {
     Full,
     Optimized,
@@ -166,6 +184,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    ExpertCachePolicy expert_cache;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

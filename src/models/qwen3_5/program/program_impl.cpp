@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "ninfer/ops/ple.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -43,11 +44,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      adaptive_draft(plan.adaptive_draft),
-      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      adaptive_draft(plan.adaptive_draft), speculative_backend(plan.speculative_backend),
+      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -264,6 +264,46 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.qwen4) {
+        const Qwen4PersistentLayout& layout = *plan.persistent.qwen4;
+        execution::Qwen4Runtime runtime;
+        Tensor slot_of   = layout.slot_of.bind(backing);
+        Tensor owner     = layout.owner.bind(backing);
+        Tensor stamp     = layout.stamp.bind(backing);
+        Tensor counters  = layout.counters.bind(backing);
+        runtime.cache    = ops::ExpertCacheState{
+               .slot_of    = static_cast<std::int32_t*>(slot_of.data),
+               .owner      = static_cast<std::int32_t*>(owner.data),
+               .stamp      = static_cast<unsigned long long*>(stamp.data),
+               .clock      = static_cast<unsigned long long*>(counters.data),
+               .statistics = static_cast<unsigned long long*>(counters.data) + 1,
+               .slots      = layout.slots,
+               .layers     = layout.cache_layers,
+               .pool       = static_cast<std::byte*>(layout.pool.bind(backing).data)};
+        CUDA_CHECK(cudaMemsetAsync(slot_of.data, 0xFF, slot_of.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(owner.data, 0xFF, owner.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
+        if (layout.staged_bank) {
+            runtime.staged_bank    = static_cast<std::byte*>(layout.staged_bank->bind(backing).data);
+            runtime.staged_columns = kQwen4StagedColumns;
+        }
+        const auto& config = parameters.model.config().text;
+        if (config.ple) {
+            const auto& block = parameters.qwen4->layers.at(config.ple->layer);
+            if (!block.ple) { throw std::logic_error("Qwen4Exp PLE layer has no parameters"); }
+            ple_gather = std::make_unique<execution::PleGather>(block.ple->table, *config.ple);
+            runtime.ple_states = state_images->ple_states();
+            if (layout.ple_record) { runtime.ple_record = layout.ple_record->bind(backing); }
+            if (layout.ple_input) { runtime.ple_input = layout.ple_input->bind(backing); }
+            const std::size_t columns = std::max<std::size_t>(
+                prefill_chunk, static_cast<std::size_t>(draft_window + 1U) * max_concurrency);
+            ple_host.emplace(columns * ple_gather->width() * sizeof(std::uint16_t));
+            runtime.ple_gather = ple_gather.get();
+            runtime.ple_host   = static_cast<std::uint16_t*>(ple_host->data());
+        }
+        qwen4_runtime = runtime;
+    }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -409,7 +449,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor target_ids = work.alloc(DType::I32, {columns});
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
-            execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            execution::output_logits(parameters, hidden, logits, work, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                                     cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids,
@@ -430,7 +470,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, qwen4_execution()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -595,5 +635,52 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+
+void ProgramImpl::stage_qwen4_round_column(std::span<const TokenId> history,
+                                           std::span<const TokenId> round,
+                                           std::size_t column_in_round,
+                                           std::size_t staging_column) {
+    if (!qwen4_runtime || ple_gather == nullptr) { return; }
+    const std::size_t context = parameters.model.config().text.ple->ngram_size - 1U;
+    std::array<std::int32_t, 16> tokens{};
+    if (context + column_in_round + 1U > tokens.size() || column_in_round >= round.size()) {
+        throw std::logic_error("Qwen4Exp round PLE column exceeds its n-gram window");
+    }
+    // Sequence tail: up to `context` history tokens, then the round tokens through this column.
+    const std::size_t before = std::min(context, history.size());
+    std::size_t count        = 0;
+    for (std::size_t i = history.size() - before; i < history.size(); ++i) {
+        tokens[count++] = history[i];
+    }
+    for (std::size_t i = 0; i <= column_in_round; ++i) { tokens[count++] = round[i]; }
+    const std::size_t width = ple_gather->width();
+    ple_gather->gather(std::span<const std::int32_t>(tokens.data(), count), count - 1U, 1,
+                       std::span<std::uint16_t>(qwen4_runtime->ple_host + staging_column * width,
+                                                width));
+}
+
+void ProgramImpl::fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow> rows) {
+    if (!qwen4_runtime || qwen4_runtime->ple_record.data == nullptr || rows.empty()) { return; }
+    const auto count = static_cast<std::int32_t>(rows.size());
+    auto scope       = work.scope();
+    Tensor control   = work.alloc(DType::I32, {count, 3});
+    std::array<std::int32_t, 3 * kMaximumConcurrency> host{};
+    for (std::int32_t row = 0; row < count; ++row) {
+        host[static_cast<std::size_t>(row)]             = rows[row].source_state_slot;
+        host[static_cast<std::size_t>(count + row)]     = rows[row].destination_state_slot;
+        host[static_cast<std::size_t>(2 * count + row)] = rows[row].commit_columns;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(control.data, host.data(), control.bytes(), cudaMemcpyHostToDevice,
+                               device.stream));
+    const Tensor& record  = qwen4_runtime->ple_record;
+    const Tensor inputs   = record.slice(2, 0, count);
+    Tensor states         = qwen4_runtime->ple_states;
+    const Tensor sources  = control.slice(1, 0, 1).view({count});
+    const Tensor targets  = control.slice(1, 1, 1).view({count});
+    const Tensor accepted = control.slice(1, 2, 1).view({count});
+    ops::ple_conv_advance(inputs, &accepted,
+                          static_cast<std::int32_t>(parameters.model.config().text.ple->conv_history()),
+                          states, sources, targets, device.stream);
+}
 
 } // namespace ninfer::models::qwen3_5::detail

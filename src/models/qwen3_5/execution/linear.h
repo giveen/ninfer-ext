@@ -25,4 +25,9 @@ inline void project_swiglu(const Tensor& input, const LinearParameters& p, Tenso
     ops::linear_swiglu(input, p.weight, output, p.policy, workspace, stream);
 }
 
+// Output-head logits of continuation hidden columns: the normalized hidden for Qwen3.5, the wide
+// hyper-connection residual (through the output mixer) for Qwen4Exp.
+void output_logits(const Parameters& parameters, const Tensor& hidden, Tensor& logits,
+                   WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::models::qwen3_5::execution

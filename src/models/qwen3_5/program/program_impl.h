@@ -17,6 +17,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
+#include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -559,6 +560,17 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    [[nodiscard]] const execution::Qwen4Runtime* qwen4_execution() const noexcept {
+        return qwen4_runtime ? &*qwen4_runtime : nullptr;
+    }
+    // Host-gathers the PLE embedding of `columns` round columns into pinned staging; column c of
+    // `tokens` is the token at position `positions[c]` of a sequence whose earlier tokens are
+    // `history`. No-op without PLE.
+    void stage_qwen4_round_column(std::span<const TokenId> history, std::span<const TokenId> round,
+                                  std::size_t column_in_round, std::size_t staging_column);
+    // Advances the PLE convolution history of speculative rows by their committed prefix.
+    void fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow> rows);
+
     friend struct qwen3_5::detail::PressurePlanningSessionImpl;
 
     const execution::Parameters& parameters;
@@ -606,6 +618,9 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    std::optional<execution::Qwen4Runtime> qwen4_runtime;
+    std::unique_ptr<execution::PleGather> ple_gather;
+    std::optional<PinnedHostBuffer> ple_host;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;

@@ -8,6 +8,7 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
@@ -16,7 +17,10 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/offload_moe.h"
+#include "ninfer/ops/sparse_attention.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
@@ -135,6 +139,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .qsa_index                 = config.sparse_attention.has_value(),
                  });
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
@@ -148,8 +153,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .slot_count     = state_image_slots,
                 .conv_dtype     = DType::BF16,
             },
-        .hidden = dimension(config.hidden_size),
+        .hidden = dimension(config.residual_width()),
     };
+    if (config.ple) {
+        state_image_spec.ple_state =
+            dimension(std::uint64_t(config.ple->conv_history()) * config.residual_width());
+    }
     {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
@@ -234,19 +243,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_5::begin_round_state_layout(
-        builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.hidden_size),
+        builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.residual_width()),
                                          .output_rows    = dimension(config.vocab_size),
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring});
     out.prefill_hidden =
-        add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
+        add_tensor(builder, DType::BF16,
+                   {dimension(config.residual_width()), effective_prefill_chunk},
                    "step prefill hidden");
     if (plan.causal_scoring) {
         out.score_hidden =
             add_tensor(builder, DType::BF16,
-                       {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
+                       {dimension(config.residual_width()),
+                        static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
@@ -261,15 +272,218 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
     }
+    if (config.qwen4()) {
+        Qwen4PersistentLayout q;
+        q.cache_layers = dimension(config.num_hidden_layers + (plan.features.mtp() ? 1U : 0U));
+        q.slots        = checked_i32(plan.expert_cache_slots, "expert cache slot count");
+        q.slot_of      = add_tensor(builder, DType::I32, {q.cache_layers * ops::kOffloadMoeExperts},
+                                    "expert cache slot table");
+        q.owner        = add_tensor(builder, DType::I32, {q.slots}, "expert cache owners");
+        q.stamp        = add_tensor(builder, DType::I64, {q.slots}, "expert cache stamps");
+        q.counters     = add_tensor(builder, DType::I64, {3}, "expert cache counters");
+        q.pool         = builder.add(checked_mul(static_cast<std::size_t>(q.slots),
+                                                 ops::kExpertSlotBytes, "expert cache pool bytes"),
+                                     kArenaAlign, "expert cache pool");
+        q.staged_bank  = builder.add(static_cast<std::size_t>(ops::kOffloadMoeExperts) *
+                                         ops::kExpertSlotBytes,
+                                     kArenaAlign, "prefill expert layer bank");
+        const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
+        if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
+            q.ple_record = add_tensor(
+                builder, DType::BF16,
+                {dimension(config.residual_width()), static_cast<std::int32_t>(plan.draft_window + 1U),
+                 static_cast<std::int32_t>(plan.max_concurrency)},
+                "PLE speculative record");
+        }
+        if (config.ple && !plan.causal_scoring) {
+            q.ple_input = add_tensor(builder, DType::BF16,
+                                     {dimension(config.ple->embed_dim), columns}, "PLE round input");
+        }
+        out.qwen4 = q;
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     return out;
 }
 
+WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
+    const auto& parameters = *plan.parameters;
+    const auto& config     = parameters.model.config().text;
+    const auto& qwen4      = *parameters.qwen4;
+    const auto chunk       = static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
+    const auto verify      = static_cast<std::int32_t>(plan.draft_window + 1U);
+    const std::int32_t slots = checked_i32(plan.expert_cache_slots, "expert cache slot count");
+    const std::int32_t hidden = dimension(config.hidden_size);
+    const std::int32_t wide   = dimension(config.residual_width());
+    const auto public_tokens  = dimension(parameters.model.resources().public_token_count);
+
+    const auto scratch = [](WorkspaceLayoutBuilder& layout, std::size_t bytes) {
+        if (bytes == 0) { return; }
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(bytes);
+    };
+    const auto linear = [&](WorkspaceLayoutBuilder& layout, const execution::LinearParameters& p,
+                            std::int32_t tokens) {
+        scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n,
+                                                             p.weight.k, p.policy, 1, tokens));
+    };
+    const auto hc = [&](WorkspaceLayoutBuilder& layout, const execution::HyperConnectionParameters& p,
+                        std::int32_t tokens) {
+        auto scope = layout.scope();
+        (void)workspace::qwen4_hc(layout, config, tokens, p.inject_rows);
+        linear(layout, p.down, tokens);
+        linear(layout, p.up, tokens);
+    };
+    const auto block = [&](WorkspaceLayoutBuilder& layout, const execution::Qwen4BlockParameters& p,
+                           std::int32_t tokens, bool prefill) {
+        if (p.ple) {
+            auto scope = layout.scope();
+            (void)workspace::qwen4_ple(layout, config, tokens);
+            linear(layout, p.ple->key_value, tokens);
+        }
+        auto scope = layout.scope();
+        (void)workspace::qwen4_block(layout, config, tokens);
+        hc(layout, p.attention_hc, tokens);
+        {
+            auto mixer = layout.scope();
+            if (const auto* qsa = std::get_if<execution::QsaParameters>(&p.mixer)) {
+                (void)workspace::qwen4_qsa(layout, config, tokens);
+                linear(layout, qsa->projection, tokens);
+                linear(layout, qsa->indexer, tokens);
+                linear(layout, qsa->output, tokens);
+                scratch(layout, ops::qsa_select_workspace_bytes(
+                                    workspace::qwen4_qsa_geometry(config), plan.capacity, tokens));
+            } else {
+                const auto& gdn = std::get<execution::Qwen4GdnParameters>(p.mixer);
+                (void)workspace::qwen4_gdn(layout, config, tokens);
+                linear(layout, gdn.projection, tokens);
+                linear(layout, gdn.control, tokens);
+                linear(layout, gdn.output, tokens);
+                if (prefill) {
+                    scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
+                                        dimension(config.gdn->linear_num_key_heads),
+                                        dimension(config.gdn->linear_num_value_heads), true, 1,
+                                        tokens));
+                }
+            }
+        }
+        hc(layout, p.ffn_hc, tokens);
+        auto moe = layout.scope();
+        (void)workspace::qwen4_moe(layout, config, tokens, slots);
+        linear(layout, p.moe.shared_gate_up, tokens);
+        linear(layout, p.moe.shared_down, tokens);
+        scratch(layout, ops::moe_experts_workspace_bytes(
+                            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts)));
+    };
+    const auto body = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens, bool prefill) {
+        {
+            auto embed = layout.scope();
+            (void)layout.alloc(DType::BF16, {hidden, tokens});
+        }
+        for (const auto& layer : qwen4.layers) { block(layout, layer, tokens, prefill); }
+    };
+    const auto logits = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+        auto scope = layout.scope();
+        (void)layout.alloc(DType::BF16, {hidden, tokens});
+        hc(layout, qwen4.head, tokens);
+        linear(layout, parameters.text.output_head, tokens);
+    };
+    const auto mtp_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+        auto scope = layout.scope();
+        {
+            auto stem = layout.scope();
+            (void)workspace::qwen4_mtp_stem(layout, config, tokens);
+            linear(layout, parameters.qwen4_mtp->embedding_projection, tokens);
+            linear(layout, parameters.qwen4_mtp->hidden_projection, tokens * 4);
+        }
+        block(layout, parameters.qwen4_mtp->layer, tokens, false);
+    };
+    const auto proposal = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+        auto scope = layout.scope();
+        (void)layout.alloc(DType::BF16, {hidden, tokens});
+        hc(layout, parameters.qwen4_mtp->head, tokens);
+        linear(layout, parameters.text.output_head, tokens);
+    };
+    const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
+
+    WorkspacePlan out;
+    {
+        WorkspaceLayoutBuilder prefill;
+        (void)workspace::qwen4_prefill_roots(prefill, config, chunk, plan.features.vision ? 3 : 1,
+                                             plan.features.vision ? chunk : 0);
+        body(prefill, chunk, true);
+        (void)prefill.alloc(DType::BF16, {wide, chunk});
+        logits(prefill, 1);
+        if (!plan.causal_scoring) {
+            scratch(prefill, ops::sampling_workspace_capacity_bytes(public_tokens, 1, 1));
+        }
+        if (plan.features.mtp()) {
+            auto mtp = prefill.scope();
+            (void)prefill.alloc(DType::I32, {chunk});
+            if (plan.features.vision) { (void)prefill.alloc(DType::BF16, {hidden, chunk}); }
+            if (plan.features.vision) { (void)prefill.alloc(DType::I32, {chunk}); }
+            (void)prefill.alloc(DType::BF16, {wide, chunk});
+            mtp_core(prefill, chunk);
+            proposal(prefill, 1);
+            (void)prefill.alloc(DType::BF16, {wide, 1});
+            mtp_core(prefill, 1);
+        }
+        out.text_prefill = finish(prefill);
+        out.mtp_prefill  = plan.features.mtp() ? out.text_prefill : 0;
+    }
+    if (plan.causal_scoring) {
+        WorkspaceLayoutBuilder score;
+        (void)score.alloc(DType::BF16, {dimension(config.vocab_size),
+                                        static_cast<std::int32_t>(kCausalScoreTile)});
+        (void)score.alloc(DType::I32, {static_cast<std::int32_t>(kCausalScoreTile)});
+        (void)score.alloc(DType::FP32, {static_cast<std::int32_t>(kCausalScoreTile)});
+        logits(score, static_cast<std::int32_t>(kCausalScoreTile));
+        out.causal_score = finish(score);
+    } else {
+        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+             ++batch) {
+            WorkspaceLayoutBuilder ordinary;
+            (void)ordinary.alloc(DType::BF16, {wide, batch});
+            body(ordinary, batch, false);
+            logits(ordinary, batch);
+            scratch(ordinary, ops::sampling_workspace_capacity_bytes(public_tokens, batch, batch));
+            out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
+            if (plan.features.mtp()) {
+                const std::int32_t aggregate = batch * verify;
+                WorkspaceLayoutBuilder target;
+                (void)target.alloc(DType::BF16, {wide, aggregate});
+                body(target, aggregate, false);
+                logits(target, aggregate);
+                WorkspaceLayoutBuilder draft;
+                mtp_core(draft, aggregate);
+                WorkspaceLayoutBuilder propose;
+                proposal(propose, batch);
+                const std::size_t accept =
+                    ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                        public_tokens, verify - 1, verify - 1, batch, batch);
+                out.mtp_round = std::max({out.mtp_round, finish(target), finish(draft),
+                                          finish(propose), accept});
+            }
+        }
+    }
+    out.general_capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill,
+                                     out.mtp_round, out.causal_score});
+    out.capacity         = out.general_capacity;
+    if (plan.features.vision) {
+        const std::uint32_t merged = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+        out.vision = execution::VisionContext::plan_workspace(
+            *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
+        out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
+    }
+    return out;
+}
+
 WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
+    if (parameters.qwen4) { return build_qwen4_workspace_plan(plan); }
 
     const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
     if (chunk_u32 == 0 ||
@@ -804,6 +1018,71 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
+    const auto& text = parameters.model.config().text;
+    if (text.qwen4()) {
+        if (options.kv_cache != KvCacheStorage::BFloat16 &&
+            options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+            throw std::invalid_argument("Qwen4Exp supports the bf16 and fp8 KV-cache profiles");
+        }
+        if (options.speculative.backend != SpeculativeBackend::None &&
+            options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("Qwen4Exp supports MTP speculative decoding only");
+        }
+        if (options.speculative.backend == SpeculativeBackend::Mtp && !parameters.qwen4_mtp) {
+            throw std::invalid_argument("Qwen4Exp MTP requires the selected MTP component");
+        }
+        if (options.speculative.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("Qwen4Exp proposals use the full output head");
+        }
+        if (options.expert_cache.mode == ExpertCacheMode::Explicit &&
+            options.expert_cache.explicit_bytes < ops::kExpertSlotBytes) {
+            throw std::invalid_argument("expert cache must hold at least one expert");
+        }
+    }
+}
+
+std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
+                                                           std::uint32_t main_page_groups);
+
+// Qwen4Exp: device slots of the routed-expert cache. The KV floor is planned first; the automatic
+// cache takes the rest of free device memory less headroom, clamped to [one verify round, every
+// expert].
+std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
+                                         const EngineOptions& options,
+                                         std::uint32_t floor_pages) {
+    const auto& config = inputs.parameters->model.config().text;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(config.num_hidden_layers + (inputs.features.mtp() ? 1U : 0U)) *
+        ops::kOffloadMoeExperts;
+    const std::uint64_t minimum = static_cast<std::uint64_t>(ops::kOffloadMoeTopK) *
+                                  (inputs.draft_window + 1U) * inputs.max_concurrency;
+    std::uint64_t slots = 0;
+    if (options.expert_cache.mode == ExpertCacheMode::Explicit) {
+        slots = options.expert_cache.explicit_bytes / ops::kExpertSlotBytes;
+        if (slots < minimum) {
+            throw std::invalid_argument("expert cache must hold " + std::to_string(minimum) +
+                                        " experts (" +
+                                        std::to_string(minimum * ops::kExpertSlotBytes) +
+                                        " bytes) for one verify round");
+        }
+    } else {
+        inputs.expert_cache_slots = static_cast<std::uint32_t>(minimum);
+        const std::size_t floor   = build_sequence_candidate(inputs, floor_pages)
+                                      ->device_reservation_bytes;
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const std::size_t headroom =
+            kDefaultKvCapacityHeadroomBytes + (options.kv_capacity.mode == KvCapacityMode::Automatic
+                                                   ? options.kv_capacity.automatic_headroom_bytes
+                                                   : 0U);
+        if (free_bytes < floor + headroom) {
+            throw std::invalid_argument(
+                "the KV floor and minimum expert cache require " + std::to_string(floor + headroom) +
+                " bytes, but only " + std::to_string(free_bytes) + " bytes are free after weights");
+        }
+        slots = minimum + (free_bytes - floor - headroom) / ops::kExpertSlotBytes;
+    }
+    return static_cast<std::uint32_t>(std::min(slots, total));
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -830,6 +1109,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
+    impl->expert_cache_slots  = inputs.expert_cache_slots;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -925,6 +1205,14 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
     const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+
+    if (parameters.model.config().text.qwen4()) {
+        const std::uint32_t floor_pages =
+            options.kv_capacity.mode == KvCapacityMode::Explicit
+                ? std::max(minimum_pages, page_count(options.kv_capacity.explicit_tokens))
+                : minimum_pages;
+        inputs.expert_cache_slots = resolve_expert_cache_slots(inputs, options, floor_pages);
+    }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;

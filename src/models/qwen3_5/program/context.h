@@ -38,6 +38,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    const Qwen4Runtime* qwen4 = nullptr; // Program-owned Qwen4Exp resources, or null
 };
 
 struct PrefillContext {
@@ -152,6 +153,8 @@ struct MtpBridgeInput {
     std::array<std::int32_t, 3> rope_position{};
 };
 
+// Uploads the host-gathered PLE embedding of the next decode round inside its Graph.
+void upload_qwen4_round_input(const ExecutionCore& execution, std::int32_t columns);
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,

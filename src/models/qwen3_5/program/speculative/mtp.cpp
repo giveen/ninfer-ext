@@ -85,6 +85,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
+        card.set_qwen4_runtime(state.execution.qwen4);
+        upload_qwen4_round_input(state.execution, static_cast<std::int32_t>(k + 1U) * batch_size);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
@@ -178,10 +180,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                    .view({batch_size});
                 Tensor previous_batch = previous.view({1, batch_size});
                 Tensor hidden_batch   = ar_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
+                    {dimension(state.execution.parameters.model.config().text.residual_width()), 1,
                        batch_size});
                 Tensor next_hidden_batch = next_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
+                    {dimension(state.execution.parameters.model.config().text.residual_width()), 1,
                      batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);

@@ -37,6 +37,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
+        card.set_qwen4_runtime(state.execution.qwen4);
+        upload_qwen4_round_input(state.execution, batch_size);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -95,11 +97,10 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label) {
-    const auto it =
-        std::ranges::find_if(family.profiles, [&](const DecodeGraphProfile& profile) {
-            return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
-                   frontier <= profile.max_execution_frontier;
-        });
+    const auto it = std::ranges::find_if(family.profiles, [&](const DecodeGraphProfile& profile) {
+        return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
+               frontier <= profile.max_execution_frontier;
+    });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
     }
@@ -137,9 +138,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
     request.speculative_stats = SpeculativeStats{
-        .backend               = speculative_backend,
-        .enabled               = speculative_backend != SpeculativeBackend::None,
-        .draft_window          = draft_window,
+        .backend                = speculative_backend,
+        .enabled                = speculative_backend != SpeculativeBackend::None,
+        .draft_window           = draft_window,
         .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
         .rounds_by_draft_length = std::vector<std::uint64_t>(draft_window, 0),
     };
@@ -156,7 +157,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 ||
-        source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||
+        source.ne[0] != dimension(parameters.model.config().text.residual_width()) ||
         source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
@@ -246,7 +247,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
-                                          prefill_hidden, prefill_chunk, proposal_head},
+                                          prefill_hidden, prefill_chunk, proposal_head,
+                                          qwen4_execution()},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -329,13 +331,15 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            const std::span<const TokenId> ledger(sequence.ledger);
+            stage_qwen4_round_column(ledger.first(ledger.size() - 1U), ledger.last(1), 0, row);
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, qwen4_execution()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -470,9 +474,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent = std::min(
-                {sequence.mtp_draft_count, k, max_by_budget, capacity - sequence.execution_frontier - 1});
-            mtp_host_ingress->anchors[row]        = sequence.ledger.back();
+            const std::uint32_t extent     = std::min({sequence.mtp_draft_count, k, max_by_budget,
+                                                       capacity - sequence.execution_frontier - 1});
+            mtp_host_ingress->anchors[row] = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
@@ -496,13 +500,26 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            if (qwen4_runtime) {
+                std::array<TokenId, kMaximumMtpDraftTokens + 1> round{};
+                round[0] = sequence.ledger.back();
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    round[j + 1] = mtp_host_ingress->current_drafts[row * k + j];
+                }
+                const std::span<const TokenId> ledger(sequence.ledger);
+                for (std::uint32_t j = 0; j < width; ++j) {
+                    stage_qwen4_round_column(ledger.first(ledger.size() - 1U),
+                                             std::span<const TokenId>(round.data(), width), j,
+                                             row * width + j);
+                }
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + k));
         }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   &rung.records, io, prefill_hidden,
-                                                   prefill_chunk, proposal_head},
+                                                   &rung.records, io, prefill_hidden, prefill_chunk,
+                                                   proposal_head, qwen4_execution()},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   rung.frame,
@@ -698,7 +715,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, qwen4_execution()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,

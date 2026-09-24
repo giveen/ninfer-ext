@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -42,11 +43,6 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
-void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work,
-             cudaStream_t stream) {
-    ops::linear(x, p.weight, out, p.policy, work, stream);
-}
-
 // Copy rows [row0, row0 + rows) of a contiguous [R, T] matrix into a contiguous [rows, T] one.
 void copy_rows(const Tensor& source, std::int32_t row0, std::int32_t rows, Tensor& destination,
                cudaStream_t stream) {
@@ -69,28 +65,6 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
                                cudaMemcpyHostToDevice, stream));
 }
 
-ops::QsaGeometry qsa_geometry(const TextConfig& config) {
-    const auto& attention = *config.attention;
-    const auto& qsa       = *config.sparse_attention;
-    const auto& rope      = *config.rope_parameters;
-    ops::QsaGeometry g;
-    g.query_heads  = dimension(attention.num_attention_heads);
-    g.kv_heads     = dimension(attention.num_key_value_heads);
-    g.head_dim     = dimension(attention.head_dim);
-    g.index_heads  = dimension(qsa.indexer_heads);
-    g.index_dim    = dimension(qsa.indexer_head_dim);
-    g.budget       = dimension(qsa.budget);
-    g.ratio        = dimension(qsa.compress_ratio);
-    g.rotary_dim   = dimension(rope.rotary_dim);
-    g.rope_theta   = rope.rope_theta;
-    g.rms_norm_eps = config.rms_norm_eps;
-    if (rope.pair_axes.size() > g.pair_axes.size()) {
-        throw std::invalid_argument("QSA rotary pairs exceed the indexer geometry");
-    }
-    std::copy(rope.pair_axes.begin(), rope.pair_axes.end(), g.pair_axes.begin());
-    return g;
-}
-
 template <class T>
 class ScopedBinding {
 public:
@@ -106,8 +80,36 @@ private:
     T previous_;
 };
 
+void hc_mix(const TextConfig& config, const HyperConnectionParameters& p, const Tensor& wide,
+            Tensor& x, Tensor* inject, WorkspaceArena& work, cudaStream_t s) {
+    const int T           = wide.ne[1];
+    const std::int32_t hc = dimension(config.hyper_connection->hc_count);
+    auto scope            = work.scope();
+    auto roots            = workspace::qwen4_hc(work, config, T, p.inject_rows);
+    ops::grouped_offset_rmsnorm(wide, p.norm, hc, config.rms_norm_eps, roots.normalized, s);
+    project(roots.normalized, p.down, roots.projection, work, s);
+    ops::hyper_connection_gates(roots.projection, hc, roots.lowrank,
+                                p.inject_rows != 0 ? inject : nullptr, s);
+    project(roots.lowrank, p.up, roots.up, work, s);
+    ops::hyper_connection_collapse(roots.up, roots.normalized, hc, x, s);
+}
 
 } // namespace
+
+void output_logits(const Parameters& parameters, const Tensor& hidden, Tensor& logits,
+                   WorkspaceArena& work, cudaStream_t stream) {
+    auto scope = work.scope();
+    if (!parameters.qwen4) {
+        ops::linear(hidden, parameters.text.output_head.weight, logits,
+                    parameters.text.output_head.policy, work, stream);
+        return;
+    }
+    const auto& config = parameters.model.config().text;
+    Tensor x           = work.alloc(DType::BF16, {dimension(config.hidden_size), hidden.ne[1]});
+    hc_mix(config, parameters.qwen4->head, hidden, x, nullptr, work, stream);
+    ops::linear(x, parameters.text.output_head.weight, logits, parameters.text.output_head.policy,
+                work, stream);
+}
 
 const Qwen4Runtime& TextContext::qwen4_runtime() const {
     if (qwen4_runtime_ == nullptr) {
@@ -156,20 +158,7 @@ void TextContext::qwen4_embed(const Tensor& ids, const Tensor* scatter_indices,
 
 void TextContext::qwen4_hc_mix(const HyperConnectionParameters& p, const Tensor& wide, Tensor& x,
                                Tensor* inject) {
-    cudaStream_t s        = ctx_.stream;
-    const int T           = wide.ne[1];
-    const std::int32_t hc = dimension(config_.hyper_connection->hc_count);
-    auto scope            = work_.scope();
-    auto roots            = workspace::qwen4_hc(work_, config_, T, p.inject_rows);
-    Tensor normalized     = roots.normalized;
-    Tensor projection     = roots.projection;
-    Tensor lowrank        = roots.lowrank;
-    Tensor up             = roots.up;
-    ops::grouped_offset_rmsnorm(wide, p.norm, hc, config_.rms_norm_eps, normalized, s);
-    project(normalized, p.down, projection, work_, s);
-    ops::hyper_connection_gates(projection, hc, lowrank, p.inject_rows != 0 ? inject : nullptr, s);
-    project(lowrank, p.up, up, work_, s);
-    ops::hyper_connection_collapse(up, normalized, hc, x, s);
+    hc_mix(config_, p, wide, x, inject, work_, ctx_.stream);
 }
 
 void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4Sequence& sequence,
@@ -182,7 +171,7 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     const auto kv_heads             = dimension(attention.num_key_value_heads);
     const auto qw                   = dimension(attention.query_width());
     const auto kw                   = dimension(attention.key_width());
-    const ops::QsaGeometry geometry = qsa_geometry(config_);
+    const ops::QsaGeometry geometry = workspace::qwen4_qsa_geometry(config_);
     const std::int32_t W = sequence.width, B = sequence.batch;
 
     auto scope = work_.scope();

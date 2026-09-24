@@ -7,6 +7,7 @@
 #include "ninfer/ops/sparse_attention.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <cstdint>
 
 namespace ninfer::models::qwen3_5::execution::workspace {
@@ -17,6 +18,28 @@ namespace ninfer::models::qwen3_5::execution::workspace {
 
 [[nodiscard]] inline std::int32_t qwen4_streams(const TextConfig& config) {
     return dimension(config.hyper_connection->hc_count);
+}
+
+[[nodiscard]] inline ops::QsaGeometry qwen4_qsa_geometry(const TextConfig& config) {
+    const auto& attention = *config.attention;
+    const auto& qsa       = *config.sparse_attention;
+    const auto& rope      = *config.rope_parameters;
+    ops::QsaGeometry g;
+    g.query_heads  = dimension(attention.num_attention_heads);
+    g.kv_heads     = dimension(attention.num_key_value_heads);
+    g.head_dim     = dimension(attention.head_dim);
+    g.index_heads  = dimension(qsa.indexer_heads);
+    g.index_dim    = dimension(qsa.indexer_head_dim);
+    g.budget       = dimension(qsa.budget);
+    g.ratio        = dimension(qsa.compress_ratio);
+    g.rotary_dim   = dimension(rope.rotary_dim);
+    g.rope_theta   = rope.rope_theta;
+    g.rms_norm_eps = config.rms_norm_eps;
+    if (rope.pair_axes.size() > g.pair_axes.size()) {
+        throw std::invalid_argument("QSA rotary pairs exceed the indexer geometry");
+    }
+    std::copy(rope.pair_axes.begin(), rope.pair_axes.end(), g.pair_axes.begin());
+    return g;
 }
 
 struct Qwen4HcRoots {

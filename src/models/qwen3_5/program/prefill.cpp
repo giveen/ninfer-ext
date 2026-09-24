@@ -46,6 +46,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_qwen4_runtime(execution.qwen4);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -139,17 +140,29 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
+void upload_qwen4_round_input(const ExecutionCore& execution, std::int32_t columns) {
+    if (execution.qwen4 == nullptr || execution.qwen4->ple_input.data == nullptr) { return; }
+    if (execution.qwen4->ple_host == nullptr || columns <= 0 ||
+        columns > execution.qwen4->ple_input.ne[1]) {
+        throw std::logic_error("Qwen4Exp round PLE input is outside its staging");
+    }
+    const Tensor window = execution.qwen4->ple_input.slice(1, 0, columns);
+    CUDA_CHECK(cudaMemcpyAsync(window.data, execution.qwen4->ple_host, window.bytes(),
+                               cudaMemcpyHostToDevice, execution.device.stream));
+}
+
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose) {
     if (hidden.dtype != DType::BF16 ||
-        hidden.ne[0] != dimension(state.execution.parameters.model.config().text.hidden_size) ||
+        hidden.ne[0] !=
+            dimension(state.execution.parameters.model.config().text.residual_width()) ||
         hidden.ne[1] != 1 || hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
-            state.execution.device.stream);
+    output_logits(state.execution.parameters, hidden, logits, state.execution.work,
+                  state.execution.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -806,6 +819,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                                                  : *replay_fold;
         fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                      device.stream);
+        fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()));
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -999,7 +1013,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, qwen4_execution()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
