@@ -15,6 +15,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Swap an artifact's trailing chat-template resource without reconverting | [`artifact/replace_resource.py`](artifact/replace_resource.py); [usage](#artifact-workflow) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -44,7 +45,7 @@ artifacts. The input paths are placeholders for local checkpoint checkouts:
 python3 -m tools.convert \
   --model /path/to/Qwen3.6-27B \
   --recipe qwen3_6_27b --components text,vision,mtp --proposal \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --name qwen3.6-27b \
   --out out/qwen3_6_27b.ninfer
 
@@ -52,7 +53,7 @@ python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
   --recipe qwen3_8_27b --components text,vision,mtp,dflash2 --proposal \
   --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --name qwen3.8-27b \
   --out out/qwen3_8_27b.ninfer
 
@@ -60,7 +61,7 @@ python3 -m tools.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --recipe qwen3_6_35b_a3b --components text,vision,mtp,dflash --proposal \
   --source dflash=/path/to/Qwen3.6-35B-A3B-DFlash \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --name qwen3.6-35b-a3b \
   --out out/qwen3_6_35b_a3b.ninfer
 ```
@@ -69,6 +70,15 @@ Inspect a result:
 
 ```bash
 python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
+```
+
+Replace a stored resource, such as the chat template, in an existing single-file artifact without
+reconverting. Every weight byte is kept, the resource must be the last object in the payload, and the
+result is written to a new path with a new `artifact_id`:
+
+```bash
+python3 -m tools.artifact.replace_resource in.ninfer out.ninfer \
+  --resource frontend/chat_template.jinja=tools/chat_templates/qwen.jinja
 ```
 
 Recipes, mixed sources, custom methods, resources and sharding are described in the
