@@ -112,6 +112,7 @@ int main() {
     memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
     memory.expert_cache_slots          = 6800;
     memory.expert_cache_bytes          = 6800ULL * 2764800ULL;
+    memory.ngram_residency             = ninfer::NgramResidency::Stream;
     memory.weights.capacity_bytes      = 100;
     memory.sequence.capacity_bytes     = 200;
     memory.workspace.capacity_bytes    = 500;
@@ -177,6 +178,8 @@ int main() {
     failures += check(server.at("engine").at("expert_cache_slots") == 6800 &&
                           server.at("engine").at("expert_cache_bytes") == 6800ULL * 2764800ULL,
                       "expert cache capacity missing");
+    failures += check(server.at("engine").at("ngram_residency") == "stream",
+                      "n-gram residency missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",

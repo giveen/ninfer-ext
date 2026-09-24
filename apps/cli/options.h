@@ -27,6 +27,7 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     ExpertCachePolicy expert_cache;
+    NgramResidency ngram_residency = NgramResidency::Automatic;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

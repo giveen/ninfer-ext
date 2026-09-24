@@ -6,6 +6,7 @@
 #include "core/weight_view.h"
 #include "ninfer/types.h"
 
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <vector>
@@ -60,6 +61,9 @@ struct MappedObjectSegment {
     std::uint64_t object_offset = 0;
     std::uint64_t bytes         = 0;
     const std::byte* data       = nullptr;
+    // Location of the segment in its volume, for direct reads that bypass the mapping.
+    std::filesystem::path file;
+    std::uint64_t file_offset = 0;
 };
 
 class FileMapping;

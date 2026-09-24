@@ -1,5 +1,7 @@
 #include "models/qwen3_5/execution/ple_gather.h"
 
+#include "models/qwen3_5/execution/ple_rows.h"
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -43,7 +45,7 @@ std::uint16_t float_to_bf16(float value) {
 
 } // namespace
 
-PleGather::PleGather(const PleTable& table, const PleConfig& config)
+PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream)
     : table_(table), config_(config), width_(config.embed_dim), row_width_(config.row_width()) {
     if (config.ngram_size < 2 || config.ngram_size > kMaximumNgram ||
         config.multipliers.size() != config.ngram_size ||
@@ -64,7 +66,11 @@ PleGather::PleGather(const PleTable& table, const PleConfig& config)
     for (int code = 0; code < 256; ++code) {
         e4m3_[static_cast<std::size_t>(code)] = e4m3fn(static_cast<std::uint8_t>(code));
     }
+    if (config.heads() > 32) { throw std::invalid_argument("PLE gather supports 32 heads"); }
+    if (stream) { reader_ = std::make_unique<PleRowReader>(table.segments); }
 }
+
+PleGather::~PleGather() = default;
 
 const std::byte* PleGather::locate(std::uint64_t object_offset, std::uint64_t bytes) const {
     const auto it =
@@ -98,8 +104,8 @@ void PleGather::rows(std::span<const std::int64_t> context, std::span<std::uint6
     }
 }
 
-void PleGather::column(std::span<const std::int32_t> tokens, std::size_t position,
-                       std::uint16_t* out) const {
+void PleGather::column_rows(std::span<const std::int32_t> tokens, std::size_t position,
+                            std::span<std::uint64_t> rows_out) const {
     const auto eos = static_cast<std::int64_t>(config_.eos_token_id);
     std::array<std::int64_t, kMaximumNgram> context{};
     context[0]  = tokens[position];
@@ -113,39 +119,57 @@ void PleGather::column(std::span<const std::int32_t> tokens, std::size_t positio
             context[s] = eos;
         }
     }
-    std::array<std::uint64_t, 32> rows_buffer{};
-    const std::span<std::uint64_t> row_ids(rows_buffer.data(), config_.heads());
-    rows(std::span<const std::int64_t>(context.data(), config_.ngram_size), row_ids);
-    for (std::uint32_t head = 0; head < config_.heads(); ++head) {
-        const std::uint64_t row = row_ids[head];
-        const std::byte* codes  = locate(row * table_.row_bytes, row_width_);
-        std::uint16_t scale_word;
-        std::memcpy(&scale_word, locate(table_.scale_plane + row * 2U, 2), 2);
-        const float scale          = bf16_to_float(scale_word);
-        std::uint16_t* destination = out + static_cast<std::size_t>(head) * row_width_;
-        for (std::uint32_t i = 0; i < row_width_; ++i) {
-            destination[i] = float_to_bf16(e4m3_[static_cast<std::uint8_t>(codes[i])] * scale);
-        }
+    rows(std::span<const std::int64_t>(context.data(), config_.ngram_size), rows_out);
+}
+
+void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
+                           std::uint16_t* out) const {
+    std::uint16_t scale_word;
+    std::memcpy(&scale_word, scale_bytes, 2);
+    const float scale = bf16_to_float(scale_word);
+    for (std::uint32_t i = 0; i < row_width_; ++i) {
+        out[i] = float_to_bf16(e4m3_[static_cast<std::uint8_t>(codes[i])] * scale);
     }
 }
 
 void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count,
-                       std::span<std::uint16_t> out) const {
+                       std::span<std::uint16_t> out) {
     if (first > tokens.size() || count > tokens.size() - first ||
         out.size() < static_cast<std::size_t>(width_) * count) {
         throw std::invalid_argument("PLE gather range is invalid");
     }
-    if (config_.heads() > 32) { throw std::invalid_argument("PLE gather supports 32 heads"); }
-    const auto run = [&](std::size_t begin, std::size_t end) {
+    const std::uint32_t heads = config_.heads();
+    std::vector<std::uint64_t> rows(count * heads);
+    for (std::size_t i = 0; i < count; ++i) {
+        column_rows(tokens, first + i, std::span<std::uint64_t>(rows.data() + i * heads, heads));
+    }
+    if (reader_) {
+        std::vector<PleRowReader::Range> ranges(2 * rows.size());
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            ranges[2 * r]     = {rows[r] * table_.row_bytes, row_width_};
+            ranges[2 * r + 1] = {table_.scale_plane + rows[r] * 2U, 2U};
+        }
+        reader_->read(ranges);
+    }
+    const auto decode = [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
-            column(tokens, first + i, out.data() + i * width_);
+            for (std::uint32_t head = 0; head < heads; ++head) {
+                const std::size_t r = i * heads + head;
+                const std::byte* codes =
+                    reader_ ? reader_->data(2 * r) : locate(rows[r] * table_.row_bytes, row_width_);
+                const std::byte* scale = reader_ ? reader_->data(2 * r + 1)
+                                                 : locate(table_.scale_plane + rows[r] * 2U, 2);
+                decode_row(codes, scale,
+                           out.data() + i * width_ + static_cast<std::size_t>(head) * row_width_);
+            }
         }
     };
+    // Mapped reads fault pages in on first touch, so large calls fan out across threads.
     const std::size_t hardware = std::max(1U, std::thread::hardware_concurrency());
     const std::size_t workers =
         std::min<std::size_t>(std::min<std::size_t>(hardware, 16), count / kColumnsPerWorker);
     if (workers <= 1) {
-        run(0, count);
+        decode(0, count);
         return;
     }
     std::vector<std::jthread> threads;
@@ -154,9 +178,9 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
     for (std::size_t w = 1; w < workers; ++w) {
         const std::size_t begin = std::min(count, w * share);
         const std::size_t end   = std::min(count, begin + share);
-        threads.emplace_back([&, begin, end] { run(begin, end); });
+        threads.emplace_back([&, begin, end] { decode(begin, end); });
     }
-    run(0, std::min(count, share));
+    decode(0, std::min(count, share));
 }
 
 } // namespace ninfer::models::qwen3_5::execution

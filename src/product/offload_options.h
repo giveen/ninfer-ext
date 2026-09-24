@@ -27,4 +27,23 @@ namespace ninfer::product {
     return ExpertCachePolicy::explicit_cache(static_cast<std::size_t>(mebis * kMiB));
 }
 
+[[nodiscard]] inline NgramResidency parse_ngram_residency(std::string_view value) {
+    if (value == "auto") { return NgramResidency::Automatic; }
+    if (value == "mapped") { return NgramResidency::Mapped; }
+    if (value == "stream") { return NgramResidency::Stream; }
+    throw std::invalid_argument("invalid ngram-residency: " + std::string(value));
+}
+
+[[nodiscard]] inline const char* ngram_residency_name(NgramResidency residency) noexcept {
+    switch (residency) {
+    case NgramResidency::Automatic:
+        return "auto";
+    case NgramResidency::Mapped:
+        return "mapped";
+    case NgramResidency::Stream:
+        return "stream";
+    }
+    return "unknown";
+}
+
 } // namespace ninfer::product

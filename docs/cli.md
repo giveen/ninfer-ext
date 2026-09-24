@@ -209,6 +209,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only) | `auto` |
+| `--ngram-residency auto\|mapped\|stream` | read the Qwen4Exp n-gram table through the page cache or with batched direct I/O | `auto` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -292,6 +293,13 @@ cache that routed experts are fetched into. `auto` first reserves the KV floor (
 free device memory, less 1 GiB of headroom, to the cache, up to every expert. An explicit MiB
 value must hold one verify round (10 experts per decoded column). Qwen4Exp supports the `bf16`
 and `fp8` KV types and `--spec mtp`.
+
+The 51 GB n-gram table is never loaded. `--ngram-residency mapped` faults its rows through the
+page cache: fastest once warm, but the cached share competes with the pinned experts, and a cold
+or evicted row costs a synchronous NVMe read on the critical path. `stream` reads each round's rows
+(16 per token) with batched direct I/O into private staging, so the table uses no RAM; a round
+costs roughly 0.1-0.3 ms of NVMe latency. `auto` maps the table when the host memory still
+available after loading covers it with 8 GiB to spare, and streams it otherwise.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

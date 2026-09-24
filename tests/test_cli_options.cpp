@@ -45,6 +45,15 @@ int main() {
                                        "--expert-cache", "0"});
                       }),
                       "--expert-cache accepted zero");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--ngram-residency",
+                             "mapped"})
+                              .ngram_residency == ninfer::NgramResidency::Mapped,
+                      "--ngram-residency mapped did not parse");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hi",
+                                       "--ngram-residency", "pinned"});
+                      }),
+                      "--ngram-residency accepted an unknown mode");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

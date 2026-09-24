@@ -102,3 +102,8 @@ set_tests_properties(
 ninfer_add_test(ninfer_qwen3_5_mtp_draft_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_ple_gather_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen3_5_ple_gather_test PROPERTIES SKIP_RETURN_CODE 77)

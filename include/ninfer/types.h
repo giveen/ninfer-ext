@@ -66,6 +66,15 @@ struct KvCapacityPolicy {
     }
 };
 
+// Where the n-gram embedding table (Qwen4Exp PLE) is read from. `Mapped` faults rows through the
+// OS page cache and is fastest once warm; `Stream` reads them with batched direct I/O and keeps
+// the table out of RAM. `Automatic` maps when the free host memory covers the table.
+enum class NgramResidency : std::uint8_t {
+    Automatic,
+    Mapped,
+    Stream,
+};
+
 enum class ExpertCacheMode : std::uint8_t {
     Automatic,
     Explicit,
@@ -199,6 +208,7 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     ExpertCachePolicy expert_cache;
+    NgramResidency ngram_residency = NgramResidency::Automatic;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -907,6 +917,8 @@ struct MemorySummary {
     // Routed-expert device cache of host-resident experts (zero when experts are device-resident).
     std::uint32_t expert_cache_slots = 0;
     std::size_t expert_cache_bytes   = 0;
+    // Resolved n-gram table residency (Automatic when the model has no n-gram table).
+    NgramResidency ngram_residency = NgramResidency::Automatic;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

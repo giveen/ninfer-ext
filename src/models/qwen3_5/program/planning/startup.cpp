@@ -28,6 +28,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include <algorithm>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1050,6 +1051,39 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
                                                            std::uint32_t main_page_groups);
 
+// Free host memory the kernel can hand out without swapping (MemAvailable), or 0 if unknown.
+std::uint64_t available_host_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    std::uint64_t value = 0;
+    std::string unit;
+    while (meminfo >> key >> value) {
+        std::getline(meminfo, unit);
+        if (key == "MemAvailable:") { return value * 1024ULL; }
+    }
+    return 0;
+}
+
+// Qwen4Exp n-gram table: map it when the host can keep it in the page cache next to everything
+// already loaded, otherwise stream rows with direct I/O.
+bool resolve_ngram_stream(const execution::Parameters& parameters, NgramResidency residency) {
+    const auto& config = parameters.model.config().text;
+    if (!config.ple) { return false; }
+    switch (residency) {
+    case NgramResidency::Mapped:
+        return false;
+    case NgramResidency::Stream:
+        return true;
+    case NgramResidency::Automatic:
+        break;
+    }
+    const auto& table = parameters.qwen4->layers.at(config.ple->layer).ple->table;
+    std::uint64_t bytes = 0;
+    for (const auto& segment : table.segments) { bytes += segment.bytes; }
+    constexpr std::uint64_t kMargin = 8ULL << 30;
+    return available_host_bytes() < bytes + kMargin;
+}
+
 // Qwen4Exp: device slots of the routed-expert cache. The KV floor is planned first; the automatic
 // cache takes the rest of free device memory less headroom, clamped to [one verify round, every
 // expert].
@@ -1116,6 +1150,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
     impl->expert_cache_slots  = inputs.expert_cache_slots;
+    impl->ngram_stream        = inputs.ngram_stream;
     impl->persistent          = persistent_layout(*impl);
     if (impl->context_cache.host_cache_budget_bytes) {
         // The budget is resolved on the finished layout, before anything consumes the plan's
@@ -1294,6 +1329,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                 ? std::max(minimum_pages, page_count(options.kv_capacity.explicit_tokens))
                 : minimum_pages;
         inputs.expert_cache_slots = resolve_expert_cache_slots(inputs, options, floor_pages);
+        inputs.ngram_stream       = resolve_ngram_stream(parameters, options.ngram_residency);
     }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();

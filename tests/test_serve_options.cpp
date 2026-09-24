@@ -389,6 +389,11 @@ int main() {
                       "--expert-cache MiB did not select an explicit cache");
     failures += check(serve_usage_text("ninfer-serve").contains("--expert-cache"),
                       "serve help omits --expert-cache");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).ngram_residency ==
+                              ninfer::NgramResidency::Automatic &&
+                          parse({"ninfer-serve", "model.ninfer", "--ngram-residency", "stream"})
+                                  .ngram_residency == ninfer::NgramResidency::Stream,
+                      "--ngram-residency did not parse");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

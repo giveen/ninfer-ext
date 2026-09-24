@@ -3,6 +3,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/prompt_input/prompt_input.h"
+#include "product/offload_options.h"
 #include "product/speculative_options.h"
 
 #include "ninfer/engine.h"
@@ -183,6 +184,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric("Expert cache", std::to_string(memory.expert_cache_slots) + " experts (" +
                                          format_bytes(memory.expert_cache_bytes) + ")");
     }
+    if (memory.ngram_residency != ninfer::NgramResidency::Automatic) {
+        print_metric("N-gram table", ninfer::product::ngram_residency_name(memory.ngram_residency));
+    }
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
@@ -278,6 +282,7 @@ int main(int argc, char** argv) {
         engine_options.max_context        = cli.max_context;
         engine_options.kv_capacity        = cli.kv_capacity;
         engine_options.expert_cache       = cli.expert_cache;
+        engine_options.ngram_residency    = cli.ngram_residency;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;
         engine_options.speculative        = cli.speculative;

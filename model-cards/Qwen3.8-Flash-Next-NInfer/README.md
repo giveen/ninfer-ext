@@ -36,7 +36,7 @@ artifact size, checksums, accuracy and throughput once they have been measured.
 | Weights | Stored as | Runtime residency |
 |---|---|---|
 | Routed experts (48 × 512, plus the MTP layer) | NVFP4, imported codes and scales; MTP re-encoded from block FP8 | pinned Host, fetched into a device expert cache |
-| N-gram PLE table (320M × 160) | FP8 rows with BF16 multipliers | file-mapped, gathered on the Host per token |
+| N-gram PLE table (320M × 160) | FP8 rows with BF16 multipliers | page-cache mapped or streamed from NVMe, gathered on the Host per token |
 | Attention, GDN, hyper-connection, shared expert, PLE projections | Q8 | device |
 | Token embedding / output head | Q8 / Q6 | device |
 | Routers, shared-expert gates, norms, small vectors | BF16/FP32 direct | device |
@@ -44,8 +44,9 @@ artifact size, checksums, accuracy and throughput once they have been measured.
 ## Requirements
 
 - one RTX 5090 (sm_120a) and CUDA 13.3;
-- about 128 GB of host RAM: about 69 GB of pinned experts, plus page cache for the 52 GB n-gram
-  table;
+- about 80 GB of host RAM for the ~69 GB of pinned experts with `--ngram-residency stream`
+  (the n-gram table is read from NVMe); about 128 GB to keep the 52 GB table in the page cache
+  (`mapped`, chosen automatically when memory allows);
 - KV storage `bf16` or `fp8`; speculative decoding `--spec mtp`.
 
 ## Serve

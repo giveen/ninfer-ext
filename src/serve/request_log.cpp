@@ -1,5 +1,6 @@
 #include "serve/request_log.h"
 #include "product/logging/pretty_format.h"
+#include "product/offload_options.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -466,6 +467,7 @@ std::string format_server_start_json(
              {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
              {"expert_cache_slots", memory.expert_cache_slots},
              {"expert_cache_bytes", memory.expert_cache_bytes},
+             {"ngram_residency", product::ngram_residency_name(memory.ngram_residency)},
              {"max_concurrency", engine_options.max_concurrency},
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},

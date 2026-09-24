@@ -287,7 +287,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (config.ple) {
             const auto& block = parameters.qwen4->layers.at(config.ple->layer);
             if (!block.ple) { throw std::logic_error("Qwen4Exp PLE layer has no parameters"); }
-            ple_gather = std::make_unique<execution::PleGather>(block.ple->table, *config.ple);
+            ple_gather = std::make_unique<execution::PleGather>(block.ple->table, *config.ple,
+                                                                plan.ngram_stream);
             runtime.ple_states = state_images->ple_states();
             if (layout.ple_record) { runtime.ple_record = layout.ple_record->bind(backing); }
             if (layout.ple_input) { runtime.ple_input = layout.ple_input->bind(backing); }
@@ -568,6 +569,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.expert_cache_slots = static_cast<std::uint32_t>(qwen4_runtime->cache.slots);
         out.expert_cache_bytes =
             static_cast<std::size_t>(qwen4_runtime->cache.slots) * ops::kExpertSlotBytes;
+        if (ple_gather) {
+            out.ngram_residency =
+                ple_gather->streamed() ? NgramResidency::Stream : NgramResidency::Mapped;
+        }
     }
     const auto& weights = parameters.model.storage_stats();
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,

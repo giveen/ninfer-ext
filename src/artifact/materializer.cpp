@@ -300,7 +300,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         for (const auto& segment : reader.segments(object_offset(object), object_bytes(object))) {
             auto mapping = std::make_unique<FileMapping>(reader.file_path(segment.file_index),
                                                          segment.file_offset, segment.bytes);
-            storage.file.push_back({segment.destination_offset, segment.bytes, mapping->data()});
+            storage.file.push_back({segment.destination_offset, segment.bytes, mapping->data(),
+                                    reader.file_path(segment.file_index), segment.file_offset});
             out.mappings_.push_back(std::move(mapping));
         }
         if (std::holds_alternative<TensorObject>(object)) {

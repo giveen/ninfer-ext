@@ -79,7 +79,7 @@ struct Qwen4Runtime {
     Tensor ple_states; // BF16 [history * residual, StateImage slots]
     Tensor ple_record; // BF16 [residual, record_width, rows] speculative conv inputs, or empty
     Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch
-    const PleGather* ple_gather = nullptr;
+    PleGather* ple_gather       = nullptr;
     std::uint16_t* ple_host     = nullptr; // pinned BF16 [ple_width, prefill_chunk]
 };
 

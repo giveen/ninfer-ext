@@ -847,6 +847,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only); `auto` takes the memory left after the KV floor | `auto` |
+| `--ngram-residency auto\|mapped\|stream` | Qwen4Exp n-gram table through the page cache or batched direct I/O; `auto` maps it when host memory allows | `auto` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -1051,7 +1052,9 @@ Qwen4Exp (Qwen3.8-Flash-Next) routed experts stay in pinned Host memory. Each Mo
 its selected experts against a least-recently-used device cache inside the decode Graph and copies
 misses over PCIe; long prefill chunks stream whole layers instead. `--expert-cache` sizes that
 cache after the KV floor is planned, and `server_start.engine` records `expert_cache_slots` and
-`expert_cache_bytes`. Two concurrent 229,376-token requests with FP8 KV:
+`expert_cache_bytes`. The n-gram table is either page-cache mapped or streamed from NVMe with
+batched direct I/O (`--ngram-residency`, see the [CLI guide](cli.md)); `server_start.engine`
+records the resolved `ngram_residency`. Two concurrent 229,376-token requests with FP8 KV:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_flash_next_nvfp4.ninfer \

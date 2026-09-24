@@ -1,5 +1,5 @@
 #include "serve/serve_options.h"
-#include "product/expert_cache_options.h"
+#include "product/offload_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -69,6 +69,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--expert-cache auto|MiB] "
+           "[--ngram-residency auto|mapped|stream] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
@@ -107,6 +108,8 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --expert-cache sizes the device cache of host-resident routed experts "
            "(Qwen4Exp); auto gives it the device memory left after the KV floor\n"
+           "       --ngram-residency reads the Qwen4Exp n-gram table through the page cache "
+           "(mapped) or with batched direct I/O (stream); auto maps it when host memory allows\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,7), anchors=4; Host state=8 slots, Host KV=8192 MiB\n"
@@ -171,6 +174,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--expert-cache") {
             options.expert_cache = product::parse_expert_cache(require_value("--expert-cache"));
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency =
+                product::parse_ngram_residency(require_value("--ngram-residency"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

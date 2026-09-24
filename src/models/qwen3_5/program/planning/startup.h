@@ -107,7 +107,8 @@ struct SequencePlanningInputs {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
-    std::uint32_t expert_cache_slots = 0; // Qwen4Exp only
+    std::uint32_t expert_cache_slots = 0;     // Qwen4Exp only
+    bool ngram_stream                = false; // Qwen4Exp only: resolved n-gram residency
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -132,6 +133,7 @@ struct SequencePlanImpl {
     int device          = 0;
     ContextCacheOptions context_cache;
     std::uint32_t expert_cache_slots = 0;
+    bool ngram_stream                = false;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
