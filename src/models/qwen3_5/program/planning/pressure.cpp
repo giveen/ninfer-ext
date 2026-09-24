@@ -547,7 +547,7 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
             mix(tag);
             mix(action.begin_page);
             mix(action.page_count);
-            mix(static_cast<std::uint8_t>(action.kind));
+            mix(std::to_underlying(action.kind));
         }
     };
     mix_existing_kv(option.main_kv_changes, 0x534d41494eULL);
@@ -583,7 +583,7 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
                 option.effect.removed.device.state_slots = 1;
             }
             option.state_changes.push_back(state_change);
-            mix(static_cast<std::uint8_t>(state_change));
+            mix(std::to_underlying(state_change));
         }
     }
 
@@ -615,7 +615,7 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
             mix(tag);
             mix(action.begin_page);
             mix(action.page_count);
-            mix(static_cast<std::uint8_t>(action.kind));
+            mix(std::to_underlying(action.kind));
             changes.push_back(action);
         }
     };
@@ -743,7 +743,7 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             mix(tag);
             mix(action.begin_page);
             mix(action.page_count);
-            mix(static_cast<std::uint8_t>(action.kind));
+            mix(std::to_underlying(action.kind));
         }
     };
     mix_kv(option.main_kv_changes, 0x4d41494eULL);
@@ -849,7 +849,7 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             mix(tag);
             mix(action.begin_page);
             mix(action.page_count);
-            mix(static_cast<std::uint8_t>(action.kind));
+            mix(std::to_underlying(action.kind));
             changes.push_back(action);
         }
     };

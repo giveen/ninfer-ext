@@ -46,7 +46,7 @@ void require_members(const Json& value, std::initializer_list<std::string_view> 
 std::string require_id(const Json& value, std::string_view label) {
     if (!value.is_string()) { throw ArtifactError(std::string(label) + " must be a string"); }
     auto result = value.get<std::string>();
-    if (result.empty() || result.find('\0') != std::string::npos) {
+    if (result.empty() || result.contains('\0')) {
         throw ArtifactError(std::string(label) + " must be nonempty without NUL");
     }
     return result;
@@ -193,8 +193,8 @@ void parse_files(Directory& out, const Json& files, std::string_view entry_name)
         } else {
             file.path        = require_id(value.at("path"), "file path");
             const auto& path = *file.path;
-            if (path == "." || path == ".." || path.find('/') != std::string::npos ||
-                path.find('\\') != std::string::npos || !names.insert(path).second) {
+            if (path == "." || path == ".." || path.contains('/') ||
+                path.contains('\\') || !names.insert(path).second) {
                 throw ArtifactError("invalid or duplicate sibling filename: " + path);
             }
         }

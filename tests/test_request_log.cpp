@@ -245,7 +245,7 @@ int main() {
                           server.at("memory").at("host_kv_capacity_bytes") == (64ULL << 20) &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
                       "Host context-cache memory ledger missing");
-    failures += check(server.dump().find("must-not-appear") == std::string::npos,
+    failures += check(!server.dump().contains("must-not-appear"),
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
                       "server argv did not retain the redaction marker");
@@ -295,8 +295,8 @@ int main() {
     default_thinking.thinking_budget.reset();
     const std::string default_thinking_start = render_request_start(default_thinking).message;
     failures +=
-        check(default_thinking_start.find("thinking template default") != std::string::npos &&
-                  default_thinking_start.find("unresolved") == std::string::npos,
+        check(default_thinking_start.contains("thinking template default") &&
+                  !default_thinking_start.contains("unresolved"),
               "default thinking state leaks an internal resolution detail");
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
@@ -352,10 +352,10 @@ int main() {
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures += check(
         client_rejection.severity == OperationalSeverity::Info &&
-            client_rejection.message.find("req#8 rejected during prepare") != std::string::npos &&
-            client_rejection.message.find("context length exceeded") != std::string::npos &&
-            client_rejection.message.find("sentinel-client-value") == std::string::npos &&
-            client_rejection.message.find('\n') == std::string::npos,
+            client_rejection.message.contains("req#8 rejected during prepare") &&
+            client_rejection.message.contains("context length exceeded") &&
+            !client_rejection.message.contains("sentinel-client-value") &&
+            !client_rejection.message.contains('\n'),
         "operational rejection severity or client-data policy mismatch");
     RequestRejectionLogContext overload_context = rejected_context;
     overload_context.error.status               = 429;
@@ -549,7 +549,7 @@ int main() {
         make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
     failures +=
         check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
+                  !internal_failure.message.contains("sentinel-internal-detail"),
               "operational internal failure severity or data policy mismatch");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -626,8 +626,8 @@ int main() {
         single_decode_pretty ==
                 "throughput | 5.0s | decode 205.0 tok/s (1,025 tok) | running 1 (decode-ready 1) | "
                 "batch 1.00 | host 1.4% (69.2 ms)" &&
-            single_decode_pretty.find("prefill") == std::string::npos &&
-            single_decode_pretty.find("waiting") == std::string::npos,
+            !single_decode_pretty.contains("prefill") &&
+            !single_decode_pretty.contains("waiting"),
         "single-request pretty throughput is noisy or incomplete");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));

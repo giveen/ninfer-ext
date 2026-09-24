@@ -594,7 +594,7 @@ int test_rendered_special_tokens() {
                 return std::count(encoded.input_ids.begin(), encoded.input_ids.end(), id);
             };
             failures +=
-                check(rendered.text.find(quoted) != std::string::npos &&
+                check(rendered.text.contains(quoted) &&
                           rendered.media_placeholders.empty() && count(248056) == 0 &&
                           count(248057) == 0 && count(248053) == 0 && count(248054) == 0 &&
                           count(248045) == 3 && count(248046) == 2 &&

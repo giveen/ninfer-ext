@@ -33,17 +33,16 @@ public:
     [[nodiscard]] auto submit(Function&& function, Checkpoint checkpoint = {})
         -> std::future<std::invoke_result_t<std::decay_t<Function>&>> {
         using Result = std::invoke_result_t<std::decay_t<Function>&>;
-        auto task =
-            std::make_shared<std::packaged_task<Result()>>(std::forward<Function>(function));
-        std::future<Result> future = task->get_future();
-        enqueue([task = std::move(task)] { (*task)(); }, std::move(checkpoint));
+        std::packaged_task<Result()> task(std::forward<Function>(function));
+        std::future<Result> future = task.get_future();
+        enqueue(std::move(task), std::move(checkpoint));
         return future;
     }
 
     [[nodiscard]] Snapshot snapshot() const;
 
 private:
-    void enqueue(std::function<void()> task, Checkpoint checkpoint);
+    void enqueue(std::move_only_function<void()> task, Checkpoint checkpoint);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

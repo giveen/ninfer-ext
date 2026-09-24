@@ -730,10 +730,10 @@ int test_stream() {
                          "Anthropic stream lifecycle/signature/start usage is incomplete");
     const auto signature_position =
         std::find_if(events.begin(), events.end(), [](const auto& value) {
-            return value.find("signature_delta") != std::string::npos;
+            return value.contains("signature_delta");
         });
     const auto text_position = std::find_if(events.begin(), events.end(), [](const auto& value) {
-        return value.find("text_delta") != std::string::npos;
+        return value.contains("text_delta");
     });
     failures += check(signature_position < text_position,
                       "Thinking signature was emitted after the text block began");

@@ -97,9 +97,9 @@ int main() {
             std::regex(
                 R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
         "service pretty prefix mismatch");
-    failures += check(service_output.find("ninfer-serve") == std::string::npos,
+    failures += check(!service_output.contains("ninfer-serve"),
                       "service pretty output repeated the executable name");
-    failures += check(service_output.find("\x1b[") == std::string::npos,
+    failures += check(!service_output.contains("\x1b["),
                       "redirected service output contains ANSI escapes");
 
     std::string startup_output;
@@ -141,13 +141,13 @@ int main() {
     }
     failures += check(
         line_count(startup_output) == 4 &&
-            startup_output.find("starting engine") != std::string::npos &&
-            startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
+            startup_output.contains("starting engine") &&
+            startup_output.contains("loading weights | 16.0 GiB") &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
                 std::string::npos &&
             startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
                 std::string::npos &&
-            startup_output.find("CUDA initialized") == std::string::npos,
+            !startup_output.contains("CUDA initialized"),
         "normal startup pretty output is noisy or incomplete");
 
     std::string tool_output;

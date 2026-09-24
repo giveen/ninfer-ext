@@ -38,8 +38,8 @@ int main() {
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
     failures +=
         check(context_limit.status == 400 && context_limit.code == "context_length_exceeded" &&
-                  context_limit.message.find("200 tokens") != std::string::npos &&
-                  context_limit.message.find("128") != std::string::npos,
+                  context_limit.message.contains("200 tokens") &&
+                  context_limit.message.contains("128"),
               "context rejection lost its HTTP classification or capacity details");
     const ninfer::serve::ApiError thinking_capacity = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient,

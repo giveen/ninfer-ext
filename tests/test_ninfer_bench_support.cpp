@@ -132,7 +132,7 @@ int test_cli_contract() {
     failures +=
         expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",
                "default pp/tg matrix");
-    failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
+    failures += expect(qb::usage_text("ninfer_bench").contains("artifact.ninfer"),
                        "help names native artifact");
     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
 
@@ -164,7 +164,7 @@ int test_cli_contract() {
     const qb::BenchOptions k8v4 =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "k8v4"});
     failures += expect(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value, "K8V4 KV");
-    failures += expect(qb::usage_text("ninfer_bench").find("nvfp4|k8v4") != std::string::npos,
+    failures += expect(qb::usage_text("ninfer_bench").contains("nvfp4|k8v4"),
                        "benchmark help omits new KV modes");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Nvfp4Group16), "nvfp4",
                               "NVFP4 report name");
@@ -389,21 +389,21 @@ int test_human_and_csv_reports() {
     const qb::BenchEnvironment env = sample_environment();
     const auto results             = sample_results();
     const std::string table        = qb::format_table(env, results);
-    failures += expect(table.find("Qwen3_5ForCausalLM") != std::string::npos, "table target");
-    failures += expect(table.find("qwen3.6-27b") != std::string::npos, "table model name");
-    failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
+    failures += expect(table.contains("Qwen3_5ForCausalLM"), "table target");
+    failures += expect(table.contains("qwen3.6-27b"), "table model name");
+    failures += expect(table.contains("model.ninfer"), "table artifact");
     failures +=
-        expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
+        expect(table.contains("proposal_head=optimized"), "table proposal head");
     failures +=
-        expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
-    failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
+        expect(table.contains("decode eng t/s"), "table engine throughput");
+    failures += expect(table.contains("work peak"), "table workspace peak");
 
     auto csv_env            = env;
     csv_env.load.model_name = "trained, \"custom\"";
     csv_env.artifact_path   = "/weights/user,model.ninfer";
     const std::string csv   = qb::format_csv(csv_env, results);
-    failures += expect(csv.find("\"trained, \"\"custom\"\"\"") != std::string::npos &&
-                           csv.find("\"/weights/user,model.ninfer\"") != std::string::npos,
+    failures += expect(csv.contains("\"trained, \"\"custom\"\"\"") &&
+                           csv.contains("\"/weights/user,model.ninfer\""),
                        "CSV preserves and escapes the actual training instance");
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,architecture,prefill_signature"),
                        "CSV identity columns");
@@ -413,7 +413,7 @@ int test_human_and_csv_reports() {
           "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
           "decode_engine_tok_s_mean", "total_seconds_mean"}) {
-        failures += expect(csv.find(field) != std::string::npos,
+        failures += expect(csv.contains(field),
                            std::string("CSV field ") + std::string(field));
     }
     failures += expect(std::count(csv.begin(), csv.end(), '\n') == 3, "CSV header plus two rows");

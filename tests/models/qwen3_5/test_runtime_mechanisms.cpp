@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -209,9 +210,9 @@ void test_mtp_alignment() {
 void test_vision_control() {
     q36::PreparedPromptData prompt;
     prompt.token_ids.resize(7);
-    prompt.token_types           = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
+    prompt.token_types           = {0, std::to_underlying(q36::PromptModality::Image),
+                                    0, std::to_underlying(q36::PromptModality::Video),
+                                    0, std::to_underlying(q36::PromptModality::Video),
                                     0};
     prompt.prepare.media_items   = 2;
     prompt.prepare.raw_patches   = 12;
@@ -261,8 +262,8 @@ void test_vision_control() {
 q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     q36::PreparedPromptData prompt;
     prompt.token_ids   = {10, 248056, 248056, 11};
-    prompt.token_types = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
-                          static_cast<std::uint8_t>(q36::PromptModality::Image), 0};
+    prompt.token_types = {0, std::to_underlying(q36::PromptModality::Image),
+                          std::to_underlying(q36::PromptModality::Image), 0};
     prompt.positions   = {0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 2, 3};
     prompt.rope_delta  = 0;
     q36::VisionItem item{.modality    = q36::PromptModality::Image,

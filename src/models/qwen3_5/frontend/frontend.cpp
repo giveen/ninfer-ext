@@ -610,7 +610,7 @@ public:
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
         const std::string presented =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
-        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
+        if (exact != kThinkingControl || !presented.contains(kThinkClose)) {
             throw std::invalid_argument(
                 "Qwen tokenizer cannot present the canonical thinking control suffix");
         }

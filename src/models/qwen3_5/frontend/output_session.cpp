@@ -163,7 +163,7 @@ struct SemanticThinkingState {
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
     state.close_pending.append(bytes);
-    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+    if (state.close_pending.contains(kThinkClose)) {
         state.close_pending.clear();
         state.in_reasoning    = false;
         state.control_pending = false;

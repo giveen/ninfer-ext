@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace ninfer::nvtx {
 
@@ -126,19 +127,19 @@ enum class Name : std::size_t {
 [[nodiscard]] inline nvtxDomainHandle_t domain() noexcept {
     static nvtxDomainHandle_t handle = [] {
         nvtxDomainHandle_t out = nvtxDomainCreateA("ninfer");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Runtime), "runtime");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Prefill), "prefill");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Decode), "decode");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Mtp), "mtp");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::DFlash), "dflash");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Attention), "attention");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Gdn), "gdn");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::PostMixer), "post-mixer");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Moe), "moe");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Control), "control");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Graph), "cuda-graph");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Vision), "vision");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Scoring), "scoring");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Runtime), "runtime");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Prefill), "prefill");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Decode), "decode");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Mtp), "mtp");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::DFlash), "dflash");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Attention), "attention");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Gdn), "gdn");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::PostMixer), "post-mixer");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Moe), "moe");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Control), "control");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Graph), "cuda-graph");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Vision), "vision");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Scoring), "scoring");
         return out;
     }();
     return handle;

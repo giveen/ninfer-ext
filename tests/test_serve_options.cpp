@@ -77,8 +77,8 @@ int main() {
     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
     const std::string kv_help = serve_usage_text("ninfer-serve");
-    failures += check(kv_help.find("nvfp4") != std::string::npos &&
-                          kv_help.find("k8v4") != std::string::npos,
+    failures += check(kv_help.contains("nvfp4") &&
+                          kv_help.contains("k8v4"),
                       "serve help omits a production KV storage mode");
 
     const ServeOptions model_alias =
@@ -285,38 +285,38 @@ int main() {
                       "request preserve-thinking override did not win");
 
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").contains("--no-prefix-reuse"),
               "serve help omits --no-prefix-reuse");
-    failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve").contains("--host-kv-mib"),
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
                           std::string::npos,
                       "serve help omits context-cache defaults");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").contains("--preserve-thinking"),
               "serve help omits --preserve-thinking");
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
-    failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve").contains("--vision"),
                       "serve help omits --vision");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").contains("--log-stats-interval-ms"),
               "serve help omits --log-stats-interval-ms");
-    failures += check(serve_usage_text("ninfer-serve").find("--log-level") != std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve").contains("--log-level"),
                       "serve help omits the log-level control");
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");
-    failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve").contains("--kv-capacity"),
                       "serve help omits --kv-capacity");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").contains("--context-cost-presets"),
               "serve help omits external context-cost presets");
-    failures += check(serve_usage_text("ninfer-serve").find("metadata.name") != std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve").contains("metadata.name"),
                       "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
@@ -337,7 +337,7 @@ int main() {
     failures += check(logged.request_log_jsonl == "requests.jsonl",
                       "--request-log-jsonl did not preserve its path");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
+        check(serve_usage_text("ninfer-serve").contains("--request-log-jsonl"),
               "serve help omits --request-log-jsonl");
     bool secret_present    = false;
     bool redaction_present = false;

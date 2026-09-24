@@ -94,7 +94,7 @@ bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     });
 }
 
-constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
+constexpr std::uint8_t type_bit(SchemaType type) { return std::to_underlying(type); }
 
 constexpr bool admits_type(TypeSet types, SchemaType type) {
     return (types.bits & type_bit(type)) != 0;

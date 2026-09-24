@@ -910,7 +910,7 @@ int test_sse_sequence_and_failures() {
     std::uint64_t expected_sequence = 0;
     std::string text_deltas;
     for (const std::string& event : wire) {
-        failures += check(event.find("[DONE]") == std::string::npos,
+        failures += check(!event.contains("[DONE]"),
                           "Responses stream does not use Chat [DONE]");
         const Json payload = parse_event(event);
         failures += check(payload.at("sequence_number") == expected_sequence++,

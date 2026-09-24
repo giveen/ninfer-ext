@@ -168,14 +168,14 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         error.code    = "request_too_large";
         error.message = "request body exceeds the configured payload limit of " +
                         std::to_string(options.max_request_bytes) + " bytes";
-    } else if (response.status == 404 && request.path.rfind("/v1/messages", 0) == 0) {
+    } else if (response.status == 404 && request.path.starts_with("/v1/messages")) {
         error.status  = 404;
         error.code    = "not_found";
         error.message = "requested Anthropic resource was not found";
     } else {
         return httplib::Server::HandlerResponse::Unhandled;
     }
-    if (request.path.rfind("/v1/messages", 0) == 0) {
+    if (request.path.starts_with("/v1/messages")) {
         write_anthropic_error(response, error, new_anthropic_request_id());
     } else {
         write_openai_error(response, error);
@@ -368,7 +368,7 @@ void HttpServer::register_routes() {
             error.code    = "invalid_api_key";
             error.message = "missing or invalid API key";
             // Render the 401 in the shape the target endpoint speaks.
-            if (req.path.rfind("/v1/messages", 0) == 0) {
+            if (req.path.starts_with("/v1/messages")) {
                 write_anthropic_error(res, error, new_anthropic_request_id());
             } else {
                 write_openai_error(res, error);
@@ -390,7 +390,7 @@ void HttpServer::register_routes() {
                         make_request_failure(RequestFailurePhase::Http, e.error()),
                         response_request_id(res));
                 }
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (req.path.starts_with("/v1/messages")) {
                     write_anthropic_error(res, e.error(), new_anthropic_request_id());
                 } else {
                     write_openai_error(res, e.error());
@@ -400,7 +400,7 @@ void HttpServer::register_routes() {
                     endpoint_name(req.path),
                     make_internal_request_failure(RequestFailurePhase::Http, e.what()),
                     response_request_id(res));
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (req.path.starts_with("/v1/messages")) {
                     ApiError error;
                     error.status  = 500;
                     error.message = e.what();
@@ -417,7 +417,7 @@ void HttpServer::register_routes() {
                 error.status  = 500;
                 error.type    = "internal_error";
                 error.message = "unknown error";
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (req.path.starts_with("/v1/messages")) {
                     write_anthropic_error(res, error, new_anthropic_request_id());
                 } else {
                     write_openai_error(res, error);

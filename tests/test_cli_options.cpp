@@ -37,7 +37,7 @@ int main() {
     failures += check(configured.thinking_budget == 37,
                       "--thinking-budget did not preserve its positive value");
     failures +=
-        check(ninfer::cli::usage_text("ninfer-cli").find("--thinking-budget") != std::string::npos,
+        check(ninfer::cli::usage_text("ninfer-cli").contains("--thinking-budget"),
               "CLI help omits --thinking-budget");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
@@ -86,13 +86,13 @@ int main() {
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
     const std::string help = ninfer::cli::usage_text("ninfer-cli");
     failures +=
-        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
+        check(help.contains("nvfp4") && help.contains("k8v4"),
               "CLI help omits a production KV storage mode");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
                       "CLI log level was not parsed");
-    failures += check(help.find("--log-level") != std::string::npos,
+    failures += check(help.contains("--log-level"),
                       "CLI help omits the log-level control");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",

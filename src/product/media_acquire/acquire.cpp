@@ -214,7 +214,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         const std::string ip = resolve_public(parts, policy.allow_private_network);
         check_control(policy);
         std::string resolve = parts.host + ":" + parts.port + ":";
-        resolve += ip.find(':') == std::string::npos ? ip : "[" + ip + "]";
+        resolve += ip.contains(':') ? "[" + ip + "]" : ip;
         curl_slist* resolve_list = curl_slist_append(nullptr, resolve.c_str());
         if (resolve_list == nullptr) { throw std::bad_alloc(); }
         std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> resolve_guard(
@@ -340,7 +340,7 @@ std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& poli
     if (source.kind == SourceKind::Data) {
         const std::size_t comma = source.value.find(',');
         if (!source.value.starts_with("data:") || comma == std::string::npos ||
-            source.value.substr(0, comma).find(";base64") == std::string::npos) {
+            !source.value.substr(0, comma).contains(";base64")) {
             throw std::invalid_argument("media data source must be a base64 data URI");
         }
         const std::size_t encoded = source.value.size() - comma - 1;

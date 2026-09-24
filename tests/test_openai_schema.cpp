@@ -202,7 +202,7 @@ int test_constrained_decoding_extensions() {
         const ApiError error = api_error([&] { (void)parse(body); });
         failures +=
             check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
+                      error.message.contains(field),
                   std::string(field) + " constrained decoding is explicitly rejected");
     }
 
@@ -238,8 +238,8 @@ int test_tools() {
     body["tools"][0]["future_item_field"]                 = "ignored";
     body["tools"][0]["function"]["future_function_field"] = "ignored";
     const std::string normalized_definition = prompt(parse(body).generation).options.tool_jsons[0];
-    failures += check(normalized_definition.find("future_item_field") == std::string::npos &&
-                          normalized_definition.find("future_function_field") == std::string::npos,
+    failures += check(!normalized_definition.contains("future_item_field") &&
+                          !normalized_definition.contains("future_function_field"),
                       "unknown tool fields do not silently alter the model prompt");
 
     body["tool_choice"]          = "none";
@@ -279,7 +279,7 @@ int test_tools() {
     const ApiError required_allowed = api_error([&] { (void)parse(body); });
     failures +=
         check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.find("at least one tool call") != std::string::npos,
+                  required_allowed.message.contains("at least one tool call"),
               "required allowed_tools reports the unenforceable guarantee");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";

@@ -51,7 +51,7 @@ struct HostWorkerPool::Impl {
 
     void worker_loop() noexcept {
         for (;;) {
-            std::function<void()> task;
+            std::move_only_function<void()> task;
             {
                 std::unique_lock lock(mutex);
                 work_available.wait(lock, [this] { return stopping || !queue.empty(); });
@@ -81,7 +81,7 @@ struct HostWorkerPool::Impl {
     mutable std::mutex mutex;
     std::condition_variable work_available;
     std::condition_variable queue_space;
-    std::deque<std::function<void()>> queue;
+    std::deque<std::move_only_function<void()>> queue;
     std::vector<std::thread> workers;
     std::size_t active = 0;
     bool stopping      = false;
@@ -92,7 +92,7 @@ HostWorkerPool::HostWorkerPool(std::uint32_t threads, std::size_t queue_capacity
 
 HostWorkerPool::~HostWorkerPool() = default;
 
-void HostWorkerPool::enqueue(std::function<void()> task, Checkpoint checkpoint) {
+void HostWorkerPool::enqueue(std::move_only_function<void()> task, Checkpoint checkpoint) {
     if (!task) { throw std::invalid_argument("host worker task must not be empty"); }
     for (;;) {
         if (checkpoint) { checkpoint(); }
