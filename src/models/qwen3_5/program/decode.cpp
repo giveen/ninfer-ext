@@ -140,7 +140,8 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
-        .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
+        .rounds_by_draft_length = std::vector<std::uint64_t>(draft_window, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -409,8 +410,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    const std::uint32_t width      = draft_window + 1;
     std::uint32_t maximum_frontier = 0;
+    std::array<const MtpAcceptanceEstimate*, kMaximumConcurrency> acceptance{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -419,6 +420,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             throw std::invalid_argument("MTP batch contains an invalid or duplicate lane");
         }
         const SequenceState& sequence = active_sequence(lane);
+        acceptance[row]               = &sequence.mtp_acceptance;
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
@@ -436,6 +438,15 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // Every lane shares this round's draft length: the rung whose graphs are predicted to commit
+    // the most tokens per second for the lanes' measured acceptance.
+    mtp_round_rung = mtp_policy.select(
+        mtp_round_rung,
+        std::span<const MtpAcceptanceEstimate* const>(acceptance.data(), lanes.size()));
+    MtpRung& rung             = mtp_rungs[mtp_round_rung];
+    const std::uint32_t k     = rung.k;
+    const std::uint32_t width = k + 1;
+
     const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -443,14 +454,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(rung.graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
-                                                       capacity);
+            executable = &install_graph_profile(rung.graphs, profile, "MTP batch");
+            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, k, capacity);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -460,17 +470,16 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+            const std::uint32_t extent = std::min(
+                {sequence.mtp_draft_count, k, max_by_budget, capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                mtp_host_ingress->current_drafts[row * draft_window + j] =
+            for (std::uint32_t j = 0; j < k; ++j) {
+                mtp_host_ingress->current_drafts[row * k + j] =
                     j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
@@ -488,22 +497,22 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
-                                      std::min(capacity, frontier + extent + draft_window));
+                                      std::min(capacity, frontier + extent + k));
         }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   &rung.records, io, prefill_hidden,
+                                                   prefill_chunk, proposal_head},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
-                                                  *io.mtp_decode,
+                                                  rung.frame,
                                                   *mtp_host_ingress,
                                                   *mtp_host_egress,
                                                   state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.mtp_round);
-        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                    draft_window, envelopes, executable);
+        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,
+                                    envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -523,8 +532,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
-                accepted_i + 1 != count_i || next_i < 0 ||
-                next_i > static_cast<std::int32_t>(draft_window) ||
+                accepted_i + 1 != count_i || next_i < 0 || next_i > static_cast<std::int32_t>(k) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {
@@ -540,8 +548,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 request.speculative_stats.fallback_steps += 1;
             } else {
                 request.speculative_stats.rounds += 1;
+                request.speculative_stats.rounds_by_draft_length[k - 1U] += 1;
                 request.speculative_stats.drafted_tokens += pcur;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;

@@ -16,7 +16,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft \
   --preserve-thinking
 ```
@@ -848,7 +848,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | unset |
+| `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
@@ -940,7 +941,8 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
+`rounds_by_draft_length` (entry `k-1` counts the rounds that drafted `k` tokens). Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.

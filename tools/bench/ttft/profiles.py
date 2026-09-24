@@ -129,6 +129,7 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--pending-timeout-ms", 120000,
         "--spec", "mtp",
         "--draft-tokens", 3,
+        "--fixed-draft",
         "--lm-head-draft",
         "--device-state-slots", 2,
         "--host-state-slots", 24,

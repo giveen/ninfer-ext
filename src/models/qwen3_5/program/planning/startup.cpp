@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -785,7 +786,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,5]");
+            throw std::invalid_argument("MTP draft window must be in [1,7]");
         }
         break;
     case SpeculativeBackend::DFlash:
@@ -820,6 +821,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -838,18 +840,32 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            // Every draft length on the ladder is its own graph family with its own topology
+            // classes. The batch rung serves every batch size; the others only a single request.
+            const std::vector<std::uint32_t> ladder =
+                mtp_draft_ladder(impl->draft_window, impl->adaptive_draft);
+            const std::size_t batch_rung = mtp_batch_rung(ladder);
+            std::size_t allowance        = 0;
+            for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
+                const std::uint32_t k = ladder[rung];
+                const auto profiles = mtp_graph_profiles(impl->capacity, k);
+                allowance = checked_add(
+                    allowance,
+                    checked_mul(graph_topology_allowance(
+                                    profiles,
+                                    [&](GraphExecutionProfile profile) {
+                                        const std::uint64_t final_visible =
+                                            std::min<std::uint64_t>(
+                                                impl->capacity,
+                                                static_cast<std::uint64_t>(profile.max) + 2ULL * k);
+                                        return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                                    },
+                                    "MTP graph allowance"),
+                                rung == batch_rung ? impl->max_concurrency : 1U,
+                                "MTP exact-b graph allowance"),
+                    "MTP draft ladder graph allowance");
+            }
+            impl->graph_allowance_bytes = allowance;
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles = dflash_graph_profiles(
@@ -890,6 +906,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
+                          !options.speculative.fixed_draft,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

@@ -800,8 +800,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        // An MTP round recorded at its own width, so it folds through that width's records.
+        const ops::GdnReplayFoldPlan& fold = speculative_backend == SpeculativeBackend::Mtp
+                                                 ? *mtp_rungs[mtp_round_rung].fold
+                                                 : *replay_fold;
+        fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                     device.stream);
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -827,8 +831,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             Tensor hidden;
             Tensor selected;
             Tensor destinations;
-            if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
-                qwen3_5::MtpDecodeState& frame = *io.mtp_decode;
+            if (speculative_backend == SpeculativeBackend::Mtp && !mtp_rungs.empty()) {
+                qwen3_5::MtpDecodeState& frame = mtp_rungs[mtp_round_rung].frame;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
@@ -886,7 +890,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    // Egress rows are strided by the round's own width: the MTP draft length varies per round.
+    const std::uint32_t width = speculative_backend == SpeculativeBackend::Mtp
+                                    ? mtp_rungs[mtp_round_rung].k + 1U
+                                    : draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
@@ -1202,6 +1209,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
             sequence.mtp_draft_count = staged.initial_mtp_extent;
+            sequence.mtp_acceptance.reset();
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
         } else if (is_masked_draft_backend(speculative_backend) &&

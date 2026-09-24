@@ -43,6 +43,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      adaptive_draft(plan.adaptive_draft),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
@@ -158,6 +159,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
         replay_fold.has_value() != replay_records.has_value()) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
+    }
+    if (plan.persistent.round.mtp_decode) {
+        const std::vector<std::uint32_t> ladder = mtp_draft_ladder(draft_window, adaptive_draft);
+        mtp_rungs.reserve(ladder.size());
+        for (const std::uint32_t k : ladder) {
+            MtpRung& rung = mtp_rungs.emplace_back();
+            rung.k        = k;
+            rung.frame    = qwen3_5::MtpDecodeState(backing, *plan.persistent.round.mtp_decode,
+                                                    plan.persistent.round.spec.batch_capacity, k);
+            rung.records  = replay_records->with_width(static_cast<std::int32_t>(k + 1U));
+            rung.fold.emplace(rung.records, state_images->linear().all_layers_view());
+        }
+        // Until startup measures the graphs, every rung is assumed to cost a base round plus a
+        // fifth of it per drafted token; this is also the model an eager (graph-free) run keeps.
+        std::vector<double> prior(ladder.size());
+        for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
+            prior[rung] = 1.0 + 0.2 * static_cast<double>(ladder[rung]);
+        }
+        mtp_policy     = MtpDraftPolicy(ladder, std::move(prior));
+        mtp_round_rung = mtp_policy.initial_rung();
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();

@@ -76,6 +76,36 @@ int main() {
                   }),
                   "CLI accepted an unsupported DFlash2 draft count");
     }
+    const ninfer::cli::Options adaptive_mtp =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+               "--draft-tokens", "7"});
+    failures += check(adaptive_mtp.speculative.draft_tokens == 7 &&
+                          !adaptive_mtp.speculative.fixed_draft,
+                      "MTP did not default to adaptive drafting");
+    const ninfer::cli::Options fixed_mtp =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+               "--draft-tokens", "3", "--fixed-draft"});
+    failures += check(fixed_mtp.speculative.draft_tokens == 3 && fixed_mtp.speculative.fixed_draft,
+                      "--fixed-draft was not preserved");
+    for (const auto* k : {"0", "8"}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "mtp", "--draft-tokens", k});
+                          }),
+                          "CLI accepted an MTP draft window outside [1,7]");
+    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--fixed-draft"});
+                      }),
+                      "--fixed-draft was accepted without a speculative backend");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash", "--draft-tokens", "7", "--fixed-draft"});
+                      }),
+                      "--fixed-draft was accepted for DFlash");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--fixed-draft"),
+                      "CLI help omits --fixed-draft");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

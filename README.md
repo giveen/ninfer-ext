@@ -111,7 +111,7 @@ checkpoint capacity:
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft \
   --preserve-thinking
 ```
@@ -141,7 +141,7 @@ Run a one-shot CLI request with a 32,768-token allocation:
   --max-context 32768 \
   --max-new 8192 \
   --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft
 ```
 
@@ -288,7 +288,7 @@ docker run --rm \
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft \
   --preserve-thinking
 ```
@@ -300,7 +300,8 @@ The official artifacts provide the following capabilities, with optional compone
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP speculative decoding with draft windows from one to five;
+- MTP speculative decoding up to seven draft tokens: a single request picks its draft length per round
+  from measured acceptance, several requests decoding together draft three;
 - BF16, INT8, FP8, NVFP4, and K8V4 KV storage;
 - offline causal-perplexity scoring;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,15 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     return failures;
 }
 
+// The frame domain is K in [1,7]: T = K + 1 columns must be rejected outside [2,8].
+int expect_rejected(int k) {
+    try {
+        (void)run_case(k, {0});
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "FAIL: mtp next round K=" << k << " was accepted\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -134,7 +144,12 @@ int main() {
 
     int failures = 0;
     failures += run_case(1, {0});
+    failures += run_case(2, {0, 1, 2});
+    failures += run_case(4, {4, 0, 3});
     failures += run_case(5, {0, 2, 5});
+    failures += run_case(7, {0, 4, 7, 7, 1, 6, 3, 7});
+    failures += expect_rejected(0);
+    failures += expect_rejected(8);
 
     if (failures != 0) {
         std::cerr << "mtp_round failures=" << failures << '\n';

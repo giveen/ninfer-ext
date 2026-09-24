@@ -131,6 +131,21 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     }
 }
 
+bool DecodeGraphExecutable::try_update(const DecodeGraphDefinition& definition) {
+    nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
+    if (!ready() || !definition.ready()) {
+        throw std::logic_error("CUDA Graph update requires a definition and executable");
+    }
+
+    cudaGraphExecUpdateResultInfo result{};
+    const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+    if (err == cudaSuccess && result.result == cudaGraphExecUpdateSuccess) { return true; }
+    if (err != cudaErrorGraphExecUpdateFailure) { CUDA_CHECK(err); }
+    // The rejected update is an expected outcome, not a sticky device error.
+    (void)cudaGetLastError();
+    return false;
+}
+
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }

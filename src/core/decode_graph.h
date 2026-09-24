@@ -37,6 +37,9 @@ public:
 
     void instantiate(const DecodeGraphDefinition& definition);
     void update(const DecodeGraphDefinition& definition);
+    // Attempts the update; returns false, leaving the executable unchanged, when the definition
+    // has a different topology or otherwise violates the constraints of an in-place update.
+    [[nodiscard]] bool try_update(const DecodeGraphDefinition& definition);
     void upload(cudaStream_t stream);
     void launch(cudaStream_t stream);
     [[nodiscard]] bool ready() const noexcept;
