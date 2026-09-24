@@ -1022,6 +1022,7 @@ struct ModelMetadata {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
     double load_seconds                = 0.0;
