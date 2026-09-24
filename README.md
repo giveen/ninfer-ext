@@ -2,6 +2,9 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+> **ninfer-ext** is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer) that builds
+> as C++23.
+
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
@@ -31,14 +34,14 @@ the weights again.
 NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
 CMake 3.28 or newer, a C++23 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
+CUDA 13.3 is the validated development toolkit; CMake does not impose a CUDA version floor.
 The build rejects CUDA architectures other than `sm_120a`.
 
 Build the product binaries:
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
+git clone https://github.com/giveen/ninfer-ext.git
+cd ninfer-ext
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j

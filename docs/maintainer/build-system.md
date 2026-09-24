@@ -1,7 +1,7 @@
 # Build system
 
-NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 23.
+The supported architecture is `sm_120a`; CUDA 13.3 is the validated development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -12,6 +12,12 @@ The root `CMakeLists.txt` owns language/toolchain constraints, build options and
 composition. Architecture selection and validation happen before `project()` detects CUDA.
 The default configuration is Release. Ninja links and archives share the single-slot
 `ninfer_link` pool; compilation uses the build command's parallelism.
+
+The language standard is C++23 for host and CUDA code. CMake (through 4.3) has no CUDA23 dialect
+for nvcc, so the root file requests `CMAKE_CUDA_STANDARD 20`, blanks CMake's own
+`-std=c++20` option (`CMAKE_CUDA20_STANDARD_COMPILE_OPTION` and `..._EXTENSION_...`) and adds
+`-std=c++23` to CUDA compilation. Once CMake supports CUDA23, this reduces to
+`CMAKE_CUDA_STANDARD 23`.
 
 | Cache option | Default | Scope |
 |---|---|---|
@@ -25,7 +31,7 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+CUDA 13.3 and Python 3.11 describe the maintained environment, not configuration version gates.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in

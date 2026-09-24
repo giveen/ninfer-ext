@@ -145,10 +145,10 @@ Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual re
 causes failures or interferes with the task, and briefly explain why.
 
 Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
+`/home/jabbatheduck/.local/bin/python3.11`; the default shell's `python3` may be a different
 version. Use `python3` only after selecting the maintainer environment or checking its version.
 Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.3.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
