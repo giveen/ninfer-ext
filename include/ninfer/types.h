@@ -883,6 +883,9 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Routed-expert device cache of host-resident experts (zero when experts are device-resident).
+    std::uint32_t expert_cache_slots = 0;
+    std::size_t expert_cache_bytes   = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

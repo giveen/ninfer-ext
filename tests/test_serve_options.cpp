@@ -348,6 +348,16 @@ int main() {
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
+    const ServeOptions cached = parse({"ninfer-serve", "model.ninfer", "--expert-cache", "auto"});
+    failures += check(cached.expert_cache.mode == ninfer::ExpertCacheMode::Automatic,
+                      "--expert-cache auto did not select automatic sizing");
+    const ServeOptions sized = parse({"ninfer-serve", "model.ninfer", "--expert-cache", "512"});
+    failures += check(sized.expert_cache.mode == ninfer::ExpertCacheMode::Explicit &&
+                          sized.expert_cache.explicit_bytes == 512ULL * 1024ULL * 1024ULL,
+                      "--expert-cache MiB did not select an explicit cache");
+    failures += check(serve_usage_text("ninfer-serve").contains("--expert-cache"),
+                      "serve help omits --expert-cache");
+
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",

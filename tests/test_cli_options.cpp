@@ -32,6 +32,19 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    const ninfer::cli::Options cached =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--expert-cache", "20480"});
+    failures += check(cached.expert_cache.mode == ninfer::ExpertCacheMode::Explicit &&
+                          cached.expert_cache.explicit_bytes == 20480ULL * 1024ULL * 1024ULL,
+                      "--expert-cache MiB did not select an explicit cache");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hi"}).expert_cache.mode ==
+                          ninfer::ExpertCacheMode::Automatic,
+                      "omitted --expert-cache is not automatic");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hi",
+                                       "--expert-cache", "0"});
+                      }),
+                      "--expert-cache accepted zero");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

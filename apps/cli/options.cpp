@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/expert_cache_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -83,7 +84,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--expert-cache auto|MiB]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft] [--fixed-draft]\n"
@@ -104,6 +105,8 @@ std::string usage_text(const char* argv0) {
            "--draft-tokens N); --fixed-draft always drafts exactly N.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
+           "--expert-cache sizes the device cache of host-resident routed experts (Qwen4Exp);\n"
+           "auto gives it the device memory left after the KV floor.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -141,6 +144,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--expert-cache") {
+            options.expert_cache = product::parse_expert_cache(value(arg));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {

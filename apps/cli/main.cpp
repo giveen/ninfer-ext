@@ -179,6 +179,10 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("max context", std::to_string(memory.max_context));
     print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
     print_metric("KV capacity", std::to_string(memory.kv_capacity));
+    if (memory.expert_cache_slots != 0) {
+        print_metric("Expert cache", std::to_string(memory.expert_cache_slots) + " experts (" +
+                                         format_bytes(memory.expert_cache_bytes) + ")");
+    }
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
@@ -273,6 +277,7 @@ int main(int argc, char** argv) {
         engine_options.device             = cli.device;
         engine_options.max_context        = cli.max_context;
         engine_options.kv_capacity        = cli.kv_capacity;
+        engine_options.expert_cache       = cli.expert_cache;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;
         engine_options.speculative        = cli.speculative;

@@ -569,6 +569,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
+    if (qwen4_runtime) {
+        out.expert_cache_slots = static_cast<std::uint32_t>(qwen4_runtime->cache.slots);
+        out.expert_cache_bytes =
+            static_cast<std::size_t>(qwen4_runtime->cache.slots) * ops::kExpertSlotBytes;
+    }
     const auto& weights = parameters.model.storage_stats();
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};

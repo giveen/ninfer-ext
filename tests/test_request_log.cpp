@@ -110,6 +110,8 @@ int main() {
     memory.kv_capacity_page_groups     = 8192;
     memory.kv_capacity_max_page_groups = 16384;
     memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    memory.expert_cache_slots          = 6800;
+    memory.expert_cache_bytes          = 6800ULL * 2764800ULL;
     memory.weights.capacity_bytes      = 100;
     memory.sequence.capacity_bytes     = 200;
     memory.workspace.capacity_bytes    = 500;
@@ -169,6 +171,9 @@ int main() {
                           server.at("engine").at("kv_capacity_page_groups") == 8192 &&
                           server.at("engine").at("kv_capacity_max_page_groups") == 16384,
                       "KV capacity resolution metadata missing");
+    failures += check(server.at("engine").at("expert_cache_slots") == 6800 &&
+                          server.at("engine").at("expert_cache_bytes") == 6800ULL * 2764800ULL,
+                      "expert cache capacity missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
