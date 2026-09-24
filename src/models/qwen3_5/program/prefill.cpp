@@ -213,6 +213,13 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
+    // The sequence's own token ceiling: the last frontier its Device KV lease may cover, so
+    // on-demand growth never leases pages the request cannot reach.
+    request.lease_ceiling = std::min(
+        capacity, request_plan.summary.prompt_tokens +
+                      (request_plan.summary.effective_output_tokens == 0
+                           ? 0U
+                           : request_plan.summary.effective_output_tokens - 1U));
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =

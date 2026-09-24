@@ -1424,7 +1424,10 @@ public:
     void resize_entitlement(KVAddressSpaceHandle handle, std::uint32_t entitlement) {
         Address& address = require_active(handle);
         if (entitlement < address.page_count || entitlement > page_capacity_) {
-            throw std::invalid_argument("KV entitlement is smaller than mapped pages");
+            throw std::invalid_argument(
+                "KV entitlement is smaller than mapped pages: entitlement=" +
+                std::to_string(entitlement) + " mapped_pages=" + std::to_string(address.page_count) +
+                " capacity=" + std::to_string(page_capacity_));
         }
         pages_->physical_pool().resize_reservation(address.reservation,
                                                    entitlement - address.page_count);
@@ -1634,6 +1637,10 @@ public:
     [[nodiscard]] std::uint32_t entitlement(KVAddressSpaceHandle handle) const {
         return entitlement(require(handle));
     }
+
+    // Most pages one address space can be entitled to: the pool may hold more than the logical
+    // context needs, but an entitlement above this is rejected.
+    [[nodiscard]] std::uint32_t address_page_capacity() const noexcept { return page_capacity_; }
 
     [[nodiscard]] std::uint32_t committed_frontier(KVAddressSpaceHandle handle) const {
         return require(handle).committed_frontier;

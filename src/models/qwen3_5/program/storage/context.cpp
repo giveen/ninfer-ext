@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -1017,6 +1018,8 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
+    request.lease_settled        = false;
+    request.lease_ceiling        = 0;
     return true;
 }
 
@@ -1041,6 +1044,8 @@ void ProgramImpl::clear_lane_best_effort(SequenceState& sequence,
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
+    request.lease_settled        = false;
+    request.lease_ceiling        = 0;
     const auto* begin            = continuation_states.data();
     const auto* end              = begin + continuation_capacity;
     if (&sequence >= begin && &sequence < end) {
@@ -1428,6 +1433,118 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
     } catch (...) {}
 }
 
+void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
+                                           std::uint32_t backend_tokens) {
+    // Only a decode step may extend the lease: materialization during admission has to leave the
+    // sequence holding exactly the entitlement its plan declared.
+    RequestControl& request = requests[sequence.lane];
+    if (request.lifecycle != Lifecycle::Active) { return; }
+    const std::uint32_t cushion    = kv_lease_cushion_pages();
+    const std::uint32_t text_pages = text_kv_addresses->entitlement(sequence.kv->text);
+    const std::uint32_t backend_pages =
+        sequence.kv->backend ? backend_kv_addresses->entitlement(*sequence.kv->backend) : 0U;
+    const bool main_thin = kv_pages_for_tokens(main_tokens) + cushion > text_pages;
+    const bool backend_thin = sequence.kv->backend.has_value() && backend_tokens != 0 &&
+                              kv_pages_for_tokens(backend_tokens) + cushion > backend_pages;
+    if (!main_thin && !backend_thin) { return; }
+
+    // A full window first; when the pool cannot spare one, a step-sized extension still leaves
+    // the cushion. Neither rung may exceed its pool, so the reservation can only fail on space.
+    // The ladder ends at one page group: a pool that can only spare its own allocation
+    // granularity would otherwise settle with free page groups that no coarser rung can use.
+    const auto target = [](std::uint32_t cap, std::uint32_t pages, std::uint32_t wanted) {
+        return std::min(cap, std::max(pages, wanted));
+    };
+    const std::uint32_t backend_ceiling = std::min(
+        capacity, request.lease_ceiling + kv_lease_backend_allowance_tokens());
+    const auto grow = [&](std::uint32_t extra_tokens) {
+        const std::uint32_t text_target =
+            target(std::min(text_kv_pages->physical_pool().capacity_pages(),
+                            text_kv_addresses->address_page_capacity()),
+                   text_pages,
+                   kv_lease_pages_for_tokens(
+                       std::min(request.lease_ceiling, main_tokens + extra_tokens)));
+        const std::uint32_t backend_target =
+            sequence.kv->backend
+                ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
+                                  backend_kv_addresses->address_page_capacity()),
+                         backend_pages,
+                         backend_thin ? kv_lease_pages_for_tokens(std::min(
+                                            backend_ceiling, backend_tokens + extra_tokens))
+                                      : backend_pages)
+                : 0U;
+        if ((main_thin && text_target <= text_pages) ||
+            (backend_thin && backend_target <= backend_pages)) {
+            return false;
+        }
+        resize_sequence_kv_entitlement(sequence, text_target, backend_target);
+        // The extended lease is this owner's resource effect: keep the accounting the population
+        // proofs read in step with it.
+        request.active_resources.device.main_kv_pages += text_target - text_pages;
+        request.active_resources.device.backend_kv_pages += backend_target - backend_pages;
+        return true;
+    };
+    const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    // Per rung: 'r' refused (the target does not exceed the entitlement: ceiling or pool cap),
+    // 's' no space (the pool could not reserve the extension).
+    char outcome[4] = {'-', '-', '-', '\0'};
+    std::size_t rung = 0;
+    for (const std::uint32_t extra_tokens :
+         {kv_lease_growth_margin_tokens(), 2U * page, page}) {
+        try {
+            if (grow(extra_tokens)) { return; }
+            outcome[rung] = 'r';
+        } catch (const std::bad_alloc&) { outcome[rung] = 's'; }
+        ++rung;
+    }
+
+    // The pool cannot extend this lease. The sequence settles where the lease still covers a
+    // step, so no launch can fail coverage mid-round, and the request finishes at its output
+    // limit well before the client's budget. Record why, so a premature finish is diagnosable.
+    request.lease_settled = true;
+    const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
+    std::fprintf(stderr,
+                 "warning: Device KV lease cannot grow; lane %u settles | rungs %s | tokens %u "
+                 "(backend %u) | ceiling %u | text entitlement %u pages, pool %u capacity %u "
+                 "allocated %u reserved %u available",
+                 sequence.lane, outcome, main_tokens, backend_tokens, request.lease_ceiling,
+                 text_pages, text_pool.capacity_pages(), text_pool.allocated_pages(),
+                 text_pool.reserved_pages(), text_pool.available_pages());
+    if (sequence.kv->backend && backend_kv_pages) {
+        const DeviceKVPagePool& backend_pool = backend_kv_pages->physical_pool();
+        std::fprintf(stderr,
+                     " | backend entitlement %u pages, pool %u capacity %u allocated %u reserved "
+                     "%u available",
+                     backend_pages, backend_pool.capacity_pages(), backend_pool.allocated_pages(),
+                     backend_pool.reserved_pages(), backend_pool.available_pages());
+    }
+    std::fprintf(stderr, "\n");
+}
+
+std::optional<std::uint32_t> ProgramImpl::device_kv_lease_settlement_tokens(
+    SequenceHandle sequence, std::uint32_t forced_span_tokens) const noexcept {
+    if (!valid_sequence(sequence)) { return std::nullopt; }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    if (lane >= max_concurrency || active_continuations[lane] >= continuation_capacity ||
+        !requests[lane].lease_settled) {
+        return std::nullopt;
+    }
+    const SequenceState& state = active_sequence(lane);
+    if (!state.kv) { return std::nullopt; }
+    // The settle keeps the widest single step and the caller's forced control span unused, so
+    // every launch it still licenses stays inside the lease.
+    const std::uint32_t step = std::max(draft_window + 1U, forced_span_tokens);
+    const std::uint32_t covered = std::min(
+        state.kv->backend
+            ? kv_tokens_for_pages(backend_kv_addresses->entitlement(*state.kv->backend))
+            : std::numeric_limits<std::uint32_t>::max(),
+        kv_tokens_for_pages(text_kv_addresses->entitlement(state.kv->text)));
+    const std::uint32_t frontier = state.execution_frontier;
+    const std::uint32_t slack    = covered > frontier + step ? covered - frontier - step : 0U;
+    const std::uint32_t forced   = forced_span_tokens == 0 ? 0U : forced_span_tokens + 1U;
+    return std::max(std::max(1U, slack), forced);
+}
+
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
@@ -1436,6 +1553,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,

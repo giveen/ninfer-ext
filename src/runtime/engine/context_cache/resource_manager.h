@@ -518,12 +518,9 @@ public:
             program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
         std::optional<CheckpointRef> private_replacement;
         if (!private_baseline.private_replacement_candidates.empty()) {
-            private_replacement = *std::ranges::min_element(
+            private_replacement = select_long_anchor_replacement(
                 private_baseline.private_replacement_candidates,
-                [](CheckpointRef lhs, CheckpointRef rhs) {
-                    return std::tuple{lhs.kind, lhs.frontier, lhs.ordinal} <
-                           std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
-                });
+                private_baseline.shortlist_key.frontier);
             private_baseline =
                 program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
         }
@@ -569,6 +566,10 @@ public:
             std::uint64_t replacement_id          = 0;
             std::uint64_t replacement_revision    = 0;
             std::uint32_t stable_ordinal          = 0;
+            // Plans the publication into a catalogued automatic entry's slot as if it were
+            // vacant. The entry is released only if this scenario is the one selected, after
+            // which the capture is planned again against the freed slot.
+            bool reclaims_slot = false;
         };
 
         struct SelectedCapture {
@@ -579,12 +580,35 @@ public:
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
         if (candidate.publishes_shared) {
-            const bool pressure_evidence =
+            // Declared credit means the client (ExplicitBoundary) or a system default
+            // (RequestedAutomatic) gave this candidate an explicit retention standing. Automatic
+            // (EngineObserved) candidates carry no such contract and are therefore reclaimable.
+            const bool declared_credit =
                 has_shared_candidate_evidence(candidate.shared_evidence,
                                               SharedCandidateEvidence::ExplicitBoundary) ||
                 has_shared_candidate_evidence(candidate.shared_evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic) ||
-                matching_reuse_domains(candidate.shortlist_key) >= 2U;
+                                              SharedCandidateEvidence::RequestedAutomatic);
+            const bool pressure_evidence =
+                declared_credit || matching_reuse_domains(candidate.shortlist_key) >= 2U;
+            // Automatic-evidence candidates can only claim a vacant slot. When the catalog is
+            // saturated, the least recently used eligible automatic entry is offered as a
+            // reclaimable slot so a full catalog cannot freeze them out permanently: without it,
+            // once every slot holds a resident entry, every later ordinary client loses
+            // shared-prefix reuse until an engine restart (issue #251). Gate on the *absence of
+            // declared credit*, not on pressure_evidence: a repeated automatic candidate's own
+            // committed demand record already pushes its window-only matching_reuse_domains count
+            // to >= 2 by capture time (the very gate that made it a shared-capture candidate), so a
+            // pressure_evidence gate would make this reclaim unreachable for exactly the traffic
+            // it exists to serve. The entry is not released here: only once a scenario that
+            // publishes into its slot has planned, so a capture that cannot proceed costs nothing.
+            std::optional<std::uint32_t> reclaim_slot;
+            if (!declared_credit &&
+                std::ranges::none_of(shared_catalog_,
+                             [](const SharedCatalogEntry& entry) {
+                                 return entry.state == SharedCatalogState::Vacant;
+                             })) {
+                reclaim_slot = least_recent_reclaimable_shared_slot();
+            }
 
             std::vector<CaptureScenario> scenarios;
             scenarios.reserve(static_cast<std::size_t>(shared_catalog_count_) + 1U);
@@ -596,6 +620,14 @@ public:
                     .stable_ordinal   = 0,
                 });
                 break;
+            }
+            if (reclaim_slot) {
+                scenarios.push_back(CaptureScenario{
+                    .assessment       = candidate,
+                    .publication_slot = *reclaim_slot,
+                    .stable_ordinal   = 0,
+                    .reclaims_slot    = true,
+                });
             }
             if (pressure_evidence) {
                 for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -634,6 +666,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_,
                         program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                    .unreachable = false,
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -659,6 +692,7 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
+                    .last_hit_epoch           = owner_recency_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
                 });
                 if (entry.summary.endpoint) {
@@ -691,6 +725,7 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
+                    .last_hit_epoch           = shared_recency_epoch(entry),
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
@@ -703,6 +738,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = false,
                 });
             }
 
@@ -747,7 +783,8 @@ public:
                         const SharedCatalogEntry& entry = shared_catalog_[slot];
                         if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                             entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0 ||
-                            entry.id == scenario.replacement_id) {
+                            entry.id == scenario.replacement_id ||
+                            (scenario.reclaims_slot && slot == scenario.publication_slot)) {
                             continue;
                         }
                         shared_owners.push_back(&*entry.handle);
@@ -755,6 +792,10 @@ public:
                             owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
                     }
                 }
+                std::vector<PlanningOwnerId> recency_owner_ids = rank_pressure_owners(
+                    std::span<const typename CapturePlanner::OwnerPolicy>(owner_policies),
+                    std::span<const PlanningOwnerId>(private_owner_ids),
+                    std::span<const PlanningOwnerId>(shared_owner_ids));
                 const typename CapturePlanner::Input input{
                     .capture             = &scenario.assessment,
                     .private_owners      = private_owners,
@@ -763,6 +804,7 @@ public:
                     .shared_owner_ids    = shared_owner_ids,
                     .owner_policies      = owner_policies,
                     .checkpoint_policies = checkpoint_policies,
+                    .recency_owner_ids   = recency_owner_ids,
                     .direct_shared_victim =
                         scenario.replacement == nullptr
                             ? std::nullopt
@@ -794,6 +836,20 @@ public:
                     });
                 }
             }
+        }
+
+        if (selected && selected->scenario.reclaims_slot) {
+            // The reclaim scenario won: release the entry now and plan again, so the capture is
+            // sealed against the freed slot and the resources it released. The second pass finds
+            // a vacant slot and never reclaims again.
+            const std::uint32_t slot = selected->scenario.publication_slot;
+            selected.reset();
+            if (!reclaim_automatic_shared_prefix(program, slot)) {
+                program.skip_capture(std::move(offer));
+                return ActiveCaptureReserveResult::Skipped;
+            }
+            return reserve_active_capture(program, lane, std::move(offer),
+                                          blocked_runnable_requests, cancellation);
         }
 
         if (!selected) {
@@ -922,6 +978,42 @@ public:
         lanes_[lane.value] = LogicalLaneState::TerminalPending;
     }
 
+    // Publish a program-salvaged continuation: the same publication as a catalogued finish,
+    // except the interrupted partial response earns only Disposable retention.
+    void publish_salvaged_continuation(Program& program, LaneId lane, AbortResult& result) {
+        ActiveEntry& active = active_[lane.value];
+        CatalogEntry& publication = catalog_.at(active.publication_slot);
+        if (!result.continuation || !valid_continuation_summary(result.summary) ||
+            publication.state != CatalogState::ReservedForActive ||
+            publication.id != active.continuation_id) {
+            if (result.continuation) {
+                (void)program.release_continuation(std::move(*result.continuation));
+                result.continuation.reset();
+            }
+            throw std::logic_error("Program salvaged an invalid terminal continuation");
+        }
+        release_active_references(lane);
+        publication.state = CatalogState::Catalogued;
+        assign_continuation_summary(publication.summary, result.summary);
+        publication.handle.emplace(std::move(*result.continuation));
+        result.continuation.reset();
+        publication.session   = active.session;
+        publication.retention = RetentionClass::Disposable;
+        migrate_observations(publication, result.summary, publication.retention);
+        advance_revision(publication.revision);
+        bool lost_session_binding = false;
+        if (publication.session && active.update_session_index) {
+            if (!publish_session(*publication.session, active.publication_slot, publication.id,
+                                 publication.revision, active.publication_order)) {
+                publication.session.reset();
+                lost_session_binding = true;
+            }
+        }
+        // A late finish that lost its session's binding to a newer request is not the
+        // conversation's continuation; it must not outrank the owner that holds the binding.
+        if (!lost_session_binding) { touch_catalog_entry(publication); }
+    }
+
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
@@ -935,6 +1027,19 @@ public:
             if (discarded.status != ConsumeStatus::Consumed) {
                 throw std::logic_error(
                     "Program could neither retain nor discard terminal sequence");
+            }
+            if (discarded.salvaged) {
+                publish_salvaged_continuation(program, lane, discarded);
+                reset_active_entry(active);
+                lanes_[lane.value] = LogicalLaneState::Free;
+
+                FinishResult salvaged;
+                salvaged.status      = ConsumeStatus::Consumed;
+                salvaged.disposition = FinishDisposition::Catalogued;
+                salvaged.salvaged    = true;
+                salvaged.timings     = discarded.timings;
+                salvaged.speculative = std::move(discarded.speculative);
+                return salvaged;
             }
             release_active_references(lane);
             clear_catalog_entry(catalog_.at(active.publication_slot));
@@ -979,13 +1084,18 @@ public:
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
+        bool lost_session_binding = false;
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
                                  publication.revision, active.publication_order)) {
                 publication.session.reset();
+                lost_session_binding = true;
                 publication.retention = RetentionClass::RecentPrivate;
             }
         }
+        // A late finish that lost its session's binding to a newer request is not the
+        // conversation's continuation; it must not outrank the owner that holds the binding.
+        if (!lost_session_binding) { touch_catalog_entry(publication); }
         reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
@@ -1004,8 +1114,12 @@ public:
         if (result.status != ConsumeStatus::Consumed) {
             throw std::logic_error("Program did not consume aborted sequence");
         }
-        release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        if (result.salvaged) {
+            publish_salvaged_continuation(program, lane, result);
+        } else {
+            release_active_references(lane);
+            clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        }
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
@@ -1100,6 +1214,8 @@ public:
         out.host_state_occupied_slots        = usage.host_state_slots;
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
+        out.device_main_kv_lease_pages       = usage.device_main_kv_lease_pages;
+        out.device_backend_kv_lease_pages    = usage.device_backend_kv_lease_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
@@ -1158,6 +1274,11 @@ private:
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
+        // Retention epoch at which this owner was last published. Checkpoint observations only
+        // advance on a hit, and a publication starts them at zero (the normal ConsumeToActive
+        // continuation even clears the consumed source's history), so without this stamp every
+        // conversation that is being continued normally would rank as the oldest owner.
+        std::uint64_t last_touch_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1170,6 +1291,8 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        // Retention epoch at which this prefix was published; see CatalogEntry::last_touch_epoch.
+        std::uint64_t last_touch_epoch = 0;
     };
 
     enum class SessionIndexState : std::uint8_t {
@@ -1372,6 +1495,24 @@ private:
         return mask;
     }
 
+    // A private checkpoint is provably dead only for its own lineage: when the incoming request
+    // continues the same session and its prompt differs from the checkpoint's prefix at that
+    // frontier, no later prompt of that conversation can reuse it (issue #178). A checkpoint that
+    // merely cannot serve *this* request -- another conversation's, a shared prefix, or one this
+    // prompt does not reach -- keeps its full portfolio value: its demand comes from other
+    // requests. Treating every such checkpoint as worthless (as eb5396bf did) let any planner
+    // path evict everything the current request could not use, for free.
+    [[nodiscard]] static bool
+    lineage_diverged(const RequestBasePlan& base, const std::optional<CacheSessionKey>& owner_session,
+                     const PrefixShortlistKey& key) {
+        const std::optional<CacheSessionKey>& incoming_session = base.context_cache().session_key;
+        if (!owner_session || !incoming_session || *owner_session != *incoming_session) {
+            return false;
+        }
+        const std::optional<PrefixShortlistKey> incoming = base.prefix_shortlist_key(key.frontier);
+        return incoming && *incoming != key;
+    }
+
     [[nodiscard]] std::uint32_t
     committed_demand_mask_for(const PrefixShortlistKey& key) const noexcept {
         std::uint32_t mask = 0;
@@ -1559,7 +1700,8 @@ private:
         entry.handle.reset();
         entry.session.reset();
         entry.observations.clear();
-        entry.retention = RetentionClass::RecentPrivate;
+        entry.retention        = RetentionClass::RecentPrivate;
+        entry.last_touch_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -1572,7 +1714,66 @@ private:
         entry.transaction_pins    = 0;
         entry.explicit_credit     = false;
         entry.credit_expiry_epoch = 0;
+        entry.last_touch_epoch    = 0;
         advance_revision(entry.revision);
+    }
+
+    // LRU eligibility for automatic-evidence reclamation: catalogued, holding no explicit client
+    // credit (client-declared credit ages out through credit_expiry_epoch instead), unpinned by
+    // an open transaction, and with no active reuse edges.
+    [[nodiscard]] bool shared_automatic_reclaimable(const SharedCatalogEntry& entry,
+                                                    std::uint32_t slot) const {
+        return entry.state == SharedCatalogState::Catalogued && entry.handle &&
+               entry.transaction_pins == 0 && shared_active_edge_count(slot) == 0 &&
+               !entry.explicit_credit;
+    }
+
+    [[nodiscard]] std::uint32_t shared_reclaimable_slot_count() const {
+        std::uint32_t count = 0;
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            if (shared_automatic_reclaimable(shared_catalog_[slot], slot)) { ++count; }
+        }
+        return count;
+    }
+
+    // The eligible automatic shared catalog entry least recently used: oldest latest hit or
+    // publication (`shared_recency_epoch`), ties broken by publication order. Automatic-evidence
+    // candidates (ordinary clients) have no pressure standing -- the portfolio model prices
+    // uncredited owners at zero, so pressure planning can never approve their replacement -- and
+    // without reclamation a saturated shared catalog freezes them out for the rest of the
+    // engine's life (issue #251). Choosing by use rather than by publication order keeps a
+    // prefix every new conversation still hits from being dropped for a newcomer.
+    [[nodiscard]] std::optional<std::uint32_t> least_recent_reclaimable_shared_slot() const {
+        std::optional<std::uint32_t> victim;
+        std::tuple<std::uint64_t, std::uint64_t> oldest{std::numeric_limits<std::uint64_t>::max(),
+                                                        std::numeric_limits<std::uint64_t>::max()};
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (!shared_automatic_reclaimable(entry, slot)) { continue; }
+            const std::tuple<std::uint64_t, std::uint64_t> key{shared_recency_epoch(entry),
+                                                               entry.id};
+            if (key < oldest) {
+                victim = slot;
+                oldest = key;
+            }
+        }
+        return victim;
+    }
+
+    // Releases the automatic shared catalog entry in `slot` through the Program. Returns true
+    // when the slot became vacant.
+    bool reclaim_automatic_shared_prefix(Program& program, std::uint32_t slot) {
+        if (slot >= shared_catalog_count_ ||
+            !shared_automatic_reclaimable(shared_catalog_[slot], slot)) {
+            return false;
+        }
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        const auto released       = program.release_shared_prefix(std::move(*entry.handle));
+        if (released.status != ConsumeStatus::Consumed) { return false; }
+        clear_shared_entry(entry);
+        rebuild_prefix_index();
+        saturating_increment(context_stats_.pressure_shared_owners_evicted);
+        return true;
     }
 
     void rebuild_prefix_index() {
@@ -1636,6 +1837,37 @@ private:
         return epoch;
     }
 
+    // Owner recency for the retention tier: the later of its newest checkpoint hit and its last
+    // publication. Both are drawn from `retention_epoch_`, so they order against each other.
+    [[nodiscard]] std::uint64_t owner_recency_epoch(const CatalogEntry& entry) const noexcept {
+        return std::max(newest_hit_epoch(entry), entry.last_touch_epoch);
+    }
+
+    void touch_catalog_entry(CatalogEntry& entry) noexcept {
+        entry.last_touch_epoch = ++retention_epoch_;
+    }
+
+    [[nodiscard]] static std::uint64_t
+    shared_recency_epoch(const SharedCatalogEntry& entry) noexcept {
+        return std::max(entry.observation.last_hit_epoch, entry.last_touch_epoch);
+    }
+
+    // One recency order over every pressure owner, private and shared alike. Shared prefixes used
+    // to sit outside it and every escape-hatch rung evicted all of them; ranking them with the
+    // private owners lets a recently hit shared prefix outlive an idle conversation and be
+    // demoted to Host like one.
+    template <class Policy>
+    [[nodiscard]] static std::vector<PlanningOwnerId>
+    rank_pressure_owners(std::span<const Policy> policies,
+                         std::span<const PlanningOwnerId> private_owner_ids,
+                         std::span<const PlanningOwnerId> shared_owner_ids) {
+        std::vector<PlanningOwnerId> owners;
+        owners.reserve(private_owner_ids.size() + shared_owner_ids.size());
+        owners.insert(owners.end(), private_owner_ids.begin(), private_owner_ids.end());
+        owners.insert(owners.end(), shared_owner_ids.begin(), shared_owner_ids.end());
+        return rank_owners_by_recency(policies, std::span<const PlanningOwnerId>(owners));
+    }
+
     template <class SplitCostFn>
     [[nodiscard]] std::vector<std::uint32_t> select_materialization_shared_captures(
         Program& program, const RequestBasePlan& base, const Candidate& selected_candidate,
@@ -1656,6 +1888,12 @@ private:
             std::ranges::count_if(shared_catalog_, [](const auto& entry) {
                 return entry.state == SharedCatalogState::Vacant;
             }));
+        // Automatic-evidence candidates can also reclaim the oldest eligible automatic entry at
+        // capture time; count that slack so selection stays consistent with what the capture
+        // transaction can actually fulfil instead of silently dropping every automatic candidate
+        // once the catalog saturates (issue #251).
+        const std::uint32_t shared_publication_slack =
+            vacant_shared_slots + shared_reclaimable_slot_count();
         for (const auto& opportunity : base.context_cache().opportunities) {
             if (opportunity.kind != PromptCacheMarkerKind::SharedStablePrefix ||
                 opportunity.frontier < selected_summary.reusable_prompt_tokens) {
@@ -1683,7 +1921,7 @@ private:
                                               SharedCandidateEvidence::RequestedAutomatic);
             const bool repeated = matching_reuse_domains(*key, provisional_demand) >= 2U;
             const bool surplus_candidate =
-                vacant_shared_slots != 0 &&
+                shared_publication_slack != 0 &&
                 (has_shared_candidate_evidence(opportunity.evidence,
                                                SharedCandidateEvidence::DefaultAutomatic) ||
                  has_shared_candidate_evidence(opportunity.evidence,
@@ -1710,16 +1948,20 @@ private:
         projected_owners.reserve(catalog_count_ + shared_catalog_count_ + shared_candidates.size());
         projected_checkpoints.reserve(prefix_index_.size() + shared_candidates.size());
         const auto append_existing = [&](PlanningOwnerId owner, const auto& handle,
-                                         const auto& checkpoint) {
+                                         const auto& checkpoint,
+                                         const std::optional<CacheSessionKey>& owner_session) {
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
+            const bool unreachable =
+                lineage_diverged(base, owner_session, checkpoint.shortlist_key);
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
                 .owner       = owner,
                 .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
                 .rebuild_ns  = rebuild,
                 .baseline_recovery_ns = recovery,
                 .target_recovery_ns   = recovery,
+                .unreachable          = unreachable,
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -1736,13 +1978,13 @@ private:
                 .private_retention_weight = private_retention_weight(entry.retention),
             });
             if (entry.summary.endpoint) {
-                append_existing(owner, *entry.handle, *entry.summary.endpoint);
+                append_existing(owner, *entry.handle, *entry.summary.endpoint, entry.session);
             }
             if (entry.summary.rewrite) {
-                append_existing(owner, *entry.handle, *entry.summary.rewrite);
+                append_existing(owner, *entry.handle, *entry.summary.rewrite, entry.session);
             }
             for (const auto& checkpoint : entry.summary.long_anchors) {
-                append_existing(owner, *entry.handle, checkpoint);
+                append_existing(owner, *entry.handle, checkpoint, entry.session);
             }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -1753,7 +1995,7 @@ private:
                 .owner                  = owner,
                 .explicit_shared_credit = entry.explicit_credit,
             });
-            append_existing(owner, *entry.handle, entry.summary.checkpoint);
+            append_existing(owner, *entry.handle, entry.summary.checkpoint, std::nullopt);
         }
 
         std::vector<std::uint32_t> selected_frontiers;
@@ -1795,7 +2037,7 @@ private:
                     .target_recovery_ns   = 0,
                 });
             }
-            if (surplus_only_count > vacant_shared_slots) { continue; }
+            if (surplus_only_count > shared_publication_slack) { continue; }
             std::ranges::sort(frontiers);
             const ContextPortfolioValueResult value = projected_value.fold(owners, checkpoints);
             const std::uint64_t schedule_cost       = split_cost(frontiers);
@@ -1839,6 +2081,7 @@ private:
         std::vector<PlanningOwnerRecord> owner_records;
         std::vector<MaterializationOwnerPolicy> owner_policies;
         std::vector<MaterializationCheckpointPolicy> checkpoint_policies;
+        std::vector<PlanningOwnerId> recency_owner_ids;
         candidate_inputs.reserve(candidates.size());
 
         for (std::size_t index = 0; index < candidates.size(); ++index) {
@@ -1898,6 +2141,8 @@ private:
                         throw std::logic_error("catalogued checkpoint has no policy observation");
                     }
                     selected_hits = std::max(selected_hits, observation->selected_hit_count);
+                    const bool unreachable =
+                        lineage_diverged(base, entry.session, checkpoint.shortlist_key);
                     checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                         .owner              = owner,
                         .checkpoint         = checkpoint.ref,
@@ -1910,6 +2155,7 @@ private:
                         .baseline_recovery_ns = price_checkpoint_recovery_work(
                             cost_model_,
                             program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                        .unreachable          = unreachable,
                     });
                 };
                 if (entry.summary.endpoint) { append_checkpoint(*entry.summary.endpoint); }
@@ -1921,7 +2167,7 @@ private:
                     .owner                    = owner,
                     .retention_class          = entry.retention,
                     .selected_hit_count       = selected_hits,
-                    .last_hit_epoch           = newest_hit_epoch(entry),
+                    .last_hit_epoch           = owner_recency_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
                 });
             }
@@ -1952,10 +2198,13 @@ private:
                     .owner                    = owner,
                     .retention_class          = RetentionClass::SharedStable,
                     .selected_hit_count       = entry.observation.selected_hit_count,
-                    .last_hit_epoch           = entry.observation.last_hit_epoch,
+                    .last_hit_epoch           = shared_recency_epoch(entry),
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
+                // A shared prefix serves many lineages, so one request diverging from it proves
+                // nothing about its future demand.
+                const bool unreachable = false;
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner              = owner,
                     .checkpoint         = entry.summary.checkpoint.ref,
@@ -1968,16 +2217,22 @@ private:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = unreachable,
                 });
             }
 
+            recency_owner_ids = rank_pressure_owners(
+                std::span<const MaterializationOwnerPolicy>(owner_policies),
+                std::span<const PlanningOwnerId>(private_owner_ids),
+                std::span<const PlanningOwnerId>(shared_owner_ids));
             return typename Planner::PressureInputs{
-                .private_owners    = private_owners,
-                .private_owner_ids = private_owner_ids,
-                .shared_owners     = shared_owners,
-                .shared_owner_ids  = shared_owner_ids,
-                .owner_policy      = owner_policies,
-                .checkpoint_policy = checkpoint_policies,
+                .private_owners      = private_owners,
+                .private_owner_ids   = private_owner_ids,
+                .shared_owners       = shared_owners,
+                .shared_owner_ids    = shared_owner_ids,
+                .owner_policy        = owner_policies,
+                .checkpoint_policy   = checkpoint_policies,
+                .recency_owner_ids   = recency_owner_ids,
             };
         };
 
@@ -2388,6 +2643,53 @@ private:
         if (summary.rewrite && summary.rewrite->ref == checkpoint) { return true; }
         return std::ranges::any_of(summary.long_anchors,
                                    [&](const auto& anchor) { return anchor.ref == checkpoint; });
+    }
+
+    // The long anchor to give up when a full anchor set must make room for a new capture at
+    // `new_frontier`. A request diverging between an anchor and the next retained frontier above
+    // it resumes from that anchor; without it, it resumes from the next one below. Removing anchor
+    // a therefore costs about (a - below) extra prefill for each divergence in [a, above), so the
+    // anchor minimising (a - below) * (above - a) loses the least coverage. Always replacing the
+    // deepest anchor, as before, dropped exactly the deep history the anchors exist for and let the
+    // set drift towards the endpoint. Ties keep the deeper anchor (replace the shallower one).
+    [[nodiscard]] static CheckpointRef
+    select_long_anchor_replacement(std::span<const CheckpointRef> candidates,
+                                   std::uint32_t new_frontier) {
+        std::vector<std::uint32_t> frontiers;
+        frontiers.reserve(candidates.size() + 1U);
+        for (const CheckpointRef candidate : candidates) {
+            frontiers.push_back(candidate.frontier);
+        }
+        frontiers.push_back(new_frontier);
+        std::ranges::sort(frontiers);
+
+        std::optional<CheckpointRef> selected;
+        std::uint64_t selected_loss = std::numeric_limits<std::uint64_t>::max();
+        for (const CheckpointRef candidate : candidates) {
+            const auto first = std::lower_bound(frontiers.begin(), frontiers.end(),
+                                                candidate.frontier);
+            const auto last  = std::upper_bound(first, frontiers.end(), candidate.frontier);
+            std::uint64_t loss = 0;
+            // A frontier held twice (an anchor duplicating another, or the new capture itself)
+            // loses nothing when one copy goes.
+            if (last - first == 1) {
+                const std::uint64_t below = first == frontiers.begin() ? 0U : *(first - 1);
+                const std::uint64_t gap_below = candidate.frontier - below;
+                const std::uint64_t gap_above =
+                    last == frontiers.end() ? gap_below : *last - candidate.frontier;
+                loss = gap_below * gap_above;
+            }
+            const bool better =
+                !selected || loss < selected_loss ||
+                (loss == selected_loss &&
+                 std::tuple{candidate.frontier, candidate.ordinal} >
+                     std::tuple{selected->frontier, selected->ordinal});
+            if (better) {
+                selected      = candidate;
+                selected_loss = loss;
+            }
+        }
+        return *selected;
     }
 
     [[nodiscard]] static std::uint32_t
@@ -3086,6 +3388,7 @@ private:
             publication.handle.emplace(std::move(result.shared->handle));
             publication.observation =
                 RetentionObservation{.retention_class = RetentionClass::SharedStable};
+            publication.last_touch_epoch = ++retention_epoch_;
             publication.transaction_pins = 0;
             publication.explicit_credit =
                 has_shared_candidate_evidence(record->shared_evidence,

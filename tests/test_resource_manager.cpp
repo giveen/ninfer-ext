@@ -496,6 +496,7 @@ struct FakeFinishResult {
     FinishDisposition disposition = FinishDisposition::Released;
     FakeTimings timings;
     FakeSpeculativeStats speculative;
+    bool salvaged = false;
     FakeContinuationSummary summary;
     std::optional<FakeContinuationHandle> continuation;
 };
@@ -504,6 +505,9 @@ struct FakeAbortResult {
     ConsumeStatus status = ConsumeStatus::InvariantMismatch;
     FakeTimings timings;
     FakeSpeculativeStats speculative;
+    bool salvaged = false;
+    FakeContinuationSummary summary;
+    std::optional<FakeContinuationHandle> continuation;
 };
 
 struct FakeReleaseResult {
@@ -525,11 +529,13 @@ struct FakeDiscardResult {
 };
 
 struct FakePhysicalUsage {
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t device_state_slots            = 0;
+    std::uint32_t host_state_slots              = 0;
+    std::uint32_t device_main_kv_pages          = 0;
+    std::uint32_t device_backend_kv_pages       = 0;
+    std::uint32_t device_main_kv_lease_pages    = 0;
+    std::uint32_t device_backend_kv_lease_pages = 0;
+    std::size_t host_kv_bytes                   = 0;
 };
 
 class FakeProgram;
@@ -542,7 +548,8 @@ public:
                                 std::span<const FakeContinuationHandle* const> private_owners,
                                 std::span<const PlanningOwnerId> private_owner_ids,
                                 std::span<const FakeSharedPrefixHandle* const> shared_owners,
-                                std::span<const PlanningOwnerId> shared_owner_ids);
+                                std::span<const PlanningOwnerId> shared_owner_ids,
+                                std::span<const PlanningOwnerId> recency_order);
 
     FakePressurePlanningSession(FakePressurePlanningSession&&) noexcept            = default;
     FakePressurePlanningSession& operator=(FakePressurePlanningSession&&) noexcept = default;
@@ -557,6 +564,13 @@ public:
     }
 
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] FakePressureTargetHandle
+    recency_maximal_target(PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
@@ -564,6 +578,8 @@ public:
     next_construction_option(Cursor& cursor);
     void choose_construction(Cursor& cursor, ninfer::runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<FakePressureTargetHandle> construction_target(const Cursor& cursor);
+    // Mirrors the real session's arena accounting (same formula as the commit_expansion guard).
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion
@@ -581,6 +597,8 @@ public:
     [[nodiscard]] std::optional<FakeResourcePlan> seal(FakeAssessedPressureTarget&& assessed);
     [[nodiscard]] std::optional<FakeResourcePlan>
     seal_capture(FakeAssessedPressureTarget&& assessed);
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     struct Owner {
@@ -596,6 +614,10 @@ private:
         std::uint32_t stable_ordinal       = 0;
         bool root_maximal                  = false;
         std::uint32_t next_expansion_owner = 0;
+        // -1 = not a recency-ladder rung; otherwise the rung's `sacrifice_oldest` (used by the
+        // ladder-feasibility test mode to model "host only fits the demotions after this many
+        // oldest preserved owners are given up").
+        std::int32_t sacrifice_oldest = -1;
     };
 
 public:
@@ -625,6 +647,12 @@ private:
     std::vector<const FakeAdmissionCandidate*> candidates_;
     std::vector<PlanningCandidateId> candidate_ids_;
     std::vector<Owner> owners_;
+    std::vector<std::int32_t> recency_rank_;
+    std::uint32_t ranked_owner_count_    = 0;
+    std::uint32_t eviction_licence_count_ = 0;
+    std::vector<std::uint32_t> licence_spared_ranks_;
+    // Mirrors the real session's LRU gate on incremental eviction.
+    [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const;
     std::vector<std::vector<std::vector<FakeTargetDecision>>> options_;
     std::vector<std::uint8_t> options_populated_;
     std::vector<Target> targets_;
@@ -740,7 +768,8 @@ public:
                             std::span<const FakeContinuationHandle* const> private_owners,
                             std::span<const PlanningOwnerId> private_owner_ids,
                             std::span<const FakeSharedPrefixHandle* const> shared_owners,
-                            std::span<const PlanningOwnerId> shared_owner_ids);
+                            std::span<const PlanningOwnerId> shared_owner_ids,
+                            std::span<const PlanningOwnerId> recency_order);
 
     [[nodiscard]] PrefillWork
     shared_capture_split_prefill_work(const FakeAdmissionCandidate& candidate,
@@ -986,13 +1015,13 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
-    [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
-                                                        const FakeSharedPrefixHandle*,
-                                                        const FakeSharedPrefixHandle*,
-                                                        std::optional<CheckpointRef>,
-                                                        bool permit_shared_publication) const {
+    [[nodiscard]] FakeCaptureAssessment
+    inspect_capture(const FakeCaptureOffer&, const FakeSharedPrefixHandle*,
+                    const FakeSharedPrefixHandle*, std::optional<CheckpointRef> private_replacement,
+                    bool permit_shared_publication) const {
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
+        last_capture_private_replacement = private_replacement;
         return assessment;
     }
 
@@ -1011,7 +1040,8 @@ public:
                                     std::span<const FakeContinuationHandle* const> private_owners,
                                     std::span<const PlanningOwnerId> private_owner_ids,
                                     std::span<const FakeSharedPrefixHandle* const> shared_owners,
-                                    std::span<const PlanningOwnerId> shared_owner_ids) {
+                                    std::span<const PlanningOwnerId> shared_owner_ids,
+                                    std::span<const PlanningOwnerId> recency_order) {
         capture_pressure_candidate_       = std::make_unique<FakeAdmissionCandidate>();
         FakeAdmissionCandidate& candidate = *capture_pressure_candidate_;
         candidate.value.prompt_tokens     = assessment.shortlist_key.frontier;
@@ -1038,7 +1068,8 @@ public:
         const std::array candidate_ids{FakePressurePlanningSession::candidate_id()};
         return begin_pressure_planning(
             std::span<const FakeAdmissionCandidate* const>(&candidate_handle, 1), candidate_ids,
-            private_owners, private_owner_ids, shared_owners, shared_owner_ids);
+            private_owners, private_owner_ids, shared_owners, shared_owner_ids,
+            recency_order);
     }
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
@@ -1106,17 +1137,31 @@ public:
         return result;
     }
 
-    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle) noexcept {
+    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle sequence) noexcept {
         ++abort_calls;
         advance_revision();
-        return FakeAbortResult{.status      = ConsumeStatus::Consumed,
+        FakeAbortResult result{.status      = ConsumeStatus::Consumed,
                                .timings     = FakeTimings{.value = 7},
                                .speculative = FakeSpeculativeStats{.value = 9}};
+        if (abort_salvage_next) {
+            abort_salvage_next = false;
+            const std::uint32_t key = sequence_content_keys_[sequence.id];
+            result.salvaged        = true;
+            result.summary.endpoint = endpoint(key, finish_frontier);
+            result.continuation.emplace(sequence.id, key);
+        }
+        return result;
     }
 
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
+        advance_revision();
+        return FakeReleaseResult{.status = ConsumeStatus::Consumed};
+    }
+
+    [[nodiscard]] FakeReleaseResult release_shared_prefix(FakeSharedPrefixHandle&& shared) noexcept {
+        released_shared_prefix_keys.push_back(shared.content_key);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
@@ -1141,6 +1186,13 @@ public:
     std::uint32_t pressure_assessment_delay_us           = 0;
     std::uint64_t pressure_checkpoint_recovery_ns        = 100;
     bool require_evictions                               = false;
+    // Ladder-feasibility test mode: when true, a recency-ladder rung (sacrifice_oldest >= 0) is
+    // feasible iff its sacrifice is >= `min_feasible_sacrifice` (modeling "host only fits the
+    // demotions after that many oldest preserved owners are given up"), and the terminal
+    // clear-all (root_maximal, sacrifice_oldest < 0) is always feasible. Search-path targets
+    // (not a rung, not root_maximal) keep using `target_feasible`.
+    bool ladder_feasibility_mode    = false;
+    std::uint32_t min_feasible_sacrifice = 0;
     bool abort_start                                     = false;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
@@ -1149,8 +1201,15 @@ public:
     bool reverse_pressure_results                        = false;
     bool progress_in_progress_once                       = false;
     bool finish_fail_next                                = false;
+    // Seal-window and capture-seal failure injection.
+    bool deny_seal_window                                = false;
+    bool fail_capture_seal                               = false;
+    std::uint64_t seal_window_claims                     = 0;
+    // The private replacement the most recent capture inspection was asked to price.
+    mutable std::optional<CheckpointRef> last_capture_private_replacement;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    bool abort_salvage_next                              = false;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -1162,6 +1221,9 @@ public:
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
+    // Continuation ids of the private owners in the recency order handed to the most recent
+    // pressure planning session (most recent first).
+    std::vector<std::uint32_t> observed_recency_ids;
     std::uint64_t pressure_target_assessments = 0;
     std::uint64_t start_calls                 = 0;
     std::uint64_t finish_calls                = 0;
@@ -1177,6 +1239,7 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<std::uint32_t> released_shared_prefix_keys;
 
 private:
     void advance_revision() noexcept {
@@ -1201,7 +1264,8 @@ FakePressurePlanningSession::FakePressurePlanningSession(
     std::span<const FakeContinuationHandle* const> private_owners,
     std::span<const PlanningOwnerId> private_owner_ids,
     std::span<const FakeSharedPrefixHandle* const> shared_owners,
-    std::span<const PlanningOwnerId> shared_owner_ids)
+    std::span<const PlanningOwnerId> shared_owner_ids,
+    std::span<const PlanningOwnerId> recency_order)
     : program_(&program), revision_(program.resource_revision()) {
     require(!candidates.empty() && candidates.size() == candidate_ids.size(),
             "fake pressure session has no candidate identity");
@@ -1219,9 +1283,32 @@ FakePressurePlanningSession::FakePressurePlanningSession(
         owners_.push_back(Owner{
             .shared_handle = shared_owners[index], .id = shared_owner_ids[index], .shared = true});
     }
-    std::ranges::sort(owners_, [](const Owner& left, const Owner& right) {
-        return left.id.value < right.id.value;
-    });
+    std::ranges::sort(owners_,
+              [](const Owner& left, const Owner& right) { return left.id.value < right.id.value; });
+    recency_rank_.assign(owners_.size(), -1);
+    // `recency_order` is most-recent-first (like the real
+    // rank_owners_by_recency), so its index is the recency rank (0 = most recent) that
+    // orders the ladder sacrifice.
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto found = std::ranges::find(recency_order,
+                                     owners_[index].id);
+        if (found != recency_order.end()) {
+            recency_rank_[index] =
+                static_cast<std::int32_t>(found - recency_order.begin());
+            ++ranked_owner_count_;
+        }
+    }
+    program.observed_recency_ids.clear();
+    for (const PlanningOwnerId ranked : recency_order) {
+        for (std::size_t index = 0; index < private_owner_ids.size(); ++index) {
+            if (private_owner_ids[index] == ranked) {
+                program.observed_recency_ids.push_back(private_owners[index]->id);
+            }
+        }
+    }
+    // Mirror the real session default: the whole recency order is evictable until the
+    // admission planner narrows it.
+    eviction_licence_count_ = ranked_owner_count_;
     options_.resize(candidates_.size());
     options_populated_.resize(candidates_.size());
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
@@ -1366,6 +1453,88 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
     return target;
 }
 
+std::uint32_t FakePressurePlanningSession::ranked_owner_count() const {
+    return ranked_owner_count_;
+}
+
+void FakePressurePlanningSession::set_eviction_licence(
+    std::uint32_t oldest_licensed, std::span<const std::uint32_t> spared_ranks) {
+    eviction_licence_count_ = std::min(oldest_licensed, ranked_owner_count_);
+    licence_spared_ranks_.assign(spared_ranks.begin(), spared_ranks.end());
+}
+
+bool FakePressurePlanningSession::owner_eviction_licensed(std::uint32_t owner_index) const {
+    if (owner_index >= recency_rank_.size() || eviction_licence_count_ == 0) {
+        return false;
+    }
+    const std::int32_t rank = recency_rank_[owner_index];
+    if (rank < 0) { return true; }
+    return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
+           std::ranges::find(licence_spared_ranks_,
+                     static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
+}
+
+FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
+    PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+    const std::uint32_t selected       = candidate_index(candidate);
+    populate_options(selected);
+    const std::uint32_t demote_count =
+        sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
+    // `sacrifice_oldest` on the target records how many ranked owners the rung actually gives up
+    // (the requested tail less the spared ranks), which is what ladder-feasibility mode tests.
+    const auto spared_in_tail = static_cast<std::uint32_t>(std::ranges::count_if(spared_ranks,
+        [&](std::uint32_t rank) { return rank >= demote_count && rank < ranked_owner_count_; }));
+    Target rung{
+        .candidate_index  = selected,
+        .choices          = std::vector<std::uint16_t>(owners_.size(), 0),
+        .root_maximal     = true,
+        .sacrifice_oldest = static_cast<std::int32_t>(
+            std::min(sacrifice_oldest, ranked_owner_count_) - spared_in_tail),
+    };
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto& alternatives = options_[selected][index];
+        const std::int32_t rank   = recency_rank_[index];
+        // The rung fully evicts the sacrificed (oldest ranked, or unranked) owners, keeps every
+        // other owner as it is, and demotes a kept private owner when a non-evict (demote) outcome
+        // exists. Keeping is choice 0: whether the sacrifice frees enough is what adoption
+        // decides.
+        const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool spared  = in_tail && rank >= 0 &&
+                            std::ranges::find(spared_ranks,
+                                      static_cast<std::uint32_t>(rank)) != spared_ranks.end();
+        // A spared owner stays at the baseline here. (The real session demotes it with the other
+        // kept owners; this fake's expansion ignores the eviction licence, so a costlier spared
+        // owner would let it reach evictions the real search cannot.)
+        std::uint16_t choice = static_cast<std::uint16_t>(alternatives.size());
+        if (spared) {
+            choice = 0U;
+        } else if (!in_tail) {
+            choice = demote_kept && alternatives.size() > 1U &&
+                             !alternatives[0].evicts_continuation
+                         ? static_cast<std::uint16_t>(1)
+                         : 0U;
+        }
+        rung.choices[index] = choice;
+    }
+    auto found = std::ranges::find_if(targets_,
+        [&](const Target& target) { return same_target(target, rung) &&
+                                         target.sacrifice_oldest == rung.sacrifice_oldest; });
+    if (found != targets_.end()) {
+        found->root_maximal = true;
+        return FakePressureTargetHandle{
+            .generation = generation_,
+            .index      = static_cast<std::uint32_t>(found - targets_.begin()),
+        };
+    }
+    rung.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+    targets_.push_back(std::move(rung));
+    return FakePressureTargetHandle{
+        .generation = generation_,
+        .index      = static_cast<std::uint32_t>(targets_.size() - 1U),
+    };
+}
+
 FakePressurePlanningSession::Cursor
 FakePressurePlanningSession::begin_construction(FakePressureTargetHandle handle, bool restore) {
     require(valid(handle) && !scratch_live_, "invalid fake construction parent");
@@ -1392,6 +1561,12 @@ FakePressurePlanningSession::next_construction_option(Cursor& cursor) {
     const auto current       = cursor.target.choices[owner];
     for (std::size_t choice = cursor.restore ? 0 : 1; choice <= alternatives.size(); ++choice) {
         if (choice == current) { continue; }
+        // choice 0 is the baseline (no alternative), so it has no `alternatives[-1]` to consult;
+        // only a licensed owner's eviction is reachable.
+        if (choice != 0 && alternatives[choice - 1].evicts_continuation &&
+            !owner_eviction_licensed(static_cast<std::uint32_t>(owner))) {
+            continue;
+        }
         if (!cursor.restore && current != 0 &&
             (alternatives[current - 1].evicts_continuation ||
              !alternatives[choice - 1].evicts_continuation)) {
@@ -1432,6 +1607,16 @@ FakePressurePlanningSession::construction_target(const Cursor& cursor) {
     }
     return FakePressureTargetHandle{.generation = generation_,
                                     .index = static_cast<std::uint32_t>(found - targets_.begin())};
+}
+
+std::uint32_t FakePressurePlanningSession::optional_targets_remaining() const noexcept {
+    if (program_ == nullptr) { return 0; }
+    const std::size_t maximum = program_->pressure_optional_target_capacity
+                                    ? candidates_.size() + 1U + *program_->pressure_optional_target_capacity
+                                    : candidates_.size() + 1U + 4096U;
+    return targets_.size() >= maximum
+               ? 0U
+               : static_cast<std::uint32_t>(maximum - targets_.size());
 }
 
 ninfer::runtime::PressureTargetGuidance
@@ -1591,6 +1776,22 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         }
     }
     const bool identity  = selected.empty();
+    // Ladder-feasibility test mode: a recency-ladder rung is feasible once the host can absorb
+    // the demotions (sacrifice >= min_feasible_sacrifice); the terminal clear-all always is.
+    // Search-path targets (not a rung, not root_maximal) keep using `target_feasible`.
+    bool feasible;
+    if (program_->ladder_feasibility_mode) {
+        if (target.sacrifice_oldest >= 0) {
+            feasible = static_cast<std::uint32_t>(target.sacrifice_oldest) >=
+                       program_->min_feasible_sacrifice;
+        } else if (target.root_maximal) {
+            feasible = true;
+        } else {
+            feasible = program_->target_feasible(selected);
+        }
+    } else {
+        feasible = program_->target_feasible(selected);
+    }
     std::uint64_t digest = candidate.identity.assessment_digest;
     if (!identity) {
         digest = 1469598103934665603ULL;
@@ -1601,7 +1802,7 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         digest ^= target.candidate_index;
     }
     ninfer::runtime::PressureTargetAssessment assessment{
-        .physical_status       = program_->target_feasible(selected)
+        .physical_status       = feasible
                                      ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                                      : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
         .source_mode           = candidate.source_mode,
@@ -1763,6 +1964,7 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed, const F
 
 std::optional<FakeResourcePlan>
 FakePressurePlanningSession::seal_capture(FakeAssessedPressureTarget&& assessed) {
+    if (program_->fail_capture_seal) { return std::nullopt; }
     return seal(std::move(assessed), FakePreparedPrompt{}, {});
 }
 
@@ -1771,15 +1973,24 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed) {
     return seal_capture(std::move(assessed));
 }
 
+bool FakePressurePlanningSession::try_claim_seal_window() noexcept {
+    ++program_->seal_window_claims;
+    return !program_->deny_seal_window;
+}
+
+void FakePressurePlanningSession::release_seal_window() noexcept {}
+
 FakePressurePlanningSession
 FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* const> candidates,
                                      std::span<const PlanningCandidateId> candidate_ids,
                                      std::span<const FakeContinuationHandle* const> private_owners,
                                      std::span<const PlanningOwnerId> private_owner_ids,
                                      std::span<const FakeSharedPrefixHandle* const> shared_owners,
-                                     std::span<const PlanningOwnerId> shared_owner_ids) {
+                                     std::span<const PlanningOwnerId> shared_owner_ids,
+                                     std::span<const PlanningOwnerId> recency_order) {
     return FakePressurePlanningSession(*this, candidates, candidate_ids, private_owners,
-                                       private_owner_ids, shared_owners, shared_owner_ids);
+                                       private_owner_ids, shared_owners, shared_owner_ids,
+                                       recency_order);
 }
 
 struct FakeModelContract {
@@ -2702,6 +2913,302 @@ void test_two_owners_jointly_close_pressure() {
             "planner did not combine preserving targets from two owners");
 }
 
+void test_rank_private_owners_by_recency_ranks_every_private_owner() {
+    using namespace ninfer::runtime;
+    const std::vector<MaterializationOwnerPolicy> policies{
+        MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 0}},
+        MaterializationOwnerPolicy{
+            .owner          = PlanningOwnerId{.value = 1},
+            .last_hit_epoch = 5},
+        MaterializationOwnerPolicy{
+            .owner          = PlanningOwnerId{.value = 2},
+            .last_hit_epoch = 3},
+    };
+    const std::vector<PlanningOwnerId> private_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    std::span<const MaterializationOwnerPolicy> policy_span(policies);
+    std::span<const PlanningOwnerId> id_span(private_ids);
+
+    const auto ranked = rank_owners_by_recency(policy_span, id_span);
+    require(ranked.size() == 3 && ranked[0] == PlanningOwnerId{.value = 1} &&
+                ranked[1] == PlanningOwnerId{.value = 2} &&
+                ranked[2] == PlanningOwnerId{.value = 0},
+            "every private owner must be ranked by last hit epoch, most recent first");
+    require(rank_owners_by_recency(
+                policy_span, std::span<const PlanningOwnerId>(private_ids).first(0))
+                .empty(),
+            "no private owner must rank nothing");
+}
+
+void test_publication_counts_as_recency_for_the_ladder() {
+    // A finished request's continuation has no hit history yet: a publication starts its
+    // checkpoint observations at zero, and the normal ConsumeToActive continuation clears the
+    // consumed source's history. The ladder must still rank it as the most recently used owner,
+    // otherwise the conversation most likely to be continued next is sacrificed first.
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const ActiveRequest a = start_active(manager, program, 1, make_base(1), 1);
+    (void)finish_active(manager, program, a);
+    const ActiveRequest b = start_active(manager, program, 2, make_base(2), 2);
+    (void)finish_active(manager, program, b);
+    // Continue `a` (endpoint hit, consumed into the active lane) and publish its next turn.
+    const ActiveRequest a_next = start_active(manager, program, 1, make_base(1), 3);
+    (void)finish_active(manager, program, a_next, 24);
+    const ActiveRequest c = start_active(manager, program, 3, make_base(3), 4);
+    (void)finish_active(manager, program, c);
+
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{4}, make_base(4), 5);
+    require(inspection.choice.has_value(), "pressure admission found no choice");
+    require(program.pressure_planning_sessions != 0, "admission did not plan under pressure");
+    const std::vector<std::uint32_t> expected{c.sequence.id, a_next.sequence.id, b.sequence.id};
+    require(program.observed_recency_ids == expected,
+            "recency order did not rank owners by their latest publication or hit");
+}
+
+void test_incremental_eviction_is_licensed_by_the_lru_tail() {
+    // The admission planner licenses incremental full eviction only over the LRU tail its
+    // escape-hatch ladder had to sacrifice. Inside the session, a construction step must not
+    // offer a full eviction for a more recent owner, even when that owner has no demote outcome
+    // to fall back on.
+    FakeProgram program;
+    program.private_pressure_alternatives = 1;  // one non-evict (demote) outcome per private owner
+    std::array<FakeContinuationHandle, 2> handles{FakeContinuationHandle(1, 0),
+                                                  FakeContinuationHandle(2, 0)};
+    std::array<const FakeContinuationHandle*, 2> private_owners{&handles[0], &handles[1]};
+    std::array<PlanningOwnerId, 2> private_owner_ids{PlanningOwnerId{.value = 0},
+                                                     PlanningOwnerId{.value = 1}};
+    // Owner 0 (handle 1) is the most recently hit prefix, owner 1 is the oldest.
+    std::array<PlanningOwnerId, 2> recency_order{PlanningOwnerId{.value = 0},
+                                                 PlanningOwnerId{.value = 1}};
+    FakeAdmissionCandidate candidate;
+    const std::array<const FakeAdmissionCandidate*, 1> candidates{&candidate};
+    const std::array<PlanningCandidateId, 1> candidate_ids{PlanningCandidateId{.value = 0}};
+    auto session = program.begin_pressure_planning(
+        candidates, candidate_ids, private_owners, private_owner_ids, {}, {}, recency_order);
+
+    session.set_eviction_licence(1);  // only the oldest owner may be fully evicted
+    auto cursor = session.begin_construction(session.identity_target(candidate_ids[0]));
+    // With one alternative plus the eviction, the eviction is the last choice the session offers.
+    const std::uint16_t eviction_choice = 2;
+    std::array<bool, 2> eviction_offered{false, false};
+    for (;;) {
+        const auto step = session.next_construction_option(cursor);
+        if (step.exhausted) { break; }
+        if (!step.guidance) { continue; }  // this call only appended the next owner's options
+        const auto& child = cursor.options[step.option.index];
+        for (std::size_t owner = 0; owner < cursor.target.choices.size(); ++owner) {
+            if (child.choices[owner] != cursor.target.choices[owner] &&
+                child.choices[owner] == eviction_choice) {
+                eviction_offered[owner] = true;
+            }
+        }
+    }
+    require(eviction_offered[1] && !eviction_offered[0],
+            "incremental eviction was reachable outside the licensed LRU tail");
+
+    session.set_eviction_licence(0);  // nothing must be evicted
+    auto unrestricted = session.begin_construction(session.identity_target(candidate_ids[0]));
+    std::array<bool, 2> eviction_offered_without_licence{false, false};
+    for (;;) {
+        const auto step = session.next_construction_option(unrestricted);
+        if (step.exhausted) { break; }
+        if (!step.guidance) { continue; }
+        const auto& child = unrestricted.options[step.option.index];
+        for (std::size_t owner = 0; owner < unrestricted.target.choices.size(); ++owner) {
+            if (child.choices[owner] != unrestricted.target.choices[owner] &&
+                child.choices[owner] == eviction_choice) {
+                eviction_offered_without_licence[owner] = true;
+            }
+        }
+    }
+    require(!eviction_offered_without_licence[0] && !eviction_offered_without_licence[1],
+            "an unlicensed admission still reached incremental eviction");
+}
+
+void test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest() {
+    // Three catalogued private owners published in the order a, b, c, so their recency ranks are
+    // c=0 (most recent), b=1, a=2. The pressure search fails, so the escape-hatch recency ladder
+    // runs. Host fits only after the oldest owner is given up, so rung 1 demotes c and b (kept on
+    // host) and fully evicts a: the ladder sacrifices a suffix of the recency order and keeps
+    // every more recent prefix.
+    FakeManager manager = make_manager(1, 3, 0, true);
+    FakeProgram program;
+    const ActiveRequest a = start_active(manager, program, 151, make_base(151), 1);
+    (void)finish_active(manager, program, a);
+    const ActiveRequest b = start_active(manager, program, 152, make_base(152), 2);
+    (void)finish_active(manager, program, b);
+    const ActiveRequest c = start_active(manager, program, 153, make_base(153), 3);
+    (void)finish_active(manager, program, c);
+
+    program.ladder_feasibility_mode        = true;
+    program.min_feasible_sacrifice         = 1;  // host fits only after giving up the oldest owner
+    program.required_pressure_actions      = 4;  // above the search's max pressure -> search fails
+    program.eviction_pressure_action_units = 1;
+    program.private_pressure_alternatives  = 1;  // a non-evict (demote) alternative must exist
+    auto inspection = manager.inspect(program, FakePreparedPrompt{154}, make_base(154), 4);
+    require(inspection.choice.has_value(), "escape-hatch recency ladder found no rung");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{154}, {});
+    const auto evicted = [&program](const ActiveRequest& request) {
+        return std::ranges::find(program.started_action_ids,
+                         2000U + request.sequence.id) != program.started_action_ids.end();
+    };
+    require(evicted(a) && !evicted(b) && !evicted(c),
+            "escape-hatch rung evicted a more recent owner instead of the oldest");
+}
+
+void test_escape_hatch_clears_all_when_nothing_fits() {
+    // Host cannot absorb any demotion: every ladder rung is infeasible, so the ladder falls
+    // through to the terminal clear-all (evict everything) — the liveness backstop that never
+    // blocks the active context from getting its device KV.
+    FakeManager manager = make_manager(1, 3, 0, true);
+    FakeProgram program;
+    const ActiveRequest a = start_active(manager, program, 151, make_base(151), 1);
+    (void)finish_active(manager, program, a);
+    const ActiveRequest b = start_active(manager, program, 152, make_base(152), 2);
+    (void)finish_active(manager, program, b);
+    const ActiveRequest c = start_active(manager, program, 153, make_base(153), 3);
+    (void)finish_active(manager, program, c);
+
+    program.ladder_feasibility_mode        = true;
+    program.min_feasible_sacrifice         = 3;  // >= private owner count -> every rung infeasible
+    program.required_pressure_actions      = 4;
+    program.eviction_pressure_action_units = 1;
+    program.private_pressure_alternatives  = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{154}, make_base(154), 4);
+    require(inspection.choice.has_value(), "escape-hatch terminal clear-all was not reachable");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{154}, {});
+    const auto evicted = [&program](const ActiveRequest& request) {
+        return std::ranges::find(program.started_action_ids,
+                         2000U + request.sequence.id) != program.started_action_ids.end();
+    };
+    require(evicted(a) && evicted(b) && evicted(c), "terminal clear-all did not evict every owner");
+}
+
+void test_preserved_prefix_ladder_targets_fit_the_committed_target_budget() {
+    // Regression (2026-09-22 production 503 wall): the escape-hatch recency ladder interns one
+    // arena target per rung that the planner's optional-target budget does not count. When the
+    // pressure search then exhausts its target budget, the final expansion commit crossed the
+    // session arena limit and threw std::length_error; the worker treated the consecutive
+    // occurrences as fatal (fail-all) and rejected every subsequent request until restart. The
+    // planner must count ladder rungs in its budget and bound expansion commits by the
+    // session's true remaining capacity, so a budget-exhausting search degrades to an early
+    // stop instead of throwing.
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+
+    constexpr std::size_t arena_capacity = 24;  // small arena: the overflow is reachable quickly
+
+    FakeProgram program;
+    program.ladder_feasibility_mode           = true;
+    program.min_feasible_sacrifice            = 1;  // rung 1 (sacrifice the oldest preserved) fits
+    program.required_pressure_actions         = 5;  // above the search's max pressure -> it fails
+    program.eviction_pressure_action_units    = 1;
+    program.private_pressure_alternatives     = 4;  // wide per-owner target space
+    program.pressure_optional_target_capacity = arena_capacity;
+
+    FakeAdmissionCandidate root;
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 301;
+
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate      = &root,
+                                .id             = PlanningCandidateId{.value = 0},
+                                .stable_ordinal = 0}};
+
+    // Three ranked private owners (most-recent first: handle ids 1, 2, 3) plus one owner outside
+    // the recency order (handle id 4), which every rung evicts.
+    std::array<FakeContinuationHandle, 4> handles{};
+    std::array<const FakeContinuationHandle*, 4> private_owners{};
+    std::array<PlanningOwnerId, 4> private_owner_ids{};
+    for (std::size_t index = 0; index < handles.size(); ++index) {
+        handles[index]         = FakeContinuationHandle(static_cast<std::uint32_t>(index + 1U), 0);
+        private_owners[index]  = &handles[index];
+        private_owner_ids[index] = PlanningOwnerId{.value = static_cast<std::uint32_t>(index)};
+    }
+    const std::array<PlanningOwnerId, 3> recency_owner_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 4> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 0}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 1}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 2}},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 3}},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 4> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 1},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 2},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 3},
+            .checkpoint = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16,
+                                        .ordinal = 0},
+            .rebuild_ns = 100,
+        },
+    };
+
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners      = private_owners,
+            .private_owner_ids   = private_owner_ids,
+            .shared_owners       = {},
+            .shared_owner_ids    = {},
+            .owner_policy        = owner_policy,
+            .checkpoint_policy   = checkpoint_policy,
+            .recency_owner_ids   = recency_owner_ids,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+
+    Planner planner;
+    const auto result =
+        planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                     pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->candidate == PlanningCandidateId{.value = 0},
+            "ladder rung did not survive the budget-exhausting search");
+    require(result->diagnostics.budget_exhausted &&
+                result->diagnostics.stop_reason ==
+                        ninfer::MaterializationStopReason::ExpansionCapacity,
+            "budget-exhausting search must stop on the arena capacity instead of running past it");
+    require(program.pressure_target_count_peak <= 1U + 1U + arena_capacity,
+            "search committed more canonical targets than the arena can hold");
+    // The escape-hatch rung evicts the non-preserved owner (handle id 4) to free device KV and
+    // keeps the most-recent preserved prefix (handle id 1) on host; the pressure search must
+    // preserve that disposition when it stops on capacity.
+    const auto evicted = [&result](std::uint32_t handle_id) {
+        return std::ranges::any_of(result->plan->private_actions,
+                           [&](const auto& action) { return action.id == 2000U + handle_id; });
+    };
+    require(evicted(4) && !evicted(1),
+            "capacity stop changed the ladder's preserved/non-preserved disposition");
+}
+
 void test_materialization_result_is_validated_before_any_adoption() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -2817,7 +3324,18 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
                     program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
     }
-    require(program.pressure_target_assessments <= 8,
+    // The search grant is now cost-scaled (5 ms floor up to a 250 ms cap) instead of a flat
+    // 5 ms, so the guided search has more room before its TimeBudget stop and reaches the deep
+    // retention a few assessments later than under the old cap. The bound only needs to keep it
+    // short of a full breadth-first sweep (which would exhaust the whole grant), so this is a
+    // small relaxation, not a removal of the efficiency check.
+    // The counter is time-sensitive — the fixture injects a per-assessment delay and the search
+    // budget is time-granted — so it jitters by a couple of assessments run to run. The bound
+    // only needs to keep the guided search well short of an eager breadth-first sweep over every
+    // owner option, which is what the assertion below still rejects.
+    const std::size_t eager_sweep =
+        owner_count * (static_cast<std::size_t>(program.private_pressure_alternatives) + 2U);
+    require(program.pressure_target_assessments < eager_sweep / 2U,
             "guided pressure search returned to eager breadth-first assessment");
 }
 
@@ -3204,6 +3722,73 @@ void test_terminal_fallback_releases_failed_retention() {
             "terminal fallback did not free every logical owner");
 }
 
+void test_abort_salvage_publishes_reusable_endpoint() {
+    FakeManager manager = make_manager(1, 1);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 41, make_base(41), 1);
+
+    program.abort_salvage_next = true;
+    const FakeAbortResult result = manager.abort(program, active.lane, active.sequence);
+    require(result.status == ConsumeStatus::Consumed && result.salvaged,
+            "abort did not report its salvaged continuation");
+    require(result.timings.value == 7 && result.speculative.value == 9,
+            "salvage did not carry abort accounting");
+    require(program.abort_calls == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "salvaged abort did not free the lane or catalogue its endpoint");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{41}, make_base(41), 2);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+            "salvaged endpoint was not reusable by the retrying prompt");
+}
+
+void test_terminal_fallback_salvage_catalogues() {
+    FakeManager manager = make_manager(1, 1);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 42, make_base(42), 1);
+    manager.mark_terminal_pending(active.lane);
+    program.finish_fail_next   = true;
+    program.abort_salvage_next = true;
+    const FakeFinishResult result = manager.finish(program, active.lane, active.sequence);
+    require(result.status == ConsumeStatus::Consumed &&
+                result.disposition == FinishDisposition::Catalogued,
+            "salvaged terminal fallback was not catalogued");
+    require(result.timings.value == 7 && result.speculative.value == 9,
+            "salvaged terminal fallback lost abort accounting");
+    require(program.abort_calls == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "salvaged terminal fallback did not free every logical owner");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{42}, make_base(42), 2);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+            "salvaged terminal fallback endpoint was not reusable");
+}
+
+void test_abort_salvage_earns_disposable_retention_under_pressure() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest salvaged = start_active(
+        manager, program, 1, make_base(1, FakeCacheSessionKey{1}, RetentionClass::LiveSession), 1);
+    program.abort_salvage_next = true;
+    (void)manager.abort(program, salvaged.lane, salvaged.sequence);
+    const ActiveRequest recent = start_active(
+        manager, program, 2, make_base(2, std::nullopt, RetentionClass::RecentPrivate), 2);
+    (void)finish_active(manager, program, recent);
+
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base(3), 3);
+    require(inspection.choice.has_value(),
+            "salvage retention pressure did not find a feasible prefix");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{3}, {});
+    require(program.started_action_ids.size() == 1 &&
+                program.started_action_ids.front() == 1000U + salvaged.sequence.id,
+            "salvage did not earn Disposable retention below LiveSession");
+}
+
 void test_terminal_settlement_waits_for_open_resource_transaction() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3274,17 +3859,21 @@ void test_backfill_proof_and_stats_follow_program_revision() {
     require(!proof, "resource revision change did not invalidate persistent proof");
 
     program.usage = FakePhysicalUsage{
-        .device_state_slots      = 3,
-        .host_state_slots        = 2,
-        .device_main_kv_pages    = 11,
-        .device_backend_kv_pages = 5,
-        .host_kv_bytes           = 4096,
+        .device_state_slots            = 3,
+        .host_state_slots              = 2,
+        .device_main_kv_pages          = 11,
+        .device_backend_kv_pages       = 5,
+        .device_main_kv_lease_pages    = 4,
+        .device_backend_kv_lease_pages = 2,
+        .host_kv_bytes                 = 4096,
     };
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
     require(stats.device_state_occupied_slots == 3 && stats.host_state_occupied_slots == 2 &&
                 stats.device_main_kv_occupied_pages == 11 &&
-                stats.device_backend_kv_occupied_pages == 5 && stats.host_kv_occupied_bytes == 4096,
+                stats.device_backend_kv_occupied_pages == 5 &&
+                stats.device_main_kv_lease_pages == 4 &&
+                stats.device_backend_kv_lease_pages == 2 && stats.host_kv_occupied_bytes == 4096,
             "runtime physical gauges did not come directly from Program");
 }
 
@@ -3451,6 +4040,289 @@ void test_publication_only_pressure_constructs_adoptable_target() {
             "publication-only closure did not release exactly one private slot");
 }
 
+// Drives one full request lifecycle that publishes a shared prefix for `digest` at frontier 64
+// and finishes it, leaving the shared prefix catalogued. No private continuation is published
+// (publish_continuation cleared) so reuse can only come from the shared catalog.
+void publish_shared_prefix(FakeManager& manager, FakeProgram& program, std::uint32_t digest,
+                           std::uint64_t publication_order, std::uint32_t offer_id,
+                           ninfer::SharedCandidateEvidence evidence,
+                           std::uint32_t frontier = 64) {
+    FakeRequestBasePlan base = make_base(digest);
+    base.value.publish_continuation = false;
+    base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = evidence,
+        .frontier = frontier,
+    });
+    const ActiveRequest active = start_active(manager, program, digest, base, publication_order);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = frontier},
+        .shared_evidence        = evidence,
+        .protected_rebuild_work = PrefillWork{.tokens = frontier},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    const auto reserved = manager.reserve_active_capture(program, active.lane,
+                                                         FakeCaptureOffer{.id = offer_id}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "shared capture was not reserved");
+    auto progress      = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published,
+            "shared capture was not published");
+    (void)finish_active(manager, program, active);
+}
+
+void require_shared_reuse(FakeManager& manager, FakeProgram& program, std::uint32_t digest,
+                          std::uint64_t publication_order, bool expected, const char* message) {
+    auto inspection = manager.inspect(program, FakePreparedPrompt{digest}, make_base(digest),
+                                      publication_order);
+    require(inspection.choice.has_value(), "reuse inspection produced no admission choice");
+    const bool reused = inspection.choice->summary().prefix_reuse_path ==
+                            ninfer::PrefixReusePath::SharedStablePrefix &&
+                        inspection.choice->summary().reusable_prompt_tokens == 64;
+    require(reused == expected, message);
+}
+
+void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
+    // Shared prefixes share the private owners' recency order and get a demote-to-host outcome,
+    // so a ladder rung sacrifices the oldest owners of either kind instead of destroying every
+    // shared prefix unconditionally, and spares any sacrificed owner the rung does not need. The
+    // shared prefix is published at the fake's finish frontier because the fake pressure
+    // assessment reports every owner's checkpoint at that frontier.
+    const auto run = [](bool shared_first) {
+        FakeManager manager = make_manager(1, 4, 1);
+        FakeProgram program;
+        std::uint64_t order = 1;
+        if (shared_first) {
+            publish_shared_prefix(manager, program, 71, order++, 1,
+                                  ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                                  program.finish_frontier);
+        }
+        const ActiveRequest a = start_active(manager, program, 161, make_base(161), order++);
+        (void)finish_active(manager, program, a);
+        const ActiveRequest b = start_active(manager, program, 162, make_base(162), order++);
+        (void)finish_active(manager, program, b);
+        if (!shared_first) {
+            publish_shared_prefix(manager, program, 71, order++, 1,
+                                  ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                                  program.finish_frontier);
+        }
+        const ActiveRequest c = start_active(manager, program, 163, make_base(163), order++);
+        (void)finish_active(manager, program, c);
+
+        program.ladder_feasibility_mode        = true;
+        program.min_feasible_sacrifice         = 1;
+        program.required_pressure_actions      = 16;  // above the search's max pressure
+        program.eviction_pressure_action_units = 1;
+        program.private_pressure_alternatives  = 1;
+        auto inspection = manager.inspect(program, FakePreparedPrompt{164}, make_base(164), order);
+        require(inspection.choice.has_value(), "escape-hatch recency ladder found no rung");
+        program.abort_start = true;
+        (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                              FakePreparedPrompt{164}, {});
+        const auto private_evicted = [&program](const ActiveRequest& request) {
+            return std::ranges::find(program.started_action_ids,
+                             2000U + request.sequence.id) != program.started_action_ids.end();
+        };
+        const bool shared_evicted =
+            std::ranges::any_of(program.started_action_ids,
+                        [](std::uint64_t id) { return id >= 4000U && id < 5000U; });
+        return std::array<bool, 4>{shared_evicted, private_evicted(a), private_evicted(b),
+                                   private_evicted(c)};
+    };
+    require(run(false) == std::array<bool, 4>{false, true, false, false},
+            "rung destroyed a recent shared prefix instead of the oldest private owner");
+    // With the shared prefix published first it is the oldest owner, but this admission's
+    // pressure is a private catalog slot: only a released private owner relieves it. The smallest
+    // adoptable rung gives up the shared prefix and the oldest private owner (the shared
+    // publisher's own continuation); sparing then keeps the shared prefix, whose eviction the rung
+    // does not need, so no shared prefix and none of a, b, c are evicted.
+    require(run(true) == std::array<bool, 4>{false, false, false, false},
+            "rung destroyed a shared prefix whose eviction the admission did not need");
+}
+
+void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+
+    // The catalog (2 slots) is now full of automatic-evidence prefixes. A third distinct
+    // conversation must reclaim the oldest publication instead of losing its shared prefix
+    // forever; before the fix its capture was silently dropped and the catalog stayed frozen.
+    publish_shared_prefix(manager, program, 73, 3, 3,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    require(program.released_shared_prefix_keys == std::vector<std::uint32_t>{71},
+            "saturated catalog did not reclaim the oldest automatic shared prefix");
+    require_shared_reuse(manager, program, 73, 4, true,
+                         "reclaimed conversation has no shared prefix reuse");
+    require_shared_reuse(manager, program, 71, 5, false,
+                         "reclaimed shared prefix was still offered for reuse");
+
+    // The catalog must keep rotating for every new conversation, not freeze again after one
+    // reclaim.
+    publish_shared_prefix(manager, program, 74, 6, 4,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    require(program.released_shared_prefix_keys == std::vector<std::uint32_t>{71, 72},
+            "second saturated conversation did not reclaim the next-oldest prefix");
+    require_shared_reuse(manager, program, 72, 7, false,
+                         "second reclaimed prefix was still offered for reuse");
+}
+
+void test_explicit_credit_shared_entry_survives_automatic_reclaim() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::ExplicitBoundary);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+
+    // The explicit-credit entry (71) holds client-declared intent and must not be reclaimed by
+    // ordinary automatic traffic; the automatic entry (72) is the LRU victim instead.
+    publish_shared_prefix(manager, program, 73, 3, 3,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    require(program.released_shared_prefix_keys == std::vector<std::uint32_t>{72},
+            "automatic reclaim evicted an explicit-credit shared prefix");
+    require_shared_reuse(manager, program, 71, 4, true,
+                         "explicit-credit shared prefix lost reuse after reclaim");
+}
+
+void test_shared_capture_seal_failure_skips_instead_of_throwing() {
+    // A shared capture is optional. When the seal window cannot be claimed, or the seal's
+    // revalidation fails anyway, the scenario must not plan: the capture falls back to its private
+    // baseline or is skipped, and nothing is published -- it must not throw out of the worker.
+    const auto run = [](bool deny_window) {
+        FakeManager manager = make_manager(1, 4, 2);
+        FakeProgram program;
+        FakeRequestBasePlan base        = make_base(81);
+        base.value.publish_continuation = false;
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, 81, base, 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 81, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        program.deny_seal_window  = deny_window;
+        program.fail_capture_seal = !deny_window;
+        const std::uint64_t claims_before = program.seal_window_claims;
+        const auto reserved = manager.reserve_active_capture(program, active.lane,
+                                                             FakeCaptureOffer{.id = 1}, 0, {});
+        require(program.seal_window_claims > claims_before,
+                "shared capture sealed without claiming the seal window");
+        program.deny_seal_window  = false;
+        program.fail_capture_seal = false;
+        if (reserved == FakeManager::ActiveCaptureReserveResult::Reserved) {
+            auto progress      = manager.progress_context_transaction(program, {});
+            const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+            require(outcome.status == ContextTransactionStatus::Published,
+                    "private baseline capture was not published");
+        }
+        (void)finish_active(manager, program, active);
+        require_shared_reuse(manager, program, 81, 2, false,
+                             "unsealed shared capture was published");
+    };
+    run(true);
+    run(false);
+}
+
+void test_full_anchor_set_replaces_the_least_coverage_anchor() {
+    // Anchors at 1000, 5000, 5200 and 9000 with a new capture at 12000. Dropping 5200 costs
+    // (5200 - 5000) * (9000 - 5200); every other anchor covers more. The old rule always gave up
+    // the deepest anchor (1000), letting the set drift towards the endpoint.
+    FakeManager manager = make_manager(1, 4, 0);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 91, make_base(91), 1);
+    const auto anchor = [](std::uint32_t frontier, std::uint32_t ordinal) {
+        return CheckpointRef{
+            .kind = CheckpointKind::LongAnchor, .frontier = frontier, .ordinal = ordinal};
+    };
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 91, .frontier = 12000},
+        .protected_rebuild_work = PrefillWork{.tokens = 12000},
+        .private_replacement_candidates = {anchor(1000, 1), anchor(5000, 2), anchor(5200, 3),
+                                           anchor(9000, 4)},
+        .publishes_private   = true,
+        .physically_feasible = true,
+    };
+    (void)manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 1}, 0, {});
+    require(program.last_capture_private_replacement == anchor(5200, 3),
+            "full anchor set did not give up the anchor whose loss costs the least coverage");
+}
+
+void test_automatic_reclaim_picks_the_least_recently_used_entry() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    // A later conversation reuses 71, so 72 is now the least recently used entry even though
+    // 71 was published first.
+    const ActiveRequest reuse = start_active(manager, program, 71, make_base(71), 3);
+    (void)finish_active(manager, program, reuse);
+
+    publish_shared_prefix(manager, program, 73, 4, 3,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    require(program.released_shared_prefix_keys == std::vector<std::uint32_t>{72},
+            "automatic reclaim chose by publication order instead of by use");
+}
+
+void test_automatic_reclaim_waits_for_a_planned_capture() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+
+    publish_shared_prefix(manager, program, 71, 1, 1,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    publish_shared_prefix(manager, program, 72, 2, 2,
+                          ninfer::SharedCandidateEvidence::DefaultAutomatic);
+
+    // A third conversation's capture cannot fit, so no scenario plans. The saturated catalog
+    // must not give up an entry for a publication that never happens.
+    FakeRequestBasePlan base        = make_base(73);
+    base.value.publish_continuation = false;
+    base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+        .frontier = 64,
+    });
+    const ActiveRequest active = start_active(manager, program, 73, base, 3);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 73, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
+    };
+    program.required_pressure_actions = 1;  // the capture only fits with pressure it cannot get
+    const auto reserved = manager.reserve_active_capture(program, active.lane,
+                                                         FakeCaptureOffer{.id = 3}, 0, {});
+    program.required_pressure_actions = 0;
+    if (reserved == FakeManager::ActiveCaptureReserveResult::Reserved) {
+        // Only the private baseline can proceed; the shared publication did not plan.
+        auto progress      = manager.progress_context_transaction(program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published,
+                "private baseline capture was not published");
+    }
+    require(program.released_shared_prefix_keys.empty(),
+            "automatic reclaim released a prefix for a capture that did not plan");
+    (void)finish_active(manager, program, active);
+    require_shared_reuse(manager, program, 71, 4, true,
+                         "shared prefix was lost to a capture that never published");
+}
 
 } // namespace
 
@@ -3509,6 +4381,10 @@ int main() {
              test_observed_shared_candidate_requires_independent_domains);
     run_test("zero-prefill private promotion",
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
+    run_test("automatic shared capture LRU reclaim",
+             test_automatic_shared_capture_reclaims_oldest_catalog_entry);
+    run_test("explicit credit survives automatic reclaim",
+             test_explicit_credit_shared_entry_survives_automatic_reclaim);
     run_test("shared fanout owner edges",
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture multi-owner pressure",
@@ -3519,12 +4395,38 @@ int main() {
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
+    run_test("abort salvage publishes reusable endpoint",
+             test_abort_salvage_publishes_reusable_endpoint);
+    run_test("terminal fallback salvage", test_terminal_fallback_salvage_catalogues);
+    run_test("abort salvage earns disposable retention",
+             test_abort_salvage_earns_disposable_retention_under_pressure);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("private owner recency ranking", test_rank_private_owners_by_recency_ranks_every_private_owner);
+    run_test("publication counts as recency for the ladder",
+             test_publication_counts_as_recency_for_the_ladder);
+    run_test("incremental eviction is LRU-licensed",
+             test_incremental_eviction_is_licensed_by_the_lru_tail);
+    run_test("escape hatch sacrifices oldest first and demotes the rest",
+             test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
+    run_test("escape hatch ranks shared prefixes with private owners",
+             test_escape_hatch_ranks_shared_prefixes_with_private_owners);
+    run_test("shared capture seal failure skips instead of throwing",
+             test_shared_capture_seal_failure_skips_instead_of_throwing);
+    run_test("full anchor set replaces the least-coverage anchor",
+             test_full_anchor_set_replaces_the_least_coverage_anchor);
+    run_test("automatic reclaim picks the least recently used entry",
+             test_automatic_reclaim_picks_the_least_recently_used_entry);
+    run_test("automatic reclaim waits for a planned capture",
+             test_automatic_reclaim_waits_for_a_planned_capture);
+    run_test("escape hatch clears all when nothing fits",
+             test_escape_hatch_clears_all_when_nothing_fits);
+    run_test("escape hatch ladder fits the committed target budget",
+             test_preserved_prefix_ladder_targets_fit_the_committed_target_budget);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

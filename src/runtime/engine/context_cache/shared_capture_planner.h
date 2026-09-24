@@ -5,6 +5,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/resource_search.h"
+#include "runtime/engine/context_cache/seal_window_claim.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -33,6 +34,7 @@ public:
 
     struct OwnerPolicy {
         PlanningOwnerId owner;
+        std::uint64_t last_hit_epoch           = 0;
         std::uint32_t private_retention_weight = 0;
         bool explicit_shared_credit            = false;
     };
@@ -43,6 +45,9 @@ public:
         std::uint32_t demand_mask          = 0;
         std::uint64_t rebuild_ns           = 0;
         std::uint64_t baseline_recovery_ns = 0;
+        // The incoming request cannot reach this checkpoint's frontier, so it is not a hit the
+        // owner can be credited with retaining.
+        bool unreachable = false;
     };
 
     struct Input {
@@ -53,6 +58,9 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const OwnerPolicy> owner_policies;
         std::span<const CheckpointPolicy> checkpoint_policies;
+        // Private and shared owners ranked by recency (latest hit or publication), most recent
+        // first.
+        std::span<const PlanningOwnerId> recency_owner_ids;
         std::optional<PlanningOwnerId> direct_shared_victim;
         std::uint32_t candidate_demand_mask         = 0;
         std::uint64_t candidate_rebuild_ns          = 0;
@@ -90,7 +98,7 @@ public:
 
         auto session = program.begin_capture_pressure_planning(
             *input.capture, input.private_owners, input.private_owner_ids, input.shared_owners,
-            input.shared_owner_ids);
+            input.shared_owner_ids, input.recency_owner_ids);
         const PlanningCandidateId candidate_id = session.candidate_id();
 
         const PressureTargetHandle identity         = session.identity_target();
@@ -157,9 +165,16 @@ public:
             if (!assessment.expandable || target_marked(queued.ordinal, kTargetExpanded)) {
                 continue;
             }
-            auto prepared                 = session.prepare_expansion(queued.target);
             const std::uint32_t remaining = input.target_budget - canonical_targets;
-            if (prepared.new_canonical_count() > remaining) {
+            if (remaining == 0) { continue; }
+            // The session arena also holds targets this scenario does not budget (identity
+            // target, maximal fallback), so bound the commit by the arena's true remaining
+            // capacity; commit_expansion rejects a commit that overflows it.
+            const std::uint32_t commit_capacity =
+                std::min(remaining, session.optional_targets_remaining());
+            if (commit_capacity == 0) { continue; }
+            auto prepared = session.prepare_expansion(queued.target);
+            if (prepared.new_canonical_count() > commit_capacity) {
                 session.discard_expansion(std::move(prepared));
                 continue;
             }
@@ -181,10 +196,17 @@ public:
         }
 
         if (!incumbent) { return std::nullopt; }
-        std::optional<CapturePressurePlan> pressure = session.seal(std::move(*incumbent->assessed));
-        if (!pressure) {
-            throw std::logic_error("selected shared capture target could not be sealed");
+        // Seal under the same window claim materialization uses, so a concurrent demote cannot
+        // invalidate the selected target between its assessment and the seal. A capture is
+        // optional: if the window cannot be claimed or the seal's revalidation fails anyway, this
+        // scenario simply does not plan and the caller falls back to its private baseline or
+        // skips the capture, instead of throwing out of the worker loop.
+        std::optional<CapturePressurePlan> pressure;
+        {
+            SealWindowClaim<decltype(session)> seal_claim(session);
+            if (seal_claim.claimed()) { pressure = session.seal(std::move(*incumbent->assessed)); }
         }
+        if (!pressure) { return std::nullopt; }
         return Result{
             .pressure                = std::move(*pressure),
             .owner_outcomes          = std::move(incumbent->owner_outcomes),
@@ -340,6 +362,7 @@ private:
                 .rebuild_ns           = policy.rebuild_ns,
                 .baseline_recovery_ns = policy.baseline_recovery_ns,
                 .target_recovery_ns   = target_recovery,
+                .unreachable          = policy.unreachable,
             });
         }
         checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{

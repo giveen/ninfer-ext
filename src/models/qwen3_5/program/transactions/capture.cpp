@@ -354,8 +354,14 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
+    if (has_context_transaction() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
+    }
+    // Prefill lanes advance concurrently, so another lane may hold a StateImage fork that is not
+    // yet settled. A capture is optional: this lane forgoes it rather than fail the Engine.
+    if (has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));

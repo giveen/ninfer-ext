@@ -2319,6 +2319,16 @@ bool ProgramImpl::compose_pressure_candidate(
     return true;
 }
 
+bool ProgramImpl::try_claim_seal_window() noexcept {
+    bool expected = false;
+    return seal_window_claimed_.compare_exchange_strong(expected, true,
+                                                         std::memory_order_acquire);
+}
+
+void ProgramImpl::release_seal_window() noexcept {
+    seal_window_claimed_.store(false, std::memory_order_release);
+}
+
 runtime::PreflightStatus
 ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
                                         const PreparedPromptData& prompt) const {
@@ -2622,13 +2632,20 @@ bool ProgramImpl::persistent_backfill_safe(
 
 qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
+    // `physical_occupancy` reports the sum it needs for feasibility.  The growth reservation is
+    // broken out separately here so diagnostics can attribute Device KV held against the cache.
+    const auto lease = [](const std::unique_ptr<LogicalKVPageStore>& store) noexcept {
+        return store == nullptr ? 0U : store->physical_pool().reserved_pages();
+    };
     return qwen3_5::PhysicalUsageSnapshot{
-        .resource_revision       = resource_revision_,
-        .device_state_slots      = usage.device.state_slots,
-        .host_state_slots        = usage.host.state_slots,
-        .device_main_kv_pages    = usage.device.main_kv_pages,
-        .device_backend_kv_pages = usage.device.backend_kv_pages,
-        .host_kv_bytes           = usage.host.kv_bytes,
+        .resource_revision           = resource_revision_,
+        .device_state_slots          = usage.device.state_slots,
+        .host_state_slots            = usage.host.state_slots,
+        .device_main_kv_pages        = usage.device.main_kv_pages,
+        .device_backend_kv_pages     = usage.device.backend_kv_pages,
+        .device_main_kv_lease_pages  = lease(text_kv_pages),
+        .device_backend_kv_lease_pages = lease(backend_kv_pages),
+        .host_kv_bytes               = usage.host.kv_bytes,
     };
 }
 
