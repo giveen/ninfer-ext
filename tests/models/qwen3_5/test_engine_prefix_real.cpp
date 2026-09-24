@@ -483,6 +483,7 @@ int exercise_host_restore(const char* artifact) {
         ninfer::PromptInput input;
         input.messages.push_back(std::move(message));
         input.options.enable_thinking   = false;
+        input.options.preserve_thinking = false;
         input.context_cache.session_key = "host-restore-real";
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         return input;
