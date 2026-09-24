@@ -93,6 +93,45 @@ The benchmark disables context retention because every repetition is an independ
 Schema v15 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 
+### Inference speed-of-light estimate
+
+`tools.bench.speed_of_light` adds a theoretical reference to a completed, non-speculative
+`ninfer_bench` JSON run. It was inspired by [llm.q's speed-of-light accounting](https://github.com/IST-DASLab/llmq/blob/main/src/utilities/sol.cpp),
+which describes the idealized limit as the “fastest possible speed if the GPU was only running
+strictly necessary matmuls at peak flop/s” in its [README](https://github.com/IST-DASLab/llmq#how-to-train-your-quantized-llm).
+NInfer uses separate compute and weight-stream fractions because prompt and decode phases have
+different likely limits. The analyzer reads only the v3 artifact directory and the public Engine
+benchmark report; it does not load weights or run a second inference path.
+
+```bash
+./build/bench/ninfer_bench --weights out/qwen3_6_27b.ninfer \
+  -pg '2048,128' --warmup 1 -r 5 -o json \
+  --output-file profiles/bench/sol_input.json
+python3 -m tools.bench.speed_of_light \
+  --report profiles/bench/sol_input.json \
+  --artifact out/qwen3_6_27b.ninfer \
+  --peak-tflops 1676 --hbm-gbps 1792
+```
+
+The peak values above illustrate a nominal RTX 5090 FP4 compute ceiling and memory bandwidth;
+replace them with the ceilings being claimed for the measured device, and record their provenance
+with the report. `--json` emits all inputs, counts, times, and fractions for further analysis.
+The tool requires schema v15 and `--spec none`. It rejects speculative runs because proposals,
+verification, and acceptance make output tokens an invalid proxy for executed model work.
+
+Projection compute work is counted as `2 * matrix elements` for each executed text projection.
+Prefill counts the output head once at the prompt frontier; decode counts it once per output token.
+For MoE it counts the configured number of selected experts. The compute roof fraction is this
+projection-only ideal time divided by the measured Engine phase time. It omits attention/GDN
+arithmetic, quantization, launch, and data movement, so it is an optimistic partial floor, not a
+GPU-utilization percentage. The optional decode weight fraction estimates encoded projection bytes
+from artifact bindings and counts the smallest selectable MoE experts. The separate KV fraction
+uses the reported KV payload per capacity token and the sum of decode attention positions. Each
+divides estimated bytes by the supplied bandwidth and measured decode time. They assume one read
+from GPU memory per needed weight or KV element; cache residency, repeated reads, and reuse can
+change actual HBM traffic. Compare like workloads and inspect component timings before interpreting
+a fraction as a bottleneck.
+
 ## Context-cost calibration
 
 `ninfer_context_cost_bench` measures the static coefficients used to compare context-cache
