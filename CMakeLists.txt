@@ -19,10 +19,14 @@ option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator"
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# CMake (through 4.3) has no CUDA23 dialect for nvcc. Request CUDA20 so CMake
+# accepts the targets, blank its -std=c++20 and pass -std=c++23 directly.
 set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "")
+set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "")
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++23>)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
