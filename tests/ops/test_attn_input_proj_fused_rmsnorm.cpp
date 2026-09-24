@@ -151,7 +151,7 @@ int run_case(const Weight& weight, int tokens, bool measure) {
                 const auto stop = std::chrono::steady_clock::now();
                 samples.push_back(std::chrono::duration<double, std::micro>(stop - start).count());
             }
-            std::sort(samples.begin(), samples.end());
+            std::ranges::sort(samples);
             return samples[samples.size() / 2];
         };
         const double reference_us = median_wall_us(reference_stage);

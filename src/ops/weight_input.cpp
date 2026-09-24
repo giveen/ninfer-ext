@@ -261,9 +261,9 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
         // The prefill route of this profile quantises the hidden state to four bits, which is what
         // AllowA4 grants. The groupwise profiles consume it represented and need no permission.
         const auto permits = [](const WeightInput& input) { return allows_a4(input.policy); };
-        require(std::all_of(expert_gate_up.begin(), expert_gate_up.end(), permits) &&
-                    std::all_of(expert_down.begin(), expert_down.end(), permits) &&
-                    permits(shared_gate) && permits(shared_up) && permits(shared_down),
+        require(std::ranges::all_of(expert_gate_up, permits) &&
+                    std::ranges::all_of(expert_down, permits) && permits(shared_gate) &&
+                    permits(shared_up) && permits(shared_down),
                 "SparseMoe NVFP4 requires AllowA4 on every expert input");
     }
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
