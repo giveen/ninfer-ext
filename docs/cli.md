@@ -208,6 +208,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only) | `auto` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -267,6 +268,14 @@ and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
 unallocated. It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+
+Qwen4Exp artifacts (Qwen3.8-Flash-Next) keep routed experts in pinned Host memory and the n-gram
+table file-mapped, so the host needs roughly 128 GB of RAM. `--expert-cache` sizes the device
+cache that routed experts are fetched into. `auto` first reserves the KV floor (the explicit
+`--kv-capacity`, or one `--max-context` when the capacity is `auto`), then gives the rest of the
+free device memory, less 1 GiB of headroom, to the cache, up to every expert. An explicit MiB
+value must hold one verify round (10 experts per decoded column). Qwen4Exp supports the `bf16`
+and `fp8` KV types and `--spec mtp`.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

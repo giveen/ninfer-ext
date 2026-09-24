@@ -50,7 +50,13 @@ inactive cache 的保留而丢失完成能力。
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。当前标准架构入口是 `Qwen3_5ForCausalLM` 与
-`Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
+`Qwen3_5MoeForCausalLM` 与 `Qwen4ExpForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
+
+`Qwen4ExpForCausalLM` 的 routed experts 由 loader 以 `HostPinned` 驻留（pinned Host，经 UVA
+可被设备直接读取），n-gram 表以 `HostFile` 映射。Model 只持有这些不可变数据；device expert
+cache（slot pool、LRU 状态、prefill layer bank）、PLE 卷积历史与每轮 host gather 的 PLE 输入
+都属于 Program。cache 命中与否不改变数值结果：routed 项按 k 顺序合并，与 slot 位置无关。
+`--expert-cache` 在启动时先规划 KV floor，再把剩余设备内存分给 cache。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定

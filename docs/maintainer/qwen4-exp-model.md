@@ -6,7 +6,9 @@ architecture of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Fl
 hyper-connection residual streams, Qwen Sparse Attention (QSA) and the n-gram PLE embedding
 change the block and state mathematics.
 
-**Status:** NInfer does not execute this architecture yet. The FP64 oracle in
+**Status:** NInfer executes this architecture through `execution/qwen4_text.cpp` with routed
+experts in pinned Host memory behind a Program-owned device expert cache and a file-mapped n-gram
+table gathered on the Host. The FP64 oracle in
 [`tests/models/qwen4_exp/reference.py`](../../tests/models/qwen4_exp/reference.py) implements
 this reference. Its tests in
 [`test_reference.py`](../../tests/models/qwen4_exp/test_reference.py) check it against:

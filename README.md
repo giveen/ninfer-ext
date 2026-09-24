@@ -356,12 +356,16 @@ image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion wei
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
 and either full or optimized proposal heads.
 
+Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, converted with `qwen3_8_flash_next_nvfp4`) runs Text,
+MTP, and Vision with its routed experts in pinned Host memory behind a device expert cache sized
+by `--expert-cache`; it needs about 128 GB of host RAM and supports `bf16`/`fp8` KV.
+
 The product boundary remains intentionally small:
 
 - one RTX 5090 and one resident model per Engine;
 - a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
-  distributed serving;
+- no request preemption, priority/QoS, active-request swapping, multi-GPU, or distributed
+  serving; only Qwen4Exp routed experts and its n-gram table live outside device memory;
 - one shared startup-fixed KV pool across active requests and retained prefixes;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;

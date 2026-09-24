@@ -59,10 +59,28 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_flash_next_nvfp4` | Imported NVFP4 routed experts (MTP bank re-encoded from block FP8), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | None; `--model` is the ModelOpt NVFP4 checkpoint |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
+
+`qwen3_8_flash_next_nvfp4` converts Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) directly from
+[nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4). Each
+layer's routed experts are stored expert-major so that one expert is a few contiguous spans, and
+the 128 n-gram table shards become one row-scaled FP8 matrix. The Engine keeps both off the device:
+experts are read into pinned Host memory and the table is file-mapped (see
+[Qwen4Exp model reference](maintainer/qwen4-exp-model.md)).
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --recipe qwen3_8_flash_next_nvfp4 \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --name qwen3.8-flash-next \
+  --out models/qwen3_8_flash_next_nvfp4.ninfer
+```
 
 `qwen3_8_27b_q6` differs from `qwen3_8_27b` in one place: the MLP gate and up projections carry Q6
 instead of Q4. Those two parameters are 43% of the text weights, and at 4.25 bits per weight Q4

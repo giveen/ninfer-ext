@@ -831,6 +831,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only); `auto` takes the memory left after the KV floor | `auto` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -1026,6 +1027,19 @@ network serialization run outside the GPU executor and do not delay formation of
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
+
+Qwen4Exp (Qwen3.8-Flash-Next) routed experts stay in pinned Host memory. Each MoE layer resolves
+its selected experts against a least-recently-used device cache inside the decode Graph and copies
+misses over PCIe; long prefill chunks stream whole layers instead. `--expert-cache` sizes that
+cache after the KV floor is planned, and `server_start.engine` records `expert_cache_slots` and
+`expert_cache_bytes`. Two concurrent 229,376-token requests with FP8 KV:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_flash_next_nvfp4.ninfer \
+  --model-id qwen3.8-flash-next --max-concurrency 2 \
+  --max-context 229376 --kv-capacity 458752 --kv-dtype fp8 \
+  --expert-cache auto --spec mtp
+```
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.
