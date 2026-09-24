@@ -29,6 +29,12 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
+// RequestJson keeps insertion order and compares order-sensitively, while responses are built as
+// sorted objects; compare structure, not key order.
+bool same_json(const Json& lhs, const Json& rhs) {
+    return nlohmann::json(lhs) == nlohmann::json(rhs);
+}
+
 RequestLimits limits() {
     RequestLimits value;
     value.default_max_tokens = 256;
@@ -930,12 +936,11 @@ int test_response_object() {
     failures += check(response.at("object") == "response" && response.at("status") == "completed" &&
                           response.at("completed_at").is_number_integer(),
                       "completed response has a completion timestamp");
-    failures +=
-        check(response.at("reasoning").at("summary") == "concise" &&
-                  response.at("output")[0].at("summary") == summary &&
-                  response.at("output")[0].at("content")[0].at("text") == "thought" &&
-                  response.at("output")[0].at("encrypted_content") == "thought",
-              "reasoning placeholders preserve raw reasoning in both replays");
+    failures += check(response.at("reasoning").at("summary") == "concise" &&
+                          same_json(response.at("output")[0].at("summary"), summary) &&
+                          response.at("output")[0].at("content")[0].at("text") == "thought" &&
+                          response.at("output")[0].at("encrypted_content") == "thought",
+                      "reasoning placeholders preserve raw reasoning in both replays");
     failures += check(response.at("max_output_tokens").is_null(),
                       "omitted output budget remains null in the response");
     failures += check(response.at("output").size() == 2 &&
@@ -1036,14 +1041,14 @@ int test_sse_sequence_and_failures() {
         if (type == "response.output_item.added" && payload.at("item").at("type") == "reasoning") {
             reasoning_id = payload.at("item").at("id").get<std::string>();
             failures += check(payload.at("output_index") == 0 &&
-                                  payload.at("item").at("summary") == summary &&
+                                  same_json(payload.at("item").at("summary"), summary) &&
                                   !payload.at("item").contains("encrypted_content"),
                               "reasoning output_item.added defers raw encrypted content");
         } else if (type == "response.output_item.done" &&
                    payload.at("item").at("type") == "reasoning") {
             failures += check(payload.at("output_index") == 0 &&
                                   payload.at("item").at("id") == reasoning_id &&
-                                  payload.at("item").at("summary") == summary &&
+                                  same_json(payload.at("item").at("summary"), summary) &&
                                   payload.at("item").at("encrypted_content") == "thought",
                               "reasoning output_item.done carries the complete raw mirror");
         } else if (type.starts_with("response.reasoning_summary_")) {
@@ -1052,16 +1057,16 @@ int test_sse_sequence_and_failures() {
                           payload.at("summary_index") == 0,
                       "reasoning summary events retain stable Item indices");
             if (type == "response.reasoning_summary_part.added") {
-                failures +=
-                    check(payload.at("part") == Json{{"type", "summary_text"}, {"text", ""}},
-                          "reasoning summary part starts empty");
+                failures += check(
+                    same_json(payload.at("part"), Json{{"type", "summary_text"}, {"text", ""}}),
+                    "reasoning summary part starts empty");
             } else if (type == "response.reasoning_summary_text.delta") {
                 summary_deltas += payload.at("delta").get<std::string>();
             } else if (type == "response.reasoning_summary_text.done") {
                 failures += check(payload.at("text") == kReasoningSummaryPlaceholder,
                                   "reasoning summary text done carries the placeholder");
             } else if (type == "response.reasoning_summary_part.done") {
-                failures += check(payload.at("part") == summary.at(0),
+                failures += check(same_json(payload.at("part"), summary.at(0)),
                                   "reasoning summary part done carries the placeholder");
             }
         }
@@ -1096,11 +1101,10 @@ int test_sse_sequence_and_failures() {
         parse_event(wire.front()).at("type") == "response.created" &&
             parse_event(wire.back()).at("type") == "response.completed" &&
             parse_event(wire.back()).at("response").at("reasoning").at("summary") == "detailed" &&
-            parse_event(wire.back()).at("response").at("output")[0].at("summary") == summary &&
-            parse_event(wire.back())
-                    .at("response")
-                    .at("output")[0]
-                    .at("encrypted_content") == "thought" &&
+            same_json(parse_event(wire.back()).at("response").at("output")[0].at("summary"),
+                      summary) &&
+            parse_event(wire.back()).at("response").at("output")[0].at("encrypted_content") ==
+                "thought" &&
             text_deltas == "answer",
         "SSE starts, reconstructs output, and terminates canonically");
 
