@@ -6,6 +6,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
@@ -111,6 +112,10 @@ struct SparseMoePlanes {
     const std::uint8_t* __restrict__ codes  = nullptr;
     const std::uint8_t* __restrict__ high   = nullptr;
     const std::uint8_t* __restrict__ scales = nullptr;
+    // One divisor per source matrix the plane was assembled from, each covering `divisor_rows`
+    // consecutive rows. Only NVFP4 has them.
+    const float* __restrict__ divisors = nullptr;
+    int divisor_rows                   = 1;
 };
 
 // Codecs come in two lane ownerships. Under `kPackedWord8` a lane owns eight consecutive K values
@@ -125,9 +130,13 @@ struct Q4Codec {
     static constexpr bool kPackedWord8        = true;
     static constexpr bool kSingleValuePerLane = false;
 
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes&, int) {
+        return 1.0F;
+    }
+
     template <int K>
     __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
-                                                      int group, int lane_in_group,
+                                                      int group, int lane_in_group, float,
                                                       float (&weights)[8]) {
         const std::int64_t index   = static_cast<std::int64_t>(row) * (K / kGroupK) + group;
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
@@ -143,9 +152,13 @@ struct Q5Codec {
     static constexpr bool kPackedWord8        = true;
     static constexpr bool kSingleValuePerLane = false;
 
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes&, int) {
+        return 1.0F;
+    }
+
     template <int K>
     __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
-                                                      int group, int lane_in_group,
+                                                      int group, int lane_in_group, float,
                                                       float (&weights)[8]) {
         const std::int64_t index   = static_cast<std::int64_t>(row) * (K / kGroupK) + group;
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
@@ -163,9 +176,13 @@ struct Q6Codec {
     static constexpr bool kPackedWord8        = true;
     static constexpr bool kSingleValuePerLane = false;
 
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes&, int) {
+        return 1.0F;
+    }
+
     template <int K>
     __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
-                                                      int group, int lane_in_group,
+                                                      int group, int lane_in_group, float,
                                                       float (&weights)[8]) {
         const std::int64_t index   = static_cast<std::int64_t>(row) * (K / kGroupK) + group;
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
@@ -182,6 +199,10 @@ struct Q8Codec {
     static constexpr int kGroupK              = 32;
     static constexpr bool kPackedWord8        = false;
     static constexpr bool kSingleValuePerLane = true;
+
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes&, int) {
+        return 1.0F;
+    }
 
     template <int K>
     __device__ static __forceinline__ float load_one(const SparseMoePlanes& planes, int row,
@@ -203,6 +224,42 @@ struct Q8Codec {
     }
 };
 
+// NVFP4 packs two e2m1 codes per byte and one e4m3 scale per sixteen values, so a lane's eight
+// values are four code bytes and exactly one scale: whichever half of a block the lane owns, its
+// eight values lie inside that one block. Only the scale plane is swizzled; the codes are plain
+// row-major. The per-tensor divisor is folded into the decoded block scale, once per eight values
+// rather than once per value.
+struct Nvfp4Codec {
+    static constexpr int kGroupK              = 64;
+    static constexpr bool kPackedWord8        = true;
+    static constexpr bool kSingleValuePerLane = false;
+
+    // Which stored divisor this row was quantised against. Taken once per row, not per group.
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes& planes,
+                                                            int row) {
+        return __frcp_rn(planes.divisors[row / planes.divisor_rows]);
+    }
+
+    template <int K>
+    __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
+                                                      int group, int lane_in_group, float row_scale,
+                                                      float (&weights)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            planes.codes + static_cast<std::int64_t>(row) * (K / 2) + group * 32 +
+            lane_in_group * 4);
+        const std::uint8_t scale =
+            planes.scales[nvfp4_scale_byte<K / 64>(row, group * 4 + (lane_in_group >> 1))];
+        const float coefficient = decode_nvfp4_e4m3(scale) * row_scale;
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 code =
+                decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(packed >> (8 * pair)));
+            weights[pair * 2]     = code.x * coefficient;
+            weights[pair * 2 + 1] = code.y * coefficient;
+        }
+    }
+};
+
 // A codec declares exactly one lane ownership. The trap below catches a codec that declares
 // neither, which would otherwise compile and reduce a zero accumulator.
 template <class>
@@ -220,12 +277,14 @@ __device__ __forceinline__ void dot_two_rows(const SparseMoePlanes& planes, int 
     if constexpr (Codec::kPackedWord8) {
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
+        const float scale0      = Codec::row_coefficient(planes, row0);
+        const float scale1      = Codec::row_coefficient(planes, row1);
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group = group_base + lane_group;
             float weights0[8];
             float weights1[8];
-            Codec::template load_eight<K>(planes, row0, group, lane_in_group, weights0);
-            Codec::template load_eight<K>(planes, row1, group, lane_in_group, weights1);
+            Codec::template load_eight<K>(planes, row0, group, lane_in_group, scale0, weights0);
+            Codec::template load_eight<K>(planes, row1, group, lane_in_group, scale1, weights1);
             const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float2 x0       = bf16x2_bits_to_float2(input.x);
             const float2 x1       = bf16x2_bits_to_float2(input.y);
@@ -358,6 +417,11 @@ __device__ __forceinline__ void dot_fp32_rows(const SparseMoePlanes& planes, int
         // accumulation.
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
+        float row_scale[Rows];
+#pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            row_scale[row] = Codec::row_coefficient(planes, row_base + row);
+        }
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group = group_base + lane_group;
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
@@ -367,7 +431,7 @@ __device__ __forceinline__ void dot_fp32_rows(const SparseMoePlanes& planes, int
             for (int row = 0; row < Rows; ++row) {
                 float weights[8];
                 Codec::template load_eight<K>(planes, row_base + row, group, lane_in_group,
-                                              weights);
+                                              row_scale[row], weights);
 #pragma unroll
                 for (int item = 0; item < 8; ++item) {
                     acc[row] = fmaf(weights[item], values[item], acc[row]);
@@ -513,6 +577,14 @@ sparse_moe_d4_token_kernel(const int* __restrict__ token_ids, const float* __res
     }
 }
 
+// How many bytes of the shared-expert down codes the D1 prefetch may touch. A four-bit plane is
+// half the size of an eight-bit one, and walking the eight-bit length over it addresses memory the
+// artifact never allocated.
+unsigned long long shared_down_code_bytes(QType qtype) {
+    const unsigned long long elements = static_cast<unsigned long long>(kHidden) * kIntermediate;
+    return qtype == QType::NVFP4 ? elements / 2 : elements;
+}
+
 void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
@@ -520,14 +592,20 @@ void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
         static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
         static_cast<float*>(workspace.scratch.data),
         static_cast<const char*>(weights.shared_down.qdata),
-        static_cast<unsigned long long>(kHidden) * kIntermediate);
+        shared_down_code_bytes(weights.shared_down.qtype));
     CUDA_CHECK(cudaGetLastError());
 }
 
 SparseMoePlanes matrix_planes(const Weight& weight) {
+    // Only NVFP4 stores its block scale as a quotient of a divisor, and only it has a plane of
+    // them; for the row-split codecs the field is not part of the representation at all. The row
+    // stride is one here so that a row's divisor index is well formed whatever the codec, and the
+    // codecs without divisors never read it.
     return {static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.qhigh),
-            static_cast<const std::uint8_t*>(weight.scales)};
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<const float*>(weight.weight_divisors),
+            weight.weight_divisor_rows > 0 ? weight.weight_divisor_rows : 1};
 }
 
 template <class RoutedCodec, class SharedCodec>
@@ -557,16 +635,28 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     case QType::Q8_G32_FP16:
         launch_d3_dependent_codec<Q8Codec, Q8Codec>(x, weights, workspace, stream);
         return;
+    case QType::NVFP4:
+        launch_d3_dependent_codec<Nvfp4Codec, Nvfp4Codec>(x, weights, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
 }
 
+// Hidden rows one D4 block takes. NVFP4 interleaves rows inside a 512-byte scale tile so that rows
+// r and r+1 share one 32-byte sector: taking both halves the sectors the kernel reads from L2, 398k
+// to 326k, and the kernel from 10.2 us to 8.0. A third and fourth row start the next sector and buy
+// nothing. The row-split planes store a scale per row, so a second row only costs them grid.
+template <class Codec>
+inline constexpr int kDecodeDownRows = 1;
+template <>
+inline constexpr int kDecodeDownRows<Nvfp4Codec> = 2;
+
 template <class RoutedCodec, class SharedCodec>
 void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destination,
                                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                                const void* prefetch_data, std::size_t prefetch_bytes) {
-    constexpr int kRows = 1;
+    constexpr int kRows = kDecodeDownRows<RoutedCodec>;
     CUDA_CHECK(pdl::launch_dependent(
         {dim3(kHidden / kRows), dim3(9 * 32), 0, stream},
         sparse_moe_d4_nine_warp_kernel<RoutedCodec, SharedCodec, kRows>,
@@ -593,6 +683,10 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
     case QType::Q8_G32_FP16:
         launch_d4_dependent_codec<Q8Codec, Q8Codec>(weights, destination, workspace, stream,
                                                     prefetch_data, prefetch_bytes);
+        return;
+    case QType::NVFP4:
+        launch_d4_dependent_codec<Nvfp4Codec, Nvfp4Codec>(weights, destination, workspace, stream,
+                                                          prefetch_data, prefetch_bytes);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D4 codec");
@@ -704,6 +798,10 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
         launch_d3_small_t_codec<Q8Codec, Q8Codec, false>(x, weights, token_ids, token_activations,
                                                          tokens, schedule, stream, nullptr);
         return;
+    case QType::NVFP4:
+        launch_d3_small_t_codec<Nvfp4Codec, Nvfp4Codec, false>(
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+        return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D3 codec");
     }
@@ -739,6 +837,11 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
         return;
     case QType::Q8_G32_FP16:
         launch_d4_small_t_codec<Q8Codec, Q8Codec, false>(
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
+            schedule, stream, nullptr);
+        return;
+    case QType::NVFP4:
+        launch_d4_small_t_codec<Nvfp4Codec, Nvfp4Codec, false>(
             weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
             schedule, stream, nullptr);
         return;
