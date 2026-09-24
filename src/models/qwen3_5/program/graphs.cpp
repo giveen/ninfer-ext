@@ -357,10 +357,10 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
+    std::vector<std::uint32_t> mtp_ladder;
+    for (const MtpRung& rung : mtp_rungs) { mtp_ladder.push_back(rung.k); }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        std::vector<std::uint32_t> ladder;
-        for (const MtpRung& rung : mtp_rungs) { ladder.push_back(rung.k); }
-        const std::size_t batch_rung = mtp_batch_rung(ladder);
+        const std::size_t batch_rung = mtp_batch_rung(mtp_ladder);
         for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
             MtpRung& rung         = mtp_rungs[rung_index];
             const std::uint32_t k = rung.k;
@@ -518,9 +518,7 @@ void ProgramImpl::prepare_graphs() {
             for (std::size_t rung_index = 1; rung_index < seconds.size(); ++rung_index) {
                 seconds[rung_index] = std::max(seconds[rung_index], seconds[rung_index - 1]);
             }
-            std::vector<std::uint32_t> ladder;
-            for (const MtpRung& rung : mtp_rungs) { ladder.push_back(rung.k); }
-            mtp_policy     = MtpDraftPolicy(std::move(ladder), std::move(seconds));
+            mtp_policy     = MtpDraftPolicy(mtp_ladder, std::move(seconds));
             mtp_round_rung = mtp_policy.initial_rung();
         }
     }
