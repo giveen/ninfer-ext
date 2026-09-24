@@ -8,6 +8,7 @@
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/offload_moe.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -64,6 +66,22 @@ struct DFlashFeatureSink {
 };
 
 class VisionPrefillSession;
+class PleGather;
+
+// Program-owned mutable resources of the Qwen4Exp route. The expert cache and PLE state are
+// performance or recurrent side state; the Program allocates them once and binds them here.
+struct Qwen4Runtime {
+    ops::ExpertCacheState cache;
+    // Device buffer of one full routed-expert layer (512 experts, bank plane layout), or null.
+    std::byte* staged_bank = nullptr;
+    // Columns at or above which a call streams whole layer banks instead of using the cache.
+    std::int32_t staged_columns = std::numeric_limits<std::int32_t>::max();
+    Tensor ple_states; // BF16 [history * residual, StateImage slots]
+    Tensor ple_record; // BF16 [residual, record_width, rows] speculative conv inputs, or empty
+    Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch
+    const PleGather* ple_gather = nullptr;
+    std::uint16_t* ple_host     = nullptr; // pinned BF16 [ple_width, prefill_chunk]
+};
 
 class TextContext {
 public:
@@ -97,6 +115,12 @@ public:
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
+
+    void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
+
+    // Width of the continuation hidden this context reads and writes (the wide HC residual for
+    // Qwen4Exp, the normalized hidden otherwise).
+    [[nodiscard]] std::int32_t continuation_width() const noexcept { return continuation_width_; }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
@@ -208,6 +232,46 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+
+    // Qwen4Exp route (qwen4_text.cpp).
+    struct Qwen4Sequence {
+        const Tensor* cache_positions = nullptr; // I32 [W*B]
+        const Tensor* rope_positions  = nullptr; // I32 [W*B] or [W*B,3]
+        const Tensor* valid_columns   = nullptr; // I32 [B] or null
+        const Tensor* table_rows      = nullptr; // I32 [B]
+        std::int32_t width            = 0;
+        std::int32_t batch            = 0;
+        std::uint32_t max_visible     = 0;
+    };
+
+    [[nodiscard]] const Qwen4Runtime& qwen4_runtime() const;
+    [[nodiscard]] Qwen4Sequence qwen4_text_sequence(std::int32_t columns) const;
+    void qwen4_embed(const Tensor& ids, const Tensor* scatter_indices,
+                     const Tensor* scatter_embeddings, const Tensor* input_embeddings,
+                     Tensor& wide);
+    void qwen4_hc_mix(const HyperConnectionParameters& p, const Tensor& wide, Tensor& x,
+                      Tensor* inject);
+    void qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4Sequence& sequence,
+                   const PagedKVCache& cache, std::uint32_t layer, Tensor& y);
+    void qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gdn_index, Phase phase,
+                   Tensor& y);
+    void qwen4_ple(const PleParameters& p, const Tensor& embedding, Phase phase, Tensor& wide);
+    void qwen4_moe(const OffloadMoeParameters& p, const Tensor& x, std::int32_t cache_layer,
+                   Tensor& y);
+    void qwen4_block(const Qwen4BlockParameters& p, Tensor& wide, Phase phase,
+                     const Qwen4Sequence& sequence, const PagedKVCache& cache,
+                     std::uint32_t kv_layer, int gdn_index, std::int32_t cache_layer,
+                     const Tensor* ple_embedding);
+    void qwen4_layers(Tensor& wide, Phase phase, const Qwen4Sequence& sequence,
+                      const Tensor* ple_embedding);
+    void qwen4_logits(const HyperConnectionParameters& head, const Tensor& wide, Tensor& logits);
+    void qwen4_mtp_core(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                        const Qwen4Sequence& sequence, Tensor& mtp_hidden);
+    void qwen4_proposal(const Tensor& hidden, Tensor& logits, Tensor& tokens);
+    [[nodiscard]] PrefillChunkResult qwen4_prefill(std::span<const int> ids,
+                                                   const TextPrefill* text_prefill,
+                                                   const MultimodalPrefill* multimodal,
+                                                   bool finalize_at_end);
     DeviceContext& ctx_;
     const Parameters& parameters_;
     const TextConfig& config_;
@@ -248,6 +312,10 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    const Qwen4Parameters* qwen4_               = nullptr;
+    const Qwen4MtpParameters* qwen4_mtp_        = nullptr;
+    const Qwen4Runtime* qwen4_runtime_          = nullptr;
+    std::int32_t continuation_width_            = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

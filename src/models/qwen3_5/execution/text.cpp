@@ -249,11 +249,14 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
     set_linear_state_slots(0, 0);
-    embed_      = &parameters_.text.token_embedding;
-    final_norm_ = &parameters_.text.final_norm;
-    lm_head_    = &parameters_.text.output_head;
-    mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
-    if (mtp_enabled() && mtp_ == nullptr) {
+    embed_              = &parameters_.text.token_embedding;
+    final_norm_         = &parameters_.text.final_norm;
+    lm_head_            = &parameters_.text.output_head;
+    mtp_                = parameters_.mtp ? &*parameters_.mtp : nullptr;
+    qwen4_              = parameters_.qwen4 ? &*parameters_.qwen4 : nullptr;
+    qwen4_mtp_          = parameters_.qwen4_mtp ? &*parameters_.qwen4_mtp : nullptr;
+    continuation_width_ = dimension(config_.residual_width());
+    if (mtp_enabled() && mtp_ == nullptr && qwen4_mtp_ == nullptr) {
         throw std::invalid_argument("MTP state requires selected MTP parameters");
     }
     if (parameters_.proposal) {
@@ -418,6 +421,20 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
                                    ops::CausalAttentionExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4_ != nullptr) {
+        const auto columns = static_cast<std::int32_t>(ids.numel());
+        const Qwen4Sequence sequence{
+            .cache_positions = &positions,
+            .rope_positions  = &rope_positions,
+            .valid_columns   = active_valid_columns_,
+            .table_rows  = active_backend_kv_table_rows_ != nullptr ? active_backend_kv_table_rows_
+                                                                    : &io_.backend_kv_table_row,
+            .width       = active_sequence_batch_ != 0 ? active_sequence_width_ : columns,
+            .batch       = active_sequence_batch_ != 0 ? active_sequence_batch_ : 1,
+            .max_visible = envelope.max_visible_keys};
+        qwen4_mtp_core(ids, hidden, input_embeddings, sequence, mtp_hidden);
+        return;
+    }
     nvtx::ScopedRange forward_range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
                                     static_cast<std::uint64_t>(ids.numel()));
     auto scratch_scope = work_.scope();
@@ -564,10 +581,13 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
-                         "proposal hidden");
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, T}, "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
+    if (qwen4_ != nullptr) {
+        qwen4_proposal(hidden, logits, proposal_tokens);
+        return;
+    }
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
@@ -603,9 +623,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
     require_tensor_shape(positions, DType::I32, {T}, "MTP positions");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T}, "MTP hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), T},
-                         "MTP output hidden");
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, T}, "MTP hidden");
+    require_tensor_shape(mtp_hidden, DType::BF16, {continuation_width_, T}, "MTP output hidden");
     if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -646,10 +665,9 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
-    require_tensor_shape(previous_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
+    require_tensor_shape(previous_hidden, DType::BF16, {continuation_width_, 1},
                          "MTP AR previous hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
-                         "MTP AR output hidden");
+    require_tensor_shape(mtp_hidden, DType::BF16, {continuation_width_, 1}, "MTP AR output hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
@@ -680,7 +698,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention source slots");
     require_tensor_shape(linear_state_destination_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention destination slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, batch},
                          "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "ordinary decode logits");
@@ -699,12 +717,24 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
-        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-        ops::embedding(ids, *embed_, x, stream);
-        NullTap tap;
-        run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
+        if (qwen4_ != nullptr) {
+            Tensor wide = work_.alloc(DType::BF16, {continuation_width_, batch});
+            qwen4_embed(ids, nullptr, nullptr, nullptr, wide);
+            Tensor ple;
+            if (config_.ple) { ple = qwen4_runtime().ple_input.slice(1, 0, batch); }
+            qwen4_layers(wide, Phase::Verify, qwen4_text_sequence(batch),
+                         config_.ple ? &ple : nullptr);
+            CUDA_CHECK(cudaMemcpyAsync(hidden.data, wide.data, wide.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            qwen4_logits(qwen4_->head, hidden, logits);
+        } else {
+            Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+            ops::embedding(ids, *embed_, x, stream);
+            NullTap tap;
+            run_layers(x, Phase::Verify, tap);
+            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
+            project(hidden, *lm_head_, logits, work_, stream);
+        }
     }
     work_.reset();
 }
@@ -733,7 +763,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, width, batch},
                          "target verify batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
@@ -752,6 +782,28 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
+        if (qwen4_ != nullptr) {
+            if constexpr (Tap::enabled) {
+                throw std::logic_error("Qwen4Exp target verification publishes no draft features");
+            } else {
+                Tensor wide = work_.alloc(DType::BF16, {continuation_width_, columns});
+                qwen4_embed(ids, nullptr, nullptr, nullptr, wide);
+                Tensor ple;
+                if (config_.ple) { ple = qwen4_runtime().ple_input.slice(1, 0, columns); }
+                qwen4_layers(wide, Phase::Verify, qwen4_text_sequence(columns),
+                             config_.ple ? &ple : nullptr);
+                Tensor flat_hidden = hidden.view({continuation_width_, columns});
+                Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
+                Tensor flat_tokens = target_tokens.view({columns});
+                CUDA_CHECK(cudaMemcpyAsync(flat_hidden.data, wide.data, wide.bytes(),
+                                           cudaMemcpyDeviceToDevice, stream));
+                qwen4_logits(qwen4_->head, flat_hidden, flat_logits);
+                ops::argmax(flat_logits, flat_tokens,
+                            dimension(parameters_.model.resources().public_token_count), stream);
+            }
+            work_.reset();
+            return;
+        }
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
@@ -809,7 +861,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, width, batch},
                          "MTP decode batch target hidden");
     require_tensor_shape(cache_positions, DType::I32, {width, batch},
                          "MTP decode batch cache positions");
@@ -817,7 +869,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                          "MTP decode batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "MTP decode batch valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP decode batch KV rows");
-    require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
+    require_tensor_shape(mtp_hidden, DType::BF16, {continuation_width_, width, batch},
                          "MTP decode batch hidden");
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows);
@@ -829,7 +881,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     const std::int32_t batch = hidden.ne[1];
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, batch},
                          "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "MTP proposal batch logits");
@@ -848,24 +900,24 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
 
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
+    Tensor q           = projection.query.view({dimension(config_.attention->head_dim),
+                                                dimension(config_.attention->num_attention_heads), T});
+    Tensor gate        = projection.gate.view({dimension(config_.attention->head_dim),
+                                               dimension(config_.attention->num_attention_heads), T});
+    Tensor k           = projection.key.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
+    Tensor v           = projection.value.view({dimension(config_.attention->head_dim),
+                                                dimension(config_.attention->num_key_value_heads), T});
+    Tensor q_flat      = q.view({dimension(config_.attention->query_width()), T});
+    Tensor gate_flat   = gate.view({dimension(config_.attention->query_width()), T});
+    Tensor k_flat      = k.view({dimension(config_.attention->key_width()), T});
+    Tensor v_flat      = v.view({dimension(config_.attention->key_width()), T});
     const auto* single = std::get_if<LinearParameters>(&p.projection);
     if (single != nullptr &&
         ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
-        ops::attn_input_proj_fused_rmsnorm_nvfp4(
-            x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
-            v_flat, single->policy, work_, s);
+        ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
+                                                 single->weight, q_flat, gate_flat, k_flat, v_flat,
+                                                 single->policy, work_, s);
     } else {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
@@ -1131,6 +1183,13 @@ template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+    if (qwen4_ != nullptr) {
+        if constexpr (Tap::enabled) {
+            throw std::logic_error("Qwen4Exp prefill publishes no draft features");
+        } else {
+            return qwen4_prefill(ids, text_prefill, multimodal, finalize_at_end);
+        }
+    }
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {

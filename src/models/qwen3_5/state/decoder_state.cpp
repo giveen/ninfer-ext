@@ -14,7 +14,8 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
-                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
+                              std::int32_t table_rows, std::uint32_t physical_page_groups,
+                              bool qsa_index) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -28,7 +29,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
 
     KVPageGeometry geometry;
-    geometry.planes.reserve(static_cast<std::size_t>(layers) * layer_storage.planes_per_layer());
+    geometry.planes.reserve(static_cast<std::size_t>(layers) *
+                            (layer_storage.planes_per_layer() + (qsa_index ? 1U : 0U)));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         geometry.planes.push_back(
             {layer_storage.key.data_dtype, layer_storage.key.data_leading_extent, kv_heads, 256});
@@ -42,6 +44,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             geometry.planes.push_back({layer_storage.value.scale_dtype,
                                        layer_storage.value.scale_leading_extent, kv_heads, 256});
         }
+        if (qsa_index) {
+            geometry.planes.push_back({DType::BF16, ops::kQsaIndexRecordWords, 1, 256});
+        }
     }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
@@ -54,6 +59,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .max_context   = capacity,
         .kv_heads      = kv_heads,
         .layer_storage = layer_storage,
+        .qsa_index     = qsa_index,
     };
 }
 
@@ -63,11 +69,11 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups);
+                                spec.text_physical_page_groups, spec.qsa_index);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                   spec.mtp_physical_page_groups);
+                                   spec.mtp_physical_page_groups, spec.qsa_index);
     }
     return layout;
 }
@@ -75,9 +81,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      layer_storage_(layout.layer_storage) {
-    if (pages_.plane_count() !=
-        static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
+      layer_storage_(layout.layer_storage), qsa_index_(layout.qsa_index) {
+    if (pages_.plane_count() != static_cast<std::size_t>(layers_) * layer_plane_stride()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
 }
@@ -103,7 +108,7 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const std::size_t stride        = layer_storage_.planes_per_layer();
+    const std::size_t stride        = layer_plane_stride();
     const std::size_t base          = static_cast<std::size_t>(layer) * stride;
     const std::size_t k_scale_index = base + 2;
     const std::size_t v_scale_index =
@@ -132,6 +137,15 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
     };
+}
+
+ops::QsaIndexPlane PagedKVCache::index_plane(std::uint32_t layer) const {
+    if (!qsa_index_) { throw std::logic_error("Paged KV cache has no QSA index planes"); }
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    const std::size_t index =
+        static_cast<std::size_t>(layer) * layer_plane_stride() + layer_storage_.planes_per_layer();
+    return ops::QsaIndexPlane{.pages        = pages_.plane(index),
+                              .block_tables = execution_tables_.matrix()};
 }
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {

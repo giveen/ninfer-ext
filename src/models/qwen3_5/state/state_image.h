@@ -27,6 +27,8 @@ struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
+    // Qwen4Exp PLE convolution history: BF16 elements per slot (0 when absent).
+    std::int32_t ple_state = 0;
 };
 
 struct StateImageHostLayout {
@@ -36,6 +38,7 @@ struct StateImageHostLayout {
     LayoutRegion linear_recurrent;
     std::size_t linear_recurrent_layer_bytes = 0;
     LayoutRegion continuation_hidden;
+    std::optional<LayoutRegion> ple_state;
     std::optional<LayoutRegion> dflash_local_k;
     std::optional<LayoutRegion> dflash_local_v;
     std::size_t dflash_local_layer_bytes = 0;
@@ -45,6 +48,7 @@ struct StateImageHostLayout {
 struct StateImageDeviceLayout {
     LinearAttentionStatePoolLayout linear;
     TensorRegion continuation_hidden;
+    std::optional<TensorRegion> ple_state;
     std::optional<CyclicKVCacheLayout> dflash_local;
     StateImageHostLayout host;
 };
@@ -142,6 +146,9 @@ public:
         return self.continuation_hidden_;
     }
 
+    // BF16 [ple_state, slots]; empty Tensor when the model has no PLE.
+    [[nodiscard]] const Tensor& ple_states() const noexcept { return ple_state_; }
+
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCache* dflash_local() const noexcept;
 
@@ -162,6 +169,7 @@ private:
 
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
+    Tensor ple_state_;
     std::optional<CyclicKVCache> dflash_local_;
     StateImageHostLayout host_layout_;
 };

@@ -357,6 +357,7 @@ public:
         }
         PleParameters out;
         out.table = PleTable{table.mapped, table.view.shape[0], dimension(table.view.shape[1]),
+                             table.mapped_geometry.code_bytes_per_row,
                              table.mapped_geometry.scale_offset};
         out.key_value =
             ops::prepare_linear_weight(std::array{model_.input(w.key), model_.input(w.value)});

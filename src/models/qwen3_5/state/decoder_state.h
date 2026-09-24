@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "ninfer/ops/sparse_attention.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,8 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    // Qwen Sparse Attention: every attention layer also pages one indexer-key record per token.
+    bool qsa_index = false;
 };
 
 struct PagedKVCacheLayout {
@@ -32,6 +35,7 @@ struct PagedKVCacheLayout {
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
     PagedKVStorageLayout layer_storage;
+    bool qsa_index = false;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -78,7 +82,16 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] bool has_qsa_index() const noexcept { return qsa_index_; }
+
+    // Indexer-key plane of one layer over all execution table rows; requires has_qsa_index().
+    [[nodiscard]] ops::QsaIndexPlane index_plane(std::uint32_t layer) const;
+
 private:
+    [[nodiscard]] std::size_t layer_plane_stride() const noexcept {
+        return layer_storage_.planes_per_layer() + (qsa_index_ ? 1U : 0U);
+    }
+
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
@@ -88,6 +101,7 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    bool qsa_index_ = false;
 };
 
 struct DecoderStateLayout {

@@ -162,6 +162,7 @@ struct PleTable {
     std::vector<artifact::MappedObjectSegment> segments;
     std::uint64_t rows        = 0;
     std::int32_t width        = 0;
+    std::uint64_t row_bytes   = 0; // code bytes per stored row
     std::uint64_t scale_plane = 0; // object offset of the BF16 row multipliers
 };
 
