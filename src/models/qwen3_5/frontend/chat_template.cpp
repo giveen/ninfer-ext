@@ -5,7 +5,7 @@
 #include "text/unicode.h"
 
 #include <algorithm>
-#include <map>
+#include <flat_map>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -281,7 +281,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     result.cache_boundaries.resize(options.cache_markers.size());
 
     // Only requested/structural boundaries need proof, independent of history length.
-    std::map<std::size_t, std::optional<std::size_t>> prefix_cache;
+    std::flat_map<std::size_t, std::optional<std::size_t>> prefix_cache;
     auto prefix = [&](std::size_t count) -> std::optional<std::size_t> {
         if (count > messages.size()) return std::nullopt;
         if (const auto it = prefix_cache.find(count); it != prefix_cache.end()) return it->second;

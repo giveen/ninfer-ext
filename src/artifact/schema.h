@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flat_map>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -69,7 +70,7 @@ struct Use {
     std::string parameter;
     std::string input;
     std::optional<ActivationPolicy> activation_policy;
-    std::map<std::string, Binding, std::less<>> auxiliaries;
+    std::flat_map<std::string, Binding, std::less<>> auxiliaries;
 };
 
 struct Proposal {
@@ -80,7 +81,7 @@ struct Proposal {
 struct Component {
     Json config;
     std::optional<std::string> target;
-    std::map<std::string, ObjectHandle, std::less<>> resources;
+    std::flat_map<std::string, ObjectHandle, std::less<>> resources;
     std::optional<Proposal> proposal;
 };
 
@@ -91,7 +92,7 @@ struct FileRecord {
 };
 
 struct Directory {
-    std::map<std::string, Component, std::less<>> components;
+    std::flat_map<std::string, Component, std::less<>> components;
     std::vector<Object> objects;
     std::map<std::string, ObjectHandle, std::less<>> object_index;
     std::map<std::string, Binding, std::less<>> bindings;
