@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -51,21 +52,49 @@ std::vector<double> read_f32(const void* device, std::size_t n) {
 
 // ---- routing ---------------------------------------------------------------------------------
 
-int route_case(std::int32_t tokens, std::uint32_t seed) {
-    const auto x      = random_bf16(static_cast<std::size_t>(H) * tokens, seed, -1.0F, 1.0F);
-    const auto router = random_bf16(static_cast<std::size_t>(E + 1) * H, seed + 1U, -0.1F, 0.1F);
+// Hidden states like the model's post-mixer activations: unit RMS with a few large outlier
+// channels, and a router with N(0, 0.02) rows.
+std::vector<float> realistic_bf16(std::size_t n, std::uint32_t seed, float sigma, bool outliers) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0F, sigma);
+    std::vector<float> v(n);
+    for (auto& value : v) { value = normal(rng); }
+    if (outliers) {
+        constexpr int kChannels[4] = {17, 911, 1604, 2555};
+        for (std::size_t column = 0; column < n / H; ++column) {
+            for (int i = 0; i < 4; ++i) {
+                v[column * H + kChannels[i]] = (i % 2 ? -1.0F : 1.0F) * (40.0F + 20.0F * i);
+            }
+        }
+    }
+    round_to_bf16(v);
+    return v;
+}
+
+int route_case(std::int32_t tokens, std::uint32_t seed, bool realistic = false) {
+    const auto x = realistic
+                       ? realistic_bf16(static_cast<std::size_t>(H) * tokens, seed, 1.0F, true)
+                       : random_bf16(static_cast<std::size_t>(H) * tokens, seed, -1.0F, 1.0F);
+    const auto router =
+        realistic ? realistic_bf16(static_cast<std::size_t>(E + 1) * H, seed + 1U, 0.02F, false)
+                  : random_bf16(static_cast<std::size_t>(E + 1) * H, seed + 1U, -0.1F, 0.1F);
     std::vector<int> ids(static_cast<std::size_t>(K) * tokens);
     std::vector<double> weights(ids.size()), shared(tokens);
     std::vector<std::vector<double>> logits(tokens, std::vector<double>(E + 1));
+    // FP32 accumulation error scales with the sum of |terms|; near ties within it may swap.
+    std::vector<double> tie_tolerance(tokens, 0.0);
     for (std::int32_t t = 0; t < tokens; ++t) {
         auto& l = logits[t];
         for (std::int32_t e = 0; e <= E; ++e) {
-            double sum = 0.0;
+            double sum = 0.0, magnitude = 0.0;
             for (std::int32_t h = 0; h < H; ++h) {
-                sum += double(router[static_cast<std::size_t>(e) * H + h]) *
-                       double(x[static_cast<std::size_t>(t) * H + h]);
+                const double term = double(router[static_cast<std::size_t>(e) * H + h]) *
+                                    double(x[static_cast<std::size_t>(t) * H + h]);
+                sum += term;
+                magnitude += std::abs(term);
             }
-            l[e] = sum;
+            l[e]             = sum;
+            tie_tolerance[t] = std::max(tie_tolerance[t], 1.0e-5 * magnitude);
         }
         std::vector<int> order(E);
         std::iota(order.begin(), order.end(), 0);
@@ -88,17 +117,23 @@ int route_case(std::int32_t tokens, std::uint32_t seed) {
     Tensor ts(out_s.data(), DType::FP32, {tokens});
     ops::moe_route(tx, tr, ti, tw, ts, nullptr);
     cuda_synchronize();
-    const std::string label = "moe_route T=" + std::to_string(tokens);
-    int failures            = 0;
+    const std::string label =
+        "moe_route T=" + std::to_string(tokens) + (realistic ? " realistic" : "");
+    int failures = 0;
     // Selection is a set per column; a near-tied tenth/eleventh logit may legitimately swap.
     const std::vector<int> got = from_device<int>(out_ids.data(), ids.size());
     for (std::int32_t t = 0; t < tokens; ++t) {
         std::set<int> a(got.begin() + t * K, got.begin() + (t + 1) * K);
         std::set<int> b(ids.begin() + t * K, ids.begin() + (t + 1) * K);
+        if (a.size() != K || *a.begin() < 0 || *a.rbegin() >= E) {
+            std::cerr << label << ": column " << t << " has repeated or invalid expert ids\n";
+            ++failures;
+            continue;
+        }
         if (a != b) {
             std::vector<double> sorted(logits[t].begin(), logits[t].begin() + E);
             std::sort(sorted.rbegin(), sorted.rend());
-            if (sorted[K - 1] - sorted[K] > 1.0e-4) {
+            if (sorted[K - 1] - sorted[K] > std::max(1.0e-4, tie_tolerance[t])) {
                 std::cerr << label << ": expert set mismatch at column " << t << '\n';
                 ++failures;
             }
@@ -472,6 +507,11 @@ int main() {
     }
     int failures = 0;
     for (const std::int32_t tokens : {1, 4, 33}) { failures += route_case(tokens, 0x51U + tokens); }
+    // Prefill-sized calls with model-like magnitudes: a 526-token prompt, a 1024-token chunk, and
+    // a 2048-token chunk (many column tiles, and a non-multiple-of-64 tail).
+    for (const std::int32_t tokens : {1, 70, 526, 1024, 2048}) {
+        failures += route_case(tokens, 0x61U + tokens, true);
+    }
     const HostBank host   = make_bank(0xC0FFEEU);
     const DeviceBank bank = upload(host);
     failures += cache_case(host, bank);
