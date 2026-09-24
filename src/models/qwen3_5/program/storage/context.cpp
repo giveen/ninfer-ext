@@ -1459,12 +1459,16 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
         capacity, request.lease_ceiling + kv_lease_backend_allowance_tokens());
     const auto grow = [&](std::uint32_t extra_tokens) {
         const std::uint32_t text_target =
-            target(text_kv_pages->physical_pool().capacity_pages(), text_pages,
+            target(std::min(text_kv_pages->physical_pool().capacity_pages(),
+                            text_kv_addresses->address_page_capacity()),
+                   text_pages,
                    kv_lease_pages_for_tokens(
                        std::min(request.lease_ceiling, main_tokens + extra_tokens)));
         const std::uint32_t backend_target =
             sequence.kv->backend
-                ? target(backend_kv_pages->physical_pool().capacity_pages(), backend_pages,
+                ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
+                                  backend_kv_addresses->address_page_capacity()),
+                         backend_pages,
                          backend_thin ? kv_lease_pages_for_tokens(std::min(
                                             backend_ceiling, backend_tokens + extra_tokens))
                                       : backend_pages)
