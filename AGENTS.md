@@ -145,8 +145,9 @@ Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual re
 causes failures or interferes with the task, and briefly explain why.
 
 Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/jabbatheduck/.local/bin/python3.11`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
+`.venv/bin/python` (Python 3.11 with `jinja2` and `numpy`, created with `uv venv`); configure
+CMake with `-DPython3_EXECUTABLE=$PWD/.venv/bin/python`. The default shell's `python3` may be a
+different version. Use `python3` only after selecting the maintainer environment or checking its version.
 Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
 `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.3.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
