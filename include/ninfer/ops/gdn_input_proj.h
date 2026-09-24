@@ -239,4 +239,28 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Convolution half of gdn_input_proj_conv_snapshot for an already projected input.
+ *
+ * `projected` is contiguous BF16 `[10240, W, B]` holding the query, key and value projection rows
+ * in that order; every other operand, slot and snapshot contract is that of
+ * gdn_input_proj_conv_snapshot. Architectures whose input width has no fused projection route use
+ * the Linear Op for the projection and this entry for the convolution.
+ */
+void gdn_projected_conv_snapshot(const Tensor& projected, const Tensor& conv_weight,
+                                 Tensor& conv_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                 Tensor& value, cudaStream_t stream);
+
+/**
+ * Convolution half of gdn_input_proj_conv_record: `conv_record` is the caller-projected
+ * `[10240, W, B]` record that ReplaySSM commits later; the other contracts match
+ * gdn_input_proj_conv_record.
+ */
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream);
+
 } // namespace ninfer::ops

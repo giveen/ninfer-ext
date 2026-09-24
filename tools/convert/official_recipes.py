@@ -289,9 +289,6 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
                 name, format=FP8, method=import_encoded, source=parameter.source
             )
             continue
-        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
-            recipe.separate(name)
-            continue
         if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
             "text/token_embedding",
             "text/output_head",

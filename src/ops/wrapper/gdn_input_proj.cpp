@@ -1023,4 +1023,49 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                   value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
+void gdn_projected_conv_snapshot(const Tensor& projected, const Tensor& conv_weight,
+                                 Tensor& conv_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                 Tensor& value, cudaStream_t stream) {
+    constexpr std::int32_t kQueryRows = 2048;
+    constexpr std::int32_t kKeyRows   = 2048;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    const ConvGeometry geometry       = require_snapshot_input(projected, kChannels);
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              snapshot_base_slots, kChannels, geometry);
+    require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                        "gdn_projected_conv_snapshot", "query");
+    require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                        "gdn_projected_conv_snapshot", "key");
+    require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                        "gdn_projected_conv_snapshot", "value");
+    detail::gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
+                                               initial_state_slots, snapshot_base_slots, query, key,
+                                               value, stream);
+}
+
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream) {
+    constexpr std::int32_t kQueryRows = 2048;
+    constexpr std::int32_t kKeyRows   = 2048;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    const ConvGeometry geometry       = require_record_input(conv_record, kChannels);
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              initial_state_slots, kChannels,
+                              ConvGeometry{geometry.width, geometry.batch, 1});
+    require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                        "gdn_projected_conv_record", "query");
+    require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, "gdn_projected_conv_record",
+                        "key");
+    require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                        "gdn_projected_conv_record", "value");
+    detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
+                                             initial_state_slots, query, key, value, stream);
+}
+
 } // namespace ninfer::ops
