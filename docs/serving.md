@@ -31,6 +31,19 @@ With `C=2` and two extra Device checkpoint slots, the process owns two active St
 plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
 pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
 
+`--host-state-slots` and `--host-kv-mib` are independent allocations, so their sum — not
+`--host-kv-mib` alone — is the Host RAM the process pins: a Host StateImage costs one
+`memory.host_state_image_bytes` regardless of the prefix depth it resumes. `--host-cache-mib N`
+replaces both with a single ceiling: the engine sizes the Host state pool from the checkpoint
+inventory the capture path creates, `(2 + max-long-anchors-per-continuation) * private
+continuations + shared prefixes` images, then spends the remaining state headroom under the
+half-budget cap on **more long anchors per continuation** — up to the count whose re-prefill gap
+still outweighs one StateImage — re-sizes the pool for the grown count, gives Host KV the
+remaining bytes, and refuses to start if that state footprint would exceed half the budget. A
+budget therefore never lowers the configured anchor count, and the count it resolves is the one
+the frontend grid, the ResourceManager and the Program all use. Both unit costs and the derived
+split are reported in the `server_start` memory ledger.
+
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
@@ -861,9 +874,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-cache-mib N` | single pinned Host RAM ceiling for the whole retention tier in MiB; the engine derives the Host StateImage slot count from the checkpoint inventory the capture path creates, spends the remaining state headroom on more long anchors per continuation, and gives Host KV the remainder. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. | unset (component flags used) |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
-| `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
+| `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation; the engine anchors up to N message boundaries automatically, on a grid that doubles the gap walking back from the prompt end (1024 tokens at the first step), so short tool-loop turns do not each cost an anchor and deep history stays covered. `--host-cache-mib` raises N within the state inventory it funds and never lowers it. | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -1032,8 +1046,12 @@ pool used by active requests and retained prefixes. `auto` accounts for the comp
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
 
-Admission reserves the full prompt-plus-effective-output page entitlement through request
-completion. A request remains queued until a legal resource plan can satisfy that entitlement.
+Admission reserves a bounded Device KV window over the request's remaining output and extends it at
+each decode-round boundary; the window is never the whole `max_tokens` budget, so a client that asks
+for far more output than it generates does not hold the prefix cache out of the pool. A request
+remains queued until a legal resource plan can satisfy its prompt plus that window. If the pool can
+no longer extend the window, the request completes at the frontier its window covers and reports
+`finish_reason=length`.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

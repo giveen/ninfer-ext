@@ -444,10 +444,11 @@ Active truncate 或 speculative rollback 可以解除 mappings，但对应容量
 只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
 
 Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
-exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
-再次计费：它若由其他 surviving owner 保留则只存在于全局 physical occupancy，若由 active lineage 的
-optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
-Fork 错判为超出 active guarantee。
+exclusive optional resources。私有增长 reservation 是按需扩充的有界 Device page window，而不是 request
+尚未取得的整个 output budget（见 [Paged KV cache](paged-kv-cache.md) §6.2）。Fork 期间借用的 immutable
+StateImage/KV source 不能通过 primary binding 再次计费：它若由其他 surviving owner 保留则只存在于全局
+physical occupancy，若由 active lineage 的 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一
+allocation 会被重复收费，并把合法的 Fork 错判为超出 active guarantee。
 
 ### 6.2 Terminal 与 capture
 
@@ -744,7 +745,19 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 ### 8.7 有界 heuristic search
 
 Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
-identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+identity，或 escape-hatch recency ladder 中「sacrifice 最少且可 adoption」的一级 rung，或 root maximal
+（clear-all，liveness backstop）；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+
+Escape-hatch rung 把 private owner 与 shared owner 放进同一个 recency 排名（最近一次命中或发布优先——
+刚发布、尚未被命中的 continuation 或 shared prefix 也算最近使用；tie 保持输入顺序）：rung k 完全 evict
+最旧的 k 个 owner，其余 owner 保持不变——其中仍可由 Host 承载的 owner（private 或 shared）通过
+demote-to-host 释放 device 资源并保留 host copy。Shared prefix 不再被每一级 rung 无条件销毁：一个仍被
+新会话频繁命中的 shared prefix 会比闲置的会话活得更久。Rung 只有在 *physical 可行且 logical adoption
+成功* 时才算数，因此 publication-only 这类物理上放得下、但需要一个 released owner 的 admission 也能找到
+最小 sacrifice；没有 host tier 的池同样能表达「evict 最旧的 k 个、其余保留」。该最小 sacrifice 同时 licence
+增量搜索：incremental enumeration 只能完全 evict 这条 LRU tail，tail 之外的 owner 只能被 demote/degrade/
+保留，所以计划不会用一个更近 prefix 的内容换取更旧 prefix 的 device KV。identity 可行时 licence 为空，即
+不需要 eviction。
 
 一次 planning problem 中：
 

@@ -466,13 +466,27 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
     if (cache.enabled) {
+        // Every capacity here is a resolved value: the Host tier is read back from the Program and
+        // the catalog and anchor counts from the Engine's options, which an engaged host-cache
+        // budget has already resolved, so nothing names a default the process is not using.
         logger_->info(
             "context cache | {} active + {} cached device states | host {} states, {} KV | "
             "private {} | shared {} | anchors {}",
-            engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
-            product::format_pretty_bytes(cache.host_kv_capacity_bytes),
+            engine.max_concurrency, *cache.device_state_slots,
+            product::format_pretty_count(memory.host_state_capacity_slots),
+            product::format_pretty_bytes(memory.host_kv_capacity_bytes),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
+        if (memory.host_cache_budget_bytes != 0) {
+            // Both unit costs and the count the budget bought, so an operator can check the split
+            // against the RAM they granted rather than reconstruct it from the slot count.
+            logger_->info("host cache budget | {} total | {} per state image | {} per host KV "
+                          "page group | {} anchors per continuation | state capped at half",
+                          product::format_pretty_bytes(memory.host_cache_budget_bytes),
+                          product::format_pretty_bytes(memory.host_state_image_bytes),
+                          product::format_pretty_bytes(memory.host_kv_page_group_bytes),
+                          *cache.max_long_anchors_per_continuation);
+        }
     } else {
         logger_->info("context cache | root only");
     }

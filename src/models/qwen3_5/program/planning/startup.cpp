@@ -9,6 +9,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
+#include "core/host_kv_arena.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -136,6 +137,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
+    // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
+    // trades against is priced from the plan rather than recovered from a constructed pool.
+    out.host_kv_text_page_stride =
+        plan_host_kv_page_layout(out.decoder.text_kv.pages.spec.geometry).page_stride;
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -831,6 +836,21 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
+    if (impl->context_cache.host_cache_budget_bytes) {
+        // The budget is resolved on the finished layout, before anything consumes the plan's
+        // context-cache shape: the Program sizes its Host pools from it and the Engine publishes
+        // the same resolved counts to its own ResourceManager and frontend, so the anchors the
+        // capture path creates always fit the inventory that was paid for.
+        if (!impl->context_cache.max_private_continuations ||
+            *impl->context_cache.max_private_continuations == 0 ||
+            !impl->context_cache.max_shared_prefixes) {
+            throw std::logic_error("Qwen3.5 context cache options are not normalized");
+        }
+        resolve_host_cache_budget(impl->context_cache, *impl->context_cache.max_private_continuations,
+                                  *impl->context_cache.max_shared_prefixes, impl->capacity,
+                                  impl->persistent.state_images.host.image_bytes,
+                                  impl->persistent.host_kv_text_page_stride);
+    }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
@@ -895,6 +915,67 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 }
 
 } // namespace
+
+void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private_capacity,
+                               std::uint32_t shared_capacity, std::uint32_t capacity,
+                               std::uint64_t state_image_bytes, std::uint64_t host_kv_group_bytes) {
+    const std::uint64_t budget     = *cache.host_cache_budget_bytes;
+    const std::uint64_t configured = cache.max_long_anchors_per_continuation.value_or(0);
+    // The budget is the ceiling for the whole retention tier, so it decides the anchor count only
+    // within the inventory it must already hold: every private owner keeps its endpoint, its
+    // rewrite checkpoint and up to A long anchors.
+    const auto mandatory_images = [&](std::uint64_t anchors) {
+        return (2ULL + anchors) * private_capacity + shared_capacity;
+    };
+    const std::uint64_t base_anchors = std::max<std::uint64_t>(configured, 4U);
+    std::uint64_t anchors            = configured;
+    const std::uint64_t base_images  = mandatory_images(base_anchors);
+    if (state_image_bytes != 0 && host_kv_group_bytes != 0 &&
+        base_images * state_image_bytes <= budget / 2) {
+        // One further anchor costs one StateImage per private owner. It pays for itself only while
+        // the gap it covers is worth more Main KV than the image costs, so the number of anchors
+        // that can ever be useful is bounded by the Main pages the logical capacity admits: a
+        // StateImage buys back `buyback_tokens` tokens of re-prefill (page-aligned, so priced in
+        // whole page groups).
+        const std::uint64_t buyback_tokens =
+            std::max<std::uint64_t>(1ULL, state_image_bytes / host_kv_group_bytes) *
+            static_cast<std::uint64_t>(kPagedKVPageSize);
+        const std::uint64_t capacity_pages =
+            1ULL + (capacity - 1ULL) / static_cast<std::uint64_t>(kPagedKVPageSize);
+        const std::uint64_t buyback_pages =
+            1ULL + (buyback_tokens - 1ULL) / static_cast<std::uint64_t>(kPagedKVPageSize);
+        const std::uint64_t ceiling =
+            capacity_pages / buyback_pages > 2ULL ? capacity_pages / buyback_pages - 2ULL : 0ULL;
+        const std::uint64_t headroom_images =
+            (budget / 2 - base_images * state_image_bytes) / state_image_bytes;
+        const std::uint64_t grown =
+            base_anchors + headroom_images / private_capacity;
+        anchors = std::min(std::max(grown, base_anchors), std::max(ceiling, base_anchors));
+    }
+    if (anchors > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Qwen3.5 Host cache budget anchor count exceeds uint32");
+    }
+    const std::uint64_t state_slots = mandatory_images(anchors);
+    if (state_slots > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Qwen3.5 derived Host state capacity exceeds uint32");
+    }
+    const std::uint64_t state_bytes = state_slots * state_image_bytes;
+    if (state_bytes > budget / 2) {
+        throw std::invalid_argument(
+            "host cache budget is too small for the configured checkpoint inventory: " +
+            std::to_string(state_slots) + " Host state images x " +
+            std::to_string(state_image_bytes) + " B = " + std::to_string(state_bytes) +
+            " B exceeds half the " + std::to_string(budget) +
+            " B budget (private continuations " + std::to_string(private_capacity) +
+            ", shared prefixes " + std::to_string(shared_capacity) + ", anchors " +
+            std::to_string(anchors) +
+            "); reduce --max-private-continuations / --max-long-anchors-per-continuation or "
+            "raise --host-cache-mib");
+    }
+    cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(anchors);
+    cache.host_state_slots                  = static_cast<std::uint32_t>(state_slots);
+    cache.host_kv_capacity_bytes            = static_cast<std::size_t>(budget - state_bytes);
+}
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,

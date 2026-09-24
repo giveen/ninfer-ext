@@ -40,6 +40,20 @@ using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 
+// Device KV is leased on demand. An active request holds a bounded window of its remaining
+// output rather than the whole client budget, and extends that window at a decode-round
+// boundary; a full window is requested first and a step-sized extension is enough when the pool
+// cannot spare one.
+inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
+
+[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+[[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
+    return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
+}
+
 using ReusePath = ninfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
@@ -410,6 +424,13 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
+    // on-demand growth never leases pages the request cannot reach.
+    std::uint32_t lease_ceiling = 0;
+    // Set when the Device KV lease cannot be extended any further: the request finishes at the
+    // frontier its lease covers with its generation limit reason instead of failing a launch on
+    // coverage.
+    bool lease_settled = false;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -558,6 +579,10 @@ public:
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
 
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
@@ -569,6 +594,8 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    // Frozen context-cache shape: an engaged host budget has already resolved host_state_slots,
+    // host_kv_capacity_bytes and the long-anchor count on the plan this Program was built from.
     const ContextCacheOptions context_cache;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
@@ -1137,6 +1164,11 @@ private:
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);
+    bool publish_active_continuation(SequenceState& state, RequestControl& request,
+                                     std::uint32_t lane, std::uint32_t continuation_index,
+                                     qwen3_5::ContinuationSummary& summary) noexcept;
+    bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                              std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,
@@ -1198,6 +1230,28 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
+    [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
+        return std::max(prefill_chunk, kKVLeaseGrowthMarginTokens);
+    }
+    [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
+        // One round's Backend requirement can sit a whole draft window above the frontier the
+        // previous round checked, so the cushion has to absorb that jump before the lease is
+        // extended again.
+        const auto page  = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const auto slack = 2U * draft_window + 2U;
+        return (slack + page - 1U) / page + 1U;
+    }
+    // The Backend lease also covers the drafts a round may still verify past the sequence's
+    // output ceiling, and one forced control span.
+    [[nodiscard]] std::uint32_t kv_lease_backend_allowance_tokens() const noexcept {
+        return draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts) + 1U;
+    }
+    // Page groups an entitlement needs to cover `tokens` and still hold a full cushion.
+    [[nodiscard]] std::uint32_t kv_lease_pages_for_tokens(std::uint32_t tokens) const noexcept {
+        return kv_pages_for_tokens(tokens) + kv_lease_cushion_pages();
+    }
+    void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
+                                  std::uint32_t backend_tokens);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
@@ -1254,6 +1308,10 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        // Escape-hatch preserve choice: frees this owner's device KV while keeping its host copy
+        // (a demote-to-host outcome). Zero when the owner cannot be preserved this way; the
+        // protected maximal target then falls back to eviction for that owner.
+        std::uint16_t preserve_choice = 0;
     };
 
     struct CandidateOptions {
@@ -1301,8 +1359,26 @@ struct PressurePlanningSessionImpl {
         std::span<const ContinuationHandle* const> private_owners,
         std::span<const runtime::PlanningOwnerId> private_owner_ids,
         std::span<const SharedPrefixHandle* const> shared_owners,
-        std::span<const runtime::PlanningOwnerId> shared_owner_ids);
+        std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+        std::span<const runtime::PlanningOwnerId> recency_order);
     ~PressurePlanningSessionImpl() noexcept;
+
+    // Full eviction of an owner is reachable from incremental enumeration only inside the LRU tail
+    // the admission planner had to sacrifice: one of the `eviction_licence_count_` oldest ranks.
+    // Every other ranked owner, private or shared, is either demoted to Host (leaving its prefix
+    // matchable) or kept, so a plan can never trade a more recent prefix's content for an older
+    // one's device KV. An owner the caller left out of the recency order (rank -1) is sacrificed
+    // by every escape-hatch rung, so it is licensed whenever any sacrifice is licensed.
+    [[nodiscard]] bool owner_eviction_licensed(std::uint32_t owner_index) const {
+        if (owner_index >= recency_rank_.size() || eviction_licence_count_ == 0) {
+            return false;
+        }
+        const std::int32_t rank = recency_rank_[owner_index];
+        if (rank < 0) { return true; }
+        return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
+               std::ranges::find(licence_spared_ranks_,
+                         static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
+    }
 
     [[nodiscard]] qwen3_5::PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
@@ -1310,6 +1386,26 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
+    // Escape-hatch recency-ladder rung. For `sacrifice_oldest` = k, the k oldest ranked owners
+    // (private and shared, by recency rank) are fully evicted, and every other owner is kept — a
+    // kept owner frees its device resources through a demote-to-host outcome wherever Host can
+    // take it (keeping its host copy). Whether the sacrifice frees enough device and host capacity
+    // is the rung's adoption check, so a pool without a host tier still expresses "evict the k
+    // oldest and keep the rest". The ladder walks k = 0..R-1 (most-preserving first) and, if no
+    // rung is adoptable, the caller falls back to `root_maximal_target` (k = R: clear everything),
+    // the guaranteed liveness backstop.
+    [[nodiscard]] qwen3_5::PressureTargetHandle
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
+    // Number of owners in the recency order; bounds the escape-hatch ladder (rungs 0..R-1, then
+    // terminal).
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners. Set once per
+    // admission, from the escape-hatch ladder's smallest feasible sacrifice count (0 when the
+    // identity target is feasible, i.e. nothing needs to be evicted).
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -1318,6 +1414,12 @@ struct PressurePlanningSessionImpl {
                              runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     construction_target(const qwen3_5::PressureConstructionCursor& cursor);
+    // Canonical target slots the arena can still hold. The arena also holds targets a planning
+    // layer does not count in its own budget (identity targets, escape-hatch maximal rungs), so
+    // layers must bound expansion commits by optional_targets_remaining, not by their own
+    // budget, or commit_expansion rejects a commit the layer approved.
+    [[nodiscard]] std::size_t target_arena_maximum() const noexcept;
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] ConstructionSlot&
     construction_slot(const qwen3_5::PressureConstructionCursor& cursor);
     static void release_construction(const void*, std::uint32_t, std::uint32_t) noexcept;
@@ -1376,6 +1478,18 @@ struct PressurePlanningSessionImpl {
     std::vector<PhysicalCandidateBinding> candidates;
     std::vector<runtime::PlanningCandidateId> candidate_ids;
     std::vector<Owner> owners;
+    // Parallel to `owners`; recency rank in the caller's order over private and shared owners
+    // (0 = most recently hit or published), or -1 for an owner left out of it. Orders the
+    // escape-hatch sacrifice: the oldest ranked owner (highest rank) gives up its host copy first.
+    std::vector<std::int32_t> recency_rank_;
+    // Number of ranked owners; the escape-hatch ladder has this many sacrifice rungs
+    // plus the clear-all terminal.
+    std::uint32_t ranked_owner_count_ = 0;
+    // Ranked owners the escape-hatch ladder had to sacrifice for the current admission, oldest
+    // first. Full eviction is reachable from incremental enumeration only inside this LRU tail.
+    std::uint32_t eviction_licence_count_ = 0;
+    // Ranks inside that tail the ladder proved it did not need to sacrifice.
+    std::vector<std::uint32_t> licence_spared_ranks_;
     std::vector<CandidateOptions> candidate_options;
     std::vector<TargetNode> targets;
     std::vector<std::uint16_t> target_choice_arena;

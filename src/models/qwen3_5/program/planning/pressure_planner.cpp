@@ -32,7 +32,8 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,
     std::span<const SharedPrefixHandle* const> shared_owners,
-    std::span<const runtime::PlanningOwnerId> shared_owner_ids)
+    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+    std::span<const runtime::PlanningOwnerId> recency_order)
     : program(&owner), resource_revision(owner.resource_revision()) {
     if (physical_candidates.empty() ||
         physical_candidates.size() != admission_candidate_ids.size() ||
@@ -75,10 +76,25 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
             throw std::logic_error("pressure planning owner ID is duplicated");
         }
     }
+    recency_rank_.assign(owners.size(), -1);
+    // `recency_order` is ranked most-recent-first by the caller (rank_owners_by_recency over the
+    // private and shared owners), so its index is the recency rank used to order the escape-hatch
+    // sacrifice (the oldest ranked owner has the highest rank).
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        const auto found = std::ranges::find(recency_order, owners[index].id);
+        if (found != recency_order.end()) {
+            recency_rank_[index] = static_cast<std::int32_t>(found - recency_order.begin());
+            ++ranked_owner_count_;
+        }
+    }
+    // Until the admission planner narrows it, the whole recency order stays evictable. The
+    // capture path is not admission-feasibility driven — it prices an eviction against retention
+    // in the cost model — so it keeps this default, while the materialization escape-hatch
+    // ladder licenses only the LRU tail it had to sacrifice.
+    eviction_licence_count_ = ranked_owner_count_;
 
     candidate_options.resize(candidates.size());
-    const std::size_t maximum_targets =
-        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum_targets = target_arena_maximum();
     const std::size_t maximum_successors_per_owner =
         11U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (!owners.empty() &&
@@ -316,7 +332,7 @@ std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_
         existing->root_maximal = existing->root_maximal || root_maximal;
         return static_cast<std::uint32_t>(existing - targets.data());
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = target_arena_maximum();
     if (targets.size() >= maximum || targets.size() == targets.capacity() ||
         choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
         target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -394,24 +410,71 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
         std::vector<PressureDecision>& decisions = victim.decisions;
         using PlanningContractAccess             = qwen3_5::detail::RuntimeContractAccess;
         if (owner.shared) {
-            PressureDecision eviction = program->inspect_shared_eviction_option(
-                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)]);
+            const SharedPrefixState& shared =
+                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)];
+            PressureDecision eviction = program->inspect_shared_eviction_option(shared);
             if (!eviction.evicts_continuation || !eviction.shared_owner) {
                 throw std::logic_error("shared pressure owner has no maximal outcome");
             }
             decisions.push_back(std::move(eviction));
+            victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
+            // A shared prefix is the one every new conversation and sub-agent starts from, so it
+            // gets the same demote-to-host outcome as a private owner: free its device state and
+            // KV, keep the host copy matchable. Without it the only outcome is destruction, which
+            // is what every escape-hatch rung used to choose.
+            {
+                detail::PhysicalResources preserve_deficit;
+                preserve_deficit.device.state_slots      = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.main_kv_pages    = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.backend_kv_pages = std::numeric_limits<std::uint32_t>::max();
+                if (auto preserve = program->inspect_shared_pressure_option(
+                        shared, preserve_deficit, protection ? &*protection : nullptr, nullptr);
+                    preserve && !preserve->evicts_continuation && preserve->shared_owner &&
+                    (preserve->effect.removed.device.state_slots != 0 ||
+                     preserve->effect.removed.device.main_kv_pages != 0 ||
+                     preserve->effect.removed.device.backend_kv_pages != 0)) {
+                    decisions.push_back(std::move(*preserve));
+                    victim.preserve_choice = static_cast<std::uint16_t>(decisions.size());
+                }
+            }
         } else {
-            PressureDecision eviction = program->inspect_eviction_option(
-                program->continuation_states[PlanningContractAccess::index(*owner.private_handle)]);
+            const SequenceState& sequence =
+                program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+            PressureDecision eviction = program->inspect_eviction_option(sequence);
             if (!eviction.evicts_continuation || eviction.shared_owner) {
                 throw std::logic_error("private pressure owner has no maximal outcome");
             }
             decisions.push_back(std::move(eviction));
+            victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
+            // A prefix survives pressure on host whenever the Host tier can take it: free its
+            // device KV through a demote-to-host outcome instead of dropping it entirely. The
+            // assessor settles actual host fit jointly across every victim, and if it cannot be
+            // satisfied the outcome falls back to full eviction. Only store the preserve outcome
+            // when it genuinely frees a device resource; otherwise leave it at zero so this owner
+            // is evicted.
+            //
+            // This is offered for every private owner. Whether an owner can be spared is a
+            // Host-capacity question, so gating it on the preserved set made a saturated Device
+            // tier destroy host-reusable content that Host still had room for.
+            {
+                detail::PhysicalResources preserve_deficit;
+                preserve_deficit.device.state_slots      = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.main_kv_pages    = std::numeric_limits<std::uint32_t>::max();
+                preserve_deficit.device.backend_kv_pages = std::numeric_limits<std::uint32_t>::max();
+                if (auto preserve = program->inspect_pressure_option(
+                        sequence, preserve_deficit, protection ? &*protection : nullptr);
+                    preserve && !preserve->evicts_continuation &&
+                    (preserve->effect.removed.device.state_slots != 0 ||
+                     preserve->effect.removed.device.main_kv_pages != 0 ||
+                     preserve->effect.removed.device.backend_kv_pages != 0)) {
+                    decisions.push_back(std::move(*preserve));
+                    victim.preserve_choice = static_cast<std::uint16_t>(decisions.size());
+                }
+            }
         }
         if (decisions.size() > std::numeric_limits<std::uint16_t>::max()) {
             throw std::overflow_error("pressure owner target count is not representable");
         }
-        victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
     }
     options.populated = true;
 }
@@ -444,7 +507,15 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     }
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
-    if (std::ranges::find(successors, eviction) == successors.end()) {
+    // Eviction stays registered (invariants and the escape-hatch targets need it) but is
+    // reachable from incremental enumeration only inside the LRU tail the escape-hatch ladder
+    // had to sacrifice, and only for an owner Host cannot take: a demote frees the same device
+    // KV and leaves the prefix matchable, so destroying it would trade a restore for a full
+    // re-prefill, and evicting outside the licensed tail would destroy a more recent prefix
+    // than the plan requires.
+    if (victim_options.preserve_choice == 0 &&
+        owner_eviction_licensed(victim_options.owner_index) &&
+        std::ranges::find(successors, eviction) == successors.end()) {
         successors.push_back(eviction);
     }
     return successors;
@@ -479,6 +550,58 @@ PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
         choice_scratch.push_back(victim.eviction_choice);
     }
     const auto index = intern_target(selected, choice_scratch);
+    qwen3_5::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = index;
+    return result;
+}
+
+std::uint32_t PressurePlanningSessionImpl::ranked_owner_count() const {
+    return ranked_owner_count_;
+}
+
+void PressurePlanningSessionImpl::set_eviction_licence(
+    std::uint32_t oldest_licensed, std::span<const std::uint32_t> spared_ranks) {
+    eviction_licence_count_ = std::min(oldest_licensed, ranked_owner_count_);
+    licence_spared_ranks_.assign(spared_ranks.begin(), spared_ranks.end());
+}
+
+qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::recency_maximal_target(
+    runtime::PlanningCandidateId id, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    // The rung fully evicts the `sacrifice_oldest` oldest ranked owners (highest recency rank;
+    // private and shared share one order), keeps every other owner as it is, and demotes a kept
+    // owner to host when that frees its device resources while keeping the prefix. An owner the
+    // caller left out of the recency order (rank -1) is always sacrificed, and a rank listed in
+    // `spared_ranks` is kept even inside the sacrificed tail. `sacrifice_oldest` >= R means
+    // sacrifice every ranked owner, which the caller instead routes through `root_maximal_target`.
+    const std::uint32_t demote_count =
+        sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
+    choice_scratch.clear();
+    for (const auto& victim : candidate_options[selected].victims) {
+        const std::int32_t rank = recency_rank_[victim.owner_index];
+        const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
+        const bool spared  = in_tail && rank >= 0 &&
+                            std::ranges::find(spared_ranks,
+                                      static_cast<std::uint32_t>(rank)) != spared_ranks.end();
+        // Keeping an owner is a legal rung outcome: whether the sacrifice frees enough device and
+        // host capacity is what the rung's adoption check decides, so a pool without a host tier
+        // can still express "evict the k oldest and keep the rest" instead of clearing everything.
+        // A spared owner is treated like any other kept owner: demoted with them, or left in
+        // place with them.
+        std::uint16_t choice = victim.eviction_choice;
+        if (spared || !in_tail) {
+            choice = demote_kept && victim.preserve_choice != 0 ? victim.preserve_choice : 0U;
+        }
+        choice_scratch.push_back(choice);
+    }
+    // This is a rung of the root escape-hatch fallback, so it carries the same "maximal
+    // fallback" diagnostic marking as `root_maximal_target`.
+    const auto index = intern_target(selected, choice_scratch, true);
     qwen3_5::PressureTargetHandle result;
     result.session_    = this;
     result.generation_ = generation;
@@ -638,7 +761,7 @@ std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::constr
     const qwen3_5::PressureConstructionCursor& cursor) {
     auto& slot = construction_slot(cursor);
     if (!find_target(slot.candidate_index, slot.choices) &&
-        targets.size() >= candidates.size() + 1U + planning_detail::kOptionalTargetCapacity) {
+        targets.size() >= target_arena_maximum()) {
         return std::nullopt;
     }
     const auto index = intern_target(slot.candidate_index, slot.choices);
@@ -647,6 +770,17 @@ std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::constr
     result.generation_ = generation;
     result.index_      = index;
     return result;
+}
+
+std::size_t PressurePlanningSessionImpl::target_arena_maximum() const noexcept {
+    return candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+}
+
+std::uint32_t PressurePlanningSessionImpl::optional_targets_remaining() const noexcept {
+    const std::size_t maximum = target_arena_maximum();
+    return targets.size() >= maximum
+               ? 0U
+               : static_cast<std::uint32_t>(maximum - targets.size());
 }
 
 runtime::PressureTargetGuidance
@@ -1230,7 +1364,7 @@ PressurePlanningSessionImpl::commit_expansion(qwen3_5::PreparedPressureExpansion
         prepared.parent_index_ >= targets.size()) {
         throw std::logic_error("prepared pressure expansion is stale");
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = target_arena_maximum();
     if (prepared_new_count > maximum - std::min(maximum, targets.size())) {
         throw std::length_error("prepared pressure expansion exceeds the target arena");
     }

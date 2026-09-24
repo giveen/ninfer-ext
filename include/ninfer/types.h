@@ -133,7 +133,7 @@ struct StartupObserver {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=2;
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=4;
     // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
@@ -141,10 +141,24 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
-    // Bounded private/shared logical catalogs and per-continuation long-anchor count.
+    // Single host RAM ceiling for the whole retention tier. When engaged it is authoritative:
+    // the plan sizes the Host state pool from the checkpoint inventory the capture path creates
+    // (2 + anchors per private owner plus one per shared entry), spends the remaining state
+    // headroom under the half-budget cap on extra long anchors per owner, gives Host KV the
+    // remainder, and rejects a plan whose state footprint exceeds half the budget.
+    // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
+    std::optional<std::size_t> host_cache_budget_bytes;
+    // Bounded private/shared logical catalogs and per-continuation long-anchor count. An engaged
+    // host-cache budget raises the anchor count within the state inventory it funds.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Minimum token gap between the engine-automatic long anchors of one request, doubling per
+    // anchor walking back from the prompt end (gap k >= spacing * 2^k). Anchors closer than that
+    // cost a prefill split and a full StateImage each while covering little the endpoint and
+    // rewrite checkpoints do not, so the grid is sparse near the end and reaches deep history.
+    // Zero disables the spacing rule (every one of the last L message boundaries is anchored).
+    std::uint32_t long_anchor_min_spacing_tokens = 1024;
 };
 
 struct ContextCostOptions {
@@ -864,6 +878,13 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host retention-tier unit costs. Every Host StateImage slot pins image_bytes regardless of
+    // the prefix depth it resumes, and Host KV pins bytes per page group, so the split of a
+    // budget between the two is the depth-versus-positions trade made visible.
+    std::size_t host_state_image_bytes            = 0;
+    std::size_t host_kv_page_group_bytes          = 0;
+    // Engaged only when the single host RAM budget mode is active.
+    std::size_t host_cache_budget_bytes           = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -914,6 +935,9 @@ struct RuntimeStats {
     std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
+    // A capture the Program declined because the offer was not physically feasible. Unlike an
+    // abort this is a silent retention loss, so it needs its own counter to be observable.
+    std::uint64_t active_captures_skipped   = 0;
 
     std::uint64_t root_selections                    = 0;
     std::uint64_t private_endpoint_selections        = 0;
@@ -923,6 +947,8 @@ struct RuntimeStats {
     std::uint64_t shared_stable_prefix_selections    = 0;
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
+    // Aborted requests whose live state was published as a continuation endpoint.
+    std::uint64_t salvaged_continuations             = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;
@@ -962,6 +988,11 @@ struct RuntimeStats {
     std::uint32_t host_state_occupied_slots            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
+    // Un-written growth reservation held by active requests, split out of the occupied totals
+    // above. Occupancy alone cannot distinguish KV that exists from KV a request is merely still
+    // entitled to, which is what made context-cache starvation invisible in the request log.
+    std::uint32_t device_main_kv_lease_pages           = 0;
+    std::uint32_t device_backend_kv_lease_pages        = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;

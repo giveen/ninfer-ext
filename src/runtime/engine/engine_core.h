@@ -989,24 +989,28 @@ private:
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
+            if (finished.salvaged) { ++cumulative_stats_.salvaged_continuations; }
             request->terminal_reason.reset();
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, reason);
+            // Free the slot and publish the post-release snapshot before waking the caller so
+            // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
+            publish_runtime_stats();
+            complete_success(request, reason);
             boundary = begin_host_phase();
             changed  = true;
         }
-        if (changed) { publish_runtime_stats(); }
         return changed;
     }
 
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return; }
-        bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            const auto& request = slots_[lane];
+            // Copy the slot before remove_completed_slot below resets it so complete_success
+            // keeps the record alive across the release.
+            const auto request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             if (request->capture_pending) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
@@ -1016,15 +1020,17 @@ private:
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
+            if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
             if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, FinishReason::Cancelled);
+            // Free the slot and publish the post-release snapshot before waking the caller so
+            // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
+            publish_runtime_stats();
+            complete_success(request, FinishReason::Cancelled);
             boundary = begin_host_phase();
-            changed  = true;
         }
-        if (changed) { publish_runtime_stats(); }
     }
 
     [[nodiscard]] bool expire_pending_requests() {
@@ -1349,7 +1355,10 @@ private:
         const auto reserved = resources_.reserve_active_capture(
             *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
             CancellationFlagView{&request->cancelled});
-        if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
+        if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) {
+            ++cumulative_stats_.active_captures_skipped;
+            return;
+        }
         request->capture_pending    = true;
         request->post_capture_state = post_capture_state;
         (void)progress_context_transaction(false);
@@ -1752,8 +1761,20 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head, allowance);
-            if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
+            // Inspection is read-only: a throw here (e.g. a planning invariant or an arena
+            // overflow) must fail only this waiting request, not the whole Engine. A single
+            // bad admission must never accumulate worker recoveries into a global fail-all.
+            // The inspection result is move-only, so it is emplaced in place rather than
+            // assigned after a default construction.
+            std::optional<ResourceInspection> head_inspection;
+            try {
+                head_inspection.emplace(inspect_admission(head, allowance));
+            } catch (...) {
+                (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
+            if (head_inspection->readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -1761,14 +1782,14 @@ private:
                 control_progress = true;
                 continue;
             }
-            if (head_inspection.readiness == Readiness::Ready ||
-                head_inspection.readiness == Readiness::NeedsTransfer) {
-                if (!head_inspection.choice) {
+            if (head_inspection->readiness == Readiness::Ready ||
+                head_inspection->readiness == Readiness::NeedsTransfer) {
+                if (!head_inspection->choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
                 AdmissionGrant grant = scheduler_.grant_head(
-                    head->id, head_inspection.choice->summary().service_work_quanta);
-                return admit_planned_request(head, std::move(*head_inspection.choice),
+                    head->id, head_inspection->choice->summary().service_work_quanta);
+                return admit_planned_request(head, std::move(*head_inspection->choice),
                                              std::move(grant));
             }
 
@@ -1826,8 +1847,18 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate, allowance);
-                if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
+                // Same per-request isolation as the FIFO head: a throwing inspection rejects
+                // only this backfill candidate and leaves the rest of the Engine running.
+                // Move-only inspection result, so emplaced in place.
+                std::optional<ResourceInspection> candidate_inspection;
+                try {
+                    candidate_inspection.emplace(inspect_admission(candidate, allowance));
+                } catch (...) {
+                    (void)remove_pending_error(candidate, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                if (candidate_inspection->readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::ContextLengthExceeded,
@@ -1835,22 +1866,23 @@ private:
                     control_progress = true;
                     continue;
                 }
-                if ((candidate_inspection.readiness != Readiness::Ready &&
-                     candidate_inspection.readiness != Readiness::NeedsTransfer) ||
-                    !candidate_inspection.choice) {
+                if ((candidate_inspection->readiness != Readiness::Ready &&
+                     candidate_inspection->readiness != Readiness::NeedsTransfer) ||
+                    !candidate_inspection->choice) {
                     continue;
                 }
                 const auto proof = resources_.prove_persistent_backfill(
-                    *instance_.program, *head->base_plan, *candidate_inspection.choice,
+                    *instance_.program, *head->base_plan, *candidate_inspection->choice,
                     std::span<const SequenceHandle>(persistent_borrowers.data(),
                                                     persistent_borrower_count));
                 if (!proof) { continue; }
-                const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
+                const RequestPlanSummary& candidate_plan =
+                    candidate_inspection->choice->summary();
                 auto grant =
                     scheduler_.qualify_backfill(candidate->id, candidate_plan.service_work_quanta,
                                                 active.span(), proof->resource_revision());
                 if (grant) {
-                    return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
+                    return admit_planned_request(candidate, std::move(*candidate_inspection->choice),
                                                  std::move(*grant));
                 }
             }
@@ -1868,6 +1900,23 @@ private:
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
+    }
+
+    // A sequence whose Device KV lease can no longer grow finishes at the frontier its lease
+    // covers. Bound its remaining budget now so that finish carries the request's generation
+    // limit reason, instead of the sequence running past its lease and failing a launch.
+    void apply_device_kv_lease_settlements() {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr || !request->is_decode_ready() || !request->sequence ||
+                !request->budget) {
+                continue;
+            }
+            const std::uint32_t control = request->output.control_suffix_tokens();
+            const std::optional<std::uint32_t> limit =
+                instance_.program->device_kv_lease_settlement_tokens(*request->sequence, control);
+            if (limit) { request->budget->cap_remaining(*limit); }
+        }
     }
 
     void run_control_batch(const ControlMembership& membership) {
@@ -2056,6 +2105,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                apply_device_kv_lease_settlements();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =

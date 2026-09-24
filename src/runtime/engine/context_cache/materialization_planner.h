@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/resource_search.h"
+#include "runtime/engine/context_cache/seal_window_claim.h"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,9 @@ struct MaterializationCheckpointPolicy {
     std::uint32_t demand_mask          = 0;
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
+    // The incoming request cannot reach this checkpoint's frontier, so it is not a hit the owner
+    // can be credited with retaining.
+    bool unreachable = false;
 };
 
 struct MaterializationOwnerPolicy {
@@ -38,6 +42,34 @@ struct MaterializationOwnerPolicy {
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
 };
+
+// The given pressure owners (the ResourceManager passes every private conversation prefix and
+// every shared prefix), most recently used first (`last_hit_epoch` descending, ties keep input
+// order). For an owner policy `last_hit_epoch` is the owner's recency epoch: the
+// later of its newest checkpoint hit and its last publication, so a continuation that has just
+// been published ranks as recent even though none of its checkpoints has been hit yet. The order
+// is the retention tier's recency ranking: the escape-hatch ladder sacrifices a suffix of it
+// (oldest first), and incremental eviction is licensed only inside the suffix the ladder had to
+// give up.
+template <class Policy>
+[[nodiscard]] inline std::vector<PlanningOwnerId> rank_owners_by_recency(
+    std::span<const Policy> policies, std::span<const PlanningOwnerId> owner_ids) {
+    std::vector<std::pair<std::uint64_t, PlanningOwnerId>> ranked;
+    ranked.reserve(owner_ids.size());
+    for (const PlanningOwnerId owner : owner_ids) {
+        const auto policy =
+            std::ranges::find_if(policies,
+                         [owner](const Policy& candidate) { return candidate.owner == owner; });
+        const std::uint64_t last_hit_epoch = policy == policies.end() ? 0U : policy->last_hit_epoch;
+        ranked.push_back({last_hit_epoch, owner});
+    }
+    std::ranges::stable_sort(ranked,
+                     [](const auto& left, const auto& right) { return left.first > right.first; });
+    std::vector<PlanningOwnerId> order;
+    order.reserve(ranked.size());
+    for (const auto& entry : ranked) { order.push_back(entry.second); }
+    return order;
+}
 
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
@@ -70,6 +102,9 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const MaterializationOwnerPolicy> owner_policy;
         std::span<const MaterializationCheckpointPolicy> checkpoint_policy;
+        // Private and shared owners ranked by recency (latest hit or publication), most recent
+        // first.
+        std::span<const PlanningOwnerId> recency_owner_ids;
     };
 
     struct Result {
@@ -221,7 +256,7 @@ public:
         }
         auto session = program.begin_pressure_planning(
             candidate_handles, candidate_ids, pressure.private_owners, pressure.private_owner_ids,
-            pressure.shared_owners, pressure.shared_owner_ids);
+            pressure.shared_owners, pressure.shared_owner_ids, pressure.recency_owner_ids);
         const auto candidate_index_for = [&](PlanningCandidateId id) -> std::uint32_t {
             const auto found = std::ranges::find_if(
                 candidates, [&](const CandidateInput& input) { return input.id == id; });
@@ -233,18 +268,135 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        // Arena targets interned by the escape-hatch ladder (one per rung) that the
+        // optional-target budget must account for; zero when the identity target is feasible.
+        std::uint32_t ladder_targets = 0;
+        // Ranked owners the ladder had to sacrifice, oldest first; the incremental search may
+        // fully evict an owner only inside this LRU tail.
+        std::uint32_t eviction_licence = 0;
+        std::vector<std::uint32_t> eviction_spared;
+
+        // The escape-hatch ladder for one admission candidate. A rung sacrifices the oldest
+        // `sacrifice` ranked owners (private and shared share one recency order), keeps the rest,
+        // and demotes a kept owner to host wherever Host can take it. It counts only when it is
+        // adoptable: physical fit alone is not enough, because an admission that competes for a
+        // catalogued owner (publication-only pressure) needs one released even when the device
+        // tier fits. Sacrificing one more oldest owner can only free more capacity, so
+        // adoptability is monotonic non-decreasing in the count and the smallest adoptable count is
+        // found in O(log R) projections.
+        //
+        // The demote variant can be physically infeasible on its own -- a kept owner Host cannot
+        // take -- while the sacrifice alone already fits; before, that dropped straight to the
+        // clear-all target. So a physically short rung is retried with the kept owners left where
+        // they are. (A logically short rung is not: keeping owners in place cannot release a
+        // catalogued owner.) Both variants are monotonic, so their union is.
+        //
+        // The smallest adoptable count proves the oldest owners suffice, not that each is needed:
+        // with shared and private owners in one order, a catalog-slot shortage that only a released
+        // private owner can relieve would otherwise also destroy every older shared prefix in the
+        // tail. Each sacrificed owner is therefore tried as spared, most recent first, and stays
+        // spared (treated like any other kept owner) whenever the rung remains adoptable without
+        // it.
+        enum class RungFit : std::uint8_t { Adoptable, LogicallyShort, PhysicallyShort };
+        struct LadderRung {
+            std::uint32_t sacrifice = 0;
+            std::vector<std::uint32_t> spared;
+            bool demote_kept = true;
+        };
+        const auto rung_fit = [&](PlanningCandidateId id, std::uint32_t sacrifice,
+                                  std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+            const std::optional<AssessedPressureTarget> probe = session.assess(
+                session.recency_maximal_target(id, sacrifice, spared_ranks, demote_kept));
+            const PressureTargetAssessment& status = probe->assessment();
+            if (status.candidate != id) {
+                throw std::logic_error("maximal pressure target changed admission candidate");
+            }
+            if (status.physical_status != MaterializationPhysicalStatus::Feasible) {
+                return RungFit::PhysicallyShort;
+            }
+            return logical_goal(status.candidate, status.source_mode, status.owner_outcomes)
+                           .has_value()
+                       ? RungFit::Adoptable
+                       : RungFit::LogicallyShort;
+        };
+        const auto find_ladder_rung =
+            [&](PlanningCandidateId id) -> std::optional<LadderRung> {
+            const std::uint32_t ranked = session.ranked_owner_count();
+            // Whether each probed rung's demote variant was itself adoptable, so the chosen
+            // rung's variant is known without assessing it again.
+            std::vector<std::int8_t> demote_adoptable(static_cast<std::size_t>(ranked) + 1U, -1);
+            const auto adoptable_any = [&](std::uint32_t sacrifice) {
+                const RungFit demoted = rung_fit(id, sacrifice, {}, true);
+                demote_adoptable[sacrifice] = demoted == RungFit::Adoptable ? 1 : 0;
+                return demoted == RungFit::Adoptable ||
+                       (demoted == RungFit::PhysicallyShort &&
+                        rung_fit(id, sacrifice, {}, false) == RungFit::Adoptable);
+            };
+            std::uint32_t lo = 0, hi = ranked;   // smallest feasible count in [lo, hi)
+            while (lo < hi) {
+                const std::uint32_t mid = lo + (hi - lo) / 2U;
+                if (adoptable_any(mid)) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1U;
+                }
+            }
+            // The top rung (every ranked owner sacrificed) is still a rung: when the owner the
+            // admission needs released is the most recent one, it is the only adoptable count, and
+            // sparing then keeps every older owner the admission does not need. Only when even it
+            // cannot be adopted does the caller fall back to the clear-all backstop.
+            if (lo == ranked && (ranked == 0 || !adoptable_any(ranked))) { return std::nullopt; }
+            LadderRung rung;
+            rung.sacrifice   = lo;
+            rung.demote_kept = demote_adoptable[lo] >= 0
+                                   ? demote_adoptable[lo] == 1
+                                   : rung_fit(id, lo, {}, true) == RungFit::Adoptable;
+            for (std::uint32_t rank = ranked - lo; rank < ranked; ++rank) {
+                if (session.optional_targets_remaining() == 0) { break; }
+                rung.spared.push_back(rank);
+                const RungFit fit = rung_fit(id, lo, rung.spared, rung.demote_kept);
+                if (fit == RungFit::Adoptable) { continue; }
+                // Keeping one more owner can be what makes the demote variant physically short
+                // (Host cannot take them all) while leaving the kept owners in place still fits.
+                if (fit == RungFit::PhysicallyShort && rung.demote_kept &&
+                    session.optional_targets_remaining() != 0 &&
+                    rung_fit(id, lo, rung.spared, false) == RungFit::Adoptable) {
+                    rung.demote_kept = false;
+                    continue;
+                }
+                rung.spared.pop_back();
+            }
+            return rung;
+        };
+
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
-            const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
+            // Escape hatch: the smallest adoptable ladder rung for the root candidate; if even the
+            // top rung (sacrifice every ranked owner) cannot fit, the terminal clear-all target
+            // (evict everything) is the guaranteed liveness backstop.
+            const std::uint32_t ladder_remaining_before = session.optional_targets_remaining();
+            const PlanningCandidateId root_id = candidates[root_candidate_index].id;
+            PressureTargetHandle escape;
+            std::optional<AssessedPressureTarget> assessed;
+            std::optional<LadderRung> rung = find_ladder_rung(root_id);
+            if (rung) {
+                // Smallest sacrifice that fits; the more recent prefixes and every spared one stay
+                // on host.
+                escape = session.recency_maximal_target(root_id, rung->sacrifice, rung->spared,
+                                                        rung->demote_kept);
+                assessed = session.assess(escape);
+            } else {
+                escape   = session.root_maximal_target(candidates[root_candidate_index].id);
+                assessed = session.assess(escape);
+            }
+            if (assessed->assessment().candidate != candidates[root_candidate_index].id) {
                 throw std::logic_error("maximal pressure target changed admission candidate");
             }
+            const PressureTargetAssessment& assessment = assessed->assessment();
             ++targets_evaluated;
+            ladder_targets = ladder_remaining_before - session.optional_targets_remaining();
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
@@ -255,10 +407,20 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
+            incumbent = make_incumbent(escape, root_candidate_index, assessment,
+                                       std::move(*assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            if (rung) {
+                eviction_licence = rung->sacrifice;
+                eviction_spared  = std::move(rung->spared);
+            } else {
+                eviction_licence = session.ranked_owner_count();
+            }
         }
+        // Only the LRU tail this ladder proved it must give up, less the owners it spared, may be
+        // fully evicted incrementally; a feasible identity plan needs no eviction at all, so it
+        // licenses none.
+        session.set_eviction_licence(eviction_licence, eviction_spared);
 
         if (!identity_best) { search_started = Clock::now(); }
         const auto search_origin_ns = static_cast<std::uint64_t>(
@@ -274,7 +436,7 @@ public:
         std::uint64_t search_work       = 0;
         const auto work_limit           = static_cast<std::uint64_t>(kTargetBudget) *
                                 (16U + 16ULL * pressure.owner_policy.size());
-        std::uint32_t optional_targets        = 0;
+        std::uint32_t optional_targets        = ladder_targets;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
@@ -385,8 +547,15 @@ public:
         const auto expand_target = [&](const QueueEntry& parent) {
             if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
             if (optional_targets >= kTargetBudget) { return false; }
+            // The session arena also holds targets this layer does not budget (identity
+            // targets, escape-hatch rungs beyond the counted ladder), so bound the commit by
+            // the arena's true remaining capacity; commit_expansion rejects a commit that
+            // overflows it.
+            const std::uint32_t commit_capacity =
+                std::min(kTargetBudget - optional_targets, session.optional_targets_remaining());
+            if (commit_capacity == 0) { return false; }
             auto prepared = session.prepare_expansion(parent.target, 8);
-            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
+            if (prepared.new_canonical_count() > commit_capacity) {
                 session.discard_expansion(std::move(prepared));
                 return false;
             }
@@ -497,13 +666,25 @@ public:
                             incumbent.cost.total_ns - identity_costs_[candidate].lower_bound_ns;
                         search_phase = MaterializationSearchPhase::Assessment;
                         if (allow_work(assessment_step_ns, assessment_step_ns, gain, false)) {
-                            const auto rescue = session.maximal_target(candidates[candidate].id);
-                            const auto guide  = session.guidance(rescue);
+                            // The rescue probe is this candidate's own smallest adoptable ladder
+                            // rung, not a clear-all: a candidate with a different source may give
+                            // up a different owner than the root ladder did, but still only the
+                            // oldest ones it needs, and never a prefix it can do without. (A
+                            // clear-all rescue destroyed every prefix the current request cannot
+                            // reach, since those carry no portfolio value for it.)
+                            const PlanningCandidateId rescue_id = candidates[candidate].id;
+                            const std::uint32_t arena_before = session.optional_targets_remaining();
+                            const std::optional<LadderRung> rescue_rung =
+                                find_ladder_rung(rescue_id);
+                            const auto rescue =
+                                rescue_rung
+                                    ? session.recency_maximal_target(
+                                          rescue_id, rescue_rung->sacrifice, rescue_rung->spared,
+                                          rescue_rung->demote_kept)
+                                    : session.maximal_target(rescue_id);
+                            optional_targets += arena_before - session.optional_targets_remaining();
+                            const auto guide = session.guidance(rescue);
                             if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
-                                if (!target_marked(guide.stable_target_ordinal,
-                                                   kTargetDiscovered)) {
-                                    ++optional_targets;
-                                }
                                 const auto started = Clock::now();
                                 (void)assess_target(rescue, candidate, guide.stable_target_ordinal);
                                 observe_step(assessment_step_ns, started);
@@ -699,27 +880,7 @@ public:
         // force a re-prefill). Back off briefly on contention; if we cannot claim within the
         // budget, fall through to the re-prefill fallback below (the concurrent materialization
         // makes the room, and our next admission restores the checkpoint).
-        struct SealWindowClaim {
-            bool             claimed = false;
-            decltype(session)& s;
-            explicit SealWindowClaim(decltype(session)& ref) noexcept : s(ref) {
-                for (std::uint32_t attempt = 0; attempt < 32U; ++attempt) {
-                    if (ref.try_claim_seal_window()) { claimed = true; break; }
-                    std::this_thread::sleep_for(std::chrono::microseconds(125));
-                }
-            }
-            // Release as soon as the seal (and its fallback) is done, before the result is
-            // constructed. Holding it through the result bookkeeping would starve concurrent
-            // materializations that are waiting to seal.
-            void release() noexcept {
-                if (claimed) {
-                    s.release_seal_window();
-                    claimed = false;
-                }
-            }
-            ~SealWindowClaim() { release(); }
-        };
-        SealWindowClaim seal_claim(session);
+        SealWindowClaim<decltype(session)> seal_claim(session);
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
         if (!incumbent.assessed) {
@@ -742,27 +903,31 @@ public:
         std::vector<std::uint32_t> shared_frontiers =
             final_schedule(selected.id, selected.candidate->summary(), price_split);
         std::optional<ResourcePlan> sealed;
-        if (seal_claim.claimed) {
+        if (seal_claim.claimed()) {
             sealed = session.seal(std::move(*incumbent.assessed), prompt,
                                   FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
         }
         if (!sealed) {
             // The selected preserving target lost its allocation to a concurrent demote
             // between assess and seal (or the seal window was never claimed). Fall back to the
-            // root-maximal eviction target, which needs no host and is always sealable, so the
-            // re-touch re-prefills instead of failing admission.
+            // root-maximal eviction target so the re-touch re-prefills instead of failing
+            // admission.
             const PressureTargetHandle root =
                 session.root_maximal_target(candidates[incumbent.candidate_index].id);
             AssessedPressureTarget root_assessed = session.assess(root);
-            if (root_assessed.assessment().physical_status !=
+            if (root_assessed.assessment().physical_status ==
                 MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("eviction fallback target lost feasibility");
+                sealed = session.seal(std::move(root_assessed), prompt,
+                                      FinalScheduleIntent{.shared_capture_frontiers =
+                                                              shared_frontiers});
             }
-            sealed = session.seal(std::move(root_assessed), prompt,
-                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-            if (!sealed) {
-                throw std::logic_error("eviction fallback target could not be sealed");
-            }
+            // The clear-all target is not always sealable either: while another lane's pressure
+            // transition is still moving pages it can fail the same revalidation. That is a
+            // transient resource race, not a broken invariant, so this admission yields no choice
+            // now and is re-planned on a later scheduling pass, exactly like any other admission
+            // that does not fit yet. Throwing here escaped to the worker loop and failed every
+            // request (private-checkpoint-pressure scenario).
+            if (!sealed) { return std::nullopt; }
             incumbent.root_maximal = true;
         }
         // The seal (and any fallback) is committed; release the claim so a concurrent
@@ -1219,6 +1384,7 @@ private:
                 .rebuild_ns           = policy.rebuild_ns,
                 .baseline_recovery_ns = policy.baseline_recovery_ns,
                 .target_recovery_ns   = target_recovery,
+                .unreachable          = policy.unreachable,
             });
             if (target_recovery > policy.baseline_recovery_ns) {
                 portfolio_degraded = true;

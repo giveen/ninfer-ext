@@ -422,12 +422,20 @@ Address space 拥有 logical order；block table只是 active Device mapping 的
 
 | Extent | 含义 |
 |---|---|
-| entitlement | active request 被保证可取得的最大 Device page count |
+| entitlement | active request 已取得、可在 decode-round 边界继续扩充的有界 Device page window |
 | membership | 已经属于该 address space 的 logical pages |
 | committed frontier | consumer 可以读取的 canonical token prefix |
 
 Membership 可以大于 committed frontier，例如预先 materialize 一个 prefill chunk 或 speculative window。
 这些 bytes 只有在 target commit frontier 后才成为 canonical state。
+
+Entitlement 不预留 active request 的全部剩余 output 预算。Generation 只租用「当前 frontier 加一个 bounded
+window（约 4096 tokens）加一个 per-lane cushion」的 page count，并在每个 decode-round 边界按需扩充该 window；
+window 之外、尚未取得的 output budget 不计入 active entitlement，因此可以留给 retained prefix。cushion 是
+reservation 中 cache 不得占用的一段，它保证「即将 launch 的那一步」以及一次 forced control span 已被覆盖。
+Entitlement 保证的是当前已取得的容量：每个 launch 在 round boundary 上要求 entitlement 覆盖该步所需 pages；
+池已无法再扩充该 window 时，request 在 window 覆盖的 frontier 上以 length 结束（bounded completion），
+而不是让某一步的 materialization 越过 entitlement。
 
 不同 pools 的 membership 和 frontier 可以不同；Program model schedule 定义它们之间的语义关系，
 KV Store 不自行推导。
@@ -739,13 +747,15 @@ consumer，且 replay in-flight期间不得改写同一 row。
 7. Published checkpoint所需coverage不可被writer覆盖；任一logical page至多一个writer。
 8. Shared full pages immutable；non-aligned writable tail先建立private COW page。
 9. Host/Device replacement在copy与epoch/coverage验证完成后才发布。
-10. Active entitlement在terminal release前不进入global available capacity。
+10. Active entitlement在terminal release前不进入global available capacity；它只在decode-round边界按需增大，
+    并由该request的bounded completion归还。
 11. 一个GPU execution unit内membership、block tables、replicas与read frontier稳定。
 12. Inactive address space不占execution row；execution row不拥有logical pages。
 13. Main与backend pools分别reserve、materialize、commit和truncate。
 14. Growing-cache consumer只通过paged view和block table访问KV，不取得allocator或ownership authority。
 15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV。
 16. Checkpoint可复用性由完整target continuation证明，KV page存在本身不构成hit。
+17. 每个decode或forced launch所需的覆盖在round boundary上已被entitlement满足；shortfall不通过异常离开该步。
 
 ---
 

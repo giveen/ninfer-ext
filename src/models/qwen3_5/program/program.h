@@ -31,13 +31,19 @@ struct CaptureAssessmentImpl;
 } // namespace detail
 
 // Read-only diagnostics sampled from the real Program stores.  This is not an accounting input.
+// The `_lease_pages` fields split the un-written growth reservation out of the corresponding
+// `device_*_kv_pages` total, so a reader can tell KV that actually exists from KV an active
+// request is merely still entitled to.  Only reporting the total hides how much Device KV a
+// running request reserves against the context cache.
 struct PhysicalUsageSnapshot {
     runtime::ProgramResourceRevision resource_revision;
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t device_state_slots            = 0;
+    std::uint32_t host_state_slots              = 0;
+    std::uint32_t device_main_kv_pages          = 0;
+    std::uint32_t device_backend_kv_pages       = 0;
+    std::uint32_t device_main_kv_lease_pages    = 0;
+    std::uint32_t device_backend_kv_lease_pages = 0;
+    std::size_t host_kv_bytes                   = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;
@@ -153,6 +159,10 @@ public:
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    // The context-cache shape this plan was frozen with. An engaged host RAM budget has already
+    // resolved the Host state slots, Host KV bytes and long-anchor count here, so a reader that
+    // reports or enforces capacity must take them from the plan rather than from raw options.
+    [[nodiscard]] const ContextCacheOptions& context_cache_options() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
@@ -568,6 +578,31 @@ public:
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // Escape-hatch recency-ladder rung: fully evict the `sacrifice_oldest` oldest ranked owners
+    // (private and shared share one recency order), and keep every other owner (demoting a kept
+    // owner to host wherever Host can take it, which frees its device resources while keeping the
+    // prefix). Rungs differ only in how many of the oldest owners they give up; whether a rung
+    // frees enough is what its adoption check decides. The caller walks sacrifice
+    // 0..`ranked_owner_count()`-1 (most-preserving first) and, if none is adoptable, falls back to
+    // `root_maximal_target` (clear everything).
+    // `spared_ranks` lists recency ranks inside the sacrificed tail that the rung keeps anyway:
+    // the admission planner spares every sacrificed owner whose eviction the rung does not need.
+    // With `demote_kept` false, owners outside the tail are left in place instead of demoted.
+    [[nodiscard]] PressureTargetHandle
+    recency_maximal_target(runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+                           std::span<const std::uint32_t> spared_ranks = {},
+                           bool demote_kept                            = true);
+    // Number of owners in the recency order; bounds the escape-hatch ladder.
+    [[nodiscard]] std::uint32_t ranked_owner_count() const;
+    // Licences incremental eviction of the `oldest_licensed` oldest ranked owners except
+    // `spared_ranks`; see PressurePlanningSessionImpl::owner_eviction_licensed.
+    void set_eviction_licence(std::uint32_t oldest_licensed,
+                              std::span<const std::uint32_t> spared_ranks = {});
+    // Canonical target slots this session's arena can still hold. The arena also holds targets
+    // a planning layer does not count in its own budget (identity targets, escape-hatch
+    // maximal rungs), so expansion commits must be bounded by this value; commit_expansion
+    // rejects a commit that overflows the arena.
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -622,10 +657,17 @@ public:
     [[nodiscard]] PressureTargetHandle identity_target() const;
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
+    // Canonical target slots the underlying session's arena can still hold; bound expansion
+    // commits by this value (see PressurePlanningSession::optional_targets_remaining).
+    [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept;
     [[nodiscard]] PreparedPressureExpansion prepare_expansion(PressureTargetHandle parent);
     [[nodiscard]] PressureExpansionView commit_expansion(PreparedPressureExpansion&& prepared);
     void discard_expansion(PreparedPressureExpansion&& prepared) noexcept;
     [[nodiscard]] std::optional<CapturePressurePlan> seal(AssessedPressureTarget&& assessed);
+    // The Program's seal window, as on PressurePlanningSession: claimed around `seal` so a
+    // concurrent demote cannot invalidate the selected target between assess and seal.
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
     [[nodiscard]] static constexpr runtime::PlanningCandidateId candidate_id() noexcept {
         return runtime::PlanningCandidateId{.value = 0};
@@ -826,6 +868,9 @@ struct FinishResult {
     runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // True when the terminal finish fell back to abort and the lane's live state was published
+    // as a continuation endpoint at its last committed frontier instead of being discarded.
+    bool salvaged = false;
     ContinuationSummary summary;
     std::optional<ContinuationHandle> continuation;
 };
@@ -834,6 +879,11 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // True when the aborted lane's live state was published as a continuation endpoint at its
+    // last committed frontier instead of being discarded.
+    bool salvaged = false;
+    ContinuationSummary summary;
+    std::optional<ContinuationHandle> continuation;
 };
 
 struct ReleaseResult {
@@ -868,7 +918,8 @@ public:
                             std::span<const ContinuationHandle* const> private_owners,
                             std::span<const runtime::PlanningOwnerId> private_owner_ids,
                             std::span<const SharedPrefixHandle* const> shared_owners,
-                            std::span<const runtime::PlanningOwnerId> shared_owner_ids);
+                            std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+                            std::span<const runtime::PlanningOwnerId> recency_order);
     [[nodiscard]] runtime::PrefillWork
     shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
                                       const PreparedPrompt& prompt,
@@ -901,7 +952,8 @@ public:
                                     std::span<const ContinuationHandle* const> private_owners,
                                     std::span<const runtime::PlanningOwnerId> private_owner_ids,
                                     std::span<const SharedPrefixHandle* const> shared_owners,
-                                    std::span<const runtime::PlanningOwnerId> shared_owner_ids);
+                                    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+                                    std::span<const runtime::PlanningOwnerId> recency_order);
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);
@@ -934,6 +986,15 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    // The Device KV lease of an active sequence is extended on demand at a decode-round boundary.
+    // When the pool can no longer extend it, the sequence finishes at the frontier its lease
+    // covers with its generation limit reason instead of failing a launch on coverage: this
+    // reports how many further model tokens that finish licenses, so the caller can bound the
+    // sequence's remaining generation budget. `forced_span_tokens` is the largest forced control
+    // span the caller may still apply through the same budget. Absent while the lease can grow.
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;

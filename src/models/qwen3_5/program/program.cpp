@@ -37,6 +37,11 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
+    static const ContextCacheOptions empty;
+    return impl_ != nullptr ? impl_->context_cache : empty;
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -134,6 +139,27 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+PressureTargetHandle PressurePlanningSession::recency_maximal_target(
+    runtime::PlanningCandidateId candidate, std::uint32_t sacrifice_oldest,
+    std::span<const std::uint32_t> spared_ranks, bool demote_kept) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->recency_maximal_target(candidate, sacrifice_oldest, spared_ranks, demote_kept);
+}
+
+std::uint32_t PressurePlanningSession::ranked_owner_count() const {
+    if (impl_ == nullptr) { return 0; }
+    return impl_->ranked_owner_count();
+}
+
+void PressurePlanningSession::set_eviction_licence(std::uint32_t oldest_licensed,
+                                                   std::span<const std::uint32_t> spared_ranks) {
+    if (impl_ != nullptr) { impl_->set_eviction_licence(oldest_licensed, spared_ranks); }
+}
+
+std::uint32_t PressurePlanningSession::optional_targets_remaining() const noexcept {
+    return impl_ != nullptr ? impl_->optional_targets_remaining() : 0;
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);
@@ -229,6 +255,10 @@ AssessedPressureTarget CapturePressurePlanningSession::assess(PressureTargetHand
     return session_.assess(target);
 }
 
+std::uint32_t CapturePressurePlanningSession::optional_targets_remaining() const noexcept {
+    return session_.optional_targets_remaining();
+}
+
 PreparedPressureExpansion
 CapturePressurePlanningSession::prepare_expansion(PressureTargetHandle parent) {
     return session_.prepare_expansion(parent);
@@ -247,6 +277,14 @@ void CapturePressurePlanningSession::discard_expansion(
 std::optional<CapturePressurePlan>
 CapturePressurePlanningSession::seal(AssessedPressureTarget&& assessed) {
     return session_.seal_capture(std::move(assessed));
+}
+
+bool CapturePressurePlanningSession::try_claim_seal_window() noexcept {
+    return session_.try_claim_seal_window();
+}
+
+void CapturePressurePlanningSession::release_seal_window() noexcept {
+    session_.release_seal_window();
 }
 
 Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
@@ -292,7 +330,8 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
                                  std::span<const ContinuationHandle* const> private_owners,
                                  std::span<const runtime::PlanningOwnerId> private_owner_ids,
                                  std::span<const SharedPrefixHandle* const> shared_owners,
-                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+                                 std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+                                 std::span<const runtime::PlanningOwnerId> recency_order) {
     using SessionImpl = detail::PressurePlanningSessionImpl;
     std::vector<SessionImpl::PhysicalCandidateBinding> physical_candidates;
     physical_candidates.reserve(candidates.size());
@@ -307,7 +346,7 @@ Program::begin_pressure_planning(std::span<const AdmissionCandidate* const> cand
     }
     return PressurePlanningSession(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, recency_order));
 }
 
 runtime::PrefillWork
@@ -374,7 +413,8 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const CaptureAssessment& assessment, std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,
     std::span<const SharedPrefixHandle* const> shared_owners,
-    std::span<const runtime::PlanningOwnerId> shared_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> shared_owner_ids,
+    std::span<const runtime::PlanningOwnerId> recency_order) {
     CapturePressureCandidate candidate(impl_->make_capture_physical_candidate(assessment));
     using SessionImpl = detail::PressurePlanningSessionImpl;
     const std::array physical_candidates{SessionImpl::PhysicalCandidateBinding{
@@ -384,7 +424,7 @@ CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const std::array candidate_ids{CapturePressurePlanningSession::candidate_id()};
     PressurePlanningSession session(std::make_unique<detail::PressurePlanningSessionImpl>(
         *impl_, physical_candidates, candidate_ids, private_owners, private_owner_ids,
-        shared_owners, shared_owner_ids));
+        shared_owners, shared_owner_ids, recency_order));
     return CapturePressurePlanningSession(std::move(candidate), std::move(session));
 }
 
@@ -454,6 +494,11 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
 FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
+
+std::optional<std::uint32_t> Program::device_kv_lease_settlement_tokens(
+    SequenceHandle sequence, std::uint32_t forced_span_tokens) const noexcept {
+    return impl_->device_kv_lease_settlement_tokens(sequence, forced_span_tokens);
+}
 
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));
