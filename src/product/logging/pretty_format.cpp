@@ -2,8 +2,7 @@
 
 #include <array>
 #include <cmath>
-#include <iomanip>
-#include <sstream>
+#include <format>
 
 namespace ninfer::product {
 namespace {
@@ -13,11 +12,7 @@ int scaled_precision(double value) noexcept {
     return 1;
 }
 
-std::string fixed(double value, int precision) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(precision) << value;
-    return out.str();
-}
+std::string fixed(double value, int precision) { return std::format("{:.{}f}", value, precision); }
 
 } // namespace
 

@@ -3,9 +3,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <chrono>
-#include <cstdio>
+#include <format>
 #include <random>
 #include <vector>
 #include <string_view>
@@ -18,20 +17,14 @@ namespace {
 std::string chat_identifier(std::string_view prefix) {
     static thread_local std::mt19937_64 random{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> distribution;
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx",
-                  static_cast<unsigned long long>(distribution(random)));
-    return std::string(prefix) + buffer.data();
+    return std::string(prefix) + std::format("{:016x}", distribution(random));
 }
 
 std::string responses_identifier(std::string_view prefix) {
     static thread_local std::mt19937_64 random{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> distribution;
-    std::array<char, 48> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx%016llx",
-                  static_cast<unsigned long long>(distribution(random)),
-                  static_cast<unsigned long long>(distribution(random)));
-    return std::string(prefix) + "_" + buffer.data();
+    return std::string(prefix) + "_" +
+           std::format("{:016x}{:016x}", distribution(random), distribution(random));
 }
 
 } // namespace

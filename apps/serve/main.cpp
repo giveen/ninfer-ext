@@ -10,7 +10,7 @@
 #include <chrono>
 #include <csignal>
 #include <exception>
-#include <iostream>
+#include <print>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -32,15 +32,15 @@ int main(int argc, char** argv) {
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
-        std::cerr << "ninfer-serve: " << exception.what() << '\n';
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        std::println(stderr, "ninfer-serve: {}", exception.what());
+        std::print(stderr, "{}", ninfer::serve::serve_usage_text(argv[0]));
         return 1;
     } catch (const std::exception& exception) {
-        std::cerr << "ninfer-serve: " << exception.what() << '\n';
+        std::println(stderr, "ninfer-serve: {}", exception.what());
         return 1;
     }
     if (options.help_requested) {
-        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        std::print("{}", ninfer::serve::serve_usage_text(argv[0]));
         return 0;
     }
 

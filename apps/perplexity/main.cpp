@@ -14,15 +14,14 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
-#include <ctime>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <optional>
-#include <sstream>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -161,12 +160,8 @@ std::string safe_component(std::string_view value) {
 }
 
 std::string timestamp() {
-    const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm utc{};
-    gmtime_r(&now, &utc);
-    std::ostringstream out;
-    out << std::put_time(&utc, "%Y%m%d-%H%M%S");
-    return out.str();
+    const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+    return std::format("{:%Y%m%d-%H%M%S}", now);
 }
 
 std::filesystem::path prepare_output_directory(const Options& options,
@@ -266,15 +261,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     for (std::size_t stream_index = 0; stream_index < streams.size(); ++stream_index) {
         EvaluationStream& stream = streams[stream_index];
-        std::ostringstream stream_status;
-        stream_status << "  scoring [" << stream_index + 1 << '/' << streams.size() << "] "
-                      << ninfer::product::format_pretty_text(stream.source.id) << " | "
-                      << ninfer::product::format_pretty_count(stream.tokens.size()) << " tokens | "
-                      << ninfer::product::format_pretty_count(stream.windows.size()) << " windows";
+        const std::string stream_status =
+            std::format("  scoring [{}/{}] {} | {} tokens | {} windows", stream_index + 1,
+                        streams.size(), ninfer::product::format_pretty_text(stream.source.id),
+                        ninfer::product::format_pretty_count(stream.tokens.size()),
+                        ninfer::product::format_pretty_count(stream.windows.size()));
         if (progress->enabled()) {
-            progress->update(stream_status.str());
+            progress->update(stream_status);
         } else {
-            logger->debug("{}", stream_status.str());
+            logger->debug("{}", stream_status);
         }
         const Clock::time_point stream_started = Clock::now();
         ScoreAggregate stream_score;
@@ -318,18 +313,18 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 const double rate    = static_cast<double>(overall.scored_tokens) / elapsed;
                 const std::uint64_t remaining = total_scored_tokens - overall.scored_tokens;
                 const double eta = rate > 0 ? static_cast<double>(remaining) / rate : 0.0;
-                std::ostringstream line;
-                line << "scoring | " << ninfer::product::format_pretty_count(overall.scored_tokens)
-                     << '/' << ninfer::product::format_pretty_count(total_scored_tokens)
-                     << " tokens | " << completed_windows << '/' << total_windows
-                     << " windows | PPL " << std::fixed << std::setprecision(4) << overall.ppl()
-                     << " | " << ninfer::product::format_pretty_rate(rate, "tok") << " | elapsed "
-                     << ninfer::product::format_pretty_duration(elapsed) << " | ETA "
-                     << ninfer::product::format_pretty_duration(eta);
+                const std::string line        = std::format(
+                    "scoring | {}/{} tokens | {}/{} windows | PPL {:.4f} | {} | elapsed {} | ETA "
+                    "{}",
+                    ninfer::product::format_pretty_count(overall.scored_tokens),
+                    ninfer::product::format_pretty_count(total_scored_tokens), completed_windows,
+                    total_windows, overall.ppl(), ninfer::product::format_pretty_rate(rate, "tok"),
+                    ninfer::product::format_pretty_duration(elapsed),
+                    ninfer::product::format_pretty_duration(eta));
                 if (progress->enabled()) {
-                    progress->update("  " + line.str());
+                    progress->update("  " + line);
                 } else {
-                    logger->info("{}", line.str());
+                    logger->info("{}", line);
                 }
                 next_progress = Clock::now() + std::chrono::seconds(10);
             }
@@ -411,24 +406,20 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     std::filesystem::rename(temporary, final);
 
-    std::cout << "Perplexity result\n"
-              << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
-              << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
-              << "\n\n";
-    std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"
-              << std::setw(16) << "mean_nll" << std::setw(16) << "ppl" << '\n';
+    std::println("Perplexity result");
+    std::println("artifact: {}", load.model_name);
+    std::println("kv: {}, corpus: {} / {}, context/stride: {}/{}\n", kv_name(options.kv),
+                 corpus.corpus_id, corpus.mode, options.context, options.stride);
+    std::println("{:<24}{:>16}{:>16}{:>16}", "domain", "tokens", "mean_nll", "ppl");
     for (const auto& [domain, aggregate] : domains) {
-        std::cout << std::left << std::setw(24) << domain << std::right << std::setw(16)
-                  << aggregate.scored_tokens << std::setw(16) << std::fixed << std::setprecision(6)
-                  << aggregate.mean_nll() << std::setw(16) << aggregate.ppl() << '\n';
+        std::println("{:<24}{:>16}{:>16.6f}{:>16.6f}", domain, aggregate.scored_tokens,
+                     aggregate.mean_nll(), aggregate.ppl());
     }
-    std::cout << std::left << std::setw(24) << "overall" << std::right << std::setw(16)
-              << overall.scored_tokens << std::setw(16) << std::fixed << std::setprecision(6)
-              << overall.mean_nll() << std::setw(16) << overall.ppl() << "\n\n"
-              << "score rate: " << std::setprecision(1)
-              << static_cast<double>(overall.scored_tokens) / scoring_seconds << " tok/s\n"
-              << "report: " << final << '\n';
+    std::println("{:<24}{:>16}{:>16.6f}{:>16.6f}\n", "overall", overall.scored_tokens,
+                 overall.mean_nll(), overall.ppl());
+    std::println("score rate: {:.1f} tok/s",
+                 static_cast<double>(overall.scored_tokens) / scoring_seconds);
+    std::println("report: {:?}", final.string());
     return 0;
 }
 
@@ -439,12 +430,12 @@ int main(int argc, char** argv) {
     try {
         options = parse_options(argc, argv);
     } catch (const std::exception& error) {
-        std::cerr << "ninfer-perplexity: " << error.what() << '\n';
-        std::cerr << usage_text();
+        std::println(stderr, "ninfer-perplexity: {}", error.what());
+        std::print(stderr, "{}", usage_text());
         return 1;
     }
     if (options.help_requested) {
-        std::cout << usage_text();
+        std::print("{}", usage_text());
         return 0;
     }
 

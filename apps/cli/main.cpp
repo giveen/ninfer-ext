@@ -9,9 +9,9 @@
 
 #include <cstdint>
 #include <exception>
-#include <iomanip>
+#include <format>
 #include <iostream>
-#include <sstream>
+#include <print>
 #include <string>
 #include <string_view>
 
@@ -48,12 +48,10 @@ std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
 
 std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
-           << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
-           << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
-           << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
-    return output.str();
+    return std::format("temp={:.2f} top_p={:.2f} top_k={} min_p={:.2f} presence={:.2f} freq={:.2f} "
+                       "seed={}",
+                       sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p,
+                       sampling.presence_penalty, sampling.frequency_penalty, sampling.seed);
 }
 
 std::string format_finish(ninfer::FinishReason reason) {
@@ -95,12 +93,11 @@ std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
 }
 
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
-    std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
-              << std::setw(12) << format_seconds(seconds) << '\n';
+    std::println(stderr, "{:<12}{:<26}{:>12}", group, detail, format_seconds(seconds));
 }
 
 void print_metric(std::string_view label, std::string_view value) {
-    std::cerr << std::left << std::setw(12) << "summary" << std::setw(26) << label << value << '\n';
+    std::println(stderr, "{:<12}{:<26}{}", "summary", label, value);
 }
 
 class StreamingSink final : public ninfer::OutputSink {
@@ -208,20 +205,17 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric(backend + " acceptance rate",
                      format_percent(speculative.accepted_tokens, speculative.drafted_tokens));
         if (speculative.rounds != 0) {
-            std::ostringstream length;
-            length << std::fixed << std::setprecision(2)
-                   << 1.0 + static_cast<double>(speculative.accepted_tokens) /
-                                static_cast<double>(speculative.rounds)
-                   << " tok/round";
-            print_metric(backend + " acceptance length", length.str());
+            const double length = 1.0 + static_cast<double>(speculative.accepted_tokens) /
+                                            static_cast<double>(speculative.rounds);
+            print_metric(backend + " acceptance length", std::format("{:.2f} tok/round", length));
         }
         if (!speculative.accepted_per_position.empty()) {
-            std::ostringstream positions;
+            std::string positions;
             for (std::size_t i = 0; i < speculative.accepted_per_position.size(); ++i) {
-                if (i != 0) { positions << ','; }
-                positions << speculative.accepted_per_position[i];
+                if (i != 0) { positions += ','; }
+                positions += std::to_string(speculative.accepted_per_position[i]);
             }
-            print_metric(backend + " accepted by pos", positions.str());
+            print_metric(backend + " accepted by pos", positions);
         }
     }
 }
@@ -233,12 +227,12 @@ int main(int argc, char** argv) {
     try {
         cli = ninfer::cli::parse_options(argc, argv);
     } catch (const std::exception& error) {
-        std::cerr << "error: " << error.what() << '\n';
-        std::cerr << ninfer::cli::usage_text(argv[0]);
+        std::println(stderr, "error: {}", error.what());
+        std::print(stderr, "{}", ninfer::cli::usage_text(argv[0]));
         return 1;
     }
     if (cli.help_requested) {
-        std::cout << ninfer::cli::usage_text(argv[0]);
+        std::print("{}", ninfer::cli::usage_text(argv[0]));
         return 0;
     }
 
@@ -303,14 +297,14 @@ int main(int argc, char** argv) {
             throw;
         }
 
-        std::cerr << "phase       detail                      elapsed/progress\n";
+        std::println(stderr, "phase       detail                      elapsed/progress");
         if (cli.print_token_ids) {
-            std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";
+            std::string ids;
             for (std::size_t i = 0; i < result.generated_token_ids.size(); ++i) {
-                if (i != 0) { std::cerr << ' '; }
-                std::cerr << result.generated_token_ids[i];
+                if (i != 0) { ids += ' '; }
+                ids += std::to_string(result.generated_token_ids[i]);
             }
-            std::cerr << '\n';
+            std::println(stderr, "{:<12}{:<26}{}", "tokens", "generated ids", ids);
         }
         print_generation_summary(result, sampling, engine.memory_summary());
         return 0;
