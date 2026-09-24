@@ -238,6 +238,47 @@ drafts against 30.2% (340 speculative rounds against 335); the cause is not yet 
 are single-request Op-and-engine numbers on short prompts, not a replacement for the serving
 corpus above. DFlash2, concurrency above one and NVFP4 35B-A3B were not measured.
 
+### Adaptive MTP draft length
+
+Without `--fixed-draft`, `--draft-tokens 7` makes 7 the ceiling of an adaptive policy. A single
+request drafts 2, 3, 4 or 7 tokens per round, chosen from its recent acceptance and the round times
+measured at startup; rounds with several requests decoding together draft 3, where longer drafts
+raised no aggregate throughput at concurrency 2, 4 or 8. The MTP3 tables above pin K=3 with
+`--fixed-draft`.
+
+Single-request greedy decode on one RTX 5090 (CUDA Graphs, default KV type), decode tok/s, mean of
+three runs per cell; the 27B is the Qwen3.8-27B `groupwise-int` artifact. The nine prompts are short local ones, not
+shipped with the repository: three code-edit prompts (`refactor`, `cppfix`, `edit2`), two
+code-generation (`codegen`, `codegen2`), two prose (`prose`, `prose2`) and two reasoning
+(`reason`, `reason2`) requests. Non-reasoning prompts use `--no-thinking --max-new 640`; reasoning
+prompts use `--max-new 1200`.
+
+| Prompt | 27B K=3 | 27B adaptive | Change | 35B-A3B K=3 | 35B-A3B adaptive | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| refactor | 208.4 | 220.9 | +6.0% | 714.7 | 740.9 | +3.7% |
+| cppfix | 215.7 | 263.4 | +22.1% | 750.1 | 802.5 | +7.0% |
+| edit2 | 220.1 | 287.3 | +30.5% | 752.2 | 769.3 | +2.3% |
+| codegen | 197.7 | 208.7 | +5.6% | 676.7 | 651.3 | −3.8% |
+| codegen2 | 189.4 | 199.0 | +5.1% | 674.3 | 673.5 | −0.1% |
+| prose | 140.2 | 139.6 | −0.4% | 496.7 | 508.4 | +2.3% |
+| prose2 | 121.9 | 129.3 | +6.1% | 454.7 | 499.5 | +9.8% |
+| reason | 188.7 | 188.0 | −0.4% | 587.8 | 611.1 | +4.0% |
+| reason2 | 185.8 | 191.8 | +3.2% | 663.1 | 663.6 | +0.1% |
+| Geometric mean | | | +8.2% | | | +2.7% |
+
+Per class, the 27B gains +19.1% on edits, +5.3% on code generation, +2.8% on prose and +1.4% on
+reasoning; the 35B-A3B gains +4.3%, −2.0%, +6.0% and +2.0%. Without speculation the 27B decodes at
+about 80 tok/s and the 35B-A3B at about 370 tok/s. Server runs at concurrency 2, 4 and 8 stayed
+within ±3% of fixed K=3. Each cell is one command, with `--draft-tokens 3 --fixed-draft` for the
+K=3 column:
+
+```bash
+build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "$(cat prompt.txt)" \
+  --max-context 8192 --greedy --spec mtp --draft-tokens 7 --no-thinking --max-new 640
+```
+
+The summary line reports `decode speed` and, for adaptive runs, `mtp rounds by length`.
+
 ## Evaluation
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
