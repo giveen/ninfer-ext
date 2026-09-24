@@ -134,16 +134,33 @@ struct Q4Codec {
         return 1.0F;
     }
 
+    // The raw words of one eight-value fetch, kept apart from their decode so a caller can issue
+    // several fetches before decoding any of them.
+    struct Raw {
+        std::uint32_t packed;
+        std::uint16_t scale_bits;
+    };
+
+    template <int K>
+    __device__ static __forceinline__ Raw fetch(const SparseMoePlanes& planes, int row, int group,
+                                                int lane_in_group) {
+        const std::int64_t index = static_cast<std::int64_t>(row) * (K / kGroupK) + group;
+        return {
+            *reinterpret_cast<const std::uint32_t*>(
+                planes.codes + index * Q4RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4),
+            *reinterpret_cast<const std::uint16_t*>(
+                planes.scales + index * Q4RowSplitStorage::kScaleBytesPerGroup)};
+    }
+
+    __device__ static __forceinline__ void decode(Raw raw, float (&weights)[8]) {
+        Q4SimtDecodeAtom::decode_eight(raw.packed, raw.scale_bits, weights);
+    }
+
     template <int K>
     __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
                                                       int group, int lane_in_group, float,
                                                       float (&weights)[8]) {
-        const std::int64_t index   = static_cast<std::int64_t>(row) * (K / kGroupK) + group;
-        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
-            planes.codes + index * Q4RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
-        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
-            planes.scales + index * Q4RowSplitStorage::kScaleBytesPerGroup);
-        Q4SimtDecodeAtom::decode_eight(packed, scale_bits, weights);
+        decode(fetch<K>(planes, row, group, lane_in_group), weights);
     }
 };
 
@@ -265,7 +282,35 @@ struct Nvfp4Codec {
 template <class>
 inline constexpr bool kNoLaneOwnership = false;
 
-template <class Codec, int K>
+// A codec that can separate its raw fetch from its decode: `Raw`, `fetch` and `decode`.
+template <class Codec>
+inline constexpr bool kSplitFetch = requires { typename Codec::Raw; };
+
+// One lane's eight weights of each row against eight consecutive activations.
+__device__ __forceinline__ void accumulate_eight(const __nv_bfloat16* x_lane,
+                                                 const float (&weights0)[8],
+                                                 const float (&weights1)[8], float& acc0,
+                                                 float& acc1) {
+    const uint4 input     = load_vec<uint4>(x_lane);
+    const float2 x0       = bf16x2_bits_to_float2(input.x);
+    const float2 x1       = bf16x2_bits_to_float2(input.y);
+    const float2 x2       = bf16x2_bits_to_float2(input.z);
+    const float2 x3       = bf16x2_bits_to_float2(input.w);
+    const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        acc0 = fmaf(weights0[item], values[item], acc0);
+        acc1 = fmaf(weights1[item], values[item], acc1);
+    }
+}
+
+// QuadsInFlight is the number of four-group quads whose raw words are fetched before any is
+// decoded, for codecs that can split fetch from decode. One quad in flight leaves the load unit
+// idle for the whole decode; two overlap one quad's decode and FMA chain with the next quad's
+// memory latency, which pays where the path is latency-bound rather than bandwidth-bound. Groups
+// are still visited in ascending order at any depth, so the accumulation order, and therefore the
+// output, is bit-identical. Codecs without a split fetch ignore it.
+template <class Codec, int K, int QuadsInFlight = 2>
 __device__ __forceinline__ void dot_two_rows(const SparseMoePlanes& planes, int row0, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
                                              float& result0, float& result1) {
@@ -279,22 +324,41 @@ __device__ __forceinline__ void dot_two_rows(const SparseMoePlanes& planes, int 
         const int lane_in_group = lane & 7;
         const float scale0      = Codec::row_coefficient(planes, row0);
         const float scale1      = Codec::row_coefficient(planes, row1);
-        for (int group_base = first_group; group_base < last_group; group_base += 4) {
-            const int group = group_base + lane_group;
-            float weights0[8];
-            float weights1[8];
-            Codec::template load_eight<K>(planes, row0, group, lane_in_group, scale0, weights0);
-            Codec::template load_eight<K>(planes, row1, group, lane_in_group, scale1, weights1);
-            const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
-            const float2 x0       = bf16x2_bits_to_float2(input.x);
-            const float2 x1       = bf16x2_bits_to_float2(input.y);
-            const float2 x2       = bf16x2_bits_to_float2(input.z);
-            const float2 x3       = bf16x2_bits_to_float2(input.w);
-            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+        if constexpr (kSplitFetch<Codec> && QuadsInFlight > 1) {
+            // The pairing needs the walked span, (k_end - k_begin) / kGroupK, to be a multiple of
+            // 4 * QuadsInFlight. That is a property of the arguments; every caller passes
+            // k_begin = 0 and k_end = K, which reduces it to this compile-time condition.
+            static_assert((K / Codec::kGroupK) % (4 * QuadsInFlight) == 0);
+            for (int group_base = first_group; group_base < last_group;
+                 group_base += 4 * QuadsInFlight) {
+                typename Codec::Raw raw0[QuadsInFlight];
+                typename Codec::Raw raw1[QuadsInFlight];
 #pragma unroll
-            for (int item = 0; item < 8; ++item) {
-                acc0 = fmaf(weights0[item], values[item], acc0);
-                acc1 = fmaf(weights1[item], values[item], acc1);
+                for (int quad = 0; quad < QuadsInFlight; ++quad) {
+                    const int group = group_base + quad * 4 + lane_group;
+                    raw0[quad]      = Codec::template fetch<K>(planes, row0, group, lane_in_group);
+                    raw1[quad]      = Codec::template fetch<K>(planes, row1, group, lane_in_group);
+                }
+#pragma unroll
+                for (int quad = 0; quad < QuadsInFlight; ++quad) {
+                    const int group = group_base + quad * 4 + lane_group;
+                    float weights0[8];
+                    float weights1[8];
+                    Codec::decode(raw0[quad], weights0);
+                    Codec::decode(raw1[quad], weights1);
+                    accumulate_eight(x + group * Codec::kGroupK + lane_in_group * 8, weights0,
+                                     weights1, acc0, acc1);
+                }
+            }
+        } else {
+            for (int group_base = first_group; group_base < last_group; group_base += 4) {
+                const int group = group_base + lane_group;
+                float weights0[8];
+                float weights1[8];
+                Codec::template load_eight<K>(planes, row0, group, lane_in_group, scale0, weights0);
+                Codec::template load_eight<K>(planes, row1, group, lane_in_group, scale1, weights1);
+                accumulate_eight(x + group * Codec::kGroupK + lane_in_group * 8, weights0, weights1,
+                                 acc0, acc1);
             }
         }
     } else if constexpr (Codec::kSingleValuePerLane) {
@@ -331,8 +395,10 @@ __global__ void sparse_moe_d3_nine_warp_kernel(const __nv_bfloat16* __restrict__
         pdl::wait_for_dependencies();
         const int expert   = ids[warp];
         const int row_base = expert * 1024;
-        dot_two_rows<RoutedCodec, kHidden>(routed, row_base + j, row_base + kIntermediate + j,
-                                           x_shared, 0, kHidden, gate, up);
+        // One token per launch leaves a fifth of the occupancy of the path-tiled kernel, so
+        // pairing quads costs more than it hides here: keep one quad in flight.
+        dot_two_rows<RoutedCodec, kHidden, 1>(routed, row_base + j, row_base + kIntermediate + j,
+                                              x_shared, 0, kHidden, gate, up);
     } else {
         dot_two_rows<SharedCodec, kHidden>(shared, j, kIntermediate + j, x_shared, 0, kHidden, gate,
                                            up);
