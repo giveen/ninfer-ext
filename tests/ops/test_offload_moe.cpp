@@ -388,8 +388,10 @@ int cache_case(const HostBank& host, const DeviceBank& bank) {
     return failures;
 }
 
+// `pool` > 0 routes every column within `pool` experts, so one expert job carries many tokens
+// (real prefill routing concentrates); 0 spreads routing over all experts.
 int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens,
-                 std::uint32_t seed) {
+                 std::uint32_t seed, int pool = 0) {
     const auto x      = random_bf16(static_cast<std::size_t>(H) * tokens, seed, -0.05F, 0.05F);
     const auto shared = random_bf16(static_cast<std::size_t>(H) * tokens, seed + 1U, -4.0F, 4.0F);
     std::vector<int> ids(static_cast<std::size_t>(K) * tokens);
@@ -400,7 +402,9 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
         float total = 0.0F;
         for (std::int32_t k = 0; k < K; ++k) {
             int e;
-            do { e = static_cast<int>(next(state) % E); } while (!chosen.insert(e).second);
+            do {
+                e = static_cast<int>(next(state) % (pool > 0 ? pool : E)) * (pool > 0 ? 37 : 1) % E;
+            } while (!chosen.insert(e).second);
             ids[t * K + k]     = e;
             weights[t * K + k] = 0.1F + static_cast<float>(next(state) % 100) / 100.0F;
             total += weights[t * K + k];
@@ -448,8 +452,9 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
                          ty_cached, nullptr);
         cuda_synchronize();
     }
-    const std::string label = "moe_experts T=" + std::to_string(tokens);
-    const std::size_t n     = static_cast<std::size_t>(H) * tokens;
+    const std::string label =
+        "moe_experts T=" + std::to_string(tokens) + (pool > 0 ? " concentrated" : "");
+    const std::size_t n = static_cast<std::size_t>(H) * tokens;
     int failures =
         verify_reduction(label, from_device_bf16(staged.data(), n), reference, kExpertOutput);
     failures += verify_exact((label + " cache route bits").c_str(),
@@ -477,6 +482,11 @@ int main() {
     // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
     for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
+    }
+    // Concentrated routing: 12 experts serve every column, so jobs hold up to 64 tokens and the
+    // decode GEMV walks several 8-token groups per expert.
+    for (const std::int32_t tokens : {9, 22, 64}) {
+        failures += experts_case(host, bank, tokens, 0xA00U + tokens, 12);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " offload_moe correctness\n";
     return failures == 0 ? 0 : 1;
