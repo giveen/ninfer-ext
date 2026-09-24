@@ -94,12 +94,11 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     for (std::int32_t sample = 0; sample < kSamples; ++sample) {
         const std::int32_t index = static_cast<std::int32_t>(
             (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
-        if (index >= 0 && index < extent &&
-            std::find(result.begin(), result.end(), index) == result.end()) {
+        if (index >= 0 && index < extent && std::ranges::find(result, index) == result.end()) {
             result.push_back(index);
         }
     }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     return result;
 }
 
@@ -297,8 +296,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     if (shape.invocations.empty()) {
         throw std::invalid_argument("linear test: shape has no invocations");
     }
-    const auto maximum = std::max_element(
-        shape.invocations.begin(), shape.invocations.end(),
+    const auto maximum = std::ranges::max_element(
+        shape.invocations,
         [](const Invocation& left, const Invocation& right) { return left.t < right.t; });
     if (maximum->t <= 0) {
         throw std::invalid_argument("linear test: token extent must be positive");

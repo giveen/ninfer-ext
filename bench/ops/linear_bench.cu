@@ -451,8 +451,7 @@ void append_point(std::vector<BenchPoint>& points, BenchPoint point) {
     for (BenchPoint& existing : points) {
         if (!same_point(existing, point)) { continue; }
         for (std::string& label : point.labels) {
-            if (std::find(existing.labels.begin(), existing.labels.end(), label) ==
-                existing.labels.end()) {
+            if (std::ranges::find(existing.labels, label) == existing.labels.end()) {
                 existing.labels.push_back(std::move(label));
             }
         }
@@ -499,7 +498,7 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
 std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     std::vector<PointGroup> groups;
     for (const BenchPoint& point : points) {
-        auto it = std::find_if(groups.begin(), groups.end(), [&](const PointGroup& group) {
+        auto it = std::ranges::find_if(groups, [&](const PointGroup& group) {
             return group.qtype == point.qtype && group.policy == point.policy &&
                    group.n == point.n && group.k == point.k;
         });
@@ -510,8 +509,8 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
         }
     }
     for (PointGroup& group : groups) {
-        std::sort(group.points.begin(), group.points.end(),
-                  [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; });
+        std::ranges::sort(group.points,
+                          [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; });
     }
     return groups;
 }
@@ -638,13 +637,13 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
 std::vector<Result> run_group(const PointGroup& group, const Options& opt, DeviceBuffer& flush,
                               cudaStream_t stream) {
     const std::int32_t max_t =
-        std::max_element(group.points.begin(), group.points.end(),
-                         [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
-            ->t;
+        std::ranges::max_element(group.points, [](const BenchPoint& a, const BenchPoint& b) {
+            return a.t < b.t;
+        })->t;
     const std::int32_t min_t =
-        std::min_element(group.points.begin(), group.points.end(),
-                         [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
-            ->t;
+        std::ranges::min_element(group.points, [](const BenchPoint& a, const BenchPoint& b) {
+            return a.t < b.t;
+        })->t;
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(group.k), max_t, "activation allocation");
     const std::uint64_t out_elements =

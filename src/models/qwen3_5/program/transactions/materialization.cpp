@@ -161,11 +161,10 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             break;
         }
         if (!transaction.root_continuation_index) {
-            const auto eviction =
-                std::find_if(details.pressure_options.begin(), details.pressure_options.end(),
-                             [](const qwen3_5::detail::PressureDecision& option) {
-                                 return option.evicts_continuation;
-                             });
+            const auto eviction = std::ranges::find_if(
+                details.pressure_options, [](const qwen3_5::detail::PressureDecision& option) {
+                    return option.evicts_continuation;
+                });
             if (eviction == details.pressure_options.end()) {
                 throw std::logic_error(
                     "preserving materialization has no continuation destination");
@@ -233,13 +232,12 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         if (request_plan.reuse == ReusePath::PrivateLongAnchor &&
             (!request_plan.selected_checkpoint ||
              request_plan.selected_checkpoint->kind != runtime::CheckpointKind::LongAnchor ||
-             std::none_of(source_state->long_anchors.begin(), source_state->long_anchors.end(),
-                          [&](const LongAnchorCheckpoint& anchor) {
-                              return anchor.frontier ==
-                                         request_plan.selected_checkpoint->frontier &&
-                                     anchor.ordinal == request_plan.selected_checkpoint->ordinal &&
-                                     state_store->valid(anchor.state);
-                          }))) {
+             std::ranges::none_of(
+                 source_state->long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+                     return anchor.frontier == request_plan.selected_checkpoint->frontier &&
+                            anchor.ordinal == request_plan.selected_checkpoint->ordinal &&
+                            state_store->valid(anchor.state);
+                 }))) {
             throw std::logic_error("planned long-anchor checkpoint is unavailable");
         }
         if (request_plan.rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
@@ -252,12 +250,11 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         if (request_plan.rewrite_disposition ==
                 RewriteCheckpointDisposition::ReplaceAtCommittedFrontier &&
             (!prompt.identity.rewrite_checkpoint ||
-             std::none_of(request_plan.capture_groups.begin(), request_plan.capture_groups.end(),
-                          [&](const CaptureGroup& group) {
-                              return group.rewrite &&
-                                     *group.rewrite == prompt.identity.rewrite_checkpoint->kind &&
-                                     group.frontier == prompt.identity.rewrite_checkpoint->frontier;
-                          }))) {
+             std::ranges::none_of(request_plan.capture_groups, [&](const CaptureGroup& group) {
+                 return group.rewrite &&
+                        *group.rewrite == prompt.identity.rewrite_checkpoint->kind &&
+                        group.frontier == prompt.identity.rewrite_checkpoint->frontier;
+             }))) {
             throw std::logic_error("planned rewrite checkpoint capture is invalid");
         }
         for (const CaptureGroup& group : request_plan.capture_groups) {
@@ -469,9 +466,9 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     const auto retained_state              = [&](StateImageHandle handle) {
         if (source.endpoint_valid && source.state.read == handle) { return true; }
         if (source.rewrite_state && *source.rewrite_state == handle) { return true; }
-        return std::any_of(
-            source.long_anchors.begin(), source.long_anchors.end(),
-            [&](const LongAnchorCheckpoint& anchor) { return anchor.state == handle; });
+        return std::ranges::any_of(source.long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+            return anchor.state == handle;
+        });
     };
     const auto release_if_unreferenced = [&](StateImageHandle handle) {
         if (!state_store->valid(handle) || retained_state(handle) ||
@@ -1585,12 +1582,13 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
                        work.option.backend_kv_changes[index], work.backend_kv_changes[index]);
         }
     }
-    work.submitted = std::any_of(work.state_changes.begin(), work.state_changes.end(),
-                                 [](const auto& change) { return change.transfer.has_value(); }) ||
-                     std::any_of(work.main_kv_changes.begin(), work.main_kv_changes.end(),
-                                 [](const auto& change) { return change.backup.has_value(); }) ||
-                     std::any_of(work.backend_kv_changes.begin(), work.backend_kv_changes.end(),
-                                 [](const auto& change) { return change.backup.has_value(); });
+    work.submitted =
+        std::ranges::any_of(work.state_changes,
+                            [](const auto& change) { return change.transfer.has_value(); }) ||
+        std::ranges::any_of(work.main_kv_changes,
+                            [](const auto& change) { return change.backup.has_value(); }) ||
+        std::ranges::any_of(work.backend_kv_changes,
+                            [](const auto& change) { return change.backup.has_value(); });
 }
 
 void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
@@ -1951,10 +1949,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     [&](const MaterializationTransaction::PressureWork& work) {
                         has_copy =
                             has_copy ||
-                            std::any_of(
-                                work.option.transfer_requirements.begin(),
-                                work.option.transfer_requirements.end(),
-                                [&](const auto& requirement) {
+                            std::ranges::any_of(
+                                work.option.transfer_requirements, [&](const auto& requirement) {
                                     return requirement.resource == resource &&
                                            requirement.direction ==
                                                runtime::ContextTransferDirection::DeviceToHost;

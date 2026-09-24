@@ -518,13 +518,12 @@ public:
             program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
         std::optional<CheckpointRef> private_replacement;
         if (!private_baseline.private_replacement_candidates.empty()) {
-            private_replacement =
-                *std::min_element(private_baseline.private_replacement_candidates.begin(),
-                                  private_baseline.private_replacement_candidates.end(),
-                                  [](CheckpointRef lhs, CheckpointRef rhs) {
-                                      return std::tuple{lhs.kind, lhs.frontier, lhs.ordinal} <
-                                             std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
-                                  });
+            private_replacement = *std::ranges::min_element(
+                private_baseline.private_replacement_candidates,
+                [](CheckpointRef lhs, CheckpointRef rhs) {
+                    return std::tuple{lhs.kind, lhs.frontier, lhs.ordinal} <
+                           std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
+                });
             private_baseline =
                 program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
         }
@@ -720,11 +719,10 @@ public:
                 const auto owner_id_for = [&](LogicalOwnerKind kind,
                                               std::uint32_t slot) -> PlanningOwnerId {
                     const auto found =
-                        std::find_if(capture_owner_records.begin(), capture_owner_records.end(),
-                                     [&](const auto& record) {
-                                         return record.capability.owner.kind == kind &&
-                                                record.capability.slot == slot;
-                                     });
+                        std::ranges::find_if(capture_owner_records, [&](const auto& record) {
+                            return record.capability.owner.kind == kind &&
+                                   record.capability.slot == slot;
+                        });
                     if (found == capture_owner_records.end()) {
                         throw std::logic_error("capture owner has no planning ID");
                     }
@@ -826,11 +824,10 @@ public:
             .shared_evidence      = selected->scenario.assessment.shared_evidence,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
-            const auto owner_record =
-                std::find_if(capture_owner_records.begin(), capture_owner_records.end(),
-                             [&](const PlanningOwnerRecord& candidate) {
-                                 return candidate.id == outcome.owner;
-                             });
+            const auto owner_record = std::ranges::find_if(
+                capture_owner_records, [&](const PlanningOwnerRecord& candidate) {
+                    return candidate.id == outcome.owner;
+                });
             if (owner_record == capture_owner_records.end()) {
                 throw std::logic_error("shared capture pressure owner ID is invalid");
             }
@@ -1286,8 +1283,9 @@ private:
             const ActiveEntry& active = active_[lane];
             if (!active.occupied) { continue; }
             count += static_cast<std::uint32_t>(
-                std::count_if(active.shared_sources.begin(), active.shared_sources.end(),
-                              [&](const ActiveOwnerEdge& edge) { return edge.slot == slot; }));
+                std::ranges::count_if(active.shared_sources, [&](const ActiveOwnerEdge& edge) {
+                    return edge.slot == slot;
+                }));
         }
         return count;
     }
@@ -1328,17 +1326,16 @@ private:
 
     static void append_unique(std::vector<PrefixShortlistKey>& destination,
                               const PrefixShortlistKey& key) {
-        if (std::find(destination.begin(), destination.end(), key) == destination.end()) {
+        if (std::ranges::find(destination, key) == destination.end()) {
             destination.push_back(key);
         }
     }
 
     [[nodiscard]] static bool demand_matches(const PrefixDemandRecord& demand,
                                              const PrefixShortlistKey& key) noexcept {
-        return std::find(demand.candidate_keys.begin(), demand.candidate_keys.end(), key) !=
-                   demand.candidate_keys.end() ||
-               std::find(demand.exact_resident_keys.begin(), demand.exact_resident_keys.end(),
-                         key) != demand.exact_resident_keys.end() ||
+        return std::ranges::find(demand.candidate_keys, key) != demand.candidate_keys.end() ||
+               std::ranges::find(demand.exact_resident_keys, key) !=
+                   demand.exact_resident_keys.end() ||
                (demand.selected_source_key && *demand.selected_source_key == key);
     }
 
@@ -1510,18 +1507,20 @@ private:
 
     static RetentionObservation* find_observation(std::vector<CheckpointObservation>& observations,
                                                   CheckpointRef checkpoint) noexcept {
-        const auto found = std::find_if(
-            observations.begin(), observations.end(),
-            [&](const CheckpointObservation& value) { return value.checkpoint == checkpoint; });
+        const auto found =
+            std::ranges::find_if(observations, [&](const CheckpointObservation& value) {
+                return value.checkpoint == checkpoint;
+            });
         return found == observations.end() ? nullptr : &found->observation;
     }
 
     static const RetentionObservation*
     find_observation(const std::vector<CheckpointObservation>& observations,
                      CheckpointRef checkpoint) noexcept {
-        const auto found = std::find_if(
-            observations.begin(), observations.end(),
-            [&](const CheckpointObservation& value) { return value.checkpoint == checkpoint; });
+        const auto found =
+            std::ranges::find_if(observations, [&](const CheckpointObservation& value) {
+                return value.checkpoint == checkpoint;
+            });
         return found == observations.end() ? nullptr : &found->observation;
     }
 
@@ -1654,7 +1653,7 @@ private:
         std::vector<ProjectedSharedCandidate> shared_candidates;
         shared_candidates.reserve(base.context_cache().opportunities.size());
         const std::uint32_t vacant_shared_slots = static_cast<std::uint32_t>(
-            std::count_if(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
+            std::ranges::count_if(shared_catalog_, [](const auto& entry) {
                 return entry.state == SharedCatalogState::Vacant;
             }));
         for (const auto& opportunity : base.context_cache().opportunities) {
@@ -1669,14 +1668,13 @@ private:
                 opportunity.frontier == selected_summary.reusable_prompt_tokens &&
                 selected_candidate.private_source && selected_candidate.source_key &&
                 *selected_candidate.source_key == *key;
-            const bool exact_shared_resident = std::any_of(
-                prefix_index_.begin(), prefix_index_.end(), [&](const PrefixIndexEntry& entry) {
+            const bool exact_shared_resident =
+                std::ranges::any_of(prefix_index_, [&](const PrefixIndexEntry& entry) {
                     return entry.shared && valid_prefix_index_entry(entry) && entry.key == *key;
                 });
             const bool exact_resident =
-                std::find(provisional_demand.exact_resident_keys.begin(),
-                          provisional_demand.exact_resident_keys.end(),
-                          *key) != provisional_demand.exact_resident_keys.end();
+                std::ranges::find(provisional_demand.exact_resident_keys, *key) !=
+                provisional_demand.exact_resident_keys.end();
             if (exact_shared_resident || (exact_resident && !selected_private_base)) { continue; }
             const bool declared =
                 has_shared_candidate_evidence(opportunity.evidence,
@@ -1798,7 +1796,7 @@ private:
                 });
             }
             if (surplus_only_count > vacant_shared_slots) { continue; }
-            std::sort(frontiers.begin(), frontiers.end());
+            std::ranges::sort(frontiers);
             const ContextPortfolioValueResult value = projected_value.fold(owners, checkpoints);
             const std::uint64_t schedule_cost       = split_cost(frontiers);
             if (value.saturated ||
@@ -1987,11 +1985,10 @@ private:
                                       PrivateSourceMode source_mode,
                                       std::span<const PressureOwnerOutcome> outcomes)
             -> std::optional<typename Planner::LogicalGoal> {
-            const auto candidate_record =
-                std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
-                             [&](const typename Planner::CandidateInput& input) {
-                                 return input.id == candidate_id;
-                             });
+            const auto candidate_record = std::ranges::find_if(
+                candidate_inputs, [&](const typename Planner::CandidateInput& input) {
+                    return input.id == candidate_id;
+                });
             if (candidate_record == candidate_inputs.end()) { return std::nullopt; }
             const std::size_t candidate_index =
                 static_cast<std::size_t>(candidate_record - candidate_inputs.begin());
@@ -2032,9 +2029,10 @@ private:
                                  }) != outcomes.begin() + row) {
                     return std::nullopt;
                 }
-                const auto record = std::find_if(
-                    owner_records.begin(), owner_records.end(),
-                    [&](const PlanningOwnerRecord& item) { return item.id == outcome.owner; });
+                const auto record =
+                    std::ranges::find_if(owner_records, [&](const PlanningOwnerRecord& item) {
+                        return item.id == outcome.owner;
+                    });
                 if (record == owner_records.end()) { return std::nullopt; }
                 const bool shared = record->capability.owner.kind == LogicalOwnerKind::SharedPrefix;
                 if (!shared) {
@@ -2076,10 +2074,10 @@ private:
         const auto final_schedule = [&](PlanningCandidateId candidate_id,
                                         const RequestPlanSummary& summary,
                                         const auto& split_cost) -> std::vector<std::uint32_t> {
-            const auto selected = std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
-                                               [&](const typename Planner::CandidateInput& input) {
-                                                   return input.id == candidate_id;
-                                               });
+            const auto selected = std::ranges::find_if(
+                candidate_inputs, [&](const typename Planner::CandidateInput& input) {
+                    return input.id == candidate_id;
+                });
             if (selected == candidate_inputs.end()) {
                 throw std::logic_error("final schedule references an unknown candidate");
             }
@@ -2093,10 +2091,10 @@ private:
             planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
                           logical_goal, final_schedule, planning_started, allowance);
         const auto selected_candidate =
-            planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
-                                   [&](const typename Planner::CandidateInput& input) {
-                                       return input.id == planned->candidate;
-                                   })
+            planned ? std::ranges::find_if(candidate_inputs,
+                                           [&](const typename Planner::CandidateInput& input) {
+                                               return input.id == planned->candidate;
+                                           })
                     : candidate_inputs.end();
         if (!planned || !planned->plan || selected_candidate == candidate_inputs.end()) {
             return std::nullopt;
@@ -2117,9 +2115,10 @@ private:
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {
-            const auto record = std::find_if(
-                owner_records.begin(), owner_records.end(),
-                [&](const PlanningOwnerRecord& item) { return item.id == outcome.owner; });
+            const auto record =
+                std::ranges::find_if(owner_records, [&](const PlanningOwnerRecord& item) {
+                    return item.id == outcome.owner;
+                });
             if (record == owner_records.end()) {
                 throw std::logic_error("selected pressure outcome has no logical owner record");
             }
@@ -2225,10 +2224,9 @@ private:
                                  choice.publication_slot_ == choice.private_source_->slot &&
                                  choice.source_mode_ == PrivateSourceMode::ConsumeToActive;
         const auto victim =
-            std::find_if(choice.private_claims_.begin(), choice.private_claims_.end(),
-                         [&](const OwnerClaim& claim) {
-                             return claim.capability.slot == choice.publication_slot_;
-                         });
+            std::ranges::find_if(choice.private_claims_, [&](const OwnerClaim& claim) {
+                return claim.capability.slot == choice.publication_slot_;
+            });
         const bool victim_cell = victim != choice.private_claims_.end() &&
                                  victim->disposition == VictimDisposition::Evicted;
         if (publication.state != CatalogState::Vacant && !source_cell && !victim_cell) {
@@ -2341,9 +2339,8 @@ private:
                 !entry.explicit_credit) {
                 continue;
             }
-            if (std::find(committed.exact_resident_keys.begin(),
-                          committed.exact_resident_keys.end(),
-                          entry.summary.checkpoint.shortlist_key) !=
+            if (std::ranges::find(committed.exact_resident_keys,
+                                  entry.summary.checkpoint.shortlist_key) !=
                 committed.exact_resident_keys.end()) {
                 entry.explicit_credit     = false;
                 entry.credit_expiry_epoch = 0;
@@ -2389,8 +2386,8 @@ private:
                                                                CheckpointRef checkpoint) noexcept {
         if (summary.endpoint && summary.endpoint->ref == checkpoint) { return true; }
         if (summary.rewrite && summary.rewrite->ref == checkpoint) { return true; }
-        return std::any_of(summary.long_anchors.begin(), summary.long_anchors.end(),
-                           [&](const auto& anchor) { return anchor.ref == checkpoint; });
+        return std::ranges::any_of(summary.long_anchors,
+                                   [&](const auto& anchor) { return anchor.ref == checkpoint; });
     }
 
     [[nodiscard]] static std::uint32_t
@@ -2444,8 +2441,7 @@ private:
             return false;
         }
         const auto expected_drop = [&](CheckpointRef checkpoint) {
-            return std::find(expected_drops.begin(), expected_drops.end(), checkpoint) !=
-                   expected_drops.end();
+            return std::ranges::find(expected_drops, checkpoint) != expected_drops.end();
         };
         const auto check = [&](CheckpointRef checkpoint) {
             return continuation_contains_checkpoint(*after, checkpoint) !=
@@ -2458,7 +2454,7 @@ private:
         for (const auto& anchor : before.long_anchors) {
             if (!check(anchor.ref)) { return false; }
         }
-        return std::all_of(expected_drops.begin(), expected_drops.end(), [&](CheckpointRef drop) {
+        return std::ranges::all_of(expected_drops, [&](CheckpointRef drop) {
             return continuation_contains_checkpoint(before, drop);
         });
     }
@@ -2681,9 +2677,8 @@ private:
             throw std::logic_error("materialization result is not action aligned");
         }
         const auto private_result_for = [&](const OwnerClaim& claim) -> const auto& {
-            const auto found =
-                std::find_if(result.victims.begin(), result.victims.end(),
-                             [&](const auto& row) { return row.owner == claim.planning_id; });
+            const auto found = std::ranges::find_if(
+                result.victims, [&](const auto& row) { return row.owner == claim.planning_id; });
             if (found == result.victims.end() ||
                 std::find_if(found + 1, result.victims.end(), [&](const auto& row) {
                     return row.owner == claim.planning_id;
@@ -2693,9 +2688,9 @@ private:
             return *found;
         };
         const auto shared_result_for = [&](const OwnerClaim& claim) -> const auto& {
-            const auto found =
-                std::find_if(result.shared_victims.begin(), result.shared_victims.end(),
-                             [&](const auto& row) { return row.owner == claim.planning_id; });
+            const auto found = std::ranges::find_if(result.shared_victims, [&](const auto& row) {
+                return row.owner == claim.planning_id;
+            });
             if (found == result.shared_victims.end() ||
                 std::find_if(found + 1, result.shared_victims.end(), [&](const auto& row) {
                     return row.owner == claim.planning_id;
@@ -2735,10 +2730,9 @@ private:
         }
         for (std::size_t row = 0; row < record->shared_claims.size(); ++row) {
             const OwnerClaim& claim = record->shared_claims[row];
-            if (std::any_of(record->private_claims.begin(), record->private_claims.end(),
-                            [&](const OwnerClaim& prior) {
-                                return prior.planning_id == claim.planning_id;
-                            })) {
+            if (std::ranges::any_of(record->private_claims, [&](const OwnerClaim& prior) {
+                    return prior.planning_id == claim.planning_id;
+                })) {
                 throw std::logic_error("materialization owner ID changes kind");
             }
             if ((record->shared_source && claim.capability.slot == record->shared_source->slot) ||
@@ -2939,9 +2933,8 @@ private:
             throw std::logic_error("active capture result is not pressure-action aligned");
         }
         const auto private_result_for = [&](const OwnerClaim& claim) -> const auto& {
-            const auto found =
-                std::find_if(result.victims.begin(), result.victims.end(),
-                             [&](const auto& row) { return row.owner == claim.planning_id; });
+            const auto found = std::ranges::find_if(
+                result.victims, [&](const auto& row) { return row.owner == claim.planning_id; });
             if (found == result.victims.end() ||
                 std::find_if(found + 1, result.victims.end(), [&](const auto& row) {
                     return row.owner == claim.planning_id;
@@ -2951,9 +2944,9 @@ private:
             return *found;
         };
         const auto shared_result_for = [&](const OwnerClaim& claim) -> const auto& {
-            const auto found =
-                std::find_if(result.shared_victims.begin(), result.shared_victims.end(),
-                             [&](const auto& row) { return row.owner == claim.planning_id; });
+            const auto found = std::ranges::find_if(result.shared_victims, [&](const auto& row) {
+                return row.owner == claim.planning_id;
+            });
             if (found == result.shared_victims.end() ||
                 std::find_if(found + 1, result.shared_victims.end(), [&](const auto& row) {
                     return row.owner == claim.planning_id;
@@ -2980,10 +2973,9 @@ private:
         }
         for (std::size_t row = 0; row < record->shared_claims.size(); ++row) {
             const OwnerClaim& claim = record->shared_claims[row];
-            if (std::any_of(record->private_claims.begin(), record->private_claims.end(),
-                            [&](const OwnerClaim& prior) {
-                                return prior.planning_id == claim.planning_id;
-                            })) {
+            if (std::ranges::any_of(record->private_claims, [&](const OwnerClaim& prior) {
+                    return prior.planning_id == claim.planning_id;
+                })) {
                 throw std::logic_error("active capture owner ID changes kind");
             }
             if (claim.capability.slot == record->publication_slot ||

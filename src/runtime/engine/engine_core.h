@@ -1412,7 +1412,7 @@ private:
 
     [[nodiscard]] bool erase_pending(const std::shared_ptr<Request>& request) {
         std::lock_guard lock(queue_mutex_);
-        const auto it = std::find(pending_.begin(), pending_.end(), request);
+        const auto it = std::ranges::find(pending_, request);
         if (it == pending_.end()) { return false; }
         pending_.erase(it);
         return true;
@@ -1653,8 +1653,8 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
-        const auto other_runnable = static_cast<std::uint32_t>(
-            std::count_if(slots_.begin(), slots_.end(), [](const auto& request) {
+        const auto other_runnable =
+            static_cast<std::uint32_t>(std::ranges::count_if(slots_, [](const auto& request) {
                 return request && !request->capture_pending &&
                        (request->is_decode_ready() || request->is_prefilling());
             }));

@@ -367,7 +367,7 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t q_rows      = 6144;
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = q_rows + kv_rows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens      = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
         QType::Q4_G64_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
     bench::PackedQuantizedWeight gv = bench::make_row_split_weight(
@@ -416,8 +416,8 @@ void run_four_output(const Options& options, const char* format, QType qtype,
                      std::int32_t q_rows, std::int32_t kv_rows, std::int32_t parent_rows,
                      WeightFixture& fixture, DeviceBuffer& flush, cudaStream_t stream,
                      std::vector<Result>& results) {
-    const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t min_tokens     = *std::ranges::min_element(options.tokens);
+    const std::int32_t max_tokens     = *std::ranges::max_element(options.tokens);
     const std::size_t workspace_bytes = ops::attn_input_proj_workspace_capacity_bytes(
         qtype, parent_rows, hidden, policy, min_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
@@ -474,7 +474,7 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden, 
     constexpr std::int32_t q_rows      = 4096;
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = 6144;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens       = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight weight = bench::make_row_split_weight(
         QType::Q8_G32_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);

@@ -430,9 +430,9 @@ int test_prompt_object_order() {
 
     const std::string original      = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
     const GenerationRequest request = parse_raw(original);
-    const auto assistant =
-        std::find_if(request.messages.begin(), request.messages.end(),
-                     [](const ChatTurn& turn) { return turn.role == ninfer::ChatRole::Assistant; });
+    const auto assistant = std::ranges::find_if(request.messages, [](const ChatTurn& turn) {
+        return turn.role == ninfer::ChatRole::Assistant;
+    });
     const ninfer::PromptInput translated = prompt(request);
     const std::string expected_tool =
         R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}}},"strict":false}})";
@@ -445,8 +445,9 @@ int test_prompt_object_order() {
     const GenerationRequest reordered =
         parse_raw(R"({"alpha":{"yankee":2,"bravo":true},"zeta":"last"})");
     const auto reordered_assistant =
-        std::find_if(reordered.messages.begin(), reordered.messages.end(),
-                     [](const ChatTurn& turn) { return turn.role == ninfer::ChatRole::Assistant; });
+        std::ranges::find_if(reordered.messages, [](const ChatTurn& turn) {
+            return turn.role == ninfer::ChatRole::Assistant;
+        });
     failures +=
         check(reordered_assistant != reordered.messages.end() &&
                   reordered_assistant->tool_calls.size() == 1 &&
@@ -728,13 +729,10 @@ int test_stream() {
     int failures = check(types.front() == "message_start" && types.back() == "message_stop" &&
                              saw_signature && start_usage_is_exact,
                          "Anthropic stream lifecycle/signature/start usage is incomplete");
-    const auto signature_position =
-        std::find_if(events.begin(), events.end(), [](const auto& value) {
-            return value.contains("signature_delta");
-        });
-    const auto text_position = std::find_if(events.begin(), events.end(), [](const auto& value) {
-        return value.contains("text_delta");
-    });
+    const auto signature_position = std::ranges::find_if(
+        events, [](const auto& value) { return value.contains("signature_delta"); });
+    const auto text_position = std::ranges::find_if(
+        events, [](const auto& value) { return value.contains("text_delta"); });
     failures += check(signature_position < text_position,
                       "Thinking signature was emitted after the text block began");
     const Json aggregate =

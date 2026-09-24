@@ -40,8 +40,7 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     for (std::int32_t sample = 0; sample < kSamples; ++sample) {
         const std::int32_t index = static_cast<std::int32_t>(
             (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
-        if (index >= 0 && index < extent &&
-            std::find(result.begin(), result.end(), index) == result.end()) {
+        if (index >= 0 && index < extent && std::ranges::find(result, index) == result.end()) {
             result.push_back(index);
         }
     }
@@ -85,7 +84,7 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
                      std::string_view label) {
     std::vector<std::uint8_t> actual(expected.size());
     device.copy_to_host(actual.data(), actual.size());
-    if (std::equal(actual.begin(), actual.end(), expected.begin(), expected.end())) { return 0; }
+    if (std::ranges::equal(actual, expected)) { return 0; }
     std::cerr << label << ": payload was modified\n";
     return 1;
 }

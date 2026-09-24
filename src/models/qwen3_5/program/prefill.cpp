@@ -123,8 +123,8 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
             throw std::logic_error("visual MTP bridge has no encoded Vision item");
         }
         const auto& scatter = chunk.control->scatter_indices;
-        const auto column   = std::lower_bound(scatter.begin(), scatter.end(),
-                                               static_cast<std::int32_t>(state.text_kv_base));
+        const auto column =
+            std::ranges::lower_bound(scatter, static_cast<std::int32_t>(state.text_kv_base));
         if (column == scatter.end() || *column != static_cast<std::int32_t>(state.text_kv_base) ||
             static_cast<std::uint8_t>(chunk.control->modality) !=
                 prompt.token_types[state.text_kv_base]) {
@@ -1066,9 +1066,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers.begin(),
-                    staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
+                const auto rewrite_split                    = std::ranges::upper_bound(
+                    staged.prompt.identity.rewrite_execution_frontiers, staged.cursor);
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;

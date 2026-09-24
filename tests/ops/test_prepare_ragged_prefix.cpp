@@ -46,7 +46,7 @@ int run_case(int rows, int width, int batch, bool padded, int mode, bool replay)
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         if (phase)
             for (auto& bits : source) bits ^= 0xa35c;
-        std::fill(expected.begin(), expected.end(), 0);
+        std::ranges::fill(expected, 0);
         for (int b = 0; b < batch; ++b) {
             lanes[b]           = LaneOrder[(b + 3 * phase) % 8];
             starts[b]          = 1023 + 317 * b + 259001 * phase;

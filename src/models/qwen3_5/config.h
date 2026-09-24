@@ -123,8 +123,8 @@ struct DraftConfig {
     std::optional<DFlash2Config> dflash2;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
-        return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),
-                                                     DraftAttentionKind::SlidingAttention));
+        return static_cast<std::uint32_t>(
+            std::ranges::count(layer_types, DraftAttentionKind::SlidingAttention));
     }
 
     [[nodiscard]] std::uint32_t full_layer_count() const noexcept {

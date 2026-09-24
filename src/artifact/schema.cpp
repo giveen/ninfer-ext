@@ -36,8 +36,8 @@ void require_members(const Json& value, std::initializer_list<std::string_view> 
         }
     }
     for (const auto& [key, unused] : value.items()) {
-        if (std::find(required.begin(), required.end(), key) == required.end() &&
-            std::find(optional.begin(), optional.end(), key) == optional.end()) {
+        if (std::ranges::find(required, key) == required.end() &&
+            std::ranges::find(optional, key) == optional.end()) {
             throw ArtifactError(std::string(label) + ": unknown member " + key);
         }
     }

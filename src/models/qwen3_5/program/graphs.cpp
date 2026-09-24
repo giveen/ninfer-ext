@@ -51,10 +51,9 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
             throw std::logic_error(std::string(label) + " CUDA Graph definition is empty");
         }
         const auto existing =
-            std::find_if(family.topologies.begin(), family.topologies.end(),
-                         [&](const DecodeGraphTopology& topology) {
-                             return topology.topology_class == profile.topology_class;
-                         });
+            std::ranges::find_if(family.topologies, [&](const DecodeGraphTopology& topology) {
+                return topology.topology_class == profile.topology_class;
+            });
         if (existing != family.topologies.end()) { continue; }
 
         family.topologies.emplace_back();

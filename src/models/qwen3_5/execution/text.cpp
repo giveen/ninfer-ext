@@ -168,7 +168,7 @@ void DFlashFeatureSink::begin(const Tensor& value) {
 }
 
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
-    const auto it = std::find(layers.begin(), layers.end(), layer);
+    const auto it = std::ranges::find(layers, layer);
     if (it == layers.end()) { return; }
     const std::size_t index = static_cast<std::size_t>(it - layers.begin());
     Tensor* destination     = batch_features != nullptr ? batch_features : features;
@@ -1200,7 +1200,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (vision_chunk.control != nullptr) {
                 const auto scatter =
                     std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
-                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
+                const auto begin = std::ranges::lower_bound(scatter, prompt_t0);
                 const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
                 const auto count = static_cast<std::int32_t>(end - begin);
                 visual_begin     = static_cast<std::int32_t>(begin - scatter.begin());

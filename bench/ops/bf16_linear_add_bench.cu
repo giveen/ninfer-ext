@@ -160,7 +160,7 @@ Options parse_options(int argc, char** argv) {
         options.flush_bytes == 0) {
         throw std::invalid_argument("invalid empty sweep, timing count, or flush size");
     }
-    std::sort(options.tokens.begin(), options.tokens.end());
+    std::ranges::sort(options.tokens);
     options.tokens.erase(std::unique(options.tokens.begin(), options.tokens.end()),
                          options.tokens.end());
     if (options.profile && (options.tokens.size() != 1 || options.route == Route::All)) {

@@ -95,8 +95,8 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label) {
-    const auto it = std::find_if(
-        family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
+    const auto it =
+        std::ranges::find_if(family.profiles, [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
                    frontier <= profile.max_execution_frontier;
         });
@@ -108,10 +108,10 @@ DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_
 
 DecodeGraphTopology& select_graph_topology(DecodeGraphFamily& family, std::uint32_t topology_class,
                                            const char* label) {
-    const auto it = std::find_if(family.topologies.begin(), family.topologies.end(),
-                                 [topology_class](const DecodeGraphTopology& topology) {
-                                     return topology.topology_class == topology_class;
-                                 });
+    const auto it = std::ranges::find_if(family.topologies,
+                                         [topology_class](const DecodeGraphTopology& topology) {
+                                             return topology.topology_class == topology_class;
+                                         });
     if (it == family.topologies.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph topology is unavailable");
     }

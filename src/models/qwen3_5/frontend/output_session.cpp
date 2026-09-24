@@ -469,8 +469,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         const bool stop_token =
-            std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
-            impl_->policy.token_ids.end();
+            std::ranges::find(impl_->policy.token_ids, token) != impl_->policy.token_ids.end();
         DecoderState before_state;
         PublishedOutput before_output;
         if (stop_token && !impl_->policy.publish_stop_token) {

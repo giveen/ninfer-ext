@@ -437,8 +437,7 @@ std::uint8_t encode_e4m3fn_rne_satfinite(float value) {
     const float magnitude = std::abs(value);
     int selected          = 126;
     if (magnitude < 448.0f) {
-        const int upper =
-            std::lower_bound(codebook.begin(), codebook.end(), magnitude) - codebook.begin();
+        const int upper = std::ranges::lower_bound(codebook, magnitude) - codebook.begin();
         if (upper == 0)
             selected = 0;
         else {
@@ -1729,7 +1728,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
     std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
-    if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
+    if (test_case.zero_q) std::ranges::fill(q, 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
     inject_codec_edges(geometry, test_case.tokens, k, v);
@@ -1825,7 +1824,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
     std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
-    if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
+    if (test_case.zero_q) std::ranges::fill(q, 0.0f);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
@@ -1933,8 +1932,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case) {
     const int batch = test_case.contexts.size(), width = test_case.width;
-    const int pool_rows = std::max(
-        batch, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
+    const int pool_rows = std::max(batch, *std::ranges::max_element(test_case.table_rows) + 1);
     int maximum_visible = 1;
     for (int b = 0; b < batch; ++b)
         maximum_visible = std::max(
@@ -1970,9 +1968,9 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
     DeviceContext device;
-    const bool masked = test_case.graph_replay ||
-                        std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
-                                    [&](int count) { return count != width; });
+    const bool masked =
+        test_case.graph_replay ||
+        std::ranges::any_of(test_case.valid_columns, [&](int count) { return count != width; });
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),

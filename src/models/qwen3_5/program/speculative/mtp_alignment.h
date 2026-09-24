@@ -64,8 +64,8 @@ shifted_visual_overlap(std::span<const std::int32_t> scatter_indices, std::uint3
                                   static_cast<std::uint64_t>(window.columns);
     const std::uint32_t shifted_end =
         static_cast<std::uint32_t>(std::min<std::uint64_t>(prompt_tokens, raw_end));
-    const auto begin = std::lower_bound(scatter_indices.begin(), scatter_indices.end(),
-                                        static_cast<std::int32_t>(window.shifted_embedding_begin));
+    const auto begin = std::ranges::lower_bound(
+        scatter_indices, static_cast<std::int32_t>(window.shifted_embedding_begin));
     const auto end =
         std::lower_bound(begin, scatter_indices.end(), static_cast<std::int32_t>(shifted_end));
     overlap.source_begin = static_cast<std::size_t>(begin - scatter_indices.begin());

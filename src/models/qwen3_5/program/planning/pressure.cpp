@@ -371,11 +371,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_admission(
     plan->impl_->identity_assessment.pressure_may_change_machine_work =
         plan->impl_->has_source &&
         plan->impl_->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
-        std::any_of(
-            plan->impl_->transfer_requirements.begin(), plan->impl_->transfer_requirements.end(),
-            [](const runtime::ContextTransferRequirement& requirement) {
-                return requirement.direction == runtime::ContextTransferDirection::DeviceToDevice;
-            });
+        std::ranges::any_of(plan->impl_->transfer_requirements,
+                            [](const runtime::ContextTransferRequirement& requirement) {
+                                return requirement.direction ==
+                                       runtime::ContextTransferDirection::DeviceToDevice;
+                            });
     plan->impl_->identity_assessment.expandable =
         identity_status != runtime::PreflightStatus::Ready;
     plan->impl_->identity_assessment.projection_work =
@@ -435,9 +435,8 @@ ProgramImpl::materialization_source_protection(const ResourceCandidateState& adm
             if (is_rewrite_checkpoint_restore(admission.reuse)) {
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
-                        std::any_of(
-                            protection.state_ownership_candidates.begin(),
-                            protection.state_ownership_candidates.end(),
+                        std::ranges::any_of(
+                            protection.state_ownership_candidates,
                             [&](const auto& candidate) { return candidate.state == state; })) {
                         return;
                     }
@@ -646,7 +645,7 @@ std::vector<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_press
     endpoints.reserve(8);
     const auto endpoint = [&](detail::PhysicalResources value) {
         if (value != detail::PhysicalResources{} &&
-            std::find(endpoints.begin(), endpoints.end(), value) == endpoints.end()) {
+            std::ranges::find(endpoints, value) == endpoints.end()) {
             endpoints.push_back(value);
         }
     };
@@ -694,7 +693,7 @@ std::vector<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_press
     for (const detail::PhysicalResources requested : endpoints) {
         std::optional<qwen3_5::detail::PressureDecision> option =
             inspect_shared_pressure_option(shared, requested, protection, current);
-        if (option && std::find(options.begin(), options.end(), *option) == options.end()) {
+        if (option && std::ranges::find(options, *option) == options.end()) {
             options.push_back(std::move(*option));
         }
     }
@@ -749,9 +748,8 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
     mix_kv(option.main_kv_changes, 0x4d41494eULL);
     mix_kv(option.backend_kv_changes, 0x4241434bULL);
     const auto add_state = [&](StateImageHandle state, bool rewrite) {
-        const bool checkpoint_was_dropped = std::any_of(
-            dropped_checkpoints.begin(), dropped_checkpoints.end(),
-            [&](runtime::CheckpointRef checkpoint) {
+        const bool checkpoint_was_dropped =
+            std::ranges::any_of(dropped_checkpoints, [&](runtime::CheckpointRef checkpoint) {
                 return rewrite ? (checkpoint.kind == runtime::CheckpointKind::TurnClosure ||
                                   checkpoint.kind == runtime::CheckpointKind::ResponseReplay)
                                : checkpoint.kind == runtime::CheckpointKind::SessionEndpoint;
@@ -766,12 +764,11 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             rewrite ? qwen3_5::detail::PressureStateDecision::DropRewriteHostDuplicate
                     : qwen3_5::detail::PressureStateDecision::DropEndpointHostDuplicate;
         const bool already_changed =
-            std::find(option.state_changes.begin(), option.state_changes.end(), endpoint_drop) !=
+            std::ranges::find(option.state_changes, endpoint_drop) != option.state_changes.end() ||
+            std::ranges::find(option.state_changes, endpoint_demote) !=
                 option.state_changes.end() ||
-            std::find(option.state_changes.begin(), option.state_changes.end(), endpoint_demote) !=
-                option.state_changes.end() ||
-            std::find(option.state_changes.begin(), option.state_changes.end(),
-                      endpoint_host_drop) != option.state_changes.end();
+            std::ranges::find(option.state_changes, endpoint_host_drop) !=
+                option.state_changes.end();
         const detail::PhysicalDelta extension_effect{
             .removed = checked_resource_difference(option.effect.removed, initial_effect.removed),
             .added   = checked_resource_difference(option.effect.added, initial_effect.added),
@@ -781,8 +778,7 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             checkpoint_was_dropped || already_changed || !state_store->valid(state) ||
             state_store->role(state) != StateImageRole::CheckpointImmutable ||
             state_store->source_pins(state) != 0 ||
-            std::find(released_states.begin(), released_states.end(), state) !=
-                released_states.end()) {
+            std::ranges::find(released_states, state) != released_states.end()) {
             return false;
         }
         const StateReplicaResidency residency = state_store->residency(state);
@@ -886,7 +882,7 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
     if (!sequence.kv || (current != nullptr && current->evicts_continuation)) { return successors; }
     const auto append_unique = [&](qwen3_5::detail::PressureDecision option) {
         if (current != nullptr && option == *current) { return; }
-        if (std::find(successors.begin(), successors.end(), option) == successors.end()) {
+        if (std::ranges::find(successors, option) == successors.end()) {
             successors.push_back(std::move(option));
         }
     };
@@ -895,15 +891,14 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
     std::vector<runtime::CheckpointRef> dropped =
         current != nullptr ? current->dropped_checkpoints : std::vector<runtime::CheckpointRef>{};
     const auto already_dropped = [&](runtime::CheckpointRef checkpoint) {
-        return std::find(dropped.begin(), dropped.end(), checkpoint) != dropped.end();
+        return std::ranges::find(dropped, checkpoint) != dropped.end();
     };
     const auto state_change_conflicts =
         [](runtime::CheckpointRef checkpoint,
            const qwen3_5::detail::PressureDecision& explicit_target) {
             const auto has = [&](qwen3_5::detail::PressureStateDecision change) {
-                return std::find(explicit_target.state_changes.begin(),
-                                 explicit_target.state_changes.end(),
-                                 change) != explicit_target.state_changes.end();
+                return std::ranges::find(explicit_target.state_changes, change) !=
+                       explicit_target.state_changes.end();
             };
             if (checkpoint.kind == runtime::CheckpointKind::SessionEndpoint) {
                 return has(qwen3_5::detail::PressureStateDecision::DropEndpointDeviceDuplicate) ||
@@ -938,7 +933,7 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
         if (!retained) { return; }
         const auto within = [](std::span<const qwen3_5::detail::PressureKVDecision> changes,
                                std::uint32_t pages) {
-            return std::all_of(changes.begin(), changes.end(), [&](const auto& action) {
+            return std::ranges::all_of(changes, [&](const auto& action) {
                 return action.kind != qwen3_5::detail::PressureKVDecisionKind::None &&
                        action.page_count != 0 && action.begin_page <= pages &&
                        action.page_count <= pages - action.begin_page;
@@ -965,7 +960,7 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
     endpoints.reserve(8);
     const auto endpoint = [&](detail::PhysicalResources value) {
         if (value != detail::PhysicalResources{} &&
-            std::find(endpoints.begin(), endpoints.end(), value) == endpoints.end()) {
+            std::ranges::find(endpoints, value) == endpoints.end()) {
             endpoints.push_back(value);
         }
     };
@@ -1052,8 +1047,8 @@ bool ProgramImpl::pressure_decision_valid(const SequenceState& sequence,
         return false;
     }
     const auto dropped_kind = [&](runtime::CheckpointKind kind) {
-        return std::any_of(
-            decision.dropped_checkpoints.begin(), decision.dropped_checkpoints.end(),
+        return std::ranges::any_of(
+            decision.dropped_checkpoints,
             [&](runtime::CheckpointRef checkpoint) { return checkpoint.kind == kind; });
     };
     std::vector<StateImageHandle> targeted_states;
@@ -1081,8 +1076,7 @@ bool ProgramImpl::pressure_decision_valid(const SequenceState& sequence,
             (!drops_host && !state_exclusive_to_sequence(sequence, *state)) ||
             (!drops_host && protection != nullptr && protection->state &&
              *protection->state == *state) ||
-            std::find(targeted_states.begin(), targeted_states.end(), *state) !=
-                targeted_states.end()) {
+            std::ranges::find(targeted_states, *state) != targeted_states.end()) {
             return false;
         }
         targeted_states.push_back(*state);
@@ -1121,7 +1115,7 @@ bool ProgramImpl::pressure_decision_valid(const SequenceState& sequence,
                 const bool protected_page       = protected_materialization_page(
                     protection, *addresses, page_offset, page,
                     resource == runtime::ContextResourceClass::BackendKV);
-                if (std::find(targeted.begin(), targeted.end(), page) != targeted.end() ||
+                if (std::ranges::find(targeted, page) != targeted.end() ||
                     pages->writer_references(page) != 0 || pages->source_pins(page) != 0 ||
                     (protected_page &&
                      action.kind != qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate)) {
@@ -1219,7 +1213,7 @@ bool ProgramImpl::shared_pressure_decision_valid(
                 const bool protected_page       = protected_materialization_page(
                     protection, *addresses, page_offset, page,
                     resource == runtime::ContextResourceClass::BackendKV);
-                if (std::find(targeted.begin(), targeted.end(), page) != targeted.end() ||
+                if (std::ranges::find(targeted, page) != targeted.end() ||
                     pages->writer_references(page) != 0 || pages->source_pins(page) != 0 ||
                     (protected_page &&
                      action.kind != qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate)) {
@@ -1298,8 +1292,8 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
     std::vector<std::uint8_t>& shared_owner_state  = pressure_shared_owner_scratch_;
     constexpr std::uint8_t kOwnerSelected          = 1U;
     constexpr std::uint8_t kOwnerEvicted           = 2U;
-    std::fill(private_owner_state.begin(), private_owner_state.end(), 0);
-    std::fill(shared_owner_state.begin(), shared_owner_state.end(), 0);
+    std::ranges::fill(private_owner_state, 0);
+    std::ranges::fill(shared_owner_state, 0);
     std::vector<std::vector<runtime::CheckpointRef>>& dropped_private =
         pressure_private_drop_scratch_;
     for (auto& dropped : dropped_private) { dropped.clear(); }
@@ -1337,9 +1331,10 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
             }
             const bool protected_state =
                 protection != nullptr && protection->state && *protection->state == *state;
-            const auto existing = std::find_if(
-                pressure_states.begin(), pressure_states.end(),
-                [&](const PressureSelectedState& selected) { return selected.state == *state; });
+            const auto existing =
+                std::ranges::find_if(pressure_states, [&](const PressureSelectedState& selected) {
+                    return selected.state == *state;
+                });
             if (!state_store->valid(*state) ||
                 (protected_state && !pressure_state_drops_host(change)) ||
                 existing != pressure_states.end()) {
@@ -1485,8 +1480,9 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
 
     const auto final_state_placement = [&](StateImageHandle state) {
         const auto selected =
-            std::find_if(pressure_states.begin(), pressure_states.end(),
-                         [&](const PressureSelectedState& item) { return item.state == state; });
+            std::ranges::find_if(pressure_states, [&](const PressureSelectedState& item) {
+                return item.state == state;
+            });
         if (selected != pressure_states.end()) {
             return std::pair{selected->device, selected->host};
         }
@@ -1597,12 +1593,11 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
             return sequence.rewrite_state;
         }
         if (checkpoint.kind == runtime::CheckpointKind::LongAnchor) {
-            const auto anchor =
-                std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                             [&](const LongAnchorCheckpoint& candidate) {
-                                 return candidate.frontier == checkpoint.frontier &&
-                                        candidate.ordinal == checkpoint.ordinal;
-                             });
+            const auto anchor = std::ranges::find_if(
+                sequence.long_anchors, [&](const LongAnchorCheckpoint& candidate) {
+                    return candidate.frontier == checkpoint.frontier &&
+                           candidate.ordinal == checkpoint.ordinal;
+                });
             return anchor == sequence.long_anchors.end()
                        ? std::nullopt
                        : std::optional<StateImageHandle>(anchor->state);
@@ -1615,8 +1610,8 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
             const SequenceState& sequence = continuation_states[index];
             if ((private_owner_state[index] & kOwnerEvicted) != 0) {
                 if (sequence.rewrite_state && *sequence.rewrite_state == state) { ++references; }
-                references += static_cast<std::uint32_t>(std::count_if(
-                    sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                references += static_cast<std::uint32_t>(std::ranges::count_if(
+                    sequence.long_anchors,
                     [&](const LongAnchorCheckpoint& anchor) { return anchor.state == state; }));
                 continue;
             }
@@ -1786,8 +1781,9 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
     std::vector<PressureSelectedState>& selected_states = pressure_state_scratch_;
     const auto append_state                             = [&](StateImageHandle state) {
         const auto selected =
-            std::find_if(selected_states.begin(), selected_states.end(),
-                                                     [&](const PressureSelectedState& item) { return item.state == state; });
+            std::ranges::find_if(selected_states, [&](const PressureSelectedState& item) {
+                return item.state == state;
+            });
         if (state_store->valid(state) && selected == selected_states.end()) {
             const auto [device_resident, host_resident] = final_state_placement(state);
             selected_states.push_back(PressureSelectedState{
@@ -1828,9 +1824,9 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
                                                StateImageHandle state) {
         const std::vector<runtime::CheckpointRef>& dropped = dropped_private[index];
         const auto dropped_kind                            = [&](runtime::CheckpointKind kind) {
-            return std::any_of(
-                dropped.begin(), dropped.end(),
-                [&](runtime::CheckpointRef checkpoint) { return checkpoint.kind == kind; });
+            return std::ranges::any_of(dropped, [&](runtime::CheckpointRef checkpoint) {
+                return checkpoint.kind == kind;
+            });
         };
         const bool endpoint_survives =
             sequence.endpoint_valid && !dropped_kind(runtime::CheckpointKind::SessionEndpoint);
@@ -1844,18 +1840,15 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
         if (!rewrite_dropped && sequence.rewrite_state && *sequence.rewrite_state == state) {
             return true;
         }
-        return std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                           [&](const LongAnchorCheckpoint& anchor) {
-                               const bool is_dropped =
-                                   std::any_of(dropped.begin(), dropped.end(),
-                                               [&](runtime::CheckpointRef checkpoint) {
-                                                   return checkpoint.kind ==
-                                                              runtime::CheckpointKind::LongAnchor &&
-                                                          checkpoint.frontier == anchor.frontier &&
-                                                          checkpoint.ordinal == anchor.ordinal;
-                                               });
-                               return !is_dropped && anchor.state == state;
-                           });
+        return std::ranges::any_of(sequence.long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+            const bool is_dropped =
+                std::ranges::any_of(dropped, [&](runtime::CheckpointRef checkpoint) {
+                    return checkpoint.kind == runtime::CheckpointKind::LongAnchor &&
+                           checkpoint.frontier == anchor.frontier &&
+                           checkpoint.ordinal == anchor.ordinal;
+                });
+            return !is_dropped && anchor.state == state;
+        });
     };
     for (const PressureSelectedState& selected_state : selected_states) {
         const StateImageHandle state = selected_state.state;
@@ -1874,8 +1867,8 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
                 if (sequence.rewrite_state && *sequence.rewrite_state == state) {
                     ++selected_checkpoint_references;
                 }
-                selected_checkpoint_references += static_cast<std::uint32_t>(std::count_if(
-                    sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                selected_checkpoint_references += static_cast<std::uint32_t>(std::ranges::count_if(
+                    sequence.long_anchors,
                     [&](const LongAnchorCheckpoint& anchor) { return anchor.state == state; }));
             } else {
                 for (const runtime::CheckpointRef checkpoint : dropped_private[index]) {
@@ -2004,10 +1997,9 @@ bool ProgramImpl::compose_pressure_candidate(
     std::vector<HostKVPageReplicaRelease> host_last_reference_releases;
     const auto demotion_count = [](const qwen3_5::detail::PressureDecision& option) {
         const auto count = [](const auto& changes) {
-            return static_cast<std::size_t>(
-                std::count_if(changes.begin(), changes.end(), [](const auto& action) {
-                    return action.kind == qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
-                }));
+            return static_cast<std::size_t>(std::ranges::count_if(changes, [](const auto& action) {
+                return action.kind == qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
+            }));
         };
         return count(option.main_kv_changes) + count(option.backend_kv_changes);
     };
@@ -2062,8 +2054,8 @@ bool ProgramImpl::compose_pressure_candidate(
         const qwen3_5::detail::PressureDecision& proposed = *pressure_options[position];
         if (owner == nullptr || ContractAccess::owner(*owner) != this ||
             planning_owner.value == std::numeric_limits<std::uint32_t>::max() ||
-            std::find(details.pressure_owner_ids.begin(), details.pressure_owner_ids.end(),
-                      planning_owner) != details.pressure_owner_ids.end()) {
+            std::ranges::find(details.pressure_owner_ids, planning_owner) !=
+                details.pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization pressure owner is invalid");
         }
         if (!valid_continuation(*owner)) { return false; }
@@ -2071,8 +2063,7 @@ bool ProgramImpl::compose_pressure_candidate(
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_source && index == details.source_index &&
              generation == details.source_generation) ||
-            std::find(details.pressure_indices.begin(), details.pressure_indices.end(), index) !=
-                details.pressure_indices.end()) {
+            std::ranges::find(details.pressure_indices, index) != details.pressure_indices.end()) {
             throw std::invalid_argument("materialization pressure owner is duplicated");
         }
         qwen3_5::detail::PressureDecision expected;
@@ -2114,11 +2105,10 @@ bool ProgramImpl::compose_pressure_candidate(
         const qwen3_5::detail::PressureDecision& proposed = *shared_pressure_options[position];
         if (owner == nullptr || ContractAccess::owner(*owner) != this ||
             planning_owner.value == std::numeric_limits<std::uint32_t>::max() ||
-            std::find(details.pressure_owner_ids.begin(), details.pressure_owner_ids.end(),
-                      planning_owner) != details.pressure_owner_ids.end() ||
-            std::find(details.shared_pressure_owner_ids.begin(),
-                      details.shared_pressure_owner_ids.end(),
-                      planning_owner) != details.shared_pressure_owner_ids.end()) {
+            std::ranges::find(details.pressure_owner_ids, planning_owner) !=
+                details.pressure_owner_ids.end() ||
+            std::ranges::find(details.shared_pressure_owner_ids, planning_owner) !=
+                details.shared_pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization shared pressure owner is invalid");
         }
         if (!valid_shared_prefix(*owner)) { return false; }
@@ -2126,9 +2116,8 @@ bool ProgramImpl::compose_pressure_candidate(
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_shared_source && index == details.shared_source_index &&
              generation == details.shared_source_generation) ||
-            std::find(details.shared_pressure_indices.begin(),
-                      details.shared_pressure_indices.end(),
-                      index) != details.shared_pressure_indices.end()) {
+            std::ranges::find(details.shared_pressure_indices, index) !=
+                details.shared_pressure_indices.end()) {
             throw std::invalid_argument("materialization shared pressure owner is duplicated");
         }
         qwen3_5::detail::PressureDecision expected;
@@ -2198,8 +2187,8 @@ bool ProgramImpl::compose_pressure_candidate(
             ++details.demand.reservation_credit.device.state_slots;
 
             if (is_masked_draft_backend(speculative_backend)) {
-                const auto copy = std::find_if(
-                    details.transfer_requirements.begin(), details.transfer_requirements.end(),
+                const auto copy = std::ranges::find_if(
+                    details.transfer_requirements,
                     [](const runtime::ContextTransferRequirement& requirement) {
                         return requirement.resource == runtime::ContextResourceClass::State &&
                                requirement.direction ==
@@ -2248,8 +2237,8 @@ bool ProgramImpl::compose_pressure_candidate(
             ++credit;
         }
 
-        const auto copy = std::find_if(
-            details.transfer_requirements.begin(), details.transfer_requirements.end(),
+        const auto copy = std::ranges::find_if(
+            details.transfer_requirements,
             [&](const runtime::ContextTransferRequirement& requirement) {
                 return requirement.resource == resource &&
                        requirement.direction == runtime::ContextTransferDirection::DeviceToDevice &&
@@ -2456,8 +2445,8 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
         }
         if (details.shared_pressure_owner_ids[victim].value ==
                 std::numeric_limits<std::uint32_t>::max() ||
-            std::find(details.pressure_owner_ids.begin(), details.pressure_owner_ids.end(),
-                      details.shared_pressure_owner_ids[victim]) !=
+            std::ranges::find(details.pressure_owner_ids,
+                              details.shared_pressure_owner_ids[victim]) !=
                 details.pressure_owner_ids.end()) {
             return runtime::PreflightStatus::InvariantFailure;
         }
@@ -2548,12 +2537,11 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
     if (details.reuse == ReusePath::PrivateLongAnchor &&
         (!details.selected_checkpoint ||
          details.selected_checkpoint->kind != runtime::CheckpointKind::LongAnchor ||
-         std::none_of(source_state->long_anchors.begin(), source_state->long_anchors.end(),
-                      [&](const LongAnchorCheckpoint& anchor) {
-                          return anchor.frontier == details.selected_checkpoint->frontier &&
-                                 anchor.ordinal == details.selected_checkpoint->ordinal &&
-                                 state_store->valid(anchor.state);
-                      }))) {
+         std::ranges::none_of(source_state->long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+             return anchor.frontier == details.selected_checkpoint->frontier &&
+                    anchor.ordinal == details.selected_checkpoint->ordinal &&
+                    state_store->valid(anchor.state);
+         }))) {
         return runtime::PreflightStatus::StalePolicyState;
     }
     return runtime::PreflightStatus::Ready;

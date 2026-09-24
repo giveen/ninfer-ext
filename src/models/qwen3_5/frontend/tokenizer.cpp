@@ -335,8 +335,8 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
         token_by_content.emplace(token.content, id);
         tokens.push_back(std::move(token));
     }
-    std::sort(tokens.begin(), tokens.end(),
-              [](const AddedToken& lhs, const AddedToken& rhs) { return lhs.id < rhs.id; });
+    std::ranges::sort(tokens,
+                      [](const AddedToken& lhs, const AddedToken& rhs) { return lhs.id < rhs.id; });
 }
 
 std::vector<int> load_default_stop_token_ids(std::string_view contents) {
@@ -549,7 +549,7 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
 }
 
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
-    return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
+    return std::ranges::find(stop_token_ids, id) != stop_token_ids.end();
 }
 
 struct BpeNode {
@@ -699,7 +699,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
 
     const std::string normalized = uni::normalize_nfc(text);
     const bool has_internal_boundary =
-        std::any_of(boundaries.begin(), boundaries.end(), [&](IndexedByteBoundary boundary) {
+        std::ranges::any_of(boundaries, [&](IndexedByteBoundary boundary) {
             const std::size_t local = boundary.offset - text_offset;
             return local != 0 && local != text.size();
         });
@@ -859,9 +859,9 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
         }
         boundaries.push_back(IndexedByteBoundary{.offset = byte_boundaries[index], .index = index});
     }
-    std::stable_sort(
-        boundaries.begin(), boundaries.end(),
-        [](IndexedByteBoundary lhs, IndexedByteBoundary rhs) { return lhs.offset < rhs.offset; });
+    std::ranges::stable_sort(boundaries, [](IndexedByteBoundary lhs, IndexedByteBoundary rhs) {
+        return lhs.offset < rhs.offset;
+    });
     if (options.max_tokens == 0) { return encoded; }
 
     std::size_t boundary_cursor     = 0;
@@ -979,8 +979,7 @@ bool Tokenizer::is_valid_token(int id) const noexcept {
 
 bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
     return valid_token_ids_.size() == size &&
-           std::find(valid_token_ids_.begin(), valid_token_ids_.end(), false) ==
-               valid_token_ids_.end();
+           std::ranges::find(valid_token_ids_, false) == valid_token_ids_.end();
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

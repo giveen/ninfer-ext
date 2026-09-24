@@ -52,10 +52,8 @@ retained_requirement_after_drop(const qwen3_5::ContinuationSummary& summary,
 
 void ProgramImpl::begin_pressure_page_scratch() const noexcept {
     if (++pressure_page_scratch_generation_ == 0) {
-        std::fill(pressure_text_page_scratch_.begin(), pressure_text_page_scratch_.end(),
-                  PressurePageScratchSlot{});
-        std::fill(pressure_backend_page_scratch_.begin(), pressure_backend_page_scratch_.end(),
-                  PressurePageScratchSlot{});
+        std::ranges::fill(pressure_text_page_scratch_, PressurePageScratchSlot{});
+        std::ranges::fill(pressure_backend_page_scratch_, PressurePageScratchSlot{});
         pressure_page_scratch_generation_ = 1;
     }
     pressure_text_selected_pages_.clear();
@@ -205,8 +203,8 @@ bool ProgramImpl::pressure_checkpoint_recovery_impacts(
     std::uint64_t next_host_group = 1;
 
     const auto set_state_placement = [&](StateImageHandle state, bool device, bool host) -> bool {
-        const auto found = std::find_if(state_placements.begin(), state_placements.end(),
-                                        [&](const auto& item) { return item.state == state; });
+        const auto found = std::ranges::find_if(
+            state_placements, [&](const auto& item) { return item.state == state; });
         if (found != state_placements.end()) {
             return found->device == device && found->host == host;
         }
@@ -328,8 +326,8 @@ bool ProgramImpl::pressure_checkpoint_recovery_impacts(
     }
 
     const auto final_state_placement = [&](StateImageHandle state) -> StatePlacement {
-        const auto found = std::find_if(state_placements.begin(), state_placements.end(),
-                                        [&](const auto& item) { return item.state == state; });
+        const auto found = std::ranges::find_if(
+            state_placements, [&](const auto& item) { return item.state == state; });
         if (found != state_placements.end()) { return *found; }
         const StateReplicaResidency residency = state_store->residency(state);
         return StatePlacement{
@@ -493,13 +491,12 @@ bool ProgramImpl::pressure_checkpoint_recovery_impacts(
         const bool evicted = owner.decision != nullptr && owner.decision->evicts_continuation;
         for (CheckpointProjection& checkpoint : checkpoints) {
             checkpoint.survives =
-                !evicted &&
-                !(owner.decision != nullptr &&
-                  std::find(owner.decision->dropped_checkpoints.begin(),
-                            owner.decision->dropped_checkpoints.end(), checkpoint.checkpoint.ref) !=
-                      owner.decision->dropped_checkpoints.end());
+                !evicted && !(owner.decision != nullptr &&
+                              std::ranges::find(owner.decision->dropped_checkpoints,
+                                                checkpoint.checkpoint.ref) !=
+                                  owner.decision->dropped_checkpoints.end());
         }
-        std::sort(checkpoints.begin(), checkpoints.end(), [](const auto& left, const auto& right) {
+        std::ranges::sort(checkpoints, [](const auto& left, const auto& right) {
             return std::tuple{left.checkpoint.ref.frontier, left.checkpoint.ref.kind,
                               left.checkpoint.ref.ordinal} <
                    std::tuple{right.checkpoint.ref.frontier, right.checkpoint.ref.kind,
@@ -556,12 +553,12 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_checkpoint
     const qwen3_5::ContinuationSummary summary = continuation_summary(sequence);
     qwen3_5::detail::PressureDecision option;
     option.dropped_checkpoints.assign(checkpoints.begin(), checkpoints.end());
-    std::sort(option.dropped_checkpoints.begin(), option.dropped_checkpoints.end(),
-              [](runtime::CheckpointRef left, runtime::CheckpointRef right) {
-                  return std::tuple{left.kind, left.frontier, left.ordinal} <
-                         std::tuple{right.kind, right.frontier, right.ordinal};
-              });
-    if (std::adjacent_find(option.dropped_checkpoints.begin(), option.dropped_checkpoints.end()) !=
+    std::ranges::sort(option.dropped_checkpoints,
+                      [](runtime::CheckpointRef left, runtime::CheckpointRef right) {
+                          return std::tuple{left.kind, left.frontier, left.ordinal} <
+                                 std::tuple{right.kind, right.frontier, right.ordinal};
+                      });
+    if (std::ranges::adjacent_find(option.dropped_checkpoints) !=
         option.dropped_checkpoints.end()) {
         return std::nullopt;
     }
@@ -605,18 +602,17 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_checkpoint
     std::vector<StateImageHandle> unique_states;
     unique_states.reserve(dropped_states.size());
     for (const DroppedState& dropped : dropped_states) {
-        if (std::find(unique_states.begin(), unique_states.end(), dropped.state) ==
-            unique_states.end()) {
+        if (std::ranges::find(unique_states, dropped.state) == unique_states.end()) {
             unique_states.push_back(dropped.state);
         }
     }
     const auto checkpoint_dropped = [&](runtime::CheckpointRef checkpoint) {
-        return std::binary_search(option.dropped_checkpoints.begin(),
-                                  option.dropped_checkpoints.end(), checkpoint,
-                                  [](runtime::CheckpointRef left, runtime::CheckpointRef right) {
-                                      return std::tuple{left.kind, left.frontier, left.ordinal} <
-                                             std::tuple{right.kind, right.frontier, right.ordinal};
-                                  });
+        return std::ranges::binary_search(
+            option.dropped_checkpoints, checkpoint,
+            [](runtime::CheckpointRef left, runtime::CheckpointRef right) {
+                return std::tuple{left.kind, left.frontier, left.ordinal} <
+                       std::tuple{right.kind, right.frontier, right.ordinal};
+            });
     };
     for (const StateImageHandle state : unique_states) {
         bool survives = summary.endpoint && !checkpoint_dropped(summary.endpoint->ref) &&
@@ -723,11 +719,11 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
         sequence.rewrite_checkpoint        = {};
         sequence.rewrite_checkpoint_hidden = {};
     } else if (checkpoint.kind == runtime::CheckpointKind::LongAnchor) {
-        const auto anchor = std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                                         [&](const LongAnchorCheckpoint& candidate) {
-                                             return candidate.frontier == checkpoint.frontier &&
-                                                    candidate.ordinal == checkpoint.ordinal;
-                                         });
+        const auto anchor =
+            std::ranges::find_if(sequence.long_anchors, [&](const LongAnchorCheckpoint& candidate) {
+                return candidate.frontier == checkpoint.frontier &&
+                       candidate.ordinal == checkpoint.ordinal;
+            });
         if (anchor == sequence.long_anchors.end()) {
             throw std::logic_error("long-anchor checkpoint changed before drop");
         }
@@ -739,12 +735,11 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
     }
 
     bool retained_state = sequence.endpoint_valid && sequence.state.read == dropped_state;
-    retained_state      = retained_state ||
-                     (sequence.rewrite_state && *sequence.rewrite_state == dropped_state) ||
-                     std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                                 [&](const LongAnchorCheckpoint& anchor) {
-                                     return anchor.state == dropped_state;
-                                 });
+    retained_state =
+        retained_state || (sequence.rewrite_state && *sequence.rewrite_state == dropped_state) ||
+        std::ranges::any_of(sequence.long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+            return anchor.state == dropped_state;
+        });
     if (!retained_state && state_store->checkpoint_references(dropped_state) == 0 &&
         !state_store->release(dropped_state)) {
         throw std::logic_error("dropped checkpoint StateImage remained pinned");
@@ -805,9 +800,8 @@ ProgramImpl::checkpoint_recovery_work(const ContinuationHandle& owner,
         sources.push_back(RecoverySource{.checkpoint = &summary.long_anchors[index],
                                          .state      = sequence.long_anchors[index].state});
     }
-    const auto selected = std::find_if(sources.begin(), sources.end(), [&](const auto& source) {
-        return source.checkpoint->ref == checkpoint;
-    });
+    const auto selected = std::ranges::find_if(
+        sources, [&](const auto& source) { return source.checkpoint->ref == checkpoint; });
     if (selected == sources.end() || !state_store->valid(selected->state)) {
         throw std::logic_error("checkpoint recovery target is unavailable");
     }

@@ -227,9 +227,9 @@ struct FakeRequestBasePlan {
 
     [[nodiscard]] std::optional<PrefillWork>
     shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept {
-        const auto found =
-            std::find_if(cache.opportunities.begin(), cache.opportunities.end(),
-                         [&](const auto& opportunity) { return opportunity.frontier == frontier; });
+        const auto found = std::ranges::find_if(cache.opportunities, [&](const auto& opportunity) {
+            return opportunity.frontier == frontier;
+        });
         return found == cache.opportunities.end()
                    ? std::nullopt
                    : std::optional<PrefillWork>(PrefillWork{.tokens = frontier});
@@ -754,18 +754,17 @@ public:
     [[nodiscard]] bool
     target_feasible(std::span<const FakeTargetDecision> decisions) const noexcept {
         if (pressure_units(decisions) < required_pressure_actions) { return false; }
-        const bool has_eviction =
-            std::any_of(decisions.begin(), decisions.end(),
-                        [](const auto& decision) { return decision.evicts_continuation; });
+        const bool has_eviction = std::ranges::any_of(
+            decisions, [](const auto& decision) { return decision.evicts_continuation; });
         if (required_action_id && !has_eviction &&
-            std::none_of(decisions.begin(), decisions.end(), [&](const auto& decision) {
+            std::ranges::none_of(decisions, [&](const auto& decision) {
                 return decision.id == *required_action_id;
             })) {
             return false;
         }
-        if (require_evictions &&
-            std::any_of(decisions.begin(), decisions.end(),
-                        [](const auto& decision) { return !decision.evicts_continuation; })) {
+        if (require_evictions && std::ranges::any_of(decisions, [](const auto& decision) {
+                return !decision.evicts_continuation;
+            })) {
             return false;
         }
         return true;
@@ -870,8 +869,8 @@ public:
                 victim.final_summary.reset();
             }
             if (reverse_pressure_results) {
-                std::reverse(result.victims.begin(), result.victims.end());
-                std::reverse(result.shared_victims.begin(), result.shared_victims.end());
+                std::ranges::reverse(result.victims);
+                std::ranges::reverse(result.shared_victims);
             }
             if (result.status == ContextTransactionStatus::Published) {
                 result.active_summary = capture_summary;
@@ -941,8 +940,8 @@ public:
             victim.final_summary.reset();
         }
         if (reverse_pressure_results) {
-            std::reverse(result.victims.begin(), result.victims.end());
-            std::reverse(result.shared_victims.begin(), result.shared_victims.end());
+            std::ranges::reverse(result.victims);
+            std::ranges::reverse(result.shared_victims);
         }
         if (plan.admission.private_source_id != 0) {
             result.source = FakeMaterializationSourceResult{
@@ -1220,8 +1219,9 @@ FakePressurePlanningSession::FakePressurePlanningSession(
         owners_.push_back(Owner{
             .shared_handle = shared_owners[index], .id = shared_owner_ids[index], .shared = true});
     }
-    std::sort(owners_.begin(), owners_.end(),
-              [](const Owner& left, const Owner& right) { return left.id.value < right.id.value; });
+    std::ranges::sort(owners_, [](const Owner& left, const Owner& right) {
+        return left.id.value < right.id.value;
+    });
     options_.resize(candidates_.size());
     options_populated_.resize(candidates_.size());
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
@@ -1245,7 +1245,7 @@ bool FakePressurePlanningSession::valid(FakePressureTargetHandle target) const n
 }
 
 std::uint32_t FakePressurePlanningSession::candidate_index(PlanningCandidateId candidate) const {
-    const auto found = std::find(candidate_ids_.begin(), candidate_ids_.end(), candidate);
+    const auto found = std::ranges::find(candidate_ids_, candidate);
     require(found != candidate_ids_.end(), "fake pressure candidate is foreign");
     return static_cast<std::uint32_t>(found - candidate_ids_.begin());
 }
@@ -1342,8 +1342,8 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
     for (std::size_t index = 0; index < owners_.size(); ++index) {
         maximal.choices[index] = static_cast<std::uint16_t>(options_[selected][index].size());
     }
-    auto found = std::find_if(targets_.begin(), targets_.end(),
-                              [&](const Target& target) { return same_target(target, maximal); });
+    auto found = std::ranges::find_if(
+        targets_, [&](const Target& target) { return same_target(target, maximal); });
     if (found != targets_.end()) {
         found->root_maximal = true;
         return FakePressureTargetHandle{
@@ -1418,9 +1418,8 @@ void FakePressurePlanningSession::choose_construction(
 
 std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::construction_target(const Cursor& cursor) {
-    auto found = std::find_if(targets_.begin(), targets_.end(), [&](const Target& other) {
-        return same_target(other, cursor.target);
-    });
+    auto found = std::ranges::find_if(
+        targets_, [&](const Target& other) { return same_target(other, cursor.target); });
     if (found == targets_.end()) {
         if (targets_.size() >= candidates_.size() + 1U + 4096U) { return std::nullopt; }
         auto target           = cursor.target;
@@ -1469,8 +1468,8 @@ FakePressurePlanningSession::guidance_for(const Target& target) {
     MaterializationMachineWork machine = candidate.identity.machine_work;
     const bool combined_copy_cancelled =
         program_->combined_target_cancels_pressure_copy && selected.size() > 1U &&
-        std::none_of(selected.begin(), selected.end(),
-                     [](const auto& decision) { return decision.evicts_continuation; });
+        std::ranges::none_of(selected,
+                             [](const auto& decision) { return decision.evicts_continuation; });
     if (!selected.empty() && program_->pressure_target_immediate_ns_override) {
         const auto optimistic = machine.optimistic_candidate_transfers;
         set_fake_machine_costs(machine, 0, *program_->pressure_target_immediate_ns_override);
@@ -1573,8 +1572,8 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
     MaterializationMachineWork machine = candidate.identity.machine_work;
     const bool combined_copy_cancelled =
         program_->combined_target_cancels_pressure_copy && selected.size() > 1U &&
-        std::none_of(selected.begin(), selected.end(),
-                     [](const auto& decision) { return decision.evicts_continuation; });
+        std::ranges::none_of(selected,
+                             [](const auto& decision) { return decision.evicts_continuation; });
     if (!selected.empty() && program_->pressure_target_immediate_ns_override) {
         const auto optimistic = machine.optimistic_candidate_transfers;
         set_fake_machine_costs(machine, 0, *program_->pressure_target_immediate_ns_override);
@@ -1640,8 +1639,9 @@ FakePressurePlanningSession::prepare_expansion(FakePressureTargetHandle handle,
                 child.choices[owner]       = static_cast<std::uint16_t>(choice);
                 child.root_maximal         = false;
                 child.next_expansion_owner = 0;
-                if (std::none_of(expansion_scratch_.begin(), expansion_scratch_.end(),
-                                 [&](const Target& prior) { return same_target(prior, child); })) {
+                if (std::ranges::none_of(expansion_scratch_, [&](const Target& prior) {
+                        return same_target(prior, child);
+                    })) {
                     expansion_scratch_.push_back(std::move(child));
                 }
             }
@@ -1651,16 +1651,17 @@ FakePressurePlanningSession::prepare_expansion(FakePressureTargetHandle handle,
             child.choices[owner]       = static_cast<std::uint16_t>(alternatives.size());
             child.root_maximal         = false;
             child.next_expansion_owner = 0;
-            if (std::none_of(expansion_scratch_.begin(), expansion_scratch_.end(),
-                             [&](const Target& prior) { return same_target(prior, child); })) {
+            if (std::ranges::none_of(expansion_scratch_, [&](const Target& prior) {
+                    return same_target(prior, child);
+                })) {
                 expansion_scratch_.push_back(std::move(child));
             }
         }
     }
     std::uint32_t new_count = 0;
     for (const Target& child : expansion_scratch_) {
-        if (std::none_of(targets_.begin(), targets_.end(),
-                         [&](const Target& prior) { return same_target(prior, child); })) {
+        if (std::ranges::none_of(targets_,
+                                 [&](const Target& prior) { return same_target(prior, child); })) {
             ++new_count;
         }
     }
@@ -1684,8 +1685,8 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
     committed_children_.clear();
     std::uint32_t new_count = 0;
     for (Target& child : expansion_scratch_) {
-        auto found          = std::find_if(targets_.begin(), targets_.end(),
-                                           [&](const Target& prior) { return same_target(prior, child); });
+        auto found = std::ranges::find_if(
+            targets_, [&](const Target& prior) { return same_target(prior, child); });
         std::uint32_t index = 0;
         if (found == targets_.end()) {
             child.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
@@ -2268,8 +2269,8 @@ void test_candidate_search_prefers_deep_reuse_without_eviction() {
     require(result && result->plan && result->candidate == PlanningCandidateId{.value = 1},
             "shallow Root pressure path starved the cheaper reuse candidate");
     require(result->plan->private_actions.size() == 2 &&
-                std::none_of(
-                    result->plan->private_actions.begin(), result->plan->private_actions.end(),
+                std::ranges::none_of(
+                    result->plan->private_actions,
                     [](const FakeTargetDecision& action) { return action.evicts_continuation; }),
             "one-step eviction outranked the multi-step preserving reuse closure");
 }
@@ -2692,7 +2693,7 @@ void test_two_owners_jointly_close_pressure() {
     program.abort_start = true;
     (void)manager.reserve_materialization(program, std::move(*inspection.choice),
                                           FakePreparedPrompt{43}, {});
-    std::sort(program.started_action_ids.begin(), program.started_action_ids.end());
+    std::ranges::sort(program.started_action_ids);
     const std::vector<std::uint64_t> expected{
         1000U + first.sequence.id,
         1000U + second.sequence.id,
@@ -2812,8 +2813,8 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
     require(program.started_action_ids.size() == program.required_pressure_actions,
             "guided pressure search selected maximal release instead of a retention closure");
     for (const std::uint32_t owner_id : owner_ids) {
-        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
-                          2000U + owner_id) == program.started_action_ids.end(),
+        require(std::ranges::find(program.started_action_ids, 2000U + owner_id) ==
+                    program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
     }
     require(program.pressure_target_assessments <= 8,
@@ -2837,7 +2838,7 @@ void test_combined_target_reprices_cancelled_pressure_copy() {
     program.abort_start = true;
     (void)manager.reserve_materialization(program, std::move(*inspection.choice),
                                           FakePreparedPrompt{53}, {});
-    std::sort(program.started_action_ids.begin(), program.started_action_ids.end());
+    std::ranges::sort(program.started_action_ids);
     const std::vector<std::uint64_t> expected{
         1000U + first.sequence.id,
         1000U + second.sequence.id,
@@ -3366,7 +3367,7 @@ void test_complete_search_against_small_exhaustive_oracle() {
                         std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
                     -> std::optional<Planner::LogicalGoal> {
                     if (candidate.value == 1 || !full_catalog ||
-                        std::any_of(outcomes.begin(), outcomes.end(), [](auto outcome) {
+                        std::ranges::any_of(outcomes, [](auto outcome) {
                             return outcome.disposition == VictimDisposition::Evicted;
                         })) {
                         return Planner::LogicalGoal{.publication_slot = 0};
@@ -3420,11 +3421,10 @@ void test_complete_search_against_small_exhaustive_oracle() {
                 }
                 require(result->diagnostics.predicted_total_ns == oracle,
                         "complete search missed the independent small-problem optimum");
-                require(
-                    std::none_of(result->plan->private_owner_ids.begin(),
-                                 result->plan->private_owner_ids.end(),
-                                 [&](auto id) { return result->candidate.value == 1 && id == 1; }),
-                    "construction included the selected source as a victim");
+                require(std::ranges::none_of(
+                            result->plan->private_owner_ids,
+                            [&](auto id) { return result->candidate.value == 1 && id == 1; }),
+                        "construction included the selected source as a victim");
             }
         }
     }

@@ -633,8 +633,9 @@ void parse_messages(const Json& body, GenerationRequest& request) {
         const ChatTurn& final = request.messages.back();
         if (final.content.empty() || !final.reasoning_content.empty() ||
             !final.tool_calls.empty() ||
-            std::any_of(final.content.begin(), final.content.end(),
-                        [](const ContentPart& part) { return part.kind != ContentKind::Text; })) {
+            std::ranges::any_of(final.content, [](const ContentPart& part) {
+                return part.kind != ContentKind::Text;
+            })) {
             bad_request("a final assistant prefill must contain only text", "messages",
                         "assistant_prefill_not_supported");
         }
@@ -785,7 +786,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
     };
 
     if (selection.kind == ToolSelectionKind::Named) {
-        if (std::none_of(definitions.begin(), definitions.end(), named)) {
+        if (std::ranges::none_of(definitions, named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
         bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "

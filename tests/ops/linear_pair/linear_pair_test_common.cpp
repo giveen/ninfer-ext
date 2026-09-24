@@ -61,12 +61,11 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     std::vector<std::int32_t> result;
     for (const std::int32_t index :
          {0, 1, extent / 4, extent / 2, (3 * extent) / 4, extent - 2, extent - 1}) {
-        if (index >= 0 && index < extent &&
-            std::find(result.begin(), result.end(), index) == result.end()) {
+        if (index >= 0 && index < extent && std::ranges::find(result, index) == result.end()) {
             result.push_back(index);
         }
     }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     return result;
 }
 
@@ -88,7 +87,7 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
         }
         result.push_back(interior);
     }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
@@ -226,7 +225,7 @@ int verify_preserved(const test::GuardedDeviceBuffer& device,
                      std::span<const std::uint8_t> expected, const char* label) {
     std::vector<std::uint8_t> actual(expected.size());
     device.copy_to_host(actual.data(), actual.size());
-    if (std::equal(actual.begin(), actual.end(), expected.begin(), expected.end())) { return 0; }
+    if (std::ranges::equal(actual, expected)) { return 0; }
     std::cerr << label << ": input payload was modified\n";
     return 1;
 }

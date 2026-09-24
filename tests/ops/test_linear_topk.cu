@@ -221,7 +221,7 @@ expected_order(const std::array<std::int32_t, N>& rows, const std::vector<std::i
         const std::int32_t id = id_map == nullptr ? rows[index] : (*id_map)[rows[index]];
         candidates.emplace_back(factor_for(index), id);
     }
-    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+    std::ranges::sort(candidates, [](const auto& lhs, const auto& rhs) {
         return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
     });
     candidates.resize(kTopK);
@@ -299,7 +299,7 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
     std::vector<int> expected;
     if (host_map) {
         expected = *host_map;
-        std::sort(expected.begin(), expected.end());
+        std::ranges::sort(expected);
         expected.resize(kTopK);
     } else
         for (int rank = 0; rank < kTopK; ++rank) expected.push_back(rank);

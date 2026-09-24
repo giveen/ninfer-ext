@@ -420,10 +420,9 @@ int test_response_output_history_round_trip() {
         check(built.output_history.size() == 1 && replay.prompt.input_turns.size() == 5 &&
                   same_assistant_turn(replay.prompt.input_turns[1], built.output_history[0]),
               "Responses output Items did not round-trip to their stored assistant history");
-    const auto edit_item =
-        std::find_if(built.output_items.begin(), built.output_items.end(), [](const Json& item) {
-            return item.at("type") == "function_call" && item.at("name") == "Edit";
-        });
+    const auto edit_item = std::ranges::find_if(built.output_items, [](const Json& item) {
+        return item.at("type") == "function_call" && item.at("name") == "Edit";
+    });
     failures += check(
         edit_item != built.output_items.end() &&
             !Json::parse(edit_item->at("arguments").get<std::string>()).contains("replace_all"),

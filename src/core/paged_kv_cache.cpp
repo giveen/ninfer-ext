@@ -333,9 +333,8 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
         }
     }
     if (selected == free_page_runs_.size()) {
-        const auto contiguous =
-            std::find_if(free_page_runs_.begin(), free_page_runs_.end(),
-                         [count](const FreePageRun& run) { return run.count >= count; });
+        const auto contiguous = std::ranges::find_if(
+            free_page_runs_, [count](const FreePageRun& run) { return run.count >= count; });
         if (contiguous != free_page_runs_.end()) {
             selected       = static_cast<std::size_t>(contiguous - free_page_runs_.begin());
             selected_begin = contiguous->begin;
@@ -450,7 +449,7 @@ void DeviceKVPagePool::validate_distinct_pages(std::span<const DeviceKVPageHandl
                                                const char* duplicate_message) const {
     ++validation_stamp_;
     if (validation_stamp_ == 0) {
-        std::fill(validation_marks_.begin(), validation_marks_.end(), 0);
+        std::ranges::fill(validation_marks_, 0);
         validation_stamp_ = 1;
     }
     for (const DeviceKVPageHandle page : pages) {

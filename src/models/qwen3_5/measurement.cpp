@@ -56,8 +56,7 @@ std::string prefill_signature(const Model& model) {
             weights.push_back(&weight);
         }
     }
-    std::sort(weights.begin(), weights.end(),
-              [](const auto* a, const auto* b) { return a->name < b->name; });
+    std::ranges::sort(weights, [](const auto* a, const auto* b) { return a->name < b->name; });
     std::map<const WeightParent*, std::size_t> parents;
     auto& inventory = facts["weights"] = Json::array();
     for (const auto* weight : weights) {

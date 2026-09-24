@@ -291,14 +291,13 @@ Options parse_options(int argc, char** argv) {
         }
     }
     for (const std::int32_t batch : options.batches) {
-        if (batch > 1 && std::any_of(options.tokens.begin(), options.tokens.end(),
-                                     [](std::int32_t width) { return width > 16; })) {
+        if (batch > 1 &&
+            std::ranges::any_of(options.tokens, [](std::int32_t width) { return width > 16; })) {
             usage("B>1 only supports W<=16");
         }
     }
     if (options.entry == Entry::Cached &&
-        std::any_of(options.batches.begin(), options.batches.end(),
-                    [](std::int32_t batch) { return batch > 1; })) {
+        std::ranges::any_of(options.batches, [](std::int32_t batch) { return batch > 1; })) {
         usage("cached entry is B=1 only");
     }
     if (options.profile &&
@@ -420,8 +419,8 @@ public:
          std::span<const std::int32_t> table_rows, PageMapping mapping)
         : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
           batch_(static_cast<std::int32_t>(contexts.size())),
-          masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
-                              [tokens](std::int32_t valid) { return valid != tokens; })),
+          masked_(std::ranges::any_of(valid_columns,
+                                      [tokens](std::int32_t valid) { return valid != tokens; })),
           visible_(profile_visible(contexts, valid_columns)), padded_(align_context(visible_)),
           mapping_(mapping), logical_pages_(padded_ / kPagedKVPageSize),
           physical_pages_(mapping == PageMapping::Identity ? batch_ * logical_pages_

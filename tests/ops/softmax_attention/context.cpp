@@ -221,11 +221,11 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     fill_uniform(context_v, 5003u + seed, -0.8f, 0.8f);
 
     if (profile == InputProfile::QueryVisibility) {
-        std::fill(q.begin(), q.end(), 0.0f);
-        std::fill(query_k.begin(), query_k.end(), 0.0f);
-        std::fill(query_v.begin(), query_v.end(), 0.0f);
-        std::fill(context_k.begin(), context_k.end(), 0.0f);
-        std::fill(context_v.begin(), context_v.end(), 0.0f);
+        std::ranges::fill(q, 0.0f);
+        std::ranges::fill(query_k, 0.0f);
+        std::ranges::fill(query_v, 0.0f);
+        std::ranges::fill(context_k, 0.0f);
+        std::ranges::fill(context_v, 0.0f);
         for (int kv_head = 0; kv_head < kKVHeads; ++kv_head) {
             for (int d = 0; d < kD; ++d) { query_v[query_kv_index(d, kv_head, tokens - 1)] = 1.0f; }
         }

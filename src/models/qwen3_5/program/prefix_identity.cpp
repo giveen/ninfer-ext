@@ -210,9 +210,9 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     token_types_.resize(tokens);
     for (auto& axis : positions_) { axis.resize(tokens); }
     vision_items_.resize(retained_items);
-    rewrite_execution_frontiers_.erase(std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                                        rewrite_execution_frontiers_.end(), tokens),
-                                       rewrite_execution_frontiers_.end());
+    rewrite_execution_frontiers_.erase(
+        std::ranges::upper_bound(rewrite_execution_frontiers_, tokens),
+        rewrite_execution_frontiers_.end());
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
@@ -246,10 +246,8 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
     const auto incoming_end =
-        std::upper_bound(prompt.identity.rewrite_execution_frontiers.begin(),
-                         prompt.identity.rewrite_execution_frontiers.end(), count);
-    const auto resident_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                               rewrite_execution_frontiers_.end(), count);
+        std::ranges::upper_bound(prompt.identity.rewrite_execution_frontiers, count);
+    const auto resident_end = std::ranges::upper_bound(rewrite_execution_frontiers_, count);
     return std::distance(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end) ==
                std::distance(rewrite_execution_frontiers_.begin(), resident_end) &&
            std::equal(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end,
@@ -283,10 +281,8 @@ bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
     for (std::size_t index = 0; index < left_items; ++index) {
         if (!same_item(vision_items_[index], other.vision_items_[index])) { return false; }
     }
-    const auto left_end  = std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                            rewrite_execution_frontiers_.end(), count);
-    const auto right_end = std::upper_bound(other.rewrite_execution_frontiers_.begin(),
-                                            other.rewrite_execution_frontiers_.end(), count);
+    const auto left_end  = std::ranges::upper_bound(rewrite_execution_frontiers_, count);
+    const auto right_end = std::ranges::upper_bound(other.rewrite_execution_frontiers_, count);
     return std::distance(rewrite_execution_frontiers_.begin(), left_end) ==
                std::distance(other.rewrite_execution_frontiers_.begin(), right_end) &&
            std::equal(rewrite_execution_frontiers_.begin(), left_end,

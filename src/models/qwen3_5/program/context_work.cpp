@@ -83,7 +83,7 @@ retained_requirement_after_drops(const qwen3_5::ContinuationSummary& summary,
     std::size_t found  = 0;
     bool surviving     = false;
     const auto include = [&](const qwen3_5::CheckpointSummary& checkpoint) {
-        const auto match = std::find(dropped.begin(), dropped.end(), checkpoint.ref);
+        const auto match = std::ranges::find(dropped, checkpoint.ref);
         if (match != dropped.end()) {
             ++found;
             return;

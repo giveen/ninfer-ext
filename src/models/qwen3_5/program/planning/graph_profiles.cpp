@@ -37,7 +37,7 @@ std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
     if (draft_window >= 6 && draft_window <= 15) {
         add_target_boundary(draft_window <= 11 ? 512U : 1024U);
     }
-    std::sort(ends.begin(), ends.end());
+    std::ranges::sort(ends);
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
     return graph_profiles_through(max_frontier, ends);
 }
@@ -83,7 +83,7 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
             add_shifted(visible_end, draft_window + 1);
         }
     }
-    std::sort(ends.begin(), ends.end());
+    std::ranges::sort(ends);
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
     return graph_profiles_through(capacity - 1, ends);
 }

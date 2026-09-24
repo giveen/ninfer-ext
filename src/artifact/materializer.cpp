@@ -206,7 +206,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         phase.complete();
         return out;
     }
-    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
+    std::ranges::sort(ranges, [](const auto& a, const auto& b) {
         return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
     });
     std::vector<ReadSpan> spans;

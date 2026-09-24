@@ -229,8 +229,8 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
     }
 
     backing_.emplace(capacity_bytes_);
-    const auto smallest = std::min_element(
-        layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
+    const auto smallest = std::ranges::min_element(
+        layouts_, [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;
         });
     const std::size_t maximum_descriptors = capacity_bytes_ / smallest->page_stride;
@@ -248,16 +248,15 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
 
 std::optional<std::uint32_t>
 HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
-    const auto it = std::find(layouts_.begin(), layouts_.end(), layout);
+    const auto it = std::ranges::find(layouts_, layout);
     if (it == layouts_.end()) { return std::nullopt; }
     return static_cast<std::uint32_t>(it - layouts_.begin());
 }
 
 const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) const noexcept {
-    const auto layout =
-        std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
-            return candidate.geometry == geometry;
-        });
+    const auto layout = std::ranges::find_if(layouts_, [&](const HostKVPageLayout& candidate) {
+        return candidate.geometry == geometry;
+    });
     return layout == layouts_.end() ? nullptr : &*layout;
 }
 
@@ -366,9 +365,8 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
         }
         const std::size_t bytes =
             request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        const auto extent = std::ranges::find_if(
+            simulated, [&](const FreeExtent& free) { return free.bytes >= bytes; });
         if (extent == simulated.end()) { return std::nullopt; }
         const std::size_t offset = extent->offset;
         extent->offset += bytes;
@@ -456,7 +454,7 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
                 intervals.emplace_back(release.begin_page, release.begin_page + release.page_count);
             }
         }
-        std::sort(intervals.begin(), intervals.end());
+        std::ranges::sort(intervals);
         const Descriptor& descriptor = descriptors_[allocation.descriptor_];
         std::uint32_t cursor         = 0;
         std::size_t retained_runs    = 0;
@@ -482,9 +480,8 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
         }
         const std::size_t bytes =
             request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        const auto extent = std::ranges::find_if(
+            simulated, [&](const FreeExtent& free) { return free.bytes >= bytes; });
         if (extent == simulated.end()) { return false; }
         extent->offset += bytes;
         extent->bytes -= bytes;

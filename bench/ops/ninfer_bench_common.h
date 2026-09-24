@@ -126,7 +126,7 @@ private:
 
 inline ColdTiming summarize_timings(std::vector<double> samples) {
     if (samples.empty()) { throw std::invalid_argument("cannot summarize empty timings"); }
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     const auto percentile = [&](double fraction) {
         const std::size_t index =
             std::min(samples.size() - 1,
@@ -218,7 +218,7 @@ ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     return {
         samples[samples.size() / 2],
         samples.front(),
@@ -245,7 +245,7 @@ inline ColdTiming measure_cold_graph(const TimedGraph& graph, DeviceBuffer& flus
         flush_l2(flush, stream);
         samples.push_back(graph.launch_timed(stream));
     }
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     const auto percentile = [&](double fraction) {
         const std::size_t index =
             std::min(samples.size() - 1,
@@ -376,7 +376,7 @@ inline Result bench_loop(const launch_fn& launch, double bytes_moved, int warmup
     cudaEventDestroy(b);
 
     std::vector<double> sorted = samples;
-    std::sort(sorted.begin(), sorted.end());
+    std::ranges::sort(sorted);
     auto pct = [&](double q) {
         const std::size_t idx = std::min(sorted.size() - 1, std::size_t(q * sorted.size()));
         return sorted[idx];

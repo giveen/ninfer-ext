@@ -78,7 +78,7 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, DeviceBuffer& flu
     CUDA_CHECK(cudaGraphDestroy(graph));
     CUDA_CHECK(cudaStreamDestroy(stream));
 
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     Result result;
     result.n_runs    = repeat;
     result.median_us = samples[samples.size() / 2];

@@ -416,7 +416,7 @@ int test_human_and_csv_reports() {
         failures += expect(csv.contains(field),
                            std::string("CSV field ") + std::string(field));
     }
-    failures += expect(std::count(csv.begin(), csv.end(), '\n') == 3, "CSV header plus two rows");
+    failures += expect(std::ranges::count(csv, '\n') == 3, "CSV header plus two rows");
     return failures;
 }
 

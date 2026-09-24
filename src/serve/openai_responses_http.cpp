@@ -114,7 +114,7 @@ void reject_unknown_query(const httplib::Request& request,
                           const std::vector<std::string_view>& allowed) {
     for (const auto& [key, value] : request.params) {
         (void)value;
-        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+        if (std::ranges::find(allowed, key) == allowed.end()) {
             invalid_query("unknown query parameter: " + key, key, "unknown_parameter");
         }
     }
@@ -204,11 +204,11 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
     }
 
     std::vector<Json> ordered = stored_items;
-    if (order == "desc") { std::reverse(ordered.begin(), ordered.end()); }
+    if (order == "desc") { std::ranges::reverse(ordered); }
     std::size_t begin = 0;
     if (request.has_param("after")) {
         const std::string after = request.get_param_value("after");
-        const auto found = std::find_if(ordered.begin(), ordered.end(), [&](const Json& item) {
+        const auto found        = std::ranges::find_if(ordered, [&](const Json& item) {
             return item.contains("id") && item.at("id").is_string() &&
                    item.at("id").get<std::string>() == after;
         });

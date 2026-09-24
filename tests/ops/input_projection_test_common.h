@@ -29,7 +29,7 @@ inline std::vector<std::int32_t> sampled_rows(std::int32_t rows, std::int32_t sa
             selected == 1 ? 0
                           : static_cast<std::int32_t>(
                                 (static_cast<std::int64_t>(rows - 1) * sample) / (selected - 1));
-        if (std::find(result.begin(), result.end(), row) == result.end()) { result.push_back(row); }
+        if (std::ranges::find(result, row) == result.end()) { result.push_back(row); }
     }
     return result;
 }
@@ -184,7 +184,7 @@ inline int compare(std::string_view label, const std::vector<double>& actual,
 inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
                             std::span<const std::uint16_t> before) {
     const std::vector<std::uint16_t> after = from_device<std::uint16_t>(device, before.size());
-    if (std::equal(after.begin(), after.end(), before.begin(), before.end())) { return 0; }
+    if (std::ranges::equal(after, before)) { return 0; }
     std::cerr << label << ": BF16 input was modified\n";
     return 1;
 }
@@ -192,7 +192,7 @@ inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
 inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
                             std::span<const std::int32_t> before) {
     const std::vector<std::int32_t> after = from_device<std::int32_t>(device, before.size());
-    if (std::equal(after.begin(), after.end(), before.begin(), before.end())) { return 0; }
+    if (std::ranges::equal(after, before)) { return 0; }
     std::cerr << label << ": I32 input was modified\n";
     return 1;
 }

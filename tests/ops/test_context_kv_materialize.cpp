@@ -312,7 +312,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
              bool zero_input = false) {
     const int columns          = width * batch;
     std::vector<float> context = make_context(columns, input_seed);
-    if (zero_input) std::fill(context.begin(), context.end(), 0.0f);
+    if (zero_input) std::ranges::fill(context, 0.0f);
     DeviceBuffer context_device   = to_device_bf16(context);
     DeviceBuffer positions_device = to_device_i32(positions);
     DeviceBuffer counts_device    = to_device_i32(counts);
@@ -326,8 +326,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     Tensor counts_tensor(counts_device.p, DType::I32, {batch});
     Tensor slots_tensor(slots_device.p, DType::I32, {batch});
     const ops::ContextKVMaterializeExecutionEnvelope envelope{
-        narrow ? static_cast<std::uint32_t>(*std::min_element(counts.begin(), counts.end())) : 0U,
-        narrow ? static_cast<std::uint32_t>(*std::max_element(counts.begin(), counts.end()))
+        narrow ? static_cast<std::uint32_t>(*std::ranges::min_element(counts)) : 0U,
+        narrow ? static_cast<std::uint32_t>(*std::ranges::max_element(counts))
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](cudaStream_t stream) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,

@@ -112,8 +112,8 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     fill_uniform(k, seed + 1, -1.0f, 1.0f);
     fill_uniform(v, seed + 2, -2.0f, 2.0f);
     if (input_profile == InputProfile::SegmentIsolation) {
-        std::fill(q.begin(), q.end(), 0.0f);
-        std::fill(k.begin(), k.end(), 0.0f);
+        std::ranges::fill(q, 0.0f);
+        std::ranges::fill(k, 0.0f);
         for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
             const float segment_value = (segment & 1u) == 0 ? 4.0f : -3.0f;
             for (int token = cu_seqlens[segment]; token < cu_seqlens[segment + 1]; ++token) {

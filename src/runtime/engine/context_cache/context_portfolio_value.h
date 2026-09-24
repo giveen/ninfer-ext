@@ -47,7 +47,7 @@ public:
         std::array<std::uint64_t, 32> target_demand{};
         owner_scratch_.clear();
         for (const ContextPortfolioOwnerPolicy& policy : owners) {
-            if (std::find_if(owner_scratch_.begin(), owner_scratch_.end(), [&](const auto& item) {
+            if (std::ranges::find_if(owner_scratch_, [&](const auto& item) {
                     return item.owner == policy.owner;
                 }) != owner_scratch_.end()) {
                 throw std::logic_error("portfolio owner policy ID is duplicated");
@@ -59,9 +59,9 @@ public:
         }
 
         for (const ContextPortfolioCheckpointValue& checkpoint : checkpoints) {
-            const auto owner = std::find_if(
-                owner_scratch_.begin(), owner_scratch_.end(),
-                [&](const OwnerValue& item) { return item.owner == checkpoint.owner; });
+            const auto owner = std::ranges::find_if(owner_scratch_, [&](const OwnerValue& item) {
+                return item.owner == checkpoint.owner;
+            });
             if (owner == owner_scratch_.end()) {
                 throw std::logic_error("portfolio checkpoint has no owner policy");
             }

@@ -92,7 +92,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
         candidates[static_cast<std::size_t>(token)] = {adjusted, token};
     }
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
         if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
         return a.token < b.token;
     });
@@ -296,7 +296,7 @@ int verify_distribution(const char* label, const std::vector<int>& samples,
                         const Distribution& expected) {
     std::vector<int> observed(expected.tokens.size(), 0);
     for (int token : samples) {
-        const auto it = std::find(expected.tokens.begin(), expected.tokens.end(), token);
+        const auto it = std::ranges::find(expected.tokens, token);
         if (it == expected.tokens.end()) {
             std::cerr << label << ": sampled token " << token << " outside oracle support\n";
             return 1;

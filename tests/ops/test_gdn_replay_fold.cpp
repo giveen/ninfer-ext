@@ -217,7 +217,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             std::vector<std::uint16_t> expected = initial;
             const std::int32_t commit           = commits[static_cast<std::size_t>(row)];
             if (commit == 0 && destination_slots[row] != source_slots[row])
-                std::fill(expected.begin(), expected.end(), 0);
+                std::ranges::fill(expected, 0);
             if (commit > 0) {
                 const std::int64_t record_outer =
                     static_cast<std::int64_t>(layer) * kRecordCapacity + row;
@@ -459,9 +459,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::uint16_t> inactive_conv(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         for (std::int32_t slot = 0; slot < slot_count; ++slot) {
-            if (std::find(source_slots.begin(), source_slots.end(), slot) != source_slots.end() ||
-                std::find(destination_slots.begin(), destination_slots.end(), slot) !=
-                    destination_slots.end()) {
+            if (std::ranges::find(source_slots, slot) != source_slots.end() ||
+                std::ranges::find(destination_slots, slot) != destination_slots.end()) {
                 continue;
             }
             const Tensor recurrent =
@@ -469,7 +468,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             cuda_check(cudaMemcpy(inactive_recurrent.data(), recurrent.data, recurrent_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download inactive recurrent state");
-            if (!std::all_of(inactive_recurrent.begin(), inactive_recurrent.end(), [](float value) {
+            if (!std::ranges::all_of(inactive_recurrent, [](float value) {
                     return std::bit_cast<std::uint32_t>(value) == 0;
                 })) {
                 std::cerr << "fold modified inactive recurrent slot" << suffix << " layer=" << layer
@@ -480,8 +479,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             cuda_check(cudaMemcpy(inactive_conv.data(), conv.data, conv_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download inactive conv state");
-            if (!std::all_of(inactive_conv.begin(), inactive_conv.end(),
-                             [](std::uint16_t value) { return value == 0; })) {
+            if (!std::ranges::all_of(inactive_conv,
+                                     [](std::uint16_t value) { return value == 0; })) {
                 std::cerr << "fold modified inactive conv slot" << suffix << " layer=" << layer
                           << " slot=" << slot << "\n";
                 return failures + 1;
@@ -498,10 +497,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const auto state_guard_before = from_device<std::uint8_t>(state_storage.p, kGuardBytes);
     const auto state_guard_after  = from_device<std::uint8_t>(
         offset_pointer(state_storage.p, kGuardBytes + state_bytes), kGuardBytes);
-    if (!std::all_of(state_guard_before.begin(), state_guard_before.end(),
-                     [](auto byte) { return byte == 0xa5; }) ||
-        !std::all_of(state_guard_after.begin(), state_guard_after.end(),
-                     [](auto byte) { return byte == 0xa5; })) {
+    if (!std::ranges::all_of(state_guard_before, [](auto byte) { return byte == 0xa5; }) ||
+        !std::ranges::all_of(state_guard_after, [](auto byte) { return byte == 0xa5; })) {
         std::cerr << "fold modified state outer guard" << suffix << "\n";
         ++failures;
     }

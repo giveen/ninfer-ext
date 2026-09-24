@@ -70,7 +70,7 @@ std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
     if (rows == 14336) {
         result.insert(result.end(), {1023, 6143, 6144, 7167, 7168, 13311, 13312});
     }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
@@ -84,7 +84,7 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
         return result;
     }
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }

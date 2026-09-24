@@ -293,7 +293,7 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     DeviceBuffer payload(layout.payload_bytes);
     initialize_payload(spec, layout, payload);
     const auto weight = make_weight(spec, layout, payload.p);
-    const int max_t   = *std::max_element(o.tokens.begin(), o.tokens.end());
+    const int max_t   = *std::ranges::max_element(o.tokens);
     std::vector<int> host_ids(max_t);
     const int mask = spec.d == 2048 ? 248077 : 248070;
     for (int i = 0; i < max_t; ++i) {

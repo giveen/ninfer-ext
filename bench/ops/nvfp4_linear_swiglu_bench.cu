@@ -109,7 +109,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
     if (options.policy == ops::LinearPolicy::A16Only &&
-        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
+        *std::ranges::max_element(options.t_sweep) > 16) {
         throw std::invalid_argument("A16 policy is registered only through T=16");
     }
     return options;
@@ -142,10 +142,8 @@ void write_csv(const Options& options, const std::vector<Result>& results,
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        const std::int32_t max_t =
-            *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
-        const std::int32_t min_t =
-            *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
+        const std::int32_t max_t = *std::ranges::max_element(options.t_sweep);
+        const std::int32_t min_t = *std::ranges::min_element(options.t_sweep);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);

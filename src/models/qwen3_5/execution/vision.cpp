@@ -476,10 +476,9 @@ VisionPrefillSession::VisionPrefillSession(
         previous_item = use.prepared_item_index;
     }
     if (plan_.max_merged_count != 0 &&
-        std::none_of(plan_.control->items.begin(), plan_.control->items.end(),
-                     [&](const qwen3_5::VisionItemControl& item) {
-                         return item.merged_count == plan_.max_merged_count;
-                     })) {
+        std::ranges::none_of(plan_.control->items, [&](const qwen3_5::VisionItemControl& item) {
+            return item.merged_count == plan_.max_merged_count;
+        })) {
         throw std::invalid_argument("Vision request workspace extent has no matching suffix item");
     }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());

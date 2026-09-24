@@ -160,9 +160,8 @@ public:
         }
 
         if (identity_best) {
-            const bool needs_optional_search =
-                std::any_of(roots.begin(), roots.end(),
-                            [](const IdentityRoot& root) { return root.expandable; });
+            const bool needs_optional_search = std::ranges::any_of(
+                roots, [](const IdentityRoot& root) { return root.expandable; });
             const bool no_allowance =
                 allowance.remaining(planning_now_ns<Clock>()) == 0 ||
                 identity_best->cost.total_ns / 20U / std::max(1U, allowance.affected_requests) == 0;
@@ -223,9 +222,8 @@ public:
             candidate_handles, candidate_ids, pressure.private_owners, pressure.private_owner_ids,
             pressure.shared_owners, pressure.shared_owner_ids);
         const auto candidate_index_for = [&](PlanningCandidateId id) -> std::uint32_t {
-            const auto found =
-                std::find_if(candidates.begin(), candidates.end(),
-                             [&](const CandidateInput& input) { return input.id == id; });
+            const auto found = std::ranges::find_if(
+                candidates, [&](const CandidateInput& input) { return input.id == id; });
             if (found == candidates.end()) {
                 throw std::logic_error("pressure target references an unknown candidate ID");
             }
@@ -444,7 +442,7 @@ public:
         for (const auto& root : roots) {
             if (root.expandable) { order.push_back(root.candidate_index); }
         }
-        std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+        std::ranges::stable_sort(order, [&](auto a, auto b) {
             return identity_costs_[a].lower_bound_ns < identity_costs_[b].lower_bound_ns;
         });
         const auto rank_guidance = [&](std::uint32_t index, const PressureTargetGuidance& guide) {
@@ -479,8 +477,7 @@ public:
         bool rescue_done       = false;
         bool refinement_seeded = false;
         const auto have_paths  = [&] {
-            return std::any_of(paths.begin(), paths.end(),
-                                [](const auto& path) { return bool(path.cursor); });
+            return std::ranges::any_of(paths, [](const auto& path) { return bool(path.cursor); });
         };
         while (!search_stopped &&
                (next_path < 2U * order.size() || have_paths() || !refinement_seeded)) {
@@ -488,7 +485,7 @@ public:
                 if (!rescue_done) {
                     rescue_done = true;
                     const auto promising =
-                        std::find_if(order.begin(), order.end(), [&](auto candidate) {
+                        std::ranges::find_if(order, [&](auto candidate) {
                             return !candidate_seeded[candidate] &&
                                    identity_costs_[candidate].lower_bound_ns <
                                        incumbent.cost.total_ns;
@@ -576,8 +573,8 @@ public:
                         break;
                     }
                     auto chosen = rank_guidance(path.candidate_index, session.guidance(*target));
-                    if (std::find(path.visited.begin(), path.visited.end(),
-                                  chosen.stable_target_ordinal) != path.visited.end()) {
+                    if (std::ranges::find(path.visited, chosen.stable_target_ordinal) !=
+                        path.visited.end()) {
                         path.cursor.reset();
                         break;
                     }
@@ -960,15 +957,15 @@ private:
     [[nodiscard]] static const MaterializationOwnerPolicy*
     owner_policy_for(std::span<const MaterializationOwnerPolicy> policies,
                      PlanningOwnerId owner) noexcept {
-        const auto found = std::find_if(policies.begin(), policies.end(),
-                                        [&](const auto& policy) { return policy.owner == owner; });
+        const auto found = std::ranges::find_if(
+            policies, [&](const auto& policy) { return policy.owner == owner; });
         return found == policies.end() ? nullptr : &*found;
     }
 
     [[nodiscard]] static const MaterializationCheckpointPolicy*
     checkpoint_policy_for(std::span<const MaterializationCheckpointPolicy> policies,
                           PlanningOwnerId owner, CheckpointRef checkpoint) noexcept {
-        const auto found = std::find_if(policies.begin(), policies.end(), [&](const auto& policy) {
+        const auto found = std::ranges::find_if(policies, [&](const auto& policy) {
             return policy.owner == owner && policy.checkpoint == checkpoint;
         });
         return found == policies.end() ? nullptr : &*found;
@@ -1048,23 +1045,24 @@ private:
         portfolio_checkpoint_scratch_.clear();
         for (const auto& checkpoint : checkpoint_policies) {
             const auto outcome =
-                std::find_if(guidance.owner_outcomes.begin(), guidance.owner_outcomes.end(),
-                             [&](const auto& item) { return item.owner == checkpoint.owner; });
+                std::ranges::find_if(guidance.owner_outcomes, [&](const auto& item) {
+                    return item.owner == checkpoint.owner;
+                });
             const auto change =
-                std::find_if(guidance.checkpoint_changes.begin(), guidance.checkpoint_changes.end(),
-                             [&](const auto& item) {
-                                 return item.owner == checkpoint.owner &&
-                                        item.checkpoint == checkpoint.checkpoint;
-                             });
+                std::ranges::find_if(guidance.checkpoint_changes, [&](const auto& item) {
+                    return item.owner == checkpoint.owner &&
+                           item.checkpoint == checkpoint.checkpoint;
+                });
             std::uint64_t recovery = checkpoint.baseline_recovery_ns;
             if ((outcome != guidance.owner_outcomes.end() &&
                  outcome->disposition == VictimDisposition::Evicted) ||
                 (change != guidance.checkpoint_changes.end() && !change->survives)) {
                 recovery = checkpoint.rebuild_ns;
             } else {
-                const auto estimate = std::find_if(
-                    guidance.recovery_estimates.begin(), guidance.recovery_estimates.end(),
-                    [&](const auto& item) { return item.owner == checkpoint.owner; });
+                const auto estimate =
+                    std::ranges::find_if(guidance.recovery_estimates, [&](const auto& item) {
+                        return item.owner == checkpoint.owner;
+                    });
                 if (estimate != guidance.recovery_estimates.end()) {
                     for (std::size_t direction = 0; direction < 3; ++direction) {
                         planning_saturating_add(
@@ -1124,8 +1122,8 @@ private:
 
         impact_scratch_.clear();
         for (const PressureCheckpointRecoveryImpact& impact : assessment.checkpoint_impacts) {
-            const auto found = std::find_if(
-                impact_scratch_.begin(), impact_scratch_.end(), [&](const CombinedImpact& item) {
+            const auto found =
+                std::ranges::find_if(impact_scratch_, [&](const CombinedImpact& item) {
                     return item.owner == impact.owner && item.checkpoint == impact.checkpoint;
                 });
             if (found == impact_scratch_.end()) {
@@ -1158,8 +1156,8 @@ private:
             if (owner == nullptr) {
                 throw std::logic_error("checkpoint policy has no portfolio owner");
             }
-            const auto impact = std::find_if(
-                impact_scratch_.begin(), impact_scratch_.end(), [&](const CombinedImpact& value) {
+            const auto impact =
+                std::ranges::find_if(impact_scratch_, [&](const CombinedImpact& value) {
                     return value.owner == policy.owner && value.checkpoint == policy.checkpoint;
                 });
             const std::uint64_t target_recovery =

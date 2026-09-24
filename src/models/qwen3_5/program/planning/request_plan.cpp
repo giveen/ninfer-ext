@@ -113,7 +113,7 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     // A shared promotion at the selected reuse base is offered before the ordinary zero/suffix
     // prefill step. It executes no model work, but it is still one scheduler service unit.
     prefill_units += static_cast<std::uint64_t>(
-        std::count_if(captures.begin(), captures.end(), [reuse_base](const CaptureGroup& capture) {
+        std::ranges::count_if(captures, [reuse_base](const CaptureGroup& capture) {
             return capture.frontier == reuse_base;
         }));
     prefill_units += prefill_splits;
@@ -331,9 +331,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                 throw std::invalid_argument("capture opportunity frontier is invalid");
             }
             auto& groups = shared ? base->shared_candidates : base->capture_groups;
-            auto existing =
-                std::find_if(groups.begin(), groups.end(),
-                             [&](const CaptureGroup& group) { return group.frontier == frontier; });
+            auto existing = std::ranges::find_if(
+                groups, [&](const CaptureGroup& group) { return group.frontier == frontier; });
             if (existing == groups.end()) {
                 CaptureGroup group;
                 group.frontier    = frontier;
@@ -358,16 +357,16 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
         }
-        std::sort(base->capture_groups.begin(), base->capture_groups.end(),
-                  [](const CaptureGroup& left, const CaptureGroup& right) {
-                      return std::tie(left.frontier, left.input_order) <
-                             std::tie(right.frontier, right.input_order);
-                  });
-        std::sort(base->shared_candidates.begin(), base->shared_candidates.end(),
-                  [](const CaptureGroup& left, const CaptureGroup& right) {
-                      return std::tie(left.frontier, left.input_order) <
-                             std::tie(right.frontier, right.input_order);
-                  });
+        std::ranges::sort(base->capture_groups,
+                          [](const CaptureGroup& left, const CaptureGroup& right) {
+                              return std::tie(left.frontier, left.input_order) <
+                                     std::tie(right.frontier, right.input_order);
+                          });
+        std::ranges::sort(base->shared_candidates,
+                          [](const CaptureGroup& left, const CaptureGroup& right) {
+                              return std::tie(left.frontier, left.input_order) <
+                                     std::tie(right.frontier, right.input_order);
+                          });
         std::shared_ptr<const PreparedCaptureBacking> capture_backing;
         if (!base->capture_groups.empty() || !base->shared_candidates.empty()) {
             auto backing = std::make_shared<PreparedCaptureBacking>();
@@ -501,12 +500,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             plan->reuse      = ReusePath::PrivateEndpoint;
             plan->reuse_base = selected.frontier;
         } else if (selected.kind == runtime::CheckpointKind::LongAnchor) {
-            const auto anchor =
-                std::find_if(source->long_anchors.begin(), source->long_anchors.end(),
-                             [&](const LongAnchorCheckpoint& candidate) {
-                                 return candidate.frontier == selected.frontier &&
-                                        candidate.ordinal == selected.ordinal;
-                             });
+            const auto anchor = std::ranges::find_if(
+                source->long_anchors, [&](const LongAnchorCheckpoint& candidate) {
+                    return candidate.frontier == selected.frontier &&
+                           candidate.ordinal == selected.ordinal;
+                });
             if (anchor == source->long_anchors.end() || selected.frontier == 0) {
                 throw std::logic_error("catalog long-anchor summary disagrees with Program state");
             }
@@ -599,15 +597,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         for (const LongAnchorCheckpoint& anchor : source->long_anchors) {
             optional_states.push_back(anchor.state);
         }
-        if (std::find(optional_states.begin(), optional_states.end(), endpoint) !=
-            optional_states.end()) {
+        if (std::ranges::find(optional_states, endpoint) != optional_states.end()) {
             plan->source_mode = runtime::PrivateSourceMode::Retain;
         } else {
             std::vector<StateImageHandle> unique;
             unique.reserve(optional_states.size());
             for (const StateImageHandle state : optional_states) {
                 if (!state_store->valid(state) ||
-                    std::find(unique.begin(), unique.end(), state) != unique.end()) {
+                    std::ranges::find(unique, state) != unique.end()) {
                     continue;
                 }
                 unique.push_back(state);
@@ -643,8 +640,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         std::vector<StateImageHandle> unique;
         unique.reserve(optional_states.size());
         for (const StateImageHandle state : optional_states) {
-            if (!state_store->valid(state) ||
-                std::find(unique.begin(), unique.end(), state) != unique.end()) {
+            if (!state_store->valid(state) || std::ranges::find(unique, state) != unique.end()) {
                 continue;
             }
             unique.push_back(state);
@@ -1230,22 +1226,23 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
     if (candidate.impl_ == nullptr || candidate.impl_->planning_revision != resource_revision()) {
         throw std::logic_error("shared capture selection observes a stale admission candidate");
     }
-    if (!std::is_sorted(frontiers.begin(), frontiers.end()) ||
-        std::adjacent_find(frontiers.begin(), frontiers.end()) != frontiers.end()) {
+    if (!std::ranges::is_sorted(frontiers) ||
+        std::ranges::adjacent_find(frontiers) != frontiers.end()) {
         throw std::invalid_argument("selected shared capture frontiers must be ordered unique");
     }
     AdmissionCandidateImpl& plan = *candidate.impl_;
     for (const std::uint32_t frontier : frontiers) {
         const auto selected =
-            std::find_if(plan.shared_candidates.begin(), plan.shared_candidates.end(),
-                         [&](const CaptureGroup& group) { return group.frontier == frontier; });
+            std::ranges::find_if(plan.shared_candidates, [&](const CaptureGroup& group) {
+                return group.frontier == frontier;
+            });
         if (selected == plan.shared_candidates.end() || frontier < plan.reuse_base ||
             !selected->shared || !selected->identity) {
             throw std::invalid_argument("selected shared capture frontier is unavailable");
         }
-        auto existing =
-            std::find_if(plan.capture_groups.begin(), plan.capture_groups.end(),
-                         [&](const CaptureGroup& group) { return group.frontier == frontier; });
+        auto existing = std::ranges::find_if(plan.capture_groups, [&](const CaptureGroup& group) {
+            return group.frontier == frontier;
+        });
         if (existing == plan.capture_groups.end()) {
             plan.capture_groups.push_back(*selected);
         } else {
@@ -1255,11 +1252,10 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
         }
     }
     plan.shared_candidates.clear();
-    std::sort(plan.capture_groups.begin(), plan.capture_groups.end(),
-              [](const CaptureGroup& left, const CaptureGroup& right) {
-                  return std::tie(left.frontier, left.input_order) <
-                         std::tie(right.frontier, right.input_order);
-              });
+    std::ranges::sort(plan.capture_groups, [](const CaptureGroup& left, const CaptureGroup& right) {
+        return std::tie(left.frontier, left.input_order) <
+               std::tie(right.frontier, right.input_order);
+    });
 
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =

@@ -330,8 +330,8 @@ struct HostExpert {
 };
 
 const HostExpert& find_expert(const std::vector<HostExpert>& experts, int id) {
-    const auto found = std::find_if(experts.begin(), experts.end(),
-                                    [id](const HostExpert& expert) { return expert.id == id; });
+    const auto found =
+        std::ranges::find_if(experts, [id](const HostExpert& expert) { return expert.id == id; });
     if (found == experts.end()) {
         throw std::logic_error("sparse_moe oracle selected an unpopulated expert");
     }
@@ -383,7 +383,7 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
 
     std::vector<int> ranked(kExperts);
     std::iota(ranked.begin(), ranked.end(), 0);
-    std::sort(ranked.begin(), ranked.end(), [&](int left, int right) {
+    std::ranges::sort(ranked, [&](int left, int right) {
         return scores[left] > scores[right] || (scores[left] == scores[right] && left < right);
     });
 
@@ -459,12 +459,12 @@ public:
         std::vector<int> expert_ids;
         for (const RoutePattern& route : kRoutePatterns) {
             for (int expert : route.selected) {
-                if (std::find(expert_ids.begin(), expert_ids.end(), expert) == expert_ids.end()) {
+                if (std::ranges::find(expert_ids, expert) == expert_ids.end()) {
                     expert_ids.push_back(expert);
                 }
             }
         }
-        std::sort(expert_ids.begin(), expert_ids.end());
+        std::ranges::sort(expert_ids);
         for (int expert : expert_ids) {
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
             auto gate_up       = quantized_weight::pack_row_split_lowbit(

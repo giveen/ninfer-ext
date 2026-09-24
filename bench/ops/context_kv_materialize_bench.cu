@@ -74,7 +74,7 @@ std::vector<int> parse_list(std::string_view text, int maximum) {
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
     }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     if (result.empty()) throw std::invalid_argument("empty --batches");
     return result;
@@ -179,9 +179,8 @@ struct Fixture {
             host_slots[b]  = 7 - b;
             for (int i = 0; i < width; ++i) host_positions[b * width + i] = 262140 + 8192 * b + i;
         }
-        envelope = {
-            static_cast<std::uint32_t>(*std::min_element(host_counts.begin(), host_counts.end())),
-            static_cast<std::uint32_t>(*std::max_element(host_counts.begin(), host_counts.end()))};
+        envelope = {static_cast<std::uint32_t>(*std::ranges::min_element(host_counts)),
+                    static_cast<std::uint32_t>(*std::ranges::max_element(host_counts))};
         positions.copy_from_host(host_positions.data(), host_positions.size() * 4);
         counts.copy_from_host(host_counts.data(), host_counts.size() * 4);
         slots.copy_from_host(host_slots.data(), host_slots.size() * 4);

@@ -90,10 +90,9 @@ RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
 std::optional<runtime::PrefillWork>
 RequestBasePlan::shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept {
     if (impl_ == nullptr) { return std::nullopt; }
-    const auto found = std::find_if(impl_->shared_candidates.begin(),
-                                    impl_->shared_candidates.end(), [&](const auto& candidate) {
-                                        return candidate.frontier == frontier && candidate.identity;
-                                    });
+    const auto found = std::ranges::find_if(impl_->shared_candidates, [&](const auto& candidate) {
+        return candidate.frontier == frontier && candidate.identity;
+    });
     return found == impl_->shared_candidates.end()
                ? std::nullopt
                : std::optional<runtime::PrefillWork>(found->identity->rebuild_work);

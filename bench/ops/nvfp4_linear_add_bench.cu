@@ -144,10 +144,8 @@ void write_csv(const Options& options, const std::vector<Result>& results,
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        const std::int32_t max_t =
-            *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
-        const std::int32_t min_t =
-            *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
+        const std::int32_t max_t = *std::ranges::max_element(options.t_sweep);
+        const std::int32_t min_t = *std::ranges::min_element(options.t_sweep);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);

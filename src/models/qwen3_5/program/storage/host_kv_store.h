@@ -472,8 +472,8 @@ private:
         affected_extents_.clear();
         ++release_stamp_;
         if (release_stamp_ == 0) {
-            std::fill(release_marks_.begin(), release_marks_.end(), 0);
-            std::fill(extent_marks_.begin(), extent_marks_.end(), 0);
+            std::ranges::fill(release_marks_, 0);
+            std::ranges::fill(extent_marks_, 0);
             release_stamp_ = 1;
         }
     }

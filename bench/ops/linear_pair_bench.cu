@@ -83,7 +83,7 @@ std::vector<std::int32_t> parse_tokens(std::string_view text) {
         begin = end + 1;
     }
     if (result.empty()) { throw std::invalid_argument("--tokens must not be empty"); }
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
@@ -191,8 +191,7 @@ double useful_flops(std::int32_t k, std::int32_t tokens) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        const std::int32_t maximum_tokens =
-            *std::max_element(options.tokens.begin(), options.tokens.end());
+        const std::int32_t maximum_tokens = *std::ranges::max_element(options.tokens);
 
         int device = 0;
         CUDA_CHECK(cudaGetDevice(&device));

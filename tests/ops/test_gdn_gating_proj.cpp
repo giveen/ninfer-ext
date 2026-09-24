@@ -335,12 +335,12 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     fill_uniform(dt_bias, seed + 5, -1.0f, 1.0f);
     norm_weight[0] = -1.0f;
     norm_weight[1] = -1.5f;
-    if (mode == 1) std::fill(x.begin(), x.end(), 0.0f);
+    if (mode == 1) std::ranges::fill(x, 0.0f);
     if (mode == 2)
         for (auto& v : x) v *= 1.0e-5f;
     if (mode == 3)
         for (auto& v : x) v *= 512.0f;
-    if (mode == 4) std::fill(norm_weight.begin(), norm_weight.end(), -1.0f);
+    if (mode == 4) std::ranges::fill(norm_weight, -1.0f);
     round_to_bf16(x);
     round_to_bf16(norm_weight);
     round_to_bf16(a_weight);
@@ -453,7 +453,7 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
 
 int verify_workspace_capacity_contract(const Geometry& geometry,
                                        std::initializer_list<std::int32_t> route_endpoints) {
-    const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
+    const std::int32_t last = *std::ranges::max_element(route_endpoints);
     const std::size_t interval =
         ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
     std::size_t witness = 0;

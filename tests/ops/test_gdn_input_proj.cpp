@@ -224,8 +224,7 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
     for (const std::int32_t token :
          {0, 1, tokens / 4, tokens / 2, (3 * tokens) / 4, tokens - 2, tokens - 1}) {
         if (token >= 0 && token < tokens &&
-            std::find(selected_tokens.begin(), selected_tokens.end(), token) ==
-                selected_tokens.end()) {
+            std::ranges::find(selected_tokens, token) == selected_tokens.end()) {
             selected_tokens.push_back(token);
         }
     }

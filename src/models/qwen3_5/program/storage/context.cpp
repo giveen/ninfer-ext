@@ -529,11 +529,11 @@ ProgramImpl::selected_state(const SequenceState& sequence, ReusePath reuse,
         if (!checkpoint || checkpoint->kind != runtime::CheckpointKind::LongAnchor) {
             throw std::logic_error("long-anchor materialization has no selected checkpoint");
         }
-        const auto anchor = std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                                         [&](const LongAnchorCheckpoint& candidate) {
-                                             return candidate.frontier == checkpoint->frontier &&
-                                                    candidate.ordinal == checkpoint->ordinal;
-                                         });
+        const auto anchor =
+            std::ranges::find_if(sequence.long_anchors, [&](const LongAnchorCheckpoint& candidate) {
+                return candidate.frontier == checkpoint->frontier &&
+                       candidate.ordinal == checkpoint->ordinal;
+            });
         if (anchor != sequence.long_anchors.end() && state_store->valid(anchor->state)) {
             return anchor->state;
         }

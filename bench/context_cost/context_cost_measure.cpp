@@ -203,7 +203,7 @@ FitMetrics metrics_for(const std::vector<PointPrediction>& predictions, bool val
     }
     FitMetrics metrics;
     if (errors.empty()) { return metrics; }
-    std::sort(errors.begin(), errors.end());
+    std::ranges::sort(errors);
     metrics.median_relative_error = median_of(errors);
     const std::size_t p95 =
         static_cast<std::size_t>(std::ceil(0.95 * static_cast<double>(errors.size()))) - 1U;
@@ -242,8 +242,8 @@ SampleSummary summarize_samples(std::vector<double> elapsed_ns) {
         }
     }
     SampleSummary out;
-    out.minimum_ns = *std::min_element(elapsed_ns.begin(), elapsed_ns.end());
-    out.maximum_ns = *std::max_element(elapsed_ns.begin(), elapsed_ns.end());
+    out.minimum_ns = *std::ranges::min_element(elapsed_ns);
+    out.maximum_ns = *std::ranges::max_element(elapsed_ns);
     out.median_ns  = median_of(elapsed_ns);
     std::vector<double> deviations;
     deviations.reserve(elapsed_ns.size());

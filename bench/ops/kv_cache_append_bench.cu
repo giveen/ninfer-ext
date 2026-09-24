@@ -249,8 +249,8 @@ Options parse_options(int argc, char** argv) {
             usage("unknown argument");
         }
     }
-    if (options.context > std::numeric_limits<std::int32_t>::max() -
-                              *std::max_element(options.tokens.begin(), options.tokens.end())) {
+    if (options.context >
+        std::numeric_limits<std::int32_t>::max() - *std::ranges::max_element(options.tokens)) {
         usage("context + tokens exceeds int32");
     }
     if (options.profile &&

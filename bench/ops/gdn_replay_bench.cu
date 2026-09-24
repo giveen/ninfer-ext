@@ -259,7 +259,7 @@ std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t wi
 }
 
 double median(std::vector<double> values) {
-    std::sort(values.begin(), values.end());
+    std::ranges::sort(values);
     return values[values.size() / 2];
 }
 

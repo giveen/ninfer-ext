@@ -7,7 +7,7 @@ namespace ninfer::runtime {
 namespace {
 
 [[nodiscard]] bool contains(std::span<const std::uint64_t> ids, std::uint64_t id) noexcept {
-    return std::find(ids.begin(), ids.end(), id) != ids.end();
+    return std::ranges::find(ids, id) != ids.end();
 }
 
 [[nodiscard]] bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept {
@@ -83,7 +83,7 @@ void rebind_admission_protection(AdmissionProtection& protection,
 
 bool protection_has_live_donor(const AdmissionProtection& protection,
                                std::span<const ActiveAdmissionSnapshot> active) noexcept {
-    return std::any_of(active.begin(), active.end(), [&](const ActiveAdmissionSnapshot& request) {
+    return std::ranges::any_of(active, [&](const ActiveAdmissionSnapshot& request) {
         return is_donor(protection, request.request_id);
     });
 }

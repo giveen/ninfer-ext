@@ -155,8 +155,8 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
             std::vector<double> gate(static_cast<std::size_t>(tokens));
             std::vector<double> up(static_cast<std::size_t>(tokens));
             for (std::int32_t row = row_begin; row < row_end; ++row) {
-                std::fill(gate.begin(), gate.end(), 0.0);
-                std::fill(up.begin(), up.end(), 0.0);
+                std::ranges::fill(gate, 0.0);
+                std::ranges::fill(up, 0.0);
                 const std::int32_t up_row = profile.output_rows + row;
                 for (std::int32_t column = 0; column < profile.input_rows; ++column) {
                     const double gate_weight =

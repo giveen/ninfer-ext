@@ -38,8 +38,7 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     std::vector<std::int32_t> result;
     for (const std::int32_t index :
          {0, 1, extent / 4, extent / 2, (3 * extent) / 4, extent - 2, extent - 1}) {
-        if (index >= 0 && index < extent &&
-            std::find(result.begin(), result.end(), index) == result.end()) {
+        if (index >= 0 && index < extent && std::ranges::find(result, index) == result.end()) {
             result.push_back(index);
         }
     }
@@ -83,7 +82,7 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
                      std::string_view label) {
     std::vector<std::uint8_t> actual(expected.size());
     device.copy_to_host(actual.data(), actual.size());
-    if (std::equal(actual.begin(), actual.end(), expected.begin(), expected.end())) { return 0; }
+    if (std::ranges::equal(actual, expected)) { return 0; }
     std::cerr << label << ": payload was modified\n";
     return 1;
 }
@@ -112,10 +111,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
     const std::int32_t kMaximumTokens =
-        std::max_element(
-            invocations.begin(), invocations.end(),
-            [](const Invocation& a, const Invocation& b) { return a.tokens < b.tokens; })
-            ->tokens;
+        std::ranges::max_element(invocations, [](const Invocation& a, const Invocation& b) {
+            return a.tokens < b.tokens;
+        })->tokens;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;

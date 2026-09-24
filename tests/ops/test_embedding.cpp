@@ -281,8 +281,8 @@ public:
 
 private:
     const Q6Row* find(std::int32_t id) const {
-        const auto it = std::find_if(rows_.begin(), rows_.end(),
-                                     [id](const Q6Row& row) { return row.id == id; });
+        const auto it =
+            std::ranges::find_if(rows_, [id](const Q6Row& row) { return row.id == id; });
         return it == rows_.end() ? nullptr : &*it;
     }
 
@@ -399,8 +399,8 @@ public:
 
 private:
     const Q8Row* find(std::int32_t id) const {
-        const auto it = std::find_if(rows_.begin(), rows_.end(),
-                                     [id](const Q8Row& row) { return row.id == id; });
+        const auto it =
+            std::ranges::find_if(rows_, [id](const Q8Row& row) { return row.id == id; });
         return it == rows_.end() ? nullptr : &*it;
     }
 
@@ -521,8 +521,8 @@ public:
 
 private:
     const Fp8Row* find(std::int32_t id) const {
-        const auto it = std::find_if(rows_.begin(), rows_.end(),
-                                     [id](const Fp8Row& row) { return row.id == id; });
+        const auto it =
+            std::ranges::find_if(rows_, [id](const Fp8Row& row) { return row.id == id; });
         return it == rows_.end() ? nullptr : &*it;
     }
 

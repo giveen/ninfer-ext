@@ -217,7 +217,7 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
         return result;
     }
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
-    std::sort(result.begin(), result.end());
+    std::ranges::sort(result);
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }

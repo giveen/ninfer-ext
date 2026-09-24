@@ -665,13 +665,12 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
                 "tool_choice", "tool_type_not_supported");
         }
         const std::string name = require_function_name(item, "tool_choice");
-        const bool declared =
-            std::any_of(output.tools.begin(), output.tools.end(),
-                        [&](const ToolDefinition& tool) { return tool.name == name; });
+        const bool declared    = std::ranges::any_of(
+            output.tools, [&](const ToolDefinition& tool) { return tool.name == name; });
         if (!declared) {
             bad_request("allowed tool '" + name + "' is not present in tools", "tool_choice");
         }
-        if (std::find(allowed_names.begin(), allowed_names.end(), name) == allowed_names.end()) {
+        if (std::ranges::find(allowed_names, name) == allowed_names.end()) {
             allowed_names.push_back(name);
         }
     }
@@ -684,8 +683,7 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
     }
 
     std::erase_if(output.tools, [&](const ToolDefinition& tool) {
-        return std::find(allowed_names.begin(), allowed_names.end(), tool.name) ==
-               allowed_names.end();
+        return std::ranges::find(allowed_names, tool.name) == allowed_names.end();
     });
     output.tool_choice.mode = ToolChoiceMode::Auto;
 }

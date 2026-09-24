@@ -184,8 +184,8 @@ Options parse_options(int argc, char** argv) {
         usage("sum of segment lengths exceeds int32");
     }
     const bool uniform =
-        std::adjacent_find(options.segment_lengths.begin(), options.segment_lengths.end(),
-                           std::not_equal_to<>()) == options.segment_lengths.end();
+        std::ranges::adjacent_find(options.segment_lengths, std::not_equal_to<>()) ==
+        options.segment_lengths.end();
     if (!uniform && options.entry != Entry::Packed) {
         usage("nonuniform segment lengths require --entry packed");
     }

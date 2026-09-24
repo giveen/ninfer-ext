@@ -67,7 +67,7 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
         owners.push_back(
             Owner{.shared_handle = handle, .id = shared_owner_ids[index], .shared = true});
     }
-    std::sort(owners.begin(), owners.end(), [](const Owner& left, const Owner& right) {
+    std::ranges::sort(owners, [](const Owner& left, const Owner& right) {
         return std::tuple{left.id.value, left.shared} < std::tuple{right.id.value, right.shared};
     });
     for (std::size_t index = 1; index < owners.size(); ++index) {
@@ -211,8 +211,8 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
 }
 
 PressurePlanningSessionImpl::~PressurePlanningSessionImpl() noexcept {
-    if (std::any_of(assessment_slots.begin(), assessment_slots.end(),
-                    [](const AssessmentSlot& slot) { return slot.leased; })) {
+    if (std::ranges::any_of(assessment_slots,
+                            [](const AssessmentSlot& slot) { return slot.leased; })) {
         std::terminate();
     }
     if (program != nullptr) { program->pressure_planning_active_ = false; }
@@ -254,7 +254,7 @@ bool PressurePlanningSessionImpl::valid(qwen3_5::PressureTargetHandle target) co
 
 std::uint32_t
 PressurePlanningSessionImpl::candidate_index(runtime::PlanningCandidateId candidate) const {
-    const auto found = std::find(candidate_ids.begin(), candidate_ids.end(), candidate);
+    const auto found = std::ranges::find(candidate_ids, candidate);
     if (found == candidate_ids.end()) {
         throw std::invalid_argument("pressure target candidate does not belong to this session");
     }
@@ -444,7 +444,7 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     }
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
-    if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
+    if (std::ranges::find(successors, eviction) == successors.end()) {
         successors.push_back(eviction);
     }
     return successors;
@@ -616,7 +616,7 @@ void PressurePlanningSessionImpl::choose_construction(qwen3_5::PressureConstruct
     auto& decisions      = candidate_options[slot.candidate_index].victims[option.victim].decisions;
     std::uint16_t choice = 0;
     if (!option.identity) {
-        const auto found = std::find(decisions.begin(), decisions.end(), option.decision);
+        const auto found = std::ranges::find(decisions, option.decision);
         if (found != decisions.end()) {
             choice = static_cast<std::uint16_t>(1 + found - decisions.begin());
         } else {
@@ -853,8 +853,8 @@ PressurePlanningSessionImpl::assess(qwen3_5::PressureTargetHandle target) {
     if (choices.size() != options.victims.size()) {
         throw std::logic_error("pressure target victim domain changed");
     }
-    const bool identity_target = std::all_of(choices.begin(), choices.end(),
-                                             [](std::uint16_t choice) { return choice == 0; });
+    const bool identity_target =
+        std::ranges::all_of(choices, [](std::uint16_t choice) { return choice == 0; });
 
     selected_private_owners.clear();
     selected_private_owner_ids.clear();
@@ -871,7 +871,7 @@ PressurePlanningSessionImpl::assess(qwen3_5::PressureTargetHandle target) {
     assessment_outcomes.clear();
     assessment_impact_projections.clear();
     assessment_recovery_alternatives.clear();
-    std::fill(projected_owner_decisions.begin(), projected_owner_decisions.end(), nullptr);
+    std::ranges::fill(projected_owner_decisions, nullptr);
 
     std::uint64_t projection_work   = 1;
     std::uint32_t total_degradation = 0;
@@ -1110,8 +1110,8 @@ PressurePlanningSessionImpl::prepare_expansion(qwen3_5::PressureTargetHandle par
     const std::optional<Core::MaterializationSourceProtection> protection =
         program->materialization_source_protection(candidate);
     if (!protection) { throw std::logic_error("pressure expansion source protection is stale"); }
-    const bool identity = std::all_of(parent_choices.begin(), parent_choices.end(),
-                                      [](std::uint16_t choice) { return choice == 0; });
+    const bool identity =
+        std::ranges::all_of(parent_choices, [](std::uint16_t choice) { return choice == 0; });
     detail::PhysicalResources residual;
     if (identity) {
         residual = candidate.identity_pressure_deficit;
@@ -1139,8 +1139,8 @@ PressurePlanningSessionImpl::prepare_expansion(qwen3_5::PressureTargetHandle par
             .victim_choice_count  = static_cast<std::uint32_t>(parent_choices.size()),
         };
         const std::span<const std::uint16_t> child_choices = victim_choices(child);
-        const bool duplicate_scratch                       = std::any_of(
-            expansion_scratch.begin(), expansion_scratch.end(), [&](const TargetNode& existing) {
+        const bool duplicate_scratch =
+            std::ranges::any_of(expansion_scratch, [&](const TargetNode& existing) {
                 return existing.candidate_index == child.candidate_index &&
                        planning_detail::same_choices(victim_choices(existing), child_choices);
             });
@@ -1155,23 +1155,21 @@ PressurePlanningSessionImpl::prepare_expansion(qwen3_5::PressureTargetHandle par
 
     const auto intern_prepared_decision = [&](std::size_t victim_index, PressureDecision decision) {
         std::vector<PressureDecision>& decisions = options.victims[victim_index].decisions;
-        const auto existing = std::find(decisions.begin(), decisions.end(), decision);
+        const auto existing                      = std::ranges::find(decisions, decision);
         if (existing != decisions.end()) {
             return static_cast<std::uint16_t>(1U + (existing - decisions.begin()));
         }
         const auto prepared =
-            std::find_if(prepared_owner_decisions.begin(), prepared_owner_decisions.end(),
-                         [&](const PreparedOwnerDecision& item) {
-                             return item.candidate_index == node.candidate_index &&
-                                    item.victim_index == victim_index && item.decision == decision;
-                         });
+            std::ranges::find_if(prepared_owner_decisions, [&](const PreparedOwnerDecision& item) {
+                return item.candidate_index == node.candidate_index &&
+                       item.victim_index == victim_index && item.decision == decision;
+            });
         if (prepared != prepared_owner_decisions.end()) { return prepared->choice; }
         const std::size_t staged = static_cast<std::size_t>(
-            std::count_if(prepared_owner_decisions.begin(), prepared_owner_decisions.end(),
-                          [&](const PreparedOwnerDecision& item) {
-                              return item.candidate_index == node.candidate_index &&
-                                     item.victim_index == victim_index;
-                          }));
+            std::ranges::count_if(prepared_owner_decisions, [&](const PreparedOwnerDecision& item) {
+                return item.candidate_index == node.candidate_index &&
+                       item.victim_index == victim_index;
+            }));
         const std::size_t value = decisions.size() + staged + 1U;
         if (value > std::numeric_limits<std::uint16_t>::max()) {
             throw std::overflow_error("pressure owner target count is not representable");

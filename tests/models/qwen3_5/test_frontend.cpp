@@ -590,9 +590,7 @@ int test_rendered_special_tokens() {
                 {chat_message(ninfer::ChatRole::User, "question"), chat_message(role, quoted)},
                 {.reasoning_effort = ninfer::ReasoningEffort::Medium});
             const auto encoded = fi::encode_rendered_chat(tokenizer, rendered);
-            const auto count   = [&](int id) {
-                return std::count(encoded.input_ids.begin(), encoded.input_ids.end(), id);
-            };
+            const auto count   = [&](int id) { return std::ranges::count(encoded.input_ids, id); };
             failures +=
                 check(rendered.text.contains(quoted) &&
                           rendered.media_placeholders.empty() && count(248056) == 0 &&
@@ -614,11 +612,11 @@ int test_rendered_special_tokens() {
     options.tool_jsons                = {R"({"function":{"description":"<|video_pad|>"}})"};
     options.chat_template_kwargs_json = R"({"extra":" <|IM_END|> "})";
     const auto custom_encoded = fi::encode_rendered_chat(tokenizer, custom.render({call}, options));
-    failures += check(
-        std::count(custom_encoded.input_ids.begin(), custom_encoded.input_ids.end(), 248046) == 1 &&
-            std::none_of(custom_encoded.input_ids.begin(), custom_encoded.input_ids.end(),
-                         [](int id) { return id == 248056 || id == 248057 || id == 248068; }),
-        "tool data or template kwargs were interpreted as controls");
+    failures += check(std::ranges::count(custom_encoded.input_ids, 248046) == 1 &&
+                          std::ranges::none_of(
+                              custom_encoded.input_ids,
+                              [](int id) { return id == 248056 || id == 248057 || id == 248068; }),
+                      "tool data or template kwargs were interpreted as controls");
     return failures;
 }
 
@@ -628,8 +626,8 @@ int test_repeated_special_tokens_scan_linearly() {
     text.reserve(token.size() * 5'000);
     for (int index = 0; index < 5'000; ++index) { text += token; }
     const std::vector<int> encoded = fixture_tokenizer().encode(text);
-    return check(encoded.size() == 5'000 && std::all_of(encoded.begin(), encoded.end(),
-                                                        [](int id) { return id == 248056; }),
+    return check(encoded.size() == 5'000 &&
+                     std::ranges::all_of(encoded, [](int id) { return id == 248056; }),
                  "repeated special-token scan changed tokenization semantics");
 }
 
@@ -847,12 +845,11 @@ int test_assistant_continuation() {
               chat_message(ninfer::ChatRole::Assistant, "<think>quoted <|im_end|><|image_pad|>")},
         options);
     const auto encoded = fi::encode_rendered_chat(fixture_tokenizer(), literal);
-    failures +=
-        check(!literal.starts_in_reasoning && literal.text.ends_with("<|image_pad|>") &&
-                  std::count(encoded.input_ids.begin(), encoded.input_ids.end(), 248046) == 1 &&
-                  std::none_of(encoded.input_ids.begin(), encoded.input_ids.end(),
-                               [](int id) { return id == 248068 || id == 248056; }),
-              "assistant continuation reinterpreted literal controls");
+    failures += check(!literal.starts_in_reasoning && literal.text.ends_with("<|image_pad|>") &&
+                          std::ranges::count(encoded.input_ids, 248046) == 1 &&
+                          std::ranges::none_of(encoded.input_ids,
+                                               [](int id) { return id == 248068 || id == 248056; }),
+                      "assistant continuation reinterpreted literal controls");
     return failures;
 }
 
@@ -1130,9 +1127,8 @@ int test_media_token_ids_come_from_tokenizer() {
     const auto frontend          = make_frontend(source);
     const auto prompt            = frontend.prepare(image_input());
     const auto& data             = FrontendFactory::inspect(prompt);
-    return check(data.has_media() &&
-                     std::count(data.token_ids.begin(), data.token_ids.end(), 1600) > 0 &&
-                     std::count(data.token_ids.begin(), data.token_ids.end(), 248056) == 0,
+    return check(data.has_media() && std::ranges::count(data.token_ids, 1600) > 0 &&
+                     std::ranges::count(data.token_ids, 248056) == 0,
                  "Vision preparation ignored the loaded image token ID");
 }
 
@@ -1263,9 +1259,8 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty() &&
         !prepared_data.vision_items.front().token_spans.empty()) {
         const auto span            = prepared_data.vision_items.front().token_spans.front();
-        const auto explicit_marker = std::find_if(
-            prepared_data.context_cache.opportunities.begin(),
-            prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
+        const auto explicit_marker = std::ranges::find_if(
+            prepared_data.context_cache.opportunities, [](const auto& opportunity) {
                 return ninfer::has_shared_candidate_evidence(
                     opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
             });
@@ -1310,10 +1305,10 @@ int test_template_media_contract() {
     const auto& data    = FrontendFactory::inspect(prepared);
     failures +=
         check(data.vision_items.size() == 1 && data.prepare.vision_tokens == 4 &&
-                  std::count(data.token_ids.begin(), data.token_ids.end(), 248056) == 4 &&
-                  std::count(data.token_ids.begin(), data.token_ids.end(), 248053) == 1 &&
-                  std::count(data.token_ids.begin(), data.token_ids.end(), 248054) == 1 &&
-                  std::count(data.token_ids.begin(), data.token_ids.end(), 248057) == 0 &&
+                  std::ranges::count(data.token_ids, 248056) == 4 &&
+                  std::ranges::count(data.token_ids, 248053) == 1 &&
+                  std::ranges::count(data.token_ids, 248054) == 1 &&
+                  std::ranges::count(data.token_ids, 248057) == 0 &&
                   frontend.count_tokens(input) == data.token_ids.size(),
               "literal media markers interfered with real image expansion or token counting");
     return failures;
@@ -1372,9 +1367,8 @@ int test_explicit_leading_instruction_cache_boundary() {
 
     const auto prepared        = frontend.prepare(std::move(input));
     const auto& data           = FrontendFactory::inspect(prepared);
-    const auto explicit_marker = std::find_if(
-        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
-        [](const auto& opportunity) {
+    const auto explicit_marker =
+        std::ranges::find_if(data.context_cache.opportunities, [](const auto& opportunity) {
             return ninfer::has_shared_candidate_evidence(
                 opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
         });

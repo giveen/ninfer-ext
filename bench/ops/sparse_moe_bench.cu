@@ -472,14 +472,12 @@ RoutePattern make_route_pattern(std::int32_t tokens, ExpertDistribution distribu
         if (token == 0) { continue; }
         std::int32_t overlap = 0;
         for (std::int32_t expert : result.selected[token]) {
-            overlap +=
-                std::find(result.selected[token - 1].begin(), result.selected[token - 1].end(),
-                          expert) != result.selected[token - 1].end();
+            overlap += std::ranges::find(result.selected[token - 1], expert) !=
+                       result.selected[token - 1].end();
         }
         overlap_sum += overlap;
     }
-    result.unique_experts =
-        static_cast<std::int32_t>(std::count(present.begin(), present.end(), true));
+    result.unique_experts   = static_cast<std::int32_t>(std::ranges::count(present, true));
     result.adjacent_overlap = overlap_sum / static_cast<double>(tokens - 1);
     return result;
 }
@@ -674,7 +672,7 @@ private:
 
 Stats summarize(std::vector<double> samples) {
     if (samples.empty()) { throw std::invalid_argument("cannot summarize an empty sample set"); }
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     const auto percentile = [&](double fraction) {
         const std::size_t index =
             std::min(samples.size() - 1,

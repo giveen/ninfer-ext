@@ -68,8 +68,8 @@ void require_exact_members(const Json& value, std::initializer_list<std::string_
     }
     for (auto it = value.begin(); it != value.end(); ++it) {
         const std::string_view member = it.key();
-        const bool known = std::find(required.begin(), required.end(), member) != required.end() ||
-                           std::find(optional.begin(), optional.end(), member) != optional.end();
+        const bool known              = std::ranges::find(required, member) != required.end() ||
+                                        std::ranges::find(optional, member) != optional.end();
         if (!known) {
             throw std::invalid_argument(std::string(context) + " contains unknown member '" +
                                         std::string(member) + "'");
@@ -196,18 +196,16 @@ Json parse_document(std::string_view text, std::string_view source_name) {
 
 const ContextCostMachinePreset* find_machine(const std::vector<ContextCostMachinePreset>& presets,
                                              std::string_view hardware_class) noexcept {
-    const auto found = std::find_if(presets.begin(), presets.end(), [&](const auto& preset) {
-        return preset.hardware_class == hardware_class;
-    });
+    const auto found = std::ranges::find_if(
+        presets, [&](const auto& preset) { return preset.hardware_class == hardware_class; });
     return found == presets.end() ? nullptr : &*found;
 }
 
 const ContextPrefillPreset* find_prefill(const ContextCostMachinePreset& machine,
                                          std::string_view prefill_signature) noexcept {
-    const auto found =
-        std::find_if(machine.prefill.begin(), machine.prefill.end(), [&](const auto& preset) {
-            return preset.prefill_signature == prefill_signature;
-        });
+    const auto found = std::ranges::find_if(machine.prefill, [&](const auto& preset) {
+        return preset.prefill_signature == prefill_signature;
+    });
     return found == machine.prefill.end() ? nullptr : &*found;
 }
 
@@ -632,7 +630,7 @@ void upsert_context_prefill_cost_atomic(const std::filesystem::path& path,
                      {"coefficients", prefill_json(prefill)},
                      {"provenance", parse_provenance(provenance_json)}};
     Json& entries    = machine.at("prefill");
-    const auto found = std::find_if(entries.begin(), entries.end(), [&](const Json& value) {
+    const auto found = std::ranges::find_if(entries, [&](const Json& value) {
         return value.at("prefill_signature").get_ref<const std::string&>() ==
                identity.prefill_signature;
     });

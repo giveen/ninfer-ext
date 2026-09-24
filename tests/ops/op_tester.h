@@ -289,7 +289,7 @@ public:
         const auto* suffix_device = static_cast<const std::uint8_t*>(data()) + payload_bytes_;
         const auto suffix         = from_device<std::uint8_t>(suffix_device, guard_bytes_);
         const auto intact         = [this](const std::vector<std::uint8_t>& guard) {
-            return std::all_of(guard.begin(), guard.end(),
+            return std::ranges::all_of(guard,
                                        [this](std::uint8_t value) { return value == guard_byte_; });
         };
         if (intact(prefix) && intact(suffix)) return 0;

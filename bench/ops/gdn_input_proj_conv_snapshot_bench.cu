@@ -776,7 +776,7 @@ private:
 
 Stats summarize(std::vector<double> samples) {
     if (samples.empty()) { throw std::invalid_argument("cannot summarize an empty sample set"); }
-    std::sort(samples.begin(), samples.end());
+    std::ranges::sort(samples);
     const auto percentile = [&](double fraction) {
         const std::size_t index =
             std::min(samples.size() - 1,

@@ -360,8 +360,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
                                           std::to_string(token));
         }
-        if (std::find(result.token_ids.begin(), result.token_ids.end(), token) ==
-            result.token_ids.end()) {
+        if (std::ranges::find(result.token_ids, token) == result.token_ids.end()) {
             result.token_ids.push_back(token);
         }
     };
@@ -374,8 +373,8 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     for (const StopString& stop : caller.strings) {
         if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
         (void)ninfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
-        const auto duplicate = std::find_if(
-            result.strings.begin(), result.strings.end(), [&](const StopString& existing) {
+        const auto duplicate =
+            std::ranges::find_if(result.strings, [&](const StopString& existing) {
                 return existing.text == stop.text && existing.channel == stop.channel &&
                        existing.include_in_output == stop.include_in_output;
             });
@@ -496,10 +495,9 @@ PreparedContextCache prepare_context_cache(
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
-        const auto duplicate = std::find_if(
-            out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
-                return existing.kind == kind && existing.frontier == frontier;
-            });
+        const auto duplicate = std::ranges::find_if(out.opportunities, [&](const auto& existing) {
+            return existing.kind == kind && existing.frontier == frontier;
+        });
         if (duplicate == out.opportunities.end()) {
             out.opportunities.push_back(PreparedCacheOpportunity{.kind        = kind,
                                                                  .evidence    = evidence,
@@ -615,8 +613,7 @@ public:
                 "Qwen tokenizer cannot present the canonical thinking control suffix");
         }
         for (const TokenId token : encoded) {
-            if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
-                defaults.token_ids.end()) {
+            if (std::ranges::find(defaults.token_ids, token) != defaults.token_ids.end()) {
                 throw std::invalid_argument(
                     "canonical thinking control suffix contains a default terminal token");
             }
@@ -741,9 +738,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     const std::size_t message_count       = input.messages.size();
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
-    const bool has_media =
-        std::any_of(messages.begin(), messages.end(),
-                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    const bool has_media                  = std::ranges::any_of(
+        messages, [](const fi::ChatMessage& message) { return message.has_media(); });
     if (has_media && !impl_->vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
@@ -827,9 +823,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
-    const bool has_media =
-        std::any_of(messages.begin(), messages.end(),
-                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    const bool has_media                  = std::ranges::any_of(
+        messages, [](const fi::ChatMessage& message) { return message.has_media(); });
     if (has_media && !impl_->vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }

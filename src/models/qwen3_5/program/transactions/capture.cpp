@@ -554,12 +554,11 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
             if (!replacement || replacement->kind != runtime::CheckpointKind::LongAnchor) {
                 throw std::logic_error("full long-anchor set has no selected replacement");
             }
-            const auto victim =
-                std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                             [&](const LongAnchorCheckpoint& anchor) {
-                                 return anchor.frontier == replacement->frontier &&
-                                        anchor.ordinal == replacement->ordinal;
-                             });
+            const auto victim = std::ranges::find_if(
+                sequence.long_anchors, [&](const LongAnchorCheckpoint& anchor) {
+                    return anchor.frontier == replacement->frontier &&
+                           anchor.ordinal == replacement->ordinal;
+                });
             if (victim == sequence.long_anchors.end()) {
                 throw std::logic_error("selected long-anchor replacement changed");
             }
@@ -571,10 +570,10 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
                 throw std::logic_error("non-full long-anchor set has a replacement");
             }
             for (std::size_t candidate = 1; candidate <= capacity_limit; ++candidate) {
-                if (std::none_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                                 [candidate](const LongAnchorCheckpoint& anchor) {
-                                     return anchor.ordinal == candidate;
-                                 })) {
+                if (std::ranges::none_of(sequence.long_anchors,
+                                         [candidate](const LongAnchorCheckpoint& anchor) {
+                                             return anchor.ordinal == candidate;
+                                         })) {
                     ordinal = static_cast<std::uint32_t>(candidate);
                     break;
                 }
@@ -1125,15 +1124,13 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
             for (const runtime::ContextResourceClass resource : resources) {
                 bool has_copy = false;
                 for_each_pending_pressure([&](const auto& work) {
-                    has_copy =
-                        has_copy ||
-                        std::any_of(work.option.transfer_requirements.begin(),
-                                    work.option.transfer_requirements.end(),
-                                    [&](const auto& requirement) {
-                                        return requirement.resource == resource &&
-                                               requirement.direction ==
-                                                   runtime::ContextTransferDirection::DeviceToHost;
-                                    });
+                    has_copy = has_copy ||
+                               std::ranges::any_of(
+                                   work.option.transfer_requirements, [&](const auto& requirement) {
+                                       return requirement.resource == resource &&
+                                              requirement.direction ==
+                                                  runtime::ContextTransferDirection::DeviceToHost;
+                                   });
                 });
                 if (has_copy) { start_context_transfer_timer(resource); }
                 for_each_pending_pressure(
@@ -1291,9 +1288,8 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         };
         const auto planned_work = [&](runtime::ContextResourceClass resource,
                                       runtime::ContextTransferDirection direction) {
-            const auto found = std::find_if(
-                transaction.transfer_requirements.begin(), transaction.transfer_requirements.end(),
-                [&](const auto& requirement) {
+            const auto found = std::ranges::find_if(
+                transaction.transfer_requirements, [&](const auto& requirement) {
                     return requirement.resource == resource && requirement.direction == direction;
                 });
             return found == transaction.transfer_requirements.end() ? TransferWork{} : found->work;

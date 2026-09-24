@@ -140,8 +140,8 @@ bool real_user(const ChatMessage& message) {
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
-    return std::any_of(parts.begin(), parts.end(),
-                       [](const ChatPart& part) { return part.kind != ChatPartKind::Text; });
+    return std::ranges::any_of(
+        parts, [](const ChatPart& part) { return part.kind != ChatPartKind::Text; });
 }
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source, std::string source_name,
@@ -320,8 +320,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         };
         for (const auto& region : output.regions) {
             if (region.tag == origin.tag || region.tag == origin.reasoning_tag ||
-                std::find(origin.part_tags.begin(), origin.part_tags.end(), region.tag) !=
-                    origin.part_tags.end()) {
+                std::ranges::find(origin.part_tags, region.tag) != origin.part_tags.end()) {
                 include({region.begin, region.end});
             }
         }

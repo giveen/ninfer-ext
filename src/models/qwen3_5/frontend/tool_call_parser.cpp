@@ -89,9 +89,8 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
 
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
-    return std::all_of(name.begin(), name.end(), [](char byte) {
-        return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
-    });
+    return std::ranges::all_of(
+        name, [](char byte) { return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-'; });
 }
 
 constexpr std::uint8_t type_bit(SchemaType type) { return std::to_underlying(type); }
@@ -206,9 +205,8 @@ bool same_contract(const Contract::Tool& lhs, const Contract::Tool& rhs) {
 void append_tool_contract(Contract& contracts, const Json& definition) {
     Contract::Tool compiled = compile_tool_contract(definition);
     if (compiled.name.empty()) { return; }
-    const auto existing =
-        std::find_if(contracts.tools.begin(), contracts.tools.end(),
-                     [&](const auto& tool) { return tool.name == compiled.name; });
+    const auto existing = std::ranges::find_if(
+        contracts.tools, [&](const auto& tool) { return tool.name == compiled.name; });
     if (existing == contracts.tools.end()) {
         contracts.tools.push_back(std::move(compiled));
         return;
@@ -220,17 +218,15 @@ void append_tool_contract(Contract& contracts, const Json& definition) {
 }
 
 const Contract::Tool* find_tool_contract(const Contract& contract, std::string_view tool_name) {
-    const auto tool =
-        std::find_if(contract.tools.begin(), contract.tools.end(),
-                     [&](const auto& candidate) { return candidate.name == tool_name; });
+    const auto tool = std::ranges::find_if(
+        contract.tools, [&](const auto& candidate) { return candidate.name == tool_name; });
     return tool == contract.tools.end() ? nullptr : &*tool;
 }
 
 const Contract::Parameter* find_parameter_contract(const Contract::Tool& tool,
                                                    std::string_view parameter_name) {
-    const auto parameter =
-        std::find_if(tool.parameters.begin(), tool.parameters.end(),
-                     [&](const auto& candidate) { return candidate.name == parameter_name; });
+    const auto parameter = std::ranges::find_if(
+        tool.parameters, [&](const auto& candidate) { return candidate.name == parameter_name; });
     return parameter == tool.parameters.end() ? nullptr : &*parameter;
 }
 
@@ -481,8 +477,9 @@ private:
             return FallbackReason::MalformedStructure;
         }
         const std::string_view name = text_.substr(name_begin, name_end - name_begin);
-        if (std::any_of(call.parameters.begin(), call.parameters.end(),
-                        [&](const RawParameter& existing) { return existing.name == name; })) {
+        if (std::ranges::any_of(call.parameters, [&](const RawParameter& existing) {
+                return existing.name == name;
+            })) {
             return FallbackReason::DuplicateParameter;
         }
 

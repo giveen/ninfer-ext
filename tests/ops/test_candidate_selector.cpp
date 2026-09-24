@@ -361,15 +361,15 @@ int run(bool ties = false, bool dependent = false) {
     }
     if (!stable) throw std::runtime_error("could not construct stable selector fixture");
     if (ties) {
-        std::fill(unary_scores.begin(), unary_scores.end(), 0.0F);
-        std::fill(projected_hidden.begin(), projected_hidden.end(), 0);
+        std::ranges::fill(unary_scores, 0.0F);
+        std::ranges::fill(projected_hidden, 0);
         for (std::size_t first = 0; first < candidate_ids.size(); first += kCandidates)
             std::reverse(candidate_ids.begin() + first,
                          candidate_ids.begin() + first + kCandidates);
         lattice = build_lattice(candidate_ids, unary_scores, projected_hidden, anchors);
     }
     if (dependent) {
-        std::fill(unary_scores.begin(), unary_scores.end(), 0.0F);
+        std::ranges::fill(unary_scores, 0.0F);
         lattice = build_lattice(candidate_ids, unary_scores, projected_hidden, anchors);
         for (int b = 0; b < kMaxBatch; ++b) {
             for (int c = 0; c < kCandidates; ++c)

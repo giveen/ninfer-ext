@@ -310,7 +310,7 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kValueRows  = 6144;
     constexpr std::int32_t kZRows      = 6144;
     constexpr std::int32_t kOutputRows = kQkRows + kValueRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens      = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
         QType::Q4_G64_FP16, kQkRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
     bench::PackedQuantizedWeight value_z = bench::make_row_split_weight(
@@ -338,7 +338,7 @@ void run_q8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kQkvRows    = 8192;
     constexpr std::int32_t kZRows      = 4096;
     constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens       = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
         QType::Q8_G32_FP16, kOutputRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
@@ -366,7 +366,7 @@ void run_nvfp4(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kQkvRows    = 10240;
     constexpr std::int32_t kZRows      = 6144;
     constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens       = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight parent = bench::make_nvfp4_weight(kOutputRows, kHidden);
     const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::NVFP4, kOutputRows, kHidden, options.nvfp4_policy, max_tokens, max_tokens);
@@ -398,7 +398,7 @@ void run_fp8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kQkvRows    = 10240;
     constexpr std::int32_t kZRows      = 6144;
     constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t max_tokens       = *std::ranges::max_element(options.tokens);
     bench::PackedQuantizedWeight parent = bench::make_fp8_weight(kOutputRows, kHidden);
     const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16, kOutputRows, kHidden, options.fp8_policy, 1, max_tokens);

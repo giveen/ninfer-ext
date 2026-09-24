@@ -32,9 +32,9 @@ namespace {
 }
 
 bool has_user_query(const std::vector<ChatTurn>& turns) {
-    return std::any_of(turns.begin(), turns.end(), [](const ChatTurn& turn) {
+    return std::ranges::any_of(turns, [](const ChatTurn& turn) {
         if (turn.role != ChatRole::User) { return false; }
-        return std::any_of(turn.content.begin(), turn.content.end(), [](const ContentPart& part) {
+        return std::ranges::any_of(turn.content, [](const ContentPart& part) {
             return part.kind != ContentKind::Text || !part.text.empty();
         });
     });

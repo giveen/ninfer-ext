@@ -71,7 +71,7 @@ int check(bool condition, const char* message) {
 }
 
 std::size_t line_count(std::string_view value) {
-    return static_cast<std::size_t>(std::count(value.begin(), value.end(), '\n'));
+    return static_cast<std::size_t>(std::ranges::count(value, '\n'));
 }
 
 } // namespace

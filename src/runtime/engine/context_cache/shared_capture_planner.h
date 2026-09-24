@@ -261,7 +261,7 @@ private:
     [[nodiscard]] static const CheckpointPolicy*
     checkpoint_policy_for(std::span<const CheckpointPolicy> policies, PlanningOwnerId owner,
                           CheckpointRef checkpoint) noexcept {
-        const auto found = std::find_if(policies.begin(), policies.end(), [&](const auto& policy) {
+        const auto found = std::ranges::find_if(policies, [&](const auto& policy) {
             return policy.owner == owner && policy.checkpoint == checkpoint;
         });
         return found == policies.end() ? nullptr : &*found;
@@ -283,8 +283,8 @@ private:
                 nullptr) {
                 throw std::logic_error("capture pressure impact has no portfolio checkpoint");
             }
-            const auto found = std::find_if(
-                impact_scratch_.begin(), impact_scratch_.end(), [&](const CombinedImpact& value) {
+            const auto found =
+                std::ranges::find_if(impact_scratch_, [&](const CombinedImpact& value) {
                     return value.owner == impact.owner && value.checkpoint == impact.checkpoint;
                 });
             if (found == impact_scratch_.end()) {
@@ -328,11 +328,10 @@ private:
             if (input.direct_shared_victim == policy.owner) {
                 target_recovery = policy.rebuild_ns;
             } else {
-                const auto impact = std::find_if(impact_scratch_.begin(), impact_scratch_.end(),
-                                                 [&](const CombinedImpact& value) {
-                                                     return value.owner == policy.owner &&
-                                                            value.checkpoint == policy.checkpoint;
-                                                 });
+                const auto impact =
+                    std::ranges::find_if(impact_scratch_, [&](const CombinedImpact& value) {
+                        return value.owner == policy.owner && value.checkpoint == policy.checkpoint;
+                    });
                 if (impact != impact_scratch_.end()) { target_recovery = impact->target_ns; }
             }
             checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
