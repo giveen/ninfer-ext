@@ -199,6 +199,14 @@ std::optional<ResourcePlan> PressurePlanningSession::seal(AssessedPressureTarget
     return ResourcePlan(std::move(*sealed), impl_->resource_revision, needs_transfer);
 }
 
+bool PressurePlanningSession::try_claim_seal_window() noexcept {
+    return impl_ != nullptr && impl_->program->try_claim_seal_window();
+}
+
+void PressurePlanningSession::release_seal_window() noexcept {
+    if (impl_ != nullptr) { impl_->program->release_seal_window(); }
+}
+
 std::optional<CapturePressurePlan>
 PressurePlanningSession::seal_capture(AssessedPressureTarget&& assessed) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
