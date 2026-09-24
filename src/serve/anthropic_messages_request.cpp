@@ -316,9 +316,19 @@ ChatTurn parse_assistant_blocks(const Json& content) {
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
-            // intentionally outside the lowered request; only visible Thinking reaches the model.
-            assistant.reasoning_content += thinking;
+            // Visible Thinking text is the prompt. A block returned under display:"omitted" has
+            // empty text and carries its reasoning in an NInfer signature; any other signature is
+            // transport metadata and stays outside the lowered request.
+            std::optional<std::string> hidden;
+            if (thinking.empty() && block.contains("signature") &&
+                block.at("signature").is_string()) {
+                try {
+                    hidden = decode_thinking_signature(block.at("signature").get<std::string>());
+                } catch (const std::invalid_argument& error) {
+                    bad_request(error.what(), "messages", "invalid_thinking_signature");
+                }
+            }
+            assistant.reasoning_content += hidden ? *hidden : thinking;
         } else if (type == "redacted_thinking") {
             if (cache_boundary(block, "messages")) {
                 bad_request("cache_control is not valid on redacted_thinking blocks", "messages",
@@ -886,12 +896,13 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }
-        if (purpose == ParsePurpose::Messages && display == "omitted") {
-            bad_request("thinking.display='omitted' requires encrypted hidden-reasoning restore "
-                        "semantics that NInfer does not provide",
-                        "thinking", "thinking_display_not_supported");
-        }
     }
+}
+
+bool thinking_display_omitted(const Json& body) {
+    if (!body.contains("thinking") || !body.at("thinking").is_object()) { return false; }
+    const Json& thinking = body.at("thinking");
+    return thinking.contains("display") && thinking.at("display") == "omitted";
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
@@ -1068,6 +1079,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                         result.generation.max_tokens);
+    result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
     return result;
 }
