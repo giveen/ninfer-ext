@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from tools.artifact.reader import Artifact
 from tools.artifact.codecs.row_split import decode_row_split_codes
@@ -15,8 +16,10 @@ from tools.artifact.writer import ArtifactWriter
 from tools.convert.methods import grouped_absmax, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
+from tools.convert.official_recipes import _moe_encoded_source
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import EncodedRows, LogicalSource, array_source
+from tools.convert.sources.safetensors import SafetensorsSource
 
 
 def _model(names=("query", "key", "gate", "value")):
@@ -405,3 +408,75 @@ def test_one_weight_divisor_still_shares_one_activation_divisor():
     assert len(prepared.auxiliaries) == 1
     assert prepared.auxiliaries[0][1] == struct.pack("<f", 5.0)
 
+
+def _moe_parameter(name, shape):
+    """A routed expert matrix as the MoE description declares it: a projection of that shape."""
+    return Parameter(
+        name, shape, array_source(torch.zeros(shape), name), inputs=("ffn_input",)
+    )
+
+
+def _nvfp4_expert_checkpoint(tmp_path, rows, columns, prefixes):
+    """One compressed-tensors shard holding several per-expert NVFP4 matrices."""
+    tensors = {}
+    for index, prefix in enumerate(prefixes):
+        tensors[f"{prefix}.weight_packed"] = torch.full(
+            (rows, columns // 2), 0x32 + index, dtype=torch.uint8
+        )
+        tensors[f"{prefix}.weight_scale"] = torch.full(
+            (rows, columns // 16), 0x38, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn)
+        tensors[f"{prefix}.weight_global_scale"] = torch.tensor(
+            [2.0], dtype=torch.float32
+        )
+        tensors[f"{prefix}.input_global_scale"] = torch.tensor(
+            [1.5], dtype=torch.float32
+        )
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    return SafetensorsSource(tmp_path)
+
+
+def test_moe_encoded_source_maps_routed_and_shared_experts(tmp_path):
+    rows, columns = 128, 64
+    layer, expert = "7", "13"
+    routed = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
+    shared = f"model.language_model.layers.{layer}.mlp.shared_expert"
+    prefixes = [
+        f"{routed}.gate_proj",
+        f"{routed}.up_proj",
+        f"{routed}.down_proj",
+        f"{shared}.gate_proj",
+        f"{shared}.down_proj",
+    ]
+    with _nvfp4_expert_checkpoint(tmp_path, rows, columns, prefixes) as store:
+        for name, expected in (
+            (f"text/layers/{layer}/moe/experts/{expert}/gate", prefixes[0]),
+            (f"text/layers/{layer}/moe/experts/{expert}/up", prefixes[1]),
+            (f"text/layers/{layer}/moe/experts/{expert}/down", prefixes[2]),
+            (f"text/layers/{layer}/moe/shared/gate", prefixes[3]),
+            (f"text/layers/{layer}/moe/shared/down", prefixes[4]),
+        ):
+            source = _moe_encoded_source(
+                store, _moe_parameter(name, (rows, columns)), name
+            )
+            assert expected in source.label
+            words = source.read_encoded(0, rows)
+            assert words.format == "nvfp4"
+            assert tuple(words.codes.shape) == (rows, columns // 2)
+            assert words.weight_divisor == struct.pack("<f", 2.0)
+            assert source.input_divisor() == struct.pack("<f", 1.5)
+
+
+def test_moe_encoded_source_reports_a_missing_or_mismatched_expert(tmp_path):
+    rows, columns = 128, 64
+    present = "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    with _nvfp4_expert_checkpoint(tmp_path, rows, columns, [present]) as store:
+        missing = "text/layers/0/moe/experts/1/gate"
+        with pytest.raises(ValueError, match="no NVFP4 source"):
+            _moe_encoded_source(store, _moe_parameter(missing, (rows, columns)), missing)
+        name = "text/layers/0/moe/experts/0/gate"
+        source = _moe_encoded_source(
+            store, _moe_parameter(name, (rows, columns + 16)), name
+        )
+        with pytest.raises(ValueError, match="expected"):
+            source.read_encoded(0, rows)
