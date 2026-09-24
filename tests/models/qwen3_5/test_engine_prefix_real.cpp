@@ -926,8 +926,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
     if (!engine.options().context_cache.max_shared_prefixes ||
         *engine.options().context_cache.max_shared_prefixes !=
-            ninfer::kMaximumExplicitPromptCacheMarkers) {
-        std::cerr << "single-concurrency Engine did not expose four default shared prefixes\n";
+            ninfer::kMaximumPreparedPromptCacheCandidatesPerRequest) {
+        std::cerr << "single-concurrency Engine did not expose the default shared prefixes\n";
         return 1;
     }
 
@@ -1995,7 +1995,8 @@ ninfer::PromptInput pressure_turn(std::string text, std::string session,
     user.parts.push_back(ninfer::MessagePart{
         .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
     input.messages.push_back(std::move(user));
-    input.options.enable_thinking = false;
+    input.options.enable_thinking   = false;
+    input.options.preserve_thinking = false;
     if (!session.empty()) { input.context_cache.session_key = std::move(session); }
     input.context_cache.retention = retention;
     return input;

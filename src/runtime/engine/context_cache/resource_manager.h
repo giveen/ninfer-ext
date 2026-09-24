@@ -1000,14 +1000,18 @@ public:
         publication.session   = active.session;
         publication.retention = RetentionClass::Disposable;
         migrate_observations(publication, result.summary, publication.retention);
-        touch_catalog_entry(publication);
         advance_revision(publication.revision);
+        bool lost_session_binding = false;
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
                                  publication.revision, active.publication_order)) {
                 publication.session.reset();
+                lost_session_binding = true;
             }
         }
+        // A late finish that lost its session's binding to a newer request is not the
+        // conversation's continuation; it must not outrank the owner that holds the binding.
+        if (!lost_session_binding) { touch_catalog_entry(publication); }
     }
 
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -1079,15 +1083,19 @@ public:
         publication.session   = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
-        touch_catalog_entry(publication);
         advance_revision(publication.revision);
+        bool lost_session_binding = false;
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
                                  publication.revision, active.publication_order)) {
                 publication.session.reset();
+                lost_session_binding = true;
                 publication.retention = RetentionClass::RecentPrivate;
             }
         }
+        // A late finish that lost its session's binding to a newer request is not the
+        // conversation's continuation; it must not outrank the owner that holds the binding.
+        if (!lost_session_binding) { touch_catalog_entry(publication); }
         reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
