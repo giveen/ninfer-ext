@@ -226,6 +226,9 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = enable_thinking;
+    // Qwen3.8 templates default to xhigh and prepend a reasoning-instruction system message;
+    // medium adds no text, keeping the goldens valid for both the 3.6 and 3.8 templates.
+    if (enable_thinking) { input.options.reasoning_effort = ninfer::ReasoningEffort::Medium; }
     return input;
 }
 
