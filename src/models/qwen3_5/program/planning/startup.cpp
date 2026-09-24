@@ -938,7 +938,7 @@ void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private
         // StateImage buys back `buyback_tokens` tokens of re-prefill (page-aligned, so priced in
         // whole page groups).
         const std::uint64_t buyback_tokens =
-            std::max(1ULL, state_image_bytes / host_kv_group_bytes) *
+            std::max<std::uint64_t>(1ULL, state_image_bytes / host_kv_group_bytes) *
             static_cast<std::uint64_t>(kPagedKVPageSize);
         const std::uint64_t capacity_pages =
             1ULL + (capacity - 1ULL) / static_cast<std::uint64_t>(kPagedKVPageSize);
