@@ -32,28 +32,46 @@ namespace ninfer::product {
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||
+            options.fixed_draft) {
             throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
+                "--draft-tokens, --lm-head-draft and --fixed-draft require --spec "
+                "mtp|dflash|dflash2");
         }
         return;
     case SpeculativeBackend::Mtp:
-        if (options.draft_tokens == 0 || options.draft_tokens > 5) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
+        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
         }
         return;
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
         }
+        if (options.fixed_draft) {
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+        }
         return;
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
         }
+        if (options.fixed_draft) {
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+        }
         return;
     }
     throw std::invalid_argument("invalid speculative backend");
+}
+
+// Applies the parsed-flag defaults, then validates: `--spec mtp` without `--draft-tokens` selects the
+// adaptive policy with the longest draft, seven tokens. `--fixed-draft` still needs an explicit length.
+inline void resolve_speculative_cli_options(SpeculativeOptions& options) {
+    if (options.backend == SpeculativeBackend::Mtp && options.draft_tokens == 0 &&
+        !options.fixed_draft) {
+        options.draft_tokens = 7;
+    }
+    validate_speculative_cli_options(options);
 }
 
 } // namespace ninfer::product

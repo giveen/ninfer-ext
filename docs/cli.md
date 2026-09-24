@@ -13,7 +13,7 @@ The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
   --max-context 32768 \
   --max-new 8192 \
   --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft
 ```
 
@@ -77,7 +77,7 @@ output capacity for the inserted suffix and the answer:
   --max-new 1024 \
   --thinking-budget 512 \
   --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft
 ```
 
@@ -137,7 +137,7 @@ Run message files from the repository root when they contain repository-relative
   --max-new 128 \
   --kv-dtype fp8 \
   --vision \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft
 ```
 
@@ -173,7 +173,7 @@ may be combined with `--vision`.
   --max-context 16384 \
   --max-new 512 \
   --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 7 \
   --lm-head-draft
 ```
 
@@ -202,7 +202,7 @@ block length eight, while fifteen uses the maximum supported block length sixtee
 
 ## Common options
 
-The table lists executable defaults. The examples above select FP8 KV and MTP3.
+The table lists executable defaults. The examples above select FP8 KV and MTP with drafts of up to seven tokens.
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -213,7 +213,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
+| `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

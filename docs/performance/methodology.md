@@ -29,12 +29,16 @@ These are recorded experimental settings, not promises about current executable 
 | Report label | Runner mode | Server options |
 |---|---|---|
 | MTP0 (no speculation) | `mtp0` | No `--spec` |
-| MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --lm-head-draft` |
+| MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --fixed-draft --lm-head-draft` |
 | DFlash, block=8 | `dflash7` | `--spec dflash --draft-tokens 7 --lm-head-draft` |
 | DFlash2, block=8 | `dflash2_7` | `--spec dflash2 --draft-tokens 7 --lm-head-draft` |
 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
-head are separate experimental dimensions.
+head are separate experimental dimensions. Published MTP rows pin one draft length with
+`--fixed-draft`; without it `--draft-tokens N` is the ceiling of the adaptive policy. A single
+request picks 2, 3, 4 or N drafts per round from its measured acceptance and the startup-measured
+round times; rounds with several requests draft 3, where a longer draft raised no aggregate
+throughput at concurrency 2, 4 or 8.
 
 ## Workloads and measurement boundaries
 

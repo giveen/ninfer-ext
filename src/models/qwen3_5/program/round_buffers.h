@@ -12,7 +12,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 7;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
@@ -213,7 +213,11 @@ struct DFlashPrefillState {
     DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout);
 };
 
+// One MTP decode frame at a fixed draft length. `draft_window` may be any K up to the layout's
+// window; frames of different K over one backing share every region and differ only in the
+// contiguous [K+1] and [K-1] extents their captured graphs bake in.
 struct MtpDecodeState {
+    std::uint32_t draft_window = 0;
     DeviceSpan ingress;
     DeviceSpan egress;
     Tensor anchors;

@@ -106,6 +106,34 @@ int test_cli_contract() {
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.speculative.draft_tokens == 5, "MTP window");
+    failures += expect(!parsed.speculative.fixed_draft, "MTP drafts adaptively by default");
+    const auto fixed_draft =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                        "--draft-tokens", "7", "--fixed-draft"});
+    failures += expect(fixed_draft.speculative.fixed_draft &&
+                           fixed_draft.speculative.draft_tokens == 7,
+                       "--fixed-draft pins the MTP draft length");
+    for (const auto k : {"0", "8"}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                                      "--draft-tokens", k});
+            },
+            "MTP draft window outside [1,7]");
+    }
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--fixed-draft"});
+        },
+        "--fixed-draft without a speculative backend");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash",
+                                  "--draft-tokens", "7", "--fixed-draft"});
+        },
+        "--fixed-draft applies only to MTP");
+    failures += expect(qb::usage_text("ninfer_bench").contains("--fixed-draft"),
+                       "help names --fixed-draft");
     failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                        "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
@@ -146,7 +174,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                                  "--draft-tokens", "6"});
+                                  "--draft-tokens", "8"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(

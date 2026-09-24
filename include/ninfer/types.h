@@ -80,9 +80,12 @@ enum class SpeculativeBackend : std::uint8_t {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: DFlash and DFlash2 1..15 (query width K+1). For MTP 1..7 it is the largest
+    // draft length: MTP chooses among graphs captured at K in {2, 4, 7} below it and at K itself
+    // before every round, unless `fixed_draft` pins every round to K.
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    bool fixed_draft           = false;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -685,6 +688,9 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // Rounds run at each draft length: entry k-1 counts rounds that drafted k tokens. MTP varies
+    // the length per round; a fixed window puts every round in its last entry.
+    std::vector<std::uint64_t> rounds_by_draft_length;
 };
 
 struct ThinkingBudgetStats {

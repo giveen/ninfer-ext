@@ -64,7 +64,10 @@ def pair_list(values: Iterable[tuple[int, int]]) -> str:
 
 
 def mtp_args(k: int) -> tuple[str, ...]:
-    return ("--spec", "mtp", "--draft-tokens", str(k), "--lm-head-draft") if k > 0 else ()
+    # The matrix measures one draft length per case, so every MTP case pins it.
+    if k == 0:
+        return ()
+    return ("--spec", "mtp", "--draft-tokens", str(k), "--fixed-draft", "--lm-head-draft")
 
 
 def shell_join(command: Sequence[str]) -> str:

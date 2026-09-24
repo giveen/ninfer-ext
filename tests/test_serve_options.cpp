@@ -140,6 +140,22 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    const ServeOptions adaptive_mtp =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "7"});
+    failures += check(adaptive_mtp.speculative.draft_tokens == 7 &&
+                          !adaptive_mtp.speculative.fixed_draft,
+                      "MTP did not default to adaptive drafting");
+    const ServeOptions fixed_mtp = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                          "--draft-tokens", "3", "--fixed-draft"});
+    failures += check(fixed_mtp.speculative.draft_tokens == 3 && fixed_mtp.speculative.fixed_draft,
+                      "--fixed-draft was not preserved");
+    bool fixed_without_mtp_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "7",
+                     "--fixed-draft"});
+    } catch (const std::invalid_argument&) { fixed_without_mtp_rejected = true; }
+    failures += check(fixed_without_mtp_rejected, "--fixed-draft was accepted for DFlash");
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

@@ -239,6 +239,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
     static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
     static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
+    this->draft_window        = draft_window;
     const auto batch          = static_cast<std::int32_t>(batch_capacity);
     const auto drafts         = static_cast<std::int32_t>(draft_window);
     const auto width          = drafts + 1;
@@ -287,23 +288,34 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
-    verify_ids       = layout.verify_ids.bind(backing);
-    target_positions = layout.target_positions.bind(backing);
-    target_argmax    = layout.target_argmax.bind(backing);
-    target_logits    = layout.target_logits.bind(backing);
-    target_hidden    = layout.target_hidden.bind(backing);
+    // The layout is sized for the largest draft window. A state built for a smaller window
+    // reinterprets the same regions with its own contiguous [K+1] and [K-1] extents, so several
+    // states over one backing serve graphs captured at different draft lengths.
+    const auto window_view = [&](const TensorRegion& region,
+                                 std::initializer_list<std::int32_t> shape) {
+        const Tensor full = region.bind(backing);
+        Tensor view(full.data, full.dtype, shape);
+        if (view.bytes() > full.bytes()) {
+            throw std::invalid_argument("MTP decode state window exceeds its layout");
+        }
+        return view;
+    };
+    const auto rows = layout.target_logits.shape[0];
+    const auto hidden_size = layout.target_hidden.shape[0];
+    verify_ids       = window_view(layout.verify_ids, {width, batch});
+    target_positions = window_view(layout.target_positions, {width, batch});
+    target_argmax    = window_view(layout.target_argmax, {width, batch});
+    target_logits    = window_view(layout.target_logits, {rows, width, batch});
+    target_hidden    = window_view(layout.target_hidden, {hidden_size, width, batch});
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
-    alignment_ids              = layout.alignment_ids.bind(backing);
-    alignment_hidden           = layout.alignment_hidden.bind(backing);
+    alignment_ids              = window_view(layout.alignment_ids, {width, batch});
+    alignment_hidden           = window_view(layout.alignment_hidden, {hidden_size, width, batch});
     ar_hidden                  = layout.ar_hidden.bind(backing);
     next_hidden                = layout.next_hidden.bind(backing);
-    ar_positions               = layout.ar_positions.bind(backing);
-    ar_rope_positions          = layout.ar_rope_positions.bind(backing);
-    ar_valid_columns           = layout.ar_valid_columns.bind(backing);
-    if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
-        throw std::logic_error("MTP decode AR layout does not match its configured dimensions");
-    }
+    ar_positions               = window_view(layout.ar_positions, {batch, steps});
+    ar_rope_positions          = window_view(layout.ar_rope_positions, {batch, steps});
+    ar_valid_columns           = window_view(layout.ar_valid_columns, {batch, steps});
 }
 
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

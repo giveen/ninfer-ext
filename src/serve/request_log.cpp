@@ -292,7 +292,8 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {

@@ -217,6 +217,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions);
         }
+        std::string lengths;
+        for (std::size_t i = 0; i < speculative.rounds_by_draft_length.size(); ++i) {
+            if (speculative.rounds_by_draft_length[i] == 0) { continue; }
+            if (!lengths.empty()) { lengths += ' '; }
+            lengths += std::format("K{}={}", i + 1, speculative.rounds_by_draft_length[i]);
+        }
+        if (!lengths.empty()) { print_metric(backend + " rounds by length", lengths); }
     }
 }
 

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -23,7 +24,7 @@ void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
 
 template <class Prepare>
 void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
-                              Prepare&& prepare);
+                              bool discover_topologies, Prepare&& prepare);
 
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
                              std::uint32_t max_frontier, const char* label) {
@@ -38,9 +39,13 @@ void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
     }
 }
 
+// With `discover_topologies` the profiles' node topologies are not predicted: a profile joins the
+// first executable the driver accepts an in-place update to, and otherwise seeds a new class. That
+// suits families whose graph structure depends on op routes that change with shape in ways the
+// planner does not model, such as MTP at every draft length.
 template <class Prepare>
 void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
-                              Prepare&& prepare) {
+                              bool discover_topologies, Prepare&& prepare) {
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
     }
@@ -49,6 +54,18 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         DecodeGraphProfile& profile = family.profiles[i];
         if (!profile.definition.ready()) {
             throw std::logic_error(std::string(label) + " CUDA Graph definition is empty");
+        }
+        if (discover_topologies) {
+            const auto accepting =
+                std::ranges::find_if(family.topologies, [&](DecodeGraphTopology& topology) {
+                    return topology.executable.try_update(profile.definition);
+                });
+            if (accepting != family.topologies.end()) {
+                accepting->installed_profile = i;
+                profile.topology_class       = accepting->topology_class;
+                continue;
+            }
+            profile.topology_class = static_cast<std::uint32_t>(family.topologies.size());
         }
         const auto existing =
             std::ranges::find_if(family.topologies, [&](const DecodeGraphTopology& topology) {
@@ -184,7 +201,9 @@ void ProgramImpl::prepare_graphs() {
             }
             cache.page_pool().zero_pages(pages, device.stream);
         };
-    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+    // `mtp_window` is the MTP draft length of the family being prepared; zero means the largest.
+    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
+                                            std::uint32_t mtp_window = 0) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -245,8 +264,9 @@ void ProgramImpl::prepare_graphs() {
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
             *mtp_host_egress           = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
-            const std::uint32_t width  = draft_window + 1U;
+            const std::uint32_t window = mtp_window != 0 ? mtp_window : draft_window;
+            const std::uint32_t extent = std::min(window, capacity - frontier - 1U);
+            const std::uint32_t width  = window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
@@ -256,8 +276,8 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->current_extents[row] = static_cast<std::int32_t>(extent);
                 mtp_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
-                for (std::uint32_t step = 0; step < draft_window; ++step) {
-                    mtp_host_ingress->current_drafts[row * draft_window + step] = 0;
+                for (std::uint32_t step = 0; step < window; ++step) {
+                    mtp_host_ingress->current_drafts[row * window + step] = 0;
                 }
                 for (std::uint32_t column = 0; column < width; ++column) {
                     mtp_host_ingress->target_rope_positions[row * width + column] =
@@ -288,16 +308,19 @@ void ProgramImpl::prepare_graphs() {
             }
         }
     };
-    const auto execution_core = [&] {
-        return execution::ExecutionCore{device,
-                                        parameters,
-                                        work,
-                                        state_images->linear(),
-                                        replay_records ? &*replay_records : nullptr,
-                                        io,
-                                        prefill_hidden,
-                                        prefill_chunk,
-                                        proposal_head};
+    // MTP graphs record and fold ReplaySSM at their own draft width, so they pass their rung's
+    // records; every other family uses the planned records.
+    const auto execution_core = [&](const GdnReplayRecords* records = nullptr) {
+        return execution::ExecutionCore{
+            device,
+            parameters,
+            work,
+            state_images->linear(),
+            records != nullptr ? records : (replay_records ? &*replay_records : nullptr),
+            io,
+            prefill_hidden,
+            prefill_chunk,
+            proposal_head};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -334,38 +357,47 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
+    std::vector<std::uint32_t> mtp_ladder;
+    for (const MtpRung& rung : mtp_rungs) { mtp_ladder.push_back(rung.k); }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
-        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
-        execution::MtpBatchContext mtp_state{execution_core(),
-                                             decoder->text_kv,
-                                             *decoder->mtp_cache(),
-                                             *io.mtp_decode,
-                                             *mtp_host_ingress,
-                                             *mtp_host_egress,
-                                             state_images->continuation_hidden_store()};
-        const GraphExecutionProfile code_warm = planned_profiles.front();
-        prepare_representative(code_warm.min, 1);
-        device.synchronize();
-        execution::mtp_decode_batch(
-            mtp_state, 1, draft_window,
-            mtp_causal_attention_envelopes(code_warm.max, draft_window, capacity), nullptr);
-        device.synchronize();
+        const std::size_t batch_rung = mtp_batch_rung(mtp_ladder);
+        for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
+            MtpRung& rung         = mtp_rungs[rung_index];
+            const std::uint32_t k = rung.k;
+            // Rounds with several requests always run the batch rung; the others serve one.
+            const std::uint32_t batch_limit = rung_index == batch_rung ? max_concurrency : 1U;
+            const auto planned_profiles     = mtp_graph_profiles(capacity, k);
+            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+            execution::MtpBatchContext mtp_state{execution_core(&rung.records),
+                                                 decoder->text_kv,
+                                                 *decoder->mtp_cache(),
+                                                 rung.frame,
+                                                 *mtp_host_ingress,
+                                                 *mtp_host_egress,
+                                                 state_images->continuation_hidden_store()};
+            const GraphExecutionProfile code_warm = planned_profiles.front();
+            prepare_representative(code_warm.min, 1, k);
+            device.synchronize();
+            execution::mtp_decode_batch(mtp_state, 1, k,
+                                        mtp_causal_attention_envelopes(code_warm.max, k, capacity),
+                                        nullptr);
+            device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                execution::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_causal_attention_envelopes(planned.max, draft_window, capacity),
-                    profile.definition);
+            rung.graphs.profiles.reserve(planned_profiles.size() * batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    rung.graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = rung.graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    execution::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), k,
+                        mtp_causal_attention_envelopes(planned.max, k, capacity),
+                        profile.definition);
+                }
             }
         }
     }
@@ -420,13 +452,78 @@ void ProgramImpl::prepare_graphs() {
     }
 
     if (!ordinary_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
+        instantiate_graph_family(ordinary_graphs, "ordinary", device, false,
+                                 prepare_representative);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
+        for (MtpRung& rung : mtp_rungs) {
+            instantiate_graph_family(rung.graphs, "MTP", device, true,
+                                     [&](std::uint32_t frontier, std::uint32_t batch_size) {
+                                         prepare_representative(frontier, batch_size, rung.k);
+                                     });
+        }
+        if (mtp_rungs.size() > 1) {
+            // Replay the lowest-frontier single-request graph of every rung to learn what a round
+            // costs at each draft length. The policy trades these times against the tokens a
+            // round is expected to commit, so they are measured on the real graphs and hardware
+            // rather than assumed.
+            constexpr int kWarmupReplays = 1;
+            constexpr int kTimedReplays  = 8;
+            std::vector<double> seconds(mtp_rungs.size(), 0.0);
+            cudaEvent_t begin = nullptr;
+            cudaEvent_t end   = nullptr;
+            CUDA_CHECK(cudaEventCreate(&begin));
+            CUDA_CHECK(cudaEventCreate(&end));
+            for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
+                MtpRung& rung                 = mtp_rungs[rung_index];
+                DecodeGraphProfile& profile   = rung.graphs.profiles.front();
+                DecodeGraphTopology& topology = *std::ranges::find_if(
+                    rung.graphs.topologies, [&](const DecodeGraphTopology& candidate) {
+                        return candidate.topology_class == profile.topology_class;
+                    });
+                if (topology.installed_profile != 0) {
+                    topology.executable.update(profile.definition);
+                    topology.installed_profile = 0;
+                }
+                prepare_representative(profile.min_execution_frontier, 1, rung.k);
+                // Identical tokens would route every row of an MoE layer to the same experts and
+                // hide the cost of verifying a longer draft. Distinct ids spread the routing the
+                // way real text does.
+                const auto vocabulary = static_cast<std::uint64_t>(
+                    dimension(parameters.model.resources().public_token_count));
+                const auto distinct_token = [&](std::uint64_t salt) {
+                    return static_cast<TokenId>(1U + (salt * 2654435761ULL) % (vocabulary - 1U));
+                };
+                mtp_host_ingress->anchors[0] = distinct_token(0);
+                for (std::uint32_t j = 0; j < rung.k; ++j) {
+                    mtp_host_ingress->current_drafts[j] = distinct_token(j + 1U);
+                }
+                device.synchronize();
+                for (int i = 0; i < kWarmupReplays; ++i) {
+                    topology.executable.launch(device.stream);
+                }
+                CUDA_CHECK(cudaEventRecord(begin, device.stream));
+                for (int i = 0; i < kTimedReplays; ++i) {
+                    topology.executable.launch(device.stream);
+                }
+                CUDA_CHECK(cudaEventRecord(end, device.stream));
+                CUDA_CHECK(cudaEventSynchronize(end));
+                float milliseconds = 0.0F;
+                CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
+                seconds[rung_index] = static_cast<double>(milliseconds) * 1e-3 / kTimedReplays;
+            }
+            CUDA_CHECK(cudaEventDestroy(begin));
+            CUDA_CHECK(cudaEventDestroy(end));
+            // A longer draft never makes a round cheaper; a smaller reading is measurement noise.
+            for (std::size_t rung_index = 1; rung_index < seconds.size(); ++rung_index) {
+                seconds[rung_index] = std::max(seconds[rung_index], seconds[rung_index - 1]);
+            }
+            mtp_policy     = MtpDraftPolicy(mtp_ladder, std::move(seconds));
+            mtp_round_rung = mtp_policy.initial_rung();
+        }
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
+        instantiate_graph_family(dflash_graphs, "DFlash", device, false, prepare_representative);
     }
 
     clear_stable_controls();

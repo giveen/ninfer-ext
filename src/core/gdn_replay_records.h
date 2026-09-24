@@ -56,6 +56,14 @@ struct GdnReplayRecords {
     GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout);
 
     [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer, std::int32_t rows) const;
+
+    /**
+     * The same planes over the same memory at a narrower width. Each plane is reinterpreted as
+     * its contiguous prefix with the width extent replaced, so a round that verifies fewer columns
+     * than the layout was planned for records and folds a tighter layout. Writers and the fold
+     * must use the same view for a round.
+     */
+    [[nodiscard]] GdnReplayRecords with_width(std::int32_t width) const;
 };
 
 } // namespace ninfer
