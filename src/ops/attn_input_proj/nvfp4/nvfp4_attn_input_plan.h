@@ -27,6 +27,22 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream);
 
+// Shared by the ordinary W4A4 launcher and the fused entry. This is the TMA cutoff.
+[[nodiscard]] inline constexpr bool nvfp4_attn_input_tma_route(std::int32_t tokens) {
+    return tokens >= 1024;
+}
+
+void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
+                                                    const Tensor& norm_weight, float eps,
+                                                    float input_scale_divisor,
+                                                    Nvfp4W4a4Workspace workspace,
+                                                    cudaStream_t stream);
+
+void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor& norm_weight,
+                                           float eps, const Weight& weight, Tensor& q, Tensor& gate,
+                                           Tensor& k, Tensor& v, WorkspaceArena& workspace,
+                                           cudaStream_t stream);
+
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream);
