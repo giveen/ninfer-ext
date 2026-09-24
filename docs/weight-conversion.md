@@ -21,7 +21,7 @@ python3 tools/upgrade_ninfer_v2_to_v3.py \
 
 The output must use a new path. After upgrading, use it directly or rename it to replace the
 original file. Stored weight values and formats are preserved. The upgrade also installs the
-matching template from `tools/chat_templates/`. Published SHA-256 checksums apply only to
+bundled template from `tools/chat_templates/`. Published SHA-256 checksums apply only to
 downloaded files.
 
 ## Start with an official recipe
@@ -37,7 +37,7 @@ python3 -m tools.convert \
   --model /path/to/Qwen3.6-27B \
   --recipe qwen3_6_27b \
   --components text,vision,mtp \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --proposal \
   --name qwen3.6-27b \
   --out models/qwen3_6_27b.ninfer
@@ -71,7 +71,7 @@ python3 -m tools.convert \
   --source quantized=/path/to/Qwen3.8-27B-NVFP4 \
   --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
   --components text,vision,mtp,dflash2 \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --proposal \
   --name qwen3.8-27b \
   --out models/qwen3_8_27b_nvfp4.ninfer
@@ -345,12 +345,19 @@ Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` a
 --resource chat_template.jinja=/path/to/chat_template.jinja
 ```
 
-The official conversion examples select these maintained templates:
+The conversion examples use one maintained template for every Qwen model:
 
-| Model | Template | Defaults |
+| Models | Template | Defaults |
 |---|---|---|
-| Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
-| Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| Qwen3.5, Qwen3.6, Qwen3.8 Dense/MoE | [qwen.jinja](../tools/chat_templates/qwen.jinja) | thinking on; effort `medium` (no injected text); closed-turn reasoning retained |
+
+`qwen.jinja` derives from
+[froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+v22.5 (Apache-2.0) with two NInfer changes: final-assistant continuation and tool-result histories
+without their original user turn. Efforts `xhigh` and `low` prepend a reasoning instruction;
+`high`, `max` and `minimal` are aliases, and inline `<|think_off|>`, `<|think_low|>`,
+`<|think_medium|>` and `<|think_xhigh|>` tags in system, developer or user text steer the turn.
+`preserve_thinking=false` omits closed-turn reasoning.
 
 Use your own Jinja file to change the artifact's default template. A startup
 [`--chat-template FILE`](cli.md#text-input) overrides the stored template.

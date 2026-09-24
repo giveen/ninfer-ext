@@ -153,21 +153,15 @@ std::string read_file(const char* path) {
 // Rendering semantics belong to those files, not to Frontend construction.
 std::string read_template_fixture(const char* path) { return read_file(path); }
 
-const std::string& thinking_toggle_template_source() {
+const std::string& chat_template_source() {
     static const std::string source =
-        read_template_fixture(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_6.jinja");
+        read_template_fixture(NINFER_SOURCE_DIR "/tools/chat_templates/qwen.jinja");
     return source;
 }
 
-const std::string& reasoning_effort_template_source() {
-    static const std::string source =
-        read_template_fixture(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_8.jinja");
-    return source;
-}
-
-const fi::CompiledChatTemplate& thinking_toggle_template() {
+const fi::CompiledChatTemplate& chat_template() {
     static const fi::CompiledChatTemplate value =
-        fi::CompiledChatTemplate::resolve(thinking_toggle_template_source());
+        fi::CompiledChatTemplate::resolve(chat_template_source());
     return value;
 }
 
@@ -201,7 +195,7 @@ std::string byte_level_symbol(std::uint8_t target) {
     throw std::logic_error("byte-level test symbol is outside one byte");
 }
 
-FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
+FrontendResources resources(const std::string& chat_template = chat_template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
     const nlohmann::json tokens = nlohmann::json::array(
@@ -350,7 +344,7 @@ fi::ChatMessage chat_message(ninfer::ChatRole role, std::string content) {
 
 fi::RenderedChat render_chat(std::vector<fi::ChatMessage> messages,
                              fi::ChatRenderOptions options = {}) {
-    return thinking_toggle_template().render(messages, std::move(options));
+    return chat_template().render(messages, std::move(options));
 }
 
 std::string render_chat_text(std::vector<fi::ChatMessage> messages,
@@ -582,7 +576,7 @@ int test_rendered_special_tokens() {
     const auto& tokenizer    = fixture_tokenizer();
     int failures             = 0;
     for (const auto& source :
-         {thinking_toggle_template_source(), reasoning_effort_template_source()}) {
+         {chat_template_source()}) {
         const auto compiled = fi::CompiledChatTemplate::resolve(source);
         for (const auto role :
              {ninfer::ChatRole::User, ninfer::ChatRole::Tool, ninfer::ChatRole::Assistant}) {
@@ -780,7 +774,7 @@ int test_selected_template_instruction_prefix() {
     const std::size_t header           = generated.text.rfind(assistant_header);
     failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
                           generated.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                           generated.rewrite_checkpoint->offset == header &&
                           generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
                       "late system was not included before the generation rewrite boundary");
@@ -866,7 +860,9 @@ int test_rewrite_checkpoint_trace() {
         chat_message(ninfer::ChatRole::User, "question"), first,
         chat_message(ninfer::ChatRole::Tool, "result one"), second,
         chat_message(ninfer::ChatRole::Tool, "result two")};
-    const fi::RenderedChat open    = render_chat(tool_loop);
+    fi::ChatRenderOptions dropped;
+    dropped.preserve_thinking      = false;
+    const fi::RenderedChat open    = render_chat(tool_loop, dropped);
     const std::size_t first_header = open.text.find(assistant_header);
     int failures =
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
@@ -899,7 +895,7 @@ int test_rewrite_checkpoint_trace() {
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
-    const fi::RenderedChat next    = render_chat(next_turn);
+    const fi::RenderedChat next    = render_chat(next_turn, dropped);
     const std::size_t final_header = next.text.rfind(assistant_header);
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
@@ -958,15 +954,17 @@ int test_selected_template_recovery_boundary() {
          chat_message(ninfer::ChatRole::Tool, "result")},
         {chat_message(ninfer::ChatRole::Tool, "imported result"), assistant}};
     int failures = 0;
+    fi::ChatRenderOptions dropped;
+    dropped.preserve_thinking = false;
     for (const auto& history : histories) {
-        const auto qwen36 = thinking_toggle_template().render(history);
-        const auto qwen38 =
-            fi::CompiledChatTemplate::resolve(reasoning_effort_template_source()).render(history);
+        const auto retained = chat_template().render(history);
+        const auto closed   = chat_template().render(history, dropped);
         failures += check(
-            qwen36.rewrite_checkpoint && qwen38.rewrite_checkpoint &&
-                qwen36.rewrite_checkpoint->offset == qwen36.text.find("<|im_start|>assistant\n") &&
-                qwen38.rewrite_checkpoint->offset == qwen38.text.rfind("<|im_start|>assistant\n"),
-            "recovery candidates ignored the selected template's default history policy");
+            retained.rewrite_checkpoint && closed.rewrite_checkpoint &&
+                retained.rewrite_checkpoint->offset ==
+                    retained.text.rfind("<|im_start|>assistant\n") &&
+                closed.rewrite_checkpoint->offset == closed.text.find("<|im_start|>assistant\n"),
+            "recovery candidates ignored the template's default or explicit history policy");
     }
     return failures;
 }
@@ -1024,7 +1022,7 @@ int test_official_resource_guards() {
 
     FrontendResources mismatched       = resources();
     nlohmann::json mismatched_config   = nlohmann::json::parse(mismatched.tokenizer_config_json);
-    mismatched_config["chat_template"] = reasoning_effort_template_source();
+    mismatched_config["chat_template"] = "{{ messages[0].content }}";
     mismatched.tokenizer_config_json   = mismatched_config.dump();
     const auto standalone              = make_frontend(mismatched, false);
     ninfer::PromptInput input;
@@ -1141,31 +1139,36 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     text_input.messages.push_back(std::move(text_message));
     auto text             = frontend.prepare(std::move(text_input));
     const auto& text_data = FrontendFactory::inspect(text);
-    const std::vector<ninfer::TokenId> expected{248045,
-                                                fixture_byte_token('u'),
-                                                fixture_byte_token('s'),
-                                                fixture_byte_token('e'),
-                                                fixture_byte_token('r'),
-                                                32,
-                                                0,
-                                                248046,
-                                                32,
-                                                248045,
-                                                31,
-                                                248068,
-                                                32};
+    // The template writes the role inside one literal, so the toy tokenizer sees "user\n" as a
+    // single piece; the assistant opener starts at token 5.
+    const std::vector<ninfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
     int failures =
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
-                          text_data.identity.rewrite_checkpoint->frontier == 9 &&
+                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                          text_data.identity.rewrite_checkpoint->frontier == 5 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
     failures +=
-        check(text_data.position_axis(0).back() == 12 && text_data.position_axis(1).back() == 12 &&
-                  text_data.position_axis(2).back() == 12,
+        check(text_data.position_axis(0).back() == 8 && text_data.position_axis(1).back() == 8 &&
+                  text_data.position_axis(2).back() == 8,
               "text frontend did not construct axis-major positions");
+
+    ninfer::ChatMessage closed_message;
+    closed_message.role = ninfer::ChatRole::User;
+    closed_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput closed_input;
+    closed_input.messages.push_back(std::move(closed_message));
+    closed_input.options.preserve_thinking = false;
+    const auto closed_prompt               = frontend.prepare(std::move(closed_input));
+    const auto& closed_data                = FrontendFactory::inspect(closed_prompt);
+    failures += check(closed_data.identity.rewrite_checkpoint &&
+                          closed_data.identity.rewrite_checkpoint->kind ==
+                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                          closed_data.identity.rewrite_checkpoint->frontier == 5,
+                      "closed-turn reasoning did not publish a turn-closure checkpoint");
 
     ninfer::ChatMessage preserved_message;
     preserved_message.role = ninfer::ChatRole::User;
@@ -1179,7 +1182,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
                               ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
-                          preserved_data.identity.rewrite_checkpoint->frontier == 9 &&
+                          preserved_data.identity.rewrite_checkpoint->frontier == 5 &&
                           preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
                       "preserve-thinking prompt did not publish a pre-generation response "
@@ -1198,7 +1201,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
                               ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking_data.identity.rewrite_checkpoint->frontier == 9 &&
+                          nonthinking_data.identity.rewrite_checkpoint->frontier == 5 &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
                           !nonthinking_data.starts_in_reasoning,
@@ -1253,7 +1256,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
-                ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
@@ -1409,7 +1412,7 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     options.max_encoded_media_bytes = bytes.size() * 2 - 1;
     auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
                                                             ninfer::kDefaultMediaLiveBytes);
-    fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(), options,
+    fi::Processor processor(fixture_tokenizer(), chat_template(), options,
                             std::move(cache));
     fi::ChatMessage internal_message;
     internal_message.role = ninfer::ChatRole::User;

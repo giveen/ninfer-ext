@@ -382,7 +382,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     // next-turn probe distinguishes retained history from a rewritten open turn, including
     // templates whose defaults or aliases differ from the typed request hint. This only chooses
     // the checkpoint to retain: subsequent requests still require exact token/state identity.
-    bool retain_open_turn = context.value("preserve_thinking", false);
+    // Without an observable closed assistant turn, assume the bundled template's default, which
+    // retains prior reasoning unless preserve_thinking is explicitly false.
+    bool retain_open_turn = context.value("preserve_thinking", true);
     if (first_tail_assistant && layout.messages[*first_tail_assistant].closed) {
         Json probe = context;
         probe["messages"].push_back({{"role", "user"}, {"content", ""}});

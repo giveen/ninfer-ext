@@ -771,13 +771,8 @@ def upgrade(input_path, output_path):
         raise ValueError("input and output must differ")
     old, source_start, source_payload = read_v2(input_path)
     directory = make_directory(old["identity"], old["objects"])
-    template_name = (
-        "qwen3_8.jinja"
-        if old["identity"]["model_id"].startswith("qwen3.8-")
-        else "qwen3_6.jinja"
-    )
     template = (
-        Path(__file__).resolve().parent / "chat_templates" / template_name
+        Path(__file__).resolve().parent / "chat_templates" / "qwen.jinja"
     ).read_bytes()
     template_id = directory["components"]["text"]["resources"]["chat_template.jinja"]
     template_object = next(

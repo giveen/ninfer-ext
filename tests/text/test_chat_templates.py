@@ -12,10 +12,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
-SOURCES = {
-    version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
-    for version in ("qwen3_6", "qwen3_8")
-}
+SOURCES = {"qwen": (ROOT / "tools" / "chat_templates" / "qwen.jinja").read_text()}
 
 
 def fail(message):
@@ -92,13 +89,39 @@ class ChatTemplates(unittest.TestCase):
                     "prior reasoning",
                     self.render(version, next_user, preserve_thinking=True),
                 )
-        self.assertNotIn("prior reasoning", self.render("qwen3_6", next_user))
-        self.assertIn("prior reasoning", self.render("qwen3_8", next_user))
-        default = TEMPLATES["qwen3_8"].render(
+        self.assertIn("prior reasoning", self.render("qwen", next_user))
+        default = TEMPLATES["qwen"].render(
             messages=[message("user", "hello")], add_generation_prompt=True
         )
-        self.assertIn("Reasoning effort is set to xhigh.", default)
+        self.assertNotIn("Reasoning effort", default)
         self.assertTrue(default.endswith("<|im_start|>assistant\n<think>\n"))
+
+    def test_reasoning_effort_and_inline_tags(self):
+        history = [message("user", "hello")]
+        xhigh = self.render("qwen", history, reasoning_effort="xhigh")
+        self.assertTrue(
+            xhigh.startswith(
+                "<|im_start|>system\nReasoning effort is set to xhigh."
+            )
+        )
+        for alias in ("high", "max", "ultracode"):
+            self.assertEqual(
+                self.render("qwen", history, reasoning_effort=alias), xhigh
+            )
+        self.assertIn(
+            "Reasoning effort is set to low.",
+            self.render("qwen", history, reasoning_effort="minimal"),
+        )
+        off = self.render(
+            "qwen", [message("user", "<|think_off|>hi")], add_generation_prompt=True
+        )
+        self.assertEqual(
+            off,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+        tagged = self.render("qwen", [message("user", "<|think_xhigh|>hi")])
+        self.assertIn("Reasoning effort is set to xhigh.", tagged)
+        self.assertNotIn("<|think_xhigh|>", tagged)
 
     def test_tools_and_instruction_preamble(self):
         tools = [
@@ -250,6 +273,38 @@ class ChatTemplates(unittest.TestCase):
                 preserve_thinking=False,
             ),
             dict(messages=[message("system", "no user")], add_generation_prompt=True),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="xhigh",
+            ),
+            dict(
+                messages=[
+                    message("system", "a <|think_low|>"),
+                    message("developer", "b"),
+                    message("user", "<|think_off|> hi"),
+                ],
+                add_generation_prompt=True,
+            ),
+            dict(
+                messages=[
+                    message("user", "q"),
+                    message(
+                        "assistant",
+                        "<think>\nplan\n</think>\n\nanswer",
+                        tool_calls=[
+                            {
+                                "type": "function",
+                                "function": {"name": "f", "arguments": '{"a": 1}'},
+                            }
+                        ],
+                    ),
+                    message("tool", "Error: boom"),
+                    message("tool", "Error: boom again"),
+                ],
+                tools=[{"type": "function", "function": {"name": "f"}}],
+                add_generation_prompt=True,
+            ),
         ]
         cases = [(name, context) for name in SOURCES for context in contexts]
         result = subprocess.run(

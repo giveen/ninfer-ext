@@ -43,7 +43,7 @@ Changes to the file take effect after restarting NInfer:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \
-  --chat-template tools/chat_templates/qwen3_8.jinja --prompt "Hello"
+  --chat-template tools/chat_templates/qwen.jinja --prompt "Hello"
 ```
 
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
