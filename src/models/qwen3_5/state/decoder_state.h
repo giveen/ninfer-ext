@@ -68,14 +68,10 @@ public:
 
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
-    [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }
+    [[nodiscard]] auto& page_pool(this auto& self) noexcept { return self.pages_; }
 
-    [[nodiscard]] const DeviceKVPagePool& page_pool() const noexcept { return pages_; }
-
-    [[nodiscard]] KVExecutionTablePool& execution_tables() noexcept { return execution_tables_; }
-
-    [[nodiscard]] const KVExecutionTablePool& execution_tables() const noexcept {
-        return execution_tables_;
+    [[nodiscard]] auto& execution_tables(this auto& self) noexcept {
+        return self.execution_tables_;
     }
 
     [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionRowLease& row) const;

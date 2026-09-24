@@ -136,14 +136,10 @@ public:
     [[nodiscard]] StateImageDeviceSlotView slot_view(std::int32_t slot) const;
     [[nodiscard]] Tensor continuation_hidden_slot(std::int32_t slot) const;
 
-    [[nodiscard]] LinearAttentionStatePool& linear() noexcept { return linear_; }
+    [[nodiscard]] auto& linear(this auto& self) noexcept { return self.linear_; }
 
-    [[nodiscard]] const LinearAttentionStatePool& linear() const noexcept { return linear_; }
-
-    [[nodiscard]] Tensor& continuation_hidden_store() noexcept { return continuation_hidden_; }
-
-    [[nodiscard]] const Tensor& continuation_hidden_store() const noexcept {
-        return continuation_hidden_;
+    [[nodiscard]] auto& continuation_hidden_store(this auto& self) noexcept {
+        return self.continuation_hidden_;
     }
 
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;

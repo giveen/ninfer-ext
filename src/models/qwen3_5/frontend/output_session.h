@@ -32,17 +32,11 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
+    [[nodiscard]] auto begin(this auto& self) noexcept { return self.values_.begin(); }
 
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
+    [[nodiscard]] auto end(this auto& self) noexcept { return self.values_.begin() + self.size_; }
 
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
-
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] auto& back(this auto& self) noexcept { return self.values_[self.size_ - 1]; }
 
     void clear() noexcept;
     void push_back(OutputDelta value);
