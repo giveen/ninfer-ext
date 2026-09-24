@@ -496,6 +496,7 @@ struct FakeFinishResult {
     FinishDisposition disposition = FinishDisposition::Released;
     FakeTimings timings;
     FakeSpeculativeStats speculative;
+    bool salvaged = false;
     FakeContinuationSummary summary;
     std::optional<FakeContinuationHandle> continuation;
 };
