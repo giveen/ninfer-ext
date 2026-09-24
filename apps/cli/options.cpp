@@ -100,8 +100,8 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--spec mtp --draft-tokens N (1..7) drafts up to N tokens per round and picks the length\n"
-           "per round from measured acceptance; --fixed-draft always drafts exactly N.\n"
+           "--spec mtp adapts the draft length of a single request per round (up to 7 tokens, or\n"
+           "--draft-tokens N); --fixed-draft always drafts exactly N.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
@@ -227,7 +227,7 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
-    product::validate_speculative_cli_options(options.speculative);
+    product::resolve_speculative_cli_options(options.speculative);
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");

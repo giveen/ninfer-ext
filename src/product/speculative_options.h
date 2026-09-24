@@ -64,4 +64,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     throw std::invalid_argument("invalid speculative backend");
 }
 
+// Applies the parsed-flag defaults, then validates: `--spec mtp` without `--draft-tokens` selects the
+// adaptive policy with the longest draft, seven tokens. `--fixed-draft` still needs an explicit length.
+inline void resolve_speculative_cli_options(SpeculativeOptions& options) {
+    if (options.backend == SpeculativeBackend::Mtp && options.draft_tokens == 0 &&
+        !options.fixed_draft) {
+        options.draft_tokens = 7;
+    }
+    validate_speculative_cli_options(options);
+}
+
 } // namespace ninfer::product

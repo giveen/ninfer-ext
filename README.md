@@ -240,7 +240,8 @@ corpus above. DFlash2, concurrency above one and NVFP4 35B-A3B were not measured
 
 ### Adaptive MTP draft length
 
-Without `--fixed-draft`, `--draft-tokens 7` makes 7 the ceiling of an adaptive policy. A single
+`--spec mtp` alone selects an adaptive policy whose longest draft is 7 tokens (`--draft-tokens N`
+lowers that ceiling; `--fixed-draft` pins exactly N). A single
 request drafts 2, 3, 4 or 7 tokens per round, chosen from its recent acceptance and the round times
 measured at startup; rounds with several requests decoding together draft 3, where longer drafts
 raised no aggregate throughput at concurrency 2, 4 or 8. The MTP3 tables above pin K=3 with
@@ -274,7 +275,7 @@ K=3 column:
 
 ```bash
 build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "$(cat prompt.txt)" \
-  --spec mtp --draft-tokens 7 --greedy --no-thinking --max-new 640
+  --spec mtp --greedy --no-thinking --max-new 640
 ```
 
 The summary line reports `decode speed` and, for adaptive runs, `mtp rounds by length`.

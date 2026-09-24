@@ -87,13 +87,21 @@ int main() {
                "--draft-tokens", "3", "--fixed-draft"});
     failures += check(fixed_mtp.speculative.draft_tokens == 3 && fixed_mtp.speculative.fixed_draft,
                       "--fixed-draft was not preserved");
-    for (const auto* k : {"0", "8"}) {
-        failures += check(rejects([&] {
-                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                           "--spec", "mtp", "--draft-tokens", k});
-                          }),
-                          "CLI accepted an MTP draft window outside [1,7]");
-    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "8"});
+                      }),
+                      "CLI accepted an MTP draft window outside [1,7]");
+    const ninfer::cli::Options default_mtp =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp"});
+    failures += check(default_mtp.speculative.draft_tokens == 7 &&
+                          !default_mtp.speculative.fixed_draft,
+                      "--spec mtp alone did not select adaptive drafting up to 7");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--fixed-draft"});
+                      }),
+                      "--fixed-draft was accepted without a draft length");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--fixed-draft"});
