@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -1480,16 +1481,40 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
         return true;
     };
     const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    // Per rung: 'r' refused (the target does not exceed the entitlement: ceiling or pool cap),
+    // 's' no space (the pool could not reserve the extension).
+    char outcome[4] = {'-', '-', '-', '\0'};
+    std::size_t rung = 0;
     for (const std::uint32_t extra_tokens :
          {kv_lease_growth_margin_tokens(), 2U * page, page}) {
         try {
             if (grow(extra_tokens)) { return; }
-        } catch (const std::bad_alloc&) {}
+            outcome[rung] = 'r';
+        } catch (const std::bad_alloc&) { outcome[rung] = 's'; }
+        ++rung;
     }
 
     // The pool cannot extend this lease. The sequence settles where the lease still covers a
-    // step, so no launch can fail coverage mid-round.
+    // step, so no launch can fail coverage mid-round, and the request finishes at its output
+    // limit well before the client's budget. Record why, so a premature finish is diagnosable.
     request.lease_settled = true;
+    const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
+    std::fprintf(stderr,
+                 "warning: Device KV lease cannot grow; lane %u settles | rungs %s | tokens %u "
+                 "(backend %u) | ceiling %u | text entitlement %u pages, pool %u capacity %u "
+                 "allocated %u reserved %u available",
+                 sequence.lane, outcome, main_tokens, backend_tokens, request.lease_ceiling,
+                 text_pages, text_pool.capacity_pages(), text_pool.allocated_pages(),
+                 text_pool.reserved_pages(), text_pool.available_pages());
+    if (sequence.kv->backend && backend_kv_pages) {
+        const DeviceKVPagePool& backend_pool = backend_kv_pages->physical_pool();
+        std::fprintf(stderr,
+                     " | backend entitlement %u pages, pool %u capacity %u allocated %u reserved "
+                     "%u available",
+                     backend_pages, backend_pool.capacity_pages(), backend_pool.allocated_pages(),
+                     backend_pool.reserved_pages(), backend_pool.available_pages());
+    }
+    std::fprintf(stderr, "\n");
 }
 
 std::optional<std::uint32_t> ProgramImpl::device_kv_lease_settlement_tokens(
