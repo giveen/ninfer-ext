@@ -13,6 +13,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   components, resources, proposals and numerical conversion methods;
 - `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
   opt-in real Engine integration;
+- `models/qwen4_exp/` — FP64 NumPy oracle for Qwen4Exp (Qwen3.8-Flash-Next) Text/MTP mathematics
+  and its qualification against checkpoint constants and, when installed, upstream Transformers;
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
