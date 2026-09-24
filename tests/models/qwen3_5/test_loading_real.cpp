@@ -30,14 +30,21 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
     const auto& weights = plan.weights();
     require(weights.vision.has_value() == options.vision,
             "Vision demand differs from startup selection");
-    require(weights.mtp.has_value() == (options.speculative == SpeculativeBackend::Mtp),
+    // Qwen4Exp binds only the vocabulary into `text`; its blocks and MTP bank are separate.
+    const bool qwen4 = weights.qwen4.has_value();
+    require(qwen4 == plan.config().text.qwen4(),
+            "text structure differs from instance config");
+    require((weights.mtp.has_value() || weights.qwen4_mtp.has_value()) ==
+                (options.speculative == SpeculativeBackend::Mtp),
             "MTP selection differs");
     require(weights.draft.has_value() == (options.speculative == SpeculativeBackend::DFlash ||
                                           options.speculative == SpeculativeBackend::DFlash2),
             "draft selection differs");
     require(weights.proposal.has_value() == options.proposal_enabled(),
             "proposal selection differs");
-    require(weights.text.layers.size() == plan.config().text.num_hidden_layers,
+    const std::size_t layer_count =
+        qwen4 ? weights.qwen4->layers.size() : weights.text.layers.size();
+    require(layer_count == plan.config().text.num_hidden_layers,
             "layer data differs from instance config");
     const auto check_head = [&](qwen::WeightId head, qwen::WeightUseId use,
                                 const std::string& input) {
@@ -83,6 +90,18 @@ void check_native_inputs(const qwen::Model& model) {
         (void)ops::prepare_linear_swiglu_weight(model.input(weights.gate), model.input(weights.up));
         (void)linear(weights.down);
     };
+    const auto moe = [&](const qwen::MoeWeights& weights) {
+        std::vector<ops::WeightInput> gate_up, down;
+        for (const auto& expert : weights.experts) {
+            gate_up.push_back(model.input(expert.gate));
+            gate_up.push_back(model.input(expert.up));
+            down.push_back(model.input(expert.down));
+        }
+        (void)ops::prepare_sparse_moe_weights(
+            model.input(weights.router), model.input(weights.shared_score), gate_up, down,
+            model.input(weights.shared.gate), model.input(weights.shared.up),
+            model.input(weights.shared.down));
+    };
     const auto block = [&](const qwen::BlockWeights& weights, bool mtp = false) {
         if (const auto* attention = std::get_if<qwen::AttentionWeights>(&weights.mixer)) {
             if (mtp) {
@@ -107,23 +126,55 @@ void check_native_inputs(const qwen::Model& model) {
         if (const auto* mlp = std::get_if<qwen::DenseWeights>(&weights.ffn)) {
             dense(*mlp);
         } else {
-            const auto& moe = std::get<qwen::MoeWeights>(weights.ffn);
-            std::vector<ops::WeightInput> gate_up, down;
-            for (const auto& expert : moe.experts) {
-                gate_up.push_back(model.input(expert.gate));
-                gate_up.push_back(model.input(expert.up));
-                down.push_back(model.input(expert.down));
-            }
-            (void)ops::prepare_sparse_moe_weights(
-                model.input(moe.router), model.input(moe.shared_score), gate_up, down,
-                model.input(moe.shared.gate), model.input(moe.shared.up),
-                model.input(moe.shared.down));
+            moe(std::get<qwen::MoeWeights>(weights.ffn));
+        }
+    };
+    const auto hyper = [&](const qwen::HyperConnectionWeights& weights) {
+        if (weights.inject) {
+            (void)ops::prepare_linear_weight(
+                std::array{model.input(weights.down), model.input(*weights.inject)});
+        } else {
+            (void)linear(weights.down);
+        }
+        (void)linear(weights.up);
+    };
+    const auto qwen4_block = [&](const qwen::Qwen4BlockWeights& weights) {
+        hyper(weights.attention_hc);
+        hyper(weights.ffn_hc);
+        if (const auto* qsa = std::get_if<qwen::QsaWeights>(&weights.mixer)) {
+            const auto& attention = qsa->attention;
+            (void)ops::prepare_linear_weight(
+                std::array{model.input(attention.query), model.input(attention.key),
+                           model.input(attention.gate), model.input(attention.value)});
+            (void)linear(attention.output);
+            (void)ops::prepare_linear_weight(std::array{model.input(qsa->indexer_query),
+                                                        model.input(qsa->indexer_key)});
+        } else {
+            const auto& gdn = std::get<qwen::GdnWeights>(weights.mixer);
+            (void)ops::prepare_linear_weight(std::array{model.input(gdn.query), model.input(gdn.key),
+                                                        model.input(gdn.value), model.input(gdn.z)});
+            (void)ops::prepare_linear_weight(std::array{model.input(gdn.a_projection),
+                                                        model.input(gdn.b_projection)});
+            (void)linear(gdn.output);
+        }
+        // Routed Qwen4Exp experts are NVFP4 banks assembled by the engine's offload MoE, which has
+        // no public native-input entry; validate the shared expert, which is a normal linear pair.
+        (void)ops::prepare_linear_weight(
+            std::array{model.input(weights.moe.shared.gate), model.input(weights.moe.shared.up)});
+        (void)linear(weights.moe.shared.down);
+        if (weights.ple) {
+            (void)ops::prepare_linear_weight(
+                std::array{model.input(weights.ple->key), model.input(weights.ple->value)});
         }
     };
     const auto& weights = model.weights();
     (void)native_weight(model.weight(weights.text.token_embedding).view);
     (void)ops::prepare_linear_weight(model.input(weights.text.output_head_use));
     for (const auto& layer : weights.text.layers) { block(layer); }
+    if (weights.qwen4) {
+        hyper(weights.qwen4->head);
+        for (const auto& layer : weights.qwen4->layers) { qwen4_block(layer); }
+    }
     if (weights.vision) {
         const auto& vision = *weights.vision;
         (void)linear(vision.patch_embedding);
@@ -142,6 +193,13 @@ void check_native_inputs(const qwen::Model& model) {
         (void)linear(weights.mtp->input_projection);
         block(weights.mtp->layer, true);
         (void)ops::prepare_linear_weight(model.input(weights.mtp->output_head_use));
+    }
+    if (weights.qwen4_mtp) {
+        const auto& m = *weights.qwen4_mtp;
+        (void)linear(m.embedding_projection);
+        (void)linear(m.hidden_projection);
+        hyper(m.head);
+        qwen4_block(m.layer);
     }
     if (weights.draft) {
         const auto& draft = *weights.draft;
@@ -259,9 +317,14 @@ int main(int argc, char** argv) {
                 "H2D did not cover all selected parent bytes");
         std::set<const WeightParent*> visited;
         for (const auto& weight : model->weight_data()) {
+            // A file-mapped weight (the Qwen4Exp n-gram table) owns no device parent.
+            if (weight.view.parts.empty()) { continue; }
             require(weight.view.parts.size() == weight.source_objects.size(),
                     "diagnostic parent association lost");
             for (std::size_t i = 0; i < weight.view.parts.size(); ++i) {
+                // Host-resident weights (Qwen4Exp routed experts, the file-mapped n-gram table)
+                // are not device objects, so they contribute no H2D bytes to verify here.
+                if (samples.find(weight.source_objects[i]) == samples.end()) { continue; }
                 const auto* parent = weight.view.parts[i].parent;
                 if (!visited.insert(parent).second) { continue; }
                 for (const auto& sample : samples.at(weight.source_objects[i])) {
