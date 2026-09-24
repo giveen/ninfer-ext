@@ -26,6 +26,7 @@ from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix
+from .quantization.nvfp4 import divisor_for, quantize_rows as quantize_nvfp4_rows
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -240,6 +241,42 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
+    """Quantize values to NVFP4 against one divisor for the whole parent.
+
+    The divisor maps the parent's largest magnitude onto the largest block scale times the
+    largest E2M1 code, so a stacked bank stores a single divisor word. Activation calibration is
+    not produced; Uses keep whatever policy and auxiliaries the recipe states.
+    """
+    if request.target.format != "nvfp4" or len(request.target.shape) != 2:
+        raise ValueError("nvfp4_absmax requires an NVFP4 matrix target")
+    if request.target.divisors != 1:
+        raise ValueError("nvfp4_absmax writes one divisor per parent")
+    _preflight(request)
+    n, k = request.target.shape
+    chunk = max(128, request.rows_per_chunk // 128 * 128)
+
+    def rows(begin, end):
+        values = request.values(begin * k, end * k).reshape(end - begin, k)
+        if not values.dtype.is_floating_point:
+            raise TypeError("nvfp4_absmax source must provide floating-point values")
+        return values
+
+    def produce(output):
+        amax = 0.0
+        for begin in range(0, n, chunk):
+            block = rows(begin, min(n, begin + chunk)).to(request.device)
+            amax = max(amax, float(block.abs().max()))
+        divisor = divisor_for(amax)
+        for begin in range(0, n, chunk):
+            encoded = quantize_nvfp4_rows(
+                rows(begin, min(n, begin + chunk)), divisor, device=request.device
+            )
+            output.write_codes(begin, encoded.codes, encoded.scales, encoded.divisor)
+
+    return request.job(produce=produce)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
     if (
@@ -326,4 +363,5 @@ METHODS: dict[str, Method] = {
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
+    "nvfp4_absmax": nvfp4_absmax,
 }

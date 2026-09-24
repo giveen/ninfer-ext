@@ -27,6 +27,22 @@ std::uint32_t dimension(const Json& config, const char* name) {
     return integer(config.at(name), name);
 }
 
+std::uint64_t splitmix64(std::uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+bool is_prime(std::uint64_t value) {
+    if (value < 2) { return false; }
+    if (value % 2 == 0) { return value == 2; }
+    for (std::uint64_t divisor = 3; divisor * divisor <= value; divisor += 2) {
+        if (value % divisor == 0) { return false; }
+    }
+    return true;
+}
+
 float positive_float(const Json& config, const char* name) {
     const auto& value = config.at(name);
     if (!value.is_number()) { throw ArtifactError(std::string(name) + " must be a real value"); }
@@ -99,16 +115,119 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     return out;
 }
 
+void qwen4_extensions(const Json& value, TextConfig& out) {
+    if (!out.attention || !out.gdn || !out.rope_parameters) {
+        throw ArtifactError("Qwen4Exp requires gated attention and GDN geometry");
+    }
+    const auto& gate = value.at("output_gate_type");
+    if (gate == "sigmoid") {
+        out.gdn_gate = GateActivation::Sigmoid;
+    } else if (gate == "silu") {
+        out.gdn_gate = GateActivation::Silu;
+    } else {
+        throw ArtifactError("unknown output_gate_type");
+    }
+
+    HyperConnectionConfig hc{dimension(value, "hc_count"), dimension(value, "hc_lowrank")};
+    if (hc.hc_count < 2) { throw ArtifactError("hyper-connections need at least two streams"); }
+    (void)artifact::checked_mul(hc.hc_count, out.hidden_size, "hyper-connection width");
+    out.hyper_connection = hc;
+
+    SparseAttentionConfig qsa{
+        dimension(value, "indexer_n_heads"), dimension(value, "indexer_head_dim"),
+        dimension(value, "indexer_budget"), dimension(value, "indexer_compress_ratio")};
+    if (dimension(value, "indexer_kv_heads") != 1) {
+        throw ArtifactError("QSA requires one indexer key head");
+    }
+    if (qsa.budget % qsa.compress_ratio) {
+        throw ArtifactError("QSA budget must be a whole number of blocks");
+    }
+    if (out.rope_parameters->rotary_dim > qsa.indexer_head_dim) {
+        throw ArtifactError("QSA indexer head is narrower than the rotary width");
+    }
+    out.sparse_attention = qsa;
+
+    const auto& ids = value.at("ple_layer_ids");
+    if (!ids.is_array() || ids.size() != 1) {
+        throw ArtifactError("Qwen4Exp requires exactly one one-indexed PLE layer");
+    }
+    PleConfig ple;
+    const auto one_indexed = integer(ids[0], "PLE layer");
+    if (one_indexed > out.num_hidden_layers ||
+        out.layer_types[one_indexed - 1] != MixerKind::LinearAttention) {
+        throw ArtifactError("PLE layer must name a GDN block");
+    }
+    ple.layer           = one_indexed - 1;
+    ple.ngram_size      = dimension(value, "ngram_size");
+    ple.heads_per_ngram = dimension(value, "heads_per_ngram");
+    ple.embed_dim       = dimension(value, "ple_embed_dim");
+    ple.conv_kernel     = dimension(value, "ple_conv_kernel_size");
+    ple.eos_token_id    = integer(value.at("eos_token_id"), "eos_token_id", false);
+    if (ple.ngram_size < 2 || ple.embed_dim % ple.heads() || ple.eos_token_id >= out.vocab_size) {
+        throw ArtifactError("invalid n-gram geometry");
+    }
+    const auto base = artifact::require_u64(value.at("ngram_vocab_size_base"), "vocab base");
+    const auto divisor =
+        artifact::require_u64(value.at("make_ngram_vocab_size_divisible_by"), "n-gram row divisor");
+    const auto seed = artifact::require_u64(value.at("seed"), "seed", false);
+    // Hash products stay in signed 64-bit range because each multiplier is below 2^63 / vocab.
+    const std::uint64_t half_bound = std::max<std::uint64_t>(
+        1, (std::uint64_t(std::numeric_limits<std::int64_t>::max()) / out.vocab_size) / 2);
+    const std::uint64_t layer_seed = seed; // single PLE layer: ple_layer_index == 0
+    for (std::uint32_t i = 0; i < ple.ngram_size; ++i) {
+        ple.multipliers.push_back(
+            2 * (splitmix64(layer_seed + 0x9E3779B97F4A7C15ULL * (i + 1)) % half_bound) + 1);
+    }
+    std::uint64_t prime = base - 1;
+    std::uint64_t total = 0;
+    for (std::uint32_t head = 0; head < ple.heads(); ++head) {
+        do { ++prime; } while (!is_prime(prime));
+        ple.head_moduli.push_back(prime);
+        ple.head_offsets.push_back(total);
+        total = artifact::checked_add(total, prime, "n-gram table rows");
+    }
+    ple.table_rows =
+        artifact::checked_mul((total + divisor - 1) / divisor, divisor, "padded n-gram table rows");
+    out.ple = std::move(ple);
+}
+
 TextConfig text(const Json& value, bool mtp) {
-    require_members(
-        value,
-        {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
-         "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "layer_types"},
-        {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
-         "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
-         "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
-        "text config");
+    require_members(value,
+                    {"architectures", "model_type", "hidden_size", "vocab_size",
+                     "num_hidden_layers", "max_position_embeddings", "tie_word_embeddings",
+                     "rms_norm_eps", "layer_types"},
+                    {"num_attention_heads",
+                     "num_key_value_heads",
+                     "head_dim",
+                     "rope_parameters",
+                     "linear_num_key_heads",
+                     "linear_key_head_dim",
+                     "linear_num_value_heads",
+                     "linear_value_head_dim",
+                     "linear_conv_kernel_dim",
+                     "intermediate_size",
+                     "num_experts",
+                     "num_experts_per_tok",
+                     "moe_intermediate_size",
+                     "shared_expert_intermediate_size",
+                     "output_gate_type",
+                     "hc_count",
+                     "hc_lowrank",
+                     "indexer_n_heads",
+                     "indexer_kv_heads",
+                     "indexer_head_dim",
+                     "indexer_budget",
+                     "indexer_compress_ratio",
+                     "ple_layer_ids",
+                     "ple_embed_dim",
+                     "ple_conv_kernel_size",
+                     "ngram_size",
+                     "heads_per_ngram",
+                     "ngram_vocab_size_base",
+                     "make_ngram_vocab_size_divisible_by",
+                     "seed",
+                     "eos_token_id"},
+                    "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
         architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
@@ -155,7 +274,18 @@ TextConfig text(const Json& value, bool mtp) {
         (void)gdn.conv_channels();
         out.gdn = gdn;
     }
-    if (out.architecture == Architecture::Qwen3_5Moe) {
+    const bool qwen4 = out.architecture == Architecture::Qwen4Exp;
+    for (const auto* key :
+         {"output_gate_type", "hc_count", "hc_lowrank", "indexer_n_heads", "indexer_kv_heads",
+          "indexer_head_dim", "indexer_budget", "indexer_compress_ratio", "ple_layer_ids",
+          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
+          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "seed", "eos_token_id"}) {
+        if (!qwen4 && value.contains(key)) {
+            throw ArtifactError(std::string("Qwen3.5 config carries Qwen4Exp field ") + key);
+        }
+    }
+    if (qwen4) { qwen4_extensions(value, out); }
+    if (out.architecture != Architecture::Qwen3_5) {
         if (value.contains("intermediate_size")) {
             throw ArtifactError("MoE config carries Dense FFN width");
         }
@@ -183,7 +313,8 @@ VisionConfig vision(const Json& value) {
                      "num_position_embeddings"},
                     {}, "vision config");
     if (value.at("model_type") != "qwen3_5_vision" &&
-        value.at("model_type") != "qwen3_5_moe_vision") {
+        value.at("model_type") != "qwen3_5_moe_vision" &&
+        value.at("model_type") != "qwen4_exp_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;
@@ -324,9 +455,11 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
             require_members(config, {"architectures"}, {}, "MTP config");
-            if (architecture(config) != (out.text.architecture == Architecture::Qwen3_5Moe
-                                             ? "Qwen3_5MoeMTP"
-                                             : "Qwen3_5MTP")) {
+            const char* expected = out.text.architecture == Architecture::Qwen4Exp ? "Qwen4ExpMTP"
+                                   : out.text.architecture == Architecture::Qwen3_5Moe
+                                       ? "Qwen3_5MoeMTP"
+                                       : "Qwen3_5MTP";
+            if (architecture(config) != expected) {
                 throw ArtifactError("MTP architecture differs from target mathematics");
             }
         }

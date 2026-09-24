@@ -70,6 +70,55 @@ struct MoeConfig {
     std::uint32_t shared_expert_intermediate_size = 0;
 };
 
+enum class GateActivation { Silu, Sigmoid };
+
+// Qwen4Exp wide residual: hc_count streams of hidden_size, low-rank input mixing per block.
+struct HyperConnectionConfig {
+    std::uint32_t hc_count   = 0;
+    std::uint32_t hc_lowrank = 0;
+};
+
+// Qwen Sparse Attention indexer: one raw key head per token, pooled over compress_ratio tokens.
+struct SparseAttentionConfig {
+    std::uint32_t indexer_heads    = 0;
+    std::uint32_t indexer_head_dim = 0;
+    std::uint32_t budget           = 0;
+    std::uint32_t compress_ratio   = 0;
+
+    [[nodiscard]] std::uint32_t block_topk() const noexcept { return budget / compress_ratio; }
+
+    // Budget blocks plus the incomplete tail.
+    [[nodiscard]] std::uint32_t max_selected_tokens() const noexcept {
+        return budget + compress_ratio - 1;
+    }
+};
+
+// Qwen4Exp n-gram hash embedding injected before one GDN block.
+struct PleConfig {
+    std::uint32_t layer           = 0; // zero-based block index
+    std::uint32_t ngram_size      = 0;
+    std::uint32_t heads_per_ngram = 0;
+    std::uint32_t embed_dim       = 0;
+    std::uint32_t conv_kernel     = 0;
+    std::uint32_t eos_token_id    = 0;
+    std::uint64_t table_rows      = 0;
+    std::vector<std::uint64_t> multipliers;  // ngram_size odd hash multipliers
+    std::vector<std::uint64_t> head_moduli;  // prime modulus per hash head
+    std::vector<std::uint64_t> head_offsets; // table row offset per hash head
+
+    [[nodiscard]] std::uint32_t heads() const noexcept {
+        return (ngram_size - 1) * heads_per_ngram;
+    }
+
+    [[nodiscard]] std::uint32_t row_width() const noexcept { return embed_dim / heads(); }
+
+    [[nodiscard]] std::uint32_t conv_dilation() const noexcept { return ngram_size; }
+
+    [[nodiscard]] std::uint32_t conv_history() const noexcept {
+        return (conv_kernel - 1) * conv_dilation();
+    }
+};
+
 struct TextConfig {
     Architecture architecture             = Architecture::Qwen3_5;
     std::uint32_t hidden_size             = 0;
@@ -86,6 +135,18 @@ struct TextConfig {
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
+    GateActivation gdn_gate = GateActivation::Silu;
+    std::optional<HyperConnectionConfig> hyper_connection; // Qwen4Exp only
+    std::optional<SparseAttentionConfig> sparse_attention; // Qwen4Exp only
+    std::optional<PleConfig> ple;                          // Qwen4Exp only
+
+    [[nodiscard]] bool qwen4() const noexcept { return architecture == Architecture::Qwen4Exp; }
+
+    // Width of the residual carried between blocks and handed to MTP.
+    [[nodiscard]] std::uint64_t residual_width() const noexcept {
+        return hyper_connection ? std::uint64_t(hyper_connection->hc_count) * hidden_size
+                                : hidden_size;
+    }
 };
 
 struct VisionConfig {

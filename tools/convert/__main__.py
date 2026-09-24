@@ -13,6 +13,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
+from .qwen4_exp import build_model as build_qwen4_exp_model, is_qwen4_exp
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
 
@@ -151,12 +152,19 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
-        model = build_model(
-            base,
-            components=components,
-            companions=companions,
-            resource_overrides=overrides,
-        )
+        if is_qwen4_exp(base.config):
+            if companions:
+                raise ValueError("Qwen4Exp has no DFlash companions")
+            model = build_qwen4_exp_model(
+                base, components=components, resource_overrides=overrides
+            )
+        else:
+            model = build_model(
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
+            )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:

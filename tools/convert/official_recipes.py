@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from .methods import (
+    cast_direct,
+    fp8_row_maxabs,
+    grouped_absmax,
+    import_encoded,
+    nvfp4_absmax,
+)
 from .sources.compressed_tensors import compressed_matrix_source
 
 Q4 = "q4_g64_fp16"
@@ -261,6 +267,54 @@ def qwen3_6_35b_a3b_nvfp4(model, recipe, sources):
             recipe.group(names)
 
 
+def qwen3_8_flash_next_nvfp4(model, recipe, sources):
+    """Qwen3.8-Flash-Next (Qwen4Exp) from the ModelOpt NVFP4 checkpoint.
+
+    Routed Text experts keep their NVFP4 codes, block scales and divisors; the MTP bank is
+    re-encoded from block FP8 to NVFP4 so every routed expert uses one execution path. The n-gram
+    table keeps its FP8 codes under the shared multiplier. Dense projections become Q8 (the output
+    head Q6); routers, shared-expert gates, norms and small vectors stay direct.
+    """
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    # Vision's mixed groupwise assignment; the loop below restates every Text and MTP choice.
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    _assign(recipe, "text/output_head", Q6)
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
+            continue
+        if name.endswith("/ple/table"):
+            recipe.assign(
+                name, format=FP8, method=import_encoded, source=parameter.source
+            )
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
+            "text/token_embedding",
+            "text/output_head",
+        ):
+            continue
+        if "/moe/experts/" in name:
+            text = name.startswith("text/")
+            recipe.assign(
+                name,
+                format="nvfp4",
+                method=import_encoded if text else nvfp4_absmax,
+                source=parameter.source,
+                activation_policy="AllowA4",
+            )
+            continue
+        _assign(recipe, name, Q8)
+    # Each layer's gate/up and down banks become one parent so an expert is a fixed row range of
+    # its bank, addressed by the expert cache as a few contiguous spans.
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -269,4 +323,5 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_6_35b_a3b_nvfp4": qwen3_6_35b_a3b_nvfp4,
+    "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
 }
