@@ -53,7 +53,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->config.vision) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text);
     }
-    if (out->config.mtp) {
+    if (text.qwen4()) {
+        out->weights.qwen4 = loading::bind_qwen4_text(bindings, text);
+        if (out->config.mtp) { out->weights.qwen4_mtp = loading::bind_qwen4_mtp(bindings, text); }
+    } else if (out->config.mtp) {
         out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
     }
     if (out->config.draft) {
@@ -84,6 +87,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->weights.mtp) {
         out->weights.mtp->output_head_use =
             bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
+    }
+    if (text.qwen4() && (out->config.draft || options.proposal_enabled())) {
+        throw artifact::ArtifactError("Qwen4Exp supports MTP speculation only");
     }
     if (out->weights.draft) {
         out->weights.draft->output_head_use =

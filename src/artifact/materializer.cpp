@@ -192,6 +192,13 @@ MaterializedArtifact::file_segments(ObjectHandle handle) const {
     return objects_[handle.index].file;
 }
 
+const WeightGeometry& MaterializedArtifact::file_geometry(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].file_geometry) {
+        throw ArtifactError("object has no file mapping");
+    }
+    return *objects_[handle.index].file_geometry;
+}
+
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
     if (!has_device(handle)) { throw ArtifactError("object has no device weight backing"); }
     return *objects_[handle.index].device;
@@ -295,6 +302,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                                          segment.file_offset, segment.bytes);
             storage.file.push_back({segment.destination_offset, segment.bytes, mapping->data()});
             out.mappings_.push_back(std::move(mapping));
+        }
+        if (std::holds_alternative<TensorObject>(object)) {
+            storage.file_geometry = reader.geometry(handle);
         }
         out.stats_.mapped_file_bytes =
             checked_add(out.stats_.mapped_file_bytes, object_bytes(object), "mapped bytes");

@@ -26,7 +26,8 @@ public:
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
-                                     std::optional<QType> exact_format = {});
+                                     std::optional<QType> exact_format = {},
+                                     artifact::Residency residency = artifact::Residency::Device);
     [[nodiscard]] WeightId direct(std::string name, artifact::Shape shape,
                                   QType format = QType::BF16);
 
@@ -59,6 +60,8 @@ private:
                                       const std::string& component);
 void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target);
+[[nodiscard]] Qwen4TextWeights bind_qwen4_text(Bindings& bindings, const TextConfig& config);
+[[nodiscard]] Qwen4MtpWeights bind_qwen4_mtp(Bindings& bindings, const TextConfig& config);
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,
                                             std::uint32_t public_tokens);

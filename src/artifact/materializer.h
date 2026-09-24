@@ -80,6 +80,7 @@ public:
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
     // Segments of a HostFile object in object-offset order; host access only.
     [[nodiscard]] std::span<const MappedObjectSegment> file_segments(ObjectHandle handle) const;
+    [[nodiscard]] const WeightGeometry& file_geometry(ObjectHandle handle) const;
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
@@ -94,6 +95,7 @@ private:
         std::optional<WeightParent> pinned;
         std::optional<PinnedHostBuffer> pinned_data;
         std::vector<MappedObjectSegment> file;
+        std::optional<WeightGeometry> file_geometry;
     };
 
     std::unique_ptr<DeviceArena> arena_;

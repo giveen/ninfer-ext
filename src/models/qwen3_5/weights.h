@@ -1,5 +1,6 @@
 #pragma once
 
+#include "artifact/materializer.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 
@@ -34,6 +35,9 @@ struct BoundWeight {
     std::vector<std::string> source_objects;
     WeightView view;
     std::vector<WeightUse> uses;
+    // HostFile weights have no parent view; host code reads their mapped object segments.
+    std::vector<artifact::MappedObjectSegment> mapped;
+    WeightGeometry mapped_geometry;
 };
 
 struct AttentionWeights {
@@ -129,6 +133,39 @@ struct ProposalWeights {
     std::vector<std::int32_t> global_token_ids;
 };
 
+struct HyperConnectionWeights {
+    WeightId norm, down, up;
+    std::optional<WeightId> inject; // absent for the output mixers
+};
+
+struct QsaWeights {
+    AttentionWeights attention;
+    WeightId indexer_query, indexer_key, indexer_query_norm, indexer_key_norm;
+};
+
+struct PleWeights {
+    WeightId table, key, value, key_norm, query_norm, conv_norm, convolution;
+};
+
+// Qwen4Exp block: hyper-connection mixers around a QSA or GDN mixer and the offloaded MoE.
+struct Qwen4BlockWeights {
+    HyperConnectionWeights attention_hc, ffn_hc;
+    std::variant<QsaWeights, GdnWeights> mixer;
+    MoeWeights moe;
+    std::optional<PleWeights> ple;
+};
+
+struct Qwen4TextWeights {
+    HyperConnectionWeights head;
+    std::vector<Qwen4BlockWeights> layers;
+};
+
+struct Qwen4MtpWeights {
+    WeightId embedding_norm, hidden_norm, embedding_projection, hidden_projection;
+    HyperConnectionWeights head;
+    Qwen4BlockWeights layer;
+};
+
 // Handles refer to the frozen model's weight array. No artifact ID lookup is needed in execution.
 struct ModelWeights {
     TextWeights text;
@@ -136,6 +173,8 @@ struct ModelWeights {
     std::optional<MtpWeights> mtp;
     std::optional<DraftWeights> draft;
     std::optional<ProposalWeights> proposal;
+    std::optional<Qwen4TextWeights> qwen4;
+    std::optional<Qwen4MtpWeights> qwen4_mtp;
 };
 
 } // namespace ninfer::models::qwen3_5

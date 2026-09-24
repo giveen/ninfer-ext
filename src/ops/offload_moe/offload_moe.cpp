@@ -97,8 +97,8 @@ void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::in
     detail::expert_cache_fetch_launch(bank, misses, max_misses, cache, stream);
 }
 
-ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const float* divisors) {
-    ExpertWeights out;
+ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
+    ExpertWeights out             = bank;
     const std::int64_t offsets[4] = {
         0, kExpertGateUpCodeBytes, kExpertGateUpCodeBytes + kExpertGateUpScaleBytes,
         kExpertGateUpCodeBytes + kExpertGateUpScaleBytes + kExpertDownCodeBytes};
@@ -106,7 +106,6 @@ ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const float* d
         out.base[p]   = cache.pool + offsets[p];
         out.stride[p] = kExpertSlotBytes;
     }
-    out.divisors = divisors;
     return out;
 }
 
@@ -130,7 +129,9 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
-    require(weights_source.divisors != nullptr, op, "expert divisors are required");
+    require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
+                weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
+            op, "expert divisors are required");
     const std::int32_t chunk = std::min(columns, kChunkColumns);
     require(chunk * kOffloadMoeTopK <= 1024 || slots <= 4096, op,
             "large token chunks require a staged bank indexed by expert id");

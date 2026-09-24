@@ -16,13 +16,13 @@ WeightUseId Bindings::use(WeightId id, std::string_view input) const {
 }
 
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
-                             std::vector<std::string> inputs, std::optional<QType> exact_format) {
+                             std::vector<std::string> inputs, std::optional<QType> exact_format,
+                             artifact::Residency residency) {
     if (parameters_.contains(name)) {
         throw artifact::ArtifactError(name + ": duplicate model parameter declaration");
     }
     PendingWeight pending;
-    pending.reference =
-        binder.parameter(name, std::move(shape), artifact::Residency::Device, exact_format);
+    pending.reference = binder.parameter(name, std::move(shape), residency, exact_format);
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -73,6 +73,20 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (auto& item : pending) {
+        if (item.reference.residency == artifact::Residency::HostFile) {
+            const auto& parts = item.reference.binding.parts;
+            if (parts.size() != 1 || parts[0].begin != 0) {
+                throw artifact::ArtifactError(item.reference.name +
+                                              ": a file-mapped weight must bind a whole object");
+            }
+            BoundWeight bound{std::move(item.reference.name), std::move(item.source_objects),
+                              WeightView{item.reference.shape, {}}, std::move(item.uses)};
+            const auto segments = materialized.file_segments(parts[0].object);
+            bound.mapped.assign(segments.begin(), segments.end());
+            bound.mapped_geometry = materialized.file_geometry(parts[0].object);
+            out.push_back(std::move(bound));
+            continue;
+        }
         auto view = artifact::bind_view(item.reference, materialized);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});

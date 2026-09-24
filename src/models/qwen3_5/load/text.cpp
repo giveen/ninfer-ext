@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <set>
+#include <string>
 
 namespace ninfer::models::qwen3_5::loading {
 
@@ -54,7 +55,8 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& prefix) {
+MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& prefix,
+                    artifact::Residency experts = artifact::Residency::Device) {
     const auto& moe   = std::get<MoeConfig>(config.ffn);
     const auto p      = prefix + "moe/";
     const auto input  = prefix + "ffn_input";
@@ -67,9 +69,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     out.experts.reserve(moe.num_experts);
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}),
-                               b.parameter(ep + "up", {ir, h}, {input}),
-                               b.parameter(ep + "down", {h, ir}, {ep + "product"})});
+        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, {}, experts),
+                               b.parameter(ep + "up", {ir, h}, {input}, {}, experts),
+                               b.parameter(ep + "down", {h, ir}, {ep + "product"}, {}, experts)});
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),
@@ -77,7 +79,92 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     return out;
 }
 
+HyperConnectionWeights bind_hyper_connection(Bindings& b, const TextConfig& config,
+                                             const std::string& p, bool inject) {
+    const auto h    = config.hidden_size;
+    const auto wide = config.residual_width();
+    const auto& hc  = config.hyper_connection.value();
+    HyperConnectionWeights out;
+    out.norm = b.direct(p + "norm", {wide});
+    out.down = b.parameter(p + "down", {hc.hc_lowrank, wide}, {p + "normed"});
+    out.up   = b.parameter(p + "up", {wide, hc.hc_lowrank}, {p + "lowrank"});
+    if (inject) { out.inject = b.parameter(p + "inject", {hc.hc_count, wide}, {p + "normed"}); }
+    (void)h;
+    return out;
+}
+
+QsaWeights bind_qsa(Bindings& b, const TextConfig& config, const std::string& p) {
+    const auto& qsa = config.sparse_attention.value();
+    const auto h    = config.hidden_size;
+    QsaWeights out;
+    out.attention     = bind_attention(b, config, p);
+    out.indexer_query = b.parameter(p + "attention/indexer_query",
+                                    {std::uint64_t(qsa.indexer_heads) * qsa.indexer_head_dim, h},
+                                    {p + "mixer_input"});
+    out.indexer_key =
+        b.parameter(p + "attention/indexer_key", {qsa.indexer_head_dim, h}, {p + "mixer_input"});
+    out.indexer_query_norm = b.direct(p + "attention/indexer_query_norm", {qsa.indexer_head_dim});
+    out.indexer_key_norm   = b.direct(p + "attention/indexer_key_norm", {qsa.indexer_head_dim});
+    return out;
+}
+
+PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& prefix) {
+    const auto& ple = config.ple.value();
+    const auto p    = prefix + "ple/";
+    const auto wide = config.residual_width();
+    PleWeights out;
+    out.table    = b.parameter(p + "table", {ple.table_rows, ple.row_width()}, {},
+                               QType::FP8_E4M3FN_ROW_BF16, artifact::Residency::HostFile);
+    out.key      = b.parameter(p + "key", {wide, ple.embed_dim}, {p + "embedding"});
+    out.value    = b.parameter(p + "value", {config.hidden_size, ple.embed_dim}, {p + "embedding"});
+    out.key_norm = b.direct(p + "key_norm", {wide});
+    out.query_norm  = b.direct(p + "query_norm", {wide});
+    out.conv_norm   = b.direct(p + "conv_norm", {wide});
+    out.convolution = b.direct(p + "convolution", {ple.conv_kernel, wide});
+    return out;
+}
+
+Qwen4BlockWeights bind_qwen4_block(Bindings& b, const TextConfig& config, const std::string& p,
+                                   MixerKind mixer, bool ple) {
+    Qwen4BlockWeights out;
+    out.attention_hc = bind_hyper_connection(b, config, p + "attn_hc/", true);
+    out.ffn_hc       = bind_hyper_connection(b, config, p + "ffn_hc/", true);
+    if (mixer == MixerKind::FullAttention) {
+        out.mixer = bind_qsa(b, config, p);
+    } else {
+        out.mixer = bind_gdn(b, config, p);
+    }
+    out.moe = bind_moe(b, config, p, artifact::Residency::HostPinned);
+    if (ple) { out.ple = bind_ple(b, config, p); }
+    return out;
+}
+
 } // namespace
+
+Qwen4TextWeights bind_qwen4_text(Bindings& b, const TextConfig& config) {
+    Qwen4TextWeights out;
+    out.head = bind_hyper_connection(b, config, "text/hc_head/", false);
+    out.layers.reserve(config.num_hidden_layers);
+    for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+        out.layers.push_back(bind_qwen4_block(b, config, "text/layers/" + std::to_string(i) + "/",
+                                              config.layer_types[i],
+                                              config.ple && config.ple->layer == i));
+    }
+    return out;
+}
+
+Qwen4MtpWeights bind_qwen4_mtp(Bindings& b, const TextConfig& config) {
+    const auto h = config.hidden_size;
+    Qwen4MtpWeights out;
+    out.embedding_norm = b.direct("mtp/embedding_norm", {h});
+    out.hidden_norm    = b.direct("mtp/hidden_norm", {config.residual_width()});
+    out.embedding_projection =
+        b.parameter("mtp/embedding_projection", {h, h}, {"mtp/embedding_input"});
+    out.hidden_projection = b.parameter("mtp/hidden_projection", {h, h}, {"mtp/hidden_input"});
+    out.head              = bind_hyper_connection(b, config, "mtp/hc_head/", false);
+    out.layer = bind_qwen4_block(b, config, "mtp/layers/0/", MixerKind::FullAttention, false);
+    return out;
+}
 
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
                         MixerKind mixer) {
@@ -99,6 +186,16 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
 
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options) {
     TextWeights out;
+    if (config.qwen4()) {
+        // Qwen4Exp keeps only the vocabulary here; its blocks bind through bind_qwen4_text.
+        out.token_embedding =
+            b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+        std::vector<std::string> inputs{"text/final_hidden"};
+        if (options.mtp()) { inputs.push_back("mtp/final_hidden"); }
+        out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
+                                      std::move(inputs));
+        return out;
+    }
     out.token_embedding =
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_inputs{"text/final_hidden"};

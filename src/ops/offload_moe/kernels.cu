@@ -429,9 +429,11 @@ __global__ void __launch_bounds__(256) moe_gate_up_kernel(
         reinterpret_cast<const std::uint8_t*>(weights.base[0] + job.slot * weights.stride[0]);
     const auto* scale =
         reinterpret_cast<const std::uint8_t*>(weights.base[1] + job.slot * weights.stride[1]);
-    const float inv_gate = 1.0F / weights.divisors[job.expert * 3 + 0];
-    const float inv_up   = 1.0F / weights.divisors[job.expert * 3 + 1];
-    float acc[4][4]      = {};
+    const std::int64_t bank_row = static_cast<std::int64_t>(job.expert) * 2 * I;
+    const float inv_gate = 1.0F / weights.gate_up_divisors[bank_row / weights.gate_up_divisor_rows];
+    const float inv_up =
+        1.0F / weights.gate_up_divisors[(bank_row + I) / weights.gate_up_divisor_rows];
+    float acc[4][4] = {};
     for (int k0 = 0; k0 < H; k0 += kTile) {
         for (int i = tid; i < kJobTokens * kTile; i += blockDim.x) {
             const int token = i / kTile, kk = i % kTile;
@@ -491,7 +493,8 @@ __global__ void __launch_bounds__(256) moe_down_kernel(
         reinterpret_cast<const std::uint8_t*>(weights.base[2] + job.slot * weights.stride[2]);
     const auto* scale =
         reinterpret_cast<const std::uint8_t*>(weights.base[3] + job.slot * weights.stride[3]);
-    const float inv = 1.0F / weights.divisors[job.expert * 3 + 2];
+    const float inv = 1.0F / weights.down_divisors[static_cast<std::int64_t>(job.expert) * H /
+                                                   weights.down_divisor_rows];
     float acc[4][4] = {};
     for (int k0 = 0; k0 < I; k0 += kTile) {
         for (int i = tid; i < kJobTokens * kTile; i += blockDim.x) {

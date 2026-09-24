@@ -36,12 +36,17 @@ inline constexpr std::int64_t kExpertSlotBytes =
  * `base[p] + i * stride[p]`; planes are gate/up codes, gate/up scales, down codes, down scales.
  * A stored bank uses the plane layout (stride = per-expert plane bytes), a slot pool uses one
  * stride of kExpertSlotBytes with plane offsets inside the slot. Every expert's gate rows precede
- * its up rows. `divisors` is FP32 `[512, 3]` (gate, up, down weight divisors by expert id).
+ * its up rows. Weight divisors are read from the stored banks by expert id: gate/up bank row r
+ * uses `gate_up_divisors[r / gate_up_divisor_rows]` and down bank row r uses
+ * `down_divisors[r / down_divisor_rows]`.
  */
 struct ExpertWeights {
-    const std::byte* base[4] = {};
-    std::int64_t stride[4]   = {};
-    const float* divisors    = nullptr;
+    const std::byte* base[4]          = {};
+    std::int64_t stride[4]            = {};
+    const float* gate_up_divisors     = nullptr;
+    std::int32_t gate_up_divisor_rows = 0;
+    const float* down_divisors        = nullptr;
+    std::int32_t down_divisor_rows    = 0;
 };
 
 /** Device-resident mutable state of the expert cache; owned by one Program. */
@@ -84,9 +89,9 @@ void expert_cache_resolve(const Tensor& ids, std::int32_t layer, const ExpertCac
 void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::int32_t max_misses,
                         const ExpertCacheState& cache, cudaStream_t stream);
 
-/** Slot-pool addressing of a cache for the given expert divisors. */
+/** Slot-pool addressing of a cache whose experts come from `bank` (divisors stay in the bank). */
 [[nodiscard]] ExpertWeights expert_cache_weights(const ExpertCacheState& cache,
-                                                 const float* divisors);
+                                                 const ExpertWeights& bank);
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots);
 
