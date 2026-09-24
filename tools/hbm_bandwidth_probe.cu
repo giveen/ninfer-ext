@@ -1,7 +1,7 @@
 // Standalone sustained device-memory bandwidth probe.
 //
 // Build:
-//   nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
+//   nvcc -O3 -std=c++23 -arch=sm_120a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
 //
 // The "bus GB/s" column counts physical streaming traffic: N bytes for a
 // read or write and 2N bytes for a copy (N read + N written). This is the
