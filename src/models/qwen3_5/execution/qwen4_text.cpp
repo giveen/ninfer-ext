@@ -402,7 +402,7 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
 
     auto scope = work_.scope();
     auto roots = workspace::qwen4_moe(work_, config_, T, cache.slots);
-    ops::moe_route(x, p.router, work_, roots.ids, roots.weights, roots.shared_gate, s);
+    ops::moe_route(x, p.router, roots.ids, roots.weights, roots.shared_gate, s);
     project(x, p.shared_gate_up, roots.shared_gate_up, work_, s);
     const std::int32_t width = roots.shared_gate_up.ne[0] / 2;
     Tensor shared_act        = roots.shared_act;

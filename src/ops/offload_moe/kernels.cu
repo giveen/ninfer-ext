@@ -8,7 +8,6 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -51,73 +50,40 @@ __device__ __forceinline__ float nvfp4_value(const std::uint8_t* codes, const st
 }
 
 // ---------------------------------------------------------------------------------------------
-// Routing. Logits: one warp per router row keeps its row in registers and sweeps a column tile, so
-// the 2.6 MB router streams through many SMs even for one token. Top-k: one warp per column.
-
-constexpr int kRouteWarps   = 4;
-constexpr int kRouteColumns = 64;
-constexpr int kRouteVectors = H / 8 / 32; // uint4 (8 x BF16) per lane
-
-__device__ __forceinline__ float dot_bf16x8(uint4 a, uint4 b) {
-    const auto* x = reinterpret_cast<const __nv_bfloat162*>(&a);
-    const auto* y = reinterpret_cast<const __nv_bfloat162*>(&b);
-    float sum     = 0.0F;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float2 u = __bfloat1622float2(x[i]);
-        const float2 v = __bfloat1622float2(y[i]);
-        sum            = fmaf(u.x, v.x, fmaf(u.y, v.y, sum));
-    }
-    return sum;
-}
-
-__global__ void __launch_bounds__(kRouteWarps * 32)
-    moe_route_logits_kernel(const __nv_bfloat16* __restrict__ x,
-                            const __nv_bfloat16* __restrict__ router, float* __restrict__ logits,
-                            std::int32_t columns) {
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int row  = static_cast<int>(blockIdx.x) * kRouteWarps + warp;
-    if (row > E) { return; }
-    const auto* w4 = reinterpret_cast<const uint4*>(router + static_cast<std::int64_t>(row) * H);
-    uint4 w[kRouteVectors];
-#pragma unroll
-    for (int i = 0; i < kRouteVectors; ++i) { w[i] = __ldg(w4 + i * 32 + lane); }
-    const int begin = static_cast<int>(blockIdx.y) * kRouteColumns;
-    const int end   = min(columns, begin + kRouteColumns);
-    for (int col = begin; col < end; ++col) {
-        const auto* x4 = reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * H);
-        float sum      = 0.0F;
-#pragma unroll
-        for (int i = 0; i < kRouteVectors; ++i) { sum += dot_bf16x8(w[i], x4[i * 32 + lane]); }
-        sum = warp_sum(sum);
-        if (lane == 0) { logits[static_cast<std::int64_t>(col) * (E + 1) + row] = sum; }
-    }
-}
+// Routing: one CTA per column; one warp per router row.
 
 __global__ void __launch_bounds__(256)
-    moe_route_topk_kernel(const float* __restrict__ logits, std::int32_t columns,
-                          std::int32_t* __restrict__ ids, float* __restrict__ weights,
-                          float* __restrict__ shared_gate) {
-    constexpr int kPerLane = E / 32;
-    const int lane         = static_cast<int>(threadIdx.x) & 31;
-    const std::int64_t col = static_cast<std::int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
-    if (col >= columns) { return; }
-    const float* l = logits + col * (E + 1);
-    float v[kPerLane];
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) { v[i] = l[i * 32 + lane]; }
-    unsigned taken = 0;
+    moe_route_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ router,
+                     std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                     float* __restrict__ shared_gate) {
+    __shared__ float xs[H];
+    __shared__ float logits[E + 1];
+    __shared__ int taken[E];
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int warp         = tid >> 5;
+    const int lane         = tid & 31;
+    const std::int64_t col = blockIdx.x;
+    for (int i = tid; i < H; i += blockDim.x) { xs[i] = __bfloat162float(x[col * H + i]); }
+    for (int e = tid; e < E; e += blockDim.x) { taken[e] = 0; }
+    __syncthreads();
+    for (int row = warp; row <= E; row += blockDim.x / 32) {
+        const __nv_bfloat16* w = router + static_cast<std::int64_t>(row) * H;
+        float sum              = 0.0F;
+        for (int i = lane; i < H; i += 32) { sum += __bfloat162float(w[i]) * xs[i]; }
+        sum = warp_sum(sum);
+        if (lane == 0) { logits[row] = sum; }
+    }
+    __syncthreads();
+    if (warp != 0) { return; }
     float top[K];
     int top_id[K];
     for (int k = 0; k < K; ++k) {
         float best  = -CUDART_INF_F;
         int best_id = E;
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int e = i * 32 + lane;
-            if (!((taken >> i) & 1U) && (v[i] > best || (v[i] == best && e < best_id))) {
-                best    = v[i];
+        for (int e = lane; e < E; e += 32) {
+            const float v = logits[e];
+            if (!taken[e] && (v > best || (v == best && e < best_id))) {
+                best    = v;
                 best_id = e;
             }
         }
@@ -131,7 +97,8 @@ __global__ void __launch_bounds__(256)
         }
         top[k]    = best;
         top_id[k] = best_id;
-        if ((best_id & 31) == lane) { taken |= 1U << (best_id >> 5); }
+        if (lane == 0) { taken[best_id] = 1; }
+        __syncwarp();
     }
     if (lane == 0) {
         float total = 0.0F;
@@ -140,7 +107,7 @@ __global__ void __launch_bounds__(256)
             ids[col * K + k]     = top_id[k];
             weights[col * K + k] = __expf(top[k] - top[0]) / total;
         }
-        shared_gate[col] = sigmoid(l[E]);
+        shared_gate[col] = sigmoid(logits[E]);
     }
 }
 
@@ -562,163 +529,6 @@ __global__ void __launch_bounds__(256) moe_down_kernel(
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Decode projections: at most 64 token columns, so a job holds only a few tokens. One warp owns a
-// few weight rows and streams them once per 8-token group with 8-byte code loads, one E4M3 scale
-// per 16 weights and the job's activations in shared memory; a warp reduction finishes each row.
-
-constexpr int kGemvTokens         = 8;
-constexpr int kGemvWarps          = 8;
-constexpr int kGateUpPairsPerWarp = 2;
-constexpr int kDownRowsPerWarp    = 4;
-constexpr int kGemvAssignments    = 640; // 64 columns
-
-// Accumulate one 16-weight scale group against `tokens` activation rows of stride `cols`.
-template <int Cols>
-__device__ __forceinline__ void gemv_group(uint2 codes, float scale,
-                                           const __nv_bfloat16* __restrict__ xs, int k, int tokens,
-                                           float (&acc)[kGemvTokens]) {
-    float w[16];
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&codes);
-#pragma unroll
-    for (int b = 0; b < 8; ++b) {
-        const float2 pair = decode_nvfp4_e2m1x2(bytes[b]);
-        w[2 * b]          = pair.x * scale;
-        w[2 * b + 1]      = pair.y * scale;
-    }
-#pragma unroll
-    for (int j = 0; j < kGemvTokens; ++j) {
-        if (j >= tokens) { break; }
-        const auto* x4 = reinterpret_cast<const uint4*>(xs + j * Cols + k);
-        const uint4 lo = x4[0], hi = x4[1];
-        const auto* a = reinterpret_cast<const __nv_bfloat162*>(&lo);
-        const auto* c = reinterpret_cast<const __nv_bfloat162*>(&hi);
-        float sum     = 0.0F;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 u = __bfloat1622float2(a[i]);
-            const float2 v = __bfloat1622float2(c[i]);
-            sum            = fmaf(w[2 * i], u.x, fmaf(w[2 * i + 1], u.y, sum));
-            sum            = fmaf(w[8 + 2 * i], v.x, fmaf(w[9 + 2 * i], v.y, sum));
-        }
-        acc[j] += sum;
-    }
-}
-
-__global__ void __launch_bounds__(kGemvWarps * 32) moe_gate_up_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ expert_ids,
-    const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
-    const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, __nv_bfloat16* __restrict__ act) {
-    __shared__ __align__(16) __nv_bfloat16 xs[kGemvTokens * H];
-    const JobView job =
-        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments);
-    if (job.count == 0) { return; }
-    const int tid   = static_cast<int>(threadIdx.x);
-    const int warp  = tid >> 5;
-    const int lane  = tid & 31;
-    const int pair0 = (static_cast<int>(blockIdx.y) * kGemvWarps + warp) * kGateUpPairsPerWarp;
-    const auto* codes =
-        reinterpret_cast<const std::uint8_t*>(weights.base[0] + job.slot * weights.stride[0]);
-    const auto* scale =
-        reinterpret_cast<const std::uint8_t*>(weights.base[1] + job.slot * weights.stride[1]);
-    const std::int64_t bank_row = static_cast<std::int64_t>(job.expert) * 2 * I;
-    const float inv_gate = 1.0F / weights.gate_up_divisors[bank_row / weights.gate_up_divisor_rows];
-    const float inv_up =
-        1.0F / weights.gate_up_divisors[(bank_row + I) / weights.gate_up_divisor_rows];
-    for (int t0 = 0; t0 < job.count; t0 += kGemvTokens) {
-        const int tokens = min(kGemvTokens, job.count - t0);
-        __syncthreads();
-        for (int i = tid; i < tokens * (H / 8); i += blockDim.x) {
-            const int token                 = i / (H / 8);
-            const int v                     = i - token * (H / 8);
-            const std::int64_t column       = sorted_assign[job.begin + t0 + token] / K;
-            reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(x + column * H)[v];
-        }
-        __syncthreads();
-        float acc[kGateUpPairsPerWarp][2][kGemvTokens] = {};
-        for (int q = lane; q < H / 16; q += 32) {
-#pragma unroll
-            for (int p = 0; p < kGateUpPairsPerWarp; ++p) {
-#pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int row = half * I + pair0 + p;
-                    const uint2 c = *reinterpret_cast<const uint2*>(
-                        codes + static_cast<std::int64_t>(row) * (H / 2) + q * 8);
-                    const float sc = decode_nvfp4_e4m3(scale[nvfp4_scale_byte<H / 64>(row, q)]);
-                    gemv_group<H>(c, sc, xs, q * 16, tokens, acc[p][half]);
-                }
-            }
-        }
-#pragma unroll
-        for (int p = 0; p < kGateUpPairsPerWarp; ++p) {
-#pragma unroll
-            for (int j = 0; j < kGemvTokens; ++j) {
-                const float g = warp_sum(acc[p][0][j]) * inv_gate;
-                const float u = warp_sum(acc[p][1][j]) * inv_up;
-                if (lane == 0 && j < tokens) {
-                    const std::int64_t a   = sorted_assign[job.begin + t0 + j];
-                    act[a * I + pair0 + p] = __float2bfloat16_rn(silu(g) * u);
-                }
-            }
-        }
-    }
-}
-
-__global__ void __launch_bounds__(kGemvWarps * 32) moe_down_gemv_kernel(
-    const __nv_bfloat16* __restrict__ act, const std::int32_t* __restrict__ expert_ids,
-    const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
-    const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, float* __restrict__ partial) {
-    __shared__ __align__(16) __nv_bfloat16 xs[kGemvTokens * I];
-    const JobView job =
-        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments);
-    if (job.count == 0) { return; }
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int row0 = (static_cast<int>(blockIdx.y) * kGemvWarps + warp) * kDownRowsPerWarp;
-    const auto* codes =
-        reinterpret_cast<const std::uint8_t*>(weights.base[2] + job.slot * weights.stride[2]);
-    const auto* scale =
-        reinterpret_cast<const std::uint8_t*>(weights.base[3] + job.slot * weights.stride[3]);
-    const float inv = 1.0F / weights.down_divisors[static_cast<std::int64_t>(job.expert) * H /
-                                                   weights.down_divisor_rows];
-    for (int t0 = 0; t0 < job.count; t0 += kGemvTokens) {
-        const int tokens = min(kGemvTokens, job.count - t0);
-        __syncthreads();
-        for (int i = tid; i < tokens * (I / 8); i += blockDim.x) {
-            const int token                 = i / (I / 8);
-            const int v                     = i - token * (I / 8);
-            const std::int64_t a            = sorted_assign[job.begin + t0 + token];
-            reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(act + a * I)[v];
-        }
-        __syncthreads();
-        float acc[kDownRowsPerWarp][kGemvTokens] = {};
-        for (int q = lane; q < I / 16; q += 32) {
-#pragma unroll
-            for (int r = 0; r < kDownRowsPerWarp; ++r) {
-                const int row = row0 + r;
-                const uint2 c = *reinterpret_cast<const uint2*>(
-                    codes + static_cast<std::int64_t>(row) * (I / 2) + q * 8);
-                const float sc = decode_nvfp4_e4m3(scale[nvfp4_scale_byte<I / 64>(row, q)]);
-                gemv_group<I>(c, sc, xs, q * 16, tokens, acc[r]);
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < kDownRowsPerWarp; ++r) {
-#pragma unroll
-            for (int j = 0; j < kGemvTokens; ++j) {
-                const float sum = warp_sum(acc[r][j]) * inv;
-                if (lane == 0 && j < tokens) {
-                    const std::int64_t a      = sorted_assign[job.begin + t0 + j];
-                    partial[a * H + row0 + r] = sum;
-                }
-            }
-        }
-    }
-}
-
 __global__ void moe_combine_kernel(const float* __restrict__ partial,
                                    const float* __restrict__ weights,
                                    const float* __restrict__ shared_gate,
@@ -738,17 +548,12 @@ __global__ void moe_combine_kernel(const float* __restrict__ partial,
 
 } // namespace
 
-void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tensor& ids,
-                      Tensor& weights, Tensor& shared_gate, cudaStream_t stream) {
+void moe_route_launch(const Tensor& x, const Tensor& router, Tensor& ids, Tensor& weights,
+                      Tensor& shared_gate, cudaStream_t stream) {
     const int columns = x.ne[1];
-    const dim3 grid((E + 1 + kRouteWarps - 1) / kRouteWarps,
-                    (columns + kRouteColumns - 1) / kRouteColumns);
-    moe_route_logits_kernel<<<grid, kRouteWarps * 32, 0, stream>>>(
+    moe_route_kernel<<<columns, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(router.data),
-        logits, columns);
-    CUDA_CHECK(cudaGetLastError());
-    moe_route_topk_kernel<<<(columns + 7) / 8, 256, 0, stream>>>(
-        logits, columns, static_cast<std::int32_t*>(ids.data), static_cast<float*>(weights.data),
+        static_cast<std::int32_t*>(ids.data), static_cast<float*>(weights.data),
         static_cast<float*>(shared_gate.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -776,27 +581,14 @@ void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream) {
                                                    chunk.counts, chunk.sorted_assign,
                                                    chunk.sorted_slot, chunk.jobs, chunk.job_count);
     CUDA_CHECK(cudaGetLastError());
-    if (assignments <= kGemvAssignments) {
-        moe_gate_up_gemv_kernel<<<dim3(assignments, I / (kGemvWarps * kGateUpPairsPerWarp)),
-                                  kGemvWarps * 32, 0, stream>>>(
-            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.act);
-        CUDA_CHECK(cudaGetLastError());
-        moe_down_gemv_kernel<<<dim3(assignments, H / (kGemvWarps * kDownRowsPerWarp)),
-                               kGemvWarps * 32, 0, stream>>>(
-            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.partial);
-        CUDA_CHECK(cudaGetLastError());
-    } else {
-        moe_gate_up_kernel<<<dim3(assignments, I / 32), 256, 0, stream>>>(
-            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.act);
-        CUDA_CHECK(cudaGetLastError());
-        moe_down_kernel<<<dim3(assignments, H / kTile), 256, 0, stream>>>(
-            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.partial);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    moe_gate_up_kernel<<<dim3(assignments, I / 32), 256, 0, stream>>>(
+        chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+        chunk.job_count, assignments, chunk.source, chunk.act);
+    CUDA_CHECK(cudaGetLastError());
+    moe_down_kernel<<<dim3(assignments, H / kTile), 256, 0, stream>>>(
+        chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+        chunk.job_count, assignments, chunk.source, chunk.partial);
+    CUDA_CHECK(cudaGetLastError());
     const std::int64_t total = static_cast<std::int64_t>(chunk.columns) * H;
     const int grid = static_cast<int>(std::min<std::int64_t>((total + 255) / 256, 1 << 16));
     moe_combine_kernel<<<grid, 256, 0, stream>>>(chunk.partial, chunk.weights, chunk.shared_gate,
