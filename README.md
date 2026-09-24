@@ -274,7 +274,7 @@ K=3 column:
 
 ```bash
 build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "$(cat prompt.txt)" \
-  --max-context 8192 --greedy --spec mtp --draft-tokens 7 --no-thinking --max-new 640
+  --spec mtp --draft-tokens 7 --greedy --no-thinking --max-new 640
 ```
 
 The summary line reports `decode speed` and, for adaptive runs, `mtp rounds by length`.
