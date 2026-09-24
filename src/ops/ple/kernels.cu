@@ -108,32 +108,39 @@ __global__ void ple_dilated_conv_kernel(const __nv_bfloat16* __restrict__ normed
     }
 }
 
+// One thread per (lane, channel). The block spans every lane for its channel tile, so a lane's
+// source rows are snapshotted into registers before the barrier: reads never observe another
+// lane's destination write (a lane's source slot may equal another lane's destination slot).
 __global__ void ple_conv_advance_kernel(const __nv_bfloat16* __restrict__ normed,
                                         const std::int32_t* __restrict__ valid_columns,
                                         __nv_bfloat16* __restrict__ states,
                                         const std::int32_t* __restrict__ source_slots,
                                         const std::int32_t* __restrict__ destination_slots,
                                         std::int32_t channels, std::int32_t width,
-                                        std::int32_t lanes, std::int32_t history) {
-    const std::int64_t total = static_cast<std::int64_t>(channels) * lanes;
-    for (std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-         i < total; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
-        const std::int32_t c    = static_cast<std::int32_t>(i % channels);
-        const std::int32_t lane = static_cast<std::int32_t>(i / channels);
-        std::int32_t count      = width;
+                                        std::int32_t lanes, std::int32_t tile,
+                                        std::int32_t history) {
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x) / tile;
+    const std::int32_t c    = static_cast<std::int32_t>(blockIdx.x) * tile +
+                              static_cast<std::int32_t>(threadIdx.x) % tile;
+    __nv_bfloat16 values[kMaximumHistory];
+    if (c < channels) {
+        std::int32_t count = width;
         if (valid_columns != nullptr) { count = max(0, min(width, valid_columns[lane])); }
         const std::int64_t source = source_slots[lane];
-        __nv_bfloat16 values[kMaximumHistory];
-        for (int r = 0; r < history; ++r) {
+        for (std::int32_t r = 0; r < history; ++r) {
             const std::int32_t index = count + r;
-            values[r]                = index < history
-                                           ? states[(source * history + index) * channels + c]
-                                           : normed[(static_cast<std::int64_t>(lane) * width + (index - history)) *
-                                         channels +
-                                     c];
+            values[r] =
+                index < history
+                    ? states[(source * history + index) * channels + c]
+                    : normed[(static_cast<std::int64_t>(lane) * width + (index - history)) *
+                                 channels +
+                             c];
         }
+    }
+    __syncthreads();
+    if (c < channels) {
         const std::int64_t destination = destination_slots[lane];
-        for (int r = 0; r < history; ++r) {
+        for (std::int32_t r = 0; r < history; ++r) {
             states[(destination * history + r) * channels + c] = values[r];
         }
     }
@@ -170,14 +177,17 @@ void ple_conv_advance_launch(const Tensor& normed, const Tensor* valid_columns,
                              const Tensor& destination_slots, cudaStream_t stream) {
     const std::int32_t channels = normed.ne[0];
     const std::int32_t lanes    = normed.ne[2];
-    ple_conv_advance_kernel<<<grid_for(static_cast<std::int64_t>(channels) * lanes), kBlock, 0,
-                              stream>>>(
+    // One block spans every lane for `tile` channels so the register snapshot sees the whole
+    // pre-update history, whatever slot permutation the lane table encodes.
+    const std::int32_t tile = std::max(1, kBlock / std::max(1, lanes));
+    const int grid          = static_cast<int>((channels + tile - 1) / tile);
+    ple_conv_advance_kernel<<<grid, tile * lanes, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(normed.data),
         valid_columns != nullptr ? static_cast<const std::int32_t*>(valid_columns->data) : nullptr,
         static_cast<__nv_bfloat16*>(states.data),
         static_cast<const std::int32_t*>(source_slots.data),
         static_cast<const std::int32_t*>(destination_slots.data), channels, normed.ne[1], lanes,
-        history);
+        tile, history);
     CUDA_CHECK(cudaGetLastError());
 }
 

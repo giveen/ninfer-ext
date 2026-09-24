@@ -141,7 +141,7 @@ int conv_case(std::int32_t width, std::int32_t lanes, std::uint32_t seed) {
     Tensor tn(dn.p, DType::BF16, {kChannels, width, lanes});
     Tensor tg(dg.p, DType::BF16, {kChannels, width, lanes});
     Tensor tr(dr.p, DType::BF16, {kChannels, width, lanes});
-    Tensor tw(dw.p, DType::BF16, {kTaps, kChannels});
+    Tensor tw(dw.p, DType::BF16, {kChannels, kTaps});
     Tensor ts(ds.p, DType::BF16, {kHistory * kChannels, kSlots});
     Tensor tsrc(dsrc.p, DType::I32, {lanes});
     Tensor tdst(ddst.p, DType::I32, {lanes});
