@@ -1376,7 +1376,7 @@ struct PressurePlanningSessionImpl {
         const std::int32_t rank = recency_rank_[owner_index];
         if (rank < 0) { return true; }
         return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
-               std::find(licence_spared_ranks_.begin(), licence_spared_ranks_.end(),
+               std::ranges::find(licence_spared_ranks_,
                          static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
     }
 

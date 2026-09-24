@@ -58,12 +58,12 @@ template <class Policy>
     ranked.reserve(owner_ids.size());
     for (const PlanningOwnerId owner : owner_ids) {
         const auto policy =
-            std::find_if(policies.begin(), policies.end(),
+            std::ranges::find_if(policies,
                          [owner](const Policy& candidate) { return candidate.owner == owner; });
         const std::uint64_t last_hit_epoch = policy == policies.end() ? 0U : policy->last_hit_epoch;
         ranked.push_back({last_hit_epoch, owner});
     }
-    std::stable_sort(ranked.begin(), ranked.end(),
+    std::ranges::stable_sort(ranked,
                      [](const auto& left, const auto& right) { return left.first > right.first; });
     std::vector<PlanningOwnerId> order;
     order.reserve(ranked.size());

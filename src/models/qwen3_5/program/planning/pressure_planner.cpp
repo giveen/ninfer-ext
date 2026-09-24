@@ -81,7 +81,7 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     // private and shared owners), so its index is the recency rank used to order the escape-hatch
     // sacrifice (the oldest ranked owner has the highest rank).
     for (std::size_t index = 0; index < owners.size(); ++index) {
-        const auto found = std::find(recency_order.begin(), recency_order.end(), owners[index].id);
+        const auto found = std::ranges::find(recency_order, owners[index].id);
         if (found != recency_order.end()) {
             recency_rank_[index] = static_cast<std::int32_t>(found - recency_order.begin());
             ++ranked_owner_count_;
@@ -515,7 +515,7 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     // than the plan requires.
     if (victim_options.preserve_choice == 0 &&
         owner_eviction_licensed(victim_options.owner_index) &&
-        std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
+        std::ranges::find(successors, eviction) == successors.end()) {
         successors.push_back(eviction);
     }
     return successors;
@@ -586,7 +586,7 @@ qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::recency_maximal_targe
         const std::int32_t rank = recency_rank_[victim.owner_index];
         const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
         const bool spared  = in_tail && rank >= 0 &&
-                            std::find(spared_ranks.begin(), spared_ranks.end(),
+                            std::ranges::find(spared_ranks,
                                       static_cast<std::uint32_t>(rank)) != spared_ranks.end();
         // Keeping an owner is a legal rung outcome: whether the sacrifice frees enough device and
         // host capacity is what the rung's adoption check decides, so a pool without a host tier

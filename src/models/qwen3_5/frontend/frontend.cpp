@@ -566,7 +566,7 @@ PreparedContextCache prepare_context_cache(
         grid_point     = *boundary;
         anchor_spacing = std::min<std::uint64_t>(anchor_spacing * 2U,
                                                  std::numeric_limits<std::uint32_t>::max());
-        if (std::any_of(out.opportunities.begin(), out.opportunities.end(),
+        if (std::ranges::any_of(out.opportunities,
                         [&](const auto& existing) { return existing.frontier == *boundary; })) {
             continue;
         }

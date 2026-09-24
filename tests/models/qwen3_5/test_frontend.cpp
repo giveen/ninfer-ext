@@ -1424,7 +1424,7 @@ int test_engine_automatic_long_anchor_opportunities() {
             }
         }
         // Synthesis visits the boundaries deepest first; compare as an ordered set.
-        std::sort(frontiers.begin(), frontiers.end());
+        std::ranges::sort(frontiers);
         return frontiers;
     };
 
@@ -1478,9 +1478,7 @@ int test_engine_automatic_long_anchor_opportunities() {
         const auto marked_prepared = frontend.prepare(std::move(marked));
         const auto& marked_data = FrontendFactory::inspect(marked_prepared);
         const auto marked_anchors = anchor_frontiers(marked_data);
-        const auto explicit_at = std::find_if(
-            marked_data.context_cache.opportunities.begin(),
-            marked_data.context_cache.opportunities.end(),
+        const auto explicit_at = std::ranges::find_if(marked_data.context_cache.opportunities,
             [&](const auto& opportunity) {
                 return opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
                        opportunity.frontier == anchors.front() &&
@@ -1544,7 +1542,7 @@ int test_engine_automatic_long_anchor_spacing() {
                 frontiers.push_back(opportunity.frontier);
             }
         }
-        std::sort(frontiers.begin(), frontiers.end());
+        std::ranges::sort(frontiers);
         return frontiers;
     };
 
@@ -1566,7 +1564,7 @@ int test_engine_automatic_long_anchor_spacing() {
         grid_point = *it;
         spacing *= 2U;
     }
-    std::sort(expected.begin(), expected.end());
+    std::ranges::sort(expected);
 
     const Frontend spaced_frontend = make(kSpacing);
     const auto spaced              = spaced_frontend.prepare(prompt());

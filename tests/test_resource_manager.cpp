@@ -1283,14 +1283,14 @@ FakePressurePlanningSession::FakePressurePlanningSession(
         owners_.push_back(Owner{
             .shared_handle = shared_owners[index], .id = shared_owner_ids[index], .shared = true});
     }
-    std::sort(owners_.begin(), owners_.end(),
+    std::ranges::sort(owners_,
               [](const Owner& left, const Owner& right) { return left.id.value < right.id.value; });
     recency_rank_.assign(owners_.size(), -1);
     // `recency_order` is most-recent-first (like the real
     // rank_owners_by_recency), so its index is the recency rank (0 = most recent) that
     // orders the ladder sacrifice.
     for (std::size_t index = 0; index < owners_.size(); ++index) {
-        const auto found = std::find(recency_order.begin(), recency_order.end(),
+        const auto found = std::ranges::find(recency_order,
                                      owners_[index].id);
         if (found != recency_order.end()) {
             recency_rank_[index] =
@@ -1470,7 +1470,7 @@ bool FakePressurePlanningSession::owner_eviction_licensed(std::uint32_t owner_in
     const std::int32_t rank = recency_rank_[owner_index];
     if (rank < 0) { return true; }
     return static_cast<std::uint32_t>(rank) >= ranked_owner_count_ - eviction_licence_count_ &&
-           std::find(licence_spared_ranks_.begin(), licence_spared_ranks_.end(),
+           std::ranges::find(licence_spared_ranks_,
                      static_cast<std::uint32_t>(rank)) == licence_spared_ranks_.end();
 }
 
@@ -1483,8 +1483,7 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
         sacrifice_oldest < ranked_owner_count_ ? ranked_owner_count_ - sacrifice_oldest : 0;
     // `sacrifice_oldest` on the target records how many ranked owners the rung actually gives up
     // (the requested tail less the spared ranks), which is what ladder-feasibility mode tests.
-    const auto spared_in_tail = static_cast<std::uint32_t>(std::count_if(
-        spared_ranks.begin(), spared_ranks.end(),
+    const auto spared_in_tail = static_cast<std::uint32_t>(std::ranges::count_if(spared_ranks,
         [&](std::uint32_t rank) { return rank >= demote_count && rank < ranked_owner_count_; }));
     Target rung{
         .candidate_index  = selected,
@@ -1502,7 +1501,7 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
         // decides.
         const bool in_tail = rank < 0 || static_cast<std::uint32_t>(rank) >= demote_count;
         const bool spared  = in_tail && rank >= 0 &&
-                            std::find(spared_ranks.begin(), spared_ranks.end(),
+                            std::ranges::find(spared_ranks,
                                       static_cast<std::uint32_t>(rank)) != spared_ranks.end();
         // A spared owner stays at the baseline here. (The real session demotes it with the other
         // kept owners; this fake's expansion ignores the eviction licence, so a costlier spared
@@ -1518,8 +1517,7 @@ FakePressureTargetHandle FakePressurePlanningSession::recency_maximal_target(
         }
         rung.choices[index] = choice;
     }
-    auto found = std::find_if(
-        targets_.begin(), targets_.end(),
+    auto found = std::ranges::find_if(targets_,
         [&](const Target& target) { return same_target(target, rung) &&
                                          target.sacrifice_oldest == rung.sacrifice_oldest; });
     if (found != targets_.end()) {
@@ -3055,7 +3053,7 @@ void test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest() {
     (void)manager.reserve_materialization(program, std::move(*inspection.choice),
                                           FakePreparedPrompt{154}, {});
     const auto evicted = [&program](const ActiveRequest& request) {
-        return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+        return std::ranges::find(program.started_action_ids,
                          2000U + request.sequence.id) != program.started_action_ids.end();
     };
     require(evicted(a) && !evicted(b) && !evicted(c),
@@ -3087,7 +3085,7 @@ void test_escape_hatch_clears_all_when_nothing_fits() {
     (void)manager.reserve_materialization(program, std::move(*inspection.choice),
                                           FakePreparedPrompt{154}, {});
     const auto evicted = [&program](const ActiveRequest& request) {
-        return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+        return std::ranges::find(program.started_action_ids,
                          2000U + request.sequence.id) != program.started_action_ids.end();
     };
     require(evicted(a) && evicted(b) && evicted(c), "terminal clear-all did not evict every owner");
@@ -3204,8 +3202,7 @@ void test_preserved_prefix_ladder_targets_fit_the_committed_target_budget() {
     // keeps the most-recent preserved prefix (handle id 1) on host; the pressure search must
     // preserve that disposition when it stops on capacity.
     const auto evicted = [&result](std::uint32_t handle_id) {
-        return std::any_of(result->plan->private_actions.begin(),
-                           result->plan->private_actions.end(),
+        return std::ranges::any_of(result->plan->private_actions,
                            [&](const auto& action) { return action.id == 2000U + handle_id; });
     };
     require(evicted(4) && !evicted(1),
@@ -4125,11 +4122,11 @@ void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
         (void)manager.reserve_materialization(program, std::move(*inspection.choice),
                                               FakePreparedPrompt{164}, {});
         const auto private_evicted = [&program](const ActiveRequest& request) {
-            return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+            return std::ranges::find(program.started_action_ids,
                              2000U + request.sequence.id) != program.started_action_ids.end();
         };
         const bool shared_evicted =
-            std::any_of(program.started_action_ids.begin(), program.started_action_ids.end(),
+            std::ranges::any_of(program.started_action_ids,
                         [](std::uint64_t id) { return id >= 4000U && id < 5000U; });
         return std::array<bool, 4>{shared_evicted, private_evicted(a), private_evicted(b),
                                    private_evicted(c)};

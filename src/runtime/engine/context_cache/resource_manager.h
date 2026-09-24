@@ -603,7 +603,7 @@ public:
             // publishes into its slot has planned, so a capture that cannot proceed costs nothing.
             std::optional<std::uint32_t> reclaim_slot;
             if (!declared_credit &&
-                std::none_of(shared_catalog_.begin(), shared_catalog_.end(),
+                std::ranges::none_of(shared_catalog_,
                              [](const SharedCatalogEntry& entry) {
                                  return entry.state == SharedCatalogState::Vacant;
                              })) {
@@ -2653,7 +2653,7 @@ private:
             frontiers.push_back(candidate.frontier);
         }
         frontiers.push_back(new_frontier);
-        std::sort(frontiers.begin(), frontiers.end());
+        std::ranges::sort(frontiers);
 
         std::optional<CheckpointRef> selected;
         std::uint64_t selected_loss = std::numeric_limits<std::uint64_t>::max();
