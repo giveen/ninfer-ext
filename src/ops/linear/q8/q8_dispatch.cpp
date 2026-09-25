@@ -19,13 +19,9 @@ constexpr ShapeEntry shape(ShapeSelector select) {
     return {Geometry::kOutputRows, Geometry::kInputRows, select};
 }
 
-// A shape whose K is padded (padded_columns != k) is not served correctly by the tiled MMA
-// route's scale-cache schedule. Route it through the SIMT gemm, which the shape's conformance
-// already covers, instead of the K-padded MMA path.
-Q8Launch select_q8_qwen4_exp_padded(std::int32_t) { return launch_q8_simt_r8_c8; }
-
 constexpr std::array kShapes{
-    shape<Q8N1024K2048>(select_q8_n1024_k2048),    shape<Q8N1024K5120>(select_q8_n1024_k5120),
+    shape<Q8N1024K2048>(select_q8_n1024_k2048),
+    shape<Q8N1024K5120>(select_q8_n1024_k5120),
     shape<Q8N2048K4096>(select_q8_n2048_k4096),
     shape<Q8N2048K4608>(select_q8_n2048_k4608),
     shape<Q8N2048K16384>(select_q8_n2048_k16384),
@@ -48,10 +44,10 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 6144, select_q8_qwen4_exp},
     ShapeEntry{16384, 2560, select_q8_qwen4_exp},
     ShapeEntry{1280, 2560, select_q8_qwen4_exp},
-    ShapeEntry{2560, 640, select_q8_qwen4_exp_padded},
+    ShapeEntry{2560, 640, select_q8_qwen4_exp},
     ShapeEntry{324, 10240, select_q8_qwen4_exp},
     ShapeEntry{320, 10240, select_q8_qwen4_exp},
-    ShapeEntry{10240, 320, select_q8_qwen4_exp_padded},
+    ShapeEntry{10240, 320, select_q8_qwen4_exp},
     ShapeEntry{12800, 2560, select_q8_qwen4_exp},
     ShapeEntry{2560, 2560, select_q8_qwen4_exp},
     ShapeEntry{2560, 4608, select_q8_qwen4_exp},
