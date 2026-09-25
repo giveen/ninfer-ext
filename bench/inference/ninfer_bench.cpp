@@ -162,7 +162,6 @@ int main(int argc, char** argv) {
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
-        env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
@@ -182,6 +181,7 @@ int main(int argc, char** argv) {
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
+        env.prefill_chunk = env.memory.prefill_chunk;
 
         prime_decode_graph(engine, env, corpus);
 

@@ -23,7 +23,6 @@ inline constexpr int kDefaultNPrompt                  = 512;
 inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
@@ -60,8 +59,8 @@ struct BenchOptions {
     int repetitions = kDefaultRepetitions;
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    std::optional<std::uint32_t> prefill_chunk; // empty: model default
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     int device            = 0;
     bool use_cuda_graph   = true;
@@ -102,7 +101,7 @@ struct BenchEnvironment {
     MemorySummary memory;
 
     std::uint32_t max_context   = 0;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk = 0; // resolved by the Engine
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;

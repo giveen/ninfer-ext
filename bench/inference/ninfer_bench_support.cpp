@@ -297,7 +297,7 @@ std::string usage_text(std::string_view program) {
         << ")\n"
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
-        << " (default: " << kDefaultPrefillChunk << ")\n"
+        << " (default: model; 4096 for Qwen4Exp, else 1024)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"
@@ -387,7 +387,7 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
-    if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
+    if (options.prefill_chunk && *options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     product::resolve_speculative_cli_options(options.speculative);

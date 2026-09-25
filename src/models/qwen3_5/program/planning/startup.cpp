@@ -955,6 +955,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
+std::uint32_t resolved_prefill_chunk(const execution::Parameters& parameters,
+                                     const EngineOptions& options) {
+    if (options.prefill_chunk) { return *options.prefill_chunk; }
+    return parameters.model.config().text.qwen4() ? kQwen4PrefillChunk : kDefaultPrefillChunk;
+}
+
 void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
                              const EngineOptions& options) {
     if (!parameters.model.config().text.attention ||
@@ -973,7 +979,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.max_context > parameters.model.config().text.max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
+    if (const std::uint32_t chunk = resolved_prefill_chunk(parameters, options);
+        chunk == 0 || chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
@@ -1308,7 +1315,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk = std::min(resolved_prefill_chunk(parameters, options), options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
                           !options.speculative.fixed_draft,

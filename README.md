@@ -358,7 +358,8 @@ and either full or optimized proposal heads.
 
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, converted with `qwen3_8_flash_next_nvfp4`) runs Text,
 MTP, and Vision with its routed experts in pinned Host memory behind a device expert cache sized
-by `--expert-cache`; it needs about 128 GB of host RAM and supports `bf16`/`fp8` KV.
+by `--expert-cache`; it needs about 128 GB of host RAM and supports `bf16`/`fp8` KV. Its prefill
+streams each routed-expert layer once per chunk, so its prefill chunk defaults to 4,096 tokens.
 
 The product boundary remains intentionally small:
 

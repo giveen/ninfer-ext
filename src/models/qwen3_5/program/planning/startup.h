@@ -22,6 +22,11 @@ using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // Qwen4Exp calls with at least this many columns stream whole routed-expert layers.
 inline constexpr std::int32_t kQwen4StagedColumns = 256;
+// Default text-prefill chunks when EngineOptions leaves the chunk open. Every Qwen4Exp chunk of
+// at least kQwen4StagedColumns streams each host-resident expert layer once, so a longer chunk
+// divides that traffic; other models keep the shorter chunk.
+inline constexpr std::uint32_t kDefaultPrefillChunk = 1024;
+inline constexpr std::uint32_t kQwen4PrefillChunk   = 4096;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
