@@ -158,7 +158,7 @@ The runners also drive a stock upstream `ninfer-serve` (`--serve PATH`):
 - **Fixed modes.** On such a build, fixed MTP modes omit the flag, because that build always drafts
   exactly `--draft-tokens`.
 - **Adaptive mode.** `mtp_adaptive` is rejected on it.
-- **Request log.** Both upstream's schema-v21 log and this fork's v23 are accepted.
+- **Request log.** Both upstream's schema-v21 log and this fork's v24 are accepted.
 Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
 
 The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under

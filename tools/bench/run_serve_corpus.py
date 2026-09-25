@@ -84,9 +84,9 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 7
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-# v23 is this fork's request log. v21 is upstream NInfer's (bace20dc), accepted so stock builds run
-# under the same harness: v22-v23 only add fields this harness does not read.
-SERVER_LOG_SCHEMA_VERSIONS = (21, 23)
+# v24 is this fork's request log. v21 is upstream NInfer's (bace20dc), accepted so stock builds run
+# under the same harness: v22-v24 only add fields this harness does not read.
+SERVER_LOG_SCHEMA_VERSIONS = (21, 24)
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
