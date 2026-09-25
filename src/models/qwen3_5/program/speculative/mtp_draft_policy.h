@@ -35,15 +35,20 @@ std::vector<std::uint32_t> mtp_draft_ladder(std::uint32_t draft_window, bool ada
     return adaptive && host_resident_experts;
 }
 
-// Draft length a round uses whenever more than one request decodes together, and the length a
-// request starts on. Measured on the dense 27B graphs with mixed workloads, no longer draft raised
-// aggregate throughput at concurrency 2, 4 or 8: the wider verify costs more than the extra
-// accepted tokens repay, and one lane's rejections slow every other lane in the batch.
+// Draft length a request starts on, and the one a batch round uses before its cost is measured.
+// Which draft length a batch should use depends on the model, the batch size and the text: on the
+// decode-saturation suite K=5 beat K=3 by 14-17% at concurrency 2-8 on Qwen3.8-27B NVFP4, while
+// Qwen3.6-35B-A3B lost 13-15% at concurrency 2 and 4 with it. So only two rungs serve batches,
+// this one and the window, and the policy picks between them from startup-measured batch times.
 inline constexpr std::uint32_t kBatchDraft = 3;
 
-// Index of that rung on a ladder: the longest rung not above `kBatchDraft`, or the first. Only this
-// rung is ever replayed for more than one request, so only it needs graphs for every batch size.
+// Index of the default batch rung on a ladder: the longest rung not above `kBatchDraft`, or the
+// first. A new request starts on it.
 [[nodiscard]] std::size_t mtp_batch_rung(std::span<const std::uint32_t> ladder) noexcept;
+
+// Rungs replayed for more than one request, ascending: the default batch rung, plus the window
+// when it is longer. Only these need graphs for every batch size.
+[[nodiscard]] std::vector<std::size_t> mtp_batch_rungs(std::span<const std::uint32_t> ladder);
 
 // Per-lane estimate of how far a round's drafts get accepted. Position j is tested only when the
 // drafts before it were accepted, so its acceptance is a conditional probability. Counts decay each
@@ -78,11 +83,16 @@ public:
     // not above `kBatchDraft`.
     [[nodiscard]] std::size_t initial_rung() const noexcept { return batch_rung_; }
 
-    // The rung to run next for lanes with the given acceptance estimates. A single lane keeps its
-    // current rung unless another is predicted to be at least 2% faster; several lanes always run
-    // the initial rung.
+    // The rung to run next for lanes with the given acceptance estimates. A single lane chooses
+    // among every rung, several lanes among the batch rungs, by the tokens all lanes are expected
+    // to commit per second of the batch's measured round. The current rung is kept unless another
+    // is predicted to be at least 2% faster. Without measured times for a batch size, several
+    // lanes run the initial rung.
     [[nodiscard]] std::size_t select(std::size_t current,
                                      std::span<const MtpAcceptanceEstimate* const> lanes) const;
+
+    // The measured time of a round of `batch_size` (>= 2) requests on batch rung `rung`.
+    void set_batch_round_seconds(std::size_t rung, std::uint32_t batch_size, double seconds);
 
     // Refine round times from single-request rounds as they run. A model whose round cost the
     // startup replays cannot see (host-resident experts: repeated replays hit the expert cache,
@@ -104,6 +114,9 @@ private:
     std::vector<double> round_seconds_; // startup times
     std::vector<double> extra_;         // learned extra per rung, valid where observed_
     std::vector<bool> observed_;
+    std::vector<std::size_t> batch_rungs_;
+    // batch_seconds_[batch_size][rung]: measured batch round time, 0 where unmeasured.
+    std::vector<std::vector<double>> batch_seconds_;
     std::size_t batch_rung_ = 0;
     bool learning_          = false;
 };

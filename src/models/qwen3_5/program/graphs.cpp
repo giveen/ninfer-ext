@@ -369,14 +369,16 @@ void ProgramImpl::prepare_graphs() {
     std::vector<std::uint32_t> mtp_ladder;
     for (const MtpRung& rung : mtp_rungs) { mtp_ladder.push_back(rung.k); }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const std::size_t batch_rung = mtp_batch_rung(mtp_ladder);
+        const std::vector<std::size_t> batch_rungs = mtp_batch_rungs(mtp_ladder);
         for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
             MtpRung& rung         = mtp_rungs[rung_index];
             const std::uint32_t k = rung.k;
-            // Rounds with several requests always run the batch rung; the others serve one.
+            // Rounds with several requests run one of the batch rungs; the others serve one.
             // Plain batches never replay an MTP rung for more than one request.
+            const bool serves_batches =
+                std::ranges::find(batch_rungs, rung_index) != batch_rungs.end();
             const std::uint32_t batch_limit =
-                rung_index == batch_rung && !plain_mtp_batches ? max_concurrency : 1U;
+                serves_batches && !plain_mtp_batches ? max_concurrency : 1U;
             const auto planned_profiles     = mtp_graph_profiles(capacity, k);
             validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
             execution::MtpBatchContext mtp_state{execution_core(&rung.records),
@@ -480,34 +482,45 @@ void ProgramImpl::prepare_graphs() {
             // rather than assumed.
             constexpr int kWarmupReplays = 1;
             constexpr int kTimedReplays  = 8;
-            std::vector<double> seconds(mtp_rungs.size(), 0.0);
             cudaEvent_t begin = nullptr;
             cudaEvent_t end   = nullptr;
             CUDA_CHECK(cudaEventCreate(&begin));
             CUDA_CHECK(cudaEventCreate(&end));
-            for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
-                MtpRung& rung                 = mtp_rungs[rung_index];
-                DecodeGraphProfile& profile   = rung.graphs.profiles.front();
+            // Identical tokens would route every row of an MoE layer to the same experts and hide
+            // the cost of verifying a longer draft. Distinct ids spread the routing the way real
+            // text does.
+            const auto vocabulary = static_cast<std::uint64_t>(
+                dimension(parameters.model.resources().public_token_count));
+            const auto distinct_token = [&](std::uint64_t salt) {
+                return static_cast<TokenId>(1U + (salt * 2654435761ULL) % (vocabulary - 1U));
+            };
+            // Time the lowest-frontier graph of `batch_size` requests on a rung.
+            const auto time_round = [&](MtpRung& rung, std::uint32_t batch_size) {
+                const auto profile = std::ranges::find_if(
+                    rung.graphs.profiles, [&](const DecodeGraphProfile& candidate) {
+                        return candidate.batch_size == batch_size;
+                    });
+                if (profile == rung.graphs.profiles.end()) {
+                    throw std::logic_error("MTP timing graph is not captured");
+                }
                 DecodeGraphTopology& topology = *std::ranges::find_if(
                     rung.graphs.topologies, [&](const DecodeGraphTopology& candidate) {
-                        return candidate.topology_class == profile.topology_class;
+                        return candidate.topology_class == profile->topology_class;
                     });
-                if (topology.installed_profile != 0) {
-                    topology.executable.update(profile.definition);
-                    topology.installed_profile = 0;
+                const auto index =
+                    static_cast<std::size_t>(profile - rung.graphs.profiles.begin());
+                if (topology.installed_profile != index) {
+                    topology.executable.update(profile->definition);
+                    topology.installed_profile = index;
                 }
-                prepare_representative(profile.min_execution_frontier, 1, rung.k);
-                // Identical tokens would route every row of an MoE layer to the same experts and
-                // hide the cost of verifying a longer draft. Distinct ids spread the routing the
-                // way real text does.
-                const auto vocabulary = static_cast<std::uint64_t>(
-                    dimension(parameters.model.resources().public_token_count));
-                const auto distinct_token = [&](std::uint64_t salt) {
-                    return static_cast<TokenId>(1U + (salt * 2654435761ULL) % (vocabulary - 1U));
-                };
-                mtp_host_ingress->anchors[0] = distinct_token(0);
-                for (std::uint32_t j = 0; j < rung.k; ++j) {
-                    mtp_host_ingress->current_drafts[j] = distinct_token(j + 1U);
+                prepare_representative(profile->min_execution_frontier, batch_size, rung.k);
+                for (std::uint32_t row = 0; row < batch_size; ++row) {
+                    const std::uint64_t salt = static_cast<std::uint64_t>(row) * (rung.k + 1U);
+                    mtp_host_ingress->anchors[row] = distinct_token(salt);
+                    for (std::uint32_t j = 0; j < rung.k; ++j) {
+                        mtp_host_ingress->current_drafts[row * rung.k + j] =
+                            distinct_token(salt + j + 1U);
+                    }
                 }
                 device.synchronize();
                 for (int i = 0; i < kWarmupReplays; ++i) {
@@ -521,15 +534,30 @@ void ProgramImpl::prepare_graphs() {
                 CUDA_CHECK(cudaEventSynchronize(end));
                 float milliseconds = 0.0F;
                 CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
-                seconds[rung_index] = static_cast<double>(milliseconds) * 1e-3 / kTimedReplays;
+                return static_cast<double>(milliseconds) * 1e-3 / kTimedReplays;
+            };
+            std::vector<double> seconds(mtp_rungs.size(), 0.0);
+            for (std::size_t rung_index = 0; rung_index < mtp_rungs.size(); ++rung_index) {
+                seconds[rung_index] = time_round(mtp_rungs[rung_index], 1);
             }
-            CUDA_CHECK(cudaEventDestroy(begin));
-            CUDA_CHECK(cudaEventDestroy(end));
             // A longer draft never makes a round cheaper; a smaller reading is measurement noise.
             for (std::size_t rung_index = 1; rung_index < seconds.size(); ++rung_index) {
                 seconds[rung_index] = std::max(seconds[rung_index], seconds[rung_index - 1]);
             }
-            mtp_policy     = MtpDraftPolicy(mtp_ladder, std::move(seconds));
+            mtp_policy = MtpDraftPolicy(mtp_ladder, std::move(seconds));
+            if (!plain_mtp_batches) {
+                // A batch picks between its rungs from what each costs at that batch size.
+                const std::vector<std::size_t> batch_rungs = mtp_batch_rungs(mtp_ladder);
+                for (std::uint32_t batch_size = 2; batch_size <= max_concurrency; ++batch_size) {
+                    double shorter = 0.0;
+                    for (const std::size_t rung_index : batch_rungs) {
+                        shorter = std::max(shorter, time_round(mtp_rungs[rung_index], batch_size));
+                        mtp_policy.set_batch_round_seconds(rung_index, batch_size, shorter);
+                    }
+                }
+            }
+            CUDA_CHECK(cudaEventDestroy(begin));
+            CUDA_CHECK(cudaEventDestroy(end));
             mtp_round_rung = mtp_policy.initial_rung();
             // Timed replays reuse one set of tokens, so after the warmup every routed expert is
             // cached and a longer draft's verify misses never show; learn from real rounds.

@@ -1223,10 +1223,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             // Every draft length on the ladder is its own graph family with its own topology
-            // classes. The batch rung serves every batch size; the others only a single request.
+            // classes. The batch rungs serve every batch size; the others only a single request.
             const std::vector<std::uint32_t> ladder =
                 mtp_draft_ladder(impl->draft_window, impl->adaptive_draft);
-            const std::size_t batch_rung = mtp_batch_rung(ladder);
+            const std::vector<std::size_t> batch_rungs = mtp_batch_rungs(ladder);
             // Plain batches replay ordinary graphs for two or more requests instead.
             std::size_t allowance =
                 impl->plain_mtp_batches
@@ -1248,7 +1248,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                         return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                                     },
                                     "MTP graph allowance"),
-                                rung == batch_rung && !impl->plain_mtp_batches
+                                std::ranges::find(batch_rungs, rung) != batch_rungs.end() &&
+                                        !impl->plain_mtp_batches
                                     ? impl->max_concurrency
                                     : 1U,
                                 "MTP exact-b graph allowance"),

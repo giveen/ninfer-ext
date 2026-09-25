@@ -27,6 +27,12 @@ std::size_t mtp_batch_rung(std::span<const std::uint32_t> ladder) noexcept {
     return rung;
 }
 
+std::vector<std::size_t> mtp_batch_rungs(std::span<const std::uint32_t> ladder) {
+    std::vector<std::size_t> rungs{mtp_batch_rung(ladder)};
+    if (!ladder.empty() && rungs.front() + 1U < ladder.size()) { rungs.push_back(ladder.size() - 1U); }
+    return rungs;
+}
+
 std::vector<std::uint32_t> mtp_draft_ladder(std::uint32_t draft_window, bool adaptive) {
     if (draft_window == 0 || draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("MTP draft window is outside the supported domain");
@@ -93,9 +99,21 @@ MtpDraftPolicy::MtpDraftPolicy(std::vector<std::uint32_t> ladder, std::vector<do
         std::ranges::any_of(round_seconds_, [](double seconds) { return !(seconds > 0.0); })) {
         throw std::invalid_argument("MTP round times must be positive for every rung");
     }
-    batch_rung_ = mtp_batch_rung(ladder_);
+    batch_rung_  = mtp_batch_rung(ladder_);
+    batch_rungs_ = mtp_batch_rungs(ladder_);
     extra_.assign(ladder_.size(), 0.0);
     observed_.assign(ladder_.size(), false);
+}
+
+void MtpDraftPolicy::set_batch_round_seconds(std::size_t rung, std::uint32_t batch_size,
+                                             double seconds) {
+    if (std::ranges::find(batch_rungs_, rung) == batch_rungs_.end() || batch_size < 2 ||
+        batch_size > kMaximumConcurrency || !(seconds > 0.0)) {
+        throw std::invalid_argument("MTP batch round time is outside its domain");
+    }
+    if (batch_seconds_.size() <= batch_size) { batch_seconds_.resize(batch_size + 1U); }
+    batch_seconds_[batch_size].resize(ladder_.size(), 0.0);
+    batch_seconds_[batch_size][rung] = seconds;
 }
 
 void MtpDraftPolicy::observe_round(std::size_t rung, double seconds) {
@@ -128,15 +146,45 @@ std::size_t MtpDraftPolicy::select(std::size_t current,
     if (current >= ladder_.size() || lanes.empty()) {
         throw std::invalid_argument("MTP draft policy selection is outside its domain");
     }
-    if (ladder_.size() == 1 || lanes.size() > 1) { return batch_rung_; }
+    if (ladder_.size() == 1) { return batch_rung_; }
+    if (lanes.size() == 1) {
+        const auto rate = [&](std::size_t rung) {
+            return lanes.front()->expected_tokens(ladder_[rung]) / round_seconds(rung);
+        };
+        std::size_t best    = current;
+        double best_rate    = rate(current);
+        const double margin = best_rate * kSwitchMargin;
+        for (std::size_t rung = 0; rung < ladder_.size(); ++rung) {
+            if (rung == current) { continue; }
+            const double candidate = rate(rung);
+            if (candidate > margin && candidate > best_rate) {
+                best      = rung;
+                best_rate = candidate;
+            }
+        }
+        return best;
+    }
+
+    // Every lane commits its own accepted prefix, so a batch round's yield is the lanes' summed
+    // expectation; its cost is the measured round of this batch size.
+    const std::size_t batch = lanes.size();
+    if (batch >= batch_seconds_.size() || batch_seconds_[batch].empty()) { return batch_rung_; }
+    const std::vector<double>& seconds = batch_seconds_[batch];
     const auto rate = [&](std::size_t rung) {
-        return lanes.front()->expected_tokens(ladder_[rung]) / round_seconds(rung);
+        double tokens = 0.0;
+        for (const MtpAcceptanceEstimate* lane : lanes) {
+            tokens += lane->expected_tokens(ladder_[rung]);
+        }
+        return tokens / seconds[rung];
     };
-    std::size_t best    = current;
-    double best_rate    = rate(current);
-    const double margin = best_rate * kSwitchMargin;
-    for (std::size_t rung = 0; rung < ladder_.size(); ++rung) {
-        if (rung == current) { continue; }
+    const bool current_serves_batch = std::ranges::find(batch_rungs_, current) != batch_rungs_.end() &&
+                                      seconds[current] > 0.0;
+    std::size_t best = current_serves_batch ? current : batch_rung_;
+    if (!(seconds[best] > 0.0)) { return batch_rung_; }
+    double best_rate    = rate(best);
+    const double margin = current_serves_batch ? best_rate * kSwitchMargin : best_rate;
+    for (const std::size_t rung : batch_rungs_) {
+        if (rung == best || !(seconds[rung] > 0.0)) { continue; }
         const double candidate = rate(rung);
         if (candidate > margin && candidate > best_rate) {
             best      = rung;

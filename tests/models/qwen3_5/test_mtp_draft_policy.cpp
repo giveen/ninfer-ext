@@ -119,8 +119,44 @@ void test_policy_selection() {
     expect(select(0, {&mid}) == 1 && select(3, {&mid}) == 1,
            "acceptance ending at three picks K=3");
 
-    // Several lanes always run the batch rung, whatever their acceptance.
-    expect(select(3, {&high, &high}) == 1 && select(0, {&low, &low, &low}) == 1, "batches run K=3");
+    // Without measured batch times, several lanes run the default batch rung.
+    expect(select(3, {&high, &high}) == 1 && select(0, {&low, &low, &low}) == 1,
+           "unmeasured batches run K=3");
+}
+
+void test_batch_selection() {
+    expect(q36::mtp_batch_rungs(Ladder({2, 3, 4, 7})) == std::vector<std::size_t>({1, 3}),
+           "the window joins K=3 as a batch rung");
+    expect(q36::mtp_batch_rungs(Ladder({2, 3})) == std::vector<std::size_t>({1}),
+           "a window of K=3 is the only batch rung");
+    expect(q36::mtp_batch_rungs(Ladder({7})) == std::vector<std::size_t>({0}),
+           "a fixed window is its own batch rung");
+
+    // Batch of two on the ladder {2, 3, 4, 5}: K=5 costs 20% more than K=3.
+    q36::MtpDraftPolicy policy(Ladder({2, 3, 4, 5}), {0.016, 0.018, 0.020, 0.022});
+    policy.set_batch_round_seconds(1, 2, 0.020);
+    policy.set_batch_round_seconds(3, 2, 0.024);
+    const q36::MtpAcceptanceEstimate high = lane(5, 5);
+    const q36::MtpAcceptanceEstimate low  = lane(5, 0);
+    const q36::MtpAcceptanceEstimate mid  = lane(5, 2);
+    const auto select = [&](std::size_t current, std::vector<const q36::MtpAcceptanceEstimate*> l) {
+        return policy.select(current, l);
+    };
+    expect(select(1, {&high, &high}) == 3, "predictable lanes batch on the window");
+    expect(select(3, {&low, &low}) == 1, "unpredictable lanes batch on K=3");
+    expect(select(1, {&mid, &mid}) == 1, "acceptance ending at two keeps K=3");
+    // One lane that rejects everything costs the other the extra draft's width, not its tokens:
+    // the yield is summed per lane.
+    expect(select(1, {&high, &low}) == 3, "a straggler does not veto a predictable lane");
+    // A lane coming from a single-request rung joins the best batch rung, never its own.
+    expect(select(0, {&high, &high}) == 3 && select(2, {&low, &low}) == 1,
+           "a non-batch rung moves to a batch rung");
+    // A batch size without measurements keeps the default.
+    expect(select(3, {&high, &high, &high}) == 1, "unmeasured batch size runs K=3");
+    expect(throws([&] { policy.set_batch_round_seconds(2, 2, 0.02); }),
+           "only batch rungs take batch times");
+    expect(throws([&] { policy.set_batch_round_seconds(1, 1, 0.02); }),
+           "a batch has at least two requests");
 }
 
 void test_hysteresis() {
@@ -216,6 +252,7 @@ int main() {
     test_ladder();
     test_estimate();
     test_policy_selection();
+    test_batch_selection();
     test_hysteresis();
     test_round_learning();
     test_policy_validation();
