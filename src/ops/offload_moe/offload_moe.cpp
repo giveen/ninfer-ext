@@ -56,6 +56,39 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
     return out;
 }
 
+struct A4Layout {
+    std::size_t input_codes, input_scales, counts, offsets, rank, packed_token, packed_index,
+        job_experts, job_columns, job_count, middle_codes, middle_scales, grouped, total;
+};
+
+A4Layout a4_layout(std::int32_t columns) {
+    const std::size_t tokens      = static_cast<std::size_t>(columns);
+    const std::size_t assignments = tokens * kOffloadMoeTopK;
+    const auto jobs               = static_cast<std::size_t>(detail::a4_max_jobs(columns));
+    A4Layout out{};
+    std::size_t cursor = 0;
+    auto take          = [&](std::size_t bytes) {
+        const std::size_t at = cursor;
+        cursor += align(bytes);
+        return at;
+    };
+    out.input_codes   = take(tokens * kOffloadMoeHidden / 2);
+    out.input_scales  = take(tokens * kOffloadMoeHidden / 16);
+    out.counts        = take(static_cast<std::size_t>(kOffloadMoeExperts) * 4);
+    out.offsets       = take(static_cast<std::size_t>(kOffloadMoeExperts + 1) * 4);
+    out.rank          = take(assignments * 4);
+    out.packed_token  = take(assignments * 4);
+    out.packed_index  = take(assignments * 4);
+    out.job_experts   = take(jobs * 4);
+    out.job_columns   = take(jobs * 4);
+    out.job_count     = take(4);
+    out.middle_codes  = take(assignments * kOffloadMoeIntermediate / 2);
+    out.middle_scales = take(assignments * kOffloadMoeIntermediate / 16);
+    out.grouped       = take(assignments * kOffloadMoeHidden * 2);
+    out.total         = cursor;
+    return out;
+}
+
 } // namespace
 
 std::size_t moe_route_workspace_bytes(std::int32_t tokens) {
@@ -177,6 +210,69 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         c.act           = reinterpret_cast<__nv_bfloat16*>(base + layout.act);
         c.partial       = reinterpret_cast<float*>(base + layout.partial);
         detail::moe_experts_chunk_launch(c, stream);
+    }
+}
+
+std::size_t moe_experts_a4_workspace_bytes(std::int32_t tokens) {
+    if (tokens <= 0) { throw std::invalid_argument("moe_experts_a4_workspace_bytes: T <= 0"); }
+    return a4_layout(std::min(tokens, kChunkColumns)).total + 256;
+}
+
+void moe_experts_a4(const Tensor& x, const Tensor& expert_ids, const Tensor& weights,
+                    const Tensor& shared_gate, const Tensor& shared, const ExpertWeights& staged,
+                    WorkspaceArena& workspace, Tensor& y, cudaStream_t stream) {
+    constexpr const char* op = "moe_experts_a4";
+    require_dense(x, DType::BF16, op, "x");
+    const std::int32_t columns = x.ne[1];
+    require(x.ne[0] == kOffloadMoeHidden, op, "x must be [2560,T]");
+    require_routed(expert_ids, DType::I32, columns, op, "expert ids");
+    require_routed(weights, DType::FP32, columns, op, "weights");
+    require_dense(shared_gate, DType::FP32, op, "shared gate");
+    require(shared_gate.numel() == columns, op, "shared gate must be [T]");
+    require_dense(shared, DType::BF16, op, "shared");
+    require_dense(y, DType::BF16, op, "y");
+    require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
+    require(staged.stride[0] == kExpertGateUpCodeBytes &&
+                staged.stride[1] == kExpertGateUpScaleBytes &&
+                staged.stride[2] == kExpertDownCodeBytes &&
+                staged.stride[3] == kExpertDownScaleBytes,
+            op, "the staged bank must use the plane layout");
+    require(staged.gate_up_divisors != nullptr && staged.down_divisors != nullptr &&
+                staged.gate_up_divisor_rows == kOffloadMoeIntermediate &&
+                staged.down_divisor_rows == kOffloadMoeHidden,
+            op, "one weight divisor per expert gate, up and down is required");
+    require(staged.gate_up_input_divisor > 0.0F && staged.down_input_divisor > 0.0F, op,
+            "A4 activation divisors must be positive");
+    const std::int32_t chunk = std::min(columns, kChunkColumns);
+    const A4Layout layout    = a4_layout(chunk);
+    auto scope               = workspace.scope();
+    auto* base               = static_cast<std::byte*>(workspace.alloc_bytes(layout.total).data);
+    for (std::int32_t begin = 0; begin < columns; begin += chunk) {
+        const std::int64_t k0 = static_cast<std::int64_t>(begin) * kOffloadMoeTopK;
+        const std::int64_t h0 = static_cast<std::int64_t>(begin) * kOffloadMoeHidden;
+        detail::MoeA4Chunk c{};
+        c.x             = static_cast<const __nv_bfloat16*>(x.data) + h0;
+        c.expert_ids    = static_cast<const std::int32_t*>(expert_ids.data) + k0;
+        c.weights       = static_cast<const float*>(weights.data) + k0;
+        c.shared_gate   = static_cast<const float*>(shared_gate.data) + begin;
+        c.shared        = static_cast<const __nv_bfloat16*>(shared.data) + h0;
+        c.y             = static_cast<__nv_bfloat16*>(y.data) + h0;
+        c.columns       = std::min(chunk, columns - begin);
+        c.source        = staged;
+        c.input_codes   = reinterpret_cast<std::uint8_t*>(base + layout.input_codes);
+        c.input_scales  = reinterpret_cast<std::uint8_t*>(base + layout.input_scales);
+        c.counts        = reinterpret_cast<std::int32_t*>(base + layout.counts);
+        c.offsets       = reinterpret_cast<std::int32_t*>(base + layout.offsets);
+        c.rank          = reinterpret_cast<std::int32_t*>(base + layout.rank);
+        c.packed_token  = reinterpret_cast<std::int32_t*>(base + layout.packed_token);
+        c.packed_index  = reinterpret_cast<std::int32_t*>(base + layout.packed_index);
+        c.job_experts   = reinterpret_cast<std::int32_t*>(base + layout.job_experts);
+        c.job_columns   = reinterpret_cast<std::int32_t*>(base + layout.job_columns);
+        c.job_count     = reinterpret_cast<std::int32_t*>(base + layout.job_count);
+        c.middle_codes  = reinterpret_cast<std::uint8_t*>(base + layout.middle_codes);
+        c.middle_scales = reinterpret_cast<std::uint8_t*>(base + layout.middle_scales);
+        c.grouped       = reinterpret_cast<__nv_bfloat16*>(base + layout.grouped);
+        detail::moe_experts_a4_launch(c, stream);
     }
 }
 
