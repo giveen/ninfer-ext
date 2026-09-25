@@ -28,7 +28,8 @@ official artifacts, and the OpenAI- and Anthropic-compatible serving. The fork t
 
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) has about 180B parameters. About 121B of them are 512
 routed experts per layer, and 51B are an n-gram embedding table. Neither fits in 32 GB, and upstream
-NInfer does not implement the architecture.
+NInfer does not implement the architecture. Stock `bace20dc` rejects the artifact at load with
+`tensor: unknown member divisors`.
 
 ninfer-ext runs it through the same Engine, CLI, and HTTP server as every other model:
 
@@ -177,12 +178,17 @@ with 15 (7% accepted), against 393.3 without speculation.
 - **Serve tables.** `ninfer-serve --max-context 4096 --max-concurrency 8 --kv-capacity auto`, BF16
   KV. The load is `temperature=0` with thinking off: one warm-up wave, then one measured wave of C
   concurrent 512-token essays on eight fixed topics.
-- **Not measured.** DFlash2 and the Qwen3.6-27B artifacts; their weights are not on the benchmark
-  machine.
+- **Not yet measured.** DFlash2 on Qwen3.8-27B (an artifact with the companion weights still has to
+  be converted) and the Qwen3.6-27B artifacts.
 - **Raw reports.** The JSON reports are kept locally under `profiles/bench/readme_20260925/`.
 
 Upstream's published results use its own methodology and artifacts. They are in the
 [performance index](docs/performance.md).
+
+To measure this fork against a stock upstream build on the same artifacts and workload, point
+`tools/bench/run_serve_concurrency.py --serve` at each build's `ninfer-serve`, then pair the runs
+with `tools/bench/compare_serve_concurrency.py`
+([serving benchmarks](tools/bench/README.md#concurrent-serving-benchmark)).
 
 ### Adaptive MTP draft length
 

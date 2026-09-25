@@ -93,7 +93,7 @@ python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
   --recipe qwen3_8_27b_q6 \
   --components text,vision,mtp \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --proposal \
   --name qwen3.8-27b-q6 \
   --out models/qwen3_8_27b_q6.ninfer
