@@ -27,7 +27,7 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 inline constexpr std::int32_t kQwen4StagedColumns = 103;
 // Default text-prefill chunks when EngineOptions leaves them open. A prefill step runs the idle
 // width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
-// chunk lifts prefill 4-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
+// chunk lifts prefill 2-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
 // decode round waiting behind one chunk stalls ~3.4x longer. Every Qwen4Exp chunk of at least
 // kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps one wide
 // chunk that divides that traffic.
@@ -170,6 +170,9 @@ namespace ninfer::models::qwen3_5::detail {
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options);
+[[nodiscard]] std::vector<std::uint32_t>
+idle_prefill_chunk_candidates_impl(const execution::Parameters& parameters,
+                                   const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

@@ -464,6 +464,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    logger_->info("prefill | chunk {} beside decode, {} idle", memory.prefill_chunk,
+                  memory.idle_prefill_chunk);
 
     if (cache.enabled) {
         // Every capacity here is a resolved value: the Host tier is read back from the Program and

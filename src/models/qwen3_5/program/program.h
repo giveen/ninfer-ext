@@ -1168,6 +1168,13 @@ struct RuntimeContractAccess {
                                                     DeviceContext& device,
                                                     const EngineOptions& options);
 
+// Idle prefill widths to try, widest first, when EngineOptions leaves both prefill widths to the
+// model default: startup takes the widest whose runtime reservation fits. Empty when the widths
+// are explicit or fixed by the model, so the options are planned as given.
+[[nodiscard]] std::vector<std::uint32_t>
+idle_prefill_chunk_candidates(const execution::Parameters& parameters,
+                              const EngineOptions& options);
+
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);

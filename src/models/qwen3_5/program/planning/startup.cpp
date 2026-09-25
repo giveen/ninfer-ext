@@ -1346,6 +1346,21 @@ void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private
     cache.host_kv_capacity_bytes            = static_cast<std::size_t>(budget - state_bytes);
 }
 
+std::vector<std::uint32_t> idle_prefill_chunk_candidates_impl(const execution::Parameters& parameters,
+                                                              const EngineOptions& options) {
+    if (options.prefill_chunk || options.idle_prefill_chunk ||
+        parameters.model.config().text.qwen4()) {
+        return {};
+    }
+    // Halving keeps every candidate a multiple of the chunk; the chunk itself is the last resort.
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t width = kDefaultIdlePrefillChunk; width >= kDefaultPrefillChunk;
+         width /= 2U) {
+        out.push_back(width);
+    }
+    return out;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {

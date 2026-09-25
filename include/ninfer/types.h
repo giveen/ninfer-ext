@@ -211,7 +211,8 @@ struct EngineOptions {
     // whole expert layer once, so fewer chunks move fewer bytes) and 1024 otherwise.
     std::optional<std::uint32_t> prefill_chunk;
     // Width a prefill step takes when no decode work is waiting, a multiple of prefill_chunk.
-    // Empty selects prefill_chunk when prefill_chunk is set, else the model's default: 4096.
+    // Empty selects prefill_chunk when prefill_chunk is set, else the model's default: the widest
+    // of 4096, 2048 and 1024 whose workspace fits beside the requested KV capacity.
     std::optional<std::uint32_t> idle_prefill_chunk;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     ExpertCachePolicy expert_cache;

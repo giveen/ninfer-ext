@@ -529,6 +529,11 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
     return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
 }
 
+std::vector<std::uint32_t> idle_prefill_chunk_candidates(const execution::Parameters& parameters,
+                                                         const EngineOptions& options) {
+    return detail::idle_prefill_chunk_candidates_impl(parameters, options);
+}
+
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {

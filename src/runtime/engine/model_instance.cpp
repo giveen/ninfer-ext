@@ -182,10 +182,27 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
+    // A default idle prefill width shrinks until its workspace fits beside the requested KV; the
+    // narrowest candidate is the ordinary chunk, whose failure reports the real shortfall.
+    EngineOptions planned = options;
+    const std::vector<std::uint32_t> idle_widths =
+        models::qwen3_5::idle_prefill_chunk_candidates(instance->parameters, options);
+    const std::size_t free_bytes = current_free_device_bytes();
+    std::optional<models::qwen3_5::SequencePlanner> planner;
+    KvCapacityResolution resolution;
+    for (std::size_t i = 0;; ++i) {
+        if (!idle_widths.empty()) { planned.idle_prefill_chunk = idle_widths[i]; }
+        planner.emplace(
+            models::qwen3_5::make_sequence_planner(instance->parameters, device, planned));
+        try {
+            resolution =
+                resolve_kv_capacity(planned.kv_capacity, planner->capacity_curve(), free_bytes);
+            break;
+        } catch (const std::invalid_argument&) {
+            if (i + 1 >= idle_widths.size()) { throw; }
+        }
+    }
+    auto sequence = std::move(*planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
@@ -195,7 +212,7 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     // Publishing that shape to the options the Engine keeps — and to the frontend grid built
     // before the plan existed — keeps the reported options, the ResourceManager and the Program
     // on the same capacity instead of a silently divergent default.
-    EngineOptions resolved = options;
+    EngineOptions resolved = planned;
     resolved.context_cache = sequence.context_cache_options();
     instance->frontend.publish_long_anchor_limit(
         resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
