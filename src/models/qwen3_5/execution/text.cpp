@@ -879,6 +879,41 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
+void TextContext::mtp_append_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                          const Tensor& cache_positions,
+                                          const Tensor& rope_positions,
+                                          const Tensor& kv_table_rows,
+                                          ops::CausalAttentionExecutionEnvelope envelope) {
+    if (batch_mtp_kv_ == nullptr || qwen4_ == nullptr) {
+        throw std::runtime_error("MTP KV append requires the Qwen4Exp MTP cache");
+    }
+    const std::int32_t width = ids.ne[0];
+    const std::int32_t batch = ids.ne[1];
+    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
+        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("MTP KV append shape is outside the supported domain");
+    }
+    require_tensor_shape(ids, DType::I32, {width, batch}, "MTP KV append ids");
+    require_tensor_shape(hidden, DType::BF16, {continuation_width_, width, batch},
+                         "MTP KV append target hidden");
+    require_tensor_shape(cache_positions, DType::I32, {width, batch},
+                         "MTP KV append cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {width, batch},
+                         "MTP KV append RoPE positions");
+    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP KV append KV rows");
+
+    ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+    ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+    const Qwen4Sequence sequence{.cache_positions = &cache_positions,
+                                 .rope_positions  = &rope_positions,
+                                 .valid_columns   = nullptr,
+                                 .table_rows      = &kv_table_rows,
+                                 .width           = width,
+                                 .batch           = batch,
+                                 .max_visible     = envelope.max_visible_keys};
+    qwen4_mtp_append(ids, hidden, sequence);
+}
+
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {continuation_width_, batch},

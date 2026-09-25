@@ -276,7 +276,7 @@ void TextContext::qwen4_hc_mix(const HyperConnectionParameters& p, const Tensor&
 }
 
 void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4Sequence& sequence,
-                            const PagedKVCache& cache, std::uint32_t layer, Tensor& y) {
+                            const PagedKVCache& cache, std::uint32_t layer, Tensor* y) {
     cudaStream_t s                  = ctx_.stream;
     const int T                     = x.ne[1];
     const auto& attention           = *config_.attention;
@@ -325,6 +325,7 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     ops::qsa_append(kn.view({head_dim, kv_heads, W, B}), v.view({head_dim, kv_heads, W, B}),
                     index_key.view({geometry.index_dim, W, B}), rope_rows, positions,
                     sequence.valid_columns, *sequence.table_rows, kv, index, s);
+    if (y == nullptr) { return; }
 
     Tensor selected = roots.selected.view({geometry.max_selected(), W, B});
     Tensor counts   = roots.counts.view({W, B});
@@ -339,7 +340,7 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
                        s);
     Tensor a_flat = a.view({qw, T});
     ops::sigmoid_mul(gate, a_flat, s);
-    project(a_flat, p.output, y, work_, s);
+    project(a_flat, p.output, *y, work_, s);
 }
 
 void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gidx, Phase ph,
@@ -554,6 +555,13 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         return;
     }
 
+    // A speculative round pads short drafts to the round width; those columns' outputs are never
+    // consumed, so they reuse their lane's experts instead of fetching their own.
+    if (active_valid_columns_ != nullptr && active_sequence_batch_ != 0 &&
+        active_sequence_width_ > 1) {
+        ops::moe_route_share_padding(roots.ids, *active_valid_columns_, active_sequence_width_, s);
+    }
+
     // Cache route in column groups the slot pool can hold at once.
     const std::int32_t group = std::min(
         {T, cache.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache.slots)});
@@ -592,7 +600,7 @@ void TextContext::qwen4_block(const Qwen4BlockParameters& p, Tensor& wide, Phase
 
     qwen4_hc_mix(p.attention_hc, wide, x, &inject);
     if (const auto* qsa = std::get_if<QsaParameters>(&p.mixer)) {
-        qwen4_qsa(*qsa, x, sequence, cache, kv_layer, y);
+        qwen4_qsa(*qsa, x, sequence, cache, kv_layer, &y);
     } else {
         qwen4_gdn(std::get<Qwen4GdnParameters>(p.mixer), x, gdn_index, ph, y);
     }
@@ -641,21 +649,13 @@ void TextContext::qwen4_proposal(const Tensor& hidden, Tensor& logits, Tensor& t
                 ctx_.stream);
 }
 
-void TextContext::qwen4_mtp_core(const Tensor& ids, const Tensor& hidden,
-                                 const Tensor* input_embeddings, const Qwen4Sequence& sequence,
-                                 Tensor& mtp_hidden) {
-    if (batch_mtp_kv_ == nullptr || qwen4_mtp_ == nullptr) {
-        throw std::runtime_error("Qwen4Exp MTP forward is not enabled");
-    }
+void TextContext::qwen4_mtp_stem(const Tensor& ids, const Tensor& hidden,
+                                 const Tensor* input_embeddings, Tensor& wide) {
     cudaStream_t s        = ctx_.stream;
     const int T           = static_cast<int>(ids.numel());
     const std::int32_t H  = dimension(config_.hidden_size);
     const std::int32_t hc = dimension(config_.hyper_connection->hc_count);
-    nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
-                            static_cast<std::uint64_t>(T));
-    auto scope        = work_.scope();
-    Tensor wide       = mtp_hidden.view({hc * H, T});
-    Tensor flat_input = hidden.view({hc * H, T});
+    Tensor flat_input     = hidden.view({hc * H, T});
     {
         auto stem        = work_.scope();
         auto roots       = workspace::qwen4_mtp_stem(work_, config_, T);
@@ -679,8 +679,44 @@ void TextContext::qwen4_mtp_core(const Tensor& ids, const Tensor& hidden,
         ops::hyper_connection_expand(projected, hc, wide, s);
         ops::residual_add(roots.projected_hidden, wide, s);
     }
+}
+
+void TextContext::qwen4_mtp_core(const Tensor& ids, const Tensor& hidden,
+                                 const Tensor* input_embeddings, const Qwen4Sequence& sequence,
+                                 Tensor& mtp_hidden) {
+    if (batch_mtp_kv_ == nullptr || qwen4_mtp_ == nullptr) {
+        throw std::runtime_error("Qwen4Exp MTP forward is not enabled");
+    }
+    const int T           = static_cast<int>(ids.numel());
+    const std::int32_t H  = dimension(config_.hidden_size);
+    const std::int32_t hc = dimension(config_.hyper_connection->hc_count);
+    nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
+                            static_cast<std::uint64_t>(T));
+    auto scope  = work_.scope();
+    Tensor wide = mtp_hidden.view({hc * H, T});
+    qwen4_mtp_stem(ids, hidden, input_embeddings, wide);
     qwen4_block(qwen4_mtp_->layer, wide, Phase::Verify, sequence, *batch_mtp_kv_, 0, -1,
                 dimension(config_.num_hidden_layers), nullptr);
+}
+
+void TextContext::qwen4_mtp_append(const Tensor& ids, const Tensor& hidden,
+                                   const Qwen4Sequence& sequence) {
+    if (batch_mtp_kv_ == nullptr || qwen4_mtp_ == nullptr) {
+        throw std::runtime_error("Qwen4Exp MTP forward is not enabled");
+    }
+    const auto* qsa = std::get_if<QsaParameters>(&qwen4_mtp_->layer.mixer);
+    if (qsa == nullptr) { throw std::logic_error("Qwen4Exp MTP layer has no QSA mixer"); }
+    const int T           = static_cast<int>(ids.numel());
+    const std::int32_t H  = dimension(config_.hidden_size);
+    const std::int32_t hc = dimension(config_.hyper_connection->hc_count);
+    nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
+                            static_cast<std::uint64_t>(T));
+    auto scope  = work_.scope();
+    Tensor wide = work_.alloc(DType::BF16, {hc * H, T});
+    qwen4_mtp_stem(ids, hidden, nullptr, wide);
+    auto roots = workspace::qwen4_block(work_, config_, T);
+    qwen4_hc_mix(qwen4_mtp_->layer.attention_hc, wide, roots.mixed, &roots.inject);
+    qwen4_qsa(*qsa, roots.mixed, sequence, *batch_mtp_kv_, 0, nullptr);
 }
 
 PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,

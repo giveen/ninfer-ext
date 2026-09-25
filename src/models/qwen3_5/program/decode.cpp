@@ -36,7 +36,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, state.mtp_cache);
         card.set_qwen4_runtime(state.execution.qwen4);
         upload_qwen4_round_input(state.execution, batch_size);
 
@@ -58,6 +58,15 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
+        if (state.mtp_cache != nullptr) {
+            // The MTP layer reads (target hidden at p, token p+1): exactly this round's pair.
+            card.mtp_append_decode_batch(sampled.view({1, batch_size}),
+                                         hidden.view({hidden.ne[0], 1, batch_size}),
+                                         cache_positions.view({1, batch_size}),
+                                         rope_positions.view({1, batch_size}),
+                                         ordinary.mtp_kv_table_rows.slice(0, 0, batch_size),
+                                         envelope);
+        }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
@@ -271,7 +280,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    if (speculative_backend != SpeculativeBackend::None) {
+    // A plain MTP batch keeps the MTP layer's KV current alongside the target.
+    const bool append_mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if (speculative_backend != SpeculativeBackend::None &&
+        !(append_mtp && plain_mtp_batches && lanes.size() > 1)) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
@@ -295,7 +307,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.prefix_digests.size() != sequence.ledger_frontier ||
+            (append_mtp && (!sequence.kv->backend ||
+                            backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
+                            sequence.mtp_kv_valid != sequence.execution_frontier))) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -330,10 +345,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
-            ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            ordinary_host_ingress->mtp_kv_table_rows[row] =
+                append_mtp ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+            ordinary_host_ingress->sampling[row] = request.sampling_host;
             const std::span<const TokenId> ledger(sequence.ledger);
             stage_qwen4_round_column(ledger.first(ledger.size() - 1U), ledger.last(1), 0, row);
-            ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
+            ensure_sequence_kv_mapped(sequence, frontier + 1, append_mtp ? frontier + 1 : 0);
         }
 
         execution::OrdinaryBatchContext schedule_state{
@@ -344,7 +361,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            append_mtp ? decoder->mtp_cache() : nullptr};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -367,7 +385,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const TokenId token        = ordinary_host_egress->sampled_tokens[row];
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
             sequence.text_kv_valid = base_E + 1;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
+            commit_sequence_kv(sequence, sequence.text_kv_valid, append_mtp ? base_E + 1 : 0);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
@@ -808,6 +826,9 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
+        if (plain_mtp_batches && lanes.size() > 1) {
+            return decode_ordinary_batch(lanes, budgets, failed_timing);
+        }
         return decode_mtp_batch(lanes, budgets, failed_timing);
     }
     return decode_dflash_batch(lanes, budgets, failed_timing);
@@ -845,6 +866,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
                              prefill_chunk);
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            // A plain MTP batch appended this token's MTP KV but proposed no drafts.
+            sequence.mtp_kv_valid    = sequence.execution_frontier;
+            sequence.mtp_draft_count = 0;
+        }
         break;
     case PendingKind::Speculative:
     case PendingKind::None:

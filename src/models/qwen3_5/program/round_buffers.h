@@ -24,6 +24,8 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // A speculative program that also runs ordinary rounds for batches.
+    bool plain_batches = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -35,6 +37,8 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // MTP KV rows of a program whose ordinary rounds append the MTP layer's KV.
+    std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -178,6 +182,7 @@ struct OrdinaryDecodeState {
     Tensor text_kv_table_rows;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor mtp_kv_table_rows;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;

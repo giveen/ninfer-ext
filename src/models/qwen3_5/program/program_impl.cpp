@@ -44,7 +44,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      adaptive_draft(plan.adaptive_draft), speculative_backend(plan.speculative_backend),
+      adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
+      speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -59,7 +60,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
       ordinary_host(
-          !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
+          !plan.causal_scoring &&
+                  (plan.speculative_backend == SpeculativeBackend::None || plan.plain_mtp_batches)
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
@@ -240,7 +242,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() !=
-        (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
+        (!causal_scoring &&
+         (speculative_backend == SpeculativeBackend::None || plain_mtp_batches))) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {

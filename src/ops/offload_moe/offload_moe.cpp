@@ -120,6 +120,16 @@ void moe_route(const Tensor& x, const Tensor& router, WorkspaceArena& workspace,
     detail::moe_route_launch(x, router, logits, ids, weights, shared_gate, stream);
 }
 
+void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int32_t width,
+                             cudaStream_t stream) {
+    constexpr const char* op = "moe_route_share_padding";
+    require_routed(ids, DType::I32, ids.ne[1], op, "ids");
+    require_dense(valid_columns, DType::I32, op, "valid columns");
+    require(width > 0 && ids.ne[1] == static_cast<std::int64_t>(width) * valid_columns.numel(),
+            op, "ids must hold width columns per lane");
+    detail::moe_route_share_padding_launch(ids, valid_columns, width, stream);
+}
+
 void expert_cache_resolve(const Tensor& ids, std::int32_t layer, const ExpertCacheState& cache,
                           Tensor& slot_ids, Tensor& misses, cudaStream_t stream) {
     constexpr const char* op = "expert_cache_resolve";

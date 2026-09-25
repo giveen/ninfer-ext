@@ -198,6 +198,12 @@ public:
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
+    // Qwen4Exp: write the MTP layer's KV for `ids [W,B]` over target `hidden [D,W,B]` without the
+    // rest of the layer. A round that verifies no drafts keeps the MTP cache current this way.
+    void mtp_append_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                 const Tensor& cache_positions, const Tensor& rope_positions,
+                                 const Tensor& kv_table_rows,
+                                 ops::CausalAttentionExecutionEnvelope envelope);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
@@ -279,8 +285,9 @@ private:
                      Tensor& wide);
     void qwen4_hc_mix(const HyperConnectionParameters& p, const Tensor& wide, Tensor& x,
                       Tensor* inject);
+    // A null `y` only appends this layer's KV and index keys.
     void qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4Sequence& sequence,
-                   const PagedKVCache& cache, std::uint32_t layer, Tensor& y);
+                   const PagedKVCache& cache, std::uint32_t layer, Tensor* y);
     void qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gdn_index, Phase phase,
                    Tensor& y);
     void qwen4_ple(const PleParameters& p, const Tensor& embedding, Phase phase, Tensor& wide);
@@ -293,8 +300,11 @@ private:
     void qwen4_layers(Tensor& wide, Phase phase, const Qwen4Sequence& sequence,
                       const Tensor* ple_embedding);
     void qwen4_logits(const HyperConnectionParameters& head, const Tensor& wide, Tensor& logits);
+    void qwen4_mtp_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                        Tensor& wide);
     void qwen4_mtp_core(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                         const Qwen4Sequence& sequence, Tensor& mtp_hidden);
+    void qwen4_mtp_append(const Tensor& ids, const Tensor& hidden, const Qwen4Sequence& sequence);
     void qwen4_proposal(const Tensor& hidden, Tensor& logits, Tensor& tokens);
     [[nodiscard]] PrefillChunkResult qwen4_prefill(std::span<const int> ids,
                                                    const TextPrefill* text_prefill,

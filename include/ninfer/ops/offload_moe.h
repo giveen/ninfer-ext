@@ -87,6 +87,19 @@ void moe_route(const Tensor& x, const Tensor& router, WorkspaceArena& workspace,
 [[nodiscard]] std::size_t moe_route_workspace_bytes(std::int32_t tokens);
 
 /**
+ * Give the padding columns of a speculative batch their lane's routing, so they fetch no expert
+ * of their own. `ids` is I32 `[10, W*B]` with column `w + W*b` belonging to lane b, and
+ * `valid_columns` is I32 `[B]`. For every lane with `1 <= valid_columns[b] < W`:
+ *
+ *   ids[:, w + W*b] = ids[:, valid_columns[b]-1 + W*b]   for valid_columns[b] <= w < W.
+ *
+ * Other columns are unchanged. The outputs of padding columns are never consumed, so only which
+ * experts they touch changes, never a valid column's result.
+ */
+void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int32_t width,
+                             cudaStream_t stream);
+
+/**
  * Resolve routed experts of one layer to cache slots, choosing least-recently-used victims for
  * misses. `ids` I32 `[10,T]` in; `slot_ids` I32 `[10,T]` out; `misses` I32 `[2*(10*T) + 1]`
  * receives the miss count followed by (slot, expert) pairs. The cache must hold at least 10*T

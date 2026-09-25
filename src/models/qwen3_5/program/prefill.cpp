@@ -753,7 +753,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         return timing.finish();
     }
 
-    if (speculative_backend == SpeculativeBackend::None) {
+    // Ordinary rounds: every round of the ordinary backend, and plain MTP batches.
+    if (speculative_backend == SpeculativeBackend::None ||
+        (lanes.front() < max_concurrency &&
+         requests[lanes.front()].pending.kind == PendingKind::Ordinary)) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||

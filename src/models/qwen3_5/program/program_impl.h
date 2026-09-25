@@ -615,6 +615,8 @@ public:
     // Largest draft length. MTP rounds may run shorter draft lengths from `mtp_rungs`.
     const std::uint32_t draft_window;
     const bool adaptive_draft;
+    // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
+    const bool plain_mtp_batches;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

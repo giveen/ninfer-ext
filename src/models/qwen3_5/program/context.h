@@ -64,6 +64,8 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Set when the round also appends each sampled token's MTP-layer KV (plain MTP batches).
+    const qwen3_5::PagedKVCache* mtp_cache = nullptr;
 };
 
 struct MtpBatchContext {
