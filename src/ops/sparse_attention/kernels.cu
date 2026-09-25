@@ -843,7 +843,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
     }
 }
 
-// One CTA per (column, KV head); thread d merges feature d of every head over the splits.
+// One CTA per (column, KV head) and head of its group; thread d merges feature d over the splits.
 __global__ void __launch_bounds__(256)
     qsa_attention_combine_kernel(const float* __restrict__ partial, std::int32_t splits,
                                  std::int32_t query_heads, std::int32_t kv_heads,
@@ -852,28 +852,27 @@ __global__ void __launch_bounds__(256)
     const int kv_head = static_cast<int>(blockIdx.x) % kv_heads;
     const int column  = static_cast<int>(blockIdx.x) / kv_heads;
     const int group   = query_heads / kv_heads;
-    for (int h = 0; h < group; ++h) {
-        const float* p =
-            partial + (static_cast<std::int64_t>(blockIdx.x) * splits * group + h) * kPartialWords;
-        const std::int64_t stride = static_cast<std::int64_t>(group) * kPartialWords;
-        float m                   = -CUDART_INF_F;
-        for (int s = 0; s < splits; ++s) { m = fmaxf(m, p[s * stride + kHeadDim]); }
-        float numerator = 0.0F, denominator = 0.0F;
-        if (m > -CUDART_INF_F) {
-            for (int s = 0; s < splits; ++s) {
-                const float* state = p + s * stride;
-                const float l      = state[kHeadDim + 1];
-                if (l > 0.0F) {
-                    const float w = __expf(state[kHeadDim] - m);
-                    numerator += w * state[d];
-                    denominator += w * l;
-                }
+    const int h       = static_cast<int>(blockIdx.y);
+    const float* p =
+        partial + (static_cast<std::int64_t>(blockIdx.x) * splits * group + h) * kPartialWords;
+    const std::int64_t stride = static_cast<std::int64_t>(group) * kPartialWords;
+    float m                   = -CUDART_INF_F;
+    for (int s = 0; s < splits; ++s) { m = fmaxf(m, p[s * stride + kHeadDim]); }
+    float numerator = 0.0F, denominator = 0.0F;
+    if (m > -CUDART_INF_F) {
+        for (int s = 0; s < splits; ++s) {
+            const float* state = p + s * stride;
+            const float l      = state[kHeadDim + 1];
+            if (l > 0.0F) {
+                const float w = __expf(state[kHeadDim] - m);
+                numerator += w * state[d];
+                denominator += w * l;
             }
         }
-        const std::int64_t index =
-            (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim + d;
-        out[index] = __float2bfloat16_rn(denominator > 0.0F ? numerator / denominator : 0.0F);
     }
+    const std::int64_t index =
+        (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim + d;
+    out[index] = __float2bfloat16_rn(denominator > 0.0F ? numerator / denominator : 0.0F);
 }
 
 } // namespace
@@ -1021,7 +1020,7 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
     }
     CUDA_CHECK(cudaGetLastError());
     if (states != nullptr) {
-        qsa_attention_combine_kernel<<<blocks, 256, 0, stream>>>(
+        qsa_attention_combine_kernel<<<dim3(blocks, query_heads / kv_heads), 256, 0, stream>>>(
             states, split.splits, query_heads, kv_heads, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     }
