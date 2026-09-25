@@ -1430,6 +1430,7 @@ private:
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        scheduler_.record_prefill_served(lane);
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }

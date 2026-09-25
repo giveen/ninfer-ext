@@ -213,6 +213,13 @@ int main() {
         slots[1]->capture_pending = false;
         failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
                           "runnable staged-prefill lane selection changed");
+        // Units rotate after the lane last served, so one long prompt cannot hold the stream.
+        scheduler.record_prefill_served(1);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(2U),
+                          "staged prefill did not rotate past the lane it served");
+        scheduler.record_prefill_served(2);
+        failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::optional(1U),
+                          "staged prefill rotation did not wrap to the first runnable lane");
         slots[1]->capture_pending = true;
         slots[2].reset();
         failures += check(scheduler.select_runnable_prefill_lane(3, slots) == std::nullopt,

@@ -1027,7 +1027,8 @@ processed by one model traversal and, when graphs are enabled, one exact-batch C
 A request joins that batch only after its staged prefill finishes; while other requests are
 prefilling, waiting requests may still be admitted to free lanes, so prefill of one request can
 overlap the prefill and decode of the others (each prefill unit advances exactly one staged lane
-per worker boundary). When a request completes or is cancelled, the next boundary rebuilds the
+per worker boundary, rotating through the prefilling lanes, so a short prompt admitted behind a
+long one waits one unit rather than the whole long prefill). When a request completes or is cancelled, the next boundary rebuilds the
 batch without an empty row.
 
 A prefill unit beside waiting decode work is one `--prefill-chunk` wide, so a decode round waits
