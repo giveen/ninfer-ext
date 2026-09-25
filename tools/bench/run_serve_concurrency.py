@@ -368,6 +368,9 @@ def validate_server_start(
         "speculative_draft_window": point.draft_tokens,
         "proposal_head": "optimized" if point.draft_tokens else "full",
     }
+    if args.prefill_chunk is None:
+        # The server resolved its own default; its value is recorded, not prescribed.
+        del expected["prefill_chunk"]
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
