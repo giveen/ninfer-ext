@@ -319,8 +319,7 @@ def server_command(
             ]
         )
         if point.speculative_backend == "mtp":
-            # Published MTP waves measure one draft length, not the adaptive policy.
-            command.append("--fixed-draft")
+            command.extend(corpus.mtp_draft_flags(serve, point.speculative_mode))
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:

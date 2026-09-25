@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import functools
 import http.client
 import json
 import math
@@ -25,9 +26,13 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
     "mtp3": ("mtp", 3),
+    "mtp5": ("mtp", 5),
+    "mtp_adaptive": ("mtp", 7),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
 }
+# MTP modes whose draft length the server chooses per round, up to the mode's draft tokens.
+ADAPTIVE_MODES = frozenset({"mtp_adaptive"})
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
 
@@ -79,7 +84,9 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 7
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 23
+# v23 is this fork's request log. v21 is upstream NInfer's (bace20dc), accepted so stock builds run
+# under the same harness: v22-v23 only add fields this harness does not read.
+SERVER_LOG_SCHEMA_VERSIONS = (21, 23)
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -457,8 +464,12 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
         event.get("schema_version"),
         event.get("event"),
     )
-    expected = (SERVER_LOG_ARTIFACT_TYPE, SERVER_LOG_SCHEMA_VERSION, event_name)
-    if identity != expected:
+    if (
+        identity[0] != SERVER_LOG_ARTIFACT_TYPE
+        or identity[1] not in SERVER_LOG_SCHEMA_VERSIONS
+        or identity[2] != event_name
+    ):
+        expected = (SERVER_LOG_ARTIFACT_TYPE, SERVER_LOG_SCHEMA_VERSIONS, event_name)
         raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
 
 
@@ -721,6 +732,32 @@ def append_record(handle: Any, record: dict[str, Any]) -> None:
     os.fsync(handle.fileno())
 
 
+@functools.cache
+def serve_has_adaptive_mtp(serve: Path) -> bool:
+    """Whether this ninfer-serve build drafts adaptively and therefore accepts --fixed-draft."""
+    try:
+        completed = subprocess.run(
+            [str(serve), "--help"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except OSError as exc:
+        raise CampaignError(f"cannot run {serve} --help: {exc}") from None
+    return "--fixed-draft" in completed.stdout + completed.stderr
+
+
+def mtp_draft_flags(serve: Path, mode_name: str) -> list[str]:
+    """Draft-policy flags for an MTP mode on this server build.
+
+    Fixed modes pin their draft length. A build without adaptive MTP always drafts exactly
+    --draft-tokens, so it needs no flag; an adaptive mode cannot run on it.
+    """
+    adaptive_server = serve_has_adaptive_mtp(serve)
+    if mode_name in ADAPTIVE_MODES:
+        if not adaptive_server:
+            raise CampaignError(f"{mode_name} needs a ninfer-serve build with adaptive MTP")
+        return []
+    return ["--fixed-draft"] if adaptive_server else []
+
+
 def server_command(
     serve: Path,
     spec: RunSpec,
@@ -762,8 +799,7 @@ def server_command(
             ]
         )
         if spec.speculative_backend == "mtp":
-            # Published MTP runs measure one draft length, not the adaptive policy.
-            command.append("--fixed-draft")
+            command.extend(mtp_draft_flags(serve, spec.speculative_mode))
     if spec.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -1083,6 +1119,10 @@ def mode_display_name(mode_name: str) -> str:
         return "MTP0"
     if mode_name == "mtp3":
         return "MTP3"
+    if mode_name == "mtp5":
+        return "MTP5"
+    if mode_name == "mtp_adaptive":
+        return "MTP adaptive (≤7)"
     if mode_name == "dflash7":
         return "DFlash block=8 (k=7)"
     if mode_name == "dflash2_7":

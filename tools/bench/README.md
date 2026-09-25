@@ -144,9 +144,21 @@ runner usage and output files.
 
 `run_serve_corpus.py` accepts explicit `--artifact LABEL=PATH` entries. Labels identify report groups;
 the selected artifact supplies the architecture, public name and weight bindings.
-Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
-Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
-in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
+Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset.
+
+- **MTP modes.** `mtp3` and `mtp5` pin the draft length. `mtp_adaptive` lets the server choose each
+  round's draft, up to 7.
+- **DFlash modes.** Use `dflash7` for Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B
+  DFlash2 K=7, with companion weights in the selected artifact.
+- **Sampling.** `--sampling greedy` selects exact argmax; the default is stochastic.
+
+The runners also drive a stock upstream `ninfer-serve` (`--serve PATH`):
+
+- **Detection.** The runner reads `--help`: a build without `--fixed-draft` has no adaptive MTP.
+- **Fixed modes.** On such a build, fixed MTP modes omit the flag, because that build always drafts
+  exactly `--draft-tokens`.
+- **Adaptive mode.** `mtp_adaptive` is rejected on it.
+- **Request log.** Both upstream's schema-v21 log and this fork's v23 are accepted.
 Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
 
 The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under
@@ -188,6 +200,19 @@ python3 tools/bench/run_serve_concurrency.py \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus
 ```
+
+To compare two builds, run the same artifact labels, suites and concurrencies once per
+`--serve` binary. Then match the points:
+
+```bash
+python3 tools/bench/compare_serve_concurrency.py \
+  --baseline stock=profiles/bench/stock --candidate fork=profiles/bench/fork \
+  --pair mtp0=mtp0 --pair mtp3=mtp3 --pair mtp5=mtp_adaptive
+```
+
+Each `--pair BASE=CANDIDATE` compares two modes; without it, every mode present in both
+directories is compared with itself. Decode-saturation rows compare steady decode tok/s, and
+corpus rows compare makespan.
 
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
