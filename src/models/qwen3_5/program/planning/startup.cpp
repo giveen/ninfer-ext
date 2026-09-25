@@ -1047,10 +1047,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     const auto& text = parameters.model.config().text;
     if (text.qwen4()) {
-        if (options.kv_cache != KvCacheStorage::BFloat16 &&
-            options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
-            throw std::invalid_argument("Qwen4Exp supports the bf16 and fp8 KV-cache profiles");
-        }
         if (options.speculative.backend != SpeculativeBackend::None &&
             options.speculative.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("Qwen4Exp supports MTP speculative decoding only");

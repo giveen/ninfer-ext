@@ -20,10 +20,20 @@ void require_dense(const Tensor& t, DType dtype, const char* op, const char* lab
 }
 
 void require_storage(const PagedKVBatchLayerView& kv, const char* op) {
-    require(kv.storage == KvCacheStorage::BFloat16 || kv.storage == KvCacheStorage::Fp8E4M3Row256,
-            op, "Qwen Sparse Attention supports the bf16 and fp8 KV-cache profiles");
     require(kv.head_dim == 256 && kv.num_kv_heads > 0 && kv.num_kv_heads <= 8, op,
             "KV geometry must be head_dim 256 with at most 8 KV heads");
+    const PagedKVStorageLayout layout = paged_kv_storage_layout(kv.storage, kv.head_dim);
+    const auto plane                  = [&](const Tensor& data, const Tensor& scales,
+                           const PagedKVVectorLayout& vector, const char* label) {
+        require(data.data != nullptr && data.dtype == vector.data_dtype &&
+                    data.ne[0] == vector.data_leading_extent,
+                op, std::string(label) + " pages do not match the KV-cache profile");
+        require(!vector.has_scale() ||
+                    (scales.data != nullptr && scales.dtype == vector.scale_dtype),
+                op, std::string(label) + " scales do not match the KV-cache profile");
+    };
+    plane(kv.k_pages, kv.k_scale_pages, layout.key, "K");
+    plane(kv.v_pages, kv.v_scale_pages, layout.value, "V");
     require(kv.block_tables.dtype == DType::I32 && kv.block_tables.data != nullptr, op,
             "block tables must be I32");
 }

@@ -56,7 +56,8 @@ struct QsaIndexPlane {
  * `rope_positions` is I32 `[W*B, 1|3]` axis-major (one column means all three axes are equal);
  * `cache_positions` is I32 `[W, B]`; `table_rows` I32 `[B]` selects each lane's block-table row.
  * `valid_columns` (optional, I32 `[B]`) limits each lane to its first columns. KV storage follows
- * the cache profile (BFloat16 or Fp8E4M3Row256); the index record is stored exactly.
+ * the cache profile with the dense cache's codecs (K Hadamard-rotated in every quantized profile,
+ * V rotated where it is NVFP4); the index record is stored exactly.
  */
 void qsa_append(const Tensor& k, const Tensor& v, const Tensor& index_keys,
                 const Tensor& rope_positions, const Tensor& cache_positions,
@@ -92,9 +93,10 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
  *
  * `q` is contiguous BF16 `[head_dim, query_heads, W, B]` after norm and RoPE; `selected`/`counts`
  * come from qsa_select. For each column and query head the oracle is the scaled dot-product
- * softmax over exactly the selected keys, reading K/V at their storage boundary (FP16 V for the
- * BFloat16 profile; represented FP8 codes times scales, K in the stored Hadamard domain, for the
- * FP8 profile). `out` has the shape of `q`; a column with count zero writes zeros. `workspace`
+ * softmax over exactly the selected keys, reading K/V at their storage boundary: FP16 V for the
+ * BFloat16 profile, and for a quantized profile each stored code times its scale in the stored
+ * domain (the query is rotated like K; output of a rotated V is rotated back). Int8 G64 values are
+ * rounded once to FP16. `out` has the shape of `q`; a column with count zero writes zeros. `workspace`
  * holds qsa_attention_workspace_bytes for the call's `W*B` columns.
  */
 void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts,
