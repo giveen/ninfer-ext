@@ -290,9 +290,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         q.pool         = builder.add(checked_mul(static_cast<std::size_t>(q.slots),
                                                  ops::kExpertSlotBytes, "expert cache pool bytes"),
                                      kArenaAlign, "expert cache pool");
-        q.staged_bank  = builder.add(static_cast<std::size_t>(ops::kOffloadMoeExperts) *
-                                         ops::kExpertSlotBytes,
-                                     kArenaAlign, "prefill expert layer bank");
+        // Two banks, so the next layer's copy overlaps this layer's compute.
+        q.staged_bank = builder.add(2 * static_cast<std::size_t>(ops::kExpertStagedLayerBytes),
+                                    kArenaAlign, "prefill expert layer banks");
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -382,8 +382,13 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::moe_route_workspace_bytes(tokens));
         linear(layout, p.moe.shared_gate_up, tokens);
         linear(layout, p.moe.shared_down, tokens);
-        scratch(layout, ops::moe_experts_workspace_bytes(
-                            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts)));
+        std::size_t experts = ops::moe_experts_workspace_bytes(
+            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts));
+        // Calls wide enough to stage the layer may take the A4 route instead.
+        if (tokens >= kQwen4StagedColumns) {
+            experts = std::max(experts, ops::moe_experts_a4_workspace_bytes(tokens));
+        }
+        scratch(layout, experts);
     };
     const auto body = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens, bool prefill) {
         {

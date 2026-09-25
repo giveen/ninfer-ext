@@ -280,7 +280,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
         if (layout.staged_bank) {
-            runtime.staged_bank    = static_cast<std::byte*>(layout.staged_bank->bind(backing).data);
+            qwen4_staging.emplace(static_cast<std::byte*>(layout.staged_bank->bind(backing).data));
+            runtime.staging        = &*qwen4_staging;
             runtime.staged_columns = kQwen4StagedColumns;
         }
         const auto& config = parameters.model.config().text;

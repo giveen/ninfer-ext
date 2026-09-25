@@ -648,6 +648,7 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    std::optional<execution::Qwen4Staging> qwen4_staging;
     std::optional<execution::Qwen4Runtime> qwen4_runtime;
     std::unique_ptr<execution::PleGather> ple_gather;
     std::optional<PinnedHostBuffer> ple_host;
