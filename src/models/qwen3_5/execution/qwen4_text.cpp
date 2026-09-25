@@ -554,6 +554,13 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         return;
     }
 
+    // A speculative round pads short drafts to the round width; those columns' outputs are never
+    // consumed, so they reuse their lane's experts instead of fetching their own.
+    if (active_valid_columns_ != nullptr && active_sequence_batch_ != 0 &&
+        active_sequence_width_ > 1) {
+        ops::moe_route_share_padding(roots.ids, *active_valid_columns_, active_sequence_width_, s);
+    }
+
     // Cache route in column groups the slot pool can hold at once.
     const std::int32_t group = std::min(
         {T, cache.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache.slots)});

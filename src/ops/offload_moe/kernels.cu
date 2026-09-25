@@ -146,6 +146,24 @@ __global__ void __launch_bounds__(256)
 // ---------------------------------------------------------------------------------------------
 // Cache resolution: one CTA of 1024 threads per call.
 
+// CTA b copies lane b's last valid routing over its padding columns. The source column is valid,
+// so it is never itself overwritten.
+constexpr int kShareThreads = 128;
+
+__global__ void __launch_bounds__(kShareThreads)
+    moe_route_share_padding_kernel(std::int32_t* __restrict__ ids,
+                                   const std::int32_t* __restrict__ valid_columns,
+                                   std::int32_t width) {
+    const int lane  = static_cast<int>(blockIdx.x);
+    const int valid = valid_columns[lane];
+    if (valid < 1 || valid >= width) { return; }
+    std::int32_t* row        = ids + static_cast<std::int64_t>(lane) * width * K;
+    const std::int32_t* from = row + (valid - 1) * K;
+    for (int i = static_cast<int>(threadIdx.x); i < (width - valid) * K; i += blockDim.x) {
+        row[valid * K + i] = from[i % K];
+    }
+}
+
 constexpr int kResolveThreads = 1024;
 
 // Exclusive scan over the CTA (blockDim.x a multiple of 32, at most 1024): warp shuffles, then
@@ -813,6 +831,15 @@ void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tens
     moe_route_topk_kernel<<<(columns + 7) / 8, 256, 0, stream>>>(
         logits, columns, static_cast<std::int32_t*>(ids.data), static_cast<float*>(weights.data),
         static_cast<float*>(shared_gate.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moe_route_share_padding_launch(Tensor& ids, const Tensor& valid_columns, std::int32_t width,
+                                    cudaStream_t stream) {
+    const auto lanes = static_cast<std::int32_t>(valid_columns.numel());
+    moe_route_share_padding_kernel<<<lanes, kShareThreads, 0, stream>>>(
+        static_cast<std::int32_t*>(ids.data), static_cast<const std::int32_t*>(valid_columns.data),
+        width);
     CUDA_CHECK(cudaGetLastError());
 }
 

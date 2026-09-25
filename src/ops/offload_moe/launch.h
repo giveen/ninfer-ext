@@ -67,6 +67,8 @@ void moe_experts_a4_launch(const MoeA4Chunk& chunk, cudaStream_t stream);
 
 void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tensor& ids,
                       Tensor& weights, Tensor& shared_gate, cudaStream_t stream);
+void moe_route_share_padding_launch(Tensor& ids, const Tensor& valid_columns, std::int32_t width,
+                                    cudaStream_t stream);
 void expert_cache_resolve_launch(const Tensor& ids, std::int32_t layer,
                                  const ExpertCacheState& cache, Tensor& slot_ids, Tensor& misses,
                                  cudaStream_t stream);

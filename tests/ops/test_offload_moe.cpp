@@ -489,6 +489,37 @@ int stage_case(const HostBank& host, const DeviceBank& bank) {
     return failures;
 }
 
+// moe_route_share_padding: lanes of width 4 whose valid prefixes cover none (0), one, two, three
+// and all four columns; padding takes the last valid column, every other column is untouched.
+int share_padding_case() {
+    constexpr std::int32_t kWidth = 4;
+    const std::vector<std::int32_t> valid = {1, 4, 0, 2, 3};
+    const auto lanes = static_cast<std::int32_t>(valid.size());
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(K) * kWidth * lanes);
+    std::mt19937 rng(0x5EEDU);
+    for (auto& id : ids) { id = static_cast<std::int32_t>(rng() % E); }
+    std::vector<std::int32_t> want = ids;
+    for (std::int32_t b = 0; b < lanes; ++b) {
+        if (valid[b] < 1) { continue; }
+        for (std::int32_t w = valid[b]; w < kWidth; ++w) {
+            for (std::int32_t k = 0; k < K; ++k) {
+                want[(b * kWidth + w) * K + k] = ids[(b * kWidth + valid[b] - 1) * K + k];
+            }
+        }
+    }
+    DeviceBuffer ids_device   = to_device_i32(ids);
+    DeviceBuffer valid_device = to_device_i32(valid);
+    Tensor ids_tensor(ids_device.p, DType::I32, {K, kWidth * lanes});
+    Tensor valid_tensor(valid_device.p, DType::I32, {lanes});
+    ops::moe_route_share_padding(ids_tensor, valid_tensor, kWidth, nullptr);
+    cuda_synchronize();
+    if (from_device<std::int32_t>(ids_device, ids.size()) != want) {
+        std::cerr << "moe_route_share_padding: ids differ from the oracle\n";
+        return 1;
+    }
+    return 0;
+}
+
 // `pool` > 0 routes every column within `pool` experts, so one expert job carries many tokens
 // (real prefill routing concentrates); 0 spreads routing over all experts.
 int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens,
@@ -722,6 +753,7 @@ int main() {
     }
     const HostBank host   = make_bank(0xC0FFEEU);
     const DeviceBank bank = upload(host);
+    failures += share_padding_case();
     failures += cache_case(host, bank);
     failures += stage_case(host, bank);
     // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
