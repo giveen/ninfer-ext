@@ -25,7 +25,6 @@ constexpr int E                         = kOffloadMoeExperts;
 constexpr int K                         = kOffloadMoeTopK;
 constexpr int I                         = kOffloadMoeIntermediate;
 constexpr int kJobTokens                = 64;
-constexpr unsigned long long kProtected = ~0ULL;
 
 __device__ __constant__ float kE2m1[16] = {0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
                                            -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
@@ -149,20 +148,44 @@ __global__ void __launch_bounds__(256)
 
 constexpr int kResolveThreads = 1024;
 
+// Exclusive scan over the CTA (blockDim.x a multiple of 32, at most 1024): warp shuffles, then
+// one warp scans the per-warp totals. `scratch` holds at least 32 ints.
 __device__ __forceinline__ int block_exclusive_scan(int value, int* scratch, int& total) {
-    const int tid = static_cast<int>(threadIdx.x);
-    scratch[tid]  = value;
-    __syncthreads();
-    for (int offset = 1; offset < static_cast<int>(blockDim.x); offset <<= 1) {
-        const int add = tid >= offset ? scratch[tid - offset] : 0;
-        __syncthreads();
-        scratch[tid] += add;
-        __syncthreads();
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    int inclusive  = value;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int up = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) { inclusive += up; }
     }
-    total            = scratch[blockDim.x - 1];
-    const int result = scratch[tid] - value;
+    if (lane == 31) { scratch[warp] = inclusive; }
+    __syncthreads();
+    if (warp == 0) {
+        const int warps = static_cast<int>(blockDim.x) >> 5;
+        int sum         = lane < warps ? scratch[lane] : 0;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, sum, offset);
+            if (lane >= offset) { sum += up; }
+        }
+        scratch[lane] = sum; // inclusive over warps
+    }
+    __syncthreads();
+    total            = scratch[31];
+    const int result = (warp > 0 ? scratch[warp - 1] : 0) + inclusive - value;
     __syncthreads();
     return result;
+}
+
+// Eviction key of a slot: smaller is older. Stamps at or after `now` (touched by this call) are
+// protected; older stamps order by age, saturated to 32 bits.
+__device__ __forceinline__ std::uint32_t eviction_key(unsigned long long stamp,
+                                                      unsigned long long now) {
+    if (stamp >= now) { return 0xFFFFFFFFu; }
+    const unsigned long long age = now - stamp;
+    return 0xFFFFFFFFu - static_cast<std::uint32_t>(min(age, 0xFFFFFFFFULL));
 }
 
 __global__ void __launch_bounds__(kResolveThreads)
@@ -173,9 +196,9 @@ __global__ void __launch_bounds__(kResolveThreads)
     __shared__ int used[E];
     __shared__ int slot_for[E];
     __shared__ int miss_expert[E];
-    __shared__ int scratch[kResolveThreads];
+    __shared__ int scratch[32];
     __shared__ unsigned long long now_s;
-    __shared__ unsigned long long prefix_s;
+    __shared__ std::uint32_t prefix_s;
     __shared__ int remaining_s;
     __shared__ unsigned histogram[256];
     __shared__ int miss_count_s;
@@ -214,54 +237,66 @@ __global__ void __launch_bounds__(kResolveThreads)
     const int need_total = miss_count_s;
 
     if (need_total > 0) {
-        // Radix-select the need_total-th smallest stamp among unprotected slots.
+        // Radix-select the need_total-th smallest eviction key.
         if (tid == 0) {
-            prefix_s    = 0ULL;
+            prefix_s    = 0U;
             remaining_s = need_total;
         }
         __syncthreads();
-        unsigned long long mask = 0ULL;
-        for (int shift = 56; shift >= 0; shift -= 8) {
+        std::uint32_t mask = 0U;
+        for (int shift = 24; shift >= 0; shift -= 8) {
             for (int b = tid; b < 256; b += blockDim.x) { histogram[b] = 0U; }
             __syncthreads();
             for (int s = tid; s < cache.slots; s += blockDim.x) {
-                const unsigned long long stamp = cache.stamp[s];
-                const unsigned long long key   = stamp >= now ? kProtected : stamp;
-                if ((key & mask) == prefix_s) {
-                    atomicAdd(&histogram[(key >> shift) & 0xFFULL], 1U);
-                }
+                const std::uint32_t key = eviction_key(cache.stamp[s], now);
+                if ((key & mask) == prefix_s) { atomicAdd(&histogram[(key >> shift) & 0xFFU], 1U); }
             }
             __syncthreads();
-            if (tid == 0) {
-                int need = remaining_s;
-                for (int bin = 0; bin < 256; ++bin) {
-                    const int count = static_cast<int>(histogram[bin]);
-                    if (count >= need) {
-                        prefix_s |= static_cast<unsigned long long>(bin) << shift;
-                        remaining_s = need;
-                        break;
+            if (tid < 32) {
+                // Lane l owns bins [8l, 8l + 8); the first lane whose running count reaches the
+                // remaining need holds the bin.
+                int counts[8];
+                int own = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    counts[i] = static_cast<int>(histogram[tid * 8 + i]);
+                    own += counts[i];
+                }
+                int inclusive = own;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    const int up = __shfl_up_sync(0xffffffffu, inclusive, offset);
+                    if (tid >= offset) { inclusive += up; }
+                }
+                const int need   = remaining_s;
+                const unsigned hit = __ballot_sync(0xffffffffu, inclusive >= need);
+                if (hit != 0U && tid == __ffs(static_cast<int>(hit)) - 1) {
+                    int left = need - (inclusive - own);
+                    for (int i = 0; i < 8; ++i) {
+                        if (counts[i] >= left) {
+                            prefix_s |= static_cast<std::uint32_t>(tid * 8 + i) << shift;
+                            remaining_s = left;
+                            break;
+                        }
+                        left -= counts[i];
                     }
-                    need -= count;
                 }
             }
-            mask |= 0xFFULL << shift;
+            mask |= 0xFFU << shift;
             __syncthreads();
         }
-        const unsigned long long threshold = prefix_s;
+        const std::uint32_t threshold = prefix_s;
         if (tid == 0) {
             emitted_s = 0;
             ties_s    = remaining_s;
         }
         __syncthreads();
         for (int base = 0; base < cache.slots; base += blockDim.x) {
-            const int s            = base + tid;
-            unsigned long long key = kProtected;
-            if (s < cache.slots) {
-                const unsigned long long stamp = cache.stamp[s];
-                key                            = stamp >= now ? kProtected : stamp;
-            }
-            const int less     = s < cache.slots && key < threshold ? 1 : 0;
-            const int tie      = s < cache.slots && key == threshold && key != kProtected ? 1 : 0;
+            const int s             = base + tid;
+            const std::uint32_t key = s < cache.slots ? eviction_key(cache.stamp[s], now)
+                                                      : 0xFFFFFFFFu;
+            const int less = s < cache.slots && key < threshold ? 1 : 0;
+            const int tie  = s < cache.slots && key == threshold && key != 0xFFFFFFFFu ? 1 : 0;
             int tie_total      = 0;
             const int tie_rank = block_exclusive_scan(tie, scratch, tie_total);
             const int take     = less || (tie && tie_rank < ties_s);
