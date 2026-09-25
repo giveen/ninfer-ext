@@ -14,6 +14,7 @@ ModelOpt stores multipliers where the v3 formats store divisors or row multiplie
 
 from __future__ import annotations
 
+from functools import cache
 from math import prod
 import struct
 
@@ -67,9 +68,12 @@ def nvfp4_source(store: SafetensorsSource, prefix: str, shape: tuple[int, int]) 
     if k % 16:
         raise ValueError(f"{prefix}: NVFP4 K must be divisible by 16")
 
+    # Each chunk of the matrix names its divisor; read the scalar once, not once per chunk.
+    @cache
     def divisor() -> bytes:
         return reciprocal_word(_scalar_f32(store, prefix + ".weight_scale_2"), prefix)
 
+    @cache
     def input_divisor() -> bytes:
         return reciprocal_word(_scalar_f32(store, prefix + ".input_scale"), prefix)
 

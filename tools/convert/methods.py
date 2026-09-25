@@ -32,6 +32,8 @@ from .sources.logical import EncodedRows, LogicalSource
 UseKey = tuple[str, str]
 AuxiliaryKey = tuple[str, str, str]
 
+IMPORT_CHUNK_BYTES = 64 * 1024 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class MethodInput:
@@ -72,12 +74,23 @@ class PrepareRequest:
         default_factory=dict
     )
     source_offsets: tuple[int, ...] = field(init=False)
+    # Parent row where each input starts, when every input is a complete row block of the parent;
+    # None otherwise, and encoded_rows then names the first input that is not.
+    row_offsets: tuple[int, ...] | None = field(init=False)
 
     def __post_init__(self) -> None:
         values = [0]
         for item in self.inputs:
             values.append(values[-1] + prod(item.source.shape))
         object.__setattr__(self, "source_offsets", tuple(values))
+        rows = [0]
+        for item in self.inputs:
+            shape = item.source.shape
+            if len(self.target.shape) != 2 or len(shape) != 2 or shape[1] != self.target.shape[1]:
+                rows = None
+                break
+            rows.append(rows[-1] + shape[0])
+        object.__setattr__(self, "row_offsets", None if rows is None else tuple(rows))
 
     @property
     def source(self) -> LogicalSource:
@@ -113,22 +126,29 @@ class PrepareRequest:
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
     def encoded_rows(self, begin: int, end: int) -> EncodedRows:
-        pieces = []
-        cursor = 0
-        for item in self.inputs:
-            source = item.source
-            if len(source.shape) != 2 or source.shape[1] != self.target.shape[1]:
-                raise ValueError(
-                    f"{item.parameter}: encoded grouping requires complete rows"
-                )
-            low, high = max(begin, cursor), min(end, cursor + source.shape[0])
-            if low < high:
-                if source.read_encoded is None:
-                    raise ValueError(f"{item.parameter}: encoded rows are unavailable")
-                pieces.append(source.read_encoded(low - cursor, high - cursor))
-            cursor += source.shape[0]
-        if not pieces or end > cursor:
+        offsets = self.row_offsets
+        if offsets is None:
+            for item in self.inputs:
+                shape = item.source.shape
+                if len(shape) != 2 or shape[1] != self.target.shape[1]:
+                    raise ValueError(
+                        f"{item.parameter}: encoded grouping requires complete rows"
+                    )
+        if not 0 <= begin < end <= offsets[-1]:
             raise ValueError("encoded method input range is invalid")
+        pieces = []
+        # A stacked bank has one input per expert; find the first overlapping one directly
+        # instead of walking every input for every chunk.
+        index = bisect_right(offsets, begin) - 1
+        while offsets[index] < end:
+            item = self.inputs[index]
+            cursor = offsets[index]
+            low, high = max(begin, cursor), min(end, offsets[index + 1])
+            if low < high:
+                if item.source.read_encoded is None:
+                    raise ValueError(f"{item.parameter}: encoded rows are unavailable")
+                pieces.append(item.source.read_encoded(low - cursor, high - cursor))
+            index += 1
         first = pieces[0]
         if any(
             (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
@@ -330,12 +350,14 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                         if activation_divisor is not None
                         else source.input_divisor()
                     )
-    n = request.target.shape[0]
-    chunk = (
-        max(128, request.rows_per_chunk // 128 * 128)
-        if request.target.format == "nvfp4"
-        else request.rows_per_chunk
-    )
+    n, k = request.target.shape
+    # Imported words are copied, not computed, so the chunk is sized by bytes: rows_per_chunk
+    # alone gives the 160-byte rows of an n-gram table 80 KB chunks and hundreds of thousands of
+    # reads. Chunk boundaries do not change the stored bytes.
+    row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
+    chunk = max(request.rows_per_chunk, IMPORT_CHUNK_BYTES // row_bytes)
+    if request.target.format == "nvfp4":
+        chunk = max(128, chunk // 128 * 128)
 
     def produce(output):
         # A stacked plane starts a new run of chunks at every source boundary, because a chunk that

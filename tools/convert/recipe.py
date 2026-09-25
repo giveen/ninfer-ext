@@ -475,6 +475,11 @@ class Recipe:
 
         uses = []
         auxiliary_outputs = []
+        # Each Use reads only its own auxiliaries; index them once, in insertion order, instead of
+        # scanning every auxiliary for every Use (quadratic across a stacked expert bank).
+        auxiliaries_by_use: dict[tuple[str, str], list[tuple[str, AuxiliaryValue]]] = {}
+        for (parameter, source_input, role), value in auxiliary_values.items():
+            auxiliaries_by_use.setdefault((parameter, source_input), []).append((role, value))
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
             key = (name, input_name, "activation_input_divisor")
@@ -490,9 +495,7 @@ class Recipe:
                 raise ValueError(f"{name}: provide its independent activation divisor")
             use = {"parameter": name, "input": input_name, "activation_policy": policy}
             referenced = {}
-            for (parameter, source_input, role), value in auxiliary_values.items():
-                if (parameter, source_input) != (name, input_name):
-                    continue
+            for role, value in auxiliaries_by_use.get((name, input_name), ()):
                 if role == "activation_input_divisor":
                     if value.format != "fp32" or value.shape != ():
                         raise ValueError(
