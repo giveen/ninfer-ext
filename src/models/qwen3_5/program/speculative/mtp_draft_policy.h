@@ -25,6 +25,16 @@ namespace ninfer::models::qwen3_5 {
 // in [2, 7], and every further rung costs another graph family.
 std::vector<std::uint32_t> mtp_draft_ladder(std::uint32_t draft_window, bool adaptive);
 
+// Whether rounds of several requests decode without drafts. A model whose routed experts live in
+// Host memory pays for every distinct expert a round touches, and every draft column routes to its
+// own: on Qwen3.8-Flash-Next a K=3 batch round committed 18%, 39% and 44% fewer tokens per second
+// than plain decode at concurrency 2, 4 and 8. Its adaptive policy therefore runs batches as
+// ordinary rounds that only append the MTP layer's KV; a fixed draft length keeps drafting, since
+// it asks for that length.
+[[nodiscard]] constexpr bool mtp_plain_batches(bool adaptive, bool host_resident_experts) noexcept {
+    return adaptive && host_resident_experts;
+}
+
 // Draft length a round uses whenever more than one request decodes together, and the length a
 // request starts on. Measured on the dense 27B graphs with mixed workloads, no longer draft raised
 // aggregate throughput at concurrency 2, 4 or 8: the wider verify costs more than the extra

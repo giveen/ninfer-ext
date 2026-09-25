@@ -38,7 +38,10 @@ head are separate experimental dimensions. Published MTP rows pin one draft leng
 `--fixed-draft`; without it `--draft-tokens N` is the ceiling of the adaptive policy. A single
 request picks 2, 3, 4 or N drafts per round from its measured acceptance and the startup-measured
 round times; rounds with several requests draft 3, where a longer draft raised no aggregate
-throughput at concurrency 2, 4 or 8.
+throughput at concurrency 2, 4 or 8. Qwen3.8-Flash-Next, whose routed experts live in Host memory,
+runs rounds with several requests as ordinary decode that only appends the MTP layer's KV: every
+draft column fetches experts of its own, and a K=3 batch round committed 18-44% fewer tokens per
+second than plain decode at concurrency 2 to 8.
 
 ## Workloads and measurement boundaries
 

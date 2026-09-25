@@ -254,7 +254,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .plain_batches  = plan.plain_mtp_batches});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16,
                    {dimension(config.residual_width()), effective_prefill_chunk},
@@ -462,6 +463,11 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
             body(ordinary, batch, false);
             logits(ordinary, batch);
             scratch(ordinary, ops::sampling_workspace_capacity_bytes(public_tokens, batch, batch));
+            if (plan.plain_mtp_batches) {
+                auto append = ordinary.scope();
+                (void)ordinary.alloc(DType::BF16, {wide, batch});
+                mtp_core(ordinary, batch);
+            }
             out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
             if (plan.features.mtp()) {
                 const std::int32_t aggregate = batch * verify;
@@ -1165,7 +1171,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_storage          = inputs.kv_storage;
     impl->expert_cache_slots  = inputs.expert_cache_slots;
     impl->ngram_stream        = inputs.ngram_stream;
-    impl->persistent          = persistent_layout(*impl);
+    impl->plain_mtp_batches =
+        inputs.speculative_backend == SpeculativeBackend::Mtp && !inputs.causal_scoring &&
+        inputs.max_concurrency > 1 &&
+        mtp_plain_batches(inputs.adaptive_draft, inputs.parameters->model.config().text.qwen4());
+    impl->persistent = persistent_layout(*impl);
     if (impl->context_cache.host_cache_budget_bytes) {
         // The budget is resolved on the finished layout, before anything consumes the plan's
         // context-cache shape: the Program sizes its Host pools from it and the Engine publishes
@@ -1195,7 +1205,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const std::vector<std::uint32_t> ladder =
                 mtp_draft_ladder(impl->draft_window, impl->adaptive_draft);
             const std::size_t batch_rung = mtp_batch_rung(ladder);
-            std::size_t allowance        = 0;
+            // Plain batches replay ordinary graphs for two or more requests instead.
+            std::size_t allowance =
+                impl->plain_mtp_batches
+                    ? checked_mul(12ULL * kMiB, impl->max_concurrency - 1U,
+                                  "ordinary exact-b graph allowance")
+                    : 0;
             for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
                 const std::uint32_t k = ladder[rung];
                 const auto profiles = mtp_graph_profiles(impl->capacity, k);
@@ -1211,7 +1226,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                         return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                                     },
                                     "MTP graph allowance"),
-                                rung == batch_rung ? impl->max_concurrency : 1U,
+                                rung == batch_rung && !impl->plain_mtp_batches
+                                    ? impl->max_concurrency
+                                    : 1U,
                                 "MTP exact-b graph allowance"),
                     "MTP draft ladder graph allowance");
             }

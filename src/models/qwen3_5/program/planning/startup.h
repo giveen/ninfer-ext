@@ -142,6 +142,8 @@ struct SequencePlanImpl {
     ContextCacheOptions context_cache;
     std::uint32_t expert_cache_slots = 0;
     bool ngram_stream                = false;
+    // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
+    bool plain_mtp_batches = false;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

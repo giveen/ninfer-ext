@@ -55,7 +55,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (!spec.causal_scoring && spec.backend == SpeculativeBackend::None) {
+    if (!spec.causal_scoring && (spec.backend == SpeculativeBackend::None || spec.plain_batches)) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
@@ -110,6 +110,8 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
     state_destination_slots =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    mtp_kv_table_rows =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, mtp_kv_table_rows), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));

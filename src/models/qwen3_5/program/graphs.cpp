@@ -304,7 +304,8 @@ void ProgramImpl::prepare_graphs() {
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->state_source_slots[row] = capture_state_slot(row);
                 ordinary_host_ingress->state_destination_slots[row] = capture_state_slot(row);
-                ordinary_host_ingress->sampling[row]                = {};
+                ordinary_host_ingress->mtp_kv_table_rows[row] = static_cast<std::int32_t>(row);
+                ordinary_host_ingress->sampling[row]          = {};
             }
         }
     };
@@ -324,23 +325,30 @@ void ProgramImpl::prepare_graphs() {
             qwen4_execution()};
     };
 
-    if (speculative_backend == SpeculativeBackend::None) {
+    if (io.ordinary) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // Plain MTP batches run ordinary rounds only for two or more requests.
+        const std::uint32_t first_batch = plain_mtp_batches ? 2U : 1U;
         execution::OrdinaryBatchContext ordinary_state{
-            execution_core(),      decoder->text_kv,
-            *io.ordinary,          *ordinary_host_ingress,
-            *ordinary_host_egress, state_images->continuation_hidden_store()};
+            execution_core(),
+            decoder->text_kv,
+            *io.ordinary,
+            *ordinary_host_ingress,
+            *ordinary_host_egress,
+            state_images->continuation_hidden_store(),
+            plain_mtp_batches ? decoder->mtp_cache() : nullptr};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
-        prepare_representative(code_warm.min, 1);
+        prepare_representative(code_warm.min, first_batch);
         device.synchronize();
-        execution::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
-                                         nullptr);
+        execution::ordinary_decode_batch(ordinary_state, static_cast<std::int32_t>(first_batch),
+                                         {code_warm.min + 1, code_warm.max + 1}, nullptr);
         device.synchronize();
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+        for (std::uint32_t batch_size = first_batch; batch_size <= ordinary_batch_limit;
+             ++batch_size) {
             for (const GraphExecutionProfile planned : ordinary_profiles) {
                 ordinary_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
@@ -366,7 +374,9 @@ void ProgramImpl::prepare_graphs() {
             MtpRung& rung         = mtp_rungs[rung_index];
             const std::uint32_t k = rung.k;
             // Rounds with several requests always run the batch rung; the others serve one.
-            const std::uint32_t batch_limit = rung_index == batch_rung ? max_concurrency : 1U;
+            // Plain batches never replay an MTP rung for more than one request.
+            const std::uint32_t batch_limit =
+                rung_index == batch_rung && !plain_mtp_batches ? max_concurrency : 1U;
             const auto planned_profiles     = mtp_graph_profiles(capacity, k);
             validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
             execution::MtpBatchContext mtp_state{execution_core(&rung.records),
