@@ -218,19 +218,22 @@ int test_measurement_contract() {
     failures += expect_u32(tg.requested_output_tokens(), 129, "tg begin plus G outputs");
     failures +=
         expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
+    // Speculative contexts cover the MTP lookahead, round up to 64-token pages and add the
+    // Program's two-page lease cushion, so the lease can grow to the final frontier.
     failures += expect_u32(pp.required_context({}), 512, "pp context");
-    failures += expect_u32(pp.required_context(mtp5), 522, "MTP pp context");
+    failures += expect_u32(pp.required_context(mtp5), 704, "MTP pp context");
     failures += expect_u32(tg.required_context({}), 129, "tg context");
-    failures += expect_u32(tg.required_context(mtp5), 139, "MTP tg context");
-    failures += expect_u32(combined.required_context(mtp5), 2186, "MTP combined context");
+    failures += expect_u32(tg.required_context(mtp5), 320, "MTP tg context");
+    failures += expect_u32(combined.required_context({}), 2176, "combined context");
+    failures += expect_u32(combined.required_context(mtp5), 2368, "MTP combined context");
     failures +=
         expect_u32(qb::decode_graph_prime_output_tokens(mtp5), 13, "MTP graph-prime outputs");
     failures +=
-        expect_u32(qb::decode_graph_prime_required_context(mtp5), 23, "MTP graph-prime context");
+        expect_u32(qb::decode_graph_prime_required_context(mtp5), 192, "MTP graph-prime context");
 
     const std::vector<qb::BenchTest> matrix = {pp, tg, combined};
     failures +=
-        expect_u32(qb::resolve_max_context(matrix, std::nullopt, mtp5, true), 2186, "auto context");
+        expect_u32(qb::resolve_max_context(matrix, std::nullopt, mtp5, true), 2368, "auto context");
     failures +=
         expect_u32(qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), mtp5, true),
                    4096, "explicit context");
@@ -241,8 +244,9 @@ int test_measurement_contract() {
         "undersized context");
     const ninfer::SpeculativeOptions dflash2{ninfer::SpeculativeBackend::DFlash2, 15};
     failures +=
-        expect_u32(combined.required_context(dflash2), 2176, "DFlash2 uses no MTP lookahead KV");
-    failures += expect_u32(qb::decode_graph_prime_required_context(dflash2), 33,
+        expect_u32(combined.required_context(dflash2), 2304,
+                   "DFlash2 adds the lease cushion but no MTP lookahead KV");
+    failures += expect_u32(qb::decode_graph_prime_required_context(dflash2), 192,
                            "DFlash2 full rounds fit the prime context");
     failures += expect_string(qb::decode_path_name(true, dflash2), "dflash2_cuda_graph",
                               "DFlash2 report route");

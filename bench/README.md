@@ -86,12 +86,18 @@ For a DFlash2 companion artifact:
 ```bash
 ./build/bench/ninfer_bench --weights out/qwen3_8_27b_nvfp4.ninfer \
   -pg '2048,128' --spec dflash2 --draft-tokens 7 --lm-head-draft \
-  --max-ctx 4096 --kv-dtype bf16 --warmup 1 -r 3
+  --kv-dtype bf16 --warmup 1 -r 3
 ```
 
 The benchmark disables context retention because every repetition is an independent root request.
 Schema v15 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
-JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
+JSON and CSV identify DFlash2 explicitly.
+
+For speculative runs, the automatic context covers the whole generation. MTP alone adds lookahead
+KV for drafts past the final frontier. Every speculative backend then rounds up to 64-token pages
+and adds the Program's Device KV lease cushion, `ceil((2K + 2) / 64) + 1` pages. Without that
+cushion the lease settles early and the run ends short of its requested output. An explicit
+`--max-ctx` smaller than this requirement is rejected.
 
 ### Inference speed-of-light estimate
 

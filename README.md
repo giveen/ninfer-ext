@@ -135,7 +135,8 @@ All values are tok/s; percentages are MTP draft acceptance.
   after 1 warm-up, and the default prefill chunk.
 - **Commands.** `-p 512,4096,16384 -n 128 -pg 2048,128` without speculation. With speculation:
   `-n 128 -pg 2048,128 --max-ctx 4096`, plus `--spec mtp` or
-  `--spec mtp --draft-tokens 3 --fixed-draft`.
+  `--spec mtp --draft-tokens 3 --fixed-draft`. `--max-ctx` is no longer needed, because
+  `ninfer_bench` now sizes the context for speculative runs itself.
 - **`tg128` acceptance.** `tg128` decodes from a one-token seed, so its MTP acceptance depends on the
   generated text.
 - **MTP after the bench prompt isn't reported.** After the 2,048-token corpus prompt, drafts are
