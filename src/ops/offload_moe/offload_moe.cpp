@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -175,6 +176,10 @@ ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWe
     return out;
 }
 
+std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept {
+    return slots <= 4096 ? std::numeric_limits<std::int32_t>::max() : 1024 / kOffloadMoeTopK;
+}
+
 std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots) {
     if (tokens <= 0) { throw std::invalid_argument("moe_experts_workspace_bytes: T <= 0"); }
     return chunk_layout(std::min(tokens, kChunkColumns), slots).total + 256;
@@ -198,9 +203,9 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
                 weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
             op, "expert divisors are required");
-    const std::int32_t chunk = std::min(columns, kChunkColumns);
-    require(chunk * kOffloadMoeTopK <= 1024 || slots <= 4096, op,
+    require(columns <= moe_experts_max_columns(slots), op,
             "large token chunks require a staged bank indexed by expert id");
+    const std::int32_t chunk = std::min(columns, kChunkColumns);
     const ChunkLayout layout = chunk_layout(chunk, slots);
     auto scope               = workspace.scope();
     auto* base               = static_cast<std::byte*>(workspace.alloc_bytes(layout.total).data);

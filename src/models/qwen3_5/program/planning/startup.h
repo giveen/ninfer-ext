@@ -20,8 +20,11 @@ namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
-// Qwen4Exp calls with at least this many columns stream whole routed-expert layers.
-inline constexpr std::int32_t kQwen4StagedColumns = 256;
+// Qwen4Exp calls with at least this many columns stream whole routed-expert layers; narrower ones
+// fetch their misses into the expert cache. Past 102 columns a cache-route call must split (its
+// job sort holds 1024 assignments) while routing already touches most of each layer's experts:
+// cold on the RTX 5090, 60 tokens take 1.2 s cached vs 1.6 s staged, 111 take 2.0 s vs 1.6 s.
+inline constexpr std::int32_t kQwen4StagedColumns = 103;
 // Default text-prefill chunks when EngineOptions leaves the chunk open. Every Qwen4Exp chunk of
 // at least kQwen4StagedColumns streams each host-resident expert layer once, so a longer chunk
 // divides that traffic; other models keep the shorter chunk.

@@ -555,7 +555,8 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
     }
 
     // Cache route in column groups the slot pool can hold at once.
-    const std::int32_t group = std::min(T, cache.slots / ops::kOffloadMoeTopK);
+    const std::int32_t group = std::min(
+        {T, cache.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache.slots)});
     if (group <= 0) { throw std::logic_error("expert cache holds fewer slots than one column"); }
     const ops::ExpertWeights slots = ops::expert_cache_weights(cache, p.bank);
     for (std::int32_t begin = 0; begin < T; begin += group) {
@@ -750,9 +751,9 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
     {
         std::vector<std::int32_t> local_scatter;
         std::int32_t visual_begin = 0;
-        if (vision_chunk.control != nullptr) {
+        if (!vision_chunk.scatter.empty()) {
             const auto scatter =
-                std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
+                vision_chunk.scatter;
             const auto begin = std::ranges::lower_bound(scatter, prompt_t0);
             const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
             visual_begin     = static_cast<std::int32_t>(begin - scatter.begin());
@@ -867,9 +868,9 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
             if (multimodal != nullptr) {
                 mtp_embeddings = work_.alloc(DType::BF16, {H, len});
                 ops::embedding(mtp_ids, *embed_, mtp_embeddings, s);
-                if (vision_chunk.control != nullptr) {
+                if (!vision_chunk.scatter.empty()) {
                     const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
-                        vision_chunk.control->scatter_indices, alignment_tokens, window);
+                        vision_chunk.scatter, alignment_tokens, window);
                     if (!overlap.empty()) {
                         Tensor shifted = workspace::visual_scatter_indices(
                             work_, static_cast<std::int32_t>(overlap.size()));

@@ -121,6 +121,12 @@ void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots);
 
 /**
+ * Most columns one moe_experts call over a pool of `slots` slots accepts: job building sorts a
+ * call's assignments in shared memory, or counts per slot when the pool has at most 4096 slots.
+ */
+[[nodiscard]] std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept;
+
+/**
  * Routed expert SwiGLU and down projections, routing-weight merge and shared expert:
  *
  *   y[:,t] = sum_k weights[k,t] * down_e(silu(gate_e x_t) * up_e x_t) + shared_gate[t] *
