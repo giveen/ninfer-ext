@@ -1,5 +1,6 @@
 // Qwen Sparse Attention Ops at the Qwen3.8-Flash-Next geometry (24/2 heads of 256, indexer 4x128,
-// budget 2048 in blocks of 4) with the BF16 KV profile over permuted physical pages.
+// budget 2048 in blocks of 4) over permuted physical pages. qsa_attention runs over both the BF16
+// and the FP8 (row-scaled E4M3, Hadamard-rotated K) KV profiles.
 //
 // qsa_append is exact. qsa_select is compared with an FP64 oracle of the block scores; a block may
 // differ from the oracle only when its oracle score lies within a near-tie allowance of the
@@ -89,6 +90,35 @@ std::vector<double> rotate(std::vector<double> v, const std::int32_t position[3]
         v[i]               = x0 * std::cos(angle) - x1 * std::sin(angle);
         v[i + kRotary / 2] = x1 * std::cos(angle) + x0 * std::sin(angle);
     }
+    return v;
+}
+
+double e4m3_value(std::uint8_t code) {
+    const int e    = (code >> 3) & 0xF;
+    const int m    = code & 7;
+    const double v = e == 0 ? m * std::ldexp(1.0, -9) : (1.0 + m / 8.0) * std::ldexp(1.0, e - 7);
+    return (code & 0x80) != 0 ? -v : v;
+}
+
+double half_value(std::uint16_t bits_value) {
+    __half h;
+    std::memcpy(&h, &bits_value, 2);
+    return double(__half2float(h));
+}
+
+// Normalized natural-order Sylvester transform, H[i][j] = (-1)^popcount(i & j) / 16: the rotation
+// FP8 K rows are stored in.
+std::vector<double> hadamard256(std::vector<double> v) {
+    for (std::size_t span = 1; span < v.size(); span <<= 1) {
+        for (std::size_t base = 0; base < v.size(); base += 2 * span) {
+            for (std::size_t i = base; i < base + span; ++i) {
+                const double low = v[i], high = v[i + span];
+                v[i]        = low + high;
+                v[i + span] = low - high;
+            }
+        }
+    }
+    for (double& x : v) { x /= 16.0; }
     return v;
 }
 
@@ -217,6 +247,28 @@ int main() {
             ++failures;
         }
     }
+
+    // The FP8 profile over the same tokens: K rows Hadamard-rotated, both planes row-scaled E4M3.
+    const std::size_t scale_elements = static_cast<std::size_t>(kPage) * kKvHeads * kPages;
+    DeviceBuffer k8_pages            = to_device(std::vector<std::uint8_t>(page_elements, 0));
+    DeviceBuffer v8_pages            = to_device(std::vector<std::uint8_t>(page_elements, 0));
+    DeviceBuffer k8_scales           = to_device(std::vector<std::uint16_t>(scale_elements, 0));
+    DeviceBuffer v8_scales           = to_device(std::vector<std::uint16_t>(scale_elements, 0));
+    PagedKVBatchLayerView kv8{
+        .k_pages       = Tensor(k8_pages.p, DType::FP8_E4M3FN, {kHeadDim, kPage, kKvHeads, kPages}),
+        .v_pages       = Tensor(v8_pages.p, DType::FP8_E4M3FN, {kHeadDim, kPage, kKvHeads, kPages}),
+        .k_scale_pages = Tensor(k8_scales.p, DType::FP16, {kPage, kKvHeads, kPages}),
+        .v_scale_pages = Tensor(v8_scales.p, DType::FP16, {kPage, kKvHeads, kPages}),
+        .block_tables  = ttables,
+        .head_dim      = kHeadDim,
+        .num_kv_heads  = kKvHeads,
+        .storage       = KvCacheStorage::Fp8E4M3Row256};
+    ops::qsa_append(tk, tv, tindex, trope, tcache, nullptr, trows, kv8, plane, nullptr);
+    cuda_synchronize();
+    const auto k8_host  = from_device<std::uint8_t>(k8_pages, page_elements);
+    const auto v8_host  = from_device<std::uint8_t>(v8_pages, page_elements);
+    const auto k8_scale = from_device<std::uint16_t>(k8_scales, scale_elements);
+    const auto v8_scale = from_device<std::uint16_t>(v8_scales, scale_elements);
 
     // ---- select: lane 0 is sparse (n > 2051), lane 1 dense; lane 1's last column is invalid ----
     constexpr std::int32_t W            = 3;
@@ -360,9 +412,20 @@ int main() {
     // ---- attention: FP64 softmax over each column's selection ----
     // Narrow calls split every selection across CTAs; a call of 256+ (column, KV head) pairs
     // runs one CTA per pair. Both routes are compared with the same oracle.
+    // FP8 reads each stored code times its row scale and rotates the query like the stored keys.
     const auto attend = [&](const std::string& label, std::int32_t width,
                             const std::vector<int>& sel, const std::vector<int>& cnt,
-                            std::uint32_t seed) {
+                            std::uint32_t seed, bool fp8) {
+        const auto key = [&](int b, int token, int kvh, int d) {
+            const std::size_t at = key_at(b, token, kvh, d);
+            return fp8 ? e4m3_value(k8_host[at]) * half_value(k8_scale[at / kHeadDim])
+                       : double(bf16_to_f32(k_host[at]));
+        };
+        const auto value = [&](int b, int token, int kvh, int d) {
+            const std::size_t at = key_at(b, token, kvh, d);
+            return fp8 ? e4m3_value(v8_host[at]) * half_value(v8_scale[at / kHeadDim])
+                       : half_value(v_host[at]);
+        };
         const auto q = random_bf16(
             static_cast<std::size_t>(kHeadDim) * kQueryHeads * width * kLanes, seed, -1.0F, 1.0F);
         DeviceBuffer dq = to_device(bits(q)), dsel = to_device_i32(sel), dcnt = to_device_i32(cnt);
@@ -373,7 +436,7 @@ int main() {
         Tensor tout(out.data(), DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
         const float scale = 1.0F / 16.0F;
         WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, width * kLanes));
-        ops::qsa_attention(tq, ts, tc, trows, kv, scale, workspace, tout, nullptr);
+        ops::qsa_attention(tq, ts, tc, trows, fp8 ? kv8 : kv, scale, workspace, tout, nullptr);
         cuda_synchronize();
         std::vector<double> reference(q.size(), 0.0);
         for (int b = 0; b < kLanes; ++b) {
@@ -385,13 +448,14 @@ int main() {
                     const int kvh = h / (kQueryHeads / kKvHeads);
                     const float* qrow =
                         q.data() + (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
+                    std::vector<double> query(qrow, qrow + kHeadDim);
+                    if (fp8) { query = hadamard256(std::move(query)); }
                     std::vector<double> logits(count);
                     double max_logit = -1e300;
                     for (int j = 0; j < count; ++j) {
                         double dot = 0.0;
                         for (int d = 0; d < kHeadDim; ++d) {
-                            dot +=
-                                double(qrow[d]) * bf16_to_f32(k_host[key_at(b, list[j], kvh, d)]);
+                            dot += query[d] * key(b, list[j], kvh, d);
                         }
                         logits[j] = dot * scale;
                         max_logit = std::max(max_logit, logits[j]);
@@ -405,10 +469,7 @@ int main() {
                                 (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
                     for (int j = 0; j < count; ++j) {
                         for (int d = 0; d < kHeadDim; ++d) {
-                            __half hv;
-                            const std::uint16_t word = v_host[key_at(b, list[j], kvh, d)];
-                            std::memcpy(&hv, &word, 2);
-                            o[d] += logits[j] / denominator * double(__half2float(hv));
+                            o[d] += logits[j] / denominator * value(b, list[j], kvh, d);
                         }
                     }
                 }
@@ -441,25 +502,29 @@ int main() {
         return sel;
     };
 
-    // The device selection: 6 columns split every selection.
-    failures += attend("qsa_attention select", W, sel_host, cnt_host, 0x31U);
-    // Decode width: a full selection beside a single key, so later splits of the short column
-    // are empty.
-    {
-        const std::vector<int> counts = {g.max_selected(), 1};
-        failures += attend("qsa_attention decode", 1, synthetic(1, counts), counts, 0x32U);
-    }
-    // 128 columns x 2 KV heads fill the GPU: one CTA per pair, counts from 0 to the maximum.
-    {
-        constexpr std::int32_t kWide = 64;
-        std::vector<int> counts(static_cast<std::size_t>(kWide) * kLanes);
-        for (std::size_t c = 0; c < counts.size(); ++c) {
-            counts[c] =
-                static_cast<int>((c * 977U) % static_cast<std::size_t>(g.max_selected() + 1));
+    for (const bool fp8 : {false, true}) {
+        const std::string profile = fp8 ? "qsa_attention FP8 " : "qsa_attention ";
+        // The device selection: 6 columns split every selection.
+        failures += attend(profile + "select", W, sel_host, cnt_host, 0x31U, fp8);
+        // Decode width: a full selection beside a single key, so later splits of the short column
+        // are empty.
+        {
+            const std::vector<int> counts = {g.max_selected(), 1};
+            failures += attend(profile + "decode", 1, synthetic(1, counts), counts, 0x32U, fp8);
         }
-        counts[1] = 0;
-        counts[2] = g.max_selected();
-        failures += attend("qsa_attention wide", kWide, synthetic(kWide, counts), counts, 0x33U);
+        // 128 columns x 2 KV heads fill the GPU: one CTA per pair, counts from 0 to the maximum.
+        {
+            constexpr std::int32_t kWide = 64;
+            std::vector<int> counts(static_cast<std::size_t>(kWide) * kLanes);
+            for (std::size_t c = 0; c < counts.size(); ++c) {
+                counts[c] =
+                    static_cast<int>((c * 977U) % static_cast<std::size_t>(g.max_selected() + 1));
+            }
+            counts[1] = 0;
+            counts[2] = g.max_selected();
+            failures +=
+                attend(profile + "wide", kWide, synthetic(kWide, counts), counts, 0x33U, fp8);
+        }
     }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_attention correctness\n";

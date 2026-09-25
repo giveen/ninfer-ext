@@ -1,9 +1,9 @@
 // Implements: include/ninfer/ops/sparse_attention.h
 // Qwen Sparse Attention: paged append, indexer block selection and selected-key attention.
 // One CTA per query column (selection) or per (column, KV head, key split) (attention), with FP32
-// accumulation and K/V read through the same codecs the dense cache uses. BF16 K/V attention runs
-// the query group on Tensor Cores; FP8 K/V attention is scalar. Narrow calls split each selection
-// across CTAs and merge the partial softmax states.
+// accumulation and K/V read through the same codecs the dense cache uses. Attention runs each
+// query group on Tensor Cores over either cache profile. Narrow calls split each selection across
+// CTAs and merge the partial softmax states.
 #include "ops/sparse_attention/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -20,14 +20,13 @@
 #include <math_constants.h>
 
 #include <algorithm>
+#include <stdexcept>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kHeadDim      = 256;
-constexpr int kMaxKvHeads   = 8;
-constexpr int kMaxGroup     = 16;
 constexpr int kIndexDim     = kQsaIndexKeyDim;
 constexpr int kRecord       = kQsaIndexRecordWords;
 constexpr int kMaxIndexHead = 8;
@@ -441,149 +440,16 @@ constexpr std::int32_t kMinSplitKeys    = 2 * kKeyTile;
 // the running max and the softmax denominator.
 constexpr std::int32_t kPartialWords = kHeadDim + 2;
 
-// With `partial` null the CTA owns the whole selection and writes normalized output; otherwise
-// it covers keys [split * split_keys, +split_keys) and writes its partial state.
-// FP8 E4M3 row-scaled K/V: the query group is Hadamard-rotated to match the stored keys.
-__global__ void __launch_bounds__(256)
-    qsa_attention_fp8_kernel(const __nv_bfloat16* __restrict__ q,
-                         const std::int32_t* __restrict__ selected,
-                         const std::int32_t* __restrict__ counts, std::int32_t max_selected,
-                         const std::int32_t* __restrict__ table_rows,
-                         const std::int32_t* __restrict__ tables, std::int32_t table_stride,
-                         const void* k_pages, const void* v_pages, const __half* k_scales,
-                         const __half* v_scales, std::int32_t query_heads, std::int32_t kv_heads,
-                         std::int32_t width, float scale, std::int32_t split_keys,
-                         float* __restrict__ partial, __nv_bfloat16* __restrict__ out) {
-    __shared__ float qs[kMaxGroup * kHeadDim];
-    __shared__ float ks[kKeyTile * kHeadDim];
-    __shared__ float vs[kKeyTile * kHeadDim];
-    __shared__ float ps[kMaxGroup * kKeyTile];
-    __shared__ float m_s[kMaxGroup], l_s[kMaxGroup], alpha_s[kMaxGroup];
-
-    const int tid            = static_cast<int>(threadIdx.x);
-    const int warp           = tid >> 5;
-    const int lane_id        = tid & 31;
-    const int kv_head        = static_cast<int>(blockIdx.x) % kv_heads;
-    const int column         = static_cast<int>(blockIdx.x) / kv_heads;
-    const int lane           = column / width;
-    const int group          = query_heads / kv_heads;
-    const std::int32_t* list = selected + static_cast<std::int64_t>(column) * max_selected;
-    const std::int32_t first = partial == nullptr ? 0 : static_cast<int>(blockIdx.y) * split_keys;
-    const std::int32_t count =
-        partial == nullptr ? counts[column] : min(counts[column], first + split_keys);
-
-    // Load (and for FP8, Hadamard-rotate) this KV head's query group.
-    for (int h = warp; h < group; h += 8) {
-        const std::int64_t base =
-            (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim;
-        float values[8];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) { values[r] = __bfloat162float(q[base + lane_id + 32 * r]); }
-        normalized_hadamard_d256_inplace(values, lane_id);
-#pragma unroll
-        for (int r = 0; r < 8; ++r) { qs[h * kHeadDim + lane_id + 32 * r] = values[r]; }
-    }
-    if (tid < group) {
-        m_s[tid] = -CUDART_INF_F;
-        l_s[tid] = 0.0F;
-    }
-    float acc[kMaxGroup];
-#pragma unroll
-    for (int h = 0; h < kMaxGroup; ++h) { acc[h] = 0.0F; }
-    __syncthreads();
-
-    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[lane]) * table_stride;
-    for (int base = first; base < count; base += kKeyTile) {
-        const int tile = min(kKeyTile, count - base);
-        // Load K/V rows of the tile, one warp per key.
-        for (int j = warp; j < tile; j += 8) {
-            const std::int32_t token  = list[base + j];
-            const std::int32_t page   = paged_kv_physical_page(table, token);
-            const std::int32_t offset = token & kPagedKVPageMask;
-            const std::int64_t row =
-                ((static_cast<std::int64_t>(page) * kv_heads + kv_head) * kPagedKVPageSize +
-                 offset);
-            const auto* kc  = static_cast<const std::uint8_t*>(k_pages);
-            const auto* vc  = static_cast<const std::uint8_t*>(v_pages);
-            const float ksc = __half2float(k_scales[row]);
-            const float vsc = __half2float(v_scales[row]);
-            for (int d = lane_id; d < kHeadDim; d += 32) {
-                __nv_fp8_e4m3 kcode, vcode;
-                kcode.__x            = kc[row * kHeadDim + d];
-                vcode.__x            = vc[row * kHeadDim + d];
-                ks[j * kHeadDim + d] = static_cast<float>(kcode) * ksc;
-                vs[j * kHeadDim + d] = static_cast<float>(vcode) * vsc;
-            }
-        }
-        __syncthreads();
-        // Scores: one thread per (head, key).
-        for (int pair = tid; pair < group * kKeyTile; pair += blockDim.x) {
-            const int h = pair / kKeyTile;
-            const int j = pair - h * kKeyTile;
-            float s     = -CUDART_INF_F;
-            if (j < tile) {
-                float dot = 0.0F;
-                for (int d = 0; d < kHeadDim; ++d) {
-                    dot += qs[h * kHeadDim + d] * ks[j * kHeadDim + d];
-                }
-                s = dot * scale;
-            }
-            ps[h * kKeyTile + j] = s;
-        }
-        __syncthreads();
-        if (tid < group) {
-            const int h    = tid;
-            float tile_max = -CUDART_INF_F;
-            for (int j = 0; j < tile; ++j) { tile_max = fmaxf(tile_max, ps[h * kKeyTile + j]); }
-            const float m_new = fmaxf(m_s[h], tile_max);
-            const float alpha = __expf(m_s[h] - m_new);
-            float l           = l_s[h] * alpha;
-            for (int j = 0; j < kKeyTile; ++j) {
-                const float p        = j < tile ? __expf(ps[h * kKeyTile + j] - m_new) : 0.0F;
-                ps[h * kKeyTile + j] = p;
-                l += p;
-            }
-            m_s[h]     = m_new;
-            l_s[h]     = l;
-            alpha_s[h] = alpha;
-        }
-        __syncthreads();
-        // Value accumulation: thread d owns feature d for every head of the group.
-        const int d = tid;
-        for (int h = 0; h < group; ++h) {
-            float sum = 0.0F;
-            for (int j = 0; j < tile; ++j) { sum += ps[h * kKeyTile + j] * vs[j * kHeadDim + d]; }
-            acc[h] = acc[h] * alpha_s[h] + sum;
-        }
-        __syncthreads();
-    }
-    const int d = tid;
-    if (partial != nullptr) {
-        const std::int64_t state =
-            (static_cast<std::int64_t>(blockIdx.x) * gridDim.y + blockIdx.y) * group;
-        for (int h = 0; h < group; ++h) {
-            float* p = partial + (state + h) * kPartialWords;
-            p[d]     = acc[h];
-            if (d == 0) {
-                p[kHeadDim]     = m_s[h];
-                p[kHeadDim + 1] = l_s[h];
-            }
-        }
-        return;
-    }
-    for (int h = 0; h < group; ++h) {
-        const std::int64_t index =
-            (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim + d;
-        const float value = count > 0 && l_s[h] > 0.0F ? acc[h] / l_s[h] : 0.0F;
-        out[index]        = __float2bfloat16_rn(value);
-    }
-}
-
-// Tensor Core attention over a BF16 K / FP16 V cache. One CTA of four warps per (column, KV head,
-// split) runs the query group as a 16-row MMA tile (rows past the group are zero) against
-// gathered 32-key tiles: S = Q K^T with BF16 MMA, an FP32 online softmax, then O += P V with FP16
-// MMA where P is rounded to FP16. K/V tiles are double-buffered through cp.async. Output and
-// partial states match qsa_attention_fp8_kernel.
+// Tensor Core attention. One CTA of four warps per (column, KV head, split) runs the query group
+// as a 16-row MMA tile (rows past the group are zero) against gathered 32-key tiles: S = Q K^T, an
+// FP32 online softmax, then O += P V with FP16 MMA where P is rounded to FP16.
+//   BF16 cache (BF16 K, FP16 V): S uses BF16 MMA on the stored rows; K/V tiles are double-buffered
+//   through cp.async.
+//   FP8 cache (row-scaled E4M3, K Hadamard-rotated): the codes are double-buffered through
+//   cp.async and widened exactly to FP16 tiles; Q is rotated like K and rounded to FP16; S uses
+//   FP16 MMA and then each key's scale, and each key's V scale is folded into P before rounding.
+// With `partial` null the CTA owns the whole selection and writes normalized output; otherwise it
+// covers keys [split * split_keys, +split_keys) and writes its partial state.
 namespace mma_attention {
 
 constexpr int kRows      = 16;
@@ -594,13 +460,19 @@ constexpr int kPStride   = kKeys + 8;    // FP16 P row stride, off the 128-byte 
 constexpr int kRowBytes  = kHeadDim * 2;
 constexpr int kTileBytes = kKeys * kRowBytes;
 
+// 16-bit K/V tiles: two BF16/FP16 buffers, or one FP16 buffer the FP8 codes widen into.
+template <bool Fp8>
 struct Shared {
+    static constexpr int kTiles = Fp8 ? 1 : 2;
     alignas(16) std::uint8_t q[kRows * kRowBytes];
-    alignas(16) std::uint8_t k[2][kTileBytes];
-    alignas(16) std::uint8_t v[2][kTileBytes];
+    alignas(16) std::uint8_t k[kTiles][kTileBytes];
+    alignas(16) std::uint8_t v[kTiles][kTileBytes];
+    alignas(16) std::uint8_t codes[Fp8 ? 2 : 1][2][Fp8 ? kKeys * kHeadDim : 16]; // [buf][K|V]
+    std::int64_t rows[Fp8 ? 2 : 1][kKeys];                                     // -1 when absent
     alignas(16) __half p[kRows * kPStride];
     float s[kRows * kKeys];
     float m[kRows], l[kRows], alpha[kRows];
+    float k_scale[kKeys], v_scale[kKeys];
 };
 
 // Byte offset of 16-byte chunk `chunk` of row `row` in a swizzled 512-byte-row tile.
@@ -615,20 +487,22 @@ __device__ __forceinline__ unsigned pack_half2(float a, float b) {
 
 } // namespace mma_attention
 
+template <bool Fp8>
 __global__ void __launch_bounds__(mma_attention::kThreads)
     qsa_attention_mma_kernel(const __nv_bfloat16* __restrict__ q,
                              const std::int32_t* __restrict__ selected,
                              const std::int32_t* __restrict__ counts, std::int32_t max_selected,
                              const std::int32_t* __restrict__ table_rows,
                              const std::int32_t* __restrict__ tables, std::int32_t table_stride,
-                             const __nv_bfloat16* __restrict__ k_pages,
-                             const __half* __restrict__ v_pages, std::int32_t query_heads,
+                             const void* __restrict__ k_pages, const void* __restrict__ v_pages,
+                             const __half* __restrict__ k_scales,
+                             const __half* __restrict__ v_scales, std::int32_t query_heads,
                              std::int32_t kv_heads, std::int32_t width, float scale,
                              std::int32_t split_keys, float* __restrict__ partial,
                              __nv_bfloat16* __restrict__ out) {
     using namespace mma_attention;
     extern __shared__ __align__(16) std::uint8_t raw_shared[];
-    Shared& sh = *reinterpret_cast<Shared*>(raw_shared);
+    Shared<Fp8>& sh = *reinterpret_cast<Shared<Fp8>*>(raw_shared);
 
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
@@ -645,25 +519,46 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
     const std::int32_t* table =
         tables + static_cast<std::int64_t>(table_rows[column / width]) * table_stride;
 
+    const auto key_row = [&](int base, int j) -> std::int64_t {
+        if (base + j >= count) { return -1; }
+        const std::int32_t token = list[base + j];
+        return (static_cast<std::int64_t>(paged_kv_physical_page(table, token)) * kv_heads +
+                kv_head) *
+                   kPagedKVPageSize +
+               (token & kPagedKVPageMask);
+    };
     // Gather keys [base, base + kKeys) of the selection into buffer `buf`; missing keys are zero.
     auto stage = [&](int buf, int base) {
+        if constexpr (!Fp8) {
+            const auto* kb = static_cast<const __nv_bfloat16*>(k_pages);
+            const auto* vh = static_cast<const __half*>(v_pages);
 #pragma unroll 4
-        for (int item = tid; item < kKeys * kChunks; item += kThreads) {
-            const int j     = item / kChunks;
-            const int chunk = item - j * kChunks;
-            const bool live = base + j < count;
-            std::int64_t row = 0;
-            if (live) {
-                const std::int32_t token = list[base + j];
-                row = (static_cast<std::int64_t>(paged_kv_physical_page(table, token)) * kv_heads +
-                       kv_head) *
-                          kPagedKVPageSize +
-                      (token & kPagedKVPageMask);
+            for (int item = tid; item < kKeys * kChunks; item += kThreads) {
+                const int j                = item / kChunks;
+                const int chunk            = item - j * kChunks;
+                const std::int64_t row     = key_row(base, j);
+                const std::int64_t element = max(row, std::int64_t{0}) * kHeadDim + chunk * 8;
+                const int offset           = swizzle(j, chunk);
+                const int bytes            = row >= 0 ? 16 : 0;
+                cp_async_zfill<16, Cache::cg>(&sh.k[buf][offset], kb + element, bytes);
+                cp_async_zfill<16, Cache::cg>(&sh.v[buf][offset], vh + element, bytes);
             }
-            const std::int64_t element = row * kHeadDim + chunk * 8;
-            const int offset           = swizzle(j, chunk);
-            cp_async_zfill<16, Cache::cg>(&sh.k[buf][offset], k_pages + element, live ? 16 : 0);
-            cp_async_zfill<16, Cache::cg>(&sh.v[buf][offset], v_pages + element, live ? 16 : 0);
+        } else {
+            // 16 chunks of 16 codes per row, unswizzled; the widening pass swizzles.
+            const auto* kc = static_cast<const std::uint8_t*>(k_pages);
+            const auto* vc = static_cast<const std::uint8_t*>(v_pages);
+            if (tid < kKeys) { sh.rows[buf][tid] = key_row(base, tid); }
+#pragma unroll 4
+            for (int item = tid; item < kKeys * 16; item += kThreads) {
+                const int j                = item / 16;
+                const int chunk            = item - j * 16;
+                const std::int64_t row     = key_row(base, j);
+                const std::int64_t element = max(row, std::int64_t{0}) * kHeadDim + chunk * 16;
+                const int offset           = j * kHeadDim + chunk * 16;
+                const int bytes            = row >= 0 ? 16 : 0;
+                cp_async_zfill<16, Cache::cg>(&sh.codes[buf][0][offset], kc + element, bytes);
+                cp_async_zfill<16, Cache::cg>(&sh.codes[buf][1][offset], vc + element, bytes);
+            }
         }
     };
 
@@ -671,17 +566,40 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
     cp_commit();
 
     // The query group, rows past the group zero.
-    for (int item = tid; item < kRows * kChunks; item += kThreads) {
-        const int h     = item / kChunks;
-        const int chunk = item - h * kChunks;
-        uint4 value     = make_uint4(0, 0, 0, 0);
-        if (h < group) {
-            value = *reinterpret_cast<const uint4*>(
-                q + (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) *
-                        kHeadDim +
-                chunk * 8);
+    if constexpr (!Fp8) {
+        for (int item = tid; item < kRows * kChunks; item += kThreads) {
+            const int h     = item / kChunks;
+            const int chunk = item - h * kChunks;
+            uint4 value     = make_uint4(0, 0, 0, 0);
+            if (h < group) {
+                value = *reinterpret_cast<const uint4*>(
+                    q + (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) *
+                            kHeadDim +
+                    chunk * 8);
+            }
+            *reinterpret_cast<uint4*>(&sh.q[swizzle(h, chunk)]) = value;
         }
-        *reinterpret_cast<uint4*>(&sh.q[swizzle(h, chunk)]) = value;
+    } else {
+        // One warp per head: lane l rotates dimensions l + 32 r, then stores them as FP16.
+        for (int h = warp; h < kRows; h += kThreads / 32) {
+            float values[8] = {};
+            if (h < group) {
+                const std::int64_t base =
+                    (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) *
+                    kHeadDim;
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    values[r] = __bfloat162float(q[base + lane_id + 32 * r]);
+                }
+                normalized_hadamard_d256_inplace(values, lane_id);
+            }
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int d = lane_id + 32 * r;
+                *reinterpret_cast<__half*>(&sh.q[swizzle(h, d / 8) + (d % 8) * 2]) =
+                    __float2half_rn(values[r]);
+            }
+        }
     }
     if (tid < kRows) {
         sh.m[tid] = -CUDART_INF_F;
@@ -712,6 +630,32 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             cp_wait<0>();
         }
         __syncthreads();
+        const int tile = Fp8 ? 0 : buf;
+
+        if constexpr (Fp8) {
+            // Widen this tile's codes exactly to FP16 (swizzled) and read the keys' row scales.
+            for (int item = tid; item < 2 * kKeys * 16; item += kThreads) {
+                const int plane = item / (kKeys * 16);
+                const int j     = (item / 16) % kKeys;
+                const int chunk = item % 16;
+                const uint4 codes =
+                    *reinterpret_cast<const uint4*>(&sh.codes[buf][plane][j * kHeadDim + chunk * 16]);
+                const auto* pairs = reinterpret_cast<const std::uint16_t*>(&codes);
+                uint4 wide[2];
+                auto* halves = reinterpret_cast<__half2*>(wide);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { halves[i] = kv_cache_fp8_code2_to_half2(pairs[i]); }
+                std::uint8_t* target = plane == 0 ? sh.k[0] : sh.v[0];
+                *reinterpret_cast<uint4*>(&target[swizzle(j, 2 * chunk)])     = wide[0];
+                *reinterpret_cast<uint4*>(&target[swizzle(j, 2 * chunk + 1)]) = wide[1];
+            }
+            if (tid < kKeys) {
+                const std::int64_t row = sh.rows[buf][tid];
+                sh.k_scale[tid]        = row >= 0 ? __half2float(k_scales[row]) : 0.0F;
+                sh.v_scale[tid]        = row >= 0 ? __half2float(v_scales[row]) : 0.0F;
+            }
+            __syncthreads();
+        }
 
         // S for keys [8 * warp, +8).
         {
@@ -721,17 +665,26 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             for (int pair = 0; pair < kHeadDim / 32; ++pair) {
                 unsigned b[4];
                 ldmatrix_x4(b[0], b[1], b[2], b[3],
-                            smem_addr(&sh.k[buf][swizzle(key, 4 * pair + (lane_id >> 3))]));
-                mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
-                         qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
-                mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
-                         qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
+                            smem_addr(&sh.k[tile][swizzle(key, 4 * pair + (lane_id >> 3))]));
+                if constexpr (Fp8) {
+                    mma_f16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
+                            qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
+                    mma_f16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
+                            qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
+                } else {
+                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
+                             qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
+                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
+                             qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
+                }
             }
-            const int col = warp * 8 + 2 * lid;
-            sh.s[gid * kKeys + col]           = c[0] * scale;
-            sh.s[gid * kKeys + col + 1]       = c[1] * scale;
-            sh.s[(gid + 8) * kKeys + col]     = c[2] * scale;
-            sh.s[(gid + 8) * kKeys + col + 1] = c[3] * scale;
+            const int col  = warp * 8 + 2 * lid;
+            const float s0 = Fp8 ? scale * sh.k_scale[col] : scale;
+            const float s1 = Fp8 ? scale * sh.k_scale[col + 1] : scale;
+            sh.s[gid * kKeys + col]           = c[0] * s0;
+            sh.s[gid * kKeys + col + 1]       = c[1] * s1;
+            sh.s[(gid + 8) * kKeys + col]     = c[2] * s0;
+            sh.s[(gid + 8) * kKeys + col + 1] = c[3] * s1;
         }
         __syncthreads();
 
@@ -762,8 +715,13 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             for (int offset = 1; offset < 8; offset <<= 1) {
                 sum += __shfl_xor_sync(0xffffffffu, sum, offset);
             }
+            float pv[4] = {s[0], s[1], s[2], s[3]};
+            if constexpr (Fp8) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { pv[i] *= sh.v_scale[col0 + i]; }
+            }
             *reinterpret_cast<uint2*>(&sh.p[row * kPStride + col0]) =
-                make_uint2(pack_half2(s[0], s[1]), pack_half2(s[2], s[3]));
+                make_uint2(pack_half2(pv[0], pv[1]), pack_half2(pv[2], pv[3]));
             __syncwarp();
             if ((tid & 7) == 0) {
                 const float alpha = __expf(m_old - m_new);
@@ -797,7 +755,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                     const int chunk = warp * 8 + pair * 2 + (lane_id >> 4);
                     unsigned b[4];
                     ldmatrix_x4_t(b[0], b[1], b[2], b[3],
-                                  smem_addr(&sh.v[buf][swizzle(key, chunk)]));
+                                  smem_addr(&sh.v[tile][swizzle(key, chunk)]));
                     mma_f16(acc[2 * pair][0], acc[2 * pair][1], acc[2 * pair][2],
                             acc[2 * pair][3], a[0], a[1], a[2], a[3], b[0], b[1]);
                     mma_f16(acc[2 * pair + 1][0], acc[2 * pair + 1][1], acc[2 * pair + 1][2],
@@ -989,34 +947,35 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
     const int blocks               = width * lanes * kv_heads;
     const QsaAttentionSplit split  = qsa_attention_split(width * lanes, kv_heads, selected.ne[0]);
     float* states                  = split.splits == 1 ? nullptr : partial;
-    if (kv.storage == KvCacheStorage::Fp8E4M3Row256) {
-        qsa_attention_fp8_kernel<<<dim3(blocks, split.splits), 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::int32_t*>(selected.data),
-            static_cast<const std::int32_t*>(counts.data), selected.ne[0],
-            static_cast<const std::int32_t*>(table_rows.data),
-            static_cast<const std::int32_t*>(kv.block_tables.data), kv.block_tables.ne[0],
-            kv.k_pages.data, kv.v_pages.data, static_cast<const __half*>(kv.k_scale_pages.data),
-            static_cast<const __half*>(kv.v_scale_pages.data), query_heads, kv_heads, width,
-            scale, split.split_keys, states, static_cast<__nv_bfloat16*>(out.data));
-    } else {
-        constexpr int kShared = sizeof(mma_attention::Shared);
+    if (query_heads % kv_heads != 0 || query_heads / kv_heads > mma_attention::kRows) {
+        throw std::invalid_argument("qsa_attention: a KV head serves at most 16 query heads");
+    }
+    const bool fp8 = kv.storage == KvCacheStorage::Fp8E4M3Row256;
+    auto launch    = [&]<bool Fp8>() {
+        constexpr int kShared = sizeof(mma_attention::Shared<Fp8>);
         static const bool configured = [] {
-            CUDA_CHECK(cudaFuncSetAttribute(qsa_attention_mma_kernel,
+            CUDA_CHECK(cudaFuncSetAttribute(qsa_attention_mma_kernel<Fp8>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, kShared));
             return true;
         }();
         (void)configured;
-        qsa_attention_mma_kernel<<<dim3(blocks, split.splits), mma_attention::kThreads, kShared,
-                                   stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::int32_t*>(selected.data),
-            static_cast<const std::int32_t*>(counts.data), selected.ne[0],
-            static_cast<const std::int32_t*>(table_rows.data),
-            static_cast<const std::int32_t*>(kv.block_tables.data), kv.block_tables.ne[0],
-            static_cast<const __nv_bfloat16*>(kv.k_pages.data),
-            static_cast<const __half*>(kv.v_pages.data), query_heads, kv_heads, width, scale,
-            split.split_keys, states, static_cast<__nv_bfloat16*>(out.data));
+        qsa_attention_mma_kernel<Fp8>
+            <<<dim3(blocks, split.splits), mma_attention::kThreads, kShared, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::int32_t*>(selected.data),
+                static_cast<const std::int32_t*>(counts.data), selected.ne[0],
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<const std::int32_t*>(kv.block_tables.data), kv.block_tables.ne[0],
+                kv.k_pages.data, kv.v_pages.data,
+                fp8 ? static_cast<const __half*>(kv.k_scale_pages.data) : nullptr,
+                fp8 ? static_cast<const __half*>(kv.v_scale_pages.data) : nullptr, query_heads,
+                kv_heads, width, scale, split.split_keys, states,
+                static_cast<__nv_bfloat16*>(out.data));
+    };
+    if (fp8) {
+        launch.template operator()<true>();
+    } else {
+        launch.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
     if (states != nullptr) {
