@@ -322,6 +322,34 @@ __global__ void __launch_bounds__(256)
     }
 }
 
+// CTA (e, chunk) copies chunk `chunk` of each plane of expert e into the staged bank when the
+// snapshot marked e resident: from its slot if the device still holds it, else from the bank.
+__global__ void __launch_bounds__(256)
+    expert_cache_stage_kernel(ExpertCacheState cache, std::int32_t layer,
+                              const std::int32_t* __restrict__ resident, ExpertWeights bank,
+                              ExpertWeights staged) {
+    const int expert = static_cast<int>(blockIdx.x);
+    const std::int64_t entry = static_cast<std::int64_t>(layer) * E + expert;
+    if (resident[entry] < 0) { return; }
+    const std::int32_t slot     = cache.slot_of[entry];
+    const std::int64_t sizes[4] = {kExpertGateUpCodeBytes, kExpertGateUpScaleBytes,
+                                   kExpertDownCodeBytes, kExpertDownScaleBytes};
+    std::int64_t plane_offset   = 0;
+    for (int p = 0; p < 4; ++p) {
+        const std::byte* from = slot >= 0 ? cache.pool + slot * kExpertSlotBytes + plane_offset
+                                          : bank.base[p] + expert * bank.stride[p];
+        const auto* src          = reinterpret_cast<const uint4*>(from);
+        auto* dst                = reinterpret_cast<uint4*>(
+            const_cast<std::byte*>(staged.base[p]) + expert * staged.stride[p]);
+        const std::int64_t vectors = sizes[p] / 16;
+        const std::int64_t per     = (vectors + kFetchChunks - 1) / kFetchChunks;
+        const std::int64_t begin   = static_cast<std::int64_t>(blockIdx.y) * per;
+        const std::int64_t end     = min(vectors, begin + per);
+        for (std::int64_t v = begin + threadIdx.x; v < end; v += blockDim.x) { dst[v] = src[v]; }
+        plane_offset += sizes[p];
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Job building: sort assignments by slot, then cut each slot's run into jobs of <= 64 tokens.
 
@@ -759,6 +787,14 @@ void expert_cache_resolve_launch(const Tensor& ids, std::int32_t layer,
     expert_cache_resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<std::int32_t>(ids.numel()), layer,
         cache, static_cast<std::int32_t*>(slot_ids.data), static_cast<std::int32_t*>(misses.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer,
+                               const std::int32_t* resident, const ExpertWeights& bank,
+                               const ExpertWeights& staged, cudaStream_t stream) {
+    expert_cache_stage_kernel<<<dim3(E, kFetchChunks), 256, 0, stream>>>(cache, layer, resident,
+                                                                          bank, staged);
     CUDA_CHECK(cudaGetLastError());
 }
 

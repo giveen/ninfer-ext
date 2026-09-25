@@ -103,6 +103,17 @@ void expert_cache_resolve(const Tensor& ids, std::int32_t layer, const ExpertCac
 void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::int32_t max_misses,
                         const ExpertCacheState& cache, cudaStream_t stream);
 
+/**
+ * Fill the experts of `layer` that `resident` marks as cached into the staged bank `staged`.
+ * `resident` is a device-readable (for example mapped pinned) snapshot of `cache.slot_of`; the
+ * caller copies every expert it marks absent itself. A marked expert comes from its cache slot
+ * while the device state still holds it and otherwise from `bank`, so a stale snapshot costs
+ * bandwidth, never correctness.
+ */
+void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
+                        const std::int32_t* resident, const ExpertWeights& bank,
+                        const ExpertWeights& staged, cudaStream_t stream);
+
 /** Slot-pool addressing of a cache whose experts come from `bank` (divisors stay in the bank). */
 [[nodiscard]] ExpertWeights expert_cache_weights(const ExpertCacheState& cache,
                                                  const ExpertWeights& bank);

@@ -70,6 +70,10 @@ void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tens
 void expert_cache_resolve_launch(const Tensor& ids, std::int32_t layer,
                                  const ExpertCacheState& cache, Tensor& slot_ids, Tensor& misses,
                                  cudaStream_t stream);
+void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer,
+                               const std::int32_t* resident, const ExpertWeights& bank,
+                               const ExpertWeights& staged, cudaStream_t stream);
+
 void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
                                std::int32_t max_misses, const ExpertCacheState& cache,
                                cudaStream_t stream);

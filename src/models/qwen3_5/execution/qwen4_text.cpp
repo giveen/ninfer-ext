@@ -42,7 +42,9 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-Qwen4Staging::Qwen4Staging(std::byte* banks) : bank{banks, banks + kBankBytes} {
+Qwen4Staging::Qwen4Staging(std::byte* banks, std::size_t cache_entries)
+    : bank{banks, banks + kBankBytes} {
+    CUDA_CHECK(cudaMallocHost(&resident, cache_entries * sizeof(std::int32_t)));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     for (int b = 0; b < 2; ++b) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ready[b], cudaEventDisableTiming));
@@ -58,6 +60,7 @@ Qwen4Staging::~Qwen4Staging() {
         if (released[b] != nullptr) { (void)cudaEventDestroy(released[b]); }
     }
     if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+    if (resident != nullptr) { (void)cudaFreeHost(resident); }
 }
 
 namespace {
@@ -76,18 +79,60 @@ ops::ExpertWeights staged_expert_weights(std::byte* bank, const ops::ExpertWeigh
     return staged;
 }
 
+// Snapshot the expert cache's residency for the fills of this forward. Staged calls leave the
+// cache untouched, so the snapshot stays exact until a cache-route call; a stale one only costs
+// bandwidth (expert_cache_stage re-checks the device state). Capture cannot synchronize, so a
+// captured forward copies every expert.
+void qwen4_snapshot_residency(Qwen4Staging& staging, const ops::ExpertCacheState& cache,
+                              cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    staging.resident_valid = false;
+    if (capture != cudaStreamCaptureStatusNone) { return; }
+    // Earlier fills may still read the previous snapshot.
+    CUDA_CHECK(cudaStreamSynchronize(staging.stream));
+    CUDA_CHECK(cudaMemcpyAsync(staging.resident, cache.slot_of,
+                               static_cast<std::size_t>(cache.layers) * ops::kOffloadMoeExperts *
+                                   sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    staging.resident_valid = true;
+}
+
 // Fill staging bank layer&1 with `layer` unless it already holds it. The fill waits until the
-// bank's previous reader has released it and marks the bank ready when done.
-void qwen4_stage(Qwen4Staging& staging, std::int32_t layer, const ops::ExpertWeights& source) {
+// bank's previous reader has released it and marks the bank ready when done. With a residency
+// snapshot, host copies cover only the runs of uncached experts and the cached ones come from
+// their device slots.
+void qwen4_stage(Qwen4Staging& staging, std::int32_t layer, const ops::ExpertWeights& source,
+                 const ops::ExpertCacheState& cache) {
     const int b = layer & 1;
     if (staging.layer[b] == layer) { return; }
     CUDA_CHECK(cudaStreamWaitEvent(staging.stream, staging.released[b]));
     const ops::ExpertWeights staged = staged_expert_weights(staging.bank[b], source);
+    const std::int32_t* resident =
+        staging.resident_valid
+            ? staging.resident + static_cast<std::ptrdiff_t>(layer) * ops::kOffloadMoeExperts
+            : nullptr;
+    if (resident != nullptr) {
+        ops::expert_cache_stage(cache, layer, staging.resident, source, staged, staging.stream);
+    }
     for (int plane = 0; plane < 4; ++plane) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            const_cast<std::byte*>(staged.base[plane]), source.base[plane],
-            static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts,
-            cudaMemcpyDefault, staging.stream));
+        const auto stride = static_cast<std::size_t>(source.stride[plane]);
+        auto* target      = const_cast<std::byte*>(staged.base[plane]);
+        for (int first = 0; first < ops::kOffloadMoeExperts;) {
+            if (resident != nullptr && resident[first] >= 0) {
+                ++first;
+                continue;
+            }
+            int last = first + 1;
+            while (last < ops::kOffloadMoeExperts && (resident == nullptr || resident[last] < 0)) {
+                ++last;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(target + first * stride, source.base[plane] + first * stride,
+                                       (last - first) * stride, cudaMemcpyDefault,
+                                       staging.stream));
+            first = last;
+        }
     }
     // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
     // one per bank (the MTP layer's banks).
@@ -485,10 +530,15 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         // bank is normally already filled; the next main layer's fill starts now, behind the
         // release of the bank it reuses, and overlaps this layer's compute.
         Qwen4Staging& staging = *runtime.staging;
-        qwen4_stage(staging, cache_layer, p.bank);
+        // A forward's first staged call fills its own layer; later layers were prefetched.
+        if (staging.layer[cache_layer & 1] != cache_layer) {
+            qwen4_snapshot_residency(staging, cache, s);
+        }
+        qwen4_stage(staging, cache_layer, p.bank, cache);
         const auto next = static_cast<std::size_t>(cache_layer) + 1;
         if (next < qwen4_->layers.size()) {
-            qwen4_stage(staging, static_cast<std::int32_t>(next), qwen4_->layers[next].moe.bank);
+            qwen4_stage(staging, static_cast<std::int32_t>(next), qwen4_->layers[next].moe.bank,
+                        cache);
         }
         const int b = cache_layer & 1;
         CUDA_CHECK(cudaStreamWaitEvent(s, staging.ready[b]));

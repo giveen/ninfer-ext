@@ -77,7 +77,8 @@ class Qwen4Staging {
 public:
     static constexpr std::size_t kBankBytes = ops::kExpertStagedLayerBytes;
 
-    explicit Qwen4Staging(std::byte* banks);
+    // `cache_entries` is the size of the expert cache's slot_of map.
+    Qwen4Staging(std::byte* banks, std::size_t cache_entries);
     ~Qwen4Staging();
 
     Qwen4Staging(const Qwen4Staging&)            = delete;
@@ -88,6 +89,11 @@ public:
     cudaEvent_t ready[2]    = {};
     cudaEvent_t released[2] = {};
     std::int32_t layer[2]   = {-1, -1};
+    // Pinned host snapshot of the cache's slot_of, taken before a forward's first fill. Fills
+    // skip the host copy of experts it marks resident; while `resident_valid` is false they copy
+    // every expert.
+    std::int32_t* resident = nullptr;
+    bool resident_valid    = false;
 };
 
 // Program-owned mutable resources of the Qwen4Exp route. The expert cache and PLE state are

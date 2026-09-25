@@ -144,6 +144,25 @@ void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::in
     detail::expert_cache_fetch_launch(bank, misses, max_misses, cache, stream);
 }
 
+void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
+                        const std::int32_t* resident, const ExpertWeights& bank,
+                        const ExpertWeights& staged, cudaStream_t stream) {
+    constexpr const char* op = "expert_cache_stage";
+    require(cache.slot_of != nullptr && cache.pool != nullptr && resident != nullptr, op,
+            "cache state and residency snapshot are required");
+    require(layer >= 0 && layer < cache.layers, op, "layer is outside the cache");
+    const std::int64_t sizes[4] = {kExpertGateUpCodeBytes, kExpertGateUpScaleBytes,
+                                   kExpertDownCodeBytes, kExpertDownScaleBytes};
+    for (int p = 0; p < 4; ++p) {
+        require(bank.base[p] != nullptr && staged.base[p] != nullptr, op,
+                "bank and staged planes are required");
+        require(bank.stride[p] >= sizes[p] && staged.stride[p] >= sizes[p] &&
+                    bank.stride[p] % 16 == 0 && staged.stride[p] % 16 == 0,
+                op, "plane strides must hold one 16-byte-aligned expert");
+    }
+    detail::expert_cache_stage_launch(cache, layer, resident, bank, staged, stream);
+}
+
 ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
     ExpertWeights out             = bank;
     const std::int64_t offsets[4] = {

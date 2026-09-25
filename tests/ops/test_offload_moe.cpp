@@ -429,6 +429,66 @@ int cache_case(const HostBank& host, const DeviceBank& bank) {
     return failures;
 }
 
+// expert_cache_stage copies exactly the experts the snapshot marks resident: from the slot while
+// the device still holds the expert (a slot rewritten with a marker proves the source), from the
+// bank when the snapshot is stale, and leaves unmarked experts to the caller.
+int stage_case(const HostBank& host, const DeviceBank& bank) {
+    constexpr std::int32_t kLayer = 1;
+    DeviceCache cache(20, 2);
+    (void)resolve(cache, bank, kLayer, expert_range(0, 10));
+    (void)resolve(cache, bank, kLayer, expert_range(20, 10));
+    std::vector<int> snapshot = cache.table();
+    constexpr int kMarked = 3, kStale = 40, kUnmarked = 25;
+    const int marked_slot = snapshot[kLayer * E + kMarked];
+    cuda_check(cudaMemset(static_cast<std::uint8_t*>(cache.pool.p) +
+                              static_cast<std::size_t>(marked_slot) * ops::kExpertSlotBytes,
+                          0xAB, ops::kExpertSlotBytes),
+               "mark expert slot");
+    snapshot[kLayer * E + kStale]    = 0;  // resident in the snapshot only
+    snapshot[kLayer * E + kUnmarked] = -1; // resident on the device only
+    DeviceBuffer resident = to_device_i32(snapshot);
+
+    const std::int64_t sizes[4] = {ops::kExpertGateUpCodeBytes, ops::kExpertGateUpScaleBytes,
+                                   ops::kExpertDownCodeBytes, ops::kExpertDownScaleBytes};
+    DeviceBuffer staged_bytes =
+        to_device(std::vector<std::uint8_t>(static_cast<std::size_t>(E) * ops::kExpertSlotBytes,
+                                            0x5A));
+    ops::ExpertWeights staged = bank.weights;
+    std::int64_t offset       = 0;
+    for (int p = 0; p < 4; ++p) {
+        staged.base[p] = static_cast<const std::byte*>(staged_bytes.p) + offset;
+        offset += sizes[p] * E;
+    }
+    ops::expert_cache_stage(cache.state, kLayer, static_cast<const std::int32_t*>(resident.p),
+                            bank.weights, staged, nullptr);
+    cuda_synchronize();
+    const auto out = from_device<std::uint8_t>(staged_bytes,
+                                              static_cast<std::size_t>(E) * ops::kExpertSlotBytes);
+
+    int failures = 0;
+    for (int e = 0; e < E; ++e) {
+        const bool copied = (snapshot[kLayer * E + e] >= 0);
+        offset            = 0;
+        for (int p = 0; p < 4; ++p) {
+            const std::uint8_t* got = out.data() + offset + static_cast<std::size_t>(e) * sizes[p];
+            const std::uint8_t* src =
+                host.planes[p].data() + static_cast<std::size_t>(e) * sizes[p];
+            bool ok = true;
+            for (std::int64_t i = 0; i < sizes[p] && ok; ++i) {
+                const std::uint8_t want = !copied ? 0x5A : e == kMarked ? 0xAB : src[i];
+                ok                      = got[i] == want;
+            }
+            if (!ok) {
+                std::cerr << "expert_cache_stage: expert " << e << " plane " << p
+                          << (copied ? " differs from its source\n" : " was written\n");
+                ++failures;
+            }
+            offset += sizes[p] * E;
+        }
+    }
+    return failures;
+}
+
 // `pool` > 0 routes every column within `pool` experts, so one expert job carries many tokens
 // (real prefill routing concentrates); 0 spreads routing over all experts.
 int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens,
@@ -663,6 +723,7 @@ int main() {
     const HostBank host   = make_bank(0xC0FFEEU);
     const DeviceBank bank = upload(host);
     failures += cache_case(host, bank);
+    failures += stage_case(host, bank);
     // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
     for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
