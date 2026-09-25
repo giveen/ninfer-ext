@@ -115,7 +115,8 @@ int route_case(std::int32_t tokens, std::uint32_t seed, bool realistic = false) 
     Tensor ti(out_ids.data(), DType::I32, {K, tokens});
     Tensor tw(out_w.data(), DType::FP32, {K, tokens});
     Tensor ts(out_s.data(), DType::FP32, {tokens});
-    ops::moe_route(tx, tr, ti, tw, ts, nullptr);
+    WorkspaceArena workspace(ops::moe_route_workspace_bytes(tokens));
+    ops::moe_route(tx, tr, workspace, ti, tw, ts, nullptr);
     cuda_synchronize();
     const std::string label =
         "moe_route T=" + std::to_string(tokens) + (realistic ? " realistic" : "");
@@ -506,7 +507,10 @@ int main() {
         return 77;
     }
     int failures = 0;
-    for (const std::int32_t tokens : {1, 4, 33}) { failures += route_case(tokens, 0x51U + tokens); }
+    // 130 columns span three logits column tiles.
+    for (const std::int32_t tokens : {1, 4, 33, 130}) {
+        failures += route_case(tokens, 0x51U + tokens);
+    }
     // Prefill-sized calls with model-like magnitudes: a 526-token prompt, a 1024-token chunk, and
     // a 2048-token chunk (many column tiles, and a non-multiple-of-64 tail).
     for (const std::int32_t tokens : {1, 70, 526, 1024, 2048}) {
@@ -515,7 +519,8 @@ int main() {
     const HostBank host   = make_bank(0xC0FFEEU);
     const DeviceBank bank = upload(host);
     failures += cache_case(host, bank);
-    for (const std::int32_t tokens : {1, 3, 16}) {
+    // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
+    for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
     }
     // Concentrated routing: 12 experts serve every column, so jobs hold up to 64 tokens and the

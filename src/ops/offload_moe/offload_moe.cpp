@@ -4,6 +4,7 @@
 #include "ops/offload_moe/launch.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -57,8 +58,13 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
 
 } // namespace
 
-void moe_route(const Tensor& x, const Tensor& router, Tensor& ids, Tensor& weights,
-               Tensor& shared_gate, cudaStream_t stream) {
+std::size_t moe_route_workspace_bytes(std::int32_t tokens) {
+    if (tokens <= 0) { throw std::invalid_argument("moe_route_workspace_bytes: T <= 0"); }
+    return align(static_cast<std::size_t>(tokens) * (kOffloadMoeExperts + 1) * sizeof(float)) + 256;
+}
+
+void moe_route(const Tensor& x, const Tensor& router, WorkspaceArena& workspace, Tensor& ids,
+               Tensor& weights, Tensor& shared_gate, cudaStream_t stream) {
     constexpr const char* op = "moe_route";
     require_dense(x, DType::BF16, op, "x");
     require(x.ne[0] == kOffloadMoeHidden && x.ne[2] == 1 && x.ne[3] == 1, op, "x must be [2560,T]");
@@ -69,7 +75,15 @@ void moe_route(const Tensor& x, const Tensor& router, Tensor& ids, Tensor& weigh
     require_routed(weights, DType::FP32, x.ne[1], op, "weights");
     require_dense(shared_gate, DType::FP32, op, "shared gate");
     require(shared_gate.numel() == x.ne[1], op, "shared gate must be [T]");
-    detail::moe_route_launch(x, router, ids, weights, shared_gate, stream);
+    require(x.data != nullptr && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
+                reinterpret_cast<std::uintptr_t>(router.data) % 16 == 0,
+            op, "x and router must be 16-byte aligned");
+    auto scope   = workspace.scope();
+    auto* logits = static_cast<float*>(workspace
+                                           .alloc_bytes(static_cast<std::size_t>(x.ne[1]) *
+                                                        (kOffloadMoeExperts + 1) * sizeof(float))
+                                           .data);
+    detail::moe_route_launch(x, router, logits, ids, weights, shared_gate, stream);
 }
 
 void expert_cache_resolve(const Tensor& ids, std::int32_t layer, const ExpertCacheState& cache,

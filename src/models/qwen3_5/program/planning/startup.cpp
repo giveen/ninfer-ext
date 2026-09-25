@@ -377,6 +377,7 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         hc(layout, p.ffn_hc, tokens);
         auto moe = layout.scope();
         (void)workspace::qwen4_moe(layout, config, tokens, slots);
+        scratch(layout, ops::moe_route_workspace_bytes(tokens));
         linear(layout, p.moe.shared_gate_up, tokens);
         linear(layout, p.moe.shared_down, tokens);
         scratch(layout, ops::moe_experts_workspace_bytes(

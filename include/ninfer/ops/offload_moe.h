@@ -69,8 +69,11 @@ struct ExpertCacheState {
  * (lower expert id wins an exact tie) and renormalized to `weights` (FP32 `[10,T]`), their ids go
  * to `ids` (I32 `[10,T]`), and `shared_gate[t] = sigmoid(shared logit)` (FP32 `[T]`).
  */
-void moe_route(const Tensor& x, const Tensor& router, Tensor& ids, Tensor& weights,
-               Tensor& shared_gate, cudaStream_t stream);
+void moe_route(const Tensor& x, const Tensor& router, WorkspaceArena& workspace, Tensor& ids,
+               Tensor& weights, Tensor& shared_gate, cudaStream_t stream);
+
+/** Workspace of moe_route: the FP32 router logits of `tokens` columns. */
+[[nodiscard]] std::size_t moe_route_workspace_bytes(std::int32_t tokens);
 
 /**
  * Resolve routed experts of one layer to cache slots, choosing least-recently-used victims for
