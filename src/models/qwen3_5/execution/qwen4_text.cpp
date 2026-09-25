@@ -304,8 +304,9 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     Tensor k3   = k.view({head_dim, kv_heads, T});
     Tensor qn   = roots.normalized_query.view({head_dim, heads, T});
     Tensor kn   = roots.normalized_key.view({head_dim, kv_heads, T});
-    Tensor rope = sequence.rope_positions->ne[1] == 3 ? *sequence.rope_positions
-                                                      : sequence.rope_positions->view({T});
+    // Batched sequences bind [W,B] positions; only unbatched prefill carries [T,3] MRoPE rows.
+    const bool mrope = active_sequence_batch_ == 0 && sequence.rope_positions->ne[1] == 3;
+    Tensor rope      = mrope ? *sequence.rope_positions : sequence.rope_positions->view({T});
     text_qk_norm_rope(rope, *config_.rope_parameters, attention, config_.rms_norm_eps, p.query_norm,
                       p.key_norm, q3, k3, qn, kn, s);
 
@@ -317,9 +318,8 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     copy_rows(roots.indexer, index_query_rows, geometry.index_dim, index_key, s);
 
     const Tensor positions         = sequence.cache_positions->view({W, B});
-    const Tensor rope_rows         = sequence.rope_positions->ne[1] == 3
-                                         ? *sequence.rope_positions
-                                         : sequence.rope_positions->view({T, 1});
+    const Tensor rope_rows =
+        mrope ? *sequence.rope_positions : sequence.rope_positions->view({T, 1});
     const PagedKVBatchLayerView kv = cache.batch_layer_view(layer);
     const ops::QsaIndexPlane index = cache.index_plane(layer);
     ops::qsa_append(kn.view({head_dim, kv_heads, W, B}), v.view({head_dim, kv_heads, W, B}),
