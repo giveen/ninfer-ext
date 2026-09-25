@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -56,6 +57,24 @@ def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):
         assert torch.equal(source.values().reshape(2, 16), expected)
         assert source.input_divisor() == struct.pack("<f", 1.5)
         assert source.values(16, 16).numel() == 0
+
+
+def test_sharded_checkpoint_without_index_maps_every_shard(tmp_path):
+    first = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    second = torch.arange(4, dtype=torch.float32)
+    save_file({"a.weight": first}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({"b.weight": second}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    with SafetensorsSource(tmp_path) as store:
+        assert store.has("a.weight") and store.has("b.weight")
+        assert torch.equal(store.read_flat("a.weight").reshape(2, 3), first)
+        assert torch.equal(store.read_flat("b.weight", 1, 3), second[1:3])
+
+
+def test_sharded_checkpoint_without_index_rejects_a_duplicated_tensor(tmp_path):
+    save_file({"a.weight": torch.zeros(2)}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({"a.weight": torch.ones(2)}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    with pytest.raises(ValueError, match="appears in"):
+        SafetensorsSource(tmp_path)
 
 
 def test_row_fp8_source_and_reordered_encoded_rows(tmp_path):
