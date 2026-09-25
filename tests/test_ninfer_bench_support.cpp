@@ -218,13 +218,13 @@ int test_measurement_contract() {
     failures += expect_u32(tg.requested_output_tokens(), 129, "tg begin plus G outputs");
     failures +=
         expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
-    // Speculative contexts cover the MTP lookahead, round up to 64-token pages and add the
-    // Program's two-page lease cushion, so the lease can grow to the final frontier.
+    // Decoding contexts cover the MTP lookahead, round up to 64-token pages and add the Program's
+    // two-page lease cushion, so the lease can grow to the final frontier with or without drafts.
     failures += expect_u32(pp.required_context({}), 512, "pp context");
     failures += expect_u32(pp.required_context(mtp5), 704, "MTP pp context");
-    failures += expect_u32(tg.required_context({}), 129, "tg context");
+    failures += expect_u32(tg.required_context({}), 320, "tg context");
     failures += expect_u32(tg.required_context(mtp5), 320, "MTP tg context");
-    failures += expect_u32(combined.required_context({}), 2176, "combined context");
+    failures += expect_u32(combined.required_context({}), 2304, "combined context");
     failures += expect_u32(combined.required_context(mtp5), 2368, "MTP combined context");
     failures +=
         expect_u32(qb::decode_graph_prime_output_tokens(mtp5), 13, "MTP graph-prime outputs");

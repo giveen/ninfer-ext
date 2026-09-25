@@ -263,15 +263,16 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
         << "\"total_seconds\": " << number(timings.total_seconds) << '}';
 }
 
-// Context a speculative run needs beyond its committed tokens. MTP writes lookahead KV for drafts
-// past the final frontier, and the Program extends a speculative sequence's Device KV lease only
-// while the pool can hold the lease ceiling plus a cushion of ceil((2*draft_window + 2) / page) + 1
-// page groups (ProgramImpl::kv_lease_cushion_pages). A capacity without that cushion settles the
-// lease early and ends generation short of the requested output.
-std::uint64_t speculative_context(std::uint64_t tokens, const SpeculativeOptions& speculative) {
-    if (speculative.backend == SpeculativeBackend::None) { return tokens; }
+// Context a decoding run needs beyond its committed tokens. MTP writes lookahead KV for drafts past
+// the final frontier, and the Program extends a sequence's Device KV lease past its admission
+// window only while the pool can hold the lease ceiling plus a cushion of
+// ceil((2*draft_window + 2) / page) + 1 page groups (ProgramImpl::kv_lease_cushion_pages; the draft
+// window is zero without speculation). A capacity without that cushion settles the lease early and
+// ends generation short of the requested output.
+std::uint64_t lease_context(std::uint64_t tokens, const SpeculativeOptions& speculative) {
     const std::uint64_t page   = 64; // kPagedKVPageSize; that header needs the CUDA runtime
-    const std::uint64_t window = speculative.draft_tokens;
+    const std::uint64_t window =
+        speculative.backend == SpeculativeBackend::None ? 0ULL : speculative.draft_tokens;
     const std::uint64_t covered =
         tokens + (speculative.backend == SpeculativeBackend::Mtp ? 2ULL * window : 0ULL);
     const std::uint64_t cushion = (2ULL * window + 2ULL + page - 1ULL) / page + 1ULL;
@@ -289,7 +290,8 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& speculative)
     const std::uint64_t prompt =
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
     const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
-    return checked_context(speculative_context(prompt + decode, speculative),
+    const bool leases = has_decode() || speculative.backend != SpeculativeBackend::None;
+    return checked_context(leases ? lease_context(prompt + decode, speculative) : prompt,
                            "benchmark context requirement");
 }
 
@@ -508,7 +510,7 @@ std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& specula
 }
 
 std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative) {
-    return checked_context(speculative_context(decode_graph_prime_output_tokens(speculative),
+    return checked_context(lease_context(decode_graph_prime_output_tokens(speculative),
                                                speculative),
                            "decode graph prime context requirement");
 }
