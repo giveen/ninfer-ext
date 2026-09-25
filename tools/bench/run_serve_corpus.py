@@ -794,8 +794,6 @@ def server_command(
         spec.model_id,
         "--max-context",
         "262144",
-        "--prefill-chunk",
-        "1024",
         "--log-stats-interval-ms",
         "0",
         "--device",

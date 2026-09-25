@@ -146,7 +146,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="N|auto",
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
     )
-    parser.add_argument("--prefill-chunk", type=int, default=1024)
+    parser.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=None,
+        help="fix ninfer-serve's prefill width (default: the server's own default)",
+    )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
@@ -165,7 +170,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--max-context must be positive")
     if args.decode_tokens <= 0:
         raise corpus.CampaignError("--decode-tokens must be positive")
-    if args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0:
+    if args.prefill_chunk is not None and (args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0):
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
     if args.kv_capacity != "auto":
         if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
@@ -296,8 +301,7 @@ def server_command(
         "1",
         "--pending-timeout-ms",
         str(PENDING_TIMEOUT_MS),
-        "--prefill-chunk",
-        str(args.prefill_chunk),
+        *(["--prefill-chunk", str(args.prefill_chunk)] if args.prefill_chunk else []),
         "--log-stats-interval-ms",
         str(STATS_INTERVAL_MS),
         "--device",
