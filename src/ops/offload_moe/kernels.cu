@@ -348,30 +348,38 @@ __global__ void __launch_bounds__(kResolveThreads)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fetch: grid (max_misses, chunks); every CTA copies one chunk of one missing expert.
+// Fetch: a fixed grid grid-strides over the flattened (miss, 16-byte vector) work. SM reads of
+// pinned Host memory lose PCIe throughput as more CTAs contend, so the CTA count stays constant
+// instead of growing with the miss count (32 CTAs per miss fell to ~20 GB/s at 16 misses; a fixed
+// 64 holds ~36 GB/s on RTX 5090).
 
-constexpr int kFetchChunks = 32;
+constexpr int kFetchChunks = 32; // staging: CTAs per expert
+constexpr int kFetchCtas   = 64;
 
 __global__ void __launch_bounds__(256)
     expert_cache_fetch_kernel(ExpertWeights bank, const std::int32_t* __restrict__ misses,
-                              std::byte* pool) {
-    const int j = static_cast<int>(blockIdx.x);
-    if (j >= misses[0]) { return; }
-    const std::int64_t slot     = misses[1 + 2 * j];
-    const std::int64_t expert   = misses[2 + 2 * j];
-    const std::int64_t sizes[4] = {kExpertGateUpCodeBytes, kExpertGateUpScaleBytes,
-                                   kExpertDownCodeBytes, kExpertDownScaleBytes};
-    std::int64_t plane_offset   = 0;
-    auto* target                = pool + slot * kExpertSlotBytes;
-    for (int p = 0; p < 4; ++p) {
-        const std::int64_t vectors = sizes[p] / 16;
+                              std::int32_t max_misses, std::byte* pool) {
+    constexpr std::int64_t kVectors[4] = {kExpertGateUpCodeBytes / 16, kExpertGateUpScaleBytes / 16,
+                                          kExpertDownCodeBytes / 16, kExpertDownScaleBytes / 16};
+    constexpr std::int64_t kPerExpert = kExpertSlotBytes / 16;
+    const std::int64_t total  = static_cast<std::int64_t>(min(misses[0], max_misses)) * kPerExpert;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t w = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         w < total; w += stride) {
+        const std::int64_t j = w / kPerExpert;
+        std::int64_t v       = w - j * kPerExpert;
+        std::int64_t offset  = 0;
+        int p                = 0;
+        while (v >= kVectors[p]) {
+            v -= kVectors[p];
+            offset += kVectors[p];
+            ++p;
+        }
+        const std::int64_t slot   = misses[1 + 2 * j];
+        const std::int64_t expert = misses[2 + 2 * j];
         const auto* src = reinterpret_cast<const uint4*>(bank.base[p] + expert * bank.stride[p]);
-        auto* dst       = reinterpret_cast<uint4*>(target + plane_offset);
-        const std::int64_t per   = (vectors + kFetchChunks - 1) / kFetchChunks;
-        const std::int64_t begin = static_cast<std::int64_t>(blockIdx.y) * per;
-        const std::int64_t end   = min(vectors, begin + per);
-        for (std::int64_t v = begin + threadIdx.x; v < end; v += blockDim.x) { dst[v] = src[v]; }
-        plane_offset += sizes[p];
+        auto* dst       = reinterpret_cast<uint4*>(pool + slot * kExpertSlotBytes) + offset;
+        dst[v]          = src[v];
     }
 }
 
@@ -863,8 +871,8 @@ void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer
 void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
                                std::int32_t max_misses, const ExpertCacheState& cache,
                                cudaStream_t stream) {
-    expert_cache_fetch_kernel<<<dim3(max_misses, kFetchChunks), 256, 0, stream>>>(
-        bank, static_cast<const std::int32_t*>(misses.data), cache.pool);
+    expert_cache_fetch_kernel<<<kFetchCtas, 256, 0, stream>>>(
+        bank, static_cast<const std::int32_t*>(misses.data), max_misses, cache.pool);
     CUDA_CHECK(cudaGetLastError());
 }
 
