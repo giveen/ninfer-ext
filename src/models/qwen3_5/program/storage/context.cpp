@@ -1443,9 +1443,16 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
     const std::uint32_t text_pages = text_kv_addresses->entitlement(sequence.kv->text);
     const std::uint32_t backend_pages =
         sequence.kv->backend ? backend_kv_addresses->entitlement(*sequence.kv->backend) : 0U;
-    const bool main_thin = kv_pages_for_tokens(main_tokens) + cushion > text_pages;
+    const std::uint32_t backend_ceiling = std::min(
+        capacity, request.lease_ceiling + kv_lease_backend_allowance_tokens());
+    // No round writes past its ceiling, so an entitlement that already covers the ceiling needs
+    // no cushion beyond it: demanding one there refuses growth and settles a lease that is whole.
+    const bool main_thin =
+        std::min(kv_pages_for_tokens(main_tokens) + cushion,
+                 kv_pages_for_tokens(request.lease_ceiling)) > text_pages;
     const bool backend_thin = sequence.kv->backend.has_value() && backend_tokens != 0 &&
-                              kv_pages_for_tokens(backend_tokens) + cushion > backend_pages;
+                              std::min(kv_pages_for_tokens(backend_tokens) + cushion,
+                                       kv_pages_for_tokens(backend_ceiling)) > backend_pages;
     if (!main_thin && !backend_thin) { return; }
 
     // A full window first; when the pool cannot spare one, a step-sized extension still leaves
@@ -1455,15 +1462,16 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
     const auto target = [](std::uint32_t cap, std::uint32_t pages, std::uint32_t wanted) {
         return std::min(cap, std::max(pages, wanted));
     };
-    const std::uint32_t backend_ceiling = std::min(
-        capacity, request.lease_ceiling + kv_lease_backend_allowance_tokens());
     const auto grow = [&](std::uint32_t extra_tokens) {
+        // Only a thin lease grows: extending a whole one would ask its pool for space the other
+        // lease needs, and one failed reservation settles both.
         const std::uint32_t text_target =
-            target(std::min(text_kv_pages->physical_pool().capacity_pages(),
-                            text_kv_addresses->address_page_capacity()),
-                   text_pages,
-                   kv_lease_pages_for_tokens(
-                       std::min(request.lease_ceiling, main_tokens + extra_tokens)));
+            main_thin ? target(std::min(text_kv_pages->physical_pool().capacity_pages(),
+                                        text_kv_addresses->address_page_capacity()),
+                               text_pages,
+                               kv_lease_pages_for_tokens(
+                                   std::min(request.lease_ceiling, main_tokens + extra_tokens)))
+                      : text_pages;
         const std::uint32_t backend_target =
             sequence.kv->backend
                 ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
