@@ -1,6 +1,6 @@
 // Qwen Sparse Attention Ops at the Qwen3.8-Flash-Next geometry (24/2 heads of 256, indexer 4x128,
-// budget 2048 in blocks of 4) over permuted physical pages. qsa_attention runs over both the BF16
-// and the FP8 (row-scaled E4M3, Hadamard-rotated K) KV profiles.
+// budget 2048 in blocks of 4) over permuted physical pages. qsa_append and qsa_attention run over
+// every KV profile: BF16, and the quantized FP8, int8 G64, NVFP4 G16 and K8V4 caches.
 //
 // qsa_append is exact. qsa_select is compared with an FP64 oracle of the block scores; a block may
 // differ from the oracle only when its oracle score lies within a near-tie allowance of the
@@ -14,7 +14,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
+#include <tuple>
 #include <numeric>
 #include <set>
 #include <string>
@@ -121,6 +123,89 @@ std::vector<double> hadamard256(std::vector<double> v) {
     for (double& x : v) { x /= 16.0; }
     return v;
 }
+
+double e2m1_value(std::uint8_t nibble) {
+    static constexpr double kMagnitude[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const double v                        = kMagnitude[nibble & 7];
+    return (nibble & 8) != 0 ? -v : v;
+}
+
+// The device planes of one quantized profile and their host copies, decoded with the stored
+// scales: FP8 codes times the row scale, int8 codes times their G64 scale, E2M1 nibbles (feature
+// 2i in the low nibble of byte i) times their G16 E4M3 scale.
+struct QuantizedCache {
+    std::string name;
+    bool v_rotated;
+    PagedKVStorageLayout layout;
+    DeviceBuffer k_pages, v_pages, k_scales, v_scales;
+    PagedKVBatchLayerView view;
+    std::vector<std::uint8_t> k_host, v_host, k_scale_host, v_scale_host;
+
+    static std::size_t data_bytes(const PagedKVVectorLayout& vector) {
+        return static_cast<std::size_t>(kPage) * kKvHeads * kPages * vector.data_leading_extent *
+               dtype_size(vector.data_dtype);
+    }
+    static std::size_t scale_bytes(const PagedKVVectorLayout& vector) {
+        return static_cast<std::size_t>(kPage) * kKvHeads * kPages * vector.scale_leading_extent *
+               dtype_size(vector.scale_dtype);
+    }
+    static Tensor pages(const DeviceBuffer& buffer, DType dtype, std::int32_t extent) {
+        return Tensor(buffer.p, dtype, {extent, kPage, kKvHeads, kPages});
+    }
+
+    QuantizedCache(KvCacheStorage storage, const char* label, const Tensor& tables)
+        : name(label), v_rotated(storage == KvCacheStorage::Nvfp4Group16 ||
+                                 storage == KvCacheStorage::Fp8KeyNvfp4Value),
+          layout(paged_kv_storage_layout(storage, kHeadDim)),
+          k_pages(to_device(std::vector<std::uint8_t>(data_bytes(layout.key), 0))),
+          v_pages(to_device(std::vector<std::uint8_t>(data_bytes(layout.value), 0))),
+          k_scales(to_device(std::vector<std::uint8_t>(scale_bytes(layout.key), 0))),
+          v_scales(to_device(std::vector<std::uint8_t>(scale_bytes(layout.value), 0))) {
+        view = PagedKVBatchLayerView{
+            .k_pages = pages(k_pages, layout.key.data_dtype, layout.key.data_leading_extent),
+            .v_pages = pages(v_pages, layout.value.data_dtype, layout.value.data_leading_extent),
+            .k_scale_pages =
+                pages(k_scales, layout.key.scale_dtype, layout.key.scale_leading_extent),
+            .v_scale_pages =
+                pages(v_scales, layout.value.scale_dtype, layout.value.scale_leading_extent),
+            .block_tables = tables,
+            .head_dim     = kHeadDim,
+            .num_kv_heads = kKvHeads,
+            .storage      = storage};
+    }
+
+    void download() {
+        k_host       = from_device<std::uint8_t>(k_pages, data_bytes(layout.key));
+        v_host       = from_device<std::uint8_t>(v_pages, data_bytes(layout.value));
+        k_scale_host = from_device<std::uint8_t>(k_scales, scale_bytes(layout.key));
+        v_scale_host = from_device<std::uint8_t>(v_scales, scale_bytes(layout.value));
+    }
+
+    static double decode(const PagedKVVectorLayout& vector, const std::vector<std::uint8_t>& codes,
+                         const std::vector<std::uint8_t>& scales, std::size_t row, int d) {
+        const auto half_at = [&](std::size_t i) {
+            return half_value(static_cast<std::uint16_t>(scales[2 * i] | (scales[2 * i + 1] << 8)));
+        };
+        switch (vector.data_dtype) {
+        case DType::FP8_E4M3FN: return e4m3_value(codes[row * kHeadDim + d]) * half_at(row);
+        case DType::I8:
+            return double(static_cast<std::int8_t>(codes[row * kHeadDim + d])) *
+                   half_at(row * 4 + d / 64);
+        default: {
+            const std::uint8_t byte = codes[row * (kHeadDim / 2) + d / 2];
+            return e2m1_value(d % 2 != 0 ? byte >> 4 : byte & 0xF) *
+                   e4m3_value(scales[row * 16 + d / 16]);
+        }
+        }
+    }
+
+    [[nodiscard]] double key(std::size_t row, int d) const {
+        return decode(layout.key, k_host, k_scale_host, row, d);
+    }
+    [[nodiscard]] double value(std::size_t row, int d) const {
+        return decode(layout.value, v_host, v_scale_host, row, d);
+    }
+};
 
 std::vector<double> offset_norm(const std::vector<double>& x, const std::vector<float>& weight) {
     double sum = 0.0;
@@ -248,27 +333,50 @@ int main() {
         }
     }
 
-    // The FP8 profile over the same tokens: K rows Hadamard-rotated, both planes row-scaled E4M3.
-    const std::size_t scale_elements = static_cast<std::size_t>(kPage) * kKvHeads * kPages;
-    DeviceBuffer k8_pages            = to_device(std::vector<std::uint8_t>(page_elements, 0));
-    DeviceBuffer v8_pages            = to_device(std::vector<std::uint8_t>(page_elements, 0));
-    DeviceBuffer k8_scales           = to_device(std::vector<std::uint16_t>(scale_elements, 0));
-    DeviceBuffer v8_scales           = to_device(std::vector<std::uint16_t>(scale_elements, 0));
-    PagedKVBatchLayerView kv8{
-        .k_pages       = Tensor(k8_pages.p, DType::FP8_E4M3FN, {kHeadDim, kPage, kKvHeads, kPages}),
-        .v_pages       = Tensor(v8_pages.p, DType::FP8_E4M3FN, {kHeadDim, kPage, kKvHeads, kPages}),
-        .k_scale_pages = Tensor(k8_scales.p, DType::FP16, {kPage, kKvHeads, kPages}),
-        .v_scale_pages = Tensor(v8_scales.p, DType::FP16, {kPage, kKvHeads, kPages}),
-        .block_tables  = ttables,
-        .head_dim      = kHeadDim,
-        .num_kv_heads  = kKvHeads,
-        .storage       = KvCacheStorage::Fp8E4M3Row256};
-    ops::qsa_append(tk, tv, tindex, trope, tcache, nullptr, trows, kv8, plane, nullptr);
-    cuda_synchronize();
-    const auto k8_host  = from_device<std::uint8_t>(k8_pages, page_elements);
-    const auto v8_host  = from_device<std::uint8_t>(v8_pages, page_elements);
-    const auto k8_scale = from_device<std::uint16_t>(k8_scales, scale_elements);
-    const auto v8_scale = from_device<std::uint16_t>(v8_scales, scale_elements);
+    // The quantized profiles over the same tokens, stored with the dense cache's codecs: K is
+    // Hadamard-rotated in every profile, V where it is NVFP4. Each stored row, decoded with its
+    // stored scales, must match the (rotated) input within its codec's error: a relative RMS bound
+    // that a wrong rotation, group or nibble order exceeds many times over.
+    std::deque<QuantizedCache> quantized;
+    for (const auto& [storage, name, k_rms, v_rms] :
+         {std::tuple{KvCacheStorage::Fp8E4M3Row256, "FP8", 0.05, 0.05},
+          std::tuple{KvCacheStorage::Int8Group64, "INT8", 0.02, 0.02},
+          std::tuple{KvCacheStorage::Nvfp4Group16, "NVFP4", 0.2, 0.2},
+          std::tuple{KvCacheStorage::Fp8KeyNvfp4Value, "K8V4", 0.05, 0.2}}) {
+        QuantizedCache& cache = quantized.emplace_back(storage, name, ttables);
+        ops::qsa_append(tk, tv, tindex, trope, tcache, nullptr, trows, cache.view, plane, nullptr);
+        cuda_synchronize();
+        cache.download();
+        double k_error = 0.0, k_norm = 0.0, v_error = 0.0, v_norm = 0.0;
+        for (int b = 0; b < kLanes; ++b) {
+            for (int t = 0; t < kTokens; t += 7) {
+                const std::size_t c = static_cast<std::size_t>(b) * kTokens + t;
+                for (int h = 0; h < kKvHeads; ++h) {
+                    const std::size_t source = (c * kKvHeads + h) * kHeadDim;
+                    std::vector<double> kr(k.begin() + source, k.begin() + source + kHeadDim);
+                    std::vector<double> vr(v.begin() + source, v.begin() + source + kHeadDim);
+                    kr = hadamard256(std::move(kr));
+                    if (cache.v_rotated) { vr = hadamard256(std::move(vr)); }
+                    const std::size_t row = key_at(b, t, h, 0) / kHeadDim;
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const double ke = cache.key(row, d) - kr[d];
+                        const double ve = cache.value(row, d) - vr[d];
+                        k_error += ke * ke;
+                        k_norm += kr[d] * kr[d];
+                        v_error += ve * ve;
+                        v_norm += vr[d] * vr[d];
+                    }
+                }
+            }
+        }
+        const double k_rel = std::sqrt(k_error / k_norm), v_rel = std::sqrt(v_error / v_norm);
+        if (!(k_rel <= k_rms) || !(v_rel <= v_rms)) {
+            std::cerr << "qsa_append " << name << ": decoded rows differ from their inputs (K rms "
+                      << k_rel << " > " << k_rms << " or V rms " << v_rel << " > " << v_rms
+                      << ")\n";
+            ++failures;
+        }
+    }
 
     // ---- select: lane 0 is sparse (n > 2051), lane 1 dense; lane 1's last column is invalid ----
     constexpr std::int32_t W            = 3;
@@ -412,19 +520,18 @@ int main() {
     // ---- attention: FP64 softmax over each column's selection ----
     // Narrow calls split every selection across CTAs; a call of 256+ (column, KV head) pairs
     // runs one CTA per pair. Both routes are compared with the same oracle.
-    // FP8 reads each stored code times its row scale and rotates the query like the stored keys.
+    // A quantized profile reads each stored code times its stored scale, rotates the query like the
+    // stored keys, and rotates the output of a rotated V back.
     const auto attend = [&](const std::string& label, std::int32_t width,
                             const std::vector<int>& sel, const std::vector<int>& cnt,
-                            std::uint32_t seed, bool fp8) {
+                            std::uint32_t seed, const QuantizedCache* cache) {
         const auto key = [&](int b, int token, int kvh, int d) {
             const std::size_t at = key_at(b, token, kvh, d);
-            return fp8 ? e4m3_value(k8_host[at]) * half_value(k8_scale[at / kHeadDim])
-                       : double(bf16_to_f32(k_host[at]));
+            return cache != nullptr ? cache->key(at / kHeadDim, d) : double(bf16_to_f32(k_host[at]));
         };
         const auto value = [&](int b, int token, int kvh, int d) {
             const std::size_t at = key_at(b, token, kvh, d);
-            return fp8 ? e4m3_value(v8_host[at]) * half_value(v8_scale[at / kHeadDim])
-                       : half_value(v_host[at]);
+            return cache != nullptr ? cache->value(at / kHeadDim, d) : half_value(v_host[at]);
         };
         const auto q = random_bf16(
             static_cast<std::size_t>(kHeadDim) * kQueryHeads * width * kLanes, seed, -1.0F, 1.0F);
@@ -436,7 +543,8 @@ int main() {
         Tensor tout(out.data(), DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
         const float scale = 1.0F / 16.0F;
         WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, width * kLanes));
-        ops::qsa_attention(tq, ts, tc, trows, fp8 ? kv8 : kv, scale, workspace, tout, nullptr);
+        ops::qsa_attention(tq, ts, tc, trows, cache != nullptr ? cache->view : kv, scale, workspace,
+                           tout, nullptr);
         cuda_synchronize();
         std::vector<double> reference(q.size(), 0.0);
         for (int b = 0; b < kLanes; ++b) {
@@ -449,7 +557,7 @@ int main() {
                     const float* qrow =
                         q.data() + (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
                     std::vector<double> query(qrow, qrow + kHeadDim);
-                    if (fp8) { query = hadamard256(std::move(query)); }
+                    if (cache != nullptr) { query = hadamard256(std::move(query)); }
                     std::vector<double> logits(count);
                     double max_logit = -1e300;
                     for (int j = 0; j < count; ++j) {
@@ -467,11 +575,14 @@ int main() {
                     }
                     double* o = reference.data() +
                                 (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
+                    std::vector<double> row(kHeadDim, 0.0);
                     for (int j = 0; j < count; ++j) {
                         for (int d = 0; d < kHeadDim; ++d) {
-                            o[d] += logits[j] / denominator * value(b, list[j], kvh, d);
+                            row[d] += logits[j] / denominator * value(b, list[j], kvh, d);
                         }
                     }
+                    if (cache != nullptr && cache->v_rotated) { row = hadamard256(std::move(row)); }
+                    std::copy(row.begin(), row.end(), o);
                 }
             }
         }
@@ -502,15 +613,18 @@ int main() {
         return sel;
     };
 
-    for (const bool fp8 : {false, true}) {
-        const std::string profile = fp8 ? "qsa_attention FP8 " : "qsa_attention ";
+    std::vector<const QuantizedCache*> caches = {nullptr};
+    for (const QuantizedCache& cache : quantized) { caches.push_back(&cache); }
+    for (const QuantizedCache* cache : caches) {
+        const std::string profile =
+            std::string("qsa_attention ") + (cache != nullptr ? cache->name + " " : "");
         // The device selection: 6 columns split every selection.
-        failures += attend(profile + "select", W, sel_host, cnt_host, 0x31U, fp8);
+        failures += attend(profile + "select", W, sel_host, cnt_host, 0x31U, cache);
         // Decode width: a full selection beside a single key, so later splits of the short column
         // are empty.
         {
             const std::vector<int> counts = {g.max_selected(), 1};
-            failures += attend(profile + "decode", 1, synthetic(1, counts), counts, 0x32U, fp8);
+            failures += attend(profile + "decode", 1, synthetic(1, counts), counts, 0x32U, cache);
         }
         // 128 columns x 2 KV heads fill the GPU: one CTA per pair, counts from 0 to the maximum.
         {
@@ -523,7 +637,7 @@ int main() {
             counts[1] = 0;
             counts[2] = g.max_selected();
             failures +=
-                attend(profile + "wide", kWide, synthetic(kWide, counts), counts, 0x33U, fp8);
+                attend(profile + "wide", kWide, synthetic(kWide, counts), counts, 0x33U, cache);
         }
     }
 
