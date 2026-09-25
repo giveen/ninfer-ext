@@ -1,7 +1,8 @@
 // Implements: include/ninfer/ops/sparse_attention.h
 // Qwen Sparse Attention: paged append, indexer block selection and selected-key attention.
-// The kernels favour clarity: one CTA per query column (selection) or per (column, KV head)
-// (attention), FP32 accumulation, K/V read through the same codecs the dense cache uses.
+// The kernels favour clarity: one CTA per query column (selection) or per (column, KV head,
+// key split) (attention), FP32 accumulation, K/V read through the same codecs the dense cache
+// uses. Narrow calls split each selection across CTAs and merge the partial softmax states.
 #include "ops/sparse_attention/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -188,39 +189,45 @@ __device__ __forceinline__ std::int32_t read_position(const __nv_bfloat16* recor
                                      (static_cast<std::uint32_t>(words[2 * axis + 1]) << 16));
 }
 
-// One CTA (256 threads) per query column.
-__global__ void __launch_bounds__(256) qsa_select_kernel(SelectArgs a) {
+// Scoring split policy: narrow passes spread each column's blocks over about kScoreTargetCtas
+// CTAs, at least kMinScoreBlocks blocks (four per warp) apiece.
+constexpr std::int32_t kScoreTargetCtas = 256;
+constexpr std::int32_t kMinScoreBlocks  = 32;
+
+// Visible tokens of this CTA's query column (zero for an invalid column) and its blocks.
+struct SelectColumn {
+    int column;
+    int lane;
+    std::int32_t visible;
+    std::int32_t blocks;
+};
+
+__device__ __forceinline__ SelectColumn select_column(const SelectArgs& a) {
+    SelectColumn c{};
+    c.column    = a.column_begin + static_cast<int>(blockIdx.x);
+    c.lane      = c.column / a.width;
+    const int w = c.column % a.width;
+    c.visible   = w < lane_valid(a.valid, c.lane, a.width) ? a.cache[c.column] + 1 : 0;
+    c.blocks    = c.visible / a.geometry.ratio;
+    return c;
+}
+
+// Block scores of the columns that must choose among their blocks. CTA (x, y) scores blocks
+// [y * split_blocks, (y + 1) * split_blocks) of pass column x into its scores row.
+__global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32_t split_blocks) {
     __shared__ float query[kMaxIndexHead * kIndexDim];
-    __shared__ std::uint32_t histogram[256];
-    __shared__ std::int32_t scan[256];
-    __shared__ std::uint32_t prefix_s;
-    __shared__ std::int32_t remaining_s;
-    __shared__ std::int32_t emitted_s;
-    __shared__ std::int32_t ties_s;
 
-    const KernelGeometry& g = a.geometry;
-    const int tid           = static_cast<int>(threadIdx.x);
-    const int warp          = tid >> 5;
-    const int lane_id       = tid & 31;
-    const int column        = a.column_begin + static_cast<int>(blockIdx.x);
-    const int w             = column % a.width;
-    const int lane          = column / a.width;
-    std::int32_t* selected  = a.selected + static_cast<std::int64_t>(column) * a.max_selected;
-    if (w >= lane_valid(a.valid, lane, a.width)) {
-        if (tid == 0) { a.counts[column] = 0; }
-        return;
-    }
-    const std::int32_t visible = a.cache[column] + 1;
-    const std::int32_t ratio   = g.ratio;
-    const std::int32_t blocks  = visible / ratio;
-    const std::int32_t keep    = min(g.block_topk(), blocks);
-    const std::int32_t tail    = visible - blocks * ratio;
-
-    if (blocks <= g.block_topk()) {
-        for (int i = tid; i < visible; i += blockDim.x) { selected[i] = i; }
-        if (tid == 0) { a.counts[column] = visible; }
-        return;
-    }
+    const KernelGeometry& g  = a.geometry;
+    const int tid            = static_cast<int>(threadIdx.x);
+    const int warp           = tid >> 5;
+    const int lane_id        = tid & 31;
+    const SelectColumn col   = select_column(a);
+    const int column         = col.column;
+    const int lane           = col.lane;
+    const std::int32_t first = static_cast<int>(blockIdx.y) * split_blocks;
+    const std::int32_t last  = min(col.blocks, first + split_blocks);
+    if (col.blocks <= g.block_topk() || first >= last) { return; }
+    const std::int32_t ratio = g.ratio;
 
     // Query heads: offset RMSNorm then RoPE at the query position.
     const std::int64_t tokens = static_cast<std::int64_t>(a.width) * a.lanes;
@@ -261,7 +268,7 @@ __global__ void __launch_bounds__(256) qsa_select_kernel(SelectArgs a) {
     float* scores     = a.scores + static_cast<std::int64_t>(blockIdx.x) * a.max_blocks;
     const float scale = rsqrtf(static_cast<float>(di));
     const int per     = di / 32;
-    for (int b = warp; b < blocks; b += blockDim.x / 32) {
+    for (int b = first + warp; b < last; b += blockDim.x / 32) {
         float key[8];
         for (int r = 0; r < per; ++r) { key[r] = 0.0F; }
         std::int32_t kpos[3] = {0, 0, 0};
@@ -306,7 +313,34 @@ __global__ void __launch_bounds__(256) qsa_select_kernel(SelectArgs a) {
         }
         if (lane_id == 0) { scores[b] = score * scale; }
     }
-    __syncthreads();
+}
+
+// One CTA (256 threads) per query column: the kept blocks from qsa_score_kernel's scores.
+__global__ void __launch_bounds__(256) qsa_select_kernel(SelectArgs a) {
+    __shared__ std::uint32_t histogram[256];
+    __shared__ std::int32_t scan[256];
+    __shared__ std::uint32_t prefix_s;
+    __shared__ std::int32_t remaining_s;
+    __shared__ std::int32_t emitted_s;
+    __shared__ std::int32_t ties_s;
+
+    const KernelGeometry& g    = a.geometry;
+    const int tid              = static_cast<int>(threadIdx.x);
+    const SelectColumn col     = select_column(a);
+    const int column           = col.column;
+    const std::int32_t visible = col.visible;
+    const std::int32_t ratio   = g.ratio;
+    const std::int32_t blocks  = col.blocks;
+    const std::int32_t keep    = min(g.block_topk(), blocks);
+    const std::int32_t tail    = visible - blocks * ratio;
+    std::int32_t* selected     = a.selected + static_cast<std::int64_t>(column) * a.max_selected;
+
+    if (blocks <= g.block_topk()) {
+        for (int i = tid; i < visible; i += blockDim.x) { selected[i] = i; }
+        if (tid == 0) { a.counts[column] = visible; }
+        return;
+    }
+    const float* scores = a.scores + static_cast<std::int64_t>(blockIdx.x) * a.max_blocks;
 
     // Radix select the keep-th largest key.
     if (tid == 0) {
@@ -396,6 +430,17 @@ __global__ void __launch_bounds__(256) qsa_select_kernel(SelectArgs a) {
 
 constexpr int kKeyTile = 16;
 
+// Split policy: a call whose (column, KV head) CTAs cannot fill the GPU splits each selection
+// into contiguous ranges of at least kMinSplitKeys keys until about kSplitTargetCtas CTAs run.
+constexpr std::int32_t kSplitTargetCtas = 256;
+constexpr std::int32_t kMinSplitKeys    = 2 * kKeyTile;
+
+// Partial state of one (column, KV head, split, head): the unnormalized FP32 value sum, then
+// the running max and the softmax denominator.
+constexpr std::int32_t kPartialWords = kHeadDim + 2;
+
+// With `partial` null the CTA owns the whole selection and writes normalized output; otherwise
+// it covers keys [split * split_keys, +split_keys) and writes its partial state.
 template <bool Fp8>
 __global__ void __launch_bounds__(256)
     qsa_attention_kernel(const __nv_bfloat16* __restrict__ q,
@@ -405,7 +450,8 @@ __global__ void __launch_bounds__(256)
                          const std::int32_t* __restrict__ tables, std::int32_t table_stride,
                          const void* k_pages, const void* v_pages, const __half* k_scales,
                          const __half* v_scales, std::int32_t query_heads, std::int32_t kv_heads,
-                         std::int32_t width, float scale, __nv_bfloat16* __restrict__ out) {
+                         std::int32_t width, float scale, std::int32_t split_keys,
+                         float* __restrict__ partial, __nv_bfloat16* __restrict__ out) {
     __shared__ float qs[kMaxGroup * kHeadDim];
     __shared__ float ks[kKeyTile * kHeadDim];
     __shared__ float vs[kKeyTile * kHeadDim];
@@ -419,8 +465,10 @@ __global__ void __launch_bounds__(256)
     const int column         = static_cast<int>(blockIdx.x) / kv_heads;
     const int lane           = column / width;
     const int group          = query_heads / kv_heads;
-    const std::int32_t count = counts[column];
     const std::int32_t* list = selected + static_cast<std::int64_t>(column) * max_selected;
+    const std::int32_t first = partial == nullptr ? 0 : static_cast<int>(blockIdx.y) * split_keys;
+    const std::int32_t count =
+        partial == nullptr ? counts[column] : min(counts[column], first + split_keys);
 
     // Load (and for FP8, Hadamard-rotate) this KV head's query group.
     for (int h = warp; h < group; h += 8) {
@@ -443,7 +491,7 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
 
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[lane]) * table_stride;
-    for (int base = 0; base < count; base += kKeyTile) {
+    for (int base = first; base < count; base += kKeyTile) {
         const int tile = min(kKeyTile, count - base);
         // Load K/V rows of the tile, one warp per key.
         for (int j = warp; j < tile; j += 8) {
@@ -517,11 +565,57 @@ __global__ void __launch_bounds__(256)
         __syncthreads();
     }
     const int d = tid;
+    if (partial != nullptr) {
+        const std::int64_t state =
+            (static_cast<std::int64_t>(blockIdx.x) * gridDim.y + blockIdx.y) * group;
+        for (int h = 0; h < group; ++h) {
+            float* p = partial + (state + h) * kPartialWords;
+            p[d]     = acc[h];
+            if (d == 0) {
+                p[kHeadDim]     = m_s[h];
+                p[kHeadDim + 1] = l_s[h];
+            }
+        }
+        return;
+    }
     for (int h = 0; h < group; ++h) {
         const std::int64_t index =
             (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim + d;
         const float value = count > 0 && l_s[h] > 0.0F ? acc[h] / l_s[h] : 0.0F;
         out[index]        = __float2bfloat16_rn(value);
+    }
+}
+
+// One CTA per (column, KV head); thread d merges feature d of every head over the splits.
+__global__ void __launch_bounds__(256)
+    qsa_attention_combine_kernel(const float* __restrict__ partial, std::int32_t splits,
+                                 std::int32_t query_heads, std::int32_t kv_heads,
+                                 __nv_bfloat16* __restrict__ out) {
+    const int d       = static_cast<int>(threadIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.x) % kv_heads;
+    const int column  = static_cast<int>(blockIdx.x) / kv_heads;
+    const int group   = query_heads / kv_heads;
+    for (int h = 0; h < group; ++h) {
+        const float* p =
+            partial + (static_cast<std::int64_t>(blockIdx.x) * splits * group + h) * kPartialWords;
+        const std::int64_t stride = static_cast<std::int64_t>(group) * kPartialWords;
+        float m                   = -CUDART_INF_F;
+        for (int s = 0; s < splits; ++s) { m = fmaxf(m, p[s * stride + kHeadDim]); }
+        float numerator = 0.0F, denominator = 0.0F;
+        if (m > -CUDART_INF_F) {
+            for (int s = 0; s < splits; ++s) {
+                const float* state = p + s * stride;
+                const float l      = state[kHeadDim + 1];
+                if (l > 0.0F) {
+                    const float w = __expf(state[kHeadDim] - m);
+                    numerator += w * state[d];
+                    denominator += w * l;
+                }
+            }
+        }
+        const std::int64_t index =
+            (static_cast<std::int64_t>(column) * query_heads + kv_head * group + h) * kHeadDim + d;
+        out[index] = __float2bfloat16_rn(denominator > 0.0F ? numerator / denominator : 0.0F);
     }
 }
 
@@ -594,23 +688,54 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
     args.geometry           = kernel_geometry(geometry);
     const std::int32_t pass = qsa_select_pass_columns(columns);
     for (std::int32_t begin = 0; begin < columns; begin += pass) {
-        args.column_begin = begin;
-        qsa_select_kernel<<<std::min(pass, columns - begin), 256, 0, stream>>>(args);
+        args.column_begin       = begin;
+        const std::int32_t cols = std::min(pass, columns - begin);
+        // Narrow passes split each column's blocks across CTAs, whole warps' worth apiece.
+        const std::int32_t by_blocks = (max_blocks + kMinScoreBlocks - 1) / kMinScoreBlocks;
+        const std::int32_t splits =
+            std::max(1, std::min((kScoreTargetCtas + cols - 1) / cols, by_blocks));
+        const std::int32_t split_blocks = (max_blocks + splits - 1) / splits;
+        qsa_score_kernel<<<dim3(cols, splits), 256, 0, stream>>>(args, split_blocks);
+        CUDA_CHECK(cudaGetLastError());
+        qsa_select_kernel<<<cols, 256, 0, stream>>>(args);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
+QsaAttentionSplit qsa_attention_split(std::int32_t columns, std::int32_t kv_heads,
+                                      std::int32_t max_selected) {
+    const std::int64_t ctas    = static_cast<std::int64_t>(columns) * kv_heads;
+    const std::int32_t by_keys = (max_selected + kMinSplitKeys - 1) / kMinSplitKeys;
+    const auto wanted          = static_cast<std::int32_t>(
+        std::min<std::int64_t>((kSplitTargetCtas + ctas - 1) / ctas, by_keys));
+    if (wanted <= 1) { return {.splits = 1, .split_keys = max_selected}; }
+    // Whole key tiles per split; the last split may be short or empty.
+    const std::int32_t tiles = (max_selected + kKeyTile - 1) / kKeyTile;
+    const std::int32_t keys  = (tiles + wanted - 1) / wanted * kKeyTile;
+    return {.splits = (max_selected + keys - 1) / keys, .split_keys = keys};
+}
+
+std::size_t qsa_attention_partial_bytes(std::int32_t columns, std::int32_t query_heads,
+                                        std::int32_t kv_heads, std::int32_t max_selected) {
+    const QsaAttentionSplit split = qsa_attention_split(columns, kv_heads, max_selected);
+    if (split.splits == 1) { return 0; }
+    return static_cast<std::size_t>(columns) * kv_heads * split.splits * (query_heads / kv_heads) *
+           kPartialWords * sizeof(float);
+}
+
 void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor& counts,
                           const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                          Tensor& out, cudaStream_t stream) {
+                          float* partial, Tensor& out, cudaStream_t stream) {
     const std::int32_t query_heads = q.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t lanes       = q.ne[3];
     const std::int32_t kv_heads    = kv.num_kv_heads;
     const int blocks               = width * lanes * kv_heads;
+    const QsaAttentionSplit split  = qsa_attention_split(width * lanes, kv_heads, selected.ne[0]);
+    float* states                  = split.splits == 1 ? nullptr : partial;
     const bool fp8                 = kv.storage == KvCacheStorage::Fp8E4M3Row256;
     auto launch                    = [&](auto kernel) {
-        kernel<<<blocks, 256, 0, stream>>>(
+        kernel<<<dim3(blocks, split.splits), 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(selected.data),
             static_cast<const std::int32_t*>(counts.data), selected.ne[0],
@@ -619,7 +744,8 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
             kv.k_pages.data, kv.v_pages.data,
             fp8 ? static_cast<const __half*>(kv.k_scale_pages.data) : nullptr,
             fp8 ? static_cast<const __half*>(kv.v_scale_pages.data) : nullptr, query_heads,
-            kv_heads, width, scale, static_cast<__nv_bfloat16*>(out.data));
+            kv_heads, width, scale, split.split_keys, states,
+            static_cast<__nv_bfloat16*>(out.data));
     };
     if (fp8) {
         launch(qsa_attention_kernel<true>);
@@ -627,6 +753,11 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
         launch(qsa_attention_kernel<false>);
     }
     CUDA_CHECK(cudaGetLastError());
+    if (states != nullptr) {
+        qsa_attention_combine_kernel<<<blocks, 256, 0, stream>>>(
+            states, split.splits, query_heads, kv_heads, static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 } // namespace ninfer::ops::detail

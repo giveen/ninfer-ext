@@ -221,7 +221,8 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
 
     Tensor a = roots.attention.view({head_dim, heads, W, B});
     ops::qsa_attention(qn.view({head_dim, heads, W, B}), selected, counts, *sequence.table_rows, kv,
-                       static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))), a, s);
+                       static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))), work_, a,
+                       s);
     Tensor a_flat = a.view({qw, T});
     ops::sigmoid_mul(gate, a_flat, s);
     project(a_flat, p.output, y, work_, s);

@@ -358,8 +358,10 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
                 linear(layout, qsa->projection, tokens);
                 linear(layout, qsa->indexer, tokens);
                 linear(layout, qsa->output, tokens);
-                scratch(layout, ops::qsa_select_workspace_bytes(
-                                    workspace::qwen4_qsa_geometry(config), plan.capacity, tokens));
+                const ops::QsaGeometry geometry = workspace::qwen4_qsa_geometry(config);
+                scratch(layout,
+                        std::max(ops::qsa_select_workspace_bytes(geometry, plan.capacity, tokens),
+                                 ops::qsa_attention_workspace_bytes(geometry, tokens)));
             } else {
                 const auto& gdn = std::get<execution::Qwen4GdnParameters>(p.mixer);
                 (void)workspace::qwen4_gdn(layout, config, tokens);

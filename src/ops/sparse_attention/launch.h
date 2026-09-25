@@ -20,8 +20,21 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
                        const QsaIndexPlane& index, const QsaGeometry& geometry,
                        std::int32_t max_blocks, float* scores, Tensor& selected, Tensor& counts,
                        cudaStream_t stream);
+
+struct QsaAttentionSplit {
+    std::int32_t splits;     // CTAs per (column, KV head)
+    std::int32_t split_keys; // selected keys per split
+};
+
+[[nodiscard]] QsaAttentionSplit qsa_attention_split(std::int32_t columns, std::int32_t kv_heads,
+                                                    std::int32_t max_selected);
+[[nodiscard]] std::size_t qsa_attention_partial_bytes(std::int32_t columns,
+                                                      std::int32_t query_heads,
+                                                      std::int32_t kv_heads,
+                                                      std::int32_t max_selected);
+// `partial` holds qsa_attention_partial_bytes; it is unused when the call does not split.
 void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor& counts,
                           const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                          Tensor& out, cudaStream_t stream);
+                          float* partial, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

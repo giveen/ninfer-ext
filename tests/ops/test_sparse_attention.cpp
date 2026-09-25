@@ -357,57 +357,110 @@ int main() {
         }
     }
 
-    // ---- attention over the device selection ----
-    const auto q = random_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * W * kLanes, 0x31U,
-                               -1.0F, 1.0F);
-    DeviceBuffer dq = to_device(bits(q));
-    GuardedDeviceBuffer out(q.size() * 2);
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQueryHeads, W, kLanes});
-    Tensor tout(out.data(), DType::BF16, {kHeadDim, kQueryHeads, W, kLanes});
-    const float scale = 1.0F / 16.0F;
-    ops::qsa_attention(tq, tsel, tcnt, trows, kv, scale, tout, nullptr);
-    cuda_synchronize();
-    std::vector<double> reference(q.size(), 0.0);
-    for (int b = 0; b < kLanes; ++b) {
-        for (int w = 0; w < W; ++w) {
-            const int c     = b * W + w;
-            const int count = cnt_host[c];
-            const int* list = sel_host.data() + static_cast<std::ptrdiff_t>(c) * g.max_selected();
-            for (int h = 0; h < kQueryHeads; ++h) {
-                const int kvh = h / (kQueryHeads / kKvHeads);
-                const float* qrow =
-                    q.data() + (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
-                std::vector<double> logits(count);
-                double max_logit = -1e300;
-                for (int j = 0; j < count; ++j) {
-                    double dot = 0.0;
-                    for (int d = 0; d < kHeadDim; ++d) {
-                        dot += double(qrow[d]) * bf16_to_f32(k_host[key_at(b, list[j], kvh, d)]);
+    // ---- attention: FP64 softmax over each column's selection ----
+    // Narrow calls split every selection across CTAs; a call of 256+ (column, KV head) pairs
+    // runs one CTA per pair. Both routes are compared with the same oracle.
+    const auto attend = [&](const std::string& label, std::int32_t width,
+                            const std::vector<int>& sel, const std::vector<int>& cnt,
+                            std::uint32_t seed) {
+        const auto q = random_bf16(
+            static_cast<std::size_t>(kHeadDim) * kQueryHeads * width * kLanes, seed, -1.0F, 1.0F);
+        DeviceBuffer dq = to_device(bits(q)), dsel = to_device_i32(sel), dcnt = to_device_i32(cnt);
+        GuardedDeviceBuffer out(q.size() * 2);
+        Tensor tq(dq.p, DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
+        Tensor ts(dsel.p, DType::I32, {g.max_selected(), width, kLanes});
+        Tensor tc(dcnt.p, DType::I32, {width, kLanes});
+        Tensor tout(out.data(), DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
+        const float scale = 1.0F / 16.0F;
+        WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, width * kLanes));
+        ops::qsa_attention(tq, ts, tc, trows, kv, scale, workspace, tout, nullptr);
+        cuda_synchronize();
+        std::vector<double> reference(q.size(), 0.0);
+        for (int b = 0; b < kLanes; ++b) {
+            for (int w = 0; w < width; ++w) {
+                const int c     = b * width + w;
+                const int count = cnt[c];
+                const int* list = sel.data() + static_cast<std::ptrdiff_t>(c) * g.max_selected();
+                for (int h = 0; h < kQueryHeads; ++h) {
+                    const int kvh = h / (kQueryHeads / kKvHeads);
+                    const float* qrow =
+                        q.data() + (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
+                    std::vector<double> logits(count);
+                    double max_logit = -1e300;
+                    for (int j = 0; j < count; ++j) {
+                        double dot = 0.0;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            dot +=
+                                double(qrow[d]) * bf16_to_f32(k_host[key_at(b, list[j], kvh, d)]);
+                        }
+                        logits[j] = dot * scale;
+                        max_logit = std::max(max_logit, logits[j]);
                     }
-                    logits[j] = dot * scale;
-                    max_logit = std::max(max_logit, logits[j]);
-                }
-                double denominator = 0.0;
-                for (double& l : logits) {
-                    l = std::exp(l - max_logit);
-                    denominator += l;
-                }
-                double* o =
-                    reference.data() + (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
-                for (int j = 0; j < count; ++j) {
-                    for (int d = 0; d < kHeadDim; ++d) {
-                        __half hv;
-                        const std::uint16_t word = v_host[key_at(b, list[j], kvh, d)];
-                        std::memcpy(&hv, &word, 2);
-                        o[d] += logits[j] / denominator * double(__half2float(hv));
+                    double denominator = 0.0;
+                    for (double& l : logits) {
+                        l = std::exp(l - max_logit);
+                        denominator += l;
+                    }
+                    double* o = reference.data() +
+                                (static_cast<std::size_t>(c) * kQueryHeads + h) * kHeadDim;
+                    for (int j = 0; j < count; ++j) {
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            __half hv;
+                            const std::uint16_t word = v_host[key_at(b, list[j], kvh, d)];
+                            std::memcpy(&hv, &word, 2);
+                            o[d] += logits[j] / denominator * double(__half2float(hv));
+                        }
                     }
                 }
             }
         }
+        return verify_reduction(label, from_device_bf16(out.data(), q.size()), reference,
+                                kAttentionOutput) +
+               out.verify_guards(label);
+    };
+    // A sorted, duplicate-free selection of `count` cached tokens.
+    const auto pick = [&](int count, std::uint32_t seed) {
+        std::vector<int> all(kTokens);
+        std::iota(all.begin(), all.end(), 0);
+        std::uint32_t state = seed;
+        for (int i = kTokens - 1; i > 0; --i) {
+            state = state * 1664525U + 1013904223U;
+            std::swap(all[i], all[state % static_cast<std::uint32_t>(i + 1)]);
+        }
+        std::vector<int> out(all.begin(), all.begin() + count);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const auto synthetic = [&](std::int32_t width, const std::vector<int>& counts) {
+        std::vector<int> sel(static_cast<std::size_t>(g.max_selected()) * width * kLanes, 0);
+        for (std::size_t c = 0; c < counts.size(); ++c) {
+            const auto list = pick(counts[c], 0x40U + static_cast<std::uint32_t>(c));
+            std::copy(list.begin(), list.end(),
+                      sel.begin() + static_cast<std::ptrdiff_t>(c) * g.max_selected());
+        }
+        return sel;
+    };
+
+    // The device selection: 6 columns split every selection.
+    failures += attend("qsa_attention select", W, sel_host, cnt_host, 0x31U);
+    // Decode width: a full selection beside a single key, so later splits of the short column
+    // are empty.
+    {
+        const std::vector<int> counts = {g.max_selected(), 1};
+        failures += attend("qsa_attention decode", 1, synthetic(1, counts), counts, 0x32U);
     }
-    failures += verify_reduction("qsa_attention", from_device_bf16(out.data(), q.size()), reference,
-                                 kAttentionOutput);
-    failures += out.verify_guards("qsa_attention");
+    // 128 columns x 2 KV heads fill the GPU: one CTA per pair, counts from 0 to the maximum.
+    {
+        constexpr std::int32_t kWide = 64;
+        std::vector<int> counts(static_cast<std::size_t>(kWide) * kLanes);
+        for (std::size_t c = 0; c < counts.size(); ++c) {
+            counts[c] =
+                static_cast<int>((c * 977U) % static_cast<std::size_t>(g.max_selected() + 1));
+        }
+        counts[1] = 0;
+        counts[2] = g.max_selected();
+        failures += attend("qsa_attention wide", kWide, synthetic(kWide, counts), counts, 0x33U);
+    }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_attention correctness\n";
     return failures == 0 ? 0 : 1;
