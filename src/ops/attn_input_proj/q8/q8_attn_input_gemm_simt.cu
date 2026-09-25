@@ -24,7 +24,7 @@ void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaSt
                                  Q8Epilogue::Store, Output><<<grid, kRowsPerCta * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), output, Rows, kHidden, x.ne[1], kHidden,
-        kHidden / 1024);
+        q8_simt_vector_k(kHidden, (reinterpret_cast<std::uintptr_t>(x.data) & 0xfu) == 0));
 }
 
 template <int Rows, class Output>

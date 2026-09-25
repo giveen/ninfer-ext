@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -12,6 +13,7 @@ constexpr double kPriorAcceptance = 0.7;
 constexpr double kPriorWeight     = 2.0;
 constexpr double kShrinkWeight    = 3.0;
 constexpr double kSwitchMargin    = 1.02;
+constexpr double kRoundTimeWeight = 0.2; // weight of a new round in a learned round time
 
 constexpr std::array<std::uint32_t, 4> kAdaptiveRungs{2, 3, 4, 7};
 
@@ -92,6 +94,33 @@ MtpDraftPolicy::MtpDraftPolicy(std::vector<std::uint32_t> ladder, std::vector<do
         throw std::invalid_argument("MTP round times must be positive for every rung");
     }
     batch_rung_ = mtp_batch_rung(ladder_);
+    extra_.assign(ladder_.size(), 0.0);
+    observed_.assign(ladder_.size(), false);
+}
+
+void MtpDraftPolicy::observe_round(std::size_t rung, double seconds) {
+    if (rung >= ladder_.size()) {
+        throw std::invalid_argument("MTP round observation is outside the ladder");
+    }
+    if (!learning_ || !(seconds > 0.0)) { return; }
+    // A round faster than its startup replay is noise, not a negative cost.
+    const double extra = std::max(0.0, seconds - round_seconds_[rung]);
+    extra_[rung] =
+        observed_[rung] ? extra_[rung] + kRoundTimeWeight * (extra - extra_[rung]) : extra;
+    observed_[rung] = true;
+}
+
+double MtpDraftPolicy::round_seconds(std::size_t rung) const {
+    if (rung >= ladder_.size()) { throw std::invalid_argument("MTP rung is outside the ladder"); }
+    if (!learning_) { return round_seconds_[rung]; }
+    std::optional<std::size_t> source;
+    for (std::size_t r = rung + 1; r-- > 0 && !source;) {
+        if (observed_[r]) { source = r; }
+    }
+    for (std::size_t r = rung + 1; r < ladder_.size() && !source; ++r) {
+        if (observed_[r]) { source = r; }
+    }
+    return round_seconds_[rung] + (source ? extra_[*source] : 0.0);
 }
 
 std::size_t MtpDraftPolicy::select(std::size_t current,
@@ -101,7 +130,7 @@ std::size_t MtpDraftPolicy::select(std::size_t current,
     }
     if (ladder_.size() == 1 || lanes.size() > 1) { return batch_rung_; }
     const auto rate = [&](std::size_t rung) {
-        return lanes.front()->expected_tokens(ladder_[rung]) / round_seconds_[rung];
+        return lanes.front()->expected_tokens(ladder_[rung]) / round_seconds(rung);
     };
     std::size_t best    = current;
     double best_rate    = rate(current);

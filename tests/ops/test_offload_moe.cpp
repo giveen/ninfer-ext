@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <set>
@@ -29,6 +30,11 @@ constexpr std::int32_t I = ops::kOffloadMoeIntermediate;
 constexpr PointwiseCriterion kRouteWeights{1.0e-6, 1.0e-5};
 // Expert outputs cross a private BF16 intermediate and BF16 output rounding.
 constexpr ReductionCriterion kExpertOutput{8.0e-3, 2.0e-2, 2.0e-2};
+// The A4 route quantises the activations and the SwiGLU intermediate to NVFP4 as well, and a dot
+// product keeps the per-element relative error of e2m1 rather than averaging it away (see the
+// sparse-MoE A4 bound, which this matches). The oracle stays the A16 formula over the represented
+// weights; the divisors are calibrated from the case's own amax, as the checkpoint's were.
+constexpr ReductionCriterion kExpertA4Output{1.8e-1, 0.0, 2.4e-1};
 
 double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
@@ -115,7 +121,8 @@ int route_case(std::int32_t tokens, std::uint32_t seed, bool realistic = false) 
     Tensor ti(out_ids.data(), DType::I32, {K, tokens});
     Tensor tw(out_w.data(), DType::FP32, {K, tokens});
     Tensor ts(out_s.data(), DType::FP32, {tokens});
-    ops::moe_route(tx, tr, ti, tw, ts, nullptr);
+    WorkspaceArena workspace(ops::moe_route_workspace_bytes(tokens));
+    ops::moe_route(tx, tr, workspace, ti, tw, ts, nullptr);
     cuda_synchronize();
     const std::string label =
         "moe_route T=" + std::to_string(tokens) + (realistic ? " realistic" : "");
@@ -422,6 +429,66 @@ int cache_case(const HostBank& host, const DeviceBank& bank) {
     return failures;
 }
 
+// expert_cache_stage copies exactly the experts the snapshot marks resident: from the slot while
+// the device still holds the expert (a slot rewritten with a marker proves the source), from the
+// bank when the snapshot is stale, and leaves unmarked experts to the caller.
+int stage_case(const HostBank& host, const DeviceBank& bank) {
+    constexpr std::int32_t kLayer = 1;
+    DeviceCache cache(20, 2);
+    (void)resolve(cache, bank, kLayer, expert_range(0, 10));
+    (void)resolve(cache, bank, kLayer, expert_range(20, 10));
+    std::vector<int> snapshot = cache.table();
+    constexpr int kMarked = 3, kStale = 40, kUnmarked = 25;
+    const int marked_slot = snapshot[kLayer * E + kMarked];
+    cuda_check(cudaMemset(static_cast<std::uint8_t*>(cache.pool.p) +
+                              static_cast<std::size_t>(marked_slot) * ops::kExpertSlotBytes,
+                          0xAB, ops::kExpertSlotBytes),
+               "mark expert slot");
+    snapshot[kLayer * E + kStale]    = 0;  // resident in the snapshot only
+    snapshot[kLayer * E + kUnmarked] = -1; // resident on the device only
+    DeviceBuffer resident = to_device_i32(snapshot);
+
+    const std::int64_t sizes[4] = {ops::kExpertGateUpCodeBytes, ops::kExpertGateUpScaleBytes,
+                                   ops::kExpertDownCodeBytes, ops::kExpertDownScaleBytes};
+    DeviceBuffer staged_bytes =
+        to_device(std::vector<std::uint8_t>(static_cast<std::size_t>(E) * ops::kExpertSlotBytes,
+                                            0x5A));
+    ops::ExpertWeights staged = bank.weights;
+    std::int64_t offset       = 0;
+    for (int p = 0; p < 4; ++p) {
+        staged.base[p] = static_cast<const std::byte*>(staged_bytes.p) + offset;
+        offset += sizes[p] * E;
+    }
+    ops::expert_cache_stage(cache.state, kLayer, static_cast<const std::int32_t*>(resident.p),
+                            bank.weights, staged, nullptr);
+    cuda_synchronize();
+    const auto out = from_device<std::uint8_t>(staged_bytes,
+                                              static_cast<std::size_t>(E) * ops::kExpertSlotBytes);
+
+    int failures = 0;
+    for (int e = 0; e < E; ++e) {
+        const bool copied = (snapshot[kLayer * E + e] >= 0);
+        offset            = 0;
+        for (int p = 0; p < 4; ++p) {
+            const std::uint8_t* got = out.data() + offset + static_cast<std::size_t>(e) * sizes[p];
+            const std::uint8_t* src =
+                host.planes[p].data() + static_cast<std::size_t>(e) * sizes[p];
+            bool ok = true;
+            for (std::int64_t i = 0; i < sizes[p] && ok; ++i) {
+                const std::uint8_t want = !copied ? 0x5A : e == kMarked ? 0xAB : src[i];
+                ok                      = got[i] == want;
+            }
+            if (!ok) {
+                std::cerr << "expert_cache_stage: expert " << e << " plane " << p
+                          << (copied ? " differs from its source\n" : " was written\n");
+                ++failures;
+            }
+            offset += sizes[p] * E;
+        }
+    }
+    return failures;
+}
+
 // `pool` > 0 routes every column within `pool` experts, so one expert job carries many tokens
 // (real prefill routing concentrates); 0 spreads routing over all experts.
 int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens,
@@ -498,6 +565,144 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     return failures;
 }
 
+// Gate/up [2I,H] and down [H,I] of one expert as code times block scale, which float holds
+// exactly; the matrix divisors are applied to the FP64 dot products.
+struct DenseExpert {
+    std::vector<float> gate_up, down;
+    double gate_divisor, up_divisor, down_divisor;
+};
+
+DenseExpert dense_expert(const HostBank& bank, int e) {
+    DenseExpert out{std::vector<float>(static_cast<std::size_t>(2) * I * H),
+                    std::vector<float>(static_cast<std::size_t>(H) * I),
+                    bank.gate_up_divisors[2 * e], bank.gate_up_divisors[2 * e + 1],
+                    bank.down_divisors[e]};
+    const auto* gu_codes =
+        bank.planes[0].data() + static_cast<std::size_t>(e) * ops::kExpertGateUpCodeBytes;
+    const auto* gu_scales =
+        bank.planes[1].data() + static_cast<std::size_t>(e) * ops::kExpertGateUpScaleBytes;
+    const auto* d_codes =
+        bank.planes[2].data() + static_cast<std::size_t>(e) * ops::kExpertDownCodeBytes;
+    const auto* d_scales =
+        bank.planes[3].data() + static_cast<std::size_t>(e) * ops::kExpertDownScaleBytes;
+    for (std::int32_t r = 0; r < 2 * I; ++r) {
+        for (std::int32_t h = 0; h < H; ++h) {
+            out.gate_up[static_cast<std::size_t>(r) * H + h] =
+                static_cast<float>(decode(gu_codes, gu_scales, H, r, h, 1.0));
+        }
+    }
+    for (std::int32_t h = 0; h < H; ++h) {
+        for (std::int32_t r = 0; r < I; ++r) {
+            out.down[static_cast<std::size_t>(h) * I + r] =
+                static_cast<float>(decode(d_codes, d_scales, I, h, r, 1.0));
+        }
+    }
+    return out;
+}
+
+// The A4 route over `tokens` columns, checked against the A16 FP64 formula on `checked` columns.
+int a4_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens, std::uint32_t seed,
+            int pool, const std::vector<std::int32_t>& checked) {
+    const auto x      = random_bf16(static_cast<std::size_t>(H) * tokens, seed, -1.0F, 1.0F);
+    const auto shared = random_bf16(static_cast<std::size_t>(H) * tokens, seed + 1U, -0.01F, 0.01F);
+    std::vector<int> ids(static_cast<std::size_t>(K) * tokens);
+    std::vector<float> weights(ids.size()), shared_gate(tokens);
+    std::uint32_t state = seed | 1U;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::set<int> chosen;
+        float total = 0.0F;
+        for (std::int32_t k = 0; k < K; ++k) {
+            int e;
+            do {
+                e = static_cast<int>(next(state) % (pool > 0 ? pool : E)) * (pool > 0 ? 37 : 1) % E;
+            } while (!chosen.insert(e).second);
+            ids[t * K + k]     = e;
+            weights[t * K + k] = 0.1F + static_cast<float>(next(state) % 100) / 100.0F;
+            total += weights[t * K + k];
+        }
+        for (std::int32_t k = 0; k < K; ++k) { weights[t * K + k] /= total; }
+        shared_gate[t] = static_cast<float>(next(state) % 1000) / 1000.0F;
+    }
+
+    std::map<int, DenseExpert> experts;
+    std::vector<double> reference(static_cast<std::size_t>(H) * checked.size(), 0.0);
+    std::vector<double> act(I);
+    double act_max = 0.0;
+    for (std::size_t c = 0; c < checked.size(); ++c) {
+        const std::int32_t t = checked[c];
+        const float* xt      = x.data() + static_cast<std::size_t>(t) * H;
+        double* yt           = reference.data() + c * H;
+        for (std::int32_t k = 0; k < K; ++k) {
+            const int e = ids[t * K + k];
+            // Concentrated routing reuses a few experts; spread routing decodes each use.
+            DenseExpert uncached;
+            if (pool > 0 && !experts.contains(e)) { experts.emplace(e, dense_expert(host, e)); }
+            if (pool == 0) { uncached = dense_expert(host, e); }
+            const DenseExpert& w = pool > 0 ? experts.at(e) : uncached;
+            for (std::int32_t r = 0; r < I; ++r) {
+                const float* g_row = w.gate_up.data() + static_cast<std::size_t>(r) * H;
+                const float* u_row = w.gate_up.data() + static_cast<std::size_t>(I + r) * H;
+                double g = 0.0, u = 0.0;
+                for (std::int32_t h = 0; h < H; ++h) {
+                    g += double(g_row[h]) * xt[h];
+                    u += double(u_row[h]) * xt[h];
+                }
+                g /= w.gate_divisor;
+                u /= w.up_divisor;
+                act[r]  = g * sigmoid(g) * u;
+                act_max = std::max(act_max, std::abs(act[r]));
+            }
+            for (std::int32_t h = 0; h < H; ++h) {
+                const float* d_row = w.down.data() + static_cast<std::size_t>(h) * I;
+                double sum         = 0.0;
+                for (std::int32_t r = 0; r < I; ++r) { sum += double(d_row[r]) * act[r]; }
+                yt[h] += double(weights[t * K + k]) * sum / w.down_divisor;
+            }
+        }
+        for (std::int32_t h = 0; h < H; ++h) {
+            yt[h] += double(shared_gate[t]) * double(shared[static_cast<std::size_t>(t) * H + h]);
+        }
+    }
+    double x_max = 0.0;
+    for (const float v : x) { x_max = std::max(x_max, double(std::abs(v))); }
+
+    DeviceBuffer dx      = to_device(bits(x));
+    DeviceBuffer dshared = to_device(bits(shared));
+    DeviceBuffer dids    = to_device_i32(ids);
+    DeviceBuffer dw      = to_device(weights);
+    DeviceBuffer dsg     = to_device(shared_gate);
+    Tensor tx(dx.p, DType::BF16, {H, tokens});
+    Tensor tshared(dshared.p, DType::BF16, {H, tokens});
+    Tensor tids(dids.p, DType::I32, {K, tokens});
+    Tensor tw(dw.p, DType::FP32, {K, tokens});
+    Tensor tsg(dsg.p, DType::FP32, {tokens});
+    GuardedDeviceBuffer out(static_cast<std::size_t>(H) * tokens * 2);
+    Tensor ty(out.data(), DType::BF16, {H, tokens});
+    ops::ExpertWeights staged        = bank.weights;
+    staged.gate_up_input_divisor     = static_cast<float>(448.0 * 6.0 / x_max);
+    staged.down_input_divisor        = static_cast<float>(448.0 * 6.0 / act_max);
+    {
+        WorkspaceArena workspace(ops::moe_experts_a4_workspace_bytes(tokens));
+        ops::moe_experts_a4(tx, tids, tw, tsg, tshared, staged, workspace, ty, nullptr);
+        cuda_synchronize();
+    }
+    const auto all = from_device_bf16(out.data(), static_cast<std::size_t>(H) * tokens);
+    std::vector<double> actual(reference.size());
+    for (std::size_t c = 0; c < checked.size(); ++c) {
+        std::copy_n(all.begin() + static_cast<std::ptrdiff_t>(checked[c]) * H, H,
+                    actual.begin() + static_cast<std::ptrdiff_t>(c) * H);
+    }
+    const std::string label =
+        "moe_experts_a4 T=" + std::to_string(tokens) + (pool > 0 ? " concentrated" : "");
+    return verify_reduction(label, actual, reference, kExpertA4Output) + out.verify_guards(label);
+}
+
+std::vector<std::int32_t> column_range(std::int32_t first, std::int32_t count) {
+    std::vector<std::int32_t> out(count);
+    std::iota(out.begin(), out.end(), first);
+    return out;
+}
+
 } // namespace
 
 int main() {
@@ -506,7 +711,10 @@ int main() {
         return 77;
     }
     int failures = 0;
-    for (const std::int32_t tokens : {1, 4, 33}) { failures += route_case(tokens, 0x51U + tokens); }
+    // 130 columns span three logits column tiles.
+    for (const std::int32_t tokens : {1, 4, 33, 130}) {
+        failures += route_case(tokens, 0x51U + tokens);
+    }
     // Prefill-sized calls with model-like magnitudes: a 526-token prompt, a 1024-token chunk, and
     // a 2048-token chunk (many column tiles, and a non-multiple-of-64 tail).
     for (const std::int32_t tokens : {1, 70, 526, 1024, 2048}) {
@@ -515,13 +723,25 @@ int main() {
     const HostBank host   = make_bank(0xC0FFEEU);
     const DeviceBank bank = upload(host);
     failures += cache_case(host, bank);
-    for (const std::int32_t tokens : {1, 3, 16}) {
+    failures += stage_case(host, bank);
+    // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
+    for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
     }
     // Concentrated routing: 12 experts serve every column, so jobs hold up to 64 tokens and the
     // decode GEMV walks several 8-token groups per expert.
     for (const std::int32_t tokens : {9, 22, 64}) {
         failures += experts_case(host, bank, tokens, 0xA00U + tokens, 12);
+    }
+    // A4 prefill route. Spread routing leaves most experts a partial tile; concentrated routing
+    // gives each of 12 experts several 64-column tiles; 1040 columns cross the 1024-column chunk,
+    // checked on both sides of it.
+    failures += a4_case(host, bank, 12, 0xB00U, 0, column_range(0, 12));
+    failures += a4_case(host, bank, 200, 0xB01U, 12, column_range(0, 200));
+    {
+        auto checked = column_range(0, 24);
+        for (const std::int32_t t : column_range(1012, 28)) { checked.push_back(t); }
+        failures += a4_case(host, bank, 1040, 0xB02U, 12, checked);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " offload_moe correctness\n";
     return failures == 0 ? 0 : 1;

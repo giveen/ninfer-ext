@@ -17,26 +17,26 @@ constexpr int kStages              = 2;
 template <int ColsPerTile, bool Full>
 void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* scales,
                __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
-               std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
+               std::int32_t padded_k, std::int32_t vector_k, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlockDefault * 32;
     const dim3 grid(static_cast<unsigned>(div_up(n, kRowsPerBlockDefault)),
                     static_cast<unsigned>(div_up(t, ColsPerTile)), 1u);
     const Q8ContiguousOutput output{outp, n};
     q8_rowsplit_gemm_simt_kernel<Q8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlockDefault, kStages,
                                  Full><<<grid, kBlockThreads, 0, stream>>>(
-        xp, codes, scales, output, n, k, t, padded_k, full_slabs);
+        xp, codes, scales, output, n, k, t, padded_k, vector_k);
 }
 
 template <int ColsPerTile, bool Full>
 void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const auto* xp       = static_cast<const __nv_bfloat16*>(x.data);
     const bool aligned_x = (x.ne[0] % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
-    const std::int32_t full_slabs = aligned_x ? x.ne[0] / 1024 : 0;
+    const std::int32_t vector_k = q8_simt_vector_k(x.ne[0], aligned_x);
 
     launch_tt<ColsPerTile, Full>(xp, static_cast<const std::uint8_t*>(w.qdata),
                                  static_cast<const std::uint8_t*>(w.scales),
                                  static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1],
-                                 w.padded_shape[1], full_slabs, stream);
+                                 w.padded_shape[1], vector_k, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -62,6 +62,40 @@ void launch_q8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStr
 
 void launch_q8_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<8>(x, w, out, stream);
+}
+
+namespace {
+
+constexpr int kKSplitRows = 2;
+constexpr int kKSplitWarps = 4;
+
+template <int ColsPerTile>
+void launch_ksplit(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    const auto* xp       = static_cast<const __nv_bfloat16*>(x.data);
+    const bool aligned_x = (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
+    if (q8_simt_vector_k(x.ne[0], aligned_x) != x.ne[0]) {
+        launch_route<ColsPerTile>(x, w, out, stream);
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], kKSplitRows)),
+                    static_cast<unsigned>(div_up(x.ne[1], ColsPerTile)), 1u);
+    q8_rowsplit_ksplit_simt_kernel<ColsPerTile, kKSplitRows, kKSplitWarps>
+        <<<grid, kKSplitRows * kKSplitWarps * 32, 0, stream>>>(
+            xp, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales),
+            Q8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), out.ne[0]}, out.ne[0],
+            x.ne[0], x.ne[1], w.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void launch_q8_simt_ksplit_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_ksplit<4>(x, w, out, stream);
+}
+
+void launch_q8_simt_ksplit_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_ksplit<8>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

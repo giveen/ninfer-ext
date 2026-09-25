@@ -120,14 +120,17 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
     const Tensor* composed_embedding = nullptr;
     if (prompt.token_types[state.text_kv_base] != 0) {
         const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
-        if (chunk.control == nullptr) {
+        if (chunk.items.empty()) {
             throw std::logic_error("visual MTP bridge has no encoded Vision item");
         }
-        const auto& scatter = chunk.control->scatter_indices;
-        const auto column =
-            std::ranges::lower_bound(scatter, static_cast<std::int32_t>(state.text_kv_base));
-        if (column == scatter.end() || *column != static_cast<std::int32_t>(state.text_kv_base) ||
-            static_cast<std::uint8_t>(chunk.control->modality) !=
+        const auto position = static_cast<std::int32_t>(state.text_kv_base);
+        const auto scatter  = chunk.scatter;
+        const auto column   = std::ranges::lower_bound(scatter, position);
+        const auto item     = std::ranges::find_if(chunk.items, [&](const auto* control) {
+            return std::ranges::binary_search(control->scatter_indices, position);
+        });
+        if (column == scatter.end() || *column != position || item == chunk.items.end() ||
+            static_cast<std::uint8_t>((*item)->modality) !=
                 prompt.token_types[state.text_kv_base]) {
             throw std::logic_error("visual MTP bridge does not match Vision scatter metadata");
         }

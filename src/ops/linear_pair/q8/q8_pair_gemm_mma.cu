@@ -53,7 +53,8 @@ template <int TileCols, bool Full>
 void launch_simt_single(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int RowsPerCta      = 8;
     constexpr int Stages          = 2;
-    const std::int32_t full_slabs = x.ne[0] / 1024;
+    const std::int32_t vector_k =
+        q8_simt_vector_k(x.ne[0], (reinterpret_cast<std::uintptr_t>(x.data) & 0xfu) == 0);
     const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], RowsPerCta)),
                     static_cast<unsigned>(div_up(x.ne[1], TileCols)), 1u);
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
@@ -62,7 +63,7 @@ void launch_simt_single(const Tensor& x, const Weight& weight, Tensor& out, cuda
                                                static_cast<const std::uint8_t*>(weight.qdata),
                                                static_cast<const std::uint8_t*>(weight.scales),
                                                output, out.ne[0], x.ne[0], x.ne[1],
-                                               weight.padded_shape[1], full_slabs);
+                                               weight.padded_shape[1], vector_k);
 }
 
 template <int TileCols>

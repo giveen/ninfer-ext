@@ -340,6 +340,32 @@ public:
         bank.down_divisors =
             reinterpret_cast<const float*>(down->data + down->geometry.divisor_offset);
         bank.down_divisor_rows = dimension(down->geometry.shape[0] / down->geometry.divisor_count);
+        // The A4 route quantises a chunk once and shares it with every expert of the layer, so it
+        // needs every expert to permit A4 with one common divisor per projection input; anything
+        // else keeps the layer on the A16 route.
+        const auto common_divisor = [&](auto projections) -> float {
+            std::optional<float> common;
+            for (const auto& expert : moe.experts) {
+                for (const WeightId id : projections(expert)) {
+                    const ops::WeightInput input = model_.input(id);
+                    if (input.policy != ops::LinearPolicy::AllowA4 ||
+                        !input.activation_input_divisor ||
+                        (common && *common != *input.activation_input_divisor)) {
+                        return 0.0F;
+                    }
+                    common = input.activation_input_divisor;
+                }
+            }
+            return common.value_or(0.0F);
+        };
+        const float gate_up_input =
+            common_divisor([](const auto& expert) { return std::array{expert.gate, expert.up}; });
+        const float down_input =
+            common_divisor([](const auto& expert) { return std::array{expert.down}; });
+        if (gate_up_input > 0.0F && down_input > 0.0F) {
+            bank.gate_up_input_divisor = gate_up_input;
+            bank.down_input_divisor    = down_input;
+        }
         return bank;
     }
 

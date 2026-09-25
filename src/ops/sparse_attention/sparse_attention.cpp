@@ -3,6 +3,7 @@
 
 #include "ops/sparse_attention/launch.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -115,9 +116,24 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
                               static_cast<float*>(scratch.data), selected, counts, stream);
 }
 
+std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns) {
+    if (geometry.kv_heads <= 0 || geometry.query_heads % geometry.kv_heads != 0 || columns <= 0) {
+        throw std::invalid_argument("qsa_attention_workspace_bytes: invalid geometry");
+    }
+    // Narrower calls split further, so size for every width up to `columns`.
+    std::size_t bytes = 0;
+    for (std::int32_t c = 1; c <= columns; ++c) {
+        const std::size_t call = detail::qsa_attention_partial_bytes(
+            c, geometry.query_heads, geometry.kv_heads, geometry.max_selected());
+        if (call == 0) { break; } // wider calls fill the GPU without splitting
+        bytes = std::max(bytes, call);
+    }
+    return bytes + 256;
+}
+
 void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts,
                    const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                   Tensor& out, cudaStream_t stream) {
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "qsa_attention";
     require_storage(kv, op);
     require_dense(q, DType::BF16, op, "q");
@@ -131,7 +147,12 @@ void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts
             "counts must be [W,B]");
     require_dense(table_rows, DType::I32, op, "table rows");
     require(table_rows.numel() == q.ne[3], op, "one table row per lane");
-    detail::qsa_attention_launch(q, selected, counts, table_rows, kv, scale, out, stream);
+    const std::int32_t columns = q.ne[2] * q.ne[3];
+    const std::size_t bytes    = detail::qsa_attention_partial_bytes(
+        columns, q.ne[1], kv.num_kv_heads, static_cast<std::int32_t>(selected.ne[0]));
+    auto scope     = workspace.scope();
+    float* partial = bytes == 0 ? nullptr : static_cast<float*>(workspace.alloc_bytes(bytes).data);
+    detail::qsa_attention_launch(q, selected, counts, table_rows, kv, scale, partial, out, stream);
 }
 
 } // namespace ninfer::ops

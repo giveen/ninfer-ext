@@ -206,8 +206,18 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
                 const int valid_scales =
                     output_tile.valid(grow, m) && g0 < kg ? min(8, kg - g0) : 0;
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + min(g0, kg - 1);
-                ninfer::ops::cp_async_zfill<16, Cache::cg>(dst, &scales[gi * 2],
-                                                           valid_scales * 2);
+                if ((kg & 7) == 0) {
+                    ninfer::ops::cp_async_zfill<16, Cache::cg>(dst, &scales[gi * 2],
+                                                               valid_scales * 2);
+                } else {
+                    // A row of kg % 8 != 0 FP16 scales starts off the 16-byte grid that cp.async
+                    // requires, so read this refresh with plain loads. The barrier that precedes
+                    // dequant_w publishes them with the asynchronous copies.
+                    const auto* src = reinterpret_cast<const std::uint16_t*>(scales) + gi;
+                    auto* out       = reinterpret_cast<std::uint16_t*>(dst);
+#pragma unroll
+                    for (int g = 0; g < 8; ++g) { out[g] = g < valid_scales ? src[g] : 0; }
+                }
             }
         }
     };

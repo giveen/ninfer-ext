@@ -290,9 +290,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         q.pool         = builder.add(checked_mul(static_cast<std::size_t>(q.slots),
                                                  ops::kExpertSlotBytes, "expert cache pool bytes"),
                                      kArenaAlign, "expert cache pool");
-        q.staged_bank  = builder.add(static_cast<std::size_t>(ops::kOffloadMoeExperts) *
-                                         ops::kExpertSlotBytes,
-                                     kArenaAlign, "prefill expert layer bank");
+        // Two banks, so the next layer's copy overlaps this layer's compute.
+        q.staged_bank = builder.add(2 * static_cast<std::size_t>(ops::kExpertStagedLayerBytes),
+                                    kArenaAlign, "prefill expert layer banks");
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -358,8 +358,10 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
                 linear(layout, qsa->projection, tokens);
                 linear(layout, qsa->indexer, tokens);
                 linear(layout, qsa->output, tokens);
-                scratch(layout, ops::qsa_select_workspace_bytes(
-                                    workspace::qwen4_qsa_geometry(config), plan.capacity, tokens));
+                const ops::QsaGeometry geometry = workspace::qwen4_qsa_geometry(config);
+                scratch(layout,
+                        std::max(ops::qsa_select_workspace_bytes(geometry, plan.capacity, tokens),
+                                 ops::qsa_attention_workspace_bytes(geometry, tokens)));
             } else {
                 const auto& gdn = std::get<execution::Qwen4GdnParameters>(p.mixer);
                 (void)workspace::qwen4_gdn(layout, config, tokens);
@@ -377,10 +379,16 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         hc(layout, p.ffn_hc, tokens);
         auto moe = layout.scope();
         (void)workspace::qwen4_moe(layout, config, tokens, slots);
+        scratch(layout, ops::moe_route_workspace_bytes(tokens));
         linear(layout, p.moe.shared_gate_up, tokens);
         linear(layout, p.moe.shared_down, tokens);
-        scratch(layout, ops::moe_experts_workspace_bytes(
-                            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts)));
+        std::size_t experts = ops::moe_experts_workspace_bytes(
+            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts));
+        // Calls wide enough to stage the layer may take the A4 route instead.
+        if (tokens >= kQwen4StagedColumns) {
+            experts = std::max(experts, ops::moe_experts_a4_workspace_bytes(tokens));
+        }
+        scratch(layout, experts);
     };
     const auto body = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens, bool prefill) {
         {
@@ -947,6 +955,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
+std::uint32_t resolved_prefill_chunk(const execution::Parameters& parameters,
+                                     const EngineOptions& options) {
+    if (options.prefill_chunk) { return *options.prefill_chunk; }
+    return parameters.model.config().text.qwen4() ? kQwen4PrefillChunk : kDefaultPrefillChunk;
+}
+
 void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
                              const EngineOptions& options) {
     if (!parameters.model.config().text.attention ||
@@ -965,7 +979,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.max_context > parameters.model.config().text.max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
+    if (const std::uint32_t chunk = resolved_prefill_chunk(parameters, options);
+        chunk == 0 || chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
@@ -1300,7 +1315,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk = std::min(resolved_prefill_chunk(parameters, options), options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
                           !options.speculative.fixed_draft,

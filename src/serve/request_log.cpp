@@ -471,7 +471,7 @@ std::string format_server_start_json(
              {"max_concurrency", engine_options.max_concurrency},
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
-             {"prefill_chunk", engine_options.prefill_chunk},
+             {"prefill_chunk", memory.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},

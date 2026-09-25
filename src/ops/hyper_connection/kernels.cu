@@ -131,6 +131,56 @@ __global__ void hyper_connection_expand_kernel(const __nv_bfloat16* __restrict__
     }
 }
 
+// grouped_offset_rmsnorm_kernel for widths of whole 16-byte chunks, at most kVectorChunks per
+// thread: every thread loads its chunks once and keeps them in registers across both passes.
+constexpr int kVectorChunks = 2;
+
+__global__ void grouped_offset_rmsnorm_vector_kernel(const __nv_bfloat16* __restrict__ x,
+                                                     const __nv_bfloat16* __restrict__ weight,
+                                                     __nv_bfloat16* __restrict__ out,
+                                                     std::int32_t width, std::int32_t groups,
+                                                     float eps) {
+    __shared__ float scratch[32];
+    const std::int32_t group  = static_cast<std::int32_t>(blockIdx.x) % groups;
+    const std::int64_t column = static_cast<std::int64_t>(blockIdx.x) / groups;
+    const std::int64_t base   = column * width * groups + static_cast<std::int64_t>(group) * width;
+    const int chunks          = width / 8;
+    const auto* source        = reinterpret_cast<const uint4*>(x + base);
+    uint4 values[kVectorChunks];
+    float sum = 0.0F;
+#pragma unroll
+    for (int c = 0; c < kVectorChunks; ++c) {
+        const int chunk = static_cast<int>(threadIdx.x) + c * static_cast<int>(blockDim.x);
+        values[c]       = chunk < chunks ? source[chunk] : make_uint4(0, 0, 0, 0);
+        const auto* v   = reinterpret_cast<const __nv_bfloat162*>(&values[c]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __bfloat1622float2(v[j]);
+            sum += f.x * f.x + f.y * f.y;
+        }
+    }
+    const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(width) + eps);
+    const auto* w   = reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(group) * width);
+    auto* target    = reinterpret_cast<uint4*>(out + base);
+#pragma unroll
+    for (int c = 0; c < kVectorChunks; ++c) {
+        const int chunk = static_cast<int>(threadIdx.x) + c * static_cast<int>(blockDim.x);
+        if (chunk >= chunks) { continue; }
+        const uint4 weights = w[chunk];
+        const auto* v       = reinterpret_cast<const __nv_bfloat162*>(&values[c]);
+        const auto* g       = reinterpret_cast<const __nv_bfloat162*>(&weights);
+        uint4 result;
+        auto* r = reinterpret_cast<__nv_bfloat162*>(&result);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __bfloat1622float2(v[j]);
+            const float2 s = __bfloat1622float2(g[j]);
+            r[j] = __floats2bfloat162_rn(f.x * inv * (1.0F + s.x), f.y * inv * (1.0F + s.y));
+        }
+        target[chunk] = result;
+    }
+}
+
 int grid_for(std::int64_t work) {
     return static_cast<int>(std::clamp<std::int64_t>((work + kBlock - 1) / kBlock, 1, 65535LL * 8));
 }
@@ -141,6 +191,19 @@ void grouped_offset_rmsnorm_launch(const Tensor& x, const Tensor& weight, std::i
                                    float eps, Tensor& out, cudaStream_t stream) {
     const std::int32_t width   = x.ne[0] / groups;
     const std::int64_t columns = x.numel() / x.ne[0];
+    const auto aligned         = [](const void* p) {
+        return (reinterpret_cast<std::uintptr_t>(p) & 0xfu) == 0;
+    };
+    if (width % 8 == 0 && width / 8 <= kBlock * kVectorChunks && aligned(x.data) &&
+        aligned(weight.data) && aligned(out.data)) {
+        grouped_offset_rmsnorm_vector_kernel<<<static_cast<unsigned>(columns * groups), kBlock, 0,
+                                               stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data), static_cast<__nv_bfloat16*>(out.data),
+            width, groups, eps);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     grouped_offset_rmsnorm_kernel<<<static_cast<unsigned>(columns * groups), kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         static_cast<__nv_bfloat16*>(out.data), width, groups, eps);

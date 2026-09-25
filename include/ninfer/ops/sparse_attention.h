@@ -94,10 +94,15 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
  * come from qsa_select. For each column and query head the oracle is the scaled dot-product
  * softmax over exactly the selected keys, reading K/V at their storage boundary (FP16 V for the
  * BFloat16 profile; represented FP8 codes times scales, K in the stored Hadamard domain, for the
- * FP8 profile). `out` has the shape of `q`; a column with count zero writes zeros.
+ * FP8 profile). `out` has the shape of `q`; a column with count zero writes zeros. `workspace`
+ * holds qsa_attention_workspace_bytes for the call's `W*B` columns.
  */
 void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts,
                    const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                   Tensor& out, cudaStream_t stream);
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/** Workspace of qsa_attention: partial softmax states when a narrow call splits its keys. */
+[[nodiscard]] std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry,
+                                                        std::int32_t columns);
 
 } // namespace ninfer::ops

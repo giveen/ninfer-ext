@@ -205,8 +205,11 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Text-prefill chunk, a nonzero multiple of 128. Empty selects the model's default: 4096 for a
+    // model whose routed experts are host-resident (every chunk streams each whole expert layer
+    // once, so fewer chunks move fewer bytes) and 1024 otherwise.
+    std::optional<std::uint32_t> prefill_chunk;
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     ExpertCachePolicy expert_cache;
     NgramResidency ngram_residency = NgramResidency::Automatic;
     SpeculativeOptions speculative;
@@ -919,6 +922,8 @@ struct MemorySummary {
     std::size_t expert_cache_bytes   = 0;
     // Resolved n-gram table residency (Automatic when the model has no n-gram table).
     NgramResidency ngram_residency = NgramResidency::Automatic;
+    // Resolved text-prefill chunk (the model default when EngineOptions left it empty).
+    std::uint32_t prefill_chunk = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

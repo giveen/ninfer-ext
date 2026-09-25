@@ -280,7 +280,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
         if (layout.staged_bank) {
-            runtime.staged_bank    = static_cast<std::byte*>(layout.staged_bank->bind(backing).data);
+            qwen4_staging.emplace(static_cast<std::byte*>(layout.staged_bank->bind(backing).data),
+                                  static_cast<std::size_t>(slot_of.numel()));
+            runtime.staging        = &*qwen4_staging;
             runtime.staged_columns = kQwen4StagedColumns;
         }
         const auto& config = parameters.model.config().text;
@@ -565,6 +567,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
+    out.prefill_chunk   = prefill_chunk;
     if (qwen4_runtime) {
         out.expert_cache_slots = static_cast<std::uint32_t>(qwen4_runtime->cache.slots);
         out.expert_cache_bytes =
