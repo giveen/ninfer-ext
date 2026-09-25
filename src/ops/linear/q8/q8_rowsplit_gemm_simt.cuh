@@ -23,11 +23,13 @@
 //     so T > 8 re-streams the weights once per 8-column tile instead; the mma
 //     tensor-core GEMM takes over where that stops winning.
 //
-// Correctness for arbitrary shapes: full 1024-value slabs require k % 8 == 0
-// (16-byte aligned x columns) and cover [0, k/1024*1024); every remaining group
-// (tail of odd k, or all groups when k % 8 != 0) uses the scalar per-pair path
-// reading global memory directly, masked at the k boundary. Weights in the
-// padded region [k, padded_k) are never used.
+// Correctness for arbitrary shapes: vector_k is k when k % 8 == 0 and x is
+// 16-byte aligned, else 0. Full 1024-value slabs cover [0, vector_k/1024*1024);
+// the rest of [0, vector_k) is read straight from global memory in the same
+// phase layout, 256 values per warp step, so a short or ragged k (640, 2560)
+// costs a few independent steps rather than one dependent step per group. When
+// vector_k is 0 every group uses the scalar per-pair path, masked at the k
+// boundary. Weights in the padded region [k, padded_k) are never used.
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -142,15 +144,56 @@ q8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
     }
 }
 
-// full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
-// aligned, else 0 (everything runs through the scalar tail).
+// One lane's step outside the slab pipeline: its 8 codes at kk (kk % 8 == 0) against every live
+// column, read straight from global memory. Requires k % 8 == 0 and 16-byte aligned x.
+template <int ColsPerTile>
+__device__ __forceinline__ void
+q8_simt_vector_step(const std::uint8_t* __restrict__ code_row,
+                    const std::uint8_t* __restrict__ scale_row, const __nv_bfloat16* __restrict__ x0,
+                    std::int32_t k, int kk, int ncols, float (&acc)[ColsPerTile]) {
+    const uint2 words = *reinterpret_cast<const uint2*>(code_row + kk);
+    const float scale = __half2float(
+        __ushort_as_half(reinterpret_cast<const std::uint16_t*>(scale_row)[kk / 32]));
+    float w[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const std::uint32_t word = (&words.x)[j / 4];
+        w[j] = static_cast<float>(static_cast<std::int8_t>((word >> (8 * (j % 4))) & 0xffu)) * scale;
+    }
+#pragma unroll
+    for (int tt = 0; tt < ColsPerTile; ++tt) {
+        if (tt < ncols) {
+            const uint4 xv  = load_vec<uint4>(x0 + static_cast<std::int64_t>(tt) * k + kk);
+            const float2 f0 = bf16x2_bits_to_float2(xv.x);
+            const float2 f1 = bf16x2_bits_to_float2(xv.y);
+            const float2 f2 = bf16x2_bits_to_float2(xv.z);
+            const float2 f3 = bf16x2_bits_to_float2(xv.w);
+            acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
+            acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
+            acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
+            acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
+            acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
+            acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
+            acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
+            acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
+        }
+    }
+}
+
+// vector_k is computed on the host: q8_simt_vector_k (k when k % 8 == 0 and x is
+// 16-byte aligned, else 0, when everything runs through the scalar tail).
+__host__ __device__ constexpr std::int32_t q8_simt_vector_k(std::int32_t k, bool aligned_x) {
+    return aligned_x && k % 8 == 0 ? k : 0;
+}
+
 template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full,
           Q8Epilogue Epilogue = Q8Epilogue::Store, class Output = Q8ContiguousOutput>
 __global__ void q8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ scales, Output output,
                                              std::int32_t rows, std::int32_t k, std::int32_t cols,
-                                             std::int32_t padded_k, std::int32_t full_slabs) {
+                                             std::int32_t padded_k, std::int32_t vector_k) {
+    const std::int32_t full_slabs = vector_k / 1024;
     using Codec                = typename Schedule::Codec;
     constexpr int kPrefetch    = PipelineStages - 1;
     constexpr int kHighU4Alloc = Schedule::kHighU4 > 0 ? Schedule::kHighU4 : 1;
@@ -210,8 +253,14 @@ __global__ void q8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         __syncwarp();
     }
 
-    // Scalar tail: remaining groups read global memory directly, masked at k.
-    const int g0      = (full_slabs * 1024) / Codec::kGroupK;
+    // Vector tail: the rest of [0, vector_k) in the slab's phase layout, 256 values per step.
+#pragma unroll 4
+    for (int kk = full_slabs * 1024 + lane * 8; kk < vector_k; kk += 256) {
+        q8_simt_vector_step<ColsPerTile>(code_row, scale_row, x0, k, kk, ncols, acc);
+    }
+
+    // Scalar tail (vector_k == 0 only): groups read global memory directly, masked at k.
+    const int g0      = vector_k > 0 ? div_up(k, Codec::kGroupK) : 0;
     const int kg_used = div_up(k, Codec::kGroupK);
     for (int g = g0; g < kg_used; ++g) {
         const int kk = g * Codec::kGroupK + lane * 2;
@@ -242,6 +291,53 @@ __global__ void q8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
             }
             *destination = __float2bfloat16_rn(a);
         }
+    }
+}
+
+// K-split variant for few rows over a long K (Qwen4Exp hyper-connection [324, 10240]): the
+// warp-per-row kernel would run one warp per row across all of K on a handful of CTAs.
+// WarpsPerRow warps share a row, warp p taking steps p, p + WarpsPerRow, ... of 256 values, and
+// reduce through shared memory. Requires k % 8 == 0 and 16-byte aligned x (vector_k == k).
+template <int ColsPerTile, int RowsPerCta, int WarpsPerRow>
+__global__ void __launch_bounds__(RowsPerCta* WarpsPerRow * 32)
+    q8_rowsplit_ksplit_simt_kernel(const __nv_bfloat16* __restrict__ x,
+                                   const std::uint8_t* __restrict__ codes,
+                                   const std::uint8_t* __restrict__ scales,
+                                   Q8ContiguousOutput output, std::int32_t rows, std::int32_t k,
+                                   std::int32_t cols, std::int32_t padded_k) {
+    __shared__ float partial[RowsPerCta][WarpsPerRow][ColsPerTile];
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int local = warp / WarpsPerRow;
+    const int part  = warp % WarpsPerRow;
+    const int row   = static_cast<int>(blockIdx.x) * RowsPerCta + local;
+    const int col0  = static_cast<int>(blockIdx.y) * ColsPerTile;
+    const int ncols = min(ColsPerTile, cols - col0);
+
+    float acc[ColsPerTile];
+#pragma unroll
+    for (int i = 0; i < ColsPerTile; ++i) { acc[i] = 0.0f; }
+    if (row < rows) {
+        const int kg                  = padded_k / 32;
+        const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg * 32;
+        const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg * 2;
+        const __nv_bfloat16* x0       = x + static_cast<std::int64_t>(col0) * k;
+#pragma unroll 4
+        for (int kk = part * 256 + lane * 8; kk < k; kk += 256 * WarpsPerRow) {
+            q8_simt_vector_step<ColsPerTile>(code_row, scale_row, x0, k, kk, ncols, acc);
+        }
+    }
+#pragma unroll
+    for (int tt = 0; tt < ColsPerTile; ++tt) {
+        const float a = warp_reduce_sum(acc[tt]);
+        if (lane == 0) { partial[local][part][tt] = a; }
+    }
+    __syncthreads();
+    if (part == 0 && lane < ncols && row < rows) {
+        float a = 0.0f;
+#pragma unroll
+        for (int p = 0; p < WarpsPerRow; ++p) { a += partial[local][p][lane]; }
+        *output.tile(0).at(row, col0 + lane) = __float2bfloat16_rn(a);
     }
 }
 
