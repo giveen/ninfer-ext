@@ -67,8 +67,21 @@ class SafetensorsSource:
                 }
             else:
                 file = self.root / "model.safetensors"
+                shards = sorted(self.root.glob("*.safetensors"))
                 if file.is_file():
                     self.weight_map = {name: file for name in self._header(file)}
+                elif shards:
+                    # A sharded checkpoint without its index (an incomplete download): the shard
+                    # headers name every tensor, so read them instead.
+                    self.weight_map = {}
+                    for shard in shards:
+                        for name in self._header(shard):
+                            if name in self.weight_map:
+                                raise ValueError(
+                                    f"{self.root}: tensor {name!r} appears in "
+                                    f"{self.weight_map[name].name} and {shard.name}"
+                                )
+                            self.weight_map[name] = shard
                 elif self.path.is_dir():
                     # A custom recipe may supply every logical value from another source.
                     self.weight_map = {}
