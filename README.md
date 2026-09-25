@@ -95,6 +95,9 @@ All numbers are from one RTX 5090 with BF16 KV and CUDA Graphs, at fork commit `
 | Decode, `tg128`, adaptive MTP | 86.5 (68% accepted) |
 | Decode, `tg128`, MTP K=3 | 83.1 (51% accepted) |
 
+With FP8 KV, prefill is unchanged (2,940 tok/s at 4k, 2,908 at 16k). Decode after a 2,048-token
+prompt rises to 65.7 tok/s (+5%).
+
 Serving 512-token essays per request, aggregate decode tok/s (mean of two runs):
 
 | `ninfer-serve` | C=1 | C=2 | C=4 | C=8 |
@@ -118,7 +121,33 @@ single-request decode and about 350 tok/s prefill on a 3k-token prompt. The main
 
 ## Performance
 
-These numbers were measured on this fork: one RTX 5090, CUDA 13.3, fork commit `19f38b77`.
+These numbers were measured on this fork: one RTX 5090, CUDA 13.3, fork commits `19f38b77` and
+`f8106aa9`. The Engine is identical in both; only the benchmark sizing changed.
+
+### Serving throughput
+
+Aggregate decode tok/s from `ninfer-serve`, with C concurrent requests each writing a 512-token
+essay (mean of two runs):
+
+| Artifact | Mode | C=1 | C=2 | C=4 | C=8 |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-27B `nvfp4` | plain | 78.6 | 149.0 | 254.3 | 492.3 |
+| | `--spec mtp` | **127.2** | **253.1** | **423.0** | **730.4** |
+| Qwen3.8-27B `groupwise-int` | plain | 81.8 | 146.0 | 260.1 | 415.9 |
+| | `--spec mtp` | **127.7** | **219.3** | **340.3** | **453.2** |
+| Qwen3.6-35B-A3B `groupwise-int` | plain | 386.6 | 619.8 | **972.3** | **1,324.4** |
+| | `--spec mtp` | **491.9** | **663.5** | 850.9 | 1,001.0 |
+| | `--spec dflash --draft-tokens 7` | 355.4 | 452.1 | 507.7 | 898.9 |
+| Qwen3.8-Flash-Next `nvfp4` | plain | 82.8 | **105.4** | **114.5** | **116.8** |
+| | `--spec mtp` | **93.5** | 104.7 | 111.4 | 103.3 |
+
+Bold marks the faster mode at each concurrency.
+
+- **27B models.** MTP pays at every concurrency. On NVFP4 it is still +48% at C=8.
+- **35B-A3B.** MTP loses from C=4 up, and DFlash7 is slower than plain decode on this prose load.
+- **Flash-Next.** It is bound by expert fetches, so drafts only help a single request.
+
+### Single-request benchmark
 
 | Artifact | Prefill 4k | Prefill 16k | `tg128` | `tg128` adaptive MTP | `tg128` MTP K=3 |
 |---|---:|---:|---:|---:|---:|
@@ -129,20 +158,27 @@ These numbers were measured on this fork: one RTX 5090, CUDA 13.3, fork commit `
 
 All values are tok/s; percentages are MTP draft acceptance.
 
+DFlash on Qwen3.6-35B-A3B reaches 385.1 tok/s at `tg128` with 7 drafts (20% accepted) and 219.5
+with 15 (7% accepted), against 393.3 without speculation.
+
 ### Benchmark conditions
 
 - **Tool.** `ninfer_bench` through the public Engine: BF16 KV, CUDA Graphs, 3 measured repetitions
   after 1 warm-up, and the default prefill chunk.
 - **Commands.** `-p 512,4096,16384 -n 128 -pg 2048,128` without speculation. With speculation:
-  `-n 128 -pg 2048,128 --max-ctx 4096`, plus `--spec mtp` or
-  `--spec mtp --draft-tokens 3 --fixed-draft`. `--max-ctx` is no longer needed, because
-  `ninfer_bench` now sizes the context for speculative runs itself.
+  `-n 128 -pg 2048,128`, plus `--spec mtp`, `--spec mtp --draft-tokens 3 --fixed-draft` or
+  `--spec dflash --draft-tokens 7|15`. The first MTP runs also passed `--max-ctx 4096`; the bench
+  now sizes speculative contexts itself.
+- **FP8 KV.** The Flash-Next FP8 figures add `--kv-dtype fp8`.
 - **`tg128` acceptance.** `tg128` decodes from a one-token seed, so its MTP acceptance depends on the
   generated text.
 - **MTP after the bench prompt isn't reported.** After the 2,048-token corpus prompt, drafts are
   accepted 94–100% of the time. That flatters MTP, so those numbers are omitted.
-- **Serve table.** `ninfer-serve --max-context 4096 --max-concurrency 8 --kv-capacity auto`. The
-  load is `temperature=0`, one warm-up wave then one measured wave of C concurrent 512-token essays.
+- **Serve tables.** `ninfer-serve --max-context 4096 --max-concurrency 8 --kv-capacity auto`, BF16
+  KV. The load is `temperature=0` with thinking off: one warm-up wave, then one measured wave of C
+  concurrent 512-token essays on eight fixed topics.
+- **Not measured.** DFlash2 and the Qwen3.6-27B artifacts; their weights are not on the benchmark
+  machine.
 - **Raw reports.** The JSON reports are kept locally under `profiles/bench/readme_20260925/`.
 
 Upstream's published results use its own methodology and artifacts. They are in the
