@@ -69,6 +69,8 @@ struct VisionWorkspaceLayout {
     LayoutRegion patch_scratch, qkv_scratch, projection_scratch;
     LayoutRegion up_scratch, down_scratch, merger_first_scratch, merger_second_scratch;
     std::size_t bytes = 0;
+    // Extent of everything but the output and the final merger projection's scratch.
+    std::size_t scratch_bytes = 0;
 };
 
 TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
@@ -88,7 +90,8 @@ TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
 VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
                                              const VisionParameters& parameters,
                                              std::size_t patches64, std::size_t tokens64,
-                                             std::size_t handoff_offset_bytes) {
+                                             std::size_t handoff_offset_bytes,
+                                             std::size_t output_offset_bytes = 0) {
     if (patches64 == 0 || tokens64 == 0 ||
         patches64 != checked_mul(tokens64,
                                  dimension(std::uint64_t(config.spatial_merge_size) *
@@ -179,10 +182,12 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
             out.x, DType::BF16, {dimension(config.merger_width()), tokens}, "merger hidden");
     }
     out.bytes                = builder.finish(1, "vision workspace");
+    out.scratch_bytes        = out.bytes;
     const auto final_scratch = std::max(std::size_t{1}, capacity(parameters.merger_fc2, 1, tokens));
     {
         LayoutBuilder finish;
-        (void)finish.add(handoff_offset_bytes, kWorkspaceAlignment, "handoff start");
+        (void)finish.add(checked_add(handoff_offset_bytes, output_offset_bytes, "output offset"),
+                         kWorkspaceAlignment, "handoff start");
         (void)finish.add(
             checked_mul(checked_mul(parameters.merger_fc2.weight.n, tokens64, "output elements"), 2,
                         "output bytes"),
@@ -265,24 +270,51 @@ VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
 }
 
 Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
-                                  std::size_t merged_tokens) {
+                                  std::size_t merged_tokens, std::size_t offset_bytes) {
     if (backing.data == nullptr || backing.bytes < plan.capacity_bytes || merged_tokens == 0 ||
-        merged_tokens > plan.max_merged_tokens) {
+        merged_tokens > plan.max_merged_tokens || offset_bytes % kWorkspaceAlignment != 0) {
         throw std::invalid_argument("Vision output binding exceeds its workspace plan");
     }
     const std::size_t bytes = output_handoff_bytes(plan.output_hidden, merged_tokens);
-    if (bytes > plan.handoff_capacity_bytes) {
+    if (offset_bytes > plan.handoff_capacity_bytes ||
+        bytes > plan.handoff_capacity_bytes - offset_bytes) {
         throw std::logic_error("Vision output binding exceeds its handoff region");
     }
     TensorRegion region;
-    region.region = LayoutRegion{plan.handoff_offset_bytes, bytes, kWorkspaceAlignment};
+    region.region = LayoutRegion{plan.handoff_offset_bytes + offset_bytes, bytes,
+                                 kWorkspaceAlignment};
     region.dtype  = DType::BF16;
     region.shape  = {plan.output_hidden, static_cast<std::int32_t>(merged_tokens), 1, 1};
     return region.bind(backing);
 }
 
+bool VisionContext::fits_output(const VisionConfig& config, const VisionParameters& parameters,
+                                const VisionWorkspacePlan& plan,
+                                const qwen3_5::VisionItemControl& control,
+                                std::size_t offset_bytes) {
+    if (offset_bytes % kWorkspaceAlignment != 0 || offset_bytes > plan.handoff_capacity_bytes ||
+        control.merged_count == 0 || control.merged_count > plan.max_merged_tokens ||
+        output_handoff_bytes(plan.output_hidden, control.merged_count) >
+            plan.handoff_capacity_bytes - offset_bytes) {
+        return false;
+    }
+    const VisionWorkspaceLayout layout =
+        build_workspace_layout(config, parameters, control.patch_count, control.merged_count,
+                               plan.handoff_offset_bytes, offset_bytes);
+    // Outputs already in the handoff region lie below offset_bytes; the item's scratch must end
+    // before the region to leave them intact.
+    return layout.bytes <= plan.capacity_bytes &&
+           (offset_bytes == 0 || layout.scratch_bytes <= plan.handoff_offset_bytes);
+}
+
+std::size_t VisionContext::packed_output_bytes(const VisionWorkspacePlan& plan,
+                                               std::size_t merged_tokens) {
+    const std::size_t column = static_cast<std::size_t>(plan.output_hidden) * 2U;
+    return column % kWorkspaceAlignment == 0 ? column * merged_tokens : 0;
+}
+
 void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                           const VisionWorkspacePlan& plan) const {
+                           const VisionWorkspacePlan& plan, std::size_t offset_bytes) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_5::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
@@ -298,15 +330,16 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
     }
-    const Tensor planned_output = bind_output(backing, plan, tokens64);
+    const Tensor planned_output = bind_output(backing, plan, tokens64, offset_bytes);
     if (output.data != planned_output.data || output.bytes() != planned_output.bytes()) {
         throw std::invalid_argument("Vision output does not name the planned handoff region");
     }
-    const VisionWorkspaceLayout layout = build_workspace_layout(
-        config_, parameters_, patches64, tokens64, plan.handoff_offset_bytes);
-    if (layout.bytes > plan.encode_peak_bytes || backing.bytes < plan.capacity_bytes) {
+    if (!fits_output(config_, parameters_, plan, control, offset_bytes) ||
+        backing.bytes < plan.capacity_bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
+    const VisionWorkspaceLayout layout = build_workspace_layout(
+        config_, parameters_, patches64, tokens64, plan.handoff_offset_bytes, offset_bytes);
     const auto patches  = static_cast<std::int32_t>(patches64);
     const auto tokens   = static_cast<std::int32_t>(tokens64);
     cudaStream_t stream = ctx_.stream;
@@ -485,6 +518,10 @@ VisionPrefillSession::VisionPrefillSession(
     timers_.reserve(plan_.uses.size());
 }
 
+// A chunk holds every item whose span it reaches, as long as the next item's output can be packed
+// behind the live ones (see VisionContext::fits_output); otherwise it ends where that item begins.
+// Packing keeps a prompt with several media items in as few chunks as a text prompt, which matters
+// when every chunk has a fixed cost (Qwen4Exp streams each routed-expert layer once per chunk).
 VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
     if (nominal_length == 0 || begin >= prompt_.token_ids.size()) {
         throw std::invalid_argument("Vision chunk range is empty or outside the prompt");
@@ -494,34 +531,66 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     std::uint32_t end = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
 
+    // Items wholly before this chunk are consumed; an item still in progress stays live.
+    std::erase_if(live_, [&](const LiveItem& item) { return item.end <= begin; });
     while (next_use_ < plan_.uses.size() && plan_.uses[next_use_].end <= begin) { ++next_use_; }
-    const VisionUseSpan* active = nullptr;
-    if (next_use_ < plan_.uses.size() && plan_.uses[next_use_].begin < end) {
-        active = &plan_.uses[next_use_];
-        if (next_use_ + 1U < plan_.uses.size()) {
-            end = std::min(end, plan_.uses[next_use_ + 1U].begin);
+    for (std::size_t u = next_use_; u < plan_.uses.size() && plan_.uses[u].begin < end; ++u) {
+        const VisionUseSpan& use = plan_.uses[u];
+        if (std::ranges::any_of(live_, [&](const LiveItem& item) {
+                return item.prepared_item == use.prepared_item_index;
+            })) {
+            continue;
         }
-    }
-    if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
-    if (active == nullptr) {
-        return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
-    }
-    const qwen3_5::VisionItemControl& control = plan_.control->items[active->control_index];
-    Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
-
-    if (!active_item_ || *active_item_ != active->prepared_item_index) {
-        const auto& payload = prompt_.media_payloads[active->prepared_item_index];
+        const qwen3_5::VisionItemControl& control = plan_.control->items[use.control_index];
+        std::size_t offset                        = 0;
+        if (!live_.empty()) {
+            const std::size_t packed =
+                VisionContext::packed_output_bytes(workspace_plan_, control.merged_count);
+            offset = live_.back().offset + live_.back().bytes;
+            if (packed == 0 || live_.back().bytes == 0 ||
+                !VisionContext::fits_output(context_.config(), context_.parameters(),
+                                            workspace_plan_, control, offset)) {
+                end = use.begin;
+                break;
+            }
+        }
+        Tensor output = VisionContext::bind_output(workspace_, workspace_plan_,
+                                                   control.merged_count, offset);
+        const auto& payload = prompt_.media_payloads[use.prepared_item_index];
         timers_.emplace_back(device_);
         timers_.back().start();
         context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
-                        workspace_plan_);
+                        workspace_plan_, offset);
         timers_.back().record_stop();
-        active_item_          = active->prepared_item_index;
-        active_handoff_bytes_ = output.bytes();
-        handoff_peak_bytes_   = std::max(handoff_peak_bytes_, active_handoff_bytes_);
-        encoded_payloads_pending_release_.push_back(active->prepared_item_index);
+        live_.push_back(LiveItem{
+            .prepared_item = use.prepared_item_index,
+            .control       = &control,
+            .end           = use.end,
+            .offset        = offset,
+            .bytes = VisionContext::packed_output_bytes(workspace_plan_, control.merged_count)});
+        encoded_payloads_pending_release_.push_back(use.prepared_item_index);
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+    if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
+
+    active_handoff_bytes_ =
+        live_.empty() ? 0
+                      : live_.back().offset +
+                            output_handoff_bytes(workspace_plan_.output_hidden,
+                                                 live_.back().control->merged_count);
+    handoff_peak_bytes_ = std::max(handoff_peak_bytes_, active_handoff_bytes_);
+    chunk_scatter_.clear();
+    chunk_items_.clear();
+    std::size_t merged = 0;
+    for (const LiveItem& item : live_) {
+        chunk_scatter_.insert(chunk_scatter_.end(), item.control->scatter_indices.begin(),
+                              item.control->scatter_indices.end());
+        chunk_items_.push_back(item.control);
+        merged += item.control->merged_count;
+    }
+    if (live_.empty()) { return VisionChunk{static_cast<std::int32_t>(end - begin), {}, {}, {}}; }
+    return VisionChunk{
+        static_cast<std::int32_t>(end - begin), chunk_scatter_, chunk_items_,
+        VisionContext::bind_output(workspace_, workspace_plan_, merged, live_.front().offset)};
 }
 
 void VisionPrefillSession::release_encoded_media_payloads() noexcept {
@@ -533,7 +602,7 @@ void VisionPrefillSession::release_encoded_media_payloads() noexcept {
 }
 
 void VisionPrefillSession::retire_handoff() noexcept {
-    active_item_.reset();
+    live_.clear();
     active_handoff_bytes_ = 0;
 }
 

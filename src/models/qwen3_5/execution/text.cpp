@@ -1263,9 +1263,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         {
             std::vector<std::int32_t> local_scatter_indices;
             std::int32_t visual_begin = 0;
-            if (vision_chunk.control != nullptr) {
+            if (!vision_chunk.scatter.empty()) {
                 const auto scatter =
-                    std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
+                    vision_chunk.scatter;
                 const auto begin = std::ranges::lower_bound(scatter, prompt_t0);
                 const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
                 const auto count = static_cast<std::int32_t>(end - begin);
@@ -1385,9 +1385,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     mtp_input_embeddings =
                         work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                     ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
-                    if (vision_chunk.control != nullptr) {
+                    if (!vision_chunk.scatter.empty()) {
                         const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
-                            vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
+                            vision_chunk.scatter, alignment_tokens, mtp_window);
                         if (!overlap.empty()) {
                             Tensor shifted_indices = workspace::visual_scatter_indices(
                                 work_, static_cast<std::int32_t>(overlap.size()));
