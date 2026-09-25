@@ -68,6 +68,13 @@ struct PrefillStepResult {
     ExecutionTiming timing;
 };
 
+// Width a staged prefill step may take. The Scheduler keeps a step beside waiting decode work to
+// one prefill chunk; with nothing waiting it may take the Program's idle width.
+enum class PrefillPace : std::uint8_t {
+    BesideDecode,
+    Idle,
+};
+
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };

@@ -527,6 +527,7 @@ public:
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::PrefillPace pace,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
@@ -611,7 +612,10 @@ public:
     const ContextCacheOptions context_cache;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
+    // Service unit and the prefill width beside decode work; planning and projected work count
+    // in it. Execution contexts and workspace take prefill_width, a multiple of it.
     const std::uint32_t prefill_chunk;
+    const std::uint32_t prefill_width;
     // Largest draft length. MTP rounds may run shorter draft lengths from `mtp_rungs`.
     const std::uint32_t draft_window;
     const bool adaptive_draft;
@@ -1004,7 +1008,8 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::PrefillPace pace,
+                        runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
                runtime::ExecutionTiming* failed_timing);
@@ -1223,7 +1228,7 @@ private:
                                     std::optional<std::uint32_t> prefix_execution_split_after,
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill(SequenceState& sequence, RequestControl& request,
+    advance_prefill(SequenceState& sequence, RequestControl& request, runtime::PrefillPace pace,
                     runtime::ExecutionTiming* failed_timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
@@ -1249,7 +1254,7 @@ private:
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
-        return std::max(prefill_chunk, kKVLeaseGrowthMarginTokens);
+        return std::max(prefill_width, kKVLeaseGrowthMarginTokens);
     }
     [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
         // One round's Backend requirement can sit a whole draft window above the frontier the

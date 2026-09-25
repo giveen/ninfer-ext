@@ -48,6 +48,10 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     PrefillProgress out;
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
+    // Only a capture frontier or the prompt end cuts a step short of a whole number of chunks, and
+    // the projection opens a new segment at each, so this count stays within projected work.
+    out.service_units =
+        std::max(1U, (step.processed_prompt_tokens + prefill_chunk - 1U) / prefill_chunk);
     out.complete                = step.complete;
     out.timing                  = step.timing;
     if (step.complete) {
@@ -350,7 +354,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 const StateImageSelectors selectors = state_selectors(sequence);
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(),
-                     replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+                     replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
                      proposal_head, qwen4_execution()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),

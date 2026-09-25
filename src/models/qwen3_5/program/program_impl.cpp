@@ -43,7 +43,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      prefill_chunk(plan.prefill_chunk), prefill_width(plan.prefill_width),
+      draft_window(plan.draft_window),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
@@ -298,7 +299,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (layout.ple_record) { runtime.ple_record = layout.ple_record->bind(backing); }
             if (layout.ple_input) { runtime.ple_input = layout.ple_input->bind(backing); }
             const std::size_t columns = std::max<std::size_t>(
-                prefill_chunk, static_cast<std::size_t>(draft_window + 1U) * max_concurrency);
+                prefill_width, static_cast<std::size_t>(draft_window + 1U) * max_concurrency);
             ple_host.emplace(columns * ple_gather->width() * sizeof(std::uint16_t));
             runtime.ple_gather = ple_gather.get();
             runtime.ple_host   = static_cast<std::uint16_t*>(ple_host->data());
@@ -471,7 +472,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, qwen4_execution()},
+                 prefill_width, proposal_head, qwen4_execution()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -570,7 +571,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
-    out.prefill_chunk   = prefill_chunk;
+    out.prefill_chunk      = prefill_chunk;
+    out.idle_prefill_chunk = prefill_width;
     if (qwen4_runtime) {
         out.expert_cache_slots = static_cast<std::uint32_t>(qwen4_runtime->cache.slots);
         out.expert_cache_bytes =

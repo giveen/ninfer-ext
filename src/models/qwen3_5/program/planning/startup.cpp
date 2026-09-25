@@ -115,7 +115,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
-        static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
+        static_cast<std::int32_t>(std::min(plan.prefill_width, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
     const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
@@ -318,7 +318,7 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
     const auto& qwen4      = *parameters.qwen4;
-    const auto chunk       = static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
+    const auto chunk       = static_cast<std::int32_t>(std::min(plan.prefill_width, plan.capacity));
     const auto verify      = static_cast<std::int32_t>(plan.draft_window + 1U);
     const std::int32_t slots = checked_i32(plan.expert_cache_slots, "expert cache slot count");
     const std::int32_t hidden = dimension(config.hidden_size);
@@ -505,7 +505,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto& config     = parameters.model.config().text;
     if (parameters.qwen4) { return build_qwen4_workspace_plan(plan); }
 
-    const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
+    const std::uint32_t chunk_u32 = std::min(plan.prefill_width, plan.capacity);
     if (chunk_u32 == 0 ||
         chunk_u32 > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -961,10 +961,33 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-std::uint32_t resolved_prefill_chunk(const execution::Parameters& parameters,
+struct PrefillWidths {
+    std::uint32_t chunk = 0; // beside decode work, and the service unit
+    std::uint32_t idle  = 0; // with no decode work waiting
+};
+
+PrefillWidths resolved_prefill_widths(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    const bool qwen4          = parameters.model.config().text.qwen4();
+    const std::uint32_t chunk = options.prefill_chunk.value_or(qwen4 ? kQwen4PrefillChunk
+                                                                     : kDefaultPrefillChunk);
+    // An explicit chunk alone fixes the width; the default pair adapts to decode work.
+    const std::uint32_t idle =
+        options.idle_prefill_chunk.value_or(options.prefill_chunk || qwen4
+                                                ? chunk
+                                                : kDefaultIdlePrefillChunk);
+    return {chunk, idle};
+}
+
+// Both widths clamp to the context. A prefill step of the idle width then still spans a whole
+// number of service units, which is what keeps its accounting inside the planned projection.
+PrefillWidths clamped_prefill_widths(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
-    if (options.prefill_chunk) { return *options.prefill_chunk; }
-    return parameters.model.config().text.qwen4() ? kQwen4PrefillChunk : kDefaultPrefillChunk;
+    const PrefillWidths widths = resolved_prefill_widths(parameters, options);
+    const std::uint32_t chunk  = std::min(widths.chunk, options.max_context);
+    const std::uint32_t idle   = std::max(chunk, std::min(widths.idle, options.max_context) /
+                                                     chunk * chunk);
+    return {chunk, idle};
 }
 
 void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
@@ -985,9 +1008,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.max_context > parameters.model.config().text.max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
-    if (const std::uint32_t chunk = resolved_prefill_chunk(parameters, options);
-        chunk == 0 || chunk % kPrefillChunkAlignment != 0) {
+    if (const PrefillWidths widths = resolved_prefill_widths(parameters, options);
+        widths.chunk == 0 || widths.chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
+    } else if (widths.idle < widths.chunk || widths.idle % widths.chunk != 0) {
+        throw std::invalid_argument("idle_prefill_chunk must be a multiple of prefill_chunk");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
@@ -1155,6 +1180,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->prefill_width       = inputs.prefill_width;
     impl->draft_window        = inputs.draft_window;
     impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
@@ -1328,7 +1354,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk = std::min(resolved_prefill_chunk(parameters, options), options.max_context),
+        .prefill_chunk       = clamped_prefill_widths(parameters, options).chunk,
+        .prefill_width       = clamped_prefill_widths(parameters, options).idle,
         .draft_window        = options.speculative.draft_tokens,
         .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
                           !options.speculative.fixed_draft,

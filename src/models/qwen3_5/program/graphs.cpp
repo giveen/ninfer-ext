@@ -320,7 +320,7 @@ void ProgramImpl::prepare_graphs() {
             records != nullptr ? records : (replay_records ? &*replay_records : nullptr),
             io,
             prefill_hidden,
-            prefill_chunk,
+            prefill_width,
             proposal_head,
             qwen4_execution()};
     };

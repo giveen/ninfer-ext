@@ -256,7 +256,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
-                                          prefill_hidden, prefill_chunk, proposal_head,
+                                          prefill_hidden, prefill_width, proposal_head,
                                           qwen4_execution()},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
@@ -355,7 +355,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
              proposal_head, qwen4_execution()},
             decoder->text_kv,
             *io.ordinary,
@@ -536,7 +536,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   &rung.records, io, prefill_hidden, prefill_chunk,
+                                                   &rung.records, io, prefill_hidden, prefill_width,
                                                    proposal_head, qwen4_execution()},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
@@ -733,7 +733,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
              proposal_head, qwen4_execution()},
             decoder->text_kv,
             *dflash,

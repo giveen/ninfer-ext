@@ -851,7 +851,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `4096` for Qwen4Exp, else `2048` |
+| `--prefill-chunk N` | text-prefill chunk while decode work is waiting, and the scheduler's service unit; alone it fixes the width | `4096` for Qwen4Exp, else `1024` |
+| `--idle-prefill-chunk N` | text-prefill chunk when no decode work is waiting, a multiple of `--prefill-chunk` | `--prefill-chunk` when that is set, else `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1028,6 +1029,15 @@ prefilling, waiting requests may still be admitted to free lanes, so prefill of 
 overlap the prefill and decode of the others (each prefill unit advances exactly one staged lane
 per worker boundary). When a request completes or is cancelled, the next boundary rebuilds the
 batch without an empty row.
+
+A prefill unit beside waiting decode work is one `--prefill-chunk` wide, so a decode round waits
+behind at most one such chunk. With nothing to decode, the unit takes `--idle-prefill-chunk`, whose
+wider GEMMs prefill faster. On an RTX 5090 with the defaults (1024 and 4096) prefill alone runs
+4-7 % faster on Qwen3.8-27B NVFP4 and 19-21 % on Qwen3.6-35B-A3B than at 1024, while a decode
+round interrupted by a long prompt still stalls about 150 ms (27B) or 65 ms (35B) rather than the
+~520 ms or ~210 ms a fixed 4096 chunk costs. Prefill arithmetic is not identical across chunk
+widths, so the greedy continuation of one prompt can differ between a lone request and one that
+prefills beside decode.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

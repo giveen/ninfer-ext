@@ -389,9 +389,9 @@ void Program::finalize_context_transaction() noexcept { impl_->finalize_context_
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
-PrefillProgress Program::advance_prefill(SequenceHandle sequence,
+PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace,
                                          runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+    return impl_->advance_prefill(sequence, pace, failed_timing);
 }
 
 CaptureAssessment

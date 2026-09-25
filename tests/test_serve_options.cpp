@@ -103,6 +103,19 @@ int main() {
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
 
+    const ServeOptions prefill_widths = parse(
+        {"ninfer-serve", "model.ninfer", "--prefill-chunk", "512", "--idle-prefill-chunk", "2048"});
+    failures += check(prefill_widths.prefill_chunk == 512U &&
+                          prefill_widths.idle_prefill_chunk == 2048U,
+                      "prefill widths did not preserve their explicit values");
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).idle_prefill_chunk,
+                      "omitted --idle-prefill-chunk did not defer to the model default");
+    bool misaligned_idle_chunk_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--idle-prefill-chunk", "1000"});
+    } catch (const std::invalid_argument&) { misaligned_idle_chunk_rejected = true; }
+    failures += check(misaligned_idle_chunk_rejected, "misaligned --idle-prefill-chunk was accepted");
+
     bool empty_model_id_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});

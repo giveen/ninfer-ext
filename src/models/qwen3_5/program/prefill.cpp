@@ -703,9 +703,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
 }
 
 runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::PrefillPace pace,
+                                 runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], pace, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -985,6 +986,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
+                                                        runtime::PrefillPace pace,
                                                         runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
@@ -1025,7 +1027,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
              proposal_head, qwen4_execution()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
@@ -1070,8 +1072,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // Vision prompts keep the ordinary chunk: their media payload lifetime follows it.
+            const std::uint32_t width = pace == runtime::PrefillPace::Idle && !staged.vision
+                                            ? prefill_width
+                                            : prefill_chunk;
+            const std::uint32_t nominal = std::min(width, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {

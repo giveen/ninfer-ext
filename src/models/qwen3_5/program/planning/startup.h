@@ -25,12 +25,15 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // job sort holds 1024 assignments) while routing already touches most of each layer's experts:
 // cold on the RTX 5090, 60 tokens take 1.2 s cached vs 1.6 s staged, 111 take 2.0 s vs 1.6 s.
 inline constexpr std::int32_t kQwen4StagedColumns = 103;
-// Default text-prefill chunks when EngineOptions leaves the chunk open. Every Qwen4Exp chunk of
-// at least kQwen4StagedColumns streams each host-resident expert layer once, so a longer chunk
-// divides that traffic. Other models take 2048: wider GEMMs lift prefill 3-4 % on dense NVFP4 and
-// 12-19 % on the MoE, while a concurrent decode round waits behind one chunk (~2x the 1024 stall).
-inline constexpr std::uint32_t kDefaultPrefillChunk = 2048;
-inline constexpr std::uint32_t kQwen4PrefillChunk   = 4096;
+// Default text-prefill chunks when EngineOptions leaves them open. A prefill step runs the idle
+// width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
+// chunk lifts prefill 4-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
+// decode round waiting behind one chunk stalls ~3.4x longer. Every Qwen4Exp chunk of at least
+// kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps one wide
+// chunk that divides that traffic.
+inline constexpr std::uint32_t kDefaultPrefillChunk     = 1024;
+inline constexpr std::uint32_t kDefaultIdlePrefillChunk = 4096;
+inline constexpr std::uint32_t kQwen4PrefillChunk       = 4096;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -105,7 +108,8 @@ struct SequencePlanningInputs {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
+    std::uint32_t prefill_chunk             = 0; // service unit; the width beside decode work
+    std::uint32_t prefill_width             = 0; // widest chunk, a multiple of prefill_chunk
     std::uint32_t draft_window              = 0;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
@@ -131,6 +135,7 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t prefill_width             = 0;
     std::uint32_t draft_window              = 0;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;

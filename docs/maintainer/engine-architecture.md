@@ -371,7 +371,10 @@ Scheduler 保证：
   每次 worker boundary 只推进一个 lane 的一个 chunk，lane 在其 staged prefill 完成、settle
   或 cancel 时从集合中清除。Prefill 不持有 resource transaction，因此 admission 可以在其它
   request prefill 期间进行（仍受 open global topology transition 与 decode 连续性的门控）；
-- 已有 decode work 不会被连续 prefill 饿死；
+- 已有 decode work 不会被连续 prefill 饿死；存在 decode-ready request 时 prefill unit 宽度为
+  `prefill_chunk`（`PrefillPace::BesideDecode`），否则可取 `idle_prefill_chunk`
+  （`PrefillPace::Idle`，为 `prefill_chunk` 的整数倍）。Service work 以 `prefill_chunk` 为单位
+  规划，Program 报告每个 unit 实际跨越的 chunk 数，因此宽 unit 不会超出 admission 投影；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 

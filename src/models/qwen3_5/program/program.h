@@ -752,6 +752,8 @@ private:
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    // Scheduler service units the step consumed: one per prefill chunk it spanned, at least one.
+    std::uint32_t service_units = 1;
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
@@ -935,7 +937,8 @@ public:
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace = runtime::PrefillPace::Idle,
+                    runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

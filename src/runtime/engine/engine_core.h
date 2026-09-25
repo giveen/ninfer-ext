@@ -1372,7 +1372,7 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-        Scheduling::consume_service_work(*request, 1);
+        Scheduling::consume_service_work(*request, progress.service_units);
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
@@ -1418,7 +1418,8 @@ private:
         progress.pending.reset();
     }
 
-    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          PrefillPace pace) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto prefill_lane =
@@ -1435,7 +1436,8 @@ private:
         setup.finish();
         ProgramCallScope program_call(*this);
         auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+            instance_.program->advance_prefill(*request->sequence, pace,
+                                               &program_call.failed_timing());
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
@@ -2163,7 +2165,11 @@ private:
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
+                    // A step beside waiting decode work stays one chunk wide, bounding the
+                    // decode stall; with nothing to decode it may take the idle width.
+                    run_prefill_step(cancelled_at_unit_start, membership.empty()
+                                                                  ? PrefillPace::Idle
+                                                                  : PrefillPace::BesideDecode);
                     previous_unit_was_decode = false;
                     oom_recovery_count_ = 0;
                     continue;
