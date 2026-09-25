@@ -146,6 +146,47 @@ void test_hysteresis() {
     expect(expensive.select(1, high_lane) == 0, "measured round cost outweighs extra tokens");
 }
 
+void test_round_learning() {
+    const q36::MtpAcceptanceEstimate high = lane(7, 7);
+    const std::vector<const q36::MtpAcceptanceEstimate*> lanes{&high};
+
+    // Without learning, observations leave the startup times alone (every non-offloaded model).
+    q36::MtpDraftPolicy fixed(Ladder({3, 7}), {0.012, 0.014});
+    fixed.observe_round(1, 0.040);
+    expect(fixed.round_seconds(1) == 0.014 && fixed.select(0, lanes) == 1,
+           "a policy that does not learn keeps its startup times");
+
+    // Startup timed K=7 almost as cheap as K=3 (every expert was cached). Real rounds add 3 ms of
+    // overhead to K=3 but 26 ms of expert misses to K=7; once K=7 has run, the policy returns to
+    // K=3.
+    q36::MtpDraftPolicy learned(Ladder({3, 7}), {0.012, 0.014});
+    learned.learn_round_times();
+    learned.observe_round(0, 0.015);
+    expect(std::abs(learned.round_seconds(1) - 0.017) < 1e-12,
+           "an unmeasured longer rung borrows the shorter rung's extra");
+    expect(learned.select(0, lanes) == 1, "the optimistic estimate still explores K=7");
+    learned.observe_round(1, 0.040);
+    expect(std::abs(learned.round_seconds(1) - 0.040) < 1e-12, "the first observation sets it");
+    expect(learned.select(1, lanes) == 0, "the measured K=7 cost returns the policy to K=3");
+
+    // Later observations move an average, not the whole estimate.
+    learned.observe_round(0, 0.025);
+    expect(learned.round_seconds(0) > 0.015 && learned.round_seconds(0) < 0.025,
+           "repeated observations are averaged");
+
+    // Host overhead measured on K=3 applies to an unmeasured K=2 too, so K=2 does not look
+    // cheaper merely for lacking it. A faster-than-startup round adds nothing.
+    q36::MtpDraftPolicy shared(Ladder({2, 3, 4, 7}), dense_round_seconds());
+    shared.learn_round_times();
+    shared.observe_round(1, 0.0186 + 0.004);
+    expect(std::abs(shared.round_seconds(0) - (0.0167 + 0.004)) < 1e-12 &&
+               std::abs(shared.round_seconds(3) - (0.0262 + 0.004)) < 1e-12,
+           "unmeasured rungs take the nearest measured extra");
+    shared.observe_round(2, 0.001);
+    expect(std::abs(shared.round_seconds(2) - 0.0205) < 1e-12, "negative extras clamp to zero");
+    expect(throws([&] { shared.observe_round(4, 0.01); }), "observation outside the ladder");
+}
+
 void test_policy_validation() {
     using Seconds = std::vector<double>;
     expect(throws([] { (void)q36::MtpDraftPolicy(Ladder({}), Seconds{}); }), "empty ladder");
@@ -176,6 +217,7 @@ int main() {
     test_estimate();
     test_policy_selection();
     test_hysteresis();
+    test_round_learning();
     test_policy_validation();
     if (failures != 0) {
         std::cerr << failures << " MTP draft policy checks failed\n";

@@ -74,10 +74,28 @@ public:
     [[nodiscard]] std::size_t select(std::size_t current,
                                      std::span<const MtpAcceptanceEstimate* const> lanes) const;
 
+    // Refine round times from single-request rounds as they run. A model whose round cost the
+    // startup replays cannot see (host-resident experts: repeated replays hit the expert cache,
+    // while real verifies of longer drafts miss it) enables this; others keep the startup times.
+    void learn_round_times() noexcept { learning_ = true; }
+
+    // A single-request round on `rung` took `seconds` end to end. A learned round time is the
+    // startup time plus an extra (host overhead, expert-cache misses) measured per rung: its first
+    // observation sets the extra, later ones move an average. A rung not yet run takes the extra
+    // of the nearest measured rung, preferring a shorter one: longer drafts miss at least as much,
+    // so that is a lower bound that still lets the policy try the longer rung and measure it.
+    void observe_round(std::size_t rung, double seconds);
+
+    // The round time `select` uses for `rung`.
+    [[nodiscard]] double round_seconds(std::size_t rung) const;
+
 private:
     std::vector<std::uint32_t> ladder_;
-    std::vector<double> round_seconds_;
+    std::vector<double> round_seconds_; // startup times
+    std::vector<double> extra_;         // learned extra per rung, valid where observed_
+    std::vector<bool> observed_;
     std::size_t batch_rung_ = 0;
+    bool learning_          = false;
 };
 
 } // namespace ninfer::models::qwen3_5

@@ -540,6 +540,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        if (lanes.size() == 1) { mtp_policy.observe_round(mtp_round_rung, seconds); }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];

@@ -521,6 +521,9 @@ void ProgramImpl::prepare_graphs() {
             }
             mtp_policy     = MtpDraftPolicy(mtp_ladder, std::move(seconds));
             mtp_round_rung = mtp_policy.initial_rung();
+            // Timed replays reuse one set of tokens, so after the warmup every routed expert is
+            // cached and a longer draft's verify misses never show; learn from real rounds.
+            if (qwen4_runtime) { mtp_policy.learn_round_times(); }
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
