@@ -200,17 +200,14 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
                 const int grow =
                     kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
                 auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
-                if constexpr (Full) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                    cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
-                } else {
-                    const bool valid_row   = output_tile.valid(grow, m);
-                    const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
-                    const std::int64_t gi =
-                        static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
-                                                                           valid_scales * 2);
-                }
+                // The cache spans 8 K-groups, but the final refresh of a row whose group count is
+                // not a multiple of 8 covers fewer groups. Bound the read so it never crosses the
+                // row (and the plane); the unused lanes are zero and their activations are zero.
+                const int valid_scales =
+                    output_tile.valid(grow, m) && g0 < kg ? min(8, kg - g0) : 0;
+                const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + min(g0, kg - 1);
+                ninfer::ops::cp_async_zfill<16, Cache::cg>(dst, &scales[gi * 2],
+                                                           valid_scales * 2);
             }
         }
     };

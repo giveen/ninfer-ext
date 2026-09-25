@@ -20,7 +20,13 @@ constexpr std::array kGeometries{
     Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},  Geometry{5120, 10240, 211U},
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
     Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
-    Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U}};
+    Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U},
+    // Qwen4Exp (Qwen3.8-Flash-Next, hidden 2560) registered shapes.
+    Geometry{13312, 2560, 401U}, Geometry{640, 2560, 409U},  Geometry{2560, 6144, 419U},
+    Geometry{16384, 2560, 421U}, Geometry{1280, 2560, 431U}, Geometry{2560, 640, 433U},
+    Geometry{324, 10240, 439U},  Geometry{320, 10240, 443U}, Geometry{10240, 320, 449U},
+    Geometry{12800, 2560, 457U}, Geometry{2560, 2560, 461U}, Geometry{2560, 4608, 463U},
+    Geometry{96, 2560, 467U}};
 
 int q8_a16_conformance() {
     int failures = 0;
