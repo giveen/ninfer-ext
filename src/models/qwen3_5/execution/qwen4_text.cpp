@@ -89,13 +89,25 @@ void qwen4_stage(Qwen4Staging& staging, std::int32_t layer, const ops::ExpertWei
             static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts,
             cudaMemcpyDefault, staging.stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.gate_up_divisors),
-                               source.gate_up_divisors,
-                               2 * ops::kOffloadMoeExperts * sizeof(float), cudaMemcpyDefault,
-                               staging.stream));
+    // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
+    // one per bank (the MTP layer's banks).
+    const auto divisors = [](std::int64_t rows, std::int32_t divisor_rows, std::int64_t room) {
+        if (divisor_rows <= 0 || rows % divisor_rows != 0 || rows / divisor_rows > room) {
+            throw std::logic_error("Qwen4Exp staged bank cannot hold the layer's weight divisors");
+        }
+        return static_cast<std::size_t>(rows / divisor_rows) * sizeof(float);
+    };
+    constexpr std::int64_t kGateUpRows =
+        std::int64_t(ops::kOffloadMoeExperts) * 2 * ops::kOffloadMoeIntermediate;
+    constexpr std::int64_t kDownRows = std::int64_t(ops::kOffloadMoeExperts) * ops::kOffloadMoeHidden;
+    CUDA_CHECK(cudaMemcpyAsync(
+        const_cast<float*>(staged.gate_up_divisors), source.gate_up_divisors,
+        divisors(kGateUpRows, source.gate_up_divisor_rows, 2 * ops::kOffloadMoeExperts),
+        cudaMemcpyDefault, staging.stream));
     CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.down_divisors), source.down_divisors,
-                               ops::kOffloadMoeExperts * sizeof(float), cudaMemcpyDefault,
-                               staging.stream));
+                               divisors(kDownRows, source.down_divisor_rows,
+                                        ops::kOffloadMoeExperts),
+                               cudaMemcpyDefault, staging.stream));
     CUDA_CHECK(cudaEventRecord(staging.ready[b], staging.stream));
     staging.layer[b] = layer;
 }
