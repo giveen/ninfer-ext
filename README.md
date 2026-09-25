@@ -7,7 +7,10 @@ This fork adds:
 
 - **Qwen3.8-Flash-Next.** The fork runs this ~180B-parameter MoE model on a single 32 GB GPU. Its
   routed experts stay in pinned Host memory behind a device expert cache.
-- **Faster speculative decoding.** MTP adapts its draft length per round.
+- **Faster speculative decoding on Qwen3.8-27B `groupwise-int`.** Measured against stock NInfer on
+  the same artifacts, DFlash2 serving is 13–48% faster at C=1–4, and MTP 8–32% faster at C=1–8.
+  Other artifacts tie with stock ([Versus stock NInfer](#versus-stock-ninfer)). MTP can also adapt
+  its draft length per round.
 - **Serving and context-cache work.** Changes for long-running agent workloads.
 - **C++23 and upstream pull requests.** The tree is ported to C++23, and a set of open upstream PRs
   is merged ahead of upstream.
@@ -16,6 +19,7 @@ Everything else is upstream's engine: the architecture, the `.ninfer` v3 artifac
 official artifacts, and the OpenAI- and Anthropic-compatible serving. The fork tracks upstream
 `master` (currently `bace20dc`, the `upstream` remote).
 
+- [Versus stock NInfer](#versus-stock-ninfer)
 - [Qwen3.8-Flash-Next](#qwen38-flash-next)
 - [Performance](#performance)
 - [Quick start](#quick-start)
@@ -23,6 +27,91 @@ official artifacts, and the OpenAI- and Anthropic-compatible serving. The fork t
 - [Capabilities and limits](#capabilities-and-limits)
 - [Documentation](#documentation)
 - [Credits and license](#credits-and-license)
+
+## Versus stock NInfer
+
+Stock upstream `bace20dc` and this fork (Engine as of `19f38b77`) ran on the same RTX 5090, with the
+same artifacts, under the same harness.
+
+**Method.** The harness is upstream's decode-saturation suite
+(`tools/bench/run_serve_concurrency.py`):
+- **KV and sampling:** INT8 KV and upstream's stochastic sampling profile. Speculative modes use
+  `--lm-head-draft`.
+- **Load:** C concurrent requests, each generating 4,096 tokens from a long-reasoning (AIME)
+  prompt.
+- **Metric:** steady decode tok/s over intervals whose decode batch equals C.
+- **Repeats:** each value is the mean of two runs. A single run can vary by up to about 10%, so
+  differences under about 5% are ties.
+
+### Where ninfer-ext leads
+
+Each cell is aggregate decode tok/s from the fork's command, then the change against stock's best
+mode at that concurrency.
+
+| Artifact | `ninfer-serve` flags | C=1 | C=2 | C=4 | C=8 |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-27B `groupwise-int` + DFlash2 | `--spec dflash2 --draft-tokens 7 --lm-head-draft` | 260 **+40%** | 403 **+48%** | 522 **+13%** | 727 +3% |
+| Qwen3.8-27B `groupwise-int`, MTP only | C=1 and C=8: `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` | 203 **+22%** | | | 658 **+8%** |
+| | C=2 and C=4: `--spec mtp --lm-head-draft` | | 308 **+29%** | 520 **+32%** | |
+| Qwen3.8-Flash-Next `nvfp4` | see [Qwen3.8-Flash-Next](#qwen38-flash-next) | fork only | fork only | fork only | fork only |
+
+**Stock's best, for reference:**
+- **27B with DFlash2:** DFlash2 at every concurrency, 186 / 271 / 462 / 705 tok/s.
+- **27B MTP only:** 167 / 239 / 395 / 607 tok/s, from K=3 at C=1–2 and K=5 at C=4–8.
+- **Flash-Next:** stock cannot load it (`tensor: unknown member divisors`).
+
+The gains on `groupwise-int` come mainly from the merged Q5 K-split MMA routes for small batches
+(PR #292). They speed up the verify rounds that speculative decoding runs.
+
+### Where stock is ahead or even
+
+| Artifact | Case | Stock | Fork | Change |
+|---|---|---:|---:|---:|
+| Qwen3.8-27B `groupwise-int` | plain decode, C=1 / C=2 | 81 / 143 | 76 / 138 | **−6% / −3%** |
+| Qwen3.8-27B `nvfp4` | best mode per C (K=5 MTP on both builds) | 219 / 419 / 727 / 1,267 | 217 / 427 / 735 / 1,309 | −1% / +2% / +1% / +3% (tie) |
+| Qwen3.8-27B `nvfp4` | MTP K=3, C=4 | 655 | 634 | −3% |
+| Qwen3.6-35B-A3B | best mode per C: MTP K=3 at C=1–4, DFlash7 at C=8 | 644 / 926 / 1,173 / 1,516 | 657 / 951 / 1,159 / 1,545 | +2% / +3% / −1% / +2% (tie) |
+| Qwen3.8-27B `nvfp4` | fork default `--spec mtp` vs stock `--draft-tokens 5` | 219 / 419 / 727 / 1,267 | 211 / 377 / 640 / 1,122 | **−4% / −10% / −12% / −11%** |
+| Qwen3.6-35B-A3B | fork default `--spec mtp` vs stock `--draft-tokens 5`, C=8 | 1,488 | 1,310 | **−12%** |
+
+- **Plain decode on 27B `groupwise-int`.** One of the fork's two runs matched stock, as did four
+  later re-runs at 2,048 and 4,096 tokens. The averaged deficit stands as measured, and its cause
+  is unresolved.
+- **The fork's default adaptive MTP is not the best setting for batched, high-acceptance load.**
+  Its batch rounds draft 3 tokens. On this workload a fixed K=5 is faster, and the fork runs fixed
+  K=5 at least as fast as stock. Use `--draft-tokens 5 --fixed-draft` there.
+- **Adaptive still wins elsewhere.** It leads on 27B `groupwise-int` at C=2–4, and on the shorter
+  mixed prompts in [Adaptive MTP draft length](#adaptive-mtp-draft-length).
+- **35B-A3B and 27B `nvfp4` are ties.** The fork adds nothing measurable on these two over stock's
+  best mode.
+
+<details>
+<summary>Every mode, like for like (tok/s, mean of two runs)</summary>
+
+| Artifact | Mode | Stock C=1 / 2 / 4 / 8 | Fork C=1 / 2 / 4 / 8 |
+|---|---|---|---|
+| 27B `nvfp4` | plain | 73 / 136 / 238 / 490 | 77 / 146 / 250 / 504 |
+| | MTP K=3 | 191 / 374 / 655 / 1,135 | 191 / 373 / 634 / 1,123 |
+| | MTP K=5 | 219 / 419 / 727 / 1,267 | 217 / 427 / 735 / 1,309 |
+| | MTP adaptive | — | 211 / 377 / 640 / 1,122 |
+| 27B `groupwise-int` | plain | 81 / 143 / 228 / 321 | 76 / 138 / 249 / 404 |
+| | MTP K=3 | 167 / 239 / 354 / 560 | 177 / 291 / 485 / 612 |
+| | MTP K=5 | 151 / 210 / 395 / 607 | 203 / 299 / 465 / 658 |
+| | MTP adaptive | — | 174 / 308 / 520 / 649 |
+| | DFlash2 K=7 | 186 / 271 / 462 / 705 | 260 / 403 / 522 / 727 |
+| 35B-A3B | plain | 376 / 605 / 958 / 1,307 | 380 / 611 / 962 / 1,321 |
+| | MTP K=3 | 644 / 926 / 1,173 / 1,319 | 657 / 951 / 1,159 / 1,309 |
+| | MTP K=5 | 591 / 812 / 993 / 1,488 | 592 / 812 / 1,014 / 1,499 |
+| | MTP adaptive | — | 627 / 921 / 1,142 / 1,310 |
+| | DFlash K=7 | 630 / 764 / 876 / 1,516 | 632 / 803 / 879 / 1,545 |
+
+Reproduce by running `run_serve_concurrency.py --serve <build>/apps/ninfer-serve --suite
+decode-saturation --decode-tokens 4096 --max-context 16384 --kv-capacity auto` once per build.
+Pair the two output directories with `compare_serve_concurrency.py`
+([serving benchmarks](tools/bench/README.md#concurrent-serving-benchmark)). The raw reports are
+kept locally under `profiles/bench/vs_stock_20260925/`.
+
+</details>
 
 ## Qwen3.8-Flash-Next
 
@@ -60,7 +149,9 @@ An FP64 oracle checks them in `tests/models/qwen4_exp/`.
 ### Convert and serve
 
 There is no published Flash-Next artifact. Convert it from
-[nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4):
+[nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4).
+Conversion takes about 7.6 minutes on this machine (456 s for 127 GB), down from 17.6 minutes
+before the fork's converter fixes:
 
 ```bash
 python3 -m tools.convert \
@@ -178,8 +269,8 @@ with 15 (7% accepted), against 393.3 without speculation.
 - **Serve tables.** `ninfer-serve --max-context 4096 --max-concurrency 8 --kv-capacity auto`, BF16
   KV. The load is `temperature=0` with thinking off: one warm-up wave, then one measured wave of C
   concurrent 512-token essays on eight fixed topics.
-- **Not yet measured.** DFlash2 on Qwen3.8-27B (an artifact with the companion weights still has to
-  be converted) and the Qwen3.6-27B artifacts.
+- **Not yet measured.** The Qwen3.6-27B artifacts. DFlash2 is covered in
+  [Versus stock NInfer](#versus-stock-ninfer).
 - **Raw reports.** The JSON reports are kept locally under `profiles/bench/readme_20260925/`.
 
 Upstream's published results use its own methodology and artifacts. They are in the
@@ -196,8 +287,11 @@ with `tools/bench/compare_serve_concurrency.py`
 
 - A single request drafts 2, 3, 4 or 7 tokens per round. The length is chosen from its recent
   acceptance and from round times measured at startup.
-- Rounds where several requests decode together draft 3. Longer drafts raised no aggregate
-  throughput at C=2, 4 or 8.
+- Rounds where several requests decode together draft 3. On the 512-token essay load, longer drafts
+  raised no aggregate throughput at C=2, 4 or 8. That does not hold everywhere. On the long,
+  high-acceptance reasoning load in [Versus stock NInfer](#versus-stock-ninfer), fixed K=5 beats
+  adaptive on 27B `nvfp4` by 13–17% at C=2–8, and on 35B-A3B by 14% at C=8. Adaptive in turn beats
+  fixed K=5 by 13% on 35B-A3B at C=2–4. No single MTP setting wins on every model and load.
 - On host-resident-expert models, batches of two or more run as ordinary rounds plus an MTP KV
   append.
 - `--draft-tokens N` lowers the ceiling, and `--fixed-draft` pins exactly N.
@@ -305,6 +399,12 @@ describes the planner.
 
 ### Engineering
 
+- **Faster conversion.** Encoded weights are imported in 64 MiB chunks, and the converter no longer
+  does per-object work that grows with model size. Output is byte-identical to the previous
+  converter. Flash-Next converts 2.3× faster. A sharded checkpoint without its
+  `model.safetensors.index.json` now converts from the shard headers.
+- **Stock-comparison tooling.** The serving benchmark runners drive a stock upstream
+  `ninfer-serve` as well as this fork's, and `compare_serve_concurrency.py` pairs their results.
 - **C++23.** The tree uses `std::format`/`std::print`, `std::ranges`, `std::flat_map`,
   `std::move_only_function` and deducing `this`. CMake has no CUDA 23 dialect, so
   `CMakeLists.txt` keeps `CUDA_STANDARD 20` and passes `-std=c++23` to nvcc.
