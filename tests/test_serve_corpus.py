@@ -6,10 +6,12 @@ from argparse import Namespace
 import pytest
 
 from tools.bench.run_serve_corpus import (
+    SERVER_LOG_SCHEMA_VERSIONS,
     Fixture,
     RunSpec,
     build_result_record,
     parse_artifacts,
+    require_server_log_identity,
 )
 from tools.bench.run_serve_concurrency import build_points
 
@@ -37,7 +39,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 22,
+        "schema_version": SERVER_LOG_SCHEMA_VERSIONS[-1],
         "event": "request_done",
         "request": {
             "model": spec.model_id,
@@ -109,3 +111,23 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     assert len({point.key for point in points}) == len(points)
     for point in points:
         (tmp_path / f"{point.key}.json").write_text("{}")
+
+
+def test_request_logs_of_upstream_and_this_tree_are_accepted() -> None:
+    header = Path(__file__).resolve().parents[1] / "src/serve/request_log.h"
+    declared = int(
+        header.read_text().split("kRequestLogSchemaVersion", 1)[1].split("=", 1)[1].split(";")[0]
+    )
+    assert SERVER_LOG_SCHEMA_VERSIONS == (21, declared)
+    for version in SERVER_LOG_SCHEMA_VERSIONS:
+        require_server_log_identity(
+            {"artifact_type": "ninfer_serve_request_log", "schema_version": version,
+             "event": "server_start"},
+            "server_start",
+        )
+    with pytest.raises(Exception, match="unexpected serving log identity"):
+        require_server_log_identity(
+            {"artifact_type": "ninfer_serve_request_log", "schema_version": 20,
+             "event": "server_start"},
+            "server_start",
+        )

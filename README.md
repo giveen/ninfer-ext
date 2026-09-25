@@ -42,6 +42,8 @@ same artifacts, under the same harness.
 - **Metric:** steady decode tok/s over intervals whose decode batch equals C.
 - **Repeats:** each value is the mean of two runs. A single run can vary by up to about 10%, so
   differences under about 5% are ties.
+- **Scheduling:** stock and fork alternated within each round. The exception is the fork's fixed
+  K=5 runs, which ran later as a separate session and were not interleaved with stock.
 
 ### Where ninfer-ext leads
 
@@ -60,8 +62,36 @@ mode at that concurrency.
 - **27B MTP only:** 167 / 239 / 395 / 607 tok/s, from K=3 at C=1–2 and K=5 at C=4–8.
 - **Flash-Next:** stock cannot load it (`tensor: unknown member divisors`).
 
-The gains on `groupwise-int` come mainly from the merged Q5 K-split MMA routes for small batches
-(PR #292). They speed up the verify rounds that speculative decoding runs.
+The gains on `groupwise-int` are consistent with the merged Q5 K-split MMA routes for small batches
+(PR #292), which target the verify rounds that speculative decoding runs. NVFP4 artifacts, which
+have no Q5 weights, tie with stock. The attribution has not been isolated with an A/B.
+
+To serve with the leading settings, use the flags from the table in a full command. For example,
+Qwen3.8-27B `groupwise-int` with DFlash2 at four concurrent requests:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_dflash2.ninfer \
+  --max-context 16384 --kv-capacity auto --max-concurrency 4 --kv-dtype int8 \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft
+```
+
+**Getting the artifact.** No published artifact carries DFlash2. Convert one from `Qwen/Qwen3.8-27B`
+and the DFlash2 companion weights:
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.8-27B --recipe qwen3_8_27b \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --proposal --name qwen3.8-27b --out models/qwen3_8_27b_dflash2.ninfer
+```
+
+**Harness settings, not recommendations.** These match the measurements but aren't serving advice:
+- INT8 KV (`--kv-dtype int8`);
+- `--no-prefix-reuse`;
+- `--max-pending-requests 1`;
+- the pinned stochastic sampling profile.
+
+Leave prefix reuse on and use normal admission limits for real traffic.
 
 ### Where stock is ahead or even
 
@@ -236,7 +266,9 @@ essay (mean of two runs):
 Bold marks the faster mode at each concurrency.
 
 - **27B models.** MTP pays at every concurrency. On NVFP4 it is still +48% at C=8.
-- **35B-A3B.** MTP loses from C=4 up, and DFlash7 is slower than plain decode on this prose load.
+- **35B-A3B.** On this prose load, MTP loses from C=4 up and DFlash7 is slower than plain decode. On
+  the long reasoning load in [Versus stock NInfer](#versus-stock-ninfer) both help: MTP K=3 beats
+  plain at C=4, and DFlash7 is the fastest mode at C=8. Which mode wins depends on the workload.
 - **Flash-Next.** It is bound by expert fetches, so drafts only help a single request.
 
 ### Single-request benchmark
@@ -400,8 +432,13 @@ describes the planner.
 ### Engineering
 
 - **Faster conversion.** Encoded weights are imported in 64 MiB chunks, and the converter no longer
-  does per-object work that grows with model size. Output is byte-identical to the previous
-  converter. Flash-Next converts 2.3× faster. A sharded checkpoint without its
+  does per-object work that grows with model size. Flash-Next converts 2.3× faster.
+  - Two conversions were re-run and compared with the previous converter's output: Flash-Next
+    (ModelOpt NVFP4 and row FP8) and Qwen3.8-27B `groupwise-int` + DFlash2. Both are byte-identical
+    apart from the random artifact id.
+  - The compressed-tensors NVFP4 import behind `qwen3_8_27b_nvfp4` goes through the same changed
+    chunking but has not been re-verified, because its source checkpoint is not on the test
+    machine. A sharded checkpoint without its
   `model.safetensors.index.json` now converts from the shard headers.
 - **Stock-comparison tooling.** The serving benchmark runners drive a stock upstream
   `ninfer-serve` as well as this fork's, and `compare_serve_concurrency.py` pairs their results.
