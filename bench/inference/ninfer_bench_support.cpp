@@ -313,7 +313,7 @@ std::string usage_text(std::string_view program) {
         << ")\n"
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
-        << " (default: model; 4096 for Qwen4Exp, else 1024)\n"
+        << " (default: model; 4096 for Qwen4Exp, else 2048)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"

@@ -27,8 +27,9 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 inline constexpr std::int32_t kQwen4StagedColumns = 103;
 // Default text-prefill chunks when EngineOptions leaves the chunk open. Every Qwen4Exp chunk of
 // at least kQwen4StagedColumns streams each host-resident expert layer once, so a longer chunk
-// divides that traffic; other models keep the shorter chunk.
-inline constexpr std::uint32_t kDefaultPrefillChunk = 1024;
+// divides that traffic. Other models take 2048: wider GEMMs lift prefill 3-4 % on dense NVFP4 and
+// 12-19 % on the MoE, while a concurrent decode round waits behind one chunk (~2x the 1024 stall).
+inline constexpr std::uint32_t kDefaultPrefillChunk = 2048;
 inline constexpr std::uint32_t kQwen4PrefillChunk   = 4096;
 
 struct DFlashPersistentLayout {
