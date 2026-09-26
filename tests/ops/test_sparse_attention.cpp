@@ -8,6 +8,9 @@
 // device produced, reading K/V at their storage boundary.
 #include "ninfer/ops/sparse_attention.h"
 
+#include "core/arena.h"
+#include "core/host_kv_arena.h"
+#include "core/kv_page_ref.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -16,6 +19,7 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <optional>
 #include <tuple>
 #include <numeric>
 #include <set>
@@ -639,6 +643,100 @@ int main() {
             failures +=
                 attend(profile + "wide", kWide, synthetic(kWide, counts), counts, 0x33U, cache);
         }
+    }
+
+    // ---- Host arm: odd logical pages of both lanes read in place from Host records ----
+    // Records use the production HostKVPageLayout on 2 MiB pages; the abandoned Device copies are
+    // 0xFF-poisoned (NaN codes/scales), so output must be bit-identical to the resident call.
+    const auto run_bits = [&](const PagedKVBatchLayerView& view, const Tensor& rows,
+                              std::int32_t width, const std::vector<int>& sel,
+                              const std::vector<int>& cnt, std::uint32_t seed) {
+        const auto q = random_bf16(
+            static_cast<std::size_t>(kHeadDim) * kQueryHeads * width * kLanes, seed, -1.0F, 1.0F);
+        DeviceBuffer dq = to_device(bits(q)), dsel = to_device_i32(sel), dcnt = to_device_i32(cnt);
+        GuardedDeviceBuffer out(q.size() * 2);
+        Tensor tq(dq.p, DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
+        Tensor ts(dsel.p, DType::I32, {g.max_selected(), width, kLanes});
+        Tensor tc(dcnt.p, DType::I32, {width, kLanes});
+        Tensor tout(out.data(), DType::BF16, {kHeadDim, kQueryHeads, width, kLanes});
+        WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, width * kLanes));
+        ops::qsa_attention(tq, ts, tc, rows, view, 1.0F / 16.0F, workspace, tout, nullptr);
+        cuda_synchronize();
+        return from_device<std::uint16_t>(out.data(), q.size());
+    };
+    for (const QuantizedCache* cache : caches) {
+        const PagedKVBatchLayerView& resident = cache != nullptr ? cache->view : kv;
+        const std::string label = std::string("qsa_attention host-arm ") +
+                                  (cache != nullptr ? cache->name : std::string("BF16"));
+        std::vector<const Tensor*> planes{&resident.k_pages, &resident.v_pages};
+        if (resident.k_scale_pages.data != nullptr) planes.push_back(&resident.k_scale_pages);
+        if (resident.v_scale_pages.data != nullptr) planes.push_back(&resident.v_scale_pages);
+        KVPageGeometry page_geometry;
+        for (const Tensor* plane : planes) {
+            page_geometry.planes.push_back({plane->dtype, plane->ne[0], kKvHeads, 256});
+        }
+        const HostKVPageLayout host_layout = plan_host_kv_page_layout(page_geometry);
+
+        std::vector<DeviceBuffer> copies;
+        for (const Tensor* plane : planes) {
+            const std::size_t bytes = static_cast<std::size_t>(plane->ne[0]) * kPage * kKvHeads *
+                                      kPages * dtype_size(plane->dtype);
+            copies.push_back(to_device(std::vector<std::uint8_t>(bytes, 0)));
+            cuda_check(cudaMemcpy(copies.back().p, plane->data, bytes, cudaMemcpyDeviceToDevice),
+                       "copy KV plane");
+        }
+        std::vector<int> streamed_tables = tables;
+        std::vector<std::size_t> streamed;
+        for (std::size_t entry = 0; entry < tables.size(); ++entry) {
+            if ((entry % kPagesPerLane) % 2 == 1) streamed.push_back(entry);
+        }
+        PinnedHostBuffer records_host((streamed.size() + 1) * host_layout.page_stride,
+                                      PinnedHostPages::Huge);
+        auto* records_base = static_cast<std::byte*>(records_host.data());
+        for (std::size_t index = 0; index < streamed.size(); ++index) {
+            const int physical = tables[streamed[index]];
+            // Record 0 is left unused so the words exercise a nonzero record offset.
+            const std::size_t record = (index + 1) * host_layout.page_stride;
+            for (std::size_t plane = 0; plane < planes.size(); ++plane) {
+                const std::size_t bytes = host_layout.planes[plane].page_payload_bytes;
+                auto* page = static_cast<std::byte*>(copies[plane].p) +
+                             static_cast<std::size_t>(physical) * bytes;
+                cuda_check(cudaMemcpy(records_base + record + host_layout.planes[plane].offset,
+                                      page, bytes, cudaMemcpyDeviceToHost),
+                           "stream KV page");
+                cuda_check(cudaMemset(page, 0xff, bytes), "poison KV page");
+            }
+            streamed_tables[streamed[index]] =
+                KVPageRef(HostPageUnit{static_cast<std::uint32_t>(record / kHostKVPageUnitBytes)})
+                    .word();
+        }
+        DeviceBuffer dstreamed = to_device_i32(streamed_tables);
+        PagedKVBatchLayerView host_view = resident;
+        host_view.block_tables          = Tensor(dstreamed.p, DType::I32, {kPagesPerLane, kLanes});
+        const auto base                 = [&](std::size_t plane) -> const std::byte* {
+            return records_base + host_layout.planes[plane].offset;
+        };
+        host_view.k_pages.data = copies[0].p;
+        host_view.v_pages.data = copies[1].p;
+        host_view.host         = PagedKVHostPlanes{.k = base(0), .v = base(1)};
+        std::size_t next       = 2;
+        if (resident.k_scale_pages.data != nullptr) {
+            host_view.k_scale_pages.data = copies[next].p;
+            host_view.host.k_scale       = base(next++);
+        }
+        if (resident.v_scale_pages.data != nullptr) {
+            host_view.v_scale_pages.data = copies[next].p;
+            host_view.host.v_scale       = base(next++);
+        }
+
+        const std::vector<int> decode_counts = {g.max_selected(), 37};
+        const auto decode_sel                = synthetic(1, decode_counts);
+        failures += verify_exact((label + " select").c_str(),
+                                 run_bits(host_view, trows, W, sel_host, cnt_host, 0x51U),
+                                 run_bits(resident, trows, W, sel_host, cnt_host, 0x51U));
+        failures += verify_exact((label + " decode").c_str(),
+                                 run_bits(host_view, trows, 1, decode_sel, decode_counts, 0x52U),
+                                 run_bits(resident, trows, 1, decode_sel, decode_counts, 0x52U));
     }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_attention correctness\n";
