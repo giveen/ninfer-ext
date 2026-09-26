@@ -143,6 +143,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .qsa_index                 = config.sparse_attention.has_value(),
+                     .kv_stream                 = plan.kv_stream,
                  });
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.

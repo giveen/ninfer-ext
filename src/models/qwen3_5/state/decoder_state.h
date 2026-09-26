@@ -27,6 +27,9 @@ struct DecoderStateSpec {
     std::uint32_t mtp_physical_page_groups  = 0;
     // Qwen Sparse Attention: every attention layer also pages one indexer-key record per token.
     bool qsa_index = false;
+    // KV streaming: the physical pools may be smaller than one full-capacity sequence, since
+    // older pages are served from Host records.
+    bool kv_stream = false;
 };
 
 struct PagedKVCacheLayout {
