@@ -10,7 +10,8 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
-        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+        // 2..8 take one 8-token Tensor Core tile and 9..16 take two.
+        constexpr std::array<std::int32_t, 8> kA16Cases{1, 2, 3, 4, 5, 8, 9, 16};
         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
         // second is the narrowest ragged width the fused route admits and leaves one real token
         // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four

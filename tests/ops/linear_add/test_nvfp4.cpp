@@ -91,7 +91,15 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
+        // The A16 Tensor Core route takes 2..16 in one (2..8) or two (9..16) token tiles; 17 is
+        // the first SIMT width.
+        Invocation{2, ops::LinearPolicy::A16Only},
+        Invocation{3, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{9, ops::LinearPolicy::A16Only},
+        Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{17, ops::LinearPolicy::A16Only},
+        Invocation{first_a4 - 1, ops::LinearPolicy::AllowA4},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
