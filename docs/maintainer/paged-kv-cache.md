@@ -469,11 +469,36 @@ block\_tables[N_{logical},C]
 \]
 
 其中 \(N_{logical}=L\)，\(C=max\_concurrency\)。每个 active address space lease 一行；每一项是 I32
-pool-local physical page ID。
+`KVPageRef` word：`>=0` 是 pool-local Device page-group ID，`<0` 是 `~HostPageUnit`，即该页 Host
+record 在 Host KV arena 中的偏移（256 B 单位）。Paged Ops 每个 tile 解析一次 page base，in-page
+地址运算与 Device page 相同，因此两种 residency 的结果 bit-identical。
 
 Activation 将 address-space membership 的 Device page IDs 批量发布到所租 row。Inactive address space
 没有 row；同一个 continuation 下次 activation 可以取得另一行。Execution row 不拥有 logical page、
 reservation 或 frontier。
+
+### 6.5 KV streaming
+
+`EngineOptions::kv_stream`（`ninfer-serve --kv-stream`）让 active address space 只保留一个有界的
+Device window，更早的 full pages 由 Host records 原地读取：
+
+- Window：每个 pool 的 Device window 为 `capacity_pages / max_concurrency`。Admission entitlement
+  与 lease growth 都以 window 为上限；`kv_capacity` 因此可以小于 `max_context`，启动只要求每个 lane
+  至少容纳 sinks、一个 demotion group、frontier tail 与最宽的单步 mapping（prefill chunk 或
+  growth window）加 cushion（`planning/kv_stream.h`）。
+- Demotion：当 mapping 或 lease growth 需要超过当前 coverage 时，从第
+  `kKVStreamSinkPages` 页之后、`kv_stream_tail_pages(draft)` 之前的最旧 full committed pages 起，
+  按 `kKVStreamGroupPages` 成组复制到新的 Host extent。Copy 在 publish 前同步完成（§5.4），然后
+  `KVAddressSpaceStore::demote` 将 Device lease 归还到同一 address space 的 reservation，并把该行
+  table word 改为 Host 引用。Demotion 只改变 residency，不改变 membership、frontier 或 epoch，
+  coverage 增加 demoted page 数。
+- Demotable page：full committed、恰一个 active reference、没有 Host replica 或 pending/pinned
+  状态。Sink 与 tail pages 永不 stream；被拒绝的 speculative round 只截断 tail。
+- Host capacity：Host KV arena 不足时先释放无引用 extents 再重试一次；仍失败时 decode lease
+  按 §7.2 settle，prefill mapping 抛出 `std::runtime_error`。
+- 范围：Host record 为 page-major layout；QSA index pool、DFlash head-major pool 与 CausalScoring
+  拒绝 `kv_stream`。Streamed request 目前不进入 context cache（不 publish continuation，不复用
+  prefix），因为 retain/restore 假设 Device-resident membership。
 
 ---
 
@@ -756,6 +781,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV。
 16. Checkpoint可复用性由完整target continuation证明，KV page存在本身不构成hit。
 17. 每个decode或forced launch所需的覆盖在round boundary上已被entitlement满足；shortfall不通过异常离开该步。
+18. Host-resident member 的 table word 只在其 Host replica copy 完成后发布；Device 与 Host residency
+    对同一 page 读出相同 bytes。
 
 ---
 
