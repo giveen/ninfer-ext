@@ -27,7 +27,7 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Cac
             static_cast<const std::uint8_t*>(cache.k_pages.data),
             static_cast<const std::uint8_t*>(cache.v_pages.data),
             static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
-            static_cast<const std::uint8_t*>(cache.v_scale_pages.data), metadata,
+            static_cast<const std::uint8_t*>(cache.v_scale_pages.data), cache.host, metadata,
             static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());

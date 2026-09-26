@@ -45,7 +45,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
-        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        PagedKVHostPlanes host, const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale, float* partial_acc,
         float* partial_m, float* partial_l) {
@@ -344,19 +344,29 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
+    // A tile never crosses a page: resolve its Device or Host page once (KVPageRef); page 0 of
+    // the index helpers is the in-page offset.
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        const __half* k_scale_page = paged_kv_read_page<kKVCacheInt8Groups, Geometry::KVHeads>(
+            cache_k_scale, host.k_scale, physical_page);
+        const __half* v_scale_page = paged_kv_read_page<kKVCacheInt8Groups, Geometry::KVHeads>(
+            cache_v_scale, host.v_scale, physical_page);
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                    0, kv_head, 0, key & kPagedKVPageMask);
+                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &k_scale_page[off]);
+                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &v_scale_page[off]);
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
             }
         }
+        const std::int8_t* k_page = paged_kv_read_page<kKVCacheInt8HeadDim, Geometry::KVHeads>(
+            cache_k_i8, host.k, physical_page);
+        const std::int8_t* v_page = paged_kv_read_page<kKVCacheInt8HeadDim, Geometry::KVHeads>(
+            cache_v_i8, host.v, physical_page);
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
             const int key_l = chunk / (D / 16);
@@ -365,10 +375,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key   = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                    0, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                ninfer::ops::cp_async<16>(dst, &k_page[off]);
+                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &v_page[off]);
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));

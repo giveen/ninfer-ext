@@ -31,17 +31,19 @@ namespace ninfer::ops {
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
 template <typename Geometry, typename Element>
 __device__ __forceinline__ void causal_prompt_stage_kv(Element* dst, const Element* cache,
-                                                       int kv_head, int k0, int max_query_abs,
-                                                       int physical_page, int tid) {
+                                                       const std::byte* host, int kv_head, int k0,
+                                                       int max_query_abs, int physical_page,
+                                                       int tid) {
     constexpr int D         = kCausalPromptHeadDim;
     constexpr int Bc        = kCausalPromptBc;
     constexpr int Threads   = kCausalPromptThreads;
     constexpr int VecPerRow = D / 8; // 8 two-byte elements per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
-    // Block base pointer computed once (int64); per-element offsets stay 32-bit.
+    // Block base pointer computed once (int64) from the Device or Host page (KVPageRef);
+    // per-element offsets stay 32-bit.
     const Element* cache_block =
-        cache + paged_kv_element_offset<kCausalPromptHeadDim, Geometry::KVHeads>(
-                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+        paged_kv_read_page<kCausalPromptHeadDim, Geometry::KVHeads>(cache, host, physical_page) +
+        paged_kv_in_page_offset<kCausalPromptHeadDim>(kv_head, k0 & kPagedKVPageMask, 0);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
@@ -72,7 +74,8 @@ template <typename Geometry, typename Metadata>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
     void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                              const __nv_bfloat16* __restrict__ cache_k,
-                                             const __half* __restrict__ cache_v, Metadata metadata,
+                                             const __half* __restrict__ cache_v,
+                                             PagedKVHostPlanes host, Metadata metadata,
                                              const std::int32_t* __restrict__ positions,
                                              float scale, __nv_bfloat16* __restrict__ out,
                                              std::int32_t width) {
@@ -192,7 +195,8 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    causal_prompt_stage_kv<Geometry>(k_s, cache_k, host.k, kv_head, 0, max_query_abs,
+                                     physical_page, tid);
     ninfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
@@ -203,7 +207,8 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         __syncthreads();
 
         // Preserve the global FP16 V load/QK overlap.
-        causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
+        causal_prompt_stage_kv<Geometry>(v_s, cache_v, host.v, kv_head, k0, max_query_abs,
+                                         physical_page,
                                          tid);
         ninfer::ops::cp_commit();
 
@@ -359,7 +364,8 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+            causal_prompt_stage_kv<Geometry>(k_s, cache_k, host.k, kv_head, (kb + 1) * Bc,
+                                             max_query_abs,
                                              physical_page, tid);
             ninfer::ops::cp_commit();
         }

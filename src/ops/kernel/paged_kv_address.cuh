@@ -57,12 +57,19 @@ __device__ __forceinline__ const T* paged_kv_read_page(const T* device, const st
     return reinterpret_cast<const T*>(host + KVPageRef::from_word(word).host_offset_bytes());
 }
 
-template <int LeadingExtent, int HeadExtent, typename T>
+// HostArm = false compiles the Device arm alone, for kernels at their register limit whose launch
+// selects the Host-arm instantiation only when the view has Host planes.
+template <int LeadingExtent, int HeadExtent, bool HostArm = true, typename T>
 __device__ __forceinline__ const T* paged_kv_read_page(const T* device, const std::byte* host,
                                                        std::int32_t word) {
-    return paged_kv_read_page(device, host, word,
-                              static_cast<std::int64_t>(LeadingExtent) * kPagedKVPageSize *
-                                  HeadExtent);
+    constexpr std::int64_t kPageElements =
+        static_cast<std::int64_t>(LeadingExtent) * kPagedKVPageSize * HeadExtent;
+    if constexpr (!HostArm) {
+        (void)host;
+        return device + kPageElements * word;
+    } else {
+        return paged_kv_read_page(device, host, word, kPageElements);
+    }
 }
 
 template <int LeadingExtent>

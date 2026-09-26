@@ -53,7 +53,7 @@ template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
-    const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
+    const std::uint8_t* __restrict__ cache_v_scale, PagedKVHostPlanes host, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim;
@@ -162,17 +162,24 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
     }
 
     auto issue_kv_scales = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
-        const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
+        // One page per tile: resolve its Device or Host page (KVPageRef); page 0 of the index
+        // helpers is the in-page offset.
+        const int physical_page    = block_table[tile_k0 >> kPagedKVPageShift];
+        const int page_offset0     = tile_k0 & (kPagedKVPageSize - 1);
+        const __half* k_scale_page = paged_kv_read_page<kKVCacheFp8Groups, Geometry::KVHeads>(
+            cache_k_scale, host.k_scale, physical_page);
+        const std::uint8_t* v_scale_page =
+            paged_kv_read_page<kKVCacheNvfp4Groups, Geometry::KVHeads>(cache_v_scale, host.v_scale,
+                                                                        physical_page);
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
-                const std::int64_t k_off = kv_cache_fp8_scale_index<Geometry>(
-                    physical_page, kv_head, page_offset0 + key_l);
-                const std::int64_t v_off = kv_cache_nvfp4_scale_index<Geometry>(
-                    physical_page, kv_head, 0, page_offset0 + key_l);
-                k_scale_s[key_l] = cache_k_scale[k_off];
-                cp_async<16>(v_scale_s + key_l * kKVCacheNvfp4Groups, cache_v_scale + v_off);
+                const std::int64_t k_off =
+                    kv_cache_fp8_scale_index<Geometry>(0, kv_head, page_offset0 + key_l);
+                const std::int64_t v_off =
+                    kv_cache_nvfp4_scale_index<Geometry>(0, kv_head, 0, page_offset0 + key_l);
+                k_scale_s[key_l] = k_scale_page[k_off];
+                cp_async<16>(v_scale_s + key_l * kKVCacheNvfp4Groups, v_scale_page + v_off);
             } else {
                 k_scale_s[key_l] = __float2half_rn(0.0F);
                 store_vec(v_scale_s + key_l * kKVCacheNvfp4Groups, make_int4(0, 0, 0, 0));
@@ -181,8 +188,15 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
     };
 
     auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
-        const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
+        // One page per tile: resolve its Device or Host page (KVPageRef); page 0 of the index
+        // helpers is the in-page offset.
+        const int physical_page    = block_table[tile_k0 >> kPagedKVPageShift];
+        const int page_offset0     = tile_k0 & (kPagedKVPageSize - 1);
+        const std::uint8_t* k_page = paged_kv_read_page<kKVCacheFp8HeadDim, Geometry::KVHeads>(
+            cache_k, host.k, physical_page);
+        const std::uint8_t* v_page =
+            paged_kv_read_page<kKVCacheNvfp4CodeBytes, Geometry::KVHeads>(cache_v, host.v,
+                                                                           physical_page);
 #pragma unroll 1
         for (int chunk = cooperative_tid; chunk < Bc * (D / 16); chunk += cooperative_threads) {
             const int key_l  = chunk / (D / 16);
@@ -191,9 +205,9 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
             const int key    = tile_k0 + key_l;
             std::uint8_t* kd = &k_fp8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_code_index<Geometry>(physical_page, kv_head,
-                                                                           d, page_offset0 + key_l);
-                cp_async<16, Cache::cg>(kd, &cache_k[off]);
+                const std::int64_t off =
+                    kv_cache_fp8_code_index<Geometry>(0, kv_head, d, page_offset0 + key_l);
+                cp_async<16, Cache::cg>(kd, &k_page[off]);
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
             }
@@ -206,9 +220,9 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
             const int key    = tile_k0 + key_l;
             std::uint8_t* vd = &v_nvfp4[key_l * (D / 2) + d / 2];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, d, page_offset0 + key_l);
-                cp_async<16, Cache::cg>(vd, &cache_v[off]);
+                const std::int64_t off =
+                    kv_cache_nvfp4_code_index<Geometry>(0, kv_head, d, page_offset0 + key_l);
+                cp_async<16, Cache::cg>(vd, &v_page[off]);
             } else {
                 store_vec(vd, make_int4(0, 0, 0, 0));
             }

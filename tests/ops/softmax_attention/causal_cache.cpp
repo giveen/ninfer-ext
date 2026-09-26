@@ -2081,29 +2081,33 @@ int run_host_arm_case(const Geometry& geometry, KvCacheStorage storage,
     return failures;
 }
 
-// Host-arm routes: FP8 small-T decode and verify widths (M1 slice of the KV-stream plan).
+// Host-arm routes: small-T decode/verify and prompt prefill widths of every KV storage.
 int run_host_arm_cases() {
     int failures = 0;
-    for (const Geometry& geometry : kGeometries) {
-        for (const StreamPattern pattern :
-             {StreamPattern::All, StreamPattern::Alternate, StreamPattern::Interior}) {
-            failures += run_host_arm_case(geometry, KvCacheStorage::Fp8E4M3Row256,
-                                          {1, 255, 256, 901u}, MappingPattern::Fragmented,
-                                          pattern, false);
-            failures += run_host_arm_case(geometry, KvCacheStorage::Fp8E4M3Row256,
-                                          {6, 250, 256, 902u}, MappingPattern::Offset, pattern,
-                                          false);
-            failures += run_host_arm_case(geometry, KvCacheStorage::Fp8E4M3Row256,
-                                          {4, 256, 260, 903u}, MappingPattern::Fragmented,
-                                          pattern, true);
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (const Geometry& geometry : kGeometries) {
+            for (const StreamPattern pattern :
+                 {StreamPattern::All, StreamPattern::Alternate, StreamPattern::Interior}) {
+                failures += run_host_arm_case(geometry, storage, {1, 255, 256, 901u},
+                                              MappingPattern::Fragmented, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {6, 250, 256, 902u},
+                                              MappingPattern::Offset, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {4, 256, 260, 903u},
+                                              MappingPattern::Fragmented, pattern, true);
+                // Prefill widths take the prompt route.
+                failures += run_host_arm_case(geometry, storage, {65, 191, 256, 906u},
+                                              MappingPattern::Fragmented, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {64, 192, 256, 907u},
+                                              MappingPattern::Offset, pattern, true);
+            }
         }
+        failures += run_host_arm_case(kGeometries[1], storage, {1, 16384, 16385, 904u},
+                                      MappingPattern::Fragmented, StreamPattern::Alternate, true);
+        failures += run_host_arm_case(kGeometries[0], storage, {1, 1000, 1001, 905u, false, true},
+                                      MappingPattern::Identity, StreamPattern::Interior, true);
     }
-    failures += run_host_arm_case(kGeometries[1], KvCacheStorage::Fp8E4M3Row256,
-                                  {1, 16384, 16385, 904u}, MappingPattern::Fragmented,
-                                  StreamPattern::Alternate, true);
-    failures += run_host_arm_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
-                                  {1, 1000, 1001, 905u, false, true}, MappingPattern::Identity,
-                                  StreamPattern::Interior, true);
     return failures;
 }
 
