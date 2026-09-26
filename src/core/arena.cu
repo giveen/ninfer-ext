@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -271,7 +272,10 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, PinnedHostPages pages
         void* ptr = std::aligned_alloc(kPinnedHugePageBytes, reserved);
         if (ptr == nullptr) { throw std::bad_alloc(); }
         // Advisory: without transparent huge pages the buffer is still correct, only slower.
+        // Populate every page before registration, so the pinned mapping is built once over its
+        // final (huge) pages rather than faulted in piecewise by the registration itself.
         (void)madvise(ptr, reserved, MADV_HUGEPAGE);
+        if (madvise(ptr, reserved, MADV_POPULATE_WRITE) != 0) { std::memset(ptr, 0, reserved); }
         const cudaError_t err = cudaHostRegister(ptr, reserved, cudaHostRegisterDefault);
         if (err != cudaSuccess) {
             std::free(ptr);
