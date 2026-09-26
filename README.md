@@ -416,6 +416,24 @@ All values are tok/s; percentages are MTP draft acceptance. DFlash on Qwen3.6-35
 385.1 tok/s at `tg128` with 7 drafts (20% accepted) and 219.5 with 15 (7% accepted), against 393.3
 without speculation.
 
+### Test system
+
+Every number in this README comes from one machine:
+
+| Component | Details |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090, 32 GB, PCIe Gen5 x16 |
+| NVIDIA driver | 610.57.04 |
+| CUDA toolkit | 13.4 (`nvcc` V13.4.92) |
+| CPU | Intel Core Ultra 9 285K (24 cores, up to 5.7 GHz) |
+| RAM | 247 GiB usable |
+| Model storage | WD_BLACK SN850P 8 TB NVMe, ext4 |
+| OS | Ubuntu 26.10 (development branch), Linux 7.3.0-5-generic |
+
+Flash-Next keeps its routed experts in pinned host RAM and streams them over PCIe, so its numbers
+also depend on host memory and the PCIe link, not only on the GPU. Model load time depends on the
+NVMe drive.
+
 ### Benchmark conditions
 
 - **Tool.** `ninfer_bench` through the public Engine: BF16 KV, CUDA Graphs, 3 measured repetitions
