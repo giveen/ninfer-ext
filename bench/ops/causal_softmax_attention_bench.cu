@@ -7,7 +7,10 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/kv_cache_append.h"
 
+#include "core/arena.h"
 #include "core/device.h"
+#include "core/host_kv_arena.h"
+#include "core/kv_page_ref.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "ninfer_bench_common.h"
@@ -24,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,6 +49,8 @@ enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 enum class PageMapping : std::uint8_t { Identity, Fragmented };
+// Pages before each row's context that are read in place from pinned Host records (KVPageRef).
+enum class HostPages : std::uint8_t { None, All, Alternate, Interior };
 
 struct Geometry {
     const char* name;
@@ -62,6 +68,8 @@ struct Options {
     Execution execution     = Execution::Graph;
     CacheMode cache         = CacheMode::Cold;
     PageMapping mapping     = PageMapping::Identity;
+    HostPages host_pages    = HostPages::None;
+    int host_record_layers  = 1;
     std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 12, 16, 1024};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192};
@@ -82,6 +90,8 @@ struct Result {
     Execution execution;
     CacheState cache;
     PageMapping mapping;
+    HostPages host_pages;
+    double host_bytes;
     std::int32_t batch;
     std::int32_t tokens;
     std::string row_contexts;
@@ -112,7 +122,8 @@ struct Result {
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--mapping identity|fragmented] "
+                 "[--mapping identity|fragmented] [--host-pages none|all|alternate|interior] "
+                 "[--host-record-layers N] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -235,6 +246,22 @@ Options parse_options(int argc, char** argv) {
                 options.mapping = PageMapping::Fragmented;
             else
                 usage("--mapping expects identity or fragmented");
+        } else if (argument == "--host-pages") {
+            const std::string_view value(next("--host-pages requires a value"));
+            if (value == "none")
+                options.host_pages = HostPages::None;
+            else if (value == "all")
+                options.host_pages = HostPages::All;
+            else if (value == "alternate")
+                options.host_pages = HostPages::Alternate;
+            else if (value == "interior")
+                options.host_pages = HostPages::Interior;
+            else
+                usage("--host-pages expects none, all, alternate, or interior");
+        } else if (argument == "--host-record-layers") {
+            options.host_record_layers =
+                parse_i32(next("--host-record-layers requires a value"), 1, 64,
+                          "--host-record-layers");
         } else if (argument == "--graph-calls") {
             options.graph_calls =
                 parse_i32(next("--graph-calls requires a value"), 1, 128, "--graph-calls");
@@ -416,7 +443,8 @@ class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
-         std::span<const std::int32_t> table_rows, PageMapping mapping)
+         std::span<const std::int32_t> table_rows, PageMapping mapping, HostPages host_pages,
+         int host_record_layers)
         : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
           batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::ranges::any_of(valid_columns,
@@ -515,7 +543,12 @@ public:
             ops::kv_cache_append(k, v, positions, row_cache, nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        if (host_pages != HostPages::None) {
+            stream_to_host(geometry, host_pages, host_record_layers, contexts, host_table);
+        }
     }
+
+    [[nodiscard]] double host_bytes() const noexcept { return host_bytes_; }
 
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Append) {
@@ -532,6 +565,74 @@ public:
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
+
+    // Moves the selected populated pages of every row to Host records laid out by the production
+    // HostKVPageLayout, then publishes Host words for them. Pages at or after a row's context stay
+    // Device-resident because the append entry writes them. A record holds `record_layers` layers,
+    // as a production record holds every full-attention layer; this benchmark's layer is the first.
+    void stream_to_host(const Geometry& geometry, HostPages host_pages, int record_layers,
+                        std::span<const std::int32_t> contexts,
+                        std::vector<std::int32_t>& host_table) {
+        KVPageGeometry page_geometry;
+        const auto add_plane = [&](DType dtype, std::int32_t extent) {
+            page_geometry.planes.push_back({dtype, extent, geometry.kv_heads, 256});
+        };
+        for (int layer = 0; layer < record_layers; ++layer) {
+            add_plane(storage_layout_.key.data_dtype, storage_layout_.key.data_leading_extent);
+            add_plane(storage_layout_.value.data_dtype, storage_layout_.value.data_leading_extent);
+            if (storage_layout_.key.has_scale())
+                add_plane(storage_layout_.key.scale_dtype, storage_layout_.key.scale_leading_extent);
+            if (storage_layout_.value.has_scale())
+                add_plane(storage_layout_.value.scale_dtype,
+                          storage_layout_.value.scale_leading_extent);
+        }
+        const HostKVPageLayout layout = plan_host_kv_page_layout(page_geometry);
+
+        std::vector<std::pair<std::int32_t, std::int32_t>> streamed; // (row, logical page)
+        for (std::int32_t row = 0; row < batch_; ++row) {
+            const std::int32_t readable = contexts[static_cast<std::size_t>(row)] / kPagedKVPageSize;
+            for (std::int32_t page = 0; page < readable; ++page) {
+                const bool stream =
+                    host_pages == HostPages::All ||
+                    (host_pages == HostPages::Alternate && page % 2 == 1) ||
+                    (host_pages == HostPages::Interior && page > 0 && page + 1 < readable);
+                if (stream) streamed.emplace_back(row, page);
+            }
+        }
+        if (streamed.empty()) return;
+        host_records_.emplace(streamed.size() * layout.page_stride, PinnedHostPages::Huge);
+        auto* records = static_cast<std::byte*>(host_records_->data());
+        DeviceBuffer* planes[] = {&cache_k_, &cache_v_, &cache_k_scale_, &cache_v_scale_};
+        std::vector<DeviceBuffer*> used{planes[0], planes[1]};
+        if (storage_layout_.key.has_scale()) used.push_back(planes[2]);
+        if (storage_layout_.value.has_scale()) used.push_back(planes[3]);
+        for (std::size_t index = 0; index < streamed.size(); ++index) {
+            const auto [row, page]      = streamed[index];
+            std::int32_t& word          = host_table[static_cast<std::size_t>(row) * logical_pages_ + page];
+            const std::size_t record    = index * layout.page_stride;
+            for (std::size_t plane = 0; plane < used.size(); ++plane) {
+                const std::size_t bytes = layout.planes[plane].page_payload_bytes;
+                CUDA_CHECK(cudaMemcpy(records + record + layout.planes[plane].offset,
+                                      static_cast<std::byte*>(used[plane]->p) +
+                                          static_cast<std::size_t>(word) * bytes,
+                                      bytes, cudaMemcpyDeviceToHost));
+                host_bytes_ += static_cast<double>(bytes);
+            }
+            word = KVPageRef(HostPageUnit{static_cast<std::uint32_t>(record / kHostKVPageUnitBytes)})
+                       .word();
+        }
+        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
+                              cudaMemcpyHostToDevice));
+        const auto base = [&](std::size_t plane) -> const std::byte* {
+            return records + layout.planes[plane].offset;
+        };
+        PagedKVHostPlanes host{.k = base(0), .v = base(1)};
+        std::size_t next = 2;
+        if (storage_layout_.key.has_scale()) host.k_scale = base(next++);
+        if (storage_layout_.value.has_scale()) host.v_scale = base(next++);
+        cache_view_.host       = host;
+        batch_cache_view_.host = host;
+    }
 
     [[nodiscard]] std::size_t workspace_peak() const {
         if (workspace_.used() != 0 || workspace_.peak_used() > workspace_bytes_)
@@ -572,6 +673,8 @@ private:
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
     ops::CausalAttentionExecutionEnvelope envelope_;
+    std::optional<PinnedHostBuffer> host_records_;
+    double host_bytes_ = 0.0;
 };
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
@@ -600,6 +703,20 @@ const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "c
 
 const char* mapping_name(PageMapping mapping) {
     return mapping == PageMapping::Identity ? "identity" : "fragmented";
+}
+
+const char* host_pages_name(HostPages host_pages) {
+    switch (host_pages) {
+    case HostPages::None:
+        return "none";
+    case HostPages::All:
+        return "all";
+    case HostPages::Alternate:
+        return "alternate";
+    case HostPages::Interior:
+        return "interior";
+    }
+    return "unknown";
 }
 
 std::string profile_name(std::span<const std::int32_t> values) {
@@ -704,23 +821,24 @@ void report(const Result& result) {
     const double qk_tflops     = result.qk_flops / seconds / 1.0e12;
     const double pv_tflops     = result.pv_flops / seconds / 1.0e12;
     std::printf(
-        "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
+        "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s host=%-9s execution=%-5s cache=%-4s "
         "B=%d W=%d contexts=%s valid=%s rows=%s "
         "workspace=%9zu peak=%9zu nodes=%zu calls=%d median=%10.3f us min=%10.3f us p95=%10.3f us "
         "logical_payload=%8.1f GB/s physical_payload=%8.1f GB/s math=%7.2f TFLOP/s\n",
         entry_name(result.entry), result.geometry.name, storage_name(result.storage),
-        mapping_name(result.mapping), execution_name(result.execution), cache_name(result.cache),
-        result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
+        mapping_name(result.mapping), host_pages_name(result.host_pages),
+        execution_name(result.execution), cache_name(result.cache), result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
         result.table_rows.c_str(), result.workspace_bytes, result.workspace_peak,
         result.graph_nodes, result.graph_calls, result.timing.median_us, result.timing.min_us,
         result.timing.p95_us, logical_gbps, physical_gbps, tflops);
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
-                "unique_cache_rate=%8.1f GB/s\n",
+                "unique_cache_rate=%8.1f GB/s host_read=%.0f bytes host_rate=%8.1f GB/s\n",
                 result.key_vector_bytes, result.value_vector_bytes, result.logical_cache_bytes,
                 result.physical_cache_bytes, result.qk_flops, result.pv_flops, qk_tflops, pv_tflops,
-                result.unique_kv_bytes, cache_gbps);
+                result.unique_kv_bytes, cache_gbps, result.host_bytes,
+                result.host_bytes / seconds / 1.0e9);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -730,7 +848,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output
-        << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
+        << "entry,geometry,kv_dtype,mapping,host_pages,host_bytes,execution,cache,B,W,row_contexts,valid_columns,"
            "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
            "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
            "qk_full_op_tflops,pv_full_op_tflops,"
@@ -739,6 +857,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
+               << host_pages_name(result.host_pages) << ',' << result.host_bytes << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
                << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
                << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
@@ -873,7 +992,7 @@ int main(int argc, char** argv) {
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
-                      options.mapping);
+                      options.mapping, options.host_pages, options.host_record_layers);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
@@ -894,7 +1013,8 @@ int main(int argc, char** argv) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
-                                      rows.table_rows, options.mapping);
+                                      rows.table_rows, options.mapping, options.host_pages,
+                                      options.host_record_layers);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||
@@ -935,6 +1055,8 @@ int main(int argc, char** argv) {
                                             execution,
                                             cache,
                                             options.mapping,
+                                            options.host_pages,
+                                            data.host_bytes(),
                                             batch,
                                             tokens,
                                             profile_name(rows.contexts),

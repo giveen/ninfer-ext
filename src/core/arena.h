@@ -90,9 +90,19 @@ private:
     bool owns_        = true;
 };
 
+/** Host page size behind a PinnedHostBuffer. */
+enum class PinnedHostPages : std::uint8_t {
+    Default, ///< cudaMallocHost (4 KiB pages)
+    /** 2 MiB pages when the kernel allows. The GPU translates Host addresses through its own TLB;
+     *  scattered SM reads over 4 KiB pages lose most of the PCIe link to translation misses. */
+    Huge,
+};
+
+/** Page-locked Host memory that the device can address directly (UVA). */
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
+    explicit PinnedHostBuffer(std::size_t size_bytes,
+                              PinnedHostPages pages = PinnedHostPages::Default);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -106,6 +116,7 @@ public:
 private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
+    bool registered_  = false;
 };
 
 using WorkspaceArena = DeviceArena;

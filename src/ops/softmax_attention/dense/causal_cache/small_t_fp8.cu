@@ -50,7 +50,7 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
         auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
         kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
             q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
-            tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
+            cache.host, tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
             invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
             partial_l_ptr);
         CUDA_CHECK(cudaGetLastError());

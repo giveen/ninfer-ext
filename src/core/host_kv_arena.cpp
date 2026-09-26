@@ -1,6 +1,7 @@
 #include "core/host_kv_arena.h"
 
 #include "core/dtype.h"
+#include "core/kv_page_ref.h"
 
 #include <algorithm>
 #include <exception>
@@ -12,7 +13,8 @@
 namespace ninfer {
 namespace {
 
-constexpr std::size_t kHostKVAlignment = 256;
+// Host page records start at unit multiples so a block-table word can address them (KVPageRef).
+constexpr std::size_t kHostKVAlignment = kHostKVPageUnitBytes;
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
     if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
@@ -228,7 +230,8 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
 
-    backing_.emplace(capacity_bytes_);
+    // Streamed KV pages are read in place over PCIe (KVPageRef); see PinnedHostPages::Huge.
+    backing_.emplace(capacity_bytes_, PinnedHostPages::Huge);
     const auto smallest = std::ranges::min_element(
         layouts_, [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;

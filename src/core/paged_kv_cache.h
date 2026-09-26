@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/kv_page_ref.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
@@ -17,6 +18,19 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+/**
+ * Host page records of one layer that paged Ops read in place for Host block-table words
+ * (KVPageRef). Each pointer is the HostKVArena base plus that plane's record offset; a record's
+ * plane slice has the Device in-page element order. Null planes mean the cache has no Host arm,
+ * and its tables hold Device words only. Writes never target a Host record.
+ */
+struct PagedKVHostPlanes {
+    const std::byte* k       = nullptr;
+    const std::byte* v       = nullptr;
+    const std::byte* k_scale = nullptr;
+    const std::byte* v_scale = nullptr;
+};
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -27,6 +41,7 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVHostPlanes host;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -39,6 +54,7 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVHostPlanes host;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
