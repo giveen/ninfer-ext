@@ -205,31 +205,36 @@ Serve two concurrent 229,376-token requests with FP8 KV and MTP:
 
 ### Flash-Next speed
 
-All numbers are from one RTX 5090 with BF16 KV and CUDA Graphs, at fork commit `19f38b77`.
+All numbers are from one RTX 5090 with BF16 KV and CUDA Graphs, at fork commit `85564b25`.
 [Benchmark conditions](#benchmark-conditions) has the details.
 
 | Test | tok/s |
 |---|---:|
-| Prefill, 4,096-token prompt | 2,938 |
-| Prefill, 16,384-token prompt | 2,877 |
-| Prefill, 512-token prompt | 371 |
-| Decode, `tg128` | 71.0 |
-| Decode after a 2,048-token prompt | 62.6 |
-| Decode, `tg128`, adaptive MTP | 86.5 (68% accepted) |
-| Decode, `tg128`, MTP K=3 | 83.1 (51% accepted) |
+| Prefill, 4,096-token prompt | 2,906 |
+| Prefill, 16,384-token prompt | 2,865 |
+| Prefill, 512-token prompt | 368 |
+| Decode, `tg128` | 120.9 |
+| Decode after a 2,048-token prompt | 67.2 |
+| Decode, `tg128`, adaptive MTP | 112.8 (52% accepted) |
+| Decode, `tg128`, MTP K=3 | 115.0 (45% accepted) |
 
-With FP8 KV, prefill is unchanged (2,940 tok/s at 4k, 2,908 at 16k). Decode after a 2,048-token
-prompt rises to 65.7 tok/s (+5%).
+`tg128` decodes from a one-token seed, so its speed depends on how many distinct experts the
+generated text routes to; decode after a 2,048-token prompt is the steadier figure.
+
+With FP8 KV, prefill is unchanged (2,907 tok/s at 4k, 2,884 at 16k). Decode after a 2,048-token
+prompt rises to 68.9 tok/s (+3%).
 
 Serving 512-token essays per request, aggregate decode tok/s (mean of two runs):
 
 | `ninfer-serve` | C=1 | C=2 | C=4 | C=8 |
 |---|---:|---:|---:|---:|
-| No speculation | 82.8 | 105.4 | 114.5 | 116.8 |
-| `--spec mtp` | 93.5 | 104.7 | 111.4 | 103.3 |
+| No speculation | 93.1 | 128.6 | 123.0 | 129.1 |
+| `--spec mtp` | 72.3 | 124.6 | 116.7 | 134.7 |
 
 Decode is bound by expert-cache misses: each miss copies a 2.6 MiB expert over PCIe. Aggregate
 throughput therefore levels off at C≥4, where the requests in flight route to more distinct experts.
+On this essay load a single request now decodes faster without MTP: a verify round routes up to four
+columns, which touches more experts than the accepted drafts save.
 
 When Flash-Next support first landed (`e68225b7`), development runs measured about 19.5 tok/s
 single-request decode and about 350 tok/s prefill on a 3k-token prompt. The main steps since then:
@@ -311,7 +316,8 @@ with 15 (7% accepted), against 393.3 without speculation.
   concurrent 512-token essays on eight fixed topics.
 - **Not yet measured.** The Qwen3.6-27B artifacts. DFlash2 is covered in
   [Versus stock NInfer](#versus-stock-ninfer).
-- **Raw reports.** The JSON reports are kept locally under `profiles/bench/readme_20260925/`.
+- **Raw reports.** The JSON reports are kept locally under `profiles/bench/readme_20260925/`, and
+  the Flash-Next ones under `profiles/bench/readme_20260926/` (`run.sh` reproduces them).
 
 Upstream's published results use its own methodology and artifacts. They are in the
 [performance index](docs/performance.md).
