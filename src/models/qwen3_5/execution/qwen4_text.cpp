@@ -45,21 +45,30 @@ namespace ninfer::models::qwen3_5::execution {
 
 namespace {
 
-// Copy rows [row0, row0 + rows) of a contiguous [R, T] matrix into a contiguous [rows, T] one.
-void copy_rows(const Tensor& source, std::int32_t row0, std::int32_t rows, Tensor& destination,
-               cudaStream_t stream) {
+// Rows [row0, row0 + rows) of a contiguous [R, T] matrix as a contiguous tensor shaped like
+// `destination` ([rows, T] elements). One column is already contiguous, so the result is a view
+// into the source and nothing is copied; wider sources are copied into `destination`. Callers
+// only read the result.
+Tensor split_rows(const Tensor& source, std::int32_t row0, std::int32_t rows,
+                  const Tensor& destination, cudaStream_t stream) {
     const std::size_t element  = dtype_size(source.dtype);
     const std::int64_t columns = source.numel() / source.ne[0];
     if (destination.dtype != source.dtype || destination.ne[0] != rows ||
         destination.numel() != static_cast<std::int64_t>(rows) * columns ||
-        row0 + rows > source.ne[0]) {
+        row0 + rows > source.ne[0] || !source.is_contiguous() || !destination.is_contiguous()) {
         throw std::invalid_argument("Qwen4Exp row split does not match its source");
+    }
+    if (columns == 1) {
+        Tensor view = destination;
+        view.data   = static_cast<std::byte*>(source.data) + static_cast<std::size_t>(row0) * element;
+        return view;
     }
     CUDA_CHECK(cudaMemcpy2DAsync(
         destination.data, static_cast<std::size_t>(rows) * element,
         static_cast<const std::byte*>(source.data) + static_cast<std::size_t>(row0) * element,
         static_cast<std::size_t>(source.ne[0]) * element, static_cast<std::size_t>(rows) * element,
         static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice, stream));
+    return destination;
 }
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -179,14 +188,10 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     auto scope = work_.scope();
     auto roots = workspace::qwen4_qsa(work_, config_, T);
     project(x, p.projection, roots.projection, work_, s);
-    Tensor q    = roots.query;
-    Tensor k    = roots.key;
-    Tensor gate = roots.gate;
-    Tensor v    = roots.value;
-    copy_rows(roots.projection, 0, qw, q, s);
-    copy_rows(roots.projection, qw, kw, k, s);
-    copy_rows(roots.projection, qw + kw, qw, gate, s);
-    copy_rows(roots.projection, 2 * qw + kw, kw, v, s);
+    const Tensor q    = split_rows(roots.projection, 0, qw, roots.query, s);
+    const Tensor k    = split_rows(roots.projection, qw, kw, roots.key, s);
+    const Tensor gate = split_rows(roots.projection, qw + kw, qw, roots.gate, s);
+    const Tensor v    = split_rows(roots.projection, 2 * qw + kw, kw, roots.value, s);
 
     Tensor q3   = q.view({head_dim, heads, T});
     Tensor k3   = k.view({head_dim, kv_heads, T});
@@ -200,10 +205,10 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
 
     project(x, p.indexer, roots.indexer, work_, s);
     const std::int32_t index_query_rows = geometry.index_heads * geometry.index_dim;
-    Tensor index_query                  = roots.index_query;
-    Tensor index_key                    = roots.index_key;
-    copy_rows(roots.indexer, 0, index_query_rows, index_query, s);
-    copy_rows(roots.indexer, index_query_rows, geometry.index_dim, index_key, s);
+    const Tensor index_query =
+        split_rows(roots.indexer, 0, index_query_rows, roots.index_query, s);
+    const Tensor index_key =
+        split_rows(roots.indexer, index_query_rows, geometry.index_dim, roots.index_key, s);
 
     const Tensor positions         = sequence.cache_positions->view({W, B});
     const Tensor rope_rows =
@@ -245,15 +250,13 @@ void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gi
     auto roots = workspace::qwen4_gdn(work_, config_, T);
     project(x, p.projection, roots.projection, work_, s);
     project(x, p.control, roots.control, work_, s);
-    Tensor a = roots.a, b = roots.b, g = roots.g, beta = roots.beta;
-    copy_rows(roots.control, 0, heads, a, s);
-    copy_rows(roots.control, heads, heads, b, s);
+    const Tensor a = split_rows(roots.control, 0, heads, roots.a, s);
+    const Tensor b = split_rows(roots.control, heads, heads, roots.b, s);
+    Tensor g = roots.g, beta = roots.beta;
     ops::gdn_gating(a, b, p.a_log, p.dt_bias, g, beta, s);
 
-    Tensor qkv = roots.qkv;
-    Tensor z   = roots.z;
-    copy_rows(roots.projection, 0, conv, qkv, s);
-    copy_rows(roots.projection, conv, vwidth, z, s);
+    const Tensor qkv = split_rows(roots.projection, 0, conv, roots.qkv, s);
+    const Tensor z   = split_rows(roots.projection, conv, vwidth, roots.z, s);
     Tensor qc = roots.query, kc = roots.key, vc = roots.value;
 
     if (ph == Phase::Verify) {
@@ -345,10 +348,8 @@ void TextContext::qwen4_ple(const PleParameters& p, const Tensor& embedding, Pha
     auto scope = work_.scope();
     auto roots = workspace::qwen4_ple(work_, config_, T);
     project(embedding, p.key_value, roots.key_value, work_, s);
-    Tensor key   = roots.key;
-    Tensor value = roots.value;
-    copy_rows(roots.key_value, 0, wide_rows, key, s);
-    copy_rows(roots.key_value, wide_rows, H, value, s);
+    const Tensor key   = split_rows(roots.key_value, 0, wide_rows, roots.key, s);
+    const Tensor value = split_rows(roots.key_value, wide_rows, H, roots.value, s);
     Tensor key_n   = roots.normalized_key;
     Tensor query_n = roots.normalized_query;
     Tensor gated   = roots.gated;
