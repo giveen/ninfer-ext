@@ -46,6 +46,14 @@ CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
 SCHEMA_VERSION = 3
+# --kv-dtype values and the kv_cache name server_start records for each.
+KV_CACHE_NAMES = {
+    "bf16": "bf16",
+    "int8": "int8-group64",
+    "fp8": "fp8-e4m3-row256",
+    "nvfp4": "nvfp4",
+    "k8v4": "k8v4",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +153,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="262144",
         metavar="N|auto",
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        choices=tuple(KV_CACHE_NAMES),
+        default="int8",
+        help="KV storage passed to ninfer-serve (default: int8; Qwen4Exp requires bf16 or fp8)",
     )
     parser.add_argument(
         "--prefill-chunk",
@@ -309,7 +323,7 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        args.kv_dtype,
         "--no-prefix-reuse",
     ]
     if point.speculative_backend != "none":
@@ -361,7 +375,7 @@ def validate_server_start(
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
-        "kv_cache": "int8-group64",
+        "kv_cache": KV_CACHE_NAMES[args.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
