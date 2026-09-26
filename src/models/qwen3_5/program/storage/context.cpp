@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -1645,13 +1646,17 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
     ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
-    // Prefill maps whole chunks against the admission window; streaming makes room for each.
+    // Prefill maps each chunk against the admission window; streaming makes room for it. Host KV
+    // is not reserved at admission, so a full arena fails the step as a capacity shortfall.
     if (kv_stream &&
         (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens) ||
          (backend_tokens != 0 && !stream_kv(*backend_kv_pages, *backend_kv_addresses,
                                             *sequence.kv->backend, backend_tokens)))) {
-        throw std::runtime_error(
-            "KV streaming cannot cover this execution step: Host KV capacity is exhausted");
+        std::fprintf(stderr,
+                     "warning: KV streaming cannot map lane %u to %u tokens (backend %u): Host KV "
+                     "capacity is exhausted\n",
+                     sequence.lane, main_tokens, backend_tokens);
+        throw std::bad_alloc();
     }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {

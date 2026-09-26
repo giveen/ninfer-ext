@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -30,6 +31,8 @@ struct DecoderStateSpec {
     // KV streaming: the physical pools may be smaller than one full-capacity sequence, since
     // older pages are served from Host records.
     bool kv_stream = false;
+    // KV streaming: Host pages one text prefill chunk can stage on Device (KVPrefillStaging).
+    std::uint32_t prefill_staging_pages = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -96,6 +99,13 @@ public:
     // the cache and its base is stable for the Engine lifetime.
     void bind_host_records(const HostKVArena& arena);
 
+    [[nodiscard]] const std::byte* host_base() const noexcept { return host_base_; }
+    [[nodiscard]] const HostKVPageLayout& host_layout() const noexcept { return host_layout_; }
+    [[nodiscard]] const PagedKVStorageLayout& layer_storage() const noexcept {
+        return layer_storage_;
+    }
+    [[nodiscard]] std::size_t planes_per_layer() const noexcept { return layer_plane_stride(); }
+
 private:
     [[nodiscard]] std::size_t layer_plane_stride() const noexcept {
         return layer_storage_.planes_per_layer() + (qsa_index_ ? 1U : 0U);
@@ -115,9 +125,57 @@ private:
     HostKVPageLayout host_layout_;
 };
 
+// Device staging for a streamed text prefill chunk (paged-kv §6.5). A prompt kernel reads every
+// visible page once per query tile, so reading Host pages in place multiplies PCIe traffic by the
+// tile count. Instead each layer's slice of the chunk's Host pages is copied once into `buffer`,
+// laid out as compact one-layer records, and a staged copy of the execution tables points the
+// Host words at those records; paged Ops then resolve them through the Host arm from Device memory.
+struct KVPrefillStagingLayout {
+    TensorRegion buffer; // U8 [record_stride, capacity_pages]
+    TensorRegion tables; // I32 [logical pages, table rows], shaped like the execution tables
+    std::size_t record_stride    = 0;
+    std::uint32_t capacity_pages = 0;
+};
+
+class KVPrefillStaging {
+public:
+    KVPrefillStaging(DeviceSpan backing, const KVPrefillStagingLayout& layout,
+                     const PagedKVCache& cache);
+
+    KVPrefillStaging(const KVPrefillStaging&)            = delete;
+    KVPrefillStaging& operator=(const KVPrefillStaging&) = delete;
+
+    // Stages execution row `row` for a chunk that reads logical pages [0, pages). Returns false,
+    // staging nothing, when those pages hold no Host word or more than the buffer fits; the chunk
+    // then reads its Host pages in place. The row's words must not change until the chunk ends.
+    [[nodiscard]] bool prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream);
+
+    // Enqueues the copy of layer `layer`'s slices of the prepared Host pages and returns `view`
+    // reading them from the staging buffer. Stream-ordered: the next layer's copy overwrites the
+    // buffer after this layer's readers.
+    [[nodiscard]] PagedKVBatchLayerView stage(const PagedKVBatchLayerView& view,
+                                              std::uint32_t layer, cudaStream_t stream) const;
+
+private:
+    struct Run {
+        std::uint32_t unit  = 0; // Host unit of the first page
+        std::uint32_t index = 0; // staging record of the first page
+        std::uint32_t count = 0;
+    };
+
+    const PagedKVCache* cache_ = nullptr;
+    Tensor buffer_;
+    Tensor tables_;
+    std::size_t record_stride_    = 0;
+    std::uint32_t capacity_pages_ = 0;
+    std::vector<std::int32_t> words_;
+    std::vector<Run> runs_;
+};
+
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
+    std::optional<KVPrefillStagingLayout> text_prefill_staging;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
@@ -128,6 +186,7 @@ struct DecoderStateLayout {
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
+    std::optional<KVPrefillStaging> text_prefill_staging;
 
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
 

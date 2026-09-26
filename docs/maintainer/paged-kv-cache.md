@@ -495,7 +495,15 @@ Device window，更早的 full pages 由 Host records 原地读取：
 - Demotable page：full committed、恰一个 active reference、没有 Host replica 或 pending/pinned
   状态。Sink 与 tail pages 永不 stream；被拒绝的 speculative round 只截断 tail。
 - Host capacity：Host KV arena 不足时先释放无引用 extents 再重试一次；仍失败时 decode lease
-  按 §7.2 settle，prefill mapping 抛出 `std::runtime_error`。
+  按 §7.2 settle；prefill 每个 chunk 各自 map，其 mapping 失败按 Device OOM（`std::bad_alloc`）恢复，失败当前 active requests，worker 继续运行。
+- Prefill staging：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host pages 会让
+  PCIe 流量乘以 tile 数。Text prefill chunk 因此先由 `KVPrefillStaging::prepare` 把该 row 的 table
+  words 复制到 staged tables，Host words 改为紧凑 staging record 编号；每个 full-attention layer
+  在 attention 前用 copy engine 把这些 pages 的该层 plane span 复制到 Device staging buffer，view 的
+  Host plane bases 指向该 buffer，paged Ops 经 Host arm 从 Device 读取。Staging 容量为
+  `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该
+  chunk 退回原地读取。MTP prefill 只有末尾一个 query 的 attention，不需要 staging；decode 每步每页
+  只读一次，保持原地读取。
 - 范围：Host record 为 page-major layout；QSA index pool、DFlash head-major pool 与 CausalScoring
   拒绝 `kv_stream`。Streamed request 目前不进入 context cache（不 publish continuation，不复用
   prefix），因为 retain/restore 假设 Device-resident membership。

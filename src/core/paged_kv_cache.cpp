@@ -853,6 +853,15 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
                                cudaMemcpyHostToDevice, stream));
 }
 
+std::span<const std::int32_t> KVExecutionTablePool::published_words(std::int32_t row) const {
+    if (row < 0 || row >= spec_.table_rows) {
+        throw std::out_of_range("Paged KV execution row is out of range");
+    }
+    return {static_cast<const std::int32_t*>(host_shadow_.data()) +
+                static_cast<std::size_t>(row) * logical_page_capacity(),
+            logical_page_capacity()};
+}
+
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {
     if (!valid_handle(handle)) { throw std::invalid_argument("Paged KV execution row is stale"); }
     return block_tables_.slice(1, handle.row_, 1)

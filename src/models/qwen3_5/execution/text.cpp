@@ -976,6 +976,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    const PagedKVBatchLayerView text_kv_layer =
+        text_kv_staging_ != nullptr
+            ? text_kv_staging_->stage(batch_text_kv_->batch_layer_view(fidx),
+                                     static_cast<std::uint32_t>(fidx), s)
+            : batch_text_kv_->batch_layer_view(fidx);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1001,8 +1006,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s);
+            text_kv_layer, *active_causal_attention_envelope_, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -1010,8 +1014,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            s);
+            text_kv_layer, *active_causal_attention_envelope_, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 

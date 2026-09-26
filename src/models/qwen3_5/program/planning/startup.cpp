@@ -144,6 +144,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .qsa_index                 = config.sparse_attention.has_value(),
                      .kv_stream                 = plan.kv_stream,
+                     // Every request's Device window is at least the startup minimum, so at most
+                     // the rest of one sequence is Host-resident when a chunk stages it. The bound
+                     // does not depend on the pool size, which keeps this layout affine in it.
+                     .prefill_staging_pages =
+                         plan.kv_stream
+                             ? logical_pages -
+                                   std::min(logical_pages,
+                                            kv_stream_window_pages(plan.prefill_width,
+                                                                   plan.draft_window))
+                             : 0U,
                  });
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.

@@ -107,3 +107,11 @@ ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_qwen3_5_ple_gather_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_stream_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stream_real.cpp"
+  LIBRARIES ninfer_engine)
+
+set_tests_properties(
+  ninfer_qwen3_5_stream_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)

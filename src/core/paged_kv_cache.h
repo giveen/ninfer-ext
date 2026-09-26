@@ -375,6 +375,8 @@ public:
                           cudaStream_t stream = nullptr);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
+    /** The published words of row index `row` (its Host shadow), in logical page order. */
+    [[nodiscard]] std::span<const std::int32_t> published_words(std::int32_t row) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
