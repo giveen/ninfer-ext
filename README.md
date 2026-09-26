@@ -126,7 +126,7 @@ whether it is used or not. Where a cell says the workload decides, the numbers b
 | Qwen3.8-27B `groupwise-int` (official artifact) | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` | `--spec mtp --lm-head-draft` | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` |
 | Qwen3.6-35B-A3B | `--spec mtp --lm-head-draft` | same at 2; at 4, same for long reasoning and no `--spec` for short prose | `--spec dflash --draft-tokens 7 --lm-head-draft` for long reasoning; no `--spec` for short prose |
 | Qwen3.6-27B (both) | not measured; start from the Qwen3.8-27B row of the same weights | | |
-| Qwen3.8-Flash-Next | no `--spec` | no `--spec` | no `--spec` (MTP is within noise) |
+| Qwen3.8-Flash-Next | no `--spec` | no `--spec` | no `--spec` |
 
 Why these:
 
@@ -139,8 +139,8 @@ Why these:
   512-token essays, plain decode is 14% faster than MTP at C=4 and 32% faster at C=8. On long
   reasoning at C=8, DFlash with 7 drafts is the fastest mode.
 - **Flash-Next.** Decode is bound by fetching experts over PCIe. A verify round routes up to four
-  columns, which touches more experts than the accepted drafts save. Plain decode was 29% faster
-  than MTP for a single request.
+  columns, which touches more experts than the accepted drafts save. Plain decode was 26% faster
+  than MTP for a single request and 6% faster at C=8.
 - **The adaptive default (`--spec mtp` alone)** is a reasonable choice when the workload is unknown
   or mixed; see [Adaptive MTP draft length](#adaptive-mtp-draft-length).
 
@@ -330,29 +330,29 @@ expert-cache room and so of decode speed.
 
 ### Flash-Next speed
 
-One RTX 5090, BF16 KV, CUDA Graphs, fork commit `85564b25`
+One RTX 5090, BF16 KV, CUDA Graphs, fork commit `7fbabfbc`
 ([benchmark conditions](#benchmark-conditions)):
 
 | Test | tok/s |
 |---|---:|
-| Prefill, 4,096-token prompt | 2,906 |
-| Prefill, 16,384-token prompt | 2,865 |
-| Prefill, 512-token prompt | 368 |
-| Decode after a 2,048-token prompt | 67.2 |
-| Decode, `tg128` | 120.9 |
-| Decode, `tg128`, adaptive MTP | 112.8 (52% accepted) |
-| Decode, `tg128`, MTP K=3 | 115.0 (45% accepted) |
+| Prefill, 4,096-token prompt | 3,411 |
+| Prefill, 16,384-token prompt | 3,350 |
+| Prefill, 512-token prompt | 431 |
+| Decode after a 2,048-token prompt | 77.1 |
+| Decode, `tg128` | 125.2 |
+| Decode, `tg128`, adaptive MTP | 130.2 (52% accepted) |
+| Decode, `tg128`, MTP K=3 | 126.9 (45% accepted) |
 
 `tg128` decodes from a one-token seed, so its speed depends on how many distinct experts the
 generated text routes to; decode after a 2,048-token prompt is the steadier figure. With FP8 KV,
-prefill is unchanged and decode after a 2,048-token prompt rises to 68.9 tok/s.
+prefill is unchanged and decode after a 2,048-token prompt rises to 79.7 tok/s.
 
 Serving 512-token essays, aggregate decode tok/s (mean of two runs):
 
 | `ninfer-serve` | C=1 | C=2 | C=4 | C=8 |
 |---|---:|---:|---:|---:|
-| No speculation | **93.1** | **128.6** | **123.0** | 129.1 |
-| `--spec mtp` | 72.3 | 124.6 | 116.7 | 134.7 |
+| No speculation | **103.6** | **146.7** | **167.8** | **182.7** |
+| `--spec mtp` | 82.4 | 143.6 | 140.3 | 172.4 |
 
 Throughput levels off from C=4, where the requests in flight route to more distinct experts and
 the cache misses more often.
@@ -371,7 +371,9 @@ for a single request and prefilled about 350 tok/s. The main steps since then:
 - decode expert GEMVs that reduce only a job's live tokens and issue their weight loads before the
   job lookup finishes (+13% serving at C=1, +10% at C=8);
 - single-column projection splits as views instead of device copies, removing about 218 graph copy
-  nodes per decode token (+2.5% at C=1).
+  nodes per decode token (+2.5% at C=1);
+- pinned weights and Host KV on prefaulted 2 MiB pages, so the GPU's TLB covers the expert stream
+  (+16% prefill, +11% serving at C=1, +32% at C=8).
 
 The comparison engine used during development, FreeToken with `--moe-backend offload`, measured
 about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same machine (4k context).
@@ -380,7 +382,7 @@ about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same ma
 
 These numbers were measured on this fork: one RTX 5090, CUDA 13.3. The 27B and 35B rows are from
 fork commits `19f38b77` and `f8106aa9` (same Engine; only benchmark sizing changed); the Flash-Next
-rows are from `85564b25`.
+rows are from `7fbabfbc`, built with CUDA 13.4.
 
 ### Serving throughput
 
@@ -396,8 +398,8 @@ essay (mean of two runs). Bold marks the faster mode at each concurrency.
 | Qwen3.6-35B-A3B `groupwise-int` | plain | 386.6 | 619.8 | **972.3** | **1,324.4** |
 | | `--spec mtp` | **491.9** | **663.5** | 850.9 | 1,001.0 |
 | | `--spec dflash --draft-tokens 7` | 355.4 | 452.1 | 507.7 | 898.9 |
-| Qwen3.8-Flash-Next `nvfp4` | plain | **93.1** | **128.6** | **123.0** | 129.1 |
-| | `--spec mtp` | 72.3 | 124.6 | 116.7 | **134.7** |
+| Qwen3.8-Flash-Next `nvfp4` | plain | **103.6** | **146.7** | **167.8** | **182.7** |
+| | `--spec mtp` | 82.4 | 143.6 | 140.3 | 172.4 |
 
 On this prose load, 35B-A3B speculation loses from C=4 up. On the long-reasoning load in
 [Versus stock NInfer](#versus-stock-ninfer) it wins instead: MTP K=3 beats plain at C=4 and DFlash7
@@ -407,7 +409,7 @@ is fastest at C=8. Which mode wins depends on the workload.
 
 | Artifact | Prefill 4k | Prefill 16k | `tg128` | `tg128` adaptive MTP | `tg128` MTP K=3 |
 |---|---:|---:|---:|---:|---:|
-| Qwen3.8-Flash-Next `nvfp4` | 2,906 | 2,865 | 120.9 | 112.8 (52%) | 115.0 (45%) |
+| Qwen3.8-Flash-Next `nvfp4` | 3,411 | 3,350 | 125.2 | 130.2 (52%) | 126.9 (45%) |
 | Qwen3.8-27B `nvfp4` | 9,208 | 8,067 | 76.8 | 114.1 (42%) | 117.4 (38%) |
 | Qwen3.8-27B `groupwise-int` | 3,027 | 2,872 | 83.1 | 111.0 (41%) | 102.0 (29%) |
 | Qwen3.6-35B-A3B `groupwise-int` | 18,171 | 16,463 | 393.3 | 594.9 (72%) | 545.4 (56%) |
@@ -449,7 +451,7 @@ NVMe drive.
   512-token essays on eight fixed topics.
 - **Not yet measured.** The Qwen3.6-27B artifacts.
 - **Raw reports** are kept locally under `profiles/bench/readme_20260925/`, and the Flash-Next ones
-  under `profiles/bench/readme_20260926/` (`run.sh` reproduces them).
+  under `profiles/bench/readme_20260926b/` (`run.sh` reproduces them).
 
 Upstream's published results use its own methodology and artifacts; they are in the
 [performance index](docs/performance.md).
