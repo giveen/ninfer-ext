@@ -282,18 +282,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (config.qwen4()) {
         Qwen4PersistentLayout q;
         q.cache_layers = dimension(config.num_hidden_layers + (plan.features.mtp() ? 1U : 0U));
-        q.slots        = checked_i32(plan.expert_cache_slots, "expert cache slot count");
+        // The planned cache slots plus the staged banks' slots, which the cache uses between staged
+        // forwards.
+        q.slots = checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots) + kQwen4StagedBankSlots,
+                              "expert cache slot count");
         q.slot_of      = add_tensor(builder, DType::I32, {q.cache_layers * ops::kOffloadMoeExperts},
                                     "expert cache slot table");
         q.owner        = add_tensor(builder, DType::I32, {q.slots}, "expert cache owners");
         q.stamp        = add_tensor(builder, DType::I64, {q.slots}, "expert cache stamps");
         q.counters     = add_tensor(builder, DType::I64, {3}, "expert cache counters");
-        q.pool         = builder.add(checked_mul(static_cast<std::size_t>(q.slots),
-                                                 ops::kExpertSlotBytes, "expert cache pool bytes"),
-                                     kArenaAlign, "expert cache pool");
-        // Two banks, so the next layer's copy overlaps this layer's compute.
-        q.staged_bank = builder.add(2 * static_cast<std::size_t>(ops::kExpertStagedLayerBytes),
-                                    kArenaAlign, "prefill expert layer banks");
+        // Two staged banks (so the next layer's copy overlaps this layer's compute) overlay the last
+        // kQwen4StagedBankSlots slots; each bank also stores its layer's divisors past its experts.
+        static_assert(2 * ops::kExpertStagedLayerBytes ==
+                      kQwen4StagedBankSlots * ops::kExpertSlotBytes + 2 * ops::kExpertDivisorBytes);
+        q.pool = builder.add(checked_add(checked_mul(static_cast<std::size_t>(q.slots),
+                                                     ops::kExpertSlotBytes, "expert cache pool bytes"),
+                                         2 * ops::kExpertDivisorBytes, "expert cache pool bytes"),
+                             kArenaAlign, "expert cache pool");
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -320,7 +325,10 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     const auto& qwen4      = *parameters.qwen4;
     const auto chunk       = static_cast<std::int32_t>(std::min(plan.prefill_width, plan.capacity));
     const auto verify      = static_cast<std::int32_t>(plan.draft_window + 1U);
-    const std::int32_t slots = checked_i32(plan.expert_cache_slots, "expert cache slot count");
+    // Cache-route calls address every pool slot, the staged banks' slots included.
+    const std::int32_t slots = checked_i32(
+        static_cast<std::uint64_t>(plan.expert_cache_slots) + kQwen4StagedBankSlots,
+        "expert cache slot count");
     const std::int32_t hidden = dimension(config.hidden_size);
     const std::int32_t wide   = dimension(config.residual_width());
     const auto public_tokens  = dimension(parameters.model.resources().public_token_count);

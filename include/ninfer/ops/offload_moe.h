@@ -127,6 +127,13 @@ void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
                         const std::int32_t* resident, const ExpertWeights& bank,
                         const ExpertWeights& staged, cudaStream_t stream);
 
+/**
+ * Evict every expert held in slots `[first_slot, cache.slots)`: their `slot_of` entries become -1,
+ * their owners -1 and their stamps 0, so the range may be overwritten. Other slots are unchanged.
+ */
+void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot,
+                          cudaStream_t stream);
+
 /** Slot-pool addressing of a cache whose experts come from `bank` (divisors stay in the bank). */
 [[nodiscard]] ExpertWeights expert_cache_weights(const ExpertCacheState& cache,
                                                  const ExpertWeights& bank);

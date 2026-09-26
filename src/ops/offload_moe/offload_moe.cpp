@@ -174,6 +174,15 @@ void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
     detail::expert_cache_stage_launch(cache, layer, resident, bank, staged, stream);
 }
 
+void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot,
+                          cudaStream_t stream) {
+    constexpr const char* op = "expert_cache_reclaim";
+    require(cache.slot_of != nullptr && cache.owner != nullptr && cache.stamp != nullptr, op,
+            "cache state is incomplete");
+    require(first_slot >= 0 && first_slot < cache.slots, op, "first slot is outside the cache");
+    detail::expert_cache_reclaim_launch(cache, first_slot, stream);
+}
+
 ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
     ExpertWeights out             = bank;
     const std::int64_t offsets[4] = {

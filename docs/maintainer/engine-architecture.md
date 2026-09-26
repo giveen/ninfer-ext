@@ -56,7 +56,9 @@ inactive cache 的保留而丢失完成能力。
 可被设备直接读取），n-gram 表以 `HostFile` 映射。Model 只持有这些不可变数据；PLE 卷积历史与
 每轮 host gather 的 PLE 输入属于 Program。routed expert 如何到达设备由 Program 拥有的
 `Qwen4ExpertPager`（`execution/qwen4_expert_pager.h`）唯一负责：它持有 device expert cache
-（slot pool、LRU 状态）和两个 staged layer bank 及其 stream/event。窄调用走 cache 路线
+（slot pool、LRU 状态）和两个 staged layer bank 及其 stream/event。两个 bank 覆盖 slot pool 末尾的
+1024 个 slot：cache 路线在 staged forward 之间把它们当作普通 slot 使用，每个 staged forward 的第一次
+调用先在主 stream 上回收（evict）这些 slot，再让所有填充等待回收完成。窄调用走 cache 路线
 （resolve 后从 Host 复制 miss）；不少于 `kQwen4StagedColumns` 列的调用走 staged 路线（整层
 双缓冲，下一层的填充与本层计算重叠，staged 调用不改变 cache）。多个 lane 的 staged prefill
 chunk 共用同一对 bank：bank 内容只是某层的权重，与 lane 无关，pager 跨 forward 记录每个 bank

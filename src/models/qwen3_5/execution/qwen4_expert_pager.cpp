@@ -7,15 +7,17 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::byte* staged_banks,
+Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache,
                                    std::int32_t staged_columns)
     : cache_(cache), staged_columns_(staged_columns) {
-    if (cache_.slots < ops::kOffloadMoeTopK) {
-        throw std::logic_error("expert cache holds fewer slots than one column");
+    // Every slot the banks do not overlay must still hold one call's assignments.
+    if (cache_.slots < kBankSlots + ops::kOffloadMoeTopK) {
+        throw std::logic_error("expert cache is too small to overlay the staged banks");
     }
-    if (staged_banks == nullptr) { return; }
-    banks_[0] = staged_banks;
-    banks_[1] = staged_banks + kStagedBankBytes;
+    static_assert(kStagedBankBytes % 256 == 0, "staged banks must stay 256-byte aligned");
+    bank_slot_ = cache_.slots - kBankSlots;
+    banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * ops::kExpertSlotBytes;
+    banks_[1]  = banks_[0] + kStagedBankBytes;
     CUDA_CHECK(cudaMallocHost(&resident_, static_cast<std::size_t>(cache_.layers) *
                                               ops::kOffloadMoeExperts * sizeof(std::int32_t)));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
@@ -23,6 +25,7 @@ Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::byte
         CUDA_CHECK(cudaEventCreateWithFlags(&ready_[b], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&released_[b], cudaEventDisableTiming));
     }
+    CUDA_CHECK(cudaEventCreateWithFlags(&reclaimed_, cudaEventDisableTiming));
 }
 
 Qwen4ExpertPager::~Qwen4ExpertPager() {
@@ -32,6 +35,7 @@ Qwen4ExpertPager::~Qwen4ExpertPager() {
         if (ready_[b] != nullptr) { (void)cudaEventDestroy(ready_[b]); }
         if (released_[b] != nullptr) { (void)cudaEventDestroy(released_[b]); }
     }
+    if (reclaimed_ != nullptr) { (void)cudaEventDestroy(reclaimed_); }
     if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
     if (resident_ != nullptr) { (void)cudaFreeHost(resident_); }
 }
@@ -128,10 +132,18 @@ ops::ExpertWeights Qwen4ExpertPager::acquire_staged(std::int32_t layer,
                                                     const ops::ExpertWeights& bank,
                                                     std::int32_t next_layer,
                                                     const ops::ExpertWeights* next_bank,
-                                                    cudaStream_t stream) {
-    if (banks_[0] == nullptr) { throw std::logic_error("Qwen4Exp pager has no staged route"); }
-    // A forward's first staged call fills its own layer; later layers were prefetched.
+                                                    bool forward_start, cudaStream_t stream) {
     const int b = layer & 1;
+    if (forward_start) {
+        // Cache-route calls since the last staged forward may have placed experts in the bank
+        // slots (and still read or write them earlier on `stream`). Evict them after that work,
+        // and hold every fill of this forward behind the eviction.
+        ops::expert_cache_reclaim(cache_, bank_slot_, stream);
+        CUDA_CHECK(cudaEventRecord(reclaimed_, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream_, reclaimed_));
+        layer_[0] = layer_[1] = -1;
+    }
+    // A forward's first staged call fills its own layer; later layers were prefetched.
     if (layer_[b] != layer) { snapshot_residency(stream); }
     fill(layer, bank);
     if (next_bank != nullptr) { fill(next_layer, *next_bank); }

@@ -158,7 +158,8 @@ ninfer-ext runs it through the same Engine, CLI, and HTTP server as every other 
   after the KV floor.
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
   a double-buffered staging bank. Experts already in the cache are copied device-to-device
-  instead. Staged experts run on a W4A4 tensor-core route. The prefill chunk defaults to 4,096
+  instead. Staged experts run on a W4A4 tensor-core route. Between long chunks the staging banks
+  serve as 1024 more cache slots. The prefill chunk defaults to 4,096
   tokens for this model.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed
   from NVMe with batched direct I/O (`--ngram-residency`).
@@ -240,6 +241,9 @@ single-request decode and about 350 tok/s prefill on a 3k-token prompt. The main
 - a fixed-grid expert fetch. Profiling showed the per-miss grid falling to 20–28 GB/s over PCIe; a
   fixed 64-CTA grid holds about 36 GB/s. That raised serve throughput 13% at C=1, 24% at C=4 and 37%
   at C=8.
+- the prefill staging banks double as expert-cache slots between long chunks (1024 more slots).
+  Serve decode-saturation rose 6% at C=1, 16% at C=4 and 22% at C=8 (82.7 → 87.7, 134.8 → 156.2,
+  133.8 → 162.8 tok/s, bf16 KV, no speculation).
 
 ## Performance
 

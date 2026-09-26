@@ -283,11 +283,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(owner.data, 0xFF, owner.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
-        qwen4_experts.emplace(
-            cache,
-            layout.staged_bank ? static_cast<std::byte*>(layout.staged_bank->bind(backing).data)
-                               : nullptr,
-            kQwen4StagedColumns);
+        static_assert(execution::Qwen4ExpertPager::kBankSlots == kQwen4StagedBankSlots,
+                      "the planned pool tail must be exactly the pager's bank slots");
+        qwen4_experts.emplace(cache, kQwen4StagedColumns);
         runtime.experts = &*qwen4_experts;
         const auto& config = parameters.model.config().text;
         if (config.ple) {

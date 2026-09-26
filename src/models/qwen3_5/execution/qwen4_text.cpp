@@ -418,9 +418,13 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         // layer's fill starts now and overlaps this layer's compute.
         const auto next = static_cast<std::size_t>(cache_layer) + 1;
         const bool has_next = next < qwen4_->layers.size();
+        // Layer 0 starts a main forward; the MTP block (cache layer past the main layers) runs as
+        // its own forward. Either may follow cache-route calls that used the bank slots.
+        const bool forward_start =
+            cache_layer == 0 || static_cast<std::size_t>(cache_layer) == qwen4_->layers.size();
         const ops::ExpertWeights staged = experts.acquire_staged(
             cache_layer, p.bank, static_cast<std::int32_t>(next),
-            has_next ? &qwen4_->layers[next].moe.bank : nullptr, s);
+            has_next ? &qwen4_->layers[next].moe.bank : nullptr, forward_start, s);
         if (p.bank.gate_up_input_divisor > 0.0F) {
             ops::moe_experts_a4(x, roots.ids, roots.weights, roots.shared_gate, roots.shared,
                                 staged, work_, y, s);

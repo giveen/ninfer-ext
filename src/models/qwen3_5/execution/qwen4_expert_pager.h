@@ -23,20 +23,27 @@ namespace ninfer::models::qwen3_5::execution {
  *   Experts the cache holds are copied device-to-device instead of from the Host. Staged calls do
  *   not change the cache.
  *
+ * The banks overlay the last `kBankSlots` slots of the cache pool (plus the pool's divisor tail).
+ * Cache-route calls use those slots like any other; the first staged call of each forward reclaims
+ * them (evicts what the cache placed there) before any fill writes a bank. No cache-route call runs
+ * inside a staged forward, so the banks stay intact until the forward ends. The reclaim is part of
+ * the stream work, so a captured staged forward replays it too.
+ *
  * The two routes differ numerically (the staged route may quantize activations), so the route
  * choice is fixed by `stages`. Within a route, placement never changes a result.
  *
- * Program-owned: the Program binds the cache state and banks from its persistent allocation and
- * keeps the pager alive while any execution that uses it is in flight. Not thread-safe; all calls
- * come from the Program's execution thread.
+ * Program-owned: the Program binds the cache state from its persistent allocation and keeps the
+ * pager alive while any execution that uses it is in flight. Not thread-safe; all calls come from
+ * the Program's execution thread.
  */
 class Qwen4ExpertPager {
 public:
     static constexpr std::size_t kStagedBankBytes = ops::kExpertStagedLayerBytes;
+    static constexpr std::int32_t kBankSlots      = 2 * ops::kOffloadMoeExperts;
 
-    // `staged_banks` holds two staged layers, or is null for a pager without a staged route.
-    Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::byte* staged_banks,
-                     std::int32_t staged_columns);
+    // `cache.pool` holds `cache.slots` slots followed by two layers' weight divisors; the last
+    // kBankSlots slots double as the banks.
+    Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::int32_t staged_columns);
     ~Qwen4ExpertPager();
 
     Qwen4ExpertPager(const Qwen4ExpertPager&)            = delete;
@@ -46,7 +53,7 @@ public:
 
     // True when a call of `columns` columns takes the staged route.
     [[nodiscard]] bool stages(std::int32_t columns) const noexcept {
-        return banks_[0] != nullptr && columns >= staged_columns_;
+        return columns >= staged_columns_;
     }
 
     /**
@@ -54,12 +61,13 @@ public:
      * the fill of `next_bank` (layer `next_layer`, or none when `next_bank` is null) into the other
      * bank, and makes `stream` wait until `layer` is ready. Returns the staged addressing. Every
      * acquire is paired with `release_staged` on the same stream after the layer's last reader.
+     * `forward_start` marks the first staged call of a forward: it reclaims the bank slots.
      */
     [[nodiscard]] ops::ExpertWeights acquire_staged(std::int32_t layer,
                                                     const ops::ExpertWeights& bank,
                                                     std::int32_t next_layer,
                                                     const ops::ExpertWeights* next_bank,
-                                                    cudaStream_t stream);
+                                                    bool forward_start, cudaStream_t stream);
     void release_staged(std::int32_t layer, cudaStream_t stream);
 
     // Cache route: the most columns one `resolve` accepts.
@@ -87,12 +95,15 @@ private:
     ops::ExpertCacheState cache_;
     std::int32_t staged_columns_ = 0;
 
-    // Staged route: bank b holds (or is being filled with) layer_[b]. A fill waits for
-    // `released_[b]` of the bank's previous reader and records `ready_[b]`.
+    // Staged route: bank b holds (or is being filled with) layer_[b] within the current staged
+    // forward. A fill waits for `released_[b]` of the bank's previous reader and records
+    // `ready_[b]`; the forward's first fill also waits for `reclaimed_`.
     std::byte* banks_[2]     = {};
+    std::int32_t bank_slot_  = 0; // first slot the banks overlay
     cudaStream_t stream_     = nullptr;
     cudaEvent_t ready_[2]    = {};
     cudaEvent_t released_[2] = {};
+    cudaEvent_t reclaimed_   = nullptr;
     std::int32_t layer_[2]   = {-1, -1};
     // Pinned Host snapshot of the cache's slot_of, taken before a forward's first fill. Fills skip
     // the Host copy of experts it marks resident; while `resident_valid_` is false (a captured

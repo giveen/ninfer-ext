@@ -383,6 +383,17 @@ __global__ void __launch_bounds__(256)
     }
 }
 
+__global__ void __launch_bounds__(256)
+    expert_cache_reclaim_kernel(ExpertCacheState cache, std::int32_t first_slot) {
+    for (int s = first_slot + static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+         s < cache.slots; s += static_cast<int>(gridDim.x * blockDim.x)) {
+        const int owner = cache.owner[s];
+        if (owner >= 0) { cache.slot_of[owner] = -1; }
+        cache.owner[s] = -1;
+        cache.stamp[s] = 0ULL;
+    }
+}
+
 // CTA (e, chunk) copies chunk `chunk` of each plane of expert e into the staged bank when the
 // snapshot marked e resident: from its slot if the device still holds it, else from the bank.
 __global__ void __launch_bounds__(256)
@@ -865,6 +876,13 @@ void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer
                                const ExpertWeights& staged, cudaStream_t stream) {
     expert_cache_stage_kernel<<<dim3(E, kFetchChunks), 256, 0, stream>>>(cache, layer, resident,
                                                                           bank, staged);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void expert_cache_reclaim_launch(const ExpertCacheState& cache, std::int32_t first_slot,
+                                 cudaStream_t stream) {
+    const int count = cache.slots - first_slot;
+    expert_cache_reclaim_kernel<<<(count + 255) / 256, 256, 0, stream>>>(cache, first_slot);
     CUDA_CHECK(cudaGetLastError());
 }
 
