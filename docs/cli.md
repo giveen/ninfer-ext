@@ -291,7 +291,9 @@ table file-mapped, so the host needs roughly 128 GB of RAM. `--expert-cache` siz
 cache that routed experts are fetched into. `auto` first reserves the KV floor (the explicit
 `--kv-capacity`, or one `--max-context` when the capacity is `auto`), then gives the rest of the
 free device memory, less 1 GiB of headroom, to the cache, up to every expert. An explicit MiB
-value must hold one verify round (10 experts per decoded column). Qwen4Exp supports the `bf16`
+value must hold one verify round (10 experts per decoded column). The two prefill staging banks
+(two whole expert layers, about 2.6 GiB) also serve as cache slots between long prefill chunks, so
+the decode cache holds 1024 experts more than `--expert-cache` sizes. Qwen4Exp supports the `bf16`
 and `fp8` KV types and `--spec mtp`.
 
 The 51 GB n-gram table is never loaded. `--ngram-residency mapped` faults its rows through the

@@ -390,6 +390,53 @@ std::vector<int> expert_range(int first, int count) {
     return v;
 }
 
+// Reclaiming the slot tail evicts exactly the experts held there; the rest stay resident, and the
+// reclaimed slots are reused by the next resolve.
+int reclaim_case(const HostBank& host, const DeviceBank& bank) {
+    int failures = 0;
+    DeviceCache cache(30, 2);
+    const auto a = expert_range(0, 10), b = expert_range(10, 10), c = expert_range(20, 10);
+    const std::vector<int> slots_a = resolve(cache, bank, 0, a);
+    const std::vector<int> slots_b = resolve(cache, bank, 0, b);
+    const std::vector<int> slots_c = resolve(cache, bank, 1, c);
+    constexpr std::int32_t kFirst  = 20;
+    ops::expert_cache_reclaim(cache.state, kFirst, nullptr);
+    cuda_synchronize();
+    const std::vector<int> table = cache.table();
+    const std::vector<int> owner = from_device<int>(cache.owner, cache.state.slots);
+    const auto stamp = from_device<unsigned long long>(cache.stamp, cache.state.slots);
+    for (int s = kFirst; s < cache.state.slots; ++s) {
+        if (owner[s] != -1 || stamp[s] != 0) {
+            std::cerr << "expert cache reclaim: slot " << s << " still owned or stamped\n";
+            return failures + 1;
+        }
+    }
+    const auto check_layer = [&](std::int32_t layer, const std::vector<int>& experts,
+                                 const std::vector<int>& slots) {
+        std::vector<int> kept_experts, kept_slots;
+        for (std::size_t i = 0; i < experts.size(); ++i) {
+            const int entry = table[layer * E + experts[i]];
+            if (slots[i] >= kFirst ? entry != -1 : entry != slots[i]) {
+                std::cerr << "expert cache reclaim: expert " << experts[i] << " of layer " << layer
+                          << " maps to " << entry << " (was " << slots[i] << ")\n";
+                return 1;
+            }
+            if (slots[i] < kFirst) {
+                kept_experts.push_back(experts[i]);
+                kept_slots.push_back(slots[i]);
+            }
+        }
+        return kept_experts.empty() ? 0
+                                    : check_residency("expert cache reclaim keeps", cache, host,
+                                                      layer, kept_experts, kept_slots);
+    };
+    failures += check_layer(0, a, slots_a) + check_layer(0, b, slots_b) + check_layer(1, c, slots_c);
+    failures +=
+        check_residency("expert cache refill after reclaim", cache, host, 1, c,
+                        resolve(cache, bank, 1, c));
+    return failures;
+}
+
 int cache_case(const HostBank& host, const DeviceBank& bank) {
     int failures = 0;
     DeviceCache cache(20, 2);
@@ -755,6 +802,7 @@ int main() {
     const DeviceBank bank = upload(host);
     failures += share_padding_case();
     failures += cache_case(host, bank);
+    failures += reclaim_case(host, bank);
     failures += stage_case(host, bank);
     // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
     for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {

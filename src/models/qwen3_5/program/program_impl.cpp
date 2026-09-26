@@ -270,25 +270,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         Tensor owner     = layout.owner.bind(backing);
         Tensor stamp     = layout.stamp.bind(backing);
         Tensor counters  = layout.counters.bind(backing);
-        runtime.cache    = ops::ExpertCacheState{
-               .slot_of    = static_cast<std::int32_t*>(slot_of.data),
-               .owner      = static_cast<std::int32_t*>(owner.data),
-               .stamp      = static_cast<unsigned long long*>(stamp.data),
-               .clock      = static_cast<unsigned long long*>(counters.data),
-               .statistics = static_cast<unsigned long long*>(counters.data) + 1,
-               .slots      = layout.slots,
-               .layers     = layout.cache_layers,
-               .pool       = static_cast<std::byte*>(layout.pool.bind(backing).data)};
+        const ops::ExpertCacheState cache{
+            .slot_of    = static_cast<std::int32_t*>(slot_of.data),
+            .owner      = static_cast<std::int32_t*>(owner.data),
+            .stamp      = static_cast<unsigned long long*>(stamp.data),
+            .clock      = static_cast<unsigned long long*>(counters.data),
+            .statistics = static_cast<unsigned long long*>(counters.data) + 1,
+            .slots      = layout.slots,
+            .layers     = layout.cache_layers,
+            .pool       = static_cast<std::byte*>(layout.pool.bind(backing).data)};
         CUDA_CHECK(cudaMemsetAsync(slot_of.data, 0xFF, slot_of.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(owner.data, 0xFF, owner.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
-        if (layout.staged_bank) {
-            qwen4_staging.emplace(static_cast<std::byte*>(layout.staged_bank->bind(backing).data),
-                                  static_cast<std::size_t>(slot_of.numel()));
-            runtime.staging        = &*qwen4_staging;
-            runtime.staged_columns = kQwen4StagedColumns;
-        }
+        static_assert(execution::Qwen4ExpertPager::kBankSlots == kQwen4StagedBankSlots,
+                      "the planned pool tail must be exactly the pager's bank slots");
+        qwen4_experts.emplace(cache, kQwen4StagedColumns);
+        runtime.experts = &*qwen4_experts;
         const auto& config = parameters.model.config().text;
         if (config.ple) {
             const auto& block = parameters.qwen4->layers.at(config.ple->layer);
@@ -574,9 +572,9 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.prefill_chunk      = prefill_chunk;
     out.idle_prefill_chunk = prefill_width;
     if (qwen4_runtime) {
-        out.expert_cache_slots = static_cast<std::uint32_t>(qwen4_runtime->cache.slots);
-        out.expert_cache_bytes =
-            static_cast<std::size_t>(qwen4_runtime->cache.slots) * ops::kExpertSlotBytes;
+        const std::int32_t slots = qwen4_experts->cache().slots;
+        out.expert_cache_slots   = static_cast<std::uint32_t>(slots);
+        out.expert_cache_bytes   = static_cast<std::size_t>(slots) * ops::kExpertSlotBytes;
         if (ple_gather) {
             out.ngram_residency =
                 ple_gather->streamed() ? NgramResidency::Stream : NgramResidency::Mapped;

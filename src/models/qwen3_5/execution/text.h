@@ -68,42 +68,12 @@ struct DFlashFeatureSink {
 class VisionPrefillSession;
 class PleGather;
 
-// Double-buffered whole-layer expert staging for wide Qwen4Exp calls. Each bank holds one full
-// routed-expert layer (bank plane layout, then its weight divisors). While one bank feeds a layer,
-// `stream` fills the other with the next layer: a fill waits for `released` of the bank's previous
-// reader, and a reader waits for `ready`. `layer[b]` is the layer bank b holds or is being filled
-// with, so a bank that already holds a layer is not copied again. Program-owned.
-class Qwen4Staging {
-public:
-    static constexpr std::size_t kBankBytes = ops::kExpertStagedLayerBytes;
+class Qwen4ExpertPager;
 
-    // `cache_entries` is the size of the expert cache's slot_of map.
-    Qwen4Staging(std::byte* banks, std::size_t cache_entries);
-    ~Qwen4Staging();
-
-    Qwen4Staging(const Qwen4Staging&)            = delete;
-    Qwen4Staging& operator=(const Qwen4Staging&) = delete;
-
-    std::byte* bank[2]      = {};
-    cudaStream_t stream     = nullptr;
-    cudaEvent_t ready[2]    = {};
-    cudaEvent_t released[2] = {};
-    std::int32_t layer[2]   = {-1, -1};
-    // Pinned host snapshot of the cache's slot_of, taken before a forward's first fill. Fills
-    // skip the host copy of experts it marks resident; while `resident_valid` is false they copy
-    // every expert.
-    std::int32_t* resident = nullptr;
-    bool resident_valid    = false;
-};
-
-// Program-owned mutable resources of the Qwen4Exp route. The expert cache and PLE state are
+// Program-owned mutable resources of the Qwen4Exp route. The expert pager and PLE state are
 // performance or recurrent side state; the Program allocates them once and binds them here.
 struct Qwen4Runtime {
-    ops::ExpertCacheState cache;
-    // Whole-layer staging for wide calls, or null.
-    Qwen4Staging* staging = nullptr;
-    // Columns at or above which a call streams whole layer banks instead of using the cache.
-    std::int32_t staged_columns = std::numeric_limits<std::int32_t>::max();
+    Qwen4ExpertPager* experts = nullptr;
     Tensor ple_states; // BF16 [history * residual, StateImage slots]
     Tensor ple_record; // BF16 [residual, record_width, rows] speculative conv inputs, or empty
     Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch

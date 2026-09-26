@@ -18,6 +18,7 @@
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/ple_gather.h"
+#include "models/qwen3_5/execution/qwen4_expert_pager.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -654,7 +655,7 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
-    std::optional<execution::Qwen4Staging> qwen4_staging;
+    std::optional<execution::Qwen4ExpertPager> qwen4_experts;
     std::optional<execution::Qwen4Runtime> qwen4_runtime;
     std::unique_ptr<execution::PleGather> ple_gather;
     std::optional<PinnedHostBuffer> ple_host;

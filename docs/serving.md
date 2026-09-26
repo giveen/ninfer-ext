@@ -1069,9 +1069,10 @@ resolves once at startup.
 
 Qwen4Exp (Qwen3.8-Flash-Next) routed experts stay in pinned Host memory. Each MoE layer resolves
 its selected experts against a least-recently-used device cache inside the decode Graph and copies
-misses over PCIe; long prefill chunks stream whole layers instead. `--expert-cache` sizes that
-cache after the KV floor is planned, and `server_start.engine` records `expert_cache_slots` and
-`expert_cache_bytes`. The n-gram table is either page-cache mapped or streamed from NVMe with
+misses over PCIe; long prefill chunks stream whole layers instead, through two staging banks that
+serve as 1024 further cache slots between those chunks. `--expert-cache` sizes the cache after the
+KV floor is planned, and `server_start.engine` records `expert_cache_slots` and
+`expert_cache_bytes`, both including the staging banks' slots. The n-gram table is either page-cache mapped or streamed from NVMe with
 batched direct I/O (`--ngram-residency`, see the [CLI guide](cli.md)); `server_start.engine`
 records the resolved `ngram_residency`. Two concurrent 229,376-token requests with FP8 KV:
 

@@ -10,6 +10,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
+#include "ninfer/ops/offload_moe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,8 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // job sort holds 1024 assignments) while routing already touches most of each layer's experts:
 // cold on the RTX 5090, 60 tokens take 1.2 s cached vs 1.6 s staged, 111 take 2.0 s vs 1.6 s.
 inline constexpr std::int32_t kQwen4StagedColumns = 103;
+// Expert-cache slots that also hold the two staged layer banks (two whole routed layers).
+inline constexpr std::int32_t kQwen4StagedBankSlots = 2 * ops::kOffloadMoeExperts;
 // Default text-prefill chunks when EngineOptions leaves them open. A prefill step runs the idle
 // width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
 // chunk lifts prefill 2-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
@@ -52,8 +55,10 @@ struct Qwen4PersistentLayout {
     TensorLayout owner;    // I32 [slots]
     TensorLayout stamp;    // I64 [slots]
     TensorLayout counters; // I64 [3]: clock, hits, misses
-    LayoutRegion pool;     // slots * kExpertSlotBytes
-    std::optional<LayoutRegion> staged_bank;
+    // slots * kExpertSlotBytes, plus the divisor tails of two staged layers. The last
+    // kQwen4StagedBankSlots slots double as the two staged layer banks: staged forwards reclaim
+    // them, cache-route calls use them as ordinary slots in between.
+    LayoutRegion pool;
     std::optional<TensorLayout> ple_record; // BF16 [residual, draft_window + 1, max_concurrency]
     std::optional<TensorLayout> ple_input;  // BF16 [ple_width, (draft_window + 1) * max_concurrency]
     std::int32_t slots        = 0;

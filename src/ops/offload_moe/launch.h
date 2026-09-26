@@ -76,6 +76,8 @@ void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer
                                const std::int32_t* resident, const ExpertWeights& bank,
                                const ExpertWeights& staged, cudaStream_t stream);
 
+void expert_cache_reclaim_launch(const ExpertCacheState& cache, std::int32_t first_slot,
+                                 cudaStream_t stream);
 void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
                                std::int32_t max_misses, const ExpertCacheState& cache,
                                cudaStream_t stream);

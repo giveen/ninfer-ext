@@ -179,7 +179,8 @@ Their distinct time boundaries and workload dispatch are defined in the
 [serving methodology](../../docs/performance/methodology.md#workloads-and-measurement-boundaries).
 Repeat `--concurrency` to select C points; each point starts a fresh server. The point report
 records the actual Engine configuration, automatic KV capacity, shuffle seed where applicable,
-dispatch method, and per-request positions.
+dispatch method, and per-request positions. Servers use int8 KV unless `--kv-dtype` selects
+another storage; Qwen4Exp artifacts need `--kv-dtype bf16` or `fp8`.
 
 Schema-v3 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
 `summary.md`. Corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
