@@ -37,26 +37,36 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-// T=1 keeps the split2 SIMT kernel: the K-split MMA route wastes most of a 32-column tile on a
-// single row, worth ~1% of ordinary (non-speculative) decode end to end on qwen3.8-27b/RTX 5090.
-// Speculative decode verifies at T>=2 and is unaffected. From T=2 the K-split
-// MMA route streams the weights once per 32-column tile and stays ahead of the 64-row GEMM tiles
-// through two column tiles (measured crossover: T=60 at K=6144, T=64 at K=17408); beyond that the
-// wide tiles amortize better.
-constexpr std::array<RouteSpec, 5> kK6144Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{2, 60}, Q5LinearAddScheduleId::KSplitMmaResidual},
-    {{61, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
-    {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
-    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
+constexpr std::array<RouteSpec, 13> kK6144Routes{{
+    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
+    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+    {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
+    {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
+    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
+    {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
+    {{65, 96}, Q5LinearAddScheduleId::MmaResidualR32T32K128},
+    {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
+    {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
+    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
+    {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};
 
-constexpr std::array<RouteSpec, 5> kK17408Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{2, 64}, Q5LinearAddScheduleId::KSplitMmaResidual},
-    {{65, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
-    {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
-    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
+constexpr std::array<RouteSpec, 13> kK17408Routes{{
+    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
+    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+    {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
+    {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
+    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
+    {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S1},
+    {{65, 96}, Q5LinearAddScheduleId::SlicedR32T32W4S1},
+    {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
+    {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
+    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
+    {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};
 
 template <std::size_t N>
@@ -83,13 +93,8 @@ bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     return false;
 }
 
-// The 128-wide MMA tile loads one row-block of weights per column tile, so a launch costs whole
-// waves of 4 column tiles (80 row-blocks x 4 = 320 blocks at 5120 rows): measured on this host a
-// 512-column launch costs ~456 us at k=17408 and a 513-column launch ~934 us, i.e. the trailing
-// mostly-empty tile is billed as a full wave. Send up to 192 columns of remainder - the whole
-// narrow band - to the narrow routes instead, which stay under that wave for every T in it. A
-// wider remainder keeps the single wide launch: its tail needs a 128-wide tile of its own, which
-// costs the wave the composite is trying to avoid.
+// Keep complete 512-token waves on the wide collective MMA route. A short
+// remainder uses the measured narrow schedules to avoid another mostly empty wave.
 constexpr std::int32_t kWaveCols       = 512;
 constexpr std::int32_t kNarrowTailCols = 192;
 
@@ -99,13 +104,13 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
     const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
     const std::int32_t tail = cols - wide;
     if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
+        q5_linear_add_mma_r64_t128_launch(x, w, residual_out, stream);
         return;
     }
 
     const Tensor x_wide = x.slice(1, 0, wide);
     Tensor out_wide     = residual_out.slice(1, 0, wide);
-    q5_linear_add_mma_r64_c128_launch(x_wide, w, out_wide, stream);
+    q5_linear_add_mma_r64_t128_launch(x_wide, w, out_wide, stream);
 
     const Tensor x_tail = x.slice(1, wide, tail);
     Tensor out_tail     = residual_out.slice(1, wide, tail);
@@ -120,16 +125,30 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     switch (schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::KSplitMmaResidual:
-        return "linear_add.q5.mma.ksplit.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
-        return "linear_add.q5.mma.r64.c32.s3.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
-        return "linear_add.q5.mma.r64.c32.s4.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C128:
-        return "linear_add.q5.mma.r64.c128.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C128Tail:
-        return "linear_add.q5.mma.r64.c128.cta_collective_residual.narrow_tail";
+    case Q5LinearAddScheduleId::SlicedR16T8W4S2:
+        return "linear_add.q5.sliced.r16.t8.w4.s2.residual";
+    case Q5LinearAddScheduleId::SlicedR16T16W4S2:
+        return "linear_add.q5.sliced.r16.t16.w4.s2.residual";
+    case Q5LinearAddScheduleId::SlicedR16T24W4S2:
+        return "linear_add.q5.sliced.r16.t24.w4.s2.residual";
+    case Q5LinearAddScheduleId::SlicedR32T32W4S2:
+        return "linear_add.q5.sliced.r32.t32.w4.s2.residual";
+    case Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise:
+        return "linear_add.q5.sliced.r32.t24.w4.s2.pairwise.residual";
+    case Q5LinearAddScheduleId::SlicedR32T32W4S1:
+        return "linear_add.q5.sliced.r32.t32.w4.s1.residual";
+    case Q5LinearAddScheduleId::SlicedR32T32W2S2:
+        return "linear_add.q5.sliced.r32.t32.w2.s2.residual";
+    case Q5LinearAddScheduleId::SlicedR32T64W2S1:
+        return "linear_add.q5.sliced.r32.t64.w2.s1.residual";
+    case Q5LinearAddScheduleId::MmaResidualR32T32K128:
+        return "linear_add.q5.mma.r32.t32.k128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR32T128:
+        return "linear_add.q5.mma.r32.t128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T128:
+        return "linear_add.q5.mma.r64.t128.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
+        return "linear_add.q5.mma.r64.t128.cta_collective_residual.narrow_tail";
     }
     return "linear_add.q5.unknown";
 }
@@ -177,19 +196,40 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::KSplitMmaResidual:
-        q5_linear_add_ksplit_mma_residual_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SlicedR16T8W4S2:
+        q5_linear_add_sliced_r16_t8_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
-        q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SlicedR16T16W4S2:
+        q5_linear_add_sliced_r16_t16_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
-        q5_linear_add_mma_r64_c32_s4_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SlicedR16T24W4S2:
+        q5_linear_add_sliced_r16_t24_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C128:
-        q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SlicedR32T32W4S2:
+        q5_linear_add_sliced_r32_t32_w4_s2_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C128Tail:
+    case Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise:
+        q5_linear_add_sliced_r32_t24_pairwise_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::SlicedR32T32W4S1:
+        q5_linear_add_sliced_r32_t32_w4_s1_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::SlicedR32T32W2S2:
+        q5_linear_add_sliced_r32_t32_w2_s2_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::SlicedR32T64W2S1:
+        q5_linear_add_sliced_r32_t64_w2_s1_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR32T32K128:
+        q5_linear_add_mma_r32_t32_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR32T128:
+        q5_linear_add_mma_r32_t128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T128:
+        q5_linear_add_mma_r64_t128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
         launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
         return;
     }

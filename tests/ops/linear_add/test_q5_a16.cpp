@@ -10,21 +10,24 @@ using ninfer::test::linear_add::ShapeCase;
 using ninfer::test::linear_add::WeightFormat;
 
 int q5_a16_conformance() {
-    // Cover the k-split capacity tiles, the wide-route crossover, and the narrow-tail composite.
-    constexpr std::array<std::int32_t, 15> kInteriors{1, 2, 3, 8, 24, 40, 56, 64,
-                                                      96, 128, 129, 256, 640, 768, 1024};
-    constexpr std::array<std::int32_t, 7> kK6144RouteStarts{9, 17, 25, 33, 61, 193, 513};
-    constexpr std::array<std::int32_t, 6> kK6144GraphTokens{513, 526, 545, 561, 705, 1025};
-
+    // Exercise the production transitions, including the same transitions in
+    // a composite tail and the 192-token limit on that tail.
+    constexpr std::array<std::int32_t, 13> starts{5,  9,   17,  25,  33,  49, 65,
+                                                  97, 129, 161, 193, 257, 513};
+    constexpr std::array<std::int32_t, 13> interiors{1,  2,   3,   7,   13,  20,  40,
+                                                     80, 112, 144, 224, 768, 1024};
+    constexpr std::array<std::int32_t, 9> graphs{13, 40, 80, 112, 192, 513, 545, 609, 705};
+    constexpr std::array<std::int32_t, 0> no_starts{};
+    constexpr std::array<std::int32_t, 7> full{8, 13, 32, 40, 80, 112, 192};
     int failures = 0;
-    failures += ninfer::test::linear_add::run_shape(
-        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
-        ShapeCase{5120, 6144, 401U, kK6144RouteStarts, kInteriors, kK6144GraphTokens, false, 512});
-    constexpr std::array<std::int32_t, 7> kK17408RouteStarts{9, 17, 25, 33, 65, 193, 513};
-    constexpr std::array<std::int32_t, 6> kK17408GraphTokens{513, 529, 545, 561, 705, 1025};
-    failures += ninfer::test::linear_add::run_shape(
-        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
-        ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kInteriors, kK17408GraphTokens, false, 512});
+    for (const auto k : {6144, 17408}) {
+        failures += ninfer::test::linear_add::run_shape(
+            "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+            ShapeCase{5120, k, 401U, starts, interiors, graphs, false, 512});
+        failures += ninfer::test::linear_add::run_shape(
+            "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+            ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
+    }
     return failures;
 }
 
