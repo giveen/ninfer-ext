@@ -400,7 +400,10 @@ candidates:
 - omitted `prompt_cache_options` creates a default implicit candidate at the latest representable
   content boundary;
 - `mode:"implicit"` requests the same automatic candidate explicitly;
-- `mode:"explicit"` disables that implicit write for the request;
+- unless `mode:"explicit"` is set, the Engine also proposes its own stable-layer candidates after
+  all tools and after the leading System/Developer messages, so new conversations that share a
+  system prompt and tool set reuse that prefix. These candidates only take spare cache capacity;
+- `mode:"explicit"` disables the implicit write and the Engine candidates for the request;
 - `prompt_cache_breakpoint:{"mode":"explicit"}` on supported content creates an explicit
   candidate.
 

@@ -340,6 +340,13 @@ int test_tools() {
                               ninfer::PromptCacheMarkerLocation::MessageBoundary &&
                           mixed_prompt.context_cache.markers.back().after_message_count == 2,
                       "automatic caching stops after a complete assistant text/tool-call turn");
+    failures += check(mixed_prompt.context_cache.allow_engine_automatic_shared_prefixes,
+                      "default automatic caching lets the Engine add its stable-layer candidates");
+    Json explicit_only                    = mixed_assistant;
+    explicit_only["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    failures += check(
+        !prompt(parse(explicit_only).generation).context_cache.allow_engine_automatic_shared_prefixes,
+        "explicit prompt caching keeps Engine candidates out");
 
     const Json ordered = Json::parse(
         R"({"model":"qwen","messages":[{"role":"user","content":"probe"}],"tools":[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}}]})");
