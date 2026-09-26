@@ -53,9 +53,16 @@ inactive cache 的保留而丢失完成能力。
 `Qwen3_5MoeForCausalLM` 与 `Qwen4ExpForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
 
 `Qwen4ExpForCausalLM` 的 routed experts 由 loader 以 `HostPinned` 驻留（pinned Host，经 UVA
-可被设备直接读取），n-gram 表以 `HostFile` 映射。Model 只持有这些不可变数据；device expert
-cache（slot pool、LRU 状态、prefill layer bank）、PLE 卷积历史与每轮 host gather 的 PLE 输入
-都属于 Program。cache 命中与否不改变数值结果：routed 项按 k 顺序合并，与 slot 位置无关。
+可被设备直接读取），n-gram 表以 `HostFile` 映射。Model 只持有这些不可变数据；PLE 卷积历史与
+每轮 host gather 的 PLE 输入属于 Program。routed expert 如何到达设备由 Program 拥有的
+`Qwen4ExpertPager`（`execution/qwen4_expert_pager.h`）唯一负责：它持有 device expert cache
+（slot pool、LRU 状态）和两个 staged layer bank 及其 stream/event。窄调用走 cache 路线
+（resolve 后从 Host 复制 miss）；不少于 `kQwen4StagedColumns` 列的调用走 staged 路线（整层
+双缓冲，下一层的填充与本层计算重叠，staged 调用不改变 cache）。多个 lane 的 staged prefill
+chunk 共用同一对 bank：bank 内容只是某层的权重，与 lane 无关，pager 跨 forward 记录每个 bank
+持有的层，已持有的层不再复制。两条路线数值不同（staged 路线
+可把激活量化为 NVFP4），因此路线选择是数值边界；同一路线内 cache 命中与否不改变数值结果：
+routed 项按 k 顺序合并，与 slot 位置无关。
 `--expert-cache` 在启动时先规划 KV floor，再把剩余设备内存分给 cache。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。

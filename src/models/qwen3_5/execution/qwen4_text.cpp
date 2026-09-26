@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/qwen4_expert_pager.h"
 #include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -42,120 +43,7 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-Qwen4Staging::Qwen4Staging(std::byte* banks, std::size_t cache_entries)
-    : bank{banks, banks + kBankBytes} {
-    CUDA_CHECK(cudaMallocHost(&resident, cache_entries * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    for (int b = 0; b < 2; ++b) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ready[b], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&released[b], cudaEventDisableTiming));
-    }
-}
-
-Qwen4Staging::~Qwen4Staging() {
-    // A fill may still be in flight into Program-owned memory.
-    if (stream != nullptr) { (void)cudaStreamSynchronize(stream); }
-    for (int b = 0; b < 2; ++b) {
-        if (ready[b] != nullptr) { (void)cudaEventDestroy(ready[b]); }
-        if (released[b] != nullptr) { (void)cudaEventDestroy(released[b]); }
-    }
-    if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
-    if (resident != nullptr) { (void)cudaFreeHost(resident); }
-}
-
 namespace {
-
-// Staged-bank addressing of `source`: its four planes back to back, then its weight divisors.
-ops::ExpertWeights staged_expert_weights(std::byte* bank, const ops::ExpertWeights& source) {
-    ops::ExpertWeights staged = source;
-    std::byte* cursor         = bank;
-    for (int plane = 0; plane < 4; ++plane) {
-        staged.base[plane] = cursor;
-        cursor += static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts;
-    }
-    auto* divisors          = reinterpret_cast<float*>(cursor);
-    staged.gate_up_divisors = divisors;
-    staged.down_divisors    = divisors + 2 * ops::kOffloadMoeExperts;
-    return staged;
-}
-
-// Snapshot the expert cache's residency for the fills of this forward. Staged calls leave the
-// cache untouched, so the snapshot stays exact until a cache-route call; a stale one only costs
-// bandwidth (expert_cache_stage re-checks the device state). Capture cannot synchronize, so a
-// captured forward copies every expert.
-void qwen4_snapshot_residency(Qwen4Staging& staging, const ops::ExpertCacheState& cache,
-                              cudaStream_t stream) {
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-    staging.resident_valid = false;
-    if (capture != cudaStreamCaptureStatusNone) { return; }
-    // Earlier fills may still read the previous snapshot.
-    CUDA_CHECK(cudaStreamSynchronize(staging.stream));
-    CUDA_CHECK(cudaMemcpyAsync(staging.resident, cache.slot_of,
-                               static_cast<std::size_t>(cache.layers) * ops::kOffloadMoeExperts *
-                                   sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    staging.resident_valid = true;
-}
-
-// Fill staging bank layer&1 with `layer` unless it already holds it. The fill waits until the
-// bank's previous reader has released it and marks the bank ready when done. With a residency
-// snapshot, host copies cover only the runs of uncached experts and the cached ones come from
-// their device slots.
-void qwen4_stage(Qwen4Staging& staging, std::int32_t layer, const ops::ExpertWeights& source,
-                 const ops::ExpertCacheState& cache) {
-    const int b = layer & 1;
-    if (staging.layer[b] == layer) { return; }
-    CUDA_CHECK(cudaStreamWaitEvent(staging.stream, staging.released[b]));
-    const ops::ExpertWeights staged = staged_expert_weights(staging.bank[b], source);
-    const std::int32_t* resident =
-        staging.resident_valid
-            ? staging.resident + static_cast<std::ptrdiff_t>(layer) * ops::kOffloadMoeExperts
-            : nullptr;
-    if (resident != nullptr) {
-        ops::expert_cache_stage(cache, layer, staging.resident, source, staged, staging.stream);
-    }
-    for (int plane = 0; plane < 4; ++plane) {
-        const auto stride = static_cast<std::size_t>(source.stride[plane]);
-        auto* target      = const_cast<std::byte*>(staged.base[plane]);
-        for (int first = 0; first < ops::kOffloadMoeExperts;) {
-            if (resident != nullptr && resident[first] >= 0) {
-                ++first;
-                continue;
-            }
-            int last = first + 1;
-            while (last < ops::kOffloadMoeExperts && (resident == nullptr || resident[last] < 0)) {
-                ++last;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(target + first * stride, source.base[plane] + first * stride,
-                                       (last - first) * stride, cudaMemcpyDefault,
-                                       staging.stream));
-            first = last;
-        }
-    }
-    // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
-    // one per bank (the MTP layer's banks).
-    const auto divisors = [](std::int64_t rows, std::int32_t divisor_rows, std::int64_t room) {
-        if (divisor_rows <= 0 || rows % divisor_rows != 0 || rows / divisor_rows > room) {
-            throw std::logic_error("Qwen4Exp staged bank cannot hold the layer's weight divisors");
-        }
-        return static_cast<std::size_t>(rows / divisor_rows) * sizeof(float);
-    };
-    constexpr std::int64_t kGateUpRows =
-        std::int64_t(ops::kOffloadMoeExperts) * 2 * ops::kOffloadMoeIntermediate;
-    constexpr std::int64_t kDownRows = std::int64_t(ops::kOffloadMoeExperts) * ops::kOffloadMoeHidden;
-    CUDA_CHECK(cudaMemcpyAsync(
-        const_cast<float*>(staged.gate_up_divisors), source.gate_up_divisors,
-        divisors(kGateUpRows, source.gate_up_divisor_rows, 2 * ops::kOffloadMoeExperts),
-        cudaMemcpyDefault, staging.stream));
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.down_divisors), source.down_divisors,
-                               divisors(kDownRows, source.down_divisor_rows,
-                                        ops::kOffloadMoeExperts),
-                               cudaMemcpyDefault, staging.stream));
-    CUDA_CHECK(cudaEventRecord(staging.ready[b], staging.stream));
-    staging.layer[b] = layer;
-}
 
 // Copy rows [row0, row0 + rows) of a contiguous [R, T] matrix into a contiguous [rows, T] one.
 void copy_rows(const Tensor& source, std::int32_t row0, std::int32_t rows, Tensor& destination,
@@ -511,13 +399,12 @@ void TextContext::qwen4_ple(const PleParameters& p, const Tensor& embedding, Pha
 
 void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
                             std::int32_t cache_layer, Tensor& y) {
-    cudaStream_t s      = ctx_.stream;
-    const int T         = x.ne[1];
-    const auto& runtime = qwen4_runtime();
-    const auto& cache   = runtime.cache;
+    cudaStream_t s            = ctx_.stream;
+    const int T               = x.ne[1];
+    Qwen4ExpertPager& experts = *qwen4_runtime().experts;
 
     auto scope = work_.scope();
-    auto roots = workspace::qwen4_moe(work_, config_, T, cache.slots);
+    auto roots = workspace::qwen4_moe(work_, config_, T, experts.cache().slots);
     ops::moe_route(x, p.router, work_, roots.ids, roots.weights, roots.shared_gate, s);
     project(x, p.shared_gate_up, roots.shared_gate_up, work_, s);
     const std::int32_t width = roots.shared_gate_up.ne[0] / 2;
@@ -526,24 +413,14 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
                   roots.shared_gate_up.slice(0, width, width), shared_act, s);
     project(shared_act, p.shared_down, roots.shared, work_, s);
 
-    if (runtime.staging != nullptr && T >= runtime.staged_columns) {
-        // Stream whole layers: every expert sits at its own id in a staged bank. This layer's
-        // bank is normally already filled; the next main layer's fill starts now, behind the
-        // release of the bank it reuses, and overlaps this layer's compute.
-        Qwen4Staging& staging = *runtime.staging;
-        // A forward's first staged call fills its own layer; later layers were prefetched.
-        if (staging.layer[cache_layer & 1] != cache_layer) {
-            qwen4_snapshot_residency(staging, cache, s);
-        }
-        qwen4_stage(staging, cache_layer, p.bank, cache);
+    if (experts.stages(T)) {
+        // Stream whole layers: every expert sits at its own id in a staged bank. The next main
+        // layer's fill starts now and overlaps this layer's compute.
         const auto next = static_cast<std::size_t>(cache_layer) + 1;
-        if (next < qwen4_->layers.size()) {
-            qwen4_stage(staging, static_cast<std::int32_t>(next), qwen4_->layers[next].moe.bank,
-                        cache);
-        }
-        const int b = cache_layer & 1;
-        CUDA_CHECK(cudaStreamWaitEvent(s, staging.ready[b]));
-        const ops::ExpertWeights staged = staged_expert_weights(staging.bank[b], p.bank);
+        const bool has_next = next < qwen4_->layers.size();
+        const ops::ExpertWeights staged = experts.acquire_staged(
+            cache_layer, p.bank, static_cast<std::int32_t>(next),
+            has_next ? &qwen4_->layers[next].moe.bank : nullptr, s);
         if (p.bank.gate_up_input_divisor > 0.0F) {
             ops::moe_experts_a4(x, roots.ids, roots.weights, roots.shared_gate, roots.shared,
                                 staged, work_, y, s);
@@ -551,7 +428,7 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
             ops::moe_experts(x, roots.ids, roots.ids, roots.weights, roots.shared_gate,
                              roots.shared, staged, ops::kOffloadMoeExperts, work_, y, s);
         }
-        CUDA_CHECK(cudaEventRecord(staging.released[b], s));
+        experts.release_staged(cache_layer, s);
         return;
     }
 
@@ -563,22 +440,20 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
     }
 
     // Cache route in column groups the slot pool can hold at once.
-    const std::int32_t group = std::min(
-        {T, cache.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache.slots)});
-    if (group <= 0) { throw std::logic_error("expert cache holds fewer slots than one column"); }
-    const ops::ExpertWeights slots = ops::expert_cache_weights(cache, p.bank);
+    const std::int32_t group        = std::min(T, experts.max_resolve_columns());
+    const ops::ExpertWeights slots  = experts.slot_weights(p.bank);
+    const std::int32_t slot_count   = experts.cache().slots;
     for (std::int32_t begin = 0; begin < T; begin += group) {
         const std::int32_t count = std::min(group, T - begin);
         Tensor ids               = roots.ids.slice(1, begin, count);
         Tensor slot_ids          = roots.slot_ids.slice(1, begin, count);
         Tensor misses            = roots.misses.slice(0, 0, 2 * count * ops::kOffloadMoeTopK + 1);
-        ops::expert_cache_resolve(ids, cache_layer, cache, slot_ids, misses, s);
-        ops::expert_cache_fetch(p.bank, misses, count * ops::kOffloadMoeTopK, cache, s);
+        experts.resolve(ids, cache_layer, p.bank, slot_ids, misses, s);
         Tensor y_slice = y.slice(1, begin, count);
         ops::moe_experts(
             x.slice(1, begin, count), ids, slot_ids, roots.weights.slice(1, begin, count),
             roots.shared_gate.slice(0, begin, count), roots.shared.slice(1, begin, count), slots,
-            cache.slots, work_, y_slice, s);
+            slot_count, work_, y_slice, s);
     }
 }
 
