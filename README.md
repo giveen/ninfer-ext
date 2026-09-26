@@ -244,6 +244,10 @@ single-request decode and about 350 tok/s prefill on a 3k-token prompt. The main
 - the prefill staging banks double as expert-cache slots between long chunks (1024 more slots).
   Serve decode-saturation rose 6% at C=1, 16% at C=4 and 22% at C=8 (82.7 → 87.7, 134.8 → 156.2,
   133.8 → 162.8 tok/s, bf16 KV, no speculation).
+- decode expert GEMVs that reduce only a job's live tokens, with a four-lanes-per-row down
+  projection that issues its weight loads before the job lookup finishes. Serve decode-saturation
+  rose to 89.9 / 132.3 / 155.4 / 172.5 tok/s at C=1/2/4/8 (from 79.7 / 113.6 / 147.8 / 156.9 in the
+  same session); decode after a 2k prompt went 67.4 → 70.0 tok/s plain and 103.7 → 108.8 with MTP.
 
 ## Performance
 

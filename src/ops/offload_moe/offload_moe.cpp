@@ -222,6 +222,13 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
                 weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
             op, "expert divisors are required");
+    for (const int p : {0, 1, 2, 3}) {
+        // Code planes are read in 16-byte vectors, scale planes in adjacent pairs.
+        const std::int64_t alignment = p % 2 == 0 ? 16 : 2;
+        require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % alignment == 0 &&
+                    weights_source.stride[p] % alignment == 0,
+                op, "expert code planes must be 16-byte aligned and scale planes 2-byte aligned");
+    }
     require(columns <= moe_experts_max_columns(slots), op,
             "large token chunks require a staged bank indexed by expert id");
     const std::int32_t chunk = std::min(columns, kChunkColumns);

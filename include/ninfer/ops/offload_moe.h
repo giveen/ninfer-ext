@@ -155,8 +155,9 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * where e = expert of assignment (k,t) and `slot_ids [10,T]` locate it in `weights_source`
  * (a cache slot pool or a staged bank indexed by expert id; `slots` bounds those indices).
  * `expert_ids` supply the divisors. `shared` is the shared expert output BF16 `[2560,T]`; `y` is
- * BF16 `[2560,T]`. The oracle decodes each NVFP4 weight exactly and evaluates in FP64; routing
- * terms are summed in k order, so results do not depend on cache placement.
+ * BF16 `[2560,T]`. Code planes of `weights_source` are 16-byte aligned (base and stride), scale
+ * planes 2-byte aligned. The oracle decodes each NVFP4 weight exactly and evaluates in FP64;
+ * routing terms are summed in k order, so results do not depend on cache placement.
  */
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
