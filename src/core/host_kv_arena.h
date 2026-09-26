@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/kv_page_ref.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
@@ -235,6 +236,12 @@ public:
 
     [[nodiscard]] HostKVAllocationView writable_view(HostKVAllocation& allocation);
     [[nodiscard]] HostKVAllocationConstView view(const HostKVAllocation& allocation) const;
+
+    /** Arena base that block-table Host words are relative to; null for an empty arena. */
+    [[nodiscard]] const std::byte* base() const noexcept;
+    /** Block-table unit of page `page` of `allocation`, read in place by paged Ops (KVPageRef). */
+    [[nodiscard]] HostPageUnit page_unit(const HostKVAllocation& allocation,
+                                         std::uint32_t page) const;
 
 private:
     friend class HostKVAllocation;

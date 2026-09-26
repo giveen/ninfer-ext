@@ -596,6 +596,27 @@ HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) 
                                      &layouts_[descriptor.layout], descriptor.pages);
 }
 
+const std::byte* HostKVArena::base() const noexcept {
+    return backing_ ? static_cast<const std::byte*>(backing_->data()) : nullptr;
+}
+
+HostPageUnit HostKVArena::page_unit(const HostKVAllocation& allocation, std::uint32_t page) const {
+    if (!valid_handle(allocation.handle())) {
+        throw std::invalid_argument("Cannot address a stale Host KV allocation");
+    }
+    const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+    if (page >= descriptor.pages) {
+        throw std::out_of_range("Host KV page is outside its allocation");
+    }
+    const std::size_t offset =
+        descriptor.offset + static_cast<std::size_t>(page) * layouts_[descriptor.layout].page_stride;
+    if (offset % kHostKVPageUnitBytes != 0 ||
+        offset / kHostKVPageUnitBytes > kMaxHostPageUnit) {
+        throw std::logic_error("Host KV page is not addressable by a block-table word");
+    }
+    return HostPageUnit{static_cast<std::uint32_t>(offset / kHostKVPageUnitBytes)};
+}
+
 bool HostKVArena::valid_handle(HostKVAllocationHandle handle) const noexcept {
     if (handle.owner_ != this || handle.descriptor_ >= descriptors_.size()) { return false; }
     const Descriptor& descriptor = descriptors_[handle.descriptor_];

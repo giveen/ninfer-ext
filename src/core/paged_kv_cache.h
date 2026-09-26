@@ -247,6 +247,11 @@ public:
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    cudaStream_t stream = nullptr) const;
 
+    /** Block-table Device word of a live page of this pool. */
+    [[nodiscard]] KVPageRef page_ref(DeviceKVPageHandle handle) const {
+        return KVPageRef(DevicePageGroup{physical_index(handle)});
+    }
+
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
@@ -362,6 +367,10 @@ public:
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
+    /** Publishes Device or Host block-table words (KVPageRef); Device words must name pages of
+     *  this pool, Host words are resolved by the consumer's PagedKVHostPlanes. */
+    void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                 std::span<const KVPageRef> pages, cudaStream_t stream = nullptr);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream = nullptr);
 

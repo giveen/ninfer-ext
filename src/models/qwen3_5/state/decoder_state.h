@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/host_kv_arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/sparse_attention.h"
@@ -87,6 +88,11 @@ public:
     // Indexer-key plane of one layer over all execution table rows; requires has_qsa_index().
     [[nodiscard]] ops::QsaIndexPlane index_plane(std::uint32_t layer) const;
 
+    // KV streaming: layer views carry `arena`'s Host plane bases so execution rows may hold Host
+    // words (KVPageRef). Bind before any view is captured into a CUDA Graph; the arena outlives
+    // the cache and its base is stable for the Engine lifetime.
+    void bind_host_records(const HostKVArena& arena);
+
 private:
     [[nodiscard]] std::size_t layer_plane_stride() const noexcept {
         return layer_storage_.planes_per_layer() + (qsa_index_ ? 1U : 0U);
@@ -102,6 +108,8 @@ private:
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
     bool qsa_index_ = false;
+    const std::byte* host_base_ = nullptr;
+    HostKVPageLayout host_layout_;
 };
 
 struct DecoderStateLayout {

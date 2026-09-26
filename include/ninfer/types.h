@@ -215,6 +215,12 @@ struct EngineOptions {
     // of 4096, 2048 and 1024 whose workspace fits beside the requested KV capacity.
     std::optional<std::uint32_t> idle_prefill_chunk;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // KV streaming: each request keeps a bounded Device window of Main/MTP KV pages; older full
+    // pages move to the Host KV arena and attention reads them in place over PCIe. kv_capacity
+    // then sizes Device-resident KV only and may be far below max_context * max_concurrency.
+    // Requires Host KV capacity; unsupported with sparse attention and DFlash full-attention
+    // drafts.
+    bool kv_stream = false;
     ExpertCachePolicy expert_cache;
     NgramResidency ngram_residency = NgramResidency::Automatic;
     SpeculativeOptions speculative;

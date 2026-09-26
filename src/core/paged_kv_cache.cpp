@@ -808,6 +808,27 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
                     std::span<const std::int32_t>(shadow, page_leases.size()), stream);
 }
 
+void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_t logical_begin,
+                                   std::span<const KVPageRef> page_refs, cudaStream_t stream) {
+    if (!valid_handle(row_handle) || logical_begin > logical_page_capacity() ||
+        page_refs.size() > logical_page_capacity() - logical_begin) {
+        throw std::invalid_argument("Paged KV mapping publication is outside its execution row");
+    }
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
+                   static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() +
+                   logical_begin;
+    for (std::size_t index = 0; index < page_refs.size(); ++index) {
+        const KVPageRef ref = page_refs[index];
+        if (!ref.host() &&
+            static_cast<std::uint32_t>(ref.word()) >= pages_->capacity_pages()) {
+            throw std::invalid_argument("Paged KV execution mapping names a missing Device page");
+        }
+        shadow[index] = ref.word();
+    }
+    publish_indices(row_handle, logical_begin,
+                    std::span<const std::int32_t>(shadow, page_refs.size()), stream);
+}
+
 void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
                                             DeviceKVPageHandle page, std::uint32_t count,
                                             cudaStream_t stream) {

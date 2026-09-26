@@ -122,7 +122,33 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .head_dim      = layer_storage_.head_dim,
         .num_kv_heads  = kv_heads_,
         .storage       = layer_storage_.storage,
+        .host          = host_base_ == nullptr
+                             ? PagedKVHostPlanes{}
+                             : PagedKVHostPlanes{
+                                   .k       = host_base_ + host_layout_.planes[base].offset,
+                                   .v       = host_base_ + host_layout_.planes[base + 1].offset,
+                                   .k_scale = layer_storage_.key.has_scale()
+                                                  ? host_base_ +
+                                                        host_layout_.planes[k_scale_index].offset
+                                                  : nullptr,
+                                   .v_scale = layer_storage_.value.has_scale()
+                                                  ? host_base_ +
+                                                        host_layout_.planes[v_scale_index].offset
+                                                  : nullptr,
+                               },
     };
+}
+
+void PagedKVCache::bind_host_records(const HostKVArena& arena) {
+    const HostKVPageLayout* layout = arena.layout_for(pages_.geometry());
+    if (layout == nullptr || arena.base() == nullptr) {
+        throw std::invalid_argument("Paged KV streaming requires a Host arena for this pool");
+    }
+    if (pages_.geometry().device_plane_order != PagedKVPlaneOrder::PageMajor) {
+        throw std::invalid_argument("Paged KV streaming requires page-major Device planes");
+    }
+    host_layout_ = *layout;
+    host_base_   = arena.base();
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
@@ -136,6 +162,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .head_dim      = direct.head_dim,
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
+        .host          = direct.host,
     };
 }
 

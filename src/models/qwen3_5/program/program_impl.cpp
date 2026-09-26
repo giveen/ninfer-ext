@@ -47,7 +47,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
-      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      kv_storage(plan.kv_storage), kv_stream(plan.kv_stream), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -232,6 +232,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (extent_capacity != 0) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(
                 *host_kv_arena, static_cast<std::uint32_t>(extent_capacity));
+        }
+    }
+    if (kv_stream) {
+        if (!host_kv_arena || !host_kv_extents) {
+            throw std::invalid_argument(
+                "KV streaming requires Host KV capacity (--host-kv-mib or --host-cache-mib)");
+        }
+        // Views are captured into CUDA Graphs later; they must carry the Host plane bases now.
+        decoder->text_kv.bind_host_records(*host_kv_arena);
+        if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
+            backend->bind_host_records(*host_kv_arena);
         }
     }
 

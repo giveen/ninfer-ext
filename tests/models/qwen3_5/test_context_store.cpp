@@ -627,6 +627,109 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+// KV streaming: full members of an active address space move to Host replicas that paged Ops
+// read in place. The execution row carries their Host words, the Device leases return to the same
+// space's window, and growth reuses them.
+void test_kv_demotion(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 4,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 8, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, 16);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 1, 8);
+
+    const std::size_t page_bytes = host_layout.planes[0].page_payload_bytes;
+    const auto address           = addresses.create_active(4, 0);
+    expect(address.has_value(), "streaming KV address allocation");
+    addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    for (std::int32_t page = 0; page < 4; ++page) {
+        auto* data = static_cast<std::byte*>(physical_pages.plane(0).data) +
+                     static_cast<std::size_t>(page) * page_bytes;
+        CUDA_CHECK(cudaMemsetAsync(data, 0x10 + page, page_bytes, device.stream));
+    }
+    addresses.commit_frontier(*address, 250);
+    device.synchronize();
+
+    const std::array oldest{addresses.logical_page(*address, 0),
+                            addresses.logical_page(*address, 1)};
+    const std::array partial_tail{addresses.logical_page(*address, 3)};
+    expect(!extents.prepare(pages, oldest).has_value(),
+           "active writer pages are not ordinary retention sources");
+    expect(!extents.prepare(pages, partial_tail, true).has_value() &&
+               !pages.can_demote_active(partial_tail[0]),
+           "a partial tail page never leaves the Device");
+    auto copy = extents.prepare(pages, oldest, true);
+    expect(copy.has_value(), "full active members reserve a demotion extent");
+    physical_pages.copy_to_host(extents.device_sources(*copy), extents.writable_view(*copy),
+                                device.stream);
+    device.synchronize();
+    (void)extents.publish(std::move(*copy));
+    addresses.demote(*address, 0, 2, device.stream);
+    device.synchronize();
+
+    const auto words = read_block_table(physical_tables, 0, 4);
+    const ninfer::KVPageRef first  = pages.table_ref(oldest[0]);
+    const ninfer::KVPageRef second = pages.table_ref(oldest[1]);
+    expect(first.host() && second.host() && words[0] == first.word() &&
+               words[1] == second.word() && words[2] == 2 && words[3] == 3,
+           "demotion publishes Host words and leaves resident words unchanged");
+    const std::byte* host_base = host_arena.base();
+    bool bytes_match           = true;
+    for (std::size_t page = 0; page < 2; ++page) {
+        const std::byte* record =
+            host_base + (page == 0 ? first : second).host_offset_bytes() +
+            host_layout.planes[0].offset;
+        for (std::size_t byte = 0; byte < page_bytes; ++byte) {
+            bytes_match = bytes_match && record[byte] == std::byte(0x10 + page);
+        }
+    }
+    expect(bytes_match, "Host words address the demoted pages' payload in place");
+    expect(addresses.device_resident_pages(*address) == 2 && addresses.mapped_pages(*address) == 4 &&
+               addresses.entitlement(*address) == 6 && physical_pages.allocated_pages() == 2 &&
+               physical_pages.reserved_pages() == 2 && pages.writer_references(oldest[0]) == 0,
+           "demoted Device leases return to the address's own window");
+
+    addresses.ensure_mapped_to_tokens(*address, 384, device.stream);
+    device.synchronize();
+    const auto grown = read_block_table(physical_tables, 0, 6);
+    expect(addresses.mapped_pages(*address) == 6 && physical_pages.allocated_pages() == 4 &&
+               physical_pages.reserved_pages() == 0 && grown[0] == first.word() &&
+               grown[1] == second.word() && !ninfer::KVPageRef::from_word(grown[4]).host() &&
+               !ninfer::KVPageRef::from_word(grown[5]).host(),
+           "growth past the Device window reuses the demoted leases");
+    bool demote_rejected = false;
+    try {
+        addresses.demote(*address, 3, 1, device.stream);
+    } catch (const std::logic_error&) { demote_rejected = true; }
+    expect(demote_rejected, "demoting the partial writer tail is rejected");
+
+    addresses.deactivate(*address);
+    expect(addresses.release(*address) &&
+               extents.release_unreferenced() == 2 * host_layout.page_stride &&
+               pages.occupied() == 0 && physical_pages.allocated_pages() == 0 &&
+               physical_pages.reserved_pages() == 0 && host_arena.occupied_bytes() == 0,
+           "a streamed address space releases Device and Host ownership without leaks");
+}
+
 } // namespace
 
 int main() {
@@ -642,6 +745,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_demotion(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

@@ -253,9 +253,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
-    base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    // Streamed KV does not yet enter the context cache: retained checkpoints and restores assume
+    // Device-resident members (paged-kv §6.5).
+    const bool prefix_reuse              = options.allow_prefix_reuse && !kv_stream;
+    base->allow_prefix_reuse             = prefix_reuse;
     base->summary.publish_continuation =
-        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+        prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     // The lease covers a bounded window of the remaining output, not the whole client budget: a
     // client that asks for far more output than it uses would otherwise hold the cache out of the
     // pool for the request's whole life. The window is extended at a decode-round boundary, up to
@@ -276,6 +279,16 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             std::max(leased_output_tokens, draft_window + 1U);
         base->backend_kv_page_entitlement = kv_pages_for_tokens(
             std::min(capacity, base->summary.prompt_tokens + backend_window_tokens - 1U));
+    }
+    // A streaming request is admitted with at most its Device window; prefill and decode demote
+    // older pages to Host to cover the rest.
+    if (kv_stream) {
+        base->text_kv_page_entitlement =
+            std::min(base->text_kv_page_entitlement, kv_stream_window(*text_kv_pages));
+        if (backend_kv_pages) {
+            base->backend_kv_page_entitlement =
+                std::min(base->backend_kv_page_entitlement, kv_stream_window(*backend_kv_pages));
+        }
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -333,7 +346,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
-    if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
+    if (prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
                                      bool long_anchor, SharedCandidateEvidence evidence) {

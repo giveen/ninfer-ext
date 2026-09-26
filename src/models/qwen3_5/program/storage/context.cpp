@@ -1462,20 +1462,35 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
     const auto target = [](std::uint32_t cap, std::uint32_t pages, std::uint32_t wanted) {
         return std::min(cap, std::max(pages, wanted));
     };
+    // A streaming lease holds at most its Device window; coverage past it is paid in Host pages.
+    const auto stream_cap = [&](const LogicalKVPageStore& pages, const KVAddressSpaceStore& addresses,
+                                KVAddressSpaceHandle address) {
+        if (!kv_stream) { return std::numeric_limits<std::uint32_t>::max(); }
+        return kv_stream_window(pages) + addresses.mapped_pages(address) -
+               addresses.device_resident_pages(address);
+    };
+    const std::uint32_t text_stream_cap =
+        main_thin ? stream_cap(*text_kv_pages, *text_kv_addresses, sequence.kv->text)
+                  : std::numeric_limits<std::uint32_t>::max();
+    const std::uint32_t backend_stream_cap =
+        backend_thin ? stream_cap(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend)
+                     : std::numeric_limits<std::uint32_t>::max();
     const auto grow = [&](std::uint32_t extra_tokens) {
         // Only a thin lease grows: extending a whole one would ask its pool for space the other
         // lease needs, and one failed reservation settles both.
         const std::uint32_t text_target =
-            main_thin ? target(std::min(text_kv_pages->physical_pool().capacity_pages(),
-                                        text_kv_addresses->address_page_capacity()),
+            main_thin ? target(std::min({text_kv_pages->physical_pool().capacity_pages(),
+                                         text_kv_addresses->address_page_capacity(),
+                                         text_stream_cap}),
                                text_pages,
                                kv_lease_pages_for_tokens(
                                    std::min(request.lease_ceiling, main_tokens + extra_tokens)))
                       : text_pages;
         const std::uint32_t backend_target =
             sequence.kv->backend
-                ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
-                                  backend_kv_addresses->address_page_capacity()),
+                ? target(std::min({backend_kv_pages->physical_pool().capacity_pages(),
+                                   backend_kv_addresses->address_page_capacity(),
+                                   backend_stream_cap}),
                          backend_pages,
                          backend_thin ? kv_lease_pages_for_tokens(std::min(
                                             backend_ceiling, backend_tokens + extra_tokens))
@@ -1506,6 +1521,21 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
         ++rung;
     }
 
+    // A streaming lease at its Device window gains coverage by moving old full pages to Host.
+    if (kv_stream) {
+        const bool text_streamed =
+            !main_thin ||
+            stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text,
+                      std::min(kv_tokens_for_pages(kv_pages_for_tokens(main_tokens) + cushion),
+                               request.lease_ceiling));
+        const bool backend_streamed =
+            !backend_thin ||
+            stream_kv(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
+                      std::min(kv_tokens_for_pages(kv_pages_for_tokens(backend_tokens) + cushion),
+                               backend_ceiling));
+        if (text_streamed && backend_streamed) { return; }
+    }
+
     // The pool cannot extend this lease. The sequence settles where the lease still covers a
     // step, so no launch can fail coverage mid-round, and the request finishes at its output
     // limit well before the client's budget. Record why, so a premature finish is diagnosable.
@@ -1527,6 +1557,54 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
                      backend_pool.reserved_pages(), backend_pool.available_pages());
     }
     std::fprintf(stderr, "\n");
+}
+
+bool ProgramImpl::stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                            KVAddressSpaceHandle address, std::uint32_t tokens) {
+    const std::uint32_t needed = kv_pages_for_tokens(tokens);
+    std::uint32_t coverage     = addresses.entitlement(address);
+    if (needed <= coverage) { return true; }
+    // Only full committed pages before the never-streamed tail may leave the Device.
+    const std::uint32_t full =
+        addresses.committed_frontier(address) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t tail = detail::kv_stream_tail_pages(draft_window);
+    const std::uint32_t end  = full > tail ? full - tail : 0U;
+    std::vector<LogicalKVPageHandle> members;
+    std::uint32_t page = detail::kKVStreamSinkPages;
+    while (coverage < needed) {
+        while (page < end && !pages.can_pin_demotion_source(addresses.logical_page(address, page))) {
+            ++page;
+        }
+        if (page >= end) { return false; }
+        // The oldest run of demotable pages, a whole group when the window allows it.
+        const std::uint32_t want = std::max(needed - coverage, detail::kKVStreamGroupPages);
+        members.clear();
+        while (page + members.size() < end && members.size() < want) {
+            const LogicalKVPageHandle logical =
+                addresses.logical_page(address, page + static_cast<std::uint32_t>(members.size()));
+            if (!pages.can_pin_demotion_source(logical)) { break; }
+            members.push_back(logical);
+        }
+        // A full Host arena first returns extents no page references, then retries once.
+        std::optional<HostKVExtentReservation> reservation = [&] {
+            if (auto first = host_kv_extents->prepare(pages, members, true)) { return first; }
+            (void)host_kv_extents->release_unreferenced();
+            return host_kv_extents->prepare(pages, members, true);
+        }();
+        if (!reservation) { return false; }
+        // Publication follows the completed copy (paged-kv §5.4): the Host replica is complete
+        // before anything, on any stream, can read or release it.
+        pages.physical_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
+                                           host_kv_extents->writable_view(*reservation),
+                                           device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        (void)host_kv_extents->publish(std::move(*reservation));
+        const auto count = static_cast<std::uint32_t>(members.size());
+        addresses.demote(address, page, count, device.stream);
+        coverage += count;
+        page += count;
+    }
+    return true;
 }
 
 std::optional<std::uint32_t> ProgramImpl::device_kv_lease_settlement_tokens(
@@ -1562,6 +1640,14 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
     ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
+    // Prefill maps whole chunks against the admission window; streaming makes room for each.
+    if (kv_stream &&
+        (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens) ||
+         (backend_tokens != 0 && !stream_kv(*backend_kv_pages, *backend_kv_addresses,
+                                            *sequence.kv->backend, backend_tokens)))) {
+        throw std::runtime_error(
+            "KV streaming cannot cover this execution step: Host KV capacity is exhausted");
+    }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,

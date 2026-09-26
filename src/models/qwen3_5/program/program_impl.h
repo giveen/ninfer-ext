@@ -9,6 +9,7 @@
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
+#include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -41,12 +42,6 @@ namespace ninfer::models::qwen3_5::detail {
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
-
-// Device KV is leased on demand. An active request holds a bounded window of its remaining
-// output rather than the whole client budget, and extends that window at a decode-round
-// boundary; a full window is requested first and a step-sized extension is enough when the pool
-// cannot spare one.
-inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -624,6 +619,9 @@ public:
     const bool plain_mtp_batches;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
+    // KV streaming (planning/kv_stream.h): full pages outside a request's Device window move to
+    // Host records that attention reads in place.
+    const bool kv_stream;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;
@@ -1258,12 +1256,7 @@ private:
         return std::max(prefill_width, kKVLeaseGrowthMarginTokens);
     }
     [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
-        // One round's Backend requirement can sit a whole draft window above the frontier the
-        // previous round checked, so the cushion has to absorb that jump before the lease is
-        // extended again.
-        const auto page  = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const auto slack = 2U * draft_window + 2U;
-        return (slack + page - 1U) / page + 1U;
+        return detail::kv_lease_cushion_pages(draft_window);
     }
     // The Backend lease also covers the drafts a round may still verify past the sequence's
     // output ceiling, and one forced control span.
@@ -1276,6 +1269,14 @@ private:
     }
     void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                   std::uint32_t backend_tokens);
+    // KV streaming: a request's Device window in one pool, an equal share of that pool.
+    [[nodiscard]] std::uint32_t kv_stream_window(const LogicalKVPageStore& pages) const noexcept {
+        return pages.physical_pool().capacity_pages() / max_concurrency;
+    }
+    // Demotes the oldest demotable pages of `address` until it can map `tokens` within its window;
+    // false when too few pages can leave the Device.
+    [[nodiscard]] bool stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                 KVAddressSpaceHandle address, std::uint32_t tokens);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

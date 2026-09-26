@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -1026,15 +1027,33 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    const std::uint32_t minimum_pages =
+        options.kv_stream ? options.max_concurrency
+                          : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
+    if (options.kv_stream) {
+        if (parameters.model.config().text.sparse_attention) {
+            throw std::invalid_argument(
+                "KV streaming does not support sparse attention (its index pages stay on Device)");
+        }
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument(
+                "KV streaming does not support DFlash drafts (their full-attention KV is "
+                "head-major); use DFlash2 or MTP");
+        }
+        if (options.purpose == EnginePurpose::CausalScoring) {
+            throw std::invalid_argument("KV streaming applies to generation only");
+        }
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        // Streaming bounds Device residency per request, so Device capacity may be below one
+        // request's context; the planner checks the per-request window.
+        if (!options.kv_stream && options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
@@ -1174,6 +1193,11 @@ std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
     return static_cast<std::uint32_t>(std::min(slots, total));
 }
 
+// Device page groups one streaming request always needs (kv_stream_window_pages).
+std::uint32_t kv_stream_minimum_window_pages(const SequencePlanningInputs& inputs) {
+    return kv_stream_window_pages(inputs.prefill_width, inputs.draft_window);
+}
+
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
                                                            std::uint32_t main_page_groups) {
     if (main_page_groups == 0) {
@@ -1201,6 +1225,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_storage          = inputs.kv_storage;
     impl->expert_cache_slots  = inputs.expert_cache_slots;
     impl->ngram_stream        = inputs.ngram_stream;
+    impl->kv_stream           = inputs.kv_stream;
     impl->plain_mtp_batches =
         inputs.speculative_backend == SpeculativeBackend::Mtp && !inputs.causal_scoring &&
         inputs.max_concurrency > 1 &&
@@ -1391,9 +1416,18 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .kv_stream           = options.kv_stream,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    // Streaming bounds each request's Device residency by its window instead of max_context.
+    const std::uint32_t minimum_pages =
+        inputs.kv_stream
+            ? std::min(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                           static_cast<std::uint64_t>(inputs.max_concurrency) *
+                               kv_stream_minimum_window_pages(inputs),
+                           std::numeric_limits<std::uint32_t>::max())),
+                       inputs.max_concurrency * logical_pages)
+            : std::max(logical_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {

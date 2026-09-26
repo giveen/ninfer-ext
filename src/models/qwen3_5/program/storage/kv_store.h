@@ -49,6 +49,7 @@ struct HostKVPageReplica {
     std::uint32_t membership_node   = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t content_epoch     = 0;
     std::uint32_t committed_columns = 0;
+    HostPageUnit unit{}; // block-table word paged Ops read in place (KVPageRef)
 };
 
 class LogicalKVPageHandle {
@@ -397,6 +398,15 @@ public:
         return page.device_replica->handle();
     }
 
+    // Block-table word of a page: its Device replica when present, else its Host replica, which
+    // paged Ops read in place.
+    [[nodiscard]] KVPageRef table_ref(LogicalKVPageHandle handle) const {
+        const Page& page = require(handle);
+        if (page.device_replica) { return physical_->page_ref(page.device_replica->handle()); }
+        if (page.host_replica) { return KVPageRef(page.host_replica->unit); }
+        throw std::logic_error("logical KV page has no replica");
+    }
+
     [[nodiscard]] bool device_resident(LogicalKVPageHandle handle) const {
         return require(handle).device_replica.has_value();
     }
@@ -453,6 +463,40 @@ public:
         return page.device_replica.has_value() && page.writer_references == 1 &&
                page.references == 1 && !page.destination_pinned &&
                page.source_pins != std::numeric_limits<std::uint32_t>::max();
+    }
+
+    // A full member of exactly one active address space may be copied to Host for demotion even
+    // while it keeps its writer role: nothing writes a full, committed page.
+    [[nodiscard]] bool can_pin_demotion_source(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.device_replica.has_value() && !page.host_replica &&
+               !page.pending_device_replica && !page.destination_pinned &&
+               page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize) &&
+               page.active_references == 1 &&
+               page.source_pins != std::numeric_limits<std::uint32_t>::max();
+    }
+
+    [[nodiscard]] bool can_demote_active(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.device_replica.has_value() && host_replica_current(handle) &&
+               page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize) &&
+               page.active_references == 1 && !page.pending_device_replica &&
+               page.source_pins == 0 && !page.destination_pinned;
+    }
+
+    // The page leaves the Device for its current Host replica while staying a member of its one
+    // active address space. Its Device lease returns to `reservation`, that space's window, and
+    // the page loses any writer role.
+    void demote_active(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
+        if (!can_demote_active(handle)) {
+            throw std::logic_error("logical KV page is not demotable to its Host replica");
+        }
+        Page& page = pages_[handle.index_];
+        physical_->dematerialize_one(reservation, std::move(*page.device_replica));
+        page.device_replica.reset();
+        page.writer_references = 0;
     }
 
     [[nodiscard]] DeviceKVPageHandle reserve_device_replica(LogicalKVPageHandle handle,
@@ -1161,10 +1205,10 @@ public:
 
         publish_scratch_.clear();
         for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(source, page)));
+            publish_scratch_.push_back(pages_->table_ref(membership(source, page)));
         }
         if (fork.tail_destination_) {
-            publish_scratch_.push_back(pages_->physical(*fork.tail_destination_));
+            publish_scratch_.push_back(pages_->table_ref(*fork.tail_destination_));
         }
         tables_->publish(fork.row_->handle(), 0, publish_scratch_, stream);
 
@@ -1358,10 +1402,10 @@ public:
 
         publish_scratch_.clear();
         for (std::uint32_t page = 0; page < snapshot.shape_.full_pages; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(source, page)));
+            publish_scratch_.push_back(pages_->table_ref(membership(source, page)));
         }
         if (snapshot.tail_destination_) {
-            publish_scratch_.push_back(pages_->physical(*snapshot.tail_destination_));
+            publish_scratch_.push_back(pages_->table_ref(*snapshot.tail_destination_));
         }
         tables_->publish(source.row->handle(), 0, publish_scratch_, stream);
 
@@ -1465,7 +1509,7 @@ public:
         try {
             publish_scratch_.clear();
             for (const LogicalKVPageHandle page : added) {
-                publish_scratch_.push_back(pages_->physical(page));
+                publish_scratch_.push_back(pages_->table_ref(page));
             }
             tables_->publish(address.row->handle(), begin, publish_scratch_, stream);
         } catch (...) {
@@ -1477,6 +1521,39 @@ public:
         }
         for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
         address.page_count = target;
+    }
+
+    // Demotes members [begin, begin + count) of an active address space to their current Host
+    // replicas (see LogicalKVPageStore::demote_active). The Device leases return to this space's
+    // reservation, and its execution row reads the pages in place from Host.
+    void demote(KVAddressSpaceHandle handle, std::uint32_t begin, std::uint32_t count,
+                cudaStream_t stream = nullptr) {
+        Address& address = require_active(handle);
+        if (count == 0) { return; }
+        if (begin > address.page_count || count > address.page_count - begin) {
+            throw std::out_of_range("KV demotion range is outside the address space");
+        }
+        for (std::uint32_t page = begin; page < begin + count; ++page) {
+            if (!pages_->can_demote_active(membership(address, page))) {
+                throw std::logic_error("KV demotion range contains a page that must stay on Device");
+            }
+        }
+        publish_scratch_.clear();
+        for (std::uint32_t page = begin; page < begin + count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            pages_->demote_active(logical, address.reservation);
+            publish_scratch_.push_back(pages_->table_ref(logical));
+        }
+        tables_->publish(address.row->handle(), begin, publish_scratch_, stream);
+    }
+
+    [[nodiscard]] std::uint32_t device_resident_pages(KVAddressSpaceHandle handle) const {
+        const Address& address = require(handle);
+        std::uint32_t resident = 0;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            resident += pages_->device_resident(membership(address, page)) ? 1U : 0U;
+        }
+        return resident;
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
@@ -1854,7 +1931,7 @@ private:
         if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
         publish_scratch_.clear();
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(address, page)));
+            publish_scratch_.push_back(pages_->table_ref(membership(address, page)));
         }
         tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
     }
@@ -1865,7 +1942,7 @@ private:
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
-    std::vector<DeviceKVPageHandle> publish_scratch_;
+    std::vector<KVPageRef> publish_scratch_;
     std::uint32_t free_count_ = 0;
 };
 
