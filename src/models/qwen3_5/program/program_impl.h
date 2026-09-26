@@ -1249,6 +1249,9 @@ private:
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
+    // Eager single-sequence execution (prefill chunks, forced tokens) reads its execution rows
+    // from io; lanes interleave, so every such step selects its own rows first.
+    void select_sequence_kv_rows(const SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);

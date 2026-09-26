@@ -306,6 +306,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             const std::uint32_t base                 = sequence.execution_frontier;
             const std::uint32_t end                  = base + row_stride;
             const auto started                       = Clock::now();
+            select_sequence_kv_rows(sequence);
 
             if (is_masked_draft_backend(speculative_backend) &&
                 sequence.dflash_context_frontier < base) {

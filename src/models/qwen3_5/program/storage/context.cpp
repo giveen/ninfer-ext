@@ -1402,10 +1402,7 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
         }
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
-        set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+        select_sequence_kv_rows(sequence);
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -1417,6 +1414,14 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
         }
         throw;
     }
+}
+
+void ProgramImpl::select_sequence_kv_rows(const SequenceState& sequence) {
+    if (!sequence.kv) { throw std::logic_error("KV row selection requires a bound sequence"); }
+    set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+    set_device_i32(io.backend_kv_table_row,
+                   sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                        : 0);
 }
 
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {

@@ -1018,6 +1018,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .timing  = timing.finish(),
             };
         }
+        select_sequence_kv_rows(sequence);
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
