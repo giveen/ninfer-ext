@@ -190,9 +190,9 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 
 | # | Status | Deliverable | Done when |
 |---|---|---|---|
-| M0 | In progress | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
+| M0 | In progress (4.0 bpw reference and calibration trace pending) | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
-| M2 | In progress | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
+| M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Pending | Calibration Program + first artifact | `ninfer-quantize` produces a full 27B EXL3 artifact at 4.0 bpw with `-hq`, using a simple correct decode kernel for the sequential re-runs; artifact loads and serves; KLD recorded vs BF16 and vs exllamav3 |
 | M4 | Pending | Fast inference kernels | Decode GEMV, sliced-K MMA, prefill MMA with epilogue Hadamard; consumers `linear`, `swiglu`, `add`, `attn_input`, `gdn_input`, LM head, MTP; end-to-end speed report |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
@@ -279,6 +279,38 @@ bit.
   - `src/quantize/exl3/hadamard`: in-place 128-point FWHT along rows and columns, checked against the explicit FP64
     Sylvester product.
   - Next: `XᵀX` accumulation, blocked LDL, LDLQ, scale refit, and the single-tensor FP64 pipeline comparison.
+- 2026-09-27: M2 complete. `ninfer_quantize` now holds every stage, each checked against its own oracle:
+  - `hessian`: `XᵀX` from BF16 activations in FP32, exactly symmetric; FP64 Gram oracle.
+  - `block_ldl`: blocked Cholesky (64-wide FP32 panels, FP64 diagonal blocks) plus 16x16 block normalization.
+    Matches FP64 to 2.6e-6, reports non-positive pivots for progressive damping.
+  - `ldlq`: strip-by-strip LDLQ with the GPU encoder; states identical to an FP64 host LDLQ built on the reference
+    encoder. Error feedback lowers the proxy error from 0.067 to 0.038 at K = 2 on a correlated Hessian.
+  - Tile element order: the `mma.m16n8k16` B-fragment order, now written out as a formula in
+    `storage-layouts.md` 9.2. It matches exllamav3's `tensor_core_perm`.
+  - `pipeline` (`quantize_tensor`): damping, random signs, rotated `H` and block LDL with retries; skew-gated
+    output scales; Hadamard rotations; input scales; global-scale search (coarse grid on a third of a
+    wrapped-diagonal plus extreme-RMS tile sample, fine grid, parabolic refine, LDLQ drift); LDLQ; refit of
+    su/sv (closed-form output scales, CG input scales, 2 rounds). The codebook scale is folded into sv, so the
+    stored form is exactly W = diag(su) H128 Z H128 diag(sv) with integer Z; the test decodes it independently
+    in FP64.
+  - Single-tensor parity with exllamav3 1.5.2 (`tools/exl3/compare_tensor.py`, real layer-0 Hessian from the
+    trace, same W and H). The deviation from the plan: the stage oracles plus this parity replace one end-to-end
+    FP64 host pipeline.
+
+    | Tensor | K | NInfer proxy | exllamav3 proxy | Ratio |
+    |---|---:|---:|---:|---:|
+    | in_proj_z 5120→6144 | 2 / 2.5 / 3 / 3.5 / 4 | 0.004801 / 0.002350 / 0.001165 / 0.000585 / 0.000295 | 0.004802 / 0.002351 / 0.001167 / 0.000586 / 0.000295 | 0.9986–0.9997 |
+    | gate_proj 5120→17408 | 3 | 0.004843 | 0.004845 | 0.9996 |
+
+  - Encoder throughput (bit-identical to the FP64 reference after each change): per-rate compile-time
+    specialization, shared-memory FP32 costs for steps of at least 3 bits, conflict-free work mapping, coalesced
+    back pointers, one 1024-thread block per SM. gate_proj single-tensor time is 7.1 s at K = 3 (exllamav3
+    6.1 s), 8.0 s at K = 4, and 14.7 s at K = 2.
+  - Open performance items, none blocking M3:
+    - K <= 2.5 (smallest step 2 bits) keeps its costs in global scratch.
+    - Back pointers use a byte per node (could pack).
+    - The LDLQ compensation and refit GEMMs are SIMT FP32.
+    - The encoder is about 93% of single-tensor time, so M3's full-model quantization time follows it.
 
 ## Review notes (2026-09-27, external read-only review of `385bb9af` and the uncommitted sampler)
 
