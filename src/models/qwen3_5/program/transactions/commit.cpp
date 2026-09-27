@@ -138,8 +138,8 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         requests[lane].active_resources   = active;
         requests[lane].optional_resources = details.active_optional_resources;
         requests[lane].host_spill_budget  = details.host_spill_bytes;
-        // Host pages moved in from a reused source are already arena occupancy.
-        requests[lane].host_spilled       = active.host.kv_bytes;
+        // Host pages of a reused prefix are already arena occupancy.
+        requests[lane].host_spilled       = details.host_prefix_bytes;
         invalidate_lane(lane);
         const SequenceHandle handle =
             ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);

@@ -798,7 +798,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     const auto prepare_kv_restores =
         [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages, KVAddressSpaceHandle address,
             std::optional<std::uint32_t> activation_frontier, bool source_reservation,
-            const KVActivationReservation* activation, DeviceKVPageReservation& reservation,
+            const KVActivationReservation* activation, std::uint32_t stream_begin,
+            std::uint32_t stream_end, DeviceKVPageReservation& reservation,
             std::vector<MaterializationTransaction::KVRestorePage>& restores,
             std::vector<DeviceKVPageHandle>& destinations) {
             const std::uint32_t mapped = activation_frontier
@@ -807,9 +808,15 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             if (mapped > addresses.mapped_pages(address)) {
                 throw std::logic_error("KV activation frontier exceeds address membership");
             }
-            // Members a streamed activation keeps Host-only are read in place, not restored.
+            // Members a streamed activation or prefix fork keeps Host-only are read in place, not
+            // restored.
             const auto streams = [&](std::uint32_t page) {
-                return activation != nullptr && addresses.streams_on_activation(*activation, page);
+                if (activation != nullptr) {
+                    return addresses.streams_on_activation(*activation, page);
+                }
+                return source_reservation && activation_frontier &&
+                       addresses.streams_on_prefix_fork(address, *activation_frontier,
+                                                        stream_begin, stream_end, page);
             };
             std::uint32_t missing = 0;
             for (std::uint32_t page = 0; page < mapped; ++page) {
@@ -844,6 +851,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
                         transaction.text_activation_frontier, text_prefix_fork,
                         transaction.text_activation ? &*transaction.text_activation : nullptr,
+                        details.text_stream_begin, details.text_stream_end,
                         text_restore_reservation, transaction.text_restores,
                         transaction.text_restore_destinations);
     if (backend_address) {
@@ -855,6 +863,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                             transaction.backend_activation_frontier, backend_prefix_fork,
                             transaction.backend_activation ? &*transaction.backend_activation
                                                            : nullptr,
+                            details.backend_stream_begin, details.backend_stream_end,
                             backend_restore_reservation, transaction.backend_restores,
                             transaction.backend_restore_destinations);
     }
@@ -940,7 +949,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             source_kv->text, *transaction.root_text_address, *transaction.text_activation_frontier,
             details.text_kv_page_entitlement,
             static_cast<std::int32_t>(transaction.destination.value),
-            details.text_retained_tail_release));
+            details.text_retained_tail_release, details.text_stream_begin,
+            details.text_stream_end));
         prepare_retained_tail_backup(
             *text_kv_addresses, *text_kv_pages, *transaction.text_prefix_fork,
             details.text_retained_tail_release, transaction.text_retained_tail,
@@ -972,7 +982,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             *source_kv->backend, *transaction.root_backend_address,
             *transaction.backend_activation_frontier, details.backend_kv_page_entitlement,
             static_cast<std::int32_t>(transaction.destination.value),
-            details.backend_retained_tail_release));
+            details.backend_retained_tail_release, details.backend_stream_begin,
+            details.backend_stream_end));
         prepare_retained_tail_backup(
             *backend_kv_addresses, *backend_kv_pages, *transaction.backend_prefix_fork,
             details.backend_retained_tail_release, transaction.backend_retained_tail,

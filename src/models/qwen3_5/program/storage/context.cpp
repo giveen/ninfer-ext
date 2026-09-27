@@ -1744,6 +1744,27 @@ std::uint32_t ProgramImpl::demote_oldest_kv(LogicalKVPageStore& pages,
     return demoted;
 }
 
+std::uint32_t ProgramImpl::kv_stream_capture_credit(const LogicalKVPageStore& pages,
+                                                   const KVAddressSpaceStore& addresses,
+                                                   KVAddressSpaceHandle address,
+                                                   std::uint32_t copied_pages) const {
+    if (!kv_stream || copied_pages == 0) { return 0U; }
+    // The same pages demote_oldest_kv would take.
+    const std::uint32_t full =
+        addresses.committed_frontier(address) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t tail = detail::kv_stream_tail_pages(draft_window);
+    const std::uint32_t end  = full > tail ? full - tail : 0U;
+    std::uint32_t demotable  = 0;
+    for (std::uint32_t page = detail::kKVStreamSinkPages; page < end && demotable < copied_pages;
+         ++page) {
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (pages.can_demote_active(logical) || pages.can_pin_demotion_source(logical)) {
+            ++demotable;
+        }
+    }
+    return demotable == copied_pages ? copied_pages : 0U;
+}
+
 std::uint32_t ProgramImpl::kv_device_held(const KVAddressSpaceStore& addresses,
                                           KVAddressSpaceHandle address) const {
     return addresses.entitlement(address) -

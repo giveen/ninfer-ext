@@ -537,26 +537,35 @@ Device window，更早的 full pages 由 Host records 原地读取：
     （BF16 272 B/token/layer），在 layout 中与 pool 大小无关。
 - 范围：Host record 为 page-major layout；DFlash head-major pool 与 CausalScoring 拒绝
   `kv_stream`。
-- Context cache：active capture 要求 full pages Device-resident 且 immutable pages 在 mutable pages
-  之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 生成
-  shared-prefix 与 long-anchor captures（`RequestBasePlanImpl::prompt_fits_window`；更长 prompt
-  的 opportunities 被清空）：其 prefill 从不 demote，snapshot 都在 window 内。Private rewrite
-  checkpoint 不 snapshot KV，只保护 frontier，任何 prompt 都会 capture。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
-  reference 唯一）；该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取
-  residency，支持这种状态。已有 current Host replica 的 page 不复制，直接 demote。
-- Streamed reuse：demote 过的 request 仍在 finish 时发布 endpoint continuation。Prompt 超过 window
-  的 request 只能以 ConsumeToActive（无 prefix fork）复用自己上一轮的 endpoint 或 rewrite
-  checkpoint（chat 的常见路径 `private_response_replay`）；reuse frontier 所在页及其后的页必须
-  Device-resident 且无 Host replica（truncate 回 frontier 的要求），否则不生成候选：`inspect_lane` 给出 stream range `[kKVStreamSinkPages, full − kv_stream_tail_pages)`，
-  其中可 stream 的 members（Host-only、full、committed、Host replica current、无共享引用，
-  `LogicalKVPageStore::can_stream_active`）以 Host word 激活（`prepare_activation` 的 stream
-  range），不获得 writer 身份，也不 restore；sinks、frontier tail 与其它 Host-only pages 照常
-  restore。Plan 的 Device entitlement 取 `max(window 上限, 必须驻留的页数)`，address store 的
-  entitlement 是 coverage（mapped + reservation），prefill 恢复路径经
-  `resize_sequence_kv_device_entitlement` 换算。移入的 Host bytes 已是 arena 占用：admission peak 只加
-  spill budget 的其余部分，`host_spilled` 从它们开始。Fork 路径（Retain、shared prefix、
-  long anchor、rewrite checkpoint）会把整个前缀 restore 到 Device，对超过 window 的 prompt 不生成
-  候选。
+- Context cache：streamed members 是 Host-only、full、committed、Host replica current、没有 writer
+  的 pages（`LogicalKVPageStore::can_stream`）。它们可以被 active address 引用而不回到 Device，
+  paged Ops 经 Host word 读取，永远不会成为 writer。
+  - Captures：private rewrite checkpoint 与 long anchor 只保护 frontier，与 residency 无关。
+    Shared-prefix capture 的 active snapshot 把 streamed members 原地共享（immutable，不受
+    "immutable 在 mutable 之前" 的顺序限制），`KVActiveSnapshotShape` 把 unique pages 分为
+    Device 与 Host replica 两类；checkpoint 接走的 active entitlement 不超过 entitlement 本身
+    （window 上限的 Device pages 与激活时移入的 Host bytes；demotion 产生的 Host bytes 记在
+    spill budget）。Streaming lane 占满其 window，snapshot 的 tail copy 没有空闲 page：
+    `kv_stream_capture_credit` 以 lane 自己可 demote 的最旧 pages 抵扣，`prepare_active_capture`
+    先 demote 它们并缩小 reservation。
+  - Decode demotion 可以作用于被 retained checkpoint 共享的 page（只要求 active reference 唯一）；
+    该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取 residency。已有
+    current Host replica 的 page 不复制，直接 demote。
+- Streamed reuse：demote 过的 request 仍在 finish 时发布 continuation。Prompt 超过 window 时
+  （`RequestBasePlanImpl::prompt_fits_window` 为 false），`inspect_lane` 给出 stream range
+  `[kKVStreamSinkPages, full − kv_stream_tail_pages)`；其中的 streamed members 不 restore：
+  - ConsumeToActive（endpoint、rewrite checkpoint，如 chat 的 `private_response_replay`）以
+    `prepare_activation` 的 stream range 移入；需要 tail COW 的 moved source 不 stream，reuse
+    frontier 所在页及其后的页必须 Device-resident 且无 Host replica（truncate 回 frontier）。
+    Plan 的 Device entitlement 为 `max(window 上限, 必须驻留的页数)`；address store 的
+    entitlement 是 coverage（mapped + reservation），prefill 恢复路径经
+    `resize_sequence_kv_device_entitlement` 换算。
+  - Retain、shared prefix 与 long anchor 的 prefix fork（`prepare_prefix_fork` 的 stream range）
+    按引用共享 streamed members，不 pin；fork 的 entitlement 是 coverage（Device 目标 + streamed
+    pages），retained-tail 容量检查不计 streamed pages。
+  - 共享的 streamed members 不计入 exclusive Device pages，也不作为 shared replicas restore。
+  - Reused prefix 已在 arena 中的 Host bytes（移入或共享，`host_prefix_bytes`）只从 spill budget
+    中扣除一次：admission peak 只加其余部分，`host_spilled` 从它们开始。
 
 ---
 

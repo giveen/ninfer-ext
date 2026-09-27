@@ -110,21 +110,53 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         state_store->can_recycle_checkpoint_destination(*sequence.rewrite_state);
     detail::PhysicalResources added;
     detail::PhysicalResources active_removed;
+    detail::PhysicalResources stream_credit;
     std::optional<KVActiveSnapshotShape> text_snapshot_shape;
     std::optional<KVActiveSnapshotShape> backend_snapshot_shape;
     if (publish_shared) {
         if (!sequence.kv) { throw std::logic_error("capture source has no KV bundle"); }
+        // The checkpoint takes the unique full pages: their Device replicas and, for pages
+        // already on Host (streamed or replicated), their Host bytes.
+        const auto host_bytes = [](const LogicalKVPageStore& pages, std::uint32_t count) {
+            return static_cast<std::size_t>(count) *
+                   plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+        };
         text_snapshot_shape =
             text_kv_addresses->active_snapshot_shape(sequence.kv->text, sequence.text_kv_valid);
-        active_removed.device.main_kv_pages = text_snapshot_shape->unique_full_pages;
-        added.device.main_kv_pages          = text_snapshot_shape->copied_pages();
+        active_removed.device.main_kv_pages = text_snapshot_shape->unique_device_pages;
+        active_removed.host.kv_bytes =
+            host_bytes(*text_kv_pages, text_snapshot_shape->unique_host_replica_pages);
+        added.device.main_kv_pages = text_snapshot_shape->copied_pages();
+        stream_credit.device.main_kv_pages = kv_stream_capture_credit(
+            *text_kv_pages, *text_kv_addresses, sequence.kv->text,
+            text_snapshot_shape->copied_pages());
 
         if (sequence.kv->backend) {
             const std::uint32_t backend_frontier = backend_kv_valid(sequence);
             backend_snapshot_shape               = backend_kv_addresses->active_snapshot_shape(
                 *sequence.kv->backend, backend_frontier);
-            active_removed.device.backend_kv_pages = backend_snapshot_shape->unique_full_pages;
-            added.device.backend_kv_pages          = backend_snapshot_shape->copied_pages();
+            active_removed.device.backend_kv_pages = backend_snapshot_shape->unique_device_pages;
+            active_removed.host.kv_bytes +=
+                host_bytes(*backend_kv_pages, backend_snapshot_shape->unique_host_replica_pages);
+            added.device.backend_kv_pages = backend_snapshot_shape->copied_pages();
+            stream_credit.device.backend_kv_pages = kv_stream_capture_credit(
+                *backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
+                backend_snapshot_shape->copied_pages());
+        }
+        // A streaming lane pays its tail copy by demoting as many of its own oldest pages, so the
+        // capture needs no free pool page and the lane holds that much less Device KV.
+        active_removed = checked_resource_sum(active_removed, stream_credit);
+        // Under streaming the entitlement counts at most the window's Device pages and only the
+        // Host bytes moved in at activation; pages a demotion spilled are charged to the spill
+        // budget instead (RequestControl::host_spilled), so the checkpoint takes no more than that.
+        if (kv_stream) {
+            const detail::PhysicalResources& owned = requests[lane].active_resources;
+            active_removed.device.main_kv_pages =
+                std::min(active_removed.device.main_kv_pages, owned.device.main_kv_pages);
+            active_removed.device.backend_kv_pages =
+                std::min(active_removed.device.backend_kv_pages, owned.device.backend_kv_pages);
+            active_removed.host.kv_bytes =
+                std::min(active_removed.host.kv_bytes, owned.host.kv_bytes);
         }
     }
 
@@ -200,6 +232,8 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
                               .final_removed      = replaced,
                               .final_added        = added,
     };
+    assessment.implementation->demand.reservation_credit =
+        checked_resource_sum(assessment.implementation->demand.reservation_credit, stream_credit);
     if (assessment.recycles_private_state) {
         if (assessment.state_placement != qwen3_5::CaptureStatePlacement::DeviceFork) {
             throw std::logic_error("recycled rewrite capture selected Host placement");
@@ -671,6 +705,27 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
             throw std::logic_error("active capture source is not an in-place writer");
         }
         trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+        // The credit the assessment counted (kv_stream_capture_credit): demote the lane's oldest
+        // pages and return their Device leases to the pool for the tail copy.
+        const auto pay_tail_copy = [&](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                       KVAddressSpaceHandle address, std::uint32_t frontier) {
+            const std::uint32_t copied =
+                frontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0 ? 1U : 0U;
+            const std::uint32_t credit =
+                kv_stream_capture_credit(pages, addresses, address, copied);
+            if (credit == 0) { return; }
+            if (demote_oldest_kv(pages, addresses, address, credit, 1U,
+                                 requests[transaction.lane]) != credit) {
+                throw std::bad_alloc();
+            }
+            addresses.resize_entitlement(address, addresses.entitlement(address) - credit);
+        };
+        pay_tail_copy(*text_kv_pages, *text_kv_addresses, sequence.kv->text,
+                      sequence.text_kv_valid);
+        if (sequence.kv->backend) {
+            pay_tail_copy(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
+                          backend_kv_valid(sequence));
+        }
         transaction.active_text_destination = text_kv_addresses->create_inactive();
         if (!transaction.active_text_destination) {
             throw std::logic_error("selected capture has no Text KV address descriptor");

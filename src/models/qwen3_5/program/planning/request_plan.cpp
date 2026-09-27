@@ -253,18 +253,13 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
-    // With KV streaming, a prompt longer than its Device window captures only its private rewrite
-    // checkpoint (no KV snapshot, only a protected frontier): shared prefixes and long anchors are
-    // reused by forking, which would restore the whole prefix to Device. It may reuse its own
-    // previous turn (endpoint or rewrite checkpoint) with the older pages left on Host.
-    // Paged-kv §6.5.
+    // With KV streaming, a prompt longer than its Device window reuses a prefix with its older
+    // pages left on Host (inspect_lane's stream ranges) instead of restoring them. Paged-kv §6.5.
     const bool prompt_fits_window =
         !kv_stream || kv_pages_for_tokens(std::min(capacity, base->summary.prompt_tokens +
                                                                  draft_window + 1U)) <=
                           kv_stream_window(*text_kv_pages);
     base->prompt_fits_window             = prompt_fits_window;
-    // Opportunities are shared-prefix and long-anchor captures, which such a prompt does not take.
-    if (!prompt_fits_window) { base->context_cache.opportunities.clear(); }
     const bool prefix_reuse              = options.allow_prefix_reuse;
     base->allow_prefix_reuse             = prefix_reuse;
     base->summary.publish_continuation =
@@ -899,11 +894,13 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 partial_tail_cow_required(*backend_kv_addresses, *source_kv->backend,
                                           backend_frontier);
         }
-        // A streaming prompt longer than its window reuses only its own previous turn (endpoint
-        // or rewrite checkpoint), moved in place with its older pages left on Host (paged-kv
-        // §6.5): a Fork would restore the whole prefix to Device. Members between the sinks and
-        // the frontier tail that are Host-only stay there; the tail is written, demotion assumes
-        // it resident, and truncating back to the reuse frontier needs every later page on Device.
+        // A streaming prompt longer than its window leaves the reused prefix's older pages on
+        // Host (paged-kv §6.5): members between the sinks and the frontier tail that are
+        // Host-only are moved in (ConsumeToActive) or shared by reference (a Retain or shared
+        // prefix fork) instead of restored. The frontier tail is written or copied, and demotion
+        // assumes it resident. A moved source is truncated back to the reuse frontier, which needs
+        // every later page on Device; a moved source that needs a tail copy is not streamed.
+        const bool consumes = plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive;
         if (!base.prompt_fits_window) {
             const auto resident_from = [&](const KVAddressSpaceStore& addresses,
                                            const LogicalKVPageStore& pages,
@@ -917,16 +914,16 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 }
                 return true;
             };
-            if (source == nullptr ||
-                (plan->reuse != ReusePath::PrivateEndpoint &&
-                 !is_rewrite_checkpoint_restore(plan->reuse)) ||
-                plan->source_mode != runtime::PrivateSourceMode::ConsumeToActive ||
-                plan->text_prefix_fork_required || plan->backend_prefix_fork_required ||
-                !resident_from(*text_kv_addresses, *text_kv_pages, source_kv->text,
-                               plan->reuse_base) ||
-                (source_kv->backend && backend_frontier != 0 &&
-                 !resident_from(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend,
-                                backend_frontier))) {
+            if (consumes &&
+                (source == nullptr ||
+                 (plan->reuse != ReusePath::PrivateEndpoint &&
+                  !is_rewrite_checkpoint_restore(plan->reuse)) ||
+                 plan->text_prefix_fork_required || plan->backend_prefix_fork_required ||
+                 !resident_from(*text_kv_addresses, *text_kv_pages, source_kv->text,
+                                plan->reuse_base) ||
+                 (source_kv->backend && backend_frontier != 0 &&
+                  !resident_from(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend,
+                                 backend_frontier)))) {
                 return std::nullopt;
             }
             const auto range = [&](std::uint32_t frontier, std::uint32_t& begin,
@@ -945,10 +942,15 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         const auto streamed_pages = [&](const KVAddressSpaceStore& addresses,
                                         const LogicalKVPageStore& pages,
                                         KVAddressSpaceHandle address, std::uint32_t begin,
-                                        std::uint32_t end, std::uint32_t required) {
+                                        std::uint32_t end, std::uint32_t required,
+                                        std::uint32_t& shared) {
             std::uint32_t out = 0;
+            shared            = 0;
             for (std::uint32_t page = begin; page < std::min(end, required); ++page) {
-                out += pages.can_stream_active(addresses.logical_page(address, page)) ? 1U : 0U;
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                if (!pages.can_stream(logical)) { continue; }
+                ++out;
+                shared += pages.address_references(logical) > 1 ? 1U : 0U;
             }
             return out;
         };
@@ -960,18 +962,23 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         }
         const std::uint32_t main_streamed =
             streamed_pages(*text_kv_addresses, *text_kv_pages, source_kv->text,
-                           plan->text_stream_begin, plan->text_stream_end, main_required);
+                           plan->text_stream_begin, plan->text_stream_end, main_required,
+                           plan->text_streamed_shared_pages);
         const auto [main_all_missing, main_contiguous_runs] =
             missing_kv_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, main_required);
         if (main_all_missing != main_required - main_device) {
             throw std::logic_error("Text KV restore inventory is inconsistent");
         }
         const std::uint32_t main_missing = main_all_missing - main_streamed;
+        plan->text_streamed_pages        = main_streamed;
         if (main_streamed != 0) {
             // The streamed prefix is held on Device only as far as the window allows; the pages
-            // that must be resident fix the Device entitlement's floor.
+            // that must be resident fix the Device entitlement's floor. A moved source's
+            // activation takes Device pages, a fork's reservation takes coverage, which also
+            // spans the shared Host-only members.
             plan->text_kv_page_entitlement =
-                std::max(plan->text_kv_page_entitlement, main_required - main_streamed);
+                std::max(plan->text_kv_page_entitlement, main_required - main_streamed) +
+                (consumes ? 0U : main_streamed);
         }
         if (main_missing != main_required - main_device - main_streamed) {
             throw std::logic_error("Text KV restore inventory is inconsistent");
@@ -980,7 +987,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (main_missing != 0) {
             add_kv_transfer(runtime::ContextResourceClass::MainKV,
                             runtime::ContextTransferDirection::HostToDevice, *text_kv_pages,
-                            main_missing, main_contiguous_runs);
+                            main_missing, std::min(main_contiguous_runs, main_missing));
         }
         if (source_kv->backend && backend_frontier != 0) {
             const std::uint32_t backend_required = kv_pages_for_tokens(backend_frontier);
@@ -991,22 +998,27 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
             const std::uint32_t backend_streamed = streamed_pages(
                 *backend_kv_addresses, *backend_kv_pages, *source_kv->backend,
-                plan->backend_stream_begin, plan->backend_stream_end, backend_required);
+                plan->backend_stream_begin, plan->backend_stream_end, backend_required,
+                plan->backend_streamed_shared_pages);
             const auto [backend_all_missing, backend_contiguous_runs] = missing_kv_restore(
                 *backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_required);
             if (backend_all_missing != backend_required - backend_device) {
                 throw std::logic_error("Backend KV restore inventory is inconsistent");
             }
             const std::uint32_t backend_missing = backend_all_missing - backend_streamed;
+            plan->backend_streamed_pages        = backend_streamed;
             if (backend_streamed != 0) {
                 plan->backend_kv_page_entitlement =
-                    std::max(plan->backend_kv_page_entitlement, backend_required - backend_streamed);
+                    std::max(plan->backend_kv_page_entitlement,
+                             backend_required - backend_streamed) +
+                    (consumes ? 0U : backend_streamed);
             }
             plan->needs_transfer = plan->needs_transfer || backend_missing != 0;
             if (backend_missing != 0) {
                 add_kv_transfer(runtime::ContextResourceClass::BackendKV,
                                 runtime::ContextTransferDirection::HostToDevice, *backend_kv_pages,
-                                backend_missing, backend_contiguous_runs);
+                                backend_missing,
+                                std::min(backend_contiguous_runs, backend_missing));
             }
         }
         if (plan->text_prefix_fork_required) {
@@ -1067,7 +1079,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (main_device > main_required) {
             throw std::logic_error("retained Text KV replica count exceeds requirement");
         }
-        source_replica_additions.device.main_kv_pages = main_required - main_device;
+        // Shared Host-only members stay on Host; the rest are restored as shared replicas.
+        source_replica_additions.device.main_kv_pages =
+            main_required - main_device - plan->text_streamed_pages;
         if (source_kv->backend) {
             const std::uint32_t backend_required =
                 backend_frontier == 0 ? 0U : kv_pages_for_tokens(backend_frontier);
@@ -1076,7 +1090,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             if (backend_device > backend_required) {
                 throw std::logic_error("retained Backend KV replica count exceeds requirement");
             }
-            source_replica_additions.device.backend_kv_pages = backend_required - backend_device;
+            source_replica_additions.device.backend_kv_pages =
+                backend_required - backend_device - plan->backend_streamed_pages;
         }
         detail::PhysicalResources retained_tail_added;
         detail::PhysicalResources retained_tail_removed;
@@ -1087,8 +1102,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 std::uint32_t missing_source_pages, bool prefix_fork, bool& staged,
                 runtime::ContextResourceClass resource) {
                 const std::uint32_t required = kv_pages_for_tokens(frontier);
+                // Shared Host-only members take no Device page.
                 const std::uint64_t final_without_release =
-                    static_cast<std::uint64_t>(required) + active_pages;
+                    static_cast<std::uint64_t>(required) + active_pages -
+                    (resource == runtime::ContextResourceClass::BackendKV
+                         ? plan->backend_streamed_pages
+                         : plan->text_streamed_pages);
                 const std::uint32_t capacity = pages.physical_pool().capacity_pages();
                 if (final_without_release <= capacity) { return true; }
                 if (!prefix_fork || frontier == 0 ||
@@ -1197,7 +1216,18 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             .final_removed            = removed,
             .final_added              = added,
         };
-        plan->demand.physical_peak_additional.host.kv_bytes += plan->host_spill_bytes;
+        // Shared Host-only prefix pages are already arena occupancy; only the rest of the spill
+        // budget is new.
+        const auto stride = [](const LogicalKVPageStore& pages) {
+            return plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+        };
+        plan->host_prefix_bytes =
+            static_cast<std::size_t>(plan->text_streamed_pages) * stride(*text_kv_pages) +
+            (backend_kv_pages ? static_cast<std::size_t>(plan->backend_streamed_pages) *
+                                    stride(*backend_kv_pages)
+                              : 0U);
+        plan->demand.physical_peak_additional.host.kv_bytes +=
+            plan->host_spill_bytes - std::min(plan->host_spill_bytes, plan->host_prefix_bytes);
         return AdmissionCandidate(std::move(plan));
     }
     detail::PhysicalDeviceResources exclusive_active = active;
@@ -1247,11 +1277,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             shared_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base);
         const std::uint32_t main_missing_shared = missing_shared_device_kv_prefix_pages(
             *text_kv_addresses, source->kv->text, plan->reuse_base);
-        if (main_shared > exclusive_active.main_kv_pages) {
+        // Streamed shared members stay on Host: they hold no Device page and are not restored.
+        const std::uint32_t main_shared_resident = main_shared - plan->text_streamed_shared_pages;
+        if (main_shared_resident > exclusive_active.main_kv_pages) {
             throw std::logic_error("shared Main KV exceeds the active entitlement");
         }
-        exclusive_active.main_kv_pages -= main_shared;
-        shared_replica_additions.device.main_kv_pages = main_missing_shared;
+        exclusive_active.main_kv_pages -= main_shared_resident;
+        shared_replica_additions.device.main_kv_pages =
+            main_missing_shared - plan->text_streamed_shared_pages;
         const std::uint32_t main_shared_device =
             shared_device_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base);
         conversions.main_kv_pages =
@@ -1264,11 +1297,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 *backend_kv_addresses, *source->kv->backend, backend_frontier);
             const std::uint32_t backend_missing_shared = missing_shared_device_kv_prefix_pages(
                 *backend_kv_addresses, *source->kv->backend, backend_frontier);
-            if (backend_shared > exclusive_active.backend_kv_pages) {
+            const std::uint32_t backend_shared_resident =
+                backend_shared - plan->backend_streamed_shared_pages;
+            if (backend_shared_resident > exclusive_active.backend_kv_pages) {
                 throw std::logic_error("shared Backend KV exceeds the active entitlement");
             }
-            exclusive_active.backend_kv_pages -= backend_shared;
-            shared_replica_additions.device.backend_kv_pages = backend_missing_shared;
+            exclusive_active.backend_kv_pages -= backend_shared_resident;
+            shared_replica_additions.device.backend_kv_pages =
+                backend_missing_shared - plan->backend_streamed_shared_pages;
             const std::uint32_t backend_shared_device        = shared_device_kv_prefix_pages(
                 *backend_kv_addresses, *source->kv->backend, backend_frontier);
             conversions.backend_kv_pages =
@@ -1348,8 +1384,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     };
     // Host pages the source already holds are arena occupancy; only the rest of the spill budget
     // is new (RequestControl::host_spilled starts at them).
+    plan->host_prefix_bytes = retained_host.kv_bytes;
     plan->demand.physical_peak_additional.host.kv_bytes +=
-        plan->host_spill_bytes - std::min(plan->host_spill_bytes, retained_host.kv_bytes);
+        plan->host_spill_bytes - std::min(plan->host_spill_bytes, plan->host_prefix_bytes);
     return AdmissionCandidate(std::move(plan));
 }
 

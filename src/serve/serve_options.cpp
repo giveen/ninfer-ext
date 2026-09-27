@@ -114,7 +114,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-stream lets --kv-capacity be below --max-context: each request owns an equal "
            "share, borrows idle shares, and moves older full pages to Host KV (--host-kv-mib) "
            "beyond that, reserving Host KV at admission for prompt plus output limit beyond the share; "
-           "a longer conversation resumes its previous turn with older pages left in Host KV\n"
+           "reused context keeps its older pages in Host KV\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,7), anchors=4; Host state=8 slots, Host KV=8192 MiB\n"
            "       --host-cache-mib sizes the whole Host cache tier from one pinned-RAM ceiling and replaces --host-state-slots and --host-kv-mib\n"

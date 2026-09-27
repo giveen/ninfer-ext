@@ -655,7 +655,7 @@ void test_kv_demotion(ninfer::DeviceContext& device) {
     ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
     store::LogicalKVPageStore pages(physical_pages, 16);
     store::HostKVExtentStore extents(host_arena, 8);
-    store::KVAddressSpaceStore addresses(pages, physical_tables, 1, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 3, 8);
 
     const std::size_t page_bytes = host_layout.planes[0].page_payload_bytes;
     const auto address           = addresses.create_active(4, 0);
@@ -740,12 +740,50 @@ void test_kv_demotion(ninfer::DeviceContext& device) {
                addresses.entitlement(*address) == 6 && physical_pages.reserved_pages() == 0,
            "streamed members publish Host words and never become writers");
 
-    addresses.deactivate(*address);
-    expect(addresses.release(*address) &&
+    // Shared capture over streamed members: the snapshot shares them in place, still on Host.
+    addresses.destructive_truncate(*address, 250);
+    addresses.resize_entitlement(*address, 4);
+    const auto checkpoint = addresses.create_inactive();
+    expect(checkpoint.has_value(), "snapshot destination address allocation");
+    const store::KVActiveSnapshotShape shape = addresses.active_snapshot_shape(*address, 250);
+    expect(shape.full_pages == 3 && shape.unique_device_pages == 1 &&
+               shape.unique_host_replica_pages == 2 && shape.copied_pages() == 1,
+           "a snapshot counts streamed members as unique Host pages");
+    auto snapshot = addresses.prepare_active_snapshot(*address, *checkpoint, 250);
+    addresses.commit_active_snapshot(std::move(snapshot), device.stream);
+    device.synchronize();
+    const auto snapshot_words = read_block_table(physical_tables, 0, 4);
+    expect(addresses.active(*checkpoint) && !addresses.active(*address) &&
+               snapshot_words[0] == first.word() && snapshot_words[1] == second.word() &&
+               pages.address_references(oldest[0]) == 2 && pages.writer_references(oldest[0]) == 0,
+           "a snapshot shares streamed members by reference and republishes their Host words");
+
+    // Prefix fork of the captured address: streamed members are shared without a Device pin.
+    addresses.deactivate(*checkpoint);
+    const auto fork_destination = addresses.create_inactive();
+    expect(fork_destination.has_value(), "fork destination address allocation");
+    expect(addresses.streams_on_prefix_fork(*address, 250, 0, 2, 0) &&
+               !addresses.streams_on_prefix_fork(*address, 250, 0, 2, 2),
+           "only Host-only full members inside the range fork streamed");
+    auto fork = addresses.prepare_prefix_fork(*address, *fork_destination, 250, 4, 0, false, 0, 2);
+    expect(pages.source_pins(oldest[0]) == 0 &&
+               pages.source_pins(addresses.logical_page(*address, 2)) == 1,
+           "a streamed fork pins only its resident sources");
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    device.synchronize();
+    const auto fork_words = read_block_table(physical_tables, 0, 4);
+    expect(addresses.active(*fork_destination) && fork_words[0] == first.word() &&
+               fork_words[1] == second.word() && pages.address_references(oldest[0]) == 3 &&
+               pages.source_pins(addresses.logical_page(*address, 2)) == 0,
+           "a streamed fork publishes Host words for its shared Host-only members");
+
+    addresses.deactivate(*fork_destination);
+    expect(addresses.release(*fork_destination) && addresses.release(*checkpoint) &&
+               addresses.release(*address) &&
                extents.release_unreferenced() == 2 * host_layout.page_stride &&
                pages.occupied() == 0 && physical_pages.allocated_pages() == 0 &&
                physical_pages.reserved_pages() == 0 && host_arena.occupied_bytes() == 0,
-           "a streamed address space releases Device and Host ownership without leaks");
+           "streamed address spaces release Device and Host ownership without leaks");
 }
 
 } // namespace

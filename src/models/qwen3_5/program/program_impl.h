@@ -275,6 +275,15 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t text_stream_end      = 0;
     std::uint32_t backend_stream_begin = 0;
     std::uint32_t backend_stream_end   = 0;
+    // Source members inside those ranges that stay Host-only.
+    std::uint32_t text_streamed_pages    = 0;
+    std::uint32_t backend_streamed_pages = 0;
+    // Of those, the ones another address space also references.
+    std::uint32_t text_streamed_shared_pages    = 0;
+    std::uint32_t backend_streamed_shared_pages = 0;
+    // Host KV bytes of the reused prefix that the request's spill budget finds already in the
+    // arena (moved in or shared); RequestControl::host_spilled starts at them.
+    std::size_t host_prefix_bytes = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -1276,6 +1285,12 @@ private:
     // KV streaming: stages the mapped text KV of `lanes` when any of it is Host-resident, so a
     // round reads it once per layer from Device; null keeps the round on its graph.
     [[nodiscard]] qwen3_5::KVHostStaging* stage_text_kv(std::span<const std::uint32_t> lanes);
+    // KV streaming: Device pages a shared capture's tail copy takes from its own lane by demoting
+    // that many of the lane's oldest pages (its window fills the pool); 0 when it cannot.
+    [[nodiscard]] std::uint32_t kv_stream_capture_credit(const LogicalKVPageStore& pages,
+                                                         const KVAddressSpaceStore& addresses,
+                                                         KVAddressSpaceHandle address,
+                                                         std::uint32_t copied_pages) const;
     // KV streaming, QSA: mirrors the Device index records of `lanes`' Host pages (text, and the
     // MTP cache when `mtp`); the mirrors are null where no page is Host-resident.
     [[nodiscard]] qwen3_5::QsaIndexMirrors mirror_qsa_index(std::span<const std::uint32_t> lanes,

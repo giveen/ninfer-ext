@@ -127,7 +127,7 @@ private:
     std::uint32_t requested_entitlement_ = 0;
     std::optional<std::uint32_t> activation_frontier_;
     // KV streaming: members in [stream_begin_, stream_end_) that can stay Host-only
-    // (LogicalKVPageStore::can_stream_active) activate without a Device replica.
+    // (LogicalKVPageStore::can_stream) activate without a Device replica.
     std::uint32_t stream_begin_ = 0;
     std::uint32_t stream_end_   = 0;
     DeviceKVPageReservation page_reservation_;
@@ -149,7 +149,8 @@ public:
           page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)),
           tail_destination_(other.tail_destination_),
           staged_tail_release_(other.staged_tail_release_),
-          tail_source_settled_(other.tail_source_settled_) {
+          tail_source_settled_(other.tail_source_settled_), stream_begin_(other.stream_begin_),
+          stream_end_(other.stream_end_) {
         other.tail_destination_.reset();
     }
 
@@ -185,6 +186,10 @@ private:
     std::optional<LogicalKVPageHandle> tail_destination_;
     bool staged_tail_release_ = false;
     bool tail_source_settled_ = false;
+    // KV streaming: full source members in [stream_begin_, stream_end_) that are Host-only
+    // (LogicalKVPageStore::can_stream) are shared in place without a Device replica.
+    std::uint32_t stream_begin_ = 0;
+    std::uint32_t stream_end_   = 0;
 
     friend class KVAddressSpaceStore;
 };
@@ -193,7 +198,11 @@ struct KVActiveSnapshotShape {
     std::uint32_t full_pages           = 0;
     std::uint32_t immutable_full_pages = 0;
     std::uint32_t unique_full_pages    = 0;
-    std::uint32_t tail_columns         = 0;
+    // Of the unique full pages: those holding a Device replica, and those holding a Host replica
+    // (a streamed page holds only the latter).
+    std::uint32_t unique_device_pages       = 0;
+    std::uint32_t unique_host_replica_pages = 0;
+    std::uint32_t tail_columns              = 0;
 
     [[nodiscard]] std::uint32_t copied_pages() const noexcept {
         return tail_columns == 0 ? 0U : 1U;
@@ -493,15 +502,15 @@ public:
                page.source_pins == 0 && !page.destination_pinned;
     }
 
-    // A Host-only page that may join an active address space without a Device replica: a full,
-    // committed, unshared page whose Host replica is current. It is read through its Host word and
-    // never written, so it activates without the writer role (KV streaming, paged-kv §6.5).
-    [[nodiscard]] bool can_stream_active(LogicalKVPageHandle handle) const noexcept {
+    // A Host-only page an active address space may reference while it stays on Host, whether moved
+    // in or shared by a fork or snapshot: a full, committed page whose Host replica is current and
+    // that nothing writes. It is read through its Host word and never becomes a writer (KV
+    // streaming, paged-kv §6.5).
+    [[nodiscard]] bool can_stream(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return !page.device_replica && !page.pending_device_replica && !page.destination_pinned &&
-               page.references == 1 && page.source_pins == 0 &&
-               host_replica_current(handle) &&
+               page.writer_references == 0 && host_replica_current(handle) &&
                page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize);
     }
 
@@ -1112,7 +1121,8 @@ public:
     [[nodiscard]] KVPrefixForkReservation
     prepare_prefix_fork(KVAddressSpaceHandle source_handle, KVAddressSpaceHandle destination_handle,
                         std::uint32_t frontier, std::uint32_t entitlement,
-                        std::int32_t execution_row, bool staged_tail_release = false) {
+                        std::int32_t execution_row, bool staged_tail_release = false,
+                        std::uint32_t stream_begin = 0, std::uint32_t stream_end = 0) {
         Address& source      = require(source_handle);
         Address& destination = require(destination_handle);
         if (source.active || source.row || source.reservation.valid()) {
@@ -1135,9 +1145,19 @@ public:
         if (staged_tail_release && tail_columns == 0) {
             throw std::invalid_argument("staged KV prefix fork has no partial tail");
         }
+        const auto streamed = [&](std::uint32_t page) {
+            return page >= stream_begin && page < stream_end && page < full_pages &&
+                   pages_->can_stream(membership(source, page));
+        };
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
+            if (streamed(page)) {
+                if (!pages_->can_retain_reference(logical, false)) {
+                    throw std::logic_error("KV retained-prefix streamed source is not shareable");
+                }
+                continue;
+            }
             if (!pages_->device_resident(logical) ||
                 pages_->committed_columns(logical) < required || !pages_->can_pin_source(logical) ||
                 (page < full_pages && !pages_->can_retain_reference(logical, false))) {
@@ -1154,12 +1174,24 @@ public:
             tail_destination = pages_->materialize_transfer_destination(reservation, tail_columns);
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            pages_->pin_source(membership(source, page));
+            if (!streamed(page)) { pages_->pin_source(membership(source, page)); }
         }
-        return KVPrefixForkReservation(*this, source_handle, destination_handle, frontier,
-                                       full_pages, tail_columns, entitlement,
-                                       std::move(reservation), std::move(row), tail_destination,
-                                       staged_tail_release);
+        KVPrefixForkReservation fork(*this, source_handle, destination_handle, frontier,
+                                     full_pages, tail_columns, entitlement, std::move(reservation),
+                                     std::move(row), tail_destination, staged_tail_release);
+        fork.stream_begin_ = stream_begin;
+        fork.stream_end_   = stream_end;
+        return fork;
+    }
+
+    // Whether full member `page` of the fork's source is shared Host-only (restores skip it).
+    [[nodiscard]] bool streams_on_prefix_fork(KVAddressSpaceHandle source, std::uint32_t frontier,
+                                              std::uint32_t stream_begin, std::uint32_t stream_end,
+                                              std::uint32_t page) const {
+        const Address& address = require(source);
+        return page >= stream_begin && page < stream_end &&
+               page < frontier / static_cast<std::uint32_t>(kPagedKVPageSize) &&
+               page < address.page_count && pages_->can_stream(membership(address, page));
     }
 
     [[nodiscard]] DeviceKVPageHandle
@@ -1233,9 +1265,19 @@ public:
             fork.page_reservation_.pages() != growth) {
             throw std::logic_error("KV prefix-fork destination changed before publication");
         }
+        const auto streamed = [&](std::uint32_t page) {
+            return page >= fork.stream_begin_ && page < fork.stream_end_ &&
+                   page < fork.full_pages_ && pages_->can_stream(membership(source, page));
+        };
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
             const bool settled_tail = page == fork.full_pages_ && fork.tail_source_settled_;
+            if (streamed(page)) {
+                if (!pages_->can_retain_reference(logical, false)) {
+                    throw std::logic_error("KV prefix-fork streamed source changed before publication");
+                }
+                continue;
+            }
             if ((!settled_tail &&
                  (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical))) ||
                 (settled_tail && (!fork.staged_tail_release_ || pages_->device_resident(logical) ||
@@ -1279,7 +1321,9 @@ public:
             pages_->retain_active_reference(membership(destination, page));
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
+            if ((page == fork.full_pages_ && fork.tail_source_settled_) || streamed(page)) {
+                continue;
+            }
             pages_->unpin_source(membership(source, page));
         }
         fork.owner_ = nullptr;
@@ -1327,6 +1371,19 @@ public:
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t references    = pages_->address_references(logical);
             const std::uint8_t writers        = pages_->writer_references(logical);
+            // A streamed member stays on Host and is shared in place; it is immutable wherever it
+            // sits among the resident pages (KV streaming, paged-kv §6.5).
+            if (pages_->can_stream(logical)) {
+                if (references == 0 || !pages_->can_retain_reference(logical, false)) {
+                    throw std::logic_error("active KV snapshot streamed page is not shareable");
+                }
+                ++shape.immutable_full_pages;
+                if (references == 1) {
+                    ++shape.unique_full_pages;
+                    ++shape.unique_host_replica_pages;
+                }
+                continue;
+            }
             if (!pages_->device_resident(logical) || references == 0 ||
                 pages_->committed_columns(logical) < page_size ||
                 !pages_->can_retain_reference(logical, false)) {
@@ -1342,7 +1399,11 @@ public:
             } else {
                 throw std::logic_error("active KV snapshot full page ownership is invalid");
             }
-            if (references == 1) { ++shape.unique_full_pages; }
+            if (references == 1) {
+                ++shape.unique_full_pages;
+                ++shape.unique_device_pages;
+                if (pages_->host_resident(logical)) { ++shape.unique_host_replica_pages; }
+            }
         }
 
         if (shape.tail_columns != 0) {
@@ -1437,7 +1498,8 @@ public:
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
-            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical)) {
+            if (pages_->source_pins(logical) == 0 ||
+                (!pages_->device_resident(logical) && !pages_->can_stream(logical))) {
                 throw std::logic_error("active KV snapshot source changed before publication");
             }
         }
@@ -1976,7 +2038,7 @@ private:
     [[nodiscard]] bool streams_member(const Address& address, std::uint32_t page,
                                       std::uint32_t begin, std::uint32_t end) const noexcept {
         return page >= begin && page < end && page < address.page_count &&
-               pages_->can_stream_active(membership(address, page));
+               pages_->can_stream(membership(address, page));
     }
 
     void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
