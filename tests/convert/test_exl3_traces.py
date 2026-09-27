@@ -18,6 +18,7 @@ from tools.exl3.sample_traces import (
     response_token_ids,
     select_streams,
     template_environment,
+    template_tools,
     tool_case,
 )
 
@@ -169,3 +170,23 @@ def test_qwen38_corpus_splits_have_enough_disjoint_trace_prompts() -> None:
     assert {row.stream_id for row in calibration}.isdisjoint(
         {row.stream_id for row in evaluation}
     )
+
+
+def test_template_tojson_matches_ninfer_default_separators() -> None:
+    # ninfer-serve's template engine (like HF) renders tojson with ", "/": " and no ASCII escaping.
+    template = template_environment().from_string(
+        "{{ v|tojson }}|{{ v|tojson(separators=(',', ':'), sort_keys=true) }}"
+    )
+    assert template.render(v={"z": "北京", "a": [1, 2]}) == (
+        '{"z": "北京", "a": [1, 2]}|{"a":[1,2],"z":"北京"}'
+    )
+
+
+def test_template_tools_match_the_server_canonical_tool_object() -> None:
+    _, tools = tool_case("evaluation", 0)
+    [canonical] = template_tools(tools)
+    function = canonical["function"]
+    assert canonical["type"] == "function"
+    assert list(function) == ["name", "parameters", "strict", "description"]
+    assert function["strict"] is False
+    assert template_tools(None) is None

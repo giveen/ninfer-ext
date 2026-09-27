@@ -99,10 +99,33 @@ def template_environment() -> Environment:
         raise ValueError(message)
 
     environment.globals["raise_exception"] = raise_exception
-    environment.filters["tojson"] = lambda value: json.dumps(
-        value, ensure_ascii=False, separators=(",", ":")
-    )
+    # Match NInfer's template engine (and HF): Python's default ", "/": " separators, no ASCII
+    # escaping, with the same optional arguments.
+    def tojson(value, ensure_ascii=False, sort_keys=False, separators=None, indent=None):
+        return json.dumps(
+            value,
+            ensure_ascii=ensure_ascii,
+            sort_keys=sort_keys,
+            separators=tuple(separators) if separators is not None else None,
+            indent=indent,
+        )
+
+    environment.filters["tojson"] = tojson
     return environment
+
+
+def template_tools(tools: Sequence[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Canonical tool objects as ninfer-serve passes them to the template (translate.cpp)."""
+    if tools is None:
+        return None
+    canonical = []
+    for tool in tools:
+        source = tool["function"]
+        function = {"name": source["name"], "parameters": source["parameters"], "strict": False}
+        if source.get("description"):
+            function["description"] = source["description"]
+        canonical.append({"type": "function", "function": function})
+    return canonical
 
 
 def render_chat(
@@ -114,7 +137,7 @@ def render_chat(
 ) -> str:
     return template.render(
         messages=list(messages),
-        tools=tools,
+        tools=template_tools(tools),
         add_generation_prompt=generation_prompt,
         enable_thinking=True,
         reasoning_effort="xhigh",
