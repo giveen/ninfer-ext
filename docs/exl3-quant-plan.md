@@ -363,6 +363,11 @@ bit.
   a/b, norms and Vision at BF16; EXL3 parents stay separate until shared-`suh` fusion. Documented the
   format and recipe in the conversion guide.
 
+- 2026-09-27: End-to-end CPU test of the producer format path (`tests/convert/test_exl3_pipeline.py`):
+  a `ninfer-quantize` source store flows through `qwen3_8_27b_exl3` and `import_encoded` into an
+  `exl3_mul1` artifact, and the artifact's own planes decode to the source in FP64. Fixed
+  `import_encoded`'s format probe to read a whole 16-row tile for EXL3.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format

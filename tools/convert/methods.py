@@ -337,7 +337,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
         source = item.source
         if source.read_encoded is None:
             raise ValueError(f"{item.parameter}: encoded rows are unavailable")
-        first = source.read_encoded(0, 1)
+        first = source.read_encoded(0, 16 if request.target.format == "exl3_mul1" else 1)
         if first.format != request.target.format:
             raise ValueError(
                 f"{item.parameter}: source {first.format} differs from target {request.target.format}"
