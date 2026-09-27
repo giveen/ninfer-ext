@@ -605,6 +605,8 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         transaction.lane_epoch != lane_epochs[transaction.lane]) {
         throw std::logic_error("active capture capacity preparation is stale");
     }
+    // The plan counted pages streaming leases borrowed beyond their windows as available.
+    (void)reclaim_borrowed_kv(transaction.lane, false);
     SequenceState& sequence = active_sequence(transaction.lane);
     if (transaction.publish_shared) {
         if (!transaction.shared_index || *transaction.shared_index >= shared_prefix_capacity) {

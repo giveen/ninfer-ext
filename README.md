@@ -158,14 +158,15 @@ Other settings that matter for speed:
 - **Flash-Next:** keep `--expert-cache auto` (the default) and enough free host RAM that the n-gram
   table stays page-cache mapped (`--ngram-residency auto` decides).
 - **Contexts larger than GPU memory (dense 27B/35B-A3B):** add `--kv-stream` with `--host-kv-mib`
-  sized for the spilled KV. Each request keeps `--kv-capacity / --max-concurrency` of KV on the
-  GPU; older full pages move to pinned RAM and are copied back per layer as each step needs them.
-  Requests that fit their share run at full speed. Once a request spills, every step reads its
-  spilled KV over PCIe:
+  sized for the spilled KV. Each request owns `--kv-capacity / --max-concurrency` of GPU KV and
+  borrows idle shares, which it gives back when another request needs them. Beyond that, older full
+  pages move to pinned RAM and are copied back per layer as each step needs them. Requests that fit
+  the free GPU KV run at full speed. Once a request spills, every step reads its spilled KV over
+  PCIe:
   - Measured on 27B `nvfp4` with BF16 KV, 35k-token context and a 12k-token share: prefill ran
     at the resident rate. Decode ran at 32 tok/s versus 71 tok/s resident.
   - Use `--kv-dtype fp8`, which halves the bytes read.
-  - Set `--max-concurrency` to the number of real users, since the share is fixed per lane.
+  - A lone request on a C=2 server borrowed the idle share and decoded at the resident rate.
   - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
     total at 262k with FP8, ~2 GB with BF16.
   - Only requests whose prompt fits their share use the context cache.

@@ -1285,6 +1285,20 @@ private:
     [[nodiscard]] bool stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
                                  KVAddressSpaceHandle address, std::uint32_t tokens,
                                  RequestControl& owner);
+    // Demotes up to `count` of the oldest demotable pages of `address` in runs of at least
+    // `group` where possible; returns how many left the Device.
+    std::uint32_t demote_oldest_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                   KVAddressSpaceHandle address, std::uint32_t count,
+                                   std::uint32_t group, RequestControl& owner);
+    // Device pages an active address space holds: its entitlement less its Host-resident members.
+    [[nodiscard]] std::uint32_t kv_device_held(const KVAddressSpaceStore& addresses,
+                                               KVAddressSpaceHandle address) const;
+    // Pages streaming leases hold beyond their windows that reclaim_borrowed_kv can return.
+    [[nodiscard]] detail::PhysicalResources reclaimable_borrowed_kv() const noexcept;
+    // Shrinks every streaming lease (but `except_lane`) back to its window; returns pages freed.
+    // Outside a context transaction it advances the resource revision when it frees any.
+    std::uint32_t reclaim_borrowed_kv(std::optional<std::uint32_t> except_lane = std::nullopt,
+                                      bool advance_revision = true);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

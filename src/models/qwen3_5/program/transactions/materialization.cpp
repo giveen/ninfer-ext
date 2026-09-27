@@ -611,6 +611,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     }
 
     const auto prepare_started            = Clock::now();
+    // The plan counted pages streaming leases borrowed beyond their windows as available.
+    (void)reclaim_borrowed_kv(transaction.destination.value, false);
     const AdmissionCandidateImpl& details = *transaction.plan->impl_;
     const detail::PhysicalDemand& demand  = details.demand;
     const std::uint32_t lane              = transaction.destination.value;

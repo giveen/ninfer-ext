@@ -486,6 +486,13 @@ Device window，更早的 full pages 由 Host records 原地读取：
   与 lease growth 都以 window 为上限；`kv_capacity` 因此可以小于 `max_context`，启动只要求每个 lane
   至少容纳 sinks、一个 demotion group、frontier tail 与最宽的单步 mapping（prefill chunk 或
   growth window）加 cushion（`planning/kv_stream.h`）。
+- Borrowing：window 是 request 拥有的份额。持有满 window 的 streaming lease 在需要更多 coverage
+  时先向 pool 借空闲 pages（lease growth 或 `stream_kv` 扩展 reservation），再考虑 demotion；
+  `active_resources` 只计到 window，`physical_occupancy` 把可回收的借用 pages（空闲 reservation 与
+  可 demote 的 pages，至多超出 window 的部分）视为可用。`prepare_materialization`、
+  `prepare_active_capture`，以及低于自身 window 的 lease 增长失败时，`reclaim_borrowed_kv` 先释放
+  其它 lanes 超出 window 的空闲 reservation，再把最旧 pages demote 并缩小 reservation，使它们回到
+  window；coverage 不变。
 - Demotion：当 mapping 或 lease growth 需要超过当前 coverage 时，从第
   `kKVStreamSinkPages` 页之后、`kv_stream_tail_pages(draft)` 之前的最旧 full committed pages 起，
   按 `kKVStreamGroupPages` 成组复制到新的 Host extent。Copy 在 publish 前同步完成（§5.4），然后
