@@ -13,11 +13,12 @@ constexpr int kStateBits      = 16;
 constexpr int kThreads        = 1024;
 constexpr int kLength         = kTrellisTileWeights;
 constexpr std::uint32_t kMul1 = 0x83DCD12DU;
-// Both FP32 cost buffers fit in shared memory from a smallest step of 3 bits (2 x 8192 floats).
-constexpr int kSharedCostMinWidth = 3;
+// Both FP32 cost buffers fit in shared memory from a smallest step of 3 bits (2 x 8192 floats);
+// 2-bit smallest steps use one 16384-float buffer updated in place.
+constexpr int kInPlaceWidth = 2;
 
-// Per-block scratch: one back-pointer byte per carry node and step, plus two FP32 cost buffers
-// indexed by carry node when they do not fit in shared memory.
+// Per-block scratch: one back-pointer byte per carry node and step, plus the FP32 cost buffers
+// indexed by carry node when they do not fit in shared memory (1-bit smallest steps).
 struct ScratchLayout {
     std::size_t nodes;       // 2^(16 - smallest step width)
     bool shared_costs;       // cost buffers in shared memory
@@ -33,8 +34,8 @@ ScratchLayout scratch_layout(int bitrate_half_bits) {
     const int min_width = bitrate_half_bits / 2;
     ScratchLayout layout{};
     layout.nodes             = std::size_t{1} << (kStateBits - min_width);
-    layout.shared_costs      = min_width >= kSharedCostMinWidth;
-    layout.cost_bytes        = 2 * layout.nodes * sizeof(float);
+    layout.shared_costs      = min_width >= kInPlaceWidth;
+    layout.cost_bytes        = (min_width == kInPlaceWidth ? 1 : 2) * layout.nodes * sizeof(float);
     layout.back_bytes        = static_cast<std::size_t>(kLength) * layout.nodes;
     const std::size_t global = layout.back_bytes + (layout.shared_costs ? 0 : layout.cost_bytes);
     layout.block_bytes       = (global + 255) / 256 * 256;
@@ -107,6 +108,59 @@ trellis_step(const float* __restrict__ previous, float* __restrict__ next,
     }
 }
 
+// The same step updating one cost buffer in place, for 2-bit smallest steps whose two buffers
+// would not fit in shared memory. Each carry group lo feeds only the 2^W outputs (hi << L) | lo,
+// so a thread loads its groups' 2^V carries into registers, the block synchronizes, and the
+// outputs overwrite the buffer. Needs 2^L to be a multiple of the block size.
+template <int W, int V>
+__device__ __forceinline__ void trellis_step_in_place(float* __restrict__ costs,
+                                                      std::uint8_t* __restrict__ back_step, float x,
+                                                      float scale) {
+    constexpr int kLoBits  = kStateBits - W - V;
+    constexpr int kGroups  = (1 << kLoBits) / kThreads;
+    constexpr int kChoices = 1 << V;
+    static_assert(kGroups >= 1 && (1 << kLoBits) % kThreads == 0);
+    float carry[kGroups][kChoices];
+#pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+        const std::uint32_t lo = static_cast<std::uint32_t>(threadIdx.x) + g * kThreads;
+#pragma unroll
+        for (int d = 0; d < kChoices; d += 4) {
+            const float4 c4 = *reinterpret_cast<const float4*>(costs + (lo << V) + d);
+            carry[g][d]     = c4.x;
+            carry[g][d + 1] = c4.y;
+            carry[g][d + 2] = c4.z;
+            carry[g][d + 3] = c4.w;
+        }
+    }
+    __syncthreads();
+    const float bias = fmaf(510.0f, scale, x); // value - x = bytesum * scale - bias
+#pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+        const std::uint32_t lo = static_cast<std::uint32_t>(threadIdx.x) + g * kThreads;
+#pragma unroll
+        for (std::uint32_t hi = 0; hi < (1U << W); ++hi) {
+            const std::uint32_t n = (hi << kLoBits) | lo;
+            std::uint32_t product = (n << V) * kMul1;
+            float best            = FLT_MAX;
+            int best_d            = 0;
+#pragma unroll
+            for (int d = 0; d < kChoices; ++d) {
+                const float err =
+                    fmaf(static_cast<float>(__dp4a(product, 0x01010101U, 0U)), scale, -bias);
+                const float c = fmaf(err, err, carry[g][d]);
+                if (c < best) {
+                    best   = c;
+                    best_d = d;
+                }
+                product += kMul1;
+            }
+            costs[n]                  = best;
+            back_step[(lo << W) | hi] = static_cast<std::uint8_t>(best_d);
+        }
+    }
+}
+
 // One Viterbi pass over the ring in order roll, roll + 1, ... (mod 256). With overlap >= 0 the
 // first state must continue from it and the ring closes onto it. Leaves the states in `out`.
 template <int HalfBits>
@@ -129,7 +183,17 @@ __device__ void viterbi_pass(const float* target, float scale, int roll, int ove
         std::uint8_t* back_step = back + static_cast<std::size_t>(step) * nodes_capacity;
         // Positions alternate parity around the ring (256 is even), so odd rates alternate
         // (high, low) and (low, high) steps.
-        if constexpr (kLow == kHigh) {
+        if constexpr (kLow == kInPlaceWidth) {
+            if constexpr (kLow == kHigh) {
+                trellis_step_in_place<kLow, kLow>(previous, back_step, target[position], scale);
+            } else if (position & 1) {
+                trellis_step_in_place<kHigh, kLow>(previous, back_step, target[position], scale);
+            } else {
+                trellis_step_in_place<kLow, kHigh>(previous, back_step, target[position], scale);
+            }
+            __syncthreads();
+            continue;
+        } else if constexpr (kLow == kHigh) {
             trellis_step<kLow, kLow>(previous, next, back_step, target[position], scale);
         } else if (position & 1) {
             trellis_step<kHigh, kLow>(previous, next, back_step, target[position], scale);
@@ -196,7 +260,8 @@ __global__ void __launch_bounds__(kThreads)
                         std::uint16_t* __restrict__ states, float* __restrict__ decoded,
                         std::uint8_t* __restrict__ scratch, std::size_t block_bytes,
                         std::size_t nodes) {
-    constexpr bool kSharedCosts = HalfBits / 2 >= kSharedCostMinWidth;
+    constexpr bool kSharedCosts = HalfBits / 2 >= kInPlaceWidth;
+    constexpr bool kInPlace     = HalfBits / 2 == kInPlaceWidth;
     extern __shared__ float shared_costs[];
     __shared__ float target[kLength];
     __shared__ std::uint16_t ring[kLength];
@@ -209,7 +274,7 @@ __global__ void __launch_bounds__(kThreads)
         cost_a = reinterpret_cast<float*>(block_scratch);
         back   = block_scratch + 2 * nodes * sizeof(float);
     }
-    float* cost_b = cost_a + nodes;
+    float* cost_b = kInPlace ? cost_a : cost_a + nodes;
 
     for (std::int64_t tile = blockIdx.x; tile < count; tile += gridDim.x) {
         const float* input = tiles + tile * kLength;
