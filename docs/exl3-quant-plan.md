@@ -339,6 +339,16 @@ bit.
   `prefix.su` F32[K] and `prefix.sv` F32[N]; `import_encoded` copies tiles and scales unchanged, and a shared
   parent's sources must agree on the bitrate. This repaired a missing source import that had left six convert
   tests failing, and `tests/convert/test_sources.py` now decodes a written source independently in FP64.
+- 2026-09-27: M3 decisions recorded (`ae56f284`) and the BF16 input artifact built (`b8c442ff`). Added the
+  `qwen3_8_27b_bf16` official recipe (every weight at BF16, documented in the conversion guide). Converted
+  `/mnt/storage/models/qwen3.8/full` with `--recipe qwen3_8_27b_bf16 --components text,vision,mtp --device cpu`
+  in 43.7 s to `/mnt/storage/models/qwen3.8/bf16.ninfer` (30 GB + 22 GB parts; 1,052 tensors — 956 bf16, 96 fp32,
+  all `contiguous_le_v1`; 1,420 bindings). This is the quantizer's input artifact, not a scored baseline.
+- 2026-09-27: Next producer step, not started: `ninfer-quantize` (offline app). It reads the BF16 artifact,
+  computes each eligible linear's Hessian from the calibration trace, calls `quantize_tensor`, and writes a
+  source safetensors keyed by **logical parameter name** (`text/layers/<l>/mlp/gate.trellis/.su/.sv`). The EXL3
+  recipe then reads that store, so the app never needs the checkpoint's tensor names. Calibration re-runs each
+  layer with the BF16 reconstruction `wq`.
 
 ## M3 status and decisions
 
