@@ -39,3 +39,18 @@ set_tests_properties(ninfer_exl3_pipeline_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(ninfer_exl3_tensor_probe "${CMAKE_CURRENT_LIST_DIR}/exl3_tensor_probe.cpp")
 ninfer_internal_includes(ninfer_exl3_tensor_probe)
 target_link_libraries(ninfer_exl3_tensor_probe PRIVATE ninfer_quantize)
+
+# CPU-only host-surface test for the quantizer app; it links no CUDA kernel library.
+ninfer_add_test(ninfer_exl3_quantize_source_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_quantize_source.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/options.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/parameter_reader.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/hessian_io.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/source_writer.cpp"
+  LIBRARIES ninfer_artifact)
+target_include_directories(ninfer_exl3_quantize_source_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/quantize)
+
+add_test(NAME ninfer_exl3_quantize_interop_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/quantize_interop.py"
+    $<TARGET_FILE:ninfer-quantize>)

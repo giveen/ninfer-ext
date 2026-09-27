@@ -350,6 +350,14 @@ bit.
   recipe then reads that store, so the app never needs the checkpoint's tensor names. Calibration re-runs each
   layer with the BF16 reconstruction `wq`.
 
+- 2026-09-27: `ninfer-quantize` app v1 (host surface + quantization driver). It reads the BF16 artifact,
+  enumerates the 522 eligible Text/MTP BF16 projections (`--list`, no device), reads each as FP32, calls
+  `quantize_tensor` with a per-parameter Hessian from `--hessians`, packs the returned states through
+  `trellis_t16_v1`, and writes one `exl3.safetensors` (`<name>.trellis/.su/.sv`) plus `report.json`.
+  `ninfer_exl3_quantize_source_test` (options, Hessian IO, safetensors writer, tile packing, transpose) and
+  `ninfer_exl3_quantize_interop_test` (Python writer -> C++ enumeration) pass CPU-only. The calibration stage
+  that produces the Hessians is next; device runs await a free GPU.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
