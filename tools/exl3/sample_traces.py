@@ -128,19 +128,36 @@ def template_tools(tools: Sequence[dict[str, Any]] | None) -> list[dict[str, Any
     return canonical
 
 
+def template_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages as ninfer-serve passes them to the template: tool-call arguments as objects."""
+    out = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            message = {**message, "tool_calls": []}
+            for call in calls:
+                function = dict(call.get("function", {}))
+                if isinstance(function.get("arguments"), str):
+                    function["arguments"] = json.loads(function["arguments"])
+                message["tool_calls"].append({**call, "function": function})
+        out.append(message)
+    return out
+
+
 def render_chat(
     template,
     messages: Sequence[dict[str, Any]],
     *,
     generation_prompt: bool,
     tools: Sequence[dict[str, Any]] | None = None,
+    thinking: bool = True,
 ) -> str:
     return template.render(
-        messages=list(messages),
+        messages=template_messages(messages),
         tools=template_tools(tools),
         add_generation_prompt=generation_prompt,
-        enable_thinking=True,
-        reasoning_effort="xhigh",
+        enable_thinking=thinking,
+        reasoning_effort="xhigh" if thinking else None,
         preserve_thinking=True,
         preserve_reasoning=True,
         tool_call_format="xml",
@@ -154,14 +171,15 @@ def response_token_ids(
     template,
     *,
     tools: Sequence[dict[str, Any]] | None = None,
+    thinking: bool = True,
 ) -> tuple[list[int], str]:
     completed = render_chat(
-        template, completed_messages, generation_prompt=False, tools=tools
+        template, completed_messages, generation_prompt=False, tools=tools, thinking=thinking
     )
     if not completed_messages:
         raise ValueError("completed trace turn has no assistant message")
     prompt_text = render_chat(
-        template, completed_messages[:-1], generation_prompt=True, tools=tools
+        template, completed_messages[:-1], generation_prompt=True, tools=tools, thinking=thinking
     )
     if not completed.startswith(prompt_text):
         raise ValueError(
@@ -349,9 +367,12 @@ def sample_turn(
     args: argparse.Namespace,
     tools: Sequence[dict[str, Any]] | None,
     tool_choice: str | None = None,
+    thinking: bool = True,
 ) -> tuple[dict[str, Any], TraceRow]:
+    # ninfer-serve leaves tool definitions out of the prompt when tool_choice is "none".
+    rendered_tools = None if tool_choice == "none" else tools
     prompt_text = render_chat(
-        template, messages, generation_prompt=True, tools=tools
+        template, messages, generation_prompt=True, tools=rendered_tools, thinking=thinking
     )
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False).ids
     max_context = max(4096, args.row_tokens + 512)
@@ -364,11 +385,12 @@ def sample_turn(
         "temperature": args.temperature,
         "top_p": args.top_p,
         "seed": seed,
-        "enable_thinking": True,
-        "reasoning_effort": "xhigh",
+        "enable_thinking": thinking,
         "preserve_thinking": True,
         "stream": False,
     }
+    if thinking:
+        payload["reasoning_effort"] = "xhigh"
     response = post_chat(
         host, port, payload, args.timeout, tools=tools, tool_choice=tool_choice
     )
@@ -377,12 +399,17 @@ def sample_turn(
         if key in response:
             assistant[key] = response[key]
     response_ids, transcript = response_token_ids(
-        tokenizer, prompt_ids, [*messages, assistant], template, tools=tools
+        tokenizer, prompt_ids, [*messages, assistant], template, tools=rendered_tools, thinking=thinking
     )
     if not response_ids:
         raise RuntimeError(f"NInfer returned an empty assistant turn for {source}")
     reported_prompt = response.get("_trace_prompt_tokens")
     if isinstance(reported_prompt, int) and reported_prompt != len(prompt_ids):
+        dump = Path(f"{args.output_prefix}.prompt-mismatch.json")
+        dump.write_text(
+            json.dumps({"messages": list(messages), "rendered": prompt_text}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
         raise ValueError(
             f"artifact tokenizer/template produced {len(prompt_ids)} prompt tokens for {source}, "
             f"but ninfer-serve reports {reported_prompt}"
@@ -465,6 +492,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--tool-fraction", type=float, default=0.08)
+    parser.add_argument(
+        "--tool-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="sample tool rows with thinking (default off, so a capped response reaches the call)",
+    )
     parser.add_argument("--seed", type=int, default=1701)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -555,10 +588,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             tool_call_count = 0
             for index, chunk in enumerate(chunks):
                 tools = None
+                thinking = True
                 user_text = make_prompt(chunk)
                 if index < tool_rows:
                     tool_prompt, tools = tool_case(args.split, index)
                     user_text += "\n\n" + tool_prompt
+                    thinking = args.tool_thinking
                 user_message = {"role": "user", "content": user_text}
                 messages = [user_message]
                 assistant, trace_row = sample_turn(
@@ -572,6 +607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     seed=args.seed + index,
                     args=args,
                     tools=tools,
+                    thinking=thinking,
                 )
                 messages.append(assistant)
                 rows.append(trace_row)
@@ -585,6 +621,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "server_completion_tokens": trace_row.server_completion_tokens,
                         "finish_reason": trace_row.finish_reason,
                         "tools": tools is not None,
+                        "thinking": thinking,
                     }
                 )
                 print(
@@ -614,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args=args,
                         tools=tools,
                         tool_choice="none",
+                        thinking=thinking,
                     )
                     messages.append(final_assistant)
                     rows.append(followup)
@@ -628,6 +666,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "finish_reason": followup.finish_reason,
                             "tool_call_count": 0,
                             "tools": True,
+                            "thinking": thinking,
                         }
                     )
                     print(
@@ -636,7 +675,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         flush=True,
                     )
                 transcripts.append(
-                    render_chat(template, messages, generation_prompt=False, tools=tools)
+                    render_chat(
+                        template, messages, generation_prompt=False, tools=tools, thinking=thinking
+                    )
                 )
 
             stop_server(process)

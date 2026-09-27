@@ -18,6 +18,7 @@ from tools.exl3.sample_traces import (
     response_token_ids,
     select_streams,
     template_environment,
+    template_messages,
     template_tools,
     tool_case,
 )
@@ -190,3 +191,11 @@ def test_template_tools_match_the_server_canonical_tool_object() -> None:
     assert list(function) == ["name", "parameters", "strict", "description"]
     assert function["strict"] is False
     assert template_tools(None) is None
+
+
+def test_template_messages_pass_tool_call_arguments_as_objects() -> None:
+    call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": '{"a": 1}'}}
+    source = [{"role": "assistant", "content": None, "tool_calls": [call]}]
+    [message] = template_messages(source)
+    assert message["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+    assert source[0]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
