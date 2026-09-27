@@ -23,3 +23,9 @@ ninfer_add_test(ninfer_exl3_block_ldl_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_block_ldl.cpp"
   LIBRARIES ninfer_quantize)
 set_tests_properties(ninfer_exl3_block_ldl_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_exl3_ldlq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_ldlq.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/exl3_viterbi_reference.cpp"
+  LIBRARIES ninfer_quantize ninfer_artifact)
+set_tests_properties(ninfer_exl3_ldlq_test PROPERTIES SKIP_RETURN_CODE 77)

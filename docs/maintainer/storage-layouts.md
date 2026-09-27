@@ -409,7 +409,16 @@ tile_index(n_tile, k_tile) = n_tile * tiles_k + k_tile
 ```
 
 Each tile represents 16 output channels by 16 input channels. Its 256 states follow the
-`mma.m16n8k16` fragment order for the corresponding `[K,N]` operand tile. Stream bits are
+`mma.m16n8k16` B-operand fragment order for the corresponding `[K,N]` operand tile: with
+`t = 8 * lane + 4 * h + r` and `lane = 4 * g + q` (`h` in {0, 1}, `r`, `q` in 0..3, `g` in 0..7),
+state `t` holds
+
+```text
+k = 2 * q + (r & 1) + 8 * (r >> 1)      (input channel within the tile)
+n = g + 8 * h                           (output channel within the tile)
+```
+
+so each lane's eight B-fragment values (two n8 halves) are consecutive states. Stream bits are
 little-endian within each byte: bit zero of the first byte is the first stream bit. For state index
 `t`, the step width is `floor(bitrate_half_bits / 2)` plus one when `bitrate_half_bits` is odd and
 `t` is odd. Thus integer rates have a fixed step, while half-integer rates alternate the lower and
