@@ -538,12 +538,23 @@ Device window，更早的 full pages 由 Host records 原地读取：
 - 范围：Host record 为 page-major layout；DFlash head-major pool 与 CausalScoring 拒绝
   `kv_stream`。
 - Context cache：active capture 要求 full pages Device-resident 且 immutable pages 在 mutable pages
-  之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 使用 context
-  cache：其 prefill 从不 demote，captures 与 reuse sources（prompt 的前缀）都在 window 内。这样的
-  request 若在 decode 中 demote，`stream_kv` 清除其 `publish_continuation`，finish 与 salvage 改为
-  release。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
+  之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 生成
+  captures（`RequestBasePlanImpl::prompt_fits_window`）：其 prefill 从不 demote，captures 都在
+  window 内。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
   reference 唯一）；该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取
   residency，支持这种状态。已有 current Host replica 的 page 不复制，直接 demote。
+- Streamed reuse：demote 过的 request 仍在 finish 时发布 endpoint continuation。Prompt 超过 window
+  的 request 只能以 PrivateEndpoint + ConsumeToActive（无 prefix fork）复用自己上一轮的
+  endpoint：`inspect_lane` 给出 stream range `[kKVStreamSinkPages, full − kv_stream_tail_pages)`，
+  其中可 stream 的 members（Host-only、full、committed、Host replica current、无共享引用，
+  `LogicalKVPageStore::can_stream_active`）以 Host word 激活（`prepare_activation` 的 stream
+  range），不获得 writer 身份，也不 restore；sinks、frontier tail 与其它 Host-only pages 照常
+  restore。Plan 的 Device entitlement 取 `max(window 上限, 必须驻留的页数)`，address store 的
+  entitlement 是 coverage（mapped + reservation），prefill 恢复路径经
+  `resize_sequence_kv_device_entitlement` 换算。移入的 Host bytes 已是 arena 占用：admission peak 只加
+  spill budget 的其余部分，`host_spilled` 从它们开始。Fork 路径（Retain、shared prefix、
+  long anchor、rewrite checkpoint）会把整个前缀 restore 到 Device，对超过 window 的 prompt 不生成
+  候选。
 
 ---
 

@@ -146,7 +146,8 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
 
 The concurrent-prefill and KV-streaming test runs two long prompts together (interleaved prefill
 chunks), then again with `kv_stream` and a small Device window, and requires each request's greedy
-tokens to equal the same request run alone:
+tokens to equal the same request run alone. Two-turn conversations, one fitting the window and one
+spilling (plain and MTP), must resume from the first turn and match a resident engine:
 
 ```bash
 NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \

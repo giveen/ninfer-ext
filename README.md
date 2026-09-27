@@ -169,7 +169,9 @@ Other settings that matter for speed:
   - A lone request on a C=2 server borrowed the idle share and decoded at the resident rate.
   - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
     total at 262k with FP8, ~2 GB with BF16.
-  - Only requests whose prompt fits their share use the context cache.
+  - A conversation that spilled still resumes from its previous turn: the next request reuses
+    that KV with the older pages left in RAM. Checkpoint captures inside a prompt apply only to
+    prompts that fit the share.
   - Size `--host-kv-mib` for the spill: admission reserves Host KV for each request's prompt plus
     output limit (`max_tokens`, default 8192) beyond its share. A request that does not fit waits
     for running ones to finish; one that could never fit is rejected.

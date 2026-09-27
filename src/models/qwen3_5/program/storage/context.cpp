@@ -1399,6 +1399,23 @@ void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::u
     }
 }
 
+void ProgramImpl::resize_sequence_kv_device_entitlement(SequenceState& sequence,
+                                                        std::uint32_t text_pages,
+                                                        std::uint32_t backend_pages) {
+    // A plan entitlement counts Device pages; the address store's counts coverage, which also
+    // spans members that stream from Host.
+    const auto coverage = [](const KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
+                             std::uint32_t device_pages) {
+        return device_pages +
+               (addresses.mapped_pages(address) - addresses.device_resident_pages(address));
+    };
+    if (!sequence.kv) { throw std::logic_error("KV resize has no sequence bundle"); }
+    resize_sequence_kv_entitlement(
+        sequence, coverage(*text_kv_addresses, sequence.kv->text, text_pages),
+        sequence.kv->backend ? coverage(*backend_kv_addresses, *sequence.kv->backend, backend_pages)
+                             : 0U);
+}
+
 void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
@@ -1721,7 +1738,6 @@ std::uint32_t ProgramImpl::demote_oldest_kv(LogicalKVPageStore& pages,
         }
         const auto run = static_cast<std::uint32_t>(members.size());
         addresses.demote(address, page, run, device.stream);
-        owner.publish_continuation = false;
         demoted += run;
         page += run;
     }

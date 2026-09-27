@@ -175,15 +175,32 @@ int main() {
                       << resident.reused << ", or tokens differ\n";
             ++failures;
         }
-        // A turn that spills during decode releases instead of publishing, and its longer follow-up
-        // no longer fits the window: it prefills from scratch and still completes.
+        // A turn that spills during decode still publishes its endpoint, and its follow-up, longer
+        // than the window, resumes from it with the older pages left on Host.
+        const Turns spilled_resident =
+            run_turns(engine_options(artifact, 1, kMaxContext, false), make_prompt(5, 5000), 1500,
+                      follow_up);
         const Turns spilled =
             run_turns(engine_options(artifact, 1, 5504, true), make_prompt(5, 5000), 1500,
                       follow_up);
-        if (spilled.first.size() != 1500 || spilled.second.size() != kOutputTokens ||
-            spilled.reused != 0) {
-            std::cerr << "kv-stream spill: turn sizes " << spilled.first.size() << "/"
-                      << spilled.second.size() << ", reused " << spilled.reused << "\n";
+        if (spilled.reused == 0 || spilled.reused != spilled_resident.reused ||
+            spilled.first != spilled_resident.first || spilled.second != spilled_resident.second) {
+            std::cerr << "kv-stream spill: reused " << spilled.reused << " vs resident "
+                      << spilled_resident.reused << ", or tokens differ\n";
+            ++failures;
+        }
+        // The same with MTP, whose own cache streams too.
+        const Turns spilled_mtp_resident =
+            run_turns(engine_options(artifact, 1, kMaxContext, false, true), make_prompt(5, 5000),
+                      1500, follow_up);
+        const Turns spilled_mtp =
+            run_turns(engine_options(artifact, 1, 5504, true, true), make_prompt(5, 5000), 1500,
+                      follow_up);
+        if (spilled_mtp.reused == 0 || spilled_mtp.reused != spilled_mtp_resident.reused ||
+            spilled_mtp.first != spilled_mtp_resident.first ||
+            spilled_mtp.second != spilled_mtp_resident.second) {
+            std::cerr << "kv-stream spill MTP: reused " << spilled_mtp.reused << " vs resident "
+                      << spilled_mtp_resident.reused << ", or tokens differ\n";
             ++failures;
         }
         if (failures != 0) { return 1; }

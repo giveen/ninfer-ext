@@ -594,8 +594,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_device_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                                  request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
             sequence.prefix_digests.truncate(base);
@@ -643,8 +643,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_device_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                                  request_plan.backend_kv_page_entitlement);
             sequence.tail_hidden_valid = base == prompt_tokens;
             sequence.ledger.resize(base);
             sequence.prefix_digests.truncate(base);

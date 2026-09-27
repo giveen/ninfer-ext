@@ -204,6 +204,8 @@ struct RequestBasePlanImpl {
     bool allow_prefix_reuse           = false;
     // KV streaming: Host KV bytes the request may spill beyond its Device windows (paged-kv §6.5).
     std::size_t host_spill_bytes = 0;
+    // KV streaming: the prompt fits the request's Device window, so it may capture checkpoints.
+    bool prompt_fits_window = true;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -268,6 +270,11 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
     std::size_t host_spill_bytes          = 0;
+    // KV streaming: source members in [begin, end) may activate Host-only (streamed reuse).
+    std::uint32_t text_stream_begin    = 0;
+    std::uint32_t text_stream_end      = 0;
+    std::uint32_t backend_stream_begin = 0;
+    std::uint32_t backend_stream_end   = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -1260,6 +1267,8 @@ private:
                         runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
+    void resize_sequence_kv_device_entitlement(SequenceState& sequence, std::uint32_t text_pages,
+                                               std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     // Eager single-sequence execution (prefill chunks, forced tokens) reads its execution rows
     // from io; lanes interleave, so every such step selects its own rows first.

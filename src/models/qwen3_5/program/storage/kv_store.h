@@ -494,12 +494,13 @@ public:
     }
 
     // A Host-only page that may join an active address space without a Device replica: a full,
-    // committed page whose Host replica is current. It is read through its Host word and never
-    // written, so it activates without the writer role (KV streaming, paged-kv §6.5).
+    // committed, unshared page whose Host replica is current. It is read through its Host word and
+    // never written, so it activates without the writer role (KV streaming, paged-kv §6.5).
     [[nodiscard]] bool can_stream_active(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return !page.device_replica && !page.pending_device_replica && !page.destination_pinned &&
+               page.references == 1 && page.source_pins == 0 &&
                host_replica_current(handle) &&
                page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize);
     }
