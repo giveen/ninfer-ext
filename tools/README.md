@@ -14,6 +14,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Task | Location |
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
+| Sample disjoint EXL3 traces through `ninfer-serve` | [`exl3/sample_traces.py`](exl3/sample_traces.py) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Swap an artifact's trailing chat-template resource without reconverting | [`artifact/replace_resource.py`](artifact/replace_resource.py); [usage](#artifact-workflow) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
@@ -114,6 +115,39 @@ python3 -m tools.smoke.serve_contract \
 
 The client exercises OpenAI, Anthropic, streaming, usage, multimodal, and tool-call response
 surfaces against the resident process.
+
+## EXL3 trace preparation
+
+`tools/exl3/sample_traces.py` starts `ninfer-serve`, samples chat continuations and a small
+tool-call slice from the fixed perplexity corpus, renders conversations with the artifact's own
+tokenizer and chat template, and writes a qbench-compatible trace, packed Safetensors calibration
+rows, and a text stream for `ninfer-perplexity`. Tool results are deterministic local fixtures;
+NInfer does not execute external tools. Calibration uses corpus shards `00`/`01`; evaluation uses
+disjoint shards `02`/`03`. The sampler verifies prompt token counts against server usage and asks
+`ninfer-serve` to write exact generated token IDs to a separate opt-in JSONL trace. Ordinary API
+responses and request logs are unchanged.
+
+Install its Python-only dependencies into the maintained Python 3.11 environment and run both
+splits from the repository root:
+
+```bash
+uv pip install --python .venv/bin/python -r tools/exl3/requirements.txt
+.venv/bin/python -m tools.exl3.sample_traces \
+  --artifact models/qwen3_8_27b.ninfer \
+  --corpus-manifest eval/corpora/perplexity-1m/manifest.json \
+  --split calibration \
+  --output-prefix profiles/exl3/traces/calibration
+.venv/bin/python -m tools.exl3.sample_traces \
+  --artifact models/qwen3_8_27b.ninfer \
+  --corpus-manifest eval/corpora/perplexity-1m/manifest.json \
+  --split evaluation \
+  --rows 100 \
+  --output-prefix profiles/exl3/traces/evaluation
+```
+
+The script owns the launched server lifecycle and writes its request log and console output beside
+the trace files. The trace files may contain source corpus text and generated responses; keep them
+local and do not commit them.
 
 For typed rewrite-checkpoint and thinking-history behavior, the managed smoke script launches a
 real server and consumes the repository fixture:
