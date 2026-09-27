@@ -202,6 +202,8 @@ struct RequestBasePlanImpl {
     qwen3_5::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // KV streaming: Host KV bytes the request may spill beyond its Device windows (paged-kv §6.5).
+    std::size_t host_spill_bytes = 0;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -265,6 +267,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    std::size_t host_spill_bytes          = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -428,6 +431,15 @@ struct RequestControl {
     // frontier its lease covers with its generation limit reason instead of failing a launch on
     // coverage.
     bool lease_settled = false;
+    // KV streaming: Host KV bytes reserved at admission for this request's demotions, and the
+    // bytes its demotions have allocated so far. The unspent part counts as Host occupancy, so
+    // admission and the context cache cannot take the space a running request may still spill.
+    std::size_t host_spill_budget = 0;
+    std::size_t host_spilled      = 0;
+
+    [[nodiscard]] std::size_t host_spill_reserved() const noexcept {
+        return host_spill_budget - std::min(host_spill_budget, host_spilled);
+    }
 
     struct Prefill {
         PreparedPromptData prompt;

@@ -501,8 +501,16 @@ Device window，更早的 full pages 由 Host records 原地读取：
   coverage 增加 demoted page 数。
 - Demotable page：full committed、恰一个 active reference、没有 Host replica 或 pending/pinned
   状态。Sink 与 tail pages 永不 stream；被拒绝的 speculative round 只截断 tail。
-- Host capacity：Host KV arena 不足时先释放无引用 extents 再重试一次；仍失败时 decode lease
-  按 §7.2 settle；prefill 每个 chunk 各自 map，其 mapping 失败按 Device OOM（`std::bad_alloc`）恢复，失败当前 active requests，worker 继续运行。
+- Host capacity：admission 为 streaming request 预留其整个 context（prompt + effective output +
+  draft）超出各 pool window 的 pages × Host page stride（`RequestBasePlanImpl::host_spill_bytes`）。
+  该预留只进入 admission peak（`physical_peak_additional.host.kv_bytes`），不属于 active
+  entitlement（commit 校验 entitlement 等于实际拥有的对象）；commit 后记在
+  `RequestControl::host_spill_budget`，demotion copy 实际分配的 arena bytes 累加到
+  `host_spilled`，`physical_occupancy` 把未用部分计为 Host 占用。于是 Host 不足时新 request
+  等待、触发 Host pressure（淘汰 Host checkpoints），或在单独也放不下时被拒绝，而不是让运行中的
+  request 在中途失败；context cache 的 Host 写入也不能占用预留。Arena 碎片仍可能使分配失败：先释放
+  无引用 extents 再重试一次；仍失败时 decode lease 按 §7.2 settle；prefill 的 mapping 失败按 Device
+  OOM（`std::bad_alloc`）恢复。
 - Host staging（`KVHostStaging`）：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host
   pages 会让 PCIe 流量乘以 tile 数；decode 每页只读一次，但 SM zero-copy 读 all-layer Host records
   只有 13–23 GB/s，而 copy engine 达 ~50 GB/s。因此每个含 Host pages 的 text step（prefill chunk、

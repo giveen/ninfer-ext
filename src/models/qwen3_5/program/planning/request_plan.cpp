@@ -294,6 +294,21 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             base->backend_kv_page_entitlement =
                 std::min(base->backend_kv_page_entitlement, kv_stream_window(*backend_kv_pages));
         }
+        // Every page of the request's whole context beyond its Device window may be demoted.
+        // Admission reserves that Host capacity, so a full arena delays or rejects the new request
+        // instead of failing running ones mid-step.
+        const std::uint32_t context_tokens =
+            std::min(capacity, base->summary.prompt_tokens + base->summary.effective_output_tokens +
+                                   draft_window);
+        const auto spill = [&](const LogicalKVPageStore& pages) {
+            const std::uint32_t total  = kv_pages_for_tokens(context_tokens);
+            const std::uint32_t window = kv_stream_window(pages);
+            const std::size_t stride =
+                plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            return total > window ? static_cast<std::size_t>(total - window) * stride : 0U;
+        };
+        base->host_spill_bytes = spill(*text_kv_pages);
+        if (backend_kv_pages) { base->host_spill_bytes += spill(*backend_kv_pages); }
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -445,6 +460,9 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         .physical_peak_additional = root_vector,
         .final_added              = root_vector,
     };
+    // The spill reservation is held through completion beside the entitlement (RequestControl),
+    // not as an owned object, so only the admission peak carries it.
+    base->root_demand.physical_peak_additional.host.kv_bytes += base->host_spill_bytes;
     const std::size_t cold_prefill_splits =
         base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
     base->summary.service_work_quanta =
@@ -483,6 +501,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
+    plan->host_spill_bytes            = base.host_spill_bytes;
 
     if ((source != nullptr && shared_source != nullptr) ||
         ((source == nullptr && shared_source == nullptr) != !checkpoint.has_value())) {
@@ -1097,6 +1116,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             .final_removed            = removed,
             .final_added              = added,
         };
+        plan->demand.physical_peak_additional.host.kv_bytes += plan->host_spill_bytes;
         return AdmissionCandidate(std::move(plan));
     }
     detail::PhysicalDeviceResources exclusive_active = active;
@@ -1245,6 +1265,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         .final_removed            = source_resources,
         .final_added              = final_added,
     };
+    plan->demand.physical_peak_additional.host.kv_bytes += plan->host_spill_bytes;
     return AdmissionCandidate(std::move(plan));
 }
 

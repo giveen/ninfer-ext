@@ -170,6 +170,9 @@ Other settings that matter for speed:
   - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
     total at 262k with FP8, ~2 GB with BF16.
   - Only requests whose prompt fits their share use the context cache.
+  - Size `--host-kv-mib` for the spill: admission reserves Host KV for each request's prompt plus
+    output limit (`max_tokens`, default 8192) beyond its share. A request that does not fit waits
+    for running ones to finish; one that could never fit is rejected.
   - Flash-Next keeps a GPU copy of spilled pages' attention-index records (~3.3 KB per token of
     `--max-context` per concurrent request) and reads only the selected tokens' KV over PCIe. With
     an 80k-token prompt and a 12k-token share, decode ran at 41–44 tok/s against 46–51 resident,

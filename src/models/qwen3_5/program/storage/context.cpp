@@ -467,6 +467,11 @@ detail::PhysicalResources ProgramImpl::physical_occupancy() const noexcept {
         out.device.backend_kv_pages  = pool.allocated_pages() + pool.reserved_pages();
     }
     if (host_kv_arena) { out.host.kv_bytes = host_kv_arena->occupied_bytes(); }
+    for (const RequestControl& request : requests) {
+        if (request.lifecycle != Lifecycle::Empty) {
+            out.host.kv_bytes += request.host_spill_reserved();
+        }
+    }
     // Pages streaming leases borrowed beyond their windows are reclaimed before any reservation
     // (reclaim_borrowed_kv), so they count as available.
     const detail::PhysicalResources borrowed = reclaimable_borrowed_kv();
@@ -1024,6 +1029,8 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     request.pending              = {};
     request.active_resources     = {};
     request.optional_resources   = {};
+    request.host_spill_budget    = 0;
+    request.host_spilled         = 0;
     request.publish_continuation = true;
     request.lease_settled        = false;
     request.lease_ceiling        = 0;
@@ -1050,6 +1057,8 @@ void ProgramImpl::clear_lane_best_effort(SequenceState& sequence,
     request.pending              = {};
     request.active_resources     = {};
     request.optional_resources   = {};
+    request.host_spill_budget    = 0;
+    request.host_spilled         = 0;
     request.publish_continuation = true;
     request.lease_settled        = false;
     request.lease_ceiling        = 0;
@@ -1689,10 +1698,17 @@ std::uint32_t ProgramImpl::demote_oldest_kv(LogicalKVPageStore& pages,
         }
         if (copy) {
             // A full Host arena first returns extents no page references, then retries once.
+            // The copy draws on the request's admission reservation (physical_occupancy).
+            const auto prepare = [&] {
+                const std::size_t before = host_kv_arena->occupied_bytes();
+                auto prepared            = host_kv_extents->prepare(pages, members, true);
+                if (prepared) { owner.host_spilled += host_kv_arena->occupied_bytes() - before; }
+                return prepared;
+            };
             std::optional<HostKVExtentReservation> reservation = [&] {
-                if (auto first = host_kv_extents->prepare(pages, members, true)) { return first; }
+                if (auto first = prepare()) { return first; }
                 (void)host_kv_extents->release_unreferenced();
-                return host_kv_extents->prepare(pages, members, true);
+                return prepare();
             }();
             if (!reservation) { return demoted; }
             // Publication follows the completed copy (paged-kv §5.4): the Host replica is complete

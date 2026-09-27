@@ -137,6 +137,8 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         }
         requests[lane].active_resources   = active;
         requests[lane].optional_resources = details.active_optional_resources;
+        requests[lane].host_spill_budget  = details.host_spill_bytes;
+        requests[lane].host_spilled       = 0;
         invalidate_lane(lane);
         const SequenceHandle handle =
             ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
@@ -673,6 +675,8 @@ bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestContr
     unbind_sequence_kv(state);
     request.active_resources                    = {};
     request.optional_resources                  = {};
+    request.host_spill_budget                   = 0;
+    request.host_spilled                        = 0;
     // A published lane is free: any staged prefill bookkeeping belongs to the
     // finished request. The abort/salvage path publishes without going through
     // the commit decision loop that clears it on normal completion, so the
