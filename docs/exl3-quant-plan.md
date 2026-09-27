@@ -394,6 +394,23 @@ bit.
   q/gate/k/v, GDN q/k/v/z, MLP gate+up) must be quantized as one parent with a shared `suh`, which
   the app does not yet do.
 
+- 2026-09-27: First native EXL3 artifact produced. `ninfer-quantize` calibrated from 80 trace rows and
+  quantized all 512 Text projections (~50 min): proxies around 0.003–0.004 at 4.0 bpw, attention and the
+  small GDN controls promoted to 5.0 bpw by `--hq`, the output head at 6.0 bpw. `qwen3_8_27b_exl3` turned the
+  12.4 GB store into `/mnt/storage/models/qwen3.8/exl3-4bpw.ninfer` (18 GB, 1,266 objects: 512 `exl3_mul1`,
+  652 `bf16` Vision/MTP/embedding, 96 `fp32`). The loader reads and validates every EXL3 object
+  (`loading weights | 16.3 GiB | 2.7s`). All 12 `ctest -R exl3` tests pass.
+- 2026-09-27: Blocking finding for "serves". The Engine fails binding this artifact with
+  `text/layers/0/mlp/gate: native input requires one contiguous parent region`. The model composes each
+  shared-input group as one fused parent (`ops::prepare_linear_swiglu_weight`, `prepare_attn_input_proj_weights`,
+  `prepare_gdn_input_proj_weights`), while the app quantized each projection separately. Making the artifact
+  servable requires, in order:
+  1. quantize each shared-input parent (attention q/gate/k/v, GDN q/k/v/z, MLP gate+up) as one EXL3 matrix
+     with one shared `suh`, and have `qwen3_8_27b_exl3` assign the group through one parent source;
+  2. admit EXL3 in the fusion gates in `src/ops/weight_input.cpp`;
+  3. add EXL3 paths to `linear_add`, `linear_swiglu`, `attn_input_proj` and `gdn_input_proj` (the plan's M4
+     consumer set), each composing the existing decode with its epilogue.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
