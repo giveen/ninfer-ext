@@ -7,6 +7,7 @@ from tools.convert.official_recipes import (
     RECIPES,
     qwen3_8_27b,
     qwen3_8_27b_bf16,
+    qwen3_8_27b_exl3,
     qwen3_8_27b_q6,
 )
 from tools.convert.recipe import Recipe
@@ -67,6 +68,51 @@ def test_bf16_recipe_is_registered_and_matches_the_groupwise_layout() -> None:
     assert set(formats) == set(_formats(qwen3_8_27b))
     for name, values in formats.items():
         assert values == {"bf16"}, f"{name} is not stored at full precision: {values}"
+
+
+def test_exl3_recipe_reads_the_native_quantizer_store(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    from tools.convert.official_recipes import qwen3_8_27b_exl3
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    n = k = 128
+    half_bits = 3
+    generator = torch.Generator().manual_seed(5)
+    trellis = torch.randint(
+        0, 256, (n // 16, k // 16, 16 * half_bits), dtype=torch.uint8, generator=generator
+    )
+    su = (torch.rand(k, generator=generator) + 0.5).float()
+    sv = (torch.rand(n, generator=generator) + 0.5).float()
+    save_file(
+        {
+            "text/layers/0/mlp/gate.trellis": trellis,
+            "text/layers/0/mlp/gate.su": su,
+            "text/layers/0/mlp/gate.sv": sv,
+        },
+        str(tmp_path / "exl3.safetensors"),
+    )
+
+    model = Model({"text": {"config": {}}})
+    for name in ("text/layers/0/mlp/gate", "text/layers/0/mlp/down"):
+        model.add(
+            Parameter(
+                name,
+                (128, 128),
+                array_source(torch.ones((128, 128), dtype=torch.bfloat16), name),
+                inputs=("input",),
+            )
+        )
+    recipe = Recipe(model)
+    with SafetensorsSource(tmp_path / "exl3.safetensors") as store:
+        qwen3_8_27b_exl3(model, recipe, {"quantized": store})
+        formats = {
+            name: {selection.format for selection in selections}
+            for name, selections in recipe.selections.items()
+        }
+        assert formats["text/layers/0/mlp/gate"] == {"exl3_mul1"}
+        assert formats["text/layers/0/mlp/down"] == {"bf16"}
+        assert "text/layers/0/mlp/gate" in recipe.separate_parameters
 
 
 def test_registered_recipe_gives_the_mlp_pair_q4() -> None:

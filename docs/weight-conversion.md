@@ -55,6 +55,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
 | `qwen3_8_27b_bf16` | Every weight at full BF16 precision (the offline EXL3 quantizer's input) | None |
+| `qwen3_8_27b_exl3` | EXL3 trellis Text/MTP projections from `ninfer-quantize`; embedding, GDN a/b and Vision stay BF16 | `quantized` |
 | `qwen3_8_27b_q6` | Q4/Q5 projections, Q6 MLP gate/up, Q8 vocabulary weights | None |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
@@ -202,6 +203,7 @@ The converter currently writes these formats:
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
+| `exl3_mul1` | Produced by `ninfer-quantize`, not by a recipe method | `import_encoded` |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.

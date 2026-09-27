@@ -358,6 +358,11 @@ bit.
   `ninfer_exl3_quantize_interop_test` (Python writer -> C++ enumeration) pass CPU-only. The calibration stage
   that produces the Hessians is next; device runs await a free GPU.
 
+- 2026-09-27: Added the `qwen3_8_27b_exl3` official recipe. It assigns `exl3_mul1` (`import_encoded`) to
+  every Text/MTP projection present in the quantizer's `exl3.safetensors`, and leaves the embedding, GDN
+  a/b, norms and Vision at BF16; EXL3 parents stay separate until shared-`suh` fusion. Documented the
+  format and recipe in the conversion guide.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format

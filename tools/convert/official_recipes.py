@@ -10,6 +10,7 @@ from .methods import (
     nvfp4_absmax,
 )
 from .sources.compressed_tensors import compressed_matrix_source
+from .sources.exl3 import exl3_matrix_source
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -120,6 +121,29 @@ def qwen3_8_27b(model, recipe, sources):
 def qwen3_8_27b_bf16(model, recipe, sources):
     """Full-precision BF16 weights, the native EXL3 quantizer's input artifact."""
     _dense_bf16(model, recipe)
+
+
+def qwen3_8_27b_exl3(model, recipe, sources):
+    """Qwen3.8-27B with EXL3 Text/MTP projections produced by `ninfer-quantize`.
+
+    `--source quantized=PATH` is the quantizer's `exl3.safetensors`. Every projection present in
+    that store becomes `exl3_mul1`; everything else (embedding, norms, GDN a/b, Vision) keeps its
+    default precision. The app quantizes each projection on its own, so parents stay separate:
+    a fused EXL3 parent needs one shared input-scale vector, which is later work.
+    """
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    store = sources["quantized"]
+    for name, parameter in model.parameters.items():
+        if not parameter.projection or not store.has(name + ".trellis"):
+            continue
+        recipe.assign(
+            name,
+            format="exl3_mul1",
+            method=import_encoded,
+            source=exl3_matrix_source(store, name, parameter.shape),
+        )
+        recipe.separate(name)
 
 
 def qwen3_8_27b_q6(model, recipe, sources):
@@ -342,6 +366,7 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_bf16": qwen3_8_27b_bf16,
+    "qwen3_8_27b_exl3": qwen3_8_27b_exl3,
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
