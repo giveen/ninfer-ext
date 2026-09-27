@@ -722,6 +722,24 @@ void test_kv_demotion(ninfer::DeviceContext& device) {
     } catch (const std::logic_error&) { demote_rejected = true; }
     expect(demote_rejected, "demoting the partial writer tail is rejected");
 
+    // Streamed activation: the retained Host-only members rejoin without a Device replica.
+    addresses.deactivate(*address);
+    auto streamed = addresses.prepare_activation(*address, 4, 0, std::nullopt, 0, 2);
+    expect(addresses.streams_on_activation(streamed, 0) &&
+               addresses.streams_on_activation(streamed, 1) &&
+               !addresses.streams_on_activation(streamed, 2),
+           "only Host-only full members inside the stream range activate streamed");
+    expect(addresses.page_reservation(streamed).pages() == 0,
+           "a streamed activation reserves Device pages only for its resident members");
+    addresses.commit_activation(std::move(streamed), device.stream);
+    device.synchronize();
+    const auto reactivated = read_block_table(physical_tables, 0, 6);
+    expect(addresses.active(*address) && reactivated[0] == first.word() &&
+               reactivated[1] == second.word() && pages.writer_references(oldest[0]) == 0 &&
+               pages.writer_references(addresses.logical_page(*address, 2)) == 1 &&
+               addresses.entitlement(*address) == 6 && physical_pages.reserved_pages() == 0,
+           "streamed members publish Host words and never become writers");
+
     addresses.deactivate(*address);
     expect(addresses.release(*address) &&
                extents.release_unreferenced() == 2 * host_layout.page_stride &&

@@ -102,8 +102,9 @@ public:
     KVActivationReservation(KVActivationReservation&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), address_(other.address_),
           requested_entitlement_(other.requested_entitlement_),
-          activation_frontier_(other.activation_frontier_),
-          page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)) {}
+          activation_frontier_(other.activation_frontier_), stream_begin_(other.stream_begin_),
+          stream_end_(other.stream_end_), page_reservation_(std::move(other.page_reservation_)),
+          row_(std::move(other.row_)) {}
 
     KVActivationReservation& operator=(KVActivationReservation&&)      = delete;
     KVActivationReservation(const KVActivationReservation&)            = delete;
@@ -113,16 +114,22 @@ private:
     KVActivationReservation(KVAddressSpaceStore& owner, KVAddressSpaceHandle address,
                             std::uint32_t requested_entitlement,
                             std::optional<std::uint32_t> activation_frontier,
+                            std::uint32_t stream_begin, std::uint32_t stream_end,
                             DeviceKVPageReservation&& page_reservation,
                             KVExecutionRowLease&& row) noexcept
         : owner_(&owner), address_(address), requested_entitlement_(requested_entitlement),
-          activation_frontier_(activation_frontier), page_reservation_(std::move(page_reservation)),
+          activation_frontier_(activation_frontier), stream_begin_(stream_begin),
+          stream_end_(stream_end), page_reservation_(std::move(page_reservation)),
           row_(std::move(row)) {}
 
     KVAddressSpaceStore* owner_ = nullptr;
     KVAddressSpaceHandle address_;
     std::uint32_t requested_entitlement_ = 0;
     std::optional<std::uint32_t> activation_frontier_;
+    // KV streaming: members in [stream_begin_, stream_end_) that can stay Host-only
+    // (LogicalKVPageStore::can_stream_active) activate without a Device replica.
+    std::uint32_t stream_begin_ = 0;
+    std::uint32_t stream_end_   = 0;
     DeviceKVPageReservation page_reservation_;
     std::optional<KVExecutionRowLease> row_;
 
@@ -484,6 +491,17 @@ public:
                page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize) &&
                page.active_references == 1 && !page.pending_device_replica &&
                page.source_pins == 0 && !page.destination_pinned;
+    }
+
+    // A Host-only page that may join an active address space without a Device replica: a full,
+    // committed page whose Host replica is current. It is read through its Host word and never
+    // written, so it activates without the writer role (KV streaming, paged-kv §6.5).
+    [[nodiscard]] bool can_stream_active(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return !page.device_replica && !page.pending_device_replica && !page.destination_pinned &&
+               host_replica_current(handle) &&
+               page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize);
     }
 
     // The page leaves the Device for its current Host replica while staying a member of its one
@@ -946,25 +964,34 @@ public:
         commit_activation(std::move(reservation));
     }
 
+    // `stream_begin`/`stream_end` bound the members that may stay Host-only (KV streaming); the
+    // entitlement then covers the Device-resident members only, as after demote().
     [[nodiscard]] KVActivationReservation
     prepare_activation(KVAddressSpaceHandle handle, std::uint32_t entitlement,
                        std::int32_t execution_row,
-                       std::optional<std::uint32_t> activation_frontier = std::nullopt) {
+                       std::optional<std::uint32_t> activation_frontier = std::nullopt,
+                       std::uint32_t stream_begin = 0, std::uint32_t stream_end = 0) {
         Address& address = require(handle);
         if (address.active || address.row || address.reservation.valid() || entitlement == 0 ||
             entitlement > page_capacity_ ||
-            (activation_frontier && *activation_frontier > address.committed_frontier)) {
+            (activation_frontier && *activation_frontier > address.committed_frontier) ||
+            stream_begin > stream_end) {
             throw std::logic_error("KV address space is not reservable for activation");
         }
         const std::uint32_t required_pages =
             activation_frontier ? pages_for_tokens(*activation_frontier) : address.page_count;
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
         std::uint32_t missing_replicas      = 0;
+        std::uint32_t streamed              = 0;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            if (!pages_->device_resident(membership(address, page))) { ++missing_replicas; }
+            if (streams_member(address, page, stream_begin, stream_end)) {
+                ++streamed;
+            } else if (!pages_->device_resident(membership(address, page))) {
+                ++missing_replicas;
+            }
         }
-        const std::uint32_t growth =
-            entitlement > required_pages ? entitlement - required_pages : 0U;
+        const std::uint32_t device_pages = required_pages - streamed;
+        const std::uint32_t growth = entitlement > device_pages ? entitlement - device_pages : 0U;
         const std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
@@ -973,7 +1000,18 @@ public:
                                                    static_cast<std::uint32_t>(required));
         KVExecutionRowLease row = tables_->acquire(execution_row);
         return KVActivationReservation(*this, handle, entitlement, activation_frontier,
-                                       std::move(reservation), std::move(row));
+                                       stream_begin, stream_end, std::move(reservation),
+                                       std::move(row));
+    }
+
+    // Whether member `page` activates Host-only under `activation` (restores skip it).
+    [[nodiscard]] bool streams_on_activation(const KVActivationReservation& activation,
+                                             std::uint32_t page) const {
+        if (activation.owner_ != this || !valid(activation.address_)) {
+            throw std::logic_error("KV activation reservation is stale");
+        }
+        return streams_member(require(activation.address_), page, activation.stream_begin_,
+                              activation.stream_end_);
     }
 
     [[nodiscard]] std::vector<LogicalKVPageHandle>
@@ -1013,19 +1051,25 @@ public:
              address.committed_frontier != *activation.activation_frontier_)) {
             throw std::logic_error("KV activation destination changed after reservation");
         }
-        const std::uint32_t expected = activation.requested_entitlement_ > address.page_count
-                                           ? activation.requested_entitlement_ - address.page_count
-                                           : 0U;
-        if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
-            activation.page_reservation_.pages() != expected) {
-            throw std::logic_error("KV activation capacity reservation changed");
-        }
+        std::uint32_t streamed = 0;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
+            if (streams_member(address, page, activation.stream_begin_, activation.stream_end_)) {
+                ++streamed;
+                continue;
+            }
             if (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
                                                       !pages_->can_set_writer(logical, true))) {
                 throw std::logic_error("KV activation has an unavailable Device page");
             }
+        }
+        const std::uint32_t device_pages = address.page_count - streamed;
+        const std::uint32_t expected     = activation.requested_entitlement_ > device_pages
+                                               ? activation.requested_entitlement_ - device_pages
+                                               : 0U;
+        if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
+            activation.page_reservation_.pages() != expected) {
+            throw std::logic_error("KV activation capacity reservation changed");
         }
         address.reservation = std::move(activation.page_reservation_);
         address.row.emplace(std::move(*activation.row_));
@@ -1037,7 +1081,8 @@ public:
             const LogicalKVPageHandle logical = membership(address, page);
             if (pages_->address_references(logical) == 1) {
                 pages_->clear_protection(logical);
-                pages_->set_writer(logical, true);
+                // A streamed member is read in place and never written.
+                if (pages_->device_resident(logical)) { pages_->set_writer(logical, true); }
             }
             pages_->retain_active_reference(logical);
         }
@@ -1925,6 +1970,12 @@ private:
                                                         std::uint32_t page) const noexcept {
         const std::size_t index = static_cast<std::size_t>(&address - addresses_.data());
         return memberships_[index * page_capacity_ + page];
+    }
+
+    [[nodiscard]] bool streams_member(const Address& address, std::uint32_t page,
+                                      std::uint32_t begin, std::uint32_t end) const noexcept {
+        return page >= begin && page < end && page < address.page_count &&
+               pages_->can_stream_active(membership(address, page));
     }
 
     void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
