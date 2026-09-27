@@ -155,6 +155,12 @@ class PrepareRequest:
             for p in pieces
         ):
             raise ValueError("encoded inputs cannot share one parent format/divisor")
+        if any(
+            (p.input_scales is None) != (first.input_scales is None)
+            or (p.input_scales is not None and not torch.equal(p.input_scales, first.input_scales))
+            for p in pieces
+        ):
+            raise ValueError("EXL3 inputs of one parent must share their input scales")
         if len(pieces) == 1:
             return first
         return EncodedRows(
@@ -162,6 +168,7 @@ class PrepareRequest:
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.input_scales,
         )
 
 
@@ -298,9 +305,9 @@ def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
+    """Preserve source codes and scales: FP8/NVFP4 (with divisors) and EXL3 trellis tiles."""
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
+        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "exl3_mul1")
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -354,10 +361,16 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     # Imported words are copied, not computed, so the chunk is sized by bytes: rows_per_chunk
     # alone gives the 160-byte rows of an n-gram table 80 KB chunks and hundreds of thousands of
     # reads. Chunk boundaries do not change the stored bytes.
-    row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
+    if request.target.format == "exl3_mul1":
+        # One 16-row tile row holds k/16 tiles of bitrate_half_bits * 16 bytes, plus 16 scales.
+        row_bytes = k * request.target.bitrate_half_bits // 16 + 4
+    else:
+        row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
     chunk = max(request.rows_per_chunk, IMPORT_CHUNK_BYTES // row_bytes)
     if request.target.format == "nvfp4":
         chunk = max(128, chunk // 128 * 128)
+    elif request.target.format == "exl3_mul1":
+        chunk = max(16, chunk // 16 * 16)
 
     def produce(output):
         # A stacked plane starts a new run of chunks at every source boundary, because a chunk that
@@ -374,7 +387,13 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
         for edge in bounds:
             for begin in range(cursor, edge, chunk):
                 words = request.encoded_rows(begin, min(edge, begin + chunk))
-                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+                output.write_codes(
+                    begin,
+                    words.codes,
+                    words.scales,
+                    words.weight_divisor,
+                    input_scales=words.input_scales,
+                )
             cursor = edge
 
     return request.job(produce=produce, auxiliaries=auxiliaries)

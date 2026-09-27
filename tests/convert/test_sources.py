@@ -6,6 +6,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tools.artifact.codecs import exl3
 from tools.convert.sources.safetensors import SafetensorsSource
 from tools.convert.sources.compressed_tensors import (
     compressed_matrix_source,
@@ -97,3 +98,37 @@ def test_row_fp8_source_and_reordered_encoded_rows(tmp_path):
         words = reordered.read_encoded(0, 2)
         assert torch.equal(words.codes, codes.flip(0))
         assert torch.equal(words.scales, scales.flatten().flip(0))
+
+
+def test_exl3_source_preserves_tiles_and_decodes_independently(tmp_path):
+    n = k = 128
+    half_bits = 3
+    generator = torch.Generator().manual_seed(11)
+    trellis = torch.randint(
+        0, 256, (n // 16, k // 16, 16 * half_bits), dtype=torch.uint8, generator=generator
+    )
+    su = (torch.rand(k, generator=generator) + 0.5).float()
+    sv = (torch.rand(n, generator=generator) + 0.5).float()
+    save_file(
+        {"proj.trellis": trellis, "proj.su": su, "proj.sv": sv},
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        # A missing explicit format still detects the native quantizer's tiles.
+        source = matrix_source(store, "proj.weight", (n, k))
+        assert source.shape == (n, k)
+        assert source.bitrate_half_bits() == half_bits
+        words = source.read_encoded(0, n)
+        assert words.format == "exl3_mul1"
+        assert torch.equal(words.codes, trellis)
+        assert torch.equal(words.scales, sv)
+        assert torch.equal(words.input_scales, su)
+        # Rows move in whole 16-row tiles.
+        assert torch.equal(source.read_encoded(16, 48).codes, trellis[1:3])
+        with pytest.raises(ValueError, match="whole 16-row tiles"):
+            source.read_encoded(0, 8)
+        # Logical values are the exact FP64 decode of the stored planes.
+        expected = exl3.decode(trellis, su, sv, half_bits).float()
+        assert torch.allclose(source.values().reshape(n, k), expected, rtol=0, atol=0)
+        explicit = matrix_source(store, "proj.weight", (n, k), "exl3_mul1")
+        assert explicit.bitrate_half_bits() == half_bits

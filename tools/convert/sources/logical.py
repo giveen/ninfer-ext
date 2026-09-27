@@ -15,6 +15,8 @@ class EncodedRows:
     codes: torch.Tensor
     scales: torch.Tensor
     weight_divisor: bytes | None = None
+    # EXL3: the tensor's input scales, shared by every row block.
+    input_scales: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +29,8 @@ class LogicalSource:
     read_encoded: Callable[[int, int], EncodedRows] | None = None
     weight_divisor: Callable[[], bytes] | None = None
     input_divisor: Callable[[], bytes] | None = None
+    # EXL3: the stored rate in half bits, known before any rows are read.
+    bitrate_half_bits: Callable[[], int] | None = None
 
     def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
         end = prod(self.shape) if end is None else end

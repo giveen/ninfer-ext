@@ -340,6 +340,20 @@ class Recipe:
                 )
             return len(sources)
 
+        def parent_bitrate(sources, selection) -> int | None:
+            """The EXL3 rate every source of the parent was encoded at."""
+            if selection.format != "exl3_mul1":
+                return None
+            rates = {
+                source.bitrate_half_bits() if source.bitrate_half_bits else None
+                for source in sources
+            }
+            if None in rates or len(rates) != 1:
+                raise ValueError(
+                    "EXL3 parents need sources encoded at one known bitrate_half_bits"
+                )
+            return rates.pop()
+
         def emit(items, chosen=None):
             if len({self.model.parameters[name].residency for name, _ in items}) > 1:
                 raise ValueError(
@@ -353,9 +367,15 @@ class Recipe:
             selection = items[0][1]
             layout = selection.layout or default_layout(selection.format)
             divisors = parent_divisors(sources, selection)
-            encoded_size(layout, selection.format, dims, divisors)
+            half_bits = parent_bitrate(sources, selection)
+            encoded_size(layout, selection.format, dims, divisors, half_bits)
             spec = TensorSpec(
-                f"weight/{len(weights):06d}", dims, selection.format, layout, divisors
+                f"weight/{len(weights):06d}",
+                dims,
+                selection.format,
+                layout,
+                divisors,
+                half_bits,
             )
             inputs = tuple(
                 MethodInput(

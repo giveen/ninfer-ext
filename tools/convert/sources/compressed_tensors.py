@@ -13,6 +13,7 @@ import torch
 
 from tools.artifact.codecs.fp8_row import validate_fp8_row_words
 from tools.artifact.formats import valid_positive_fp32_word
+from .exl3 import exl3_matrix_source, has_exl3
 from .logical import EncodedRows, LogicalSource
 from .safetensors import SafetensorsSource, tensor_source
 
@@ -147,15 +148,18 @@ def matrix_source(
         nonlocal resolved
         if resolved is None:
             actual = format
+            if actual is None and has_exl3(store, prefix):
+                actual = "exl3_mul1"
             if actual is None and store.has(prefix + ".weight_packed"):
                 actual = "nvfp4"
             if actual is None and store.describe(name).dtype == "F8_E4M3":
                 actual = "fp8_e4m3fn_row_bf16"
-            resolved = (
-                tensor_source(store, name, shape)
-                if actual is None
-                else compressed_matrix_source(store, prefix, shape, actual)
-            )
+            if actual == "exl3_mul1":
+                resolved = exl3_matrix_source(store, prefix, shape)
+            elif actual is None:
+                resolved = tensor_source(store, name, shape)
+            else:
+                resolved = compressed_matrix_source(store, prefix, shape, actual)
         return resolved
 
     def encoded(begin: int, end: int) -> EncodedRows:
@@ -177,4 +181,5 @@ def matrix_source(
         encoded,
         lambda: divisor("weight_divisor"),
         lambda: divisor("input_divisor"),
+        lambda: divisor("bitrate_half_bits"),
     )
