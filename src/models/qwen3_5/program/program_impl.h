@@ -1252,6 +1252,9 @@ private:
     // Eager single-sequence execution (prefill chunks, forced tokens) reads its execution rows
     // from io; lanes interleave, so every such step selects its own rows first.
     void select_sequence_kv_rows(const SequenceState& sequence);
+    // KV streaming: stages the mapped text KV of `lanes` when any of it is Host-resident, so a
+    // round reads it once per layer from Device; null keeps the round on its graph.
+    [[nodiscard]] qwen3_5::KVHostStaging* stage_text_kv(std::span<const std::uint32_t> lanes);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);

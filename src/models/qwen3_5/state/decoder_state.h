@@ -5,8 +5,10 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/sparse_attention.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -31,7 +33,7 @@ struct DecoderStateSpec {
     // KV streaming: the physical pools may be smaller than one full-capacity sequence, since
     // older pages are served from Host records.
     bool kv_stream = false;
-    // KV streaming: Host pages one text prefill chunk can stage on Device (KVHostStaging).
+    // KV streaming: Host pages one text step can stage on Device (KVHostStaging).
     std::uint32_t kv_staging_pages = 0;
 };
 
@@ -125,13 +127,14 @@ private:
     HostKVPageLayout host_layout_;
 };
 
-// Device staging for a streamed text prefill chunk (paged-kv §6.5). A prompt kernel reads every
-// visible page once per query tile, so reading Host pages in place multiplies PCIe traffic by the
-// tile count. Instead each layer's slice of the chunk's Host pages is copied once into `buffer`,
-// laid out as compact one-layer records, and a staged copy of the execution tables points the
-// Host words at those records; paged Ops then resolve them through the Host arm from Device memory.
+// Device staging of streamed text KV for one execution step (paged-kv §6.5). Each layer's slice of
+// the step's Host pages is copied once, through the copy engine, into `buffer` as compact one-layer
+// records, and a staged copy of the execution tables points the Host words at those records; paged
+// Ops then resolve them through the Host arm from Device memory. A prompt chunk would otherwise read
+// every Host page over PCIe once per query tile; a decode round reads each once, but SM zero-copy
+// over the all-layer Host records reaches well under the copy engine's rate.
 struct KVHostStagingLayout {
-    TensorRegion buffer; // U8 [record_stride, capacity_pages]
+    TensorRegion buffer; // U8 [record_stride, capacity_pages, 2]: two layer buffers
     TensorRegion tables; // I32 [logical pages, table rows], shaped like the execution tables
     std::size_t record_stride    = 0;
     std::uint32_t capacity_pages = 0;
@@ -145,18 +148,39 @@ public:
     KVHostStaging(const KVHostStaging&)            = delete;
     KVHostStaging& operator=(const KVHostStaging&) = delete;
 
-    // Stages execution row `row` for a chunk that reads logical pages [0, pages). Returns false,
-    // staging nothing, when those pages hold no Host word or more than the buffer fits; the chunk
-    // then reads its Host pages in place. The row's words must not change until the chunk ends.
-    [[nodiscard]] bool prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream);
+    struct RowPages {
+        std::int32_t row    = 0; // execution-table row
+        std::uint32_t pages = 0; // logical pages [0, pages) the step reads
+    };
 
-    // Enqueues the copy of layer `layer`'s slices of the prepared Host pages and returns `view`
-    // reading them from the staging buffer. Stream-ordered: the next layer's copy overwrites the
-    // buffer after this layer's readers.
+    // Stages the rows of one step executing on `stream`; layer copies run on `transfer`. Returns
+    // false, staging nothing, when those pages hold no Host word or more than a buffer fits; the
+    // step then reads its Host pages in place. The rows' words must not change until the step
+    // ends.
+    [[nodiscard]] bool prepare(std::span<const RowPages> rows, cudaStream_t stream,
+                               cudaStream_t transfer);
+    [[nodiscard]] bool prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream,
+                               cudaStream_t transfer) {
+        const RowPages single{.row = row, .pages = pages};
+        return prepare(std::span<const RowPages>(&single, 1), stream, transfer);
+    }
+
+    // Returns `view` reading layer `layer`'s slices of the prepared Host pages from Device, and
+    // starts copying the next layer's into the other buffer so it overlaps this layer's compute.
+    // Layers are staged in increasing order within a step; the step's stream waits for each
+    // copy, and a buffer is refilled only after the readers enqueued before the refill.
     [[nodiscard]] PagedKVBatchLayerView stage(const PagedKVBatchLayerView& view,
-                                              std::uint32_t layer, cudaStream_t stream) const;
+                                              std::uint32_t layer);
 
 private:
+    struct EventDeleter {
+        void operator()(cudaEvent_t event) const noexcept { (void)cudaEventDestroy(event); }
+    };
+    using Event = std::unique_ptr<CUevent_st, EventDeleter>;
+
+    void copy_layer(std::uint32_t layer, cudaStream_t stream) const;
+    [[nodiscard]] std::byte* buffer(std::uint32_t layer) const;
+
     struct Run {
         std::uint32_t unit  = 0; // Host unit of the first page
         std::uint32_t index = 0; // staging record of the first page
@@ -170,6 +194,11 @@ private:
     std::uint32_t capacity_pages_ = 0;
     std::vector<std::int32_t> words_;
     std::vector<Run> runs_;
+    cudaStream_t stream_   = nullptr;
+    cudaStream_t transfer_ = nullptr;
+    std::array<Event, 2> copied_;
+    Event consumed_;
+    std::int64_t prefetched_layer_ = -1;
 };
 
 struct DecoderStateLayout {

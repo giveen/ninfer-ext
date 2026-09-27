@@ -38,6 +38,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, state.mtp_cache);
         card.set_qwen4_runtime(state.execution.qwen4);
+        card.set_text_kv_staging(state.text_kv_staging);
         upload_qwen4_round_input(state.execution, batch_size);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
@@ -352,6 +353,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             stage_qwen4_round_column(ledger.first(ledger.size() - 1U), ledger.last(1), 0, row);
             ensure_sequence_kv_mapped(sequence, frontier + 1, append_mtp ? frontier + 1 : 0);
         }
+        // A round over streamed KV runs eager so its Host pages can be staged per layer.
+        qwen3_5::KVHostStaging* staging = stage_text_kv(lanes);
+        if (staging != nullptr) {
+            executable = nullptr;
+            envelope   = {maximum_frontier + 1, maximum_frontier + 1};
+        }
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
@@ -362,7 +369,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *ordinary_host_ingress,
             *ordinary_host_egress,
             state_images->continuation_hidden_store(),
-            append_mtp ? decoder->mtp_cache() : nullptr};
+            append_mtp ? decoder->mtp_cache() : nullptr,
+            staging};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -534,6 +542,11 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + k));
         }
+        qwen3_5::KVHostStaging* staging = stage_text_kv(lanes);
+        if (staging != nullptr) {
+            executable = nullptr;
+            envelopes  = mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
+        }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    &rung.records, io, prefill_hidden, prefill_width,
@@ -543,7 +556,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   rung.frame,
                                                   *mtp_host_ingress,
                                                   *mtp_host_egress,
-                                                  state_images->continuation_hidden_store()};
+                                                  state_images->continuation_hidden_store(),
+                                                  staging};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,

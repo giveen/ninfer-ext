@@ -113,7 +113,7 @@ public:
     }
 
     // Streamed prefill: full-attention layers read the chunk's Host pages from this staging.
-    void set_text_kv_staging(const qwen3_5::KVHostStaging* staging) noexcept {
+    void set_text_kv_staging(qwen3_5::KVHostStaging* staging) noexcept {
         text_kv_staging_ = staging;
     }
 
@@ -292,7 +292,7 @@ private:
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
-    const qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
+    qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;

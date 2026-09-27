@@ -114,7 +114,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
             .buffer = builder.add_tensor(
                 DType::U8,
                 {static_cast<std::int32_t>(stride),
-                 static_cast<std::int32_t>(spec.kv_staging_pages)},
+                 static_cast<std::int32_t>(spec.kv_staging_pages), 2},
                 256, "Paged KV prefill staging"),
             .tables = builder.add_tensor(
                 DType::I32,
@@ -247,64 +247,118 @@ KVHostStaging::KVHostStaging(DeviceSpan backing, const KVHostStagingLayout& layo
         tables_.ne[1] != cache.execution_tables().matrix().ne[1]) {
         throw std::logic_error("Paged KV prefill staging layout is inconsistent");
     }
-    words_.reserve(static_cast<std::size_t>(tables_.ne[0]));
+    words_.reserve(static_cast<std::size_t>(tables_.ne[0]) *
+                   static_cast<std::size_t>(tables_.ne[1]));
     runs_.reserve(capacity_pages_);
+    const auto make_event = [] {
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        return Event(event);
+    };
+    copied_   = {make_event(), make_event()};
+    consumed_ = make_event();
 }
 
-bool KVHostStaging::prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream) {
-    runs_.clear();
-    const std::span<const std::int32_t> published = cache_->execution_tables().published_words(row);
-    if (pages > published.size()) {
-        throw std::out_of_range("prefill KV staging reads past the execution row");
+bool KVHostStaging::prepare(std::span<const RowPages> rows, cudaStream_t stream,
+                            cudaStream_t transfer) {
+    // A step that ended before its last layer may leave a prefetch in flight into a buffer the
+    // next step refills on its own stream.
+    if (prefetched_layer_ >= 0) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, copied_[prefetched_layer_ & 1].get()));
     }
+    runs_.clear();
+    prefetched_layer_ = -1;
+    stream_           = stream;
+    transfer_         = transfer;
     if (cache_->host_base() == nullptr) { return false; }
     const auto page_units = static_cast<std::uint32_t>(cache_->host_layout().page_stride /
                                                        kHostKVPageUnitBytes);
     const auto record_units = static_cast<std::uint32_t>(record_stride_ / kHostKVPageUnitBytes);
-    words_.assign(published.begin(), published.begin() + pages);
+    const auto row_words    = static_cast<std::size_t>(tables_.ne[0]);
+    // Every row's staged words, then one upload each; records are shared across the rows.
+    words_.clear();
     std::uint32_t staged = 0;
-    for (std::int32_t& word : words_) {
-        const KVPageRef ref = KVPageRef::from_word(word);
-        if (!ref.host()) { continue; }
-        if (staged == capacity_pages_) {
-            runs_.clear();
-            return false;
+    for (const RowPages& request : rows) {
+        const std::span<const std::int32_t> published =
+            cache_->execution_tables().published_words(request.row);
+        if (request.pages > published.size()) {
+            throw std::out_of_range("KV staging reads past the execution row");
         }
-        const auto unit = static_cast<std::uint32_t>(ref.host_unit());
-        if (!runs_.empty() && runs_.back().unit + runs_.back().count * page_units == unit) {
-            ++runs_.back().count;
-        } else {
-            runs_.push_back(Run{.unit = unit, .index = staged, .count = 1});
+        const std::size_t first = words_.size();
+        words_.insert(words_.end(), published.begin(), published.begin() + request.pages);
+        for (std::size_t index = first; index < words_.size(); ++index) {
+            const KVPageRef ref = KVPageRef::from_word(words_[index]);
+            if (!ref.host()) { continue; }
+            if (staged == capacity_pages_) {
+                runs_.clear();
+                return false;
+            }
+            const auto unit = static_cast<std::uint32_t>(ref.host_unit());
+            if (!runs_.empty() && runs_.back().index + runs_.back().count == staged &&
+                runs_.back().unit + runs_.back().count * page_units == unit) {
+                ++runs_.back().count;
+            } else {
+                runs_.push_back(Run{.unit = unit, .index = staged, .count = 1});
+            }
+            words_[index] = KVPageRef(static_cast<HostPageUnit>(staged * record_units)).word();
+            ++staged;
         }
-        word = KVPageRef(static_cast<HostPageUnit>(staged * record_units)).word();
-        ++staged;
     }
     if (runs_.empty()) { return false; }
-    // Pageable source: the call returns once the words are captured, so words_ may be reused.
-    auto* destination = static_cast<std::int32_t*>(tables_.data) +
-                        static_cast<std::size_t>(row) * static_cast<std::size_t>(tables_.ne[0]);
-    CUDA_CHECK(cudaMemcpyAsync(destination, words_.data(), words_.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
+    // Pageable source: each call returns once the words are captured, so words_ may be reused.
+    std::size_t offset = 0;
+    for (const RowPages& request : rows) {
+        auto* destination = static_cast<std::int32_t*>(tables_.data) +
+                            static_cast<std::size_t>(request.row) * row_words;
+        CUDA_CHECK(cudaMemcpyAsync(destination, words_.data() + offset,
+                                   request.pages * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   stream));
+        offset += request.pages;
+    }
     return true;
 }
 
-PagedKVBatchLayerView KVHostStaging::stage(const PagedKVBatchLayerView& view,
-                                              std::uint32_t layer, cudaStream_t stream) const {
-    if (runs_.empty()) { throw std::logic_error("prefill KV staging is not prepared"); }
+std::byte* KVHostStaging::buffer(std::uint32_t layer) const {
+    return static_cast<std::byte*>(buffer_.data) +
+           static_cast<std::size_t>(layer & 1U) * record_stride_ * capacity_pages_;
+}
+
+void KVHostStaging::copy_layer(std::uint32_t layer, cudaStream_t stream) const {
     const HostKVPageLayout& host = cache_->host_layout();
-    const std::size_t planes     = cache_->planes_per_layer();
-    const HostLayerSpan span     = host_layer_span(host, planes, layer);
-    auto* buffer                 = static_cast<std::byte*>(buffer_.data);
+    const HostLayerSpan span     = host_layer_span(host, cache_->planes_per_layer(), layer);
+    std::byte* destination       = buffer(layer);
     for (const Run& run : runs_) {
         CUDA_CHECK(cudaMemcpy2DAsync(
-            buffer + static_cast<std::size_t>(run.index) * record_stride_, record_stride_,
+            destination + static_cast<std::size_t>(run.index) * record_stride_, record_stride_,
             cache_->host_base() + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes +
                 span.begin,
             host.page_stride, span.bytes, run.count, cudaMemcpyHostToDevice, stream));
     }
-    const std::size_t first = static_cast<std::size_t>(layer) * planes;
-    const auto plane        = [&](std::size_t index) -> const std::byte* {
-        return buffer + (host.planes[first + index].offset - span.begin);
+}
+
+PagedKVBatchLayerView KVHostStaging::stage(const PagedKVBatchLayerView& view,
+                                           std::uint32_t layer) {
+    if (runs_.empty()) { throw std::logic_error("KV staging is not prepared"); }
+    if (prefetched_layer_ == static_cast<std::int64_t>(layer)) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream_, copied_[layer & 1U].get()));
+    } else {
+        copy_layer(layer, stream_);
+    }
+    // The other buffer's last readers (layer - 1) are enqueued on the step stream by now.
+    if (layer + 1U < cache_->layers()) {
+        CUDA_CHECK(cudaEventRecord(consumed_.get(), stream_));
+        CUDA_CHECK(cudaStreamWaitEvent(transfer_, consumed_.get()));
+        copy_layer(layer + 1U, transfer_);
+        CUDA_CHECK(cudaEventRecord(copied_[(layer + 1U) & 1U].get(), transfer_));
+        prefetched_layer_ = static_cast<std::int64_t>(layer) + 1;
+    }
+    const HostKVPageLayout& host = cache_->host_layout();
+    const std::size_t planes     = cache_->planes_per_layer();
+    const HostLayerSpan span     = host_layer_span(host, planes, layer);
+    const std::size_t first      = static_cast<std::size_t>(layer) * planes;
+    std::byte* base              = buffer(layer);
+    const auto plane             = [&](std::size_t index) -> const std::byte* {
+        return base + (host.planes[first + index].offset - span.begin);
     };
     PagedKVBatchLayerView staged = view;
     staged.block_tables          = tables_;

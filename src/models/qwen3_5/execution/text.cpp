@@ -979,7 +979,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const PagedKVBatchLayerView text_kv_layer =
         text_kv_staging_ != nullptr
             ? text_kv_staging_->stage(batch_text_kv_->batch_layer_view(fidx),
-                                     static_cast<std::uint32_t>(fidx), s)
+                                     static_cast<std::uint32_t>(fidx))
             : batch_text_kv_->batch_layer_view(fidx);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;

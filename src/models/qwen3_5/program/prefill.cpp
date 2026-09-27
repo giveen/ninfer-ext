@@ -1119,7 +1119,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         decoder->text_kv_staging &&
                                 decoder->text_kv_staging->prepare(
                                     text_kv_addresses->bound_row(sequence.kv->text),
-                                    kv_pages_for_tokens(chunk_end), device.stream)
+                                    kv_pages_for_tokens(chunk_end), device.stream,
+                                    device.transfer_stream)
                             ? &*decoder->text_kv_staging
                             : nullptr;
                 }

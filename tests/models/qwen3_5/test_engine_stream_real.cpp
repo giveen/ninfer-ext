@@ -34,7 +34,7 @@ std::vector<ninfer::TokenId> make_prompt(std::uint32_t seed, std::size_t tokens)
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t concurrency,
-                                     std::uint32_t kv_capacity, bool kv_stream) {
+                                     std::uint32_t kv_capacity, bool kv_stream, bool mtp = false) {
     ninfer::EngineOptions options;
     options.artifact_path        = artifact;
     options.max_context          = kMaxContext;
@@ -44,6 +44,12 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t concurr
     options.max_pending_requests = concurrency;
     options.kv_stream            = kv_stream;
     if (kv_stream) { options.context_cache.host_kv_capacity_bytes = 1ULL << 30; }
+    if (mtp) {
+        // Fixed K: an adaptive draft length follows startup-timed round costs, not the model.
+        options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+        options.speculative.fixed_draft  = true;
+    }
     return options;
 }
 
@@ -107,11 +113,20 @@ int main() {
                         .generated_token_ids);
             }
         }
+        std::vector<ninfer::TokenId> mtp_reference;
+        {
+            ninfer::Engine engine(engine_options(artifact, 1, kMaxContext, false, true));
+            mtp_reference = engine.generate(engine.prepare_tokens(prompts[0]), greedy_request())
+                                .generated_token_ids;
+        }
         int failures = 0;
         // Streaming alone: a ~5.5k-token Device window, so older pages move to Host during
-        // prefill (read through prefill staging) and decode (read in place).
+        // prefill and decode, and every step reads them through Device staging.
         failures += compare("kv-stream C=1", {reference[0]},
                             run_together(engine_options(artifact, 1, 5504, true), {prompts[0]}, 0));
+        failures +=
+            compare("kv-stream C=1 MTP", {mtp_reference},
+                    run_together(engine_options(artifact, 1, 5504, true, true), {prompts[0]}, 0));
         for (std::size_t long_request = 0; long_request < prompts.size(); ++long_request) {
             const std::string suffix = " (long request " + std::to_string(long_request) + ")";
             // Prefill chunks of both requests interleave: each must use its own KV rows.

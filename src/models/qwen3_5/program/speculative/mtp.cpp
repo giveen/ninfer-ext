@@ -86,6 +86,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
         card.set_qwen4_runtime(state.execution.qwen4);
+        card.set_text_kv_staging(state.text_kv_staging);
         upload_qwen4_round_input(state.execution, static_cast<std::int32_t>(k + 1U) * batch_size);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);

@@ -1425,6 +1425,22 @@ void ProgramImpl::select_sequence_kv_rows(const SequenceState& sequence) {
                                         : 0);
 }
 
+qwen3_5::KVHostStaging* ProgramImpl::stage_text_kv(std::span<const std::uint32_t> lanes) {
+    if (!decoder->text_kv_staging) { return nullptr; }
+    std::array<qwen3_5::KVHostStaging::RowPages, kMaximumConcurrency> rows{};
+    if (lanes.size() > rows.size()) { throw std::logic_error("KV staging batch is too wide"); }
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        const SequenceState& sequence = active_sequence(lanes[index]);
+        rows[index] = {.row   = text_kv_addresses->bound_row(sequence.kv->text),
+                       .pages = text_kv_addresses->mapped_pages(sequence.kv->text)};
+    }
+    return decoder->text_kv_staging->prepare(
+               std::span<const qwen3_5::KVHostStaging::RowPages>(rows.data(), lanes.size()),
+               device.stream, device.transfer_stream)
+               ? &*decoder->text_kv_staging
+               : nullptr;
+}
+
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {

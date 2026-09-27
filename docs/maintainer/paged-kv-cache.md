@@ -496,14 +496,17 @@ Device window，更早的 full pages 由 Host records 原地读取：
   状态。Sink 与 tail pages 永不 stream；被拒绝的 speculative round 只截断 tail。
 - Host capacity：Host KV arena 不足时先释放无引用 extents 再重试一次；仍失败时 decode lease
   按 §7.2 settle；prefill 每个 chunk 各自 map，其 mapping 失败按 Device OOM（`std::bad_alloc`）恢复，失败当前 active requests，worker 继续运行。
-- Prefill staging：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host pages 会让
-  PCIe 流量乘以 tile 数。Text prefill chunk 因此先由 `KVHostStaging::prepare` 把该 row 的 table
-  words 复制到 staged tables，Host words 改为紧凑 staging record 编号；每个 full-attention layer
-  在 attention 前用 copy engine 把这些 pages 的该层 plane span 复制到 Device staging buffer，view 的
-  Host plane bases 指向该 buffer，paged Ops 经 Host arm 从 Device 读取。Staging 容量为
-  `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该
-  chunk 退回原地读取。MTP prefill 只有末尾一个 query 的 attention，不需要 staging；decode 每步每页
-  只读一次，保持原地读取。
+- Host staging（`KVHostStaging`）：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host
+  pages 会让 PCIe 流量乘以 tile 数；decode 每页只读一次，但 SM zero-copy 读 all-layer Host records
+  只有 13–23 GB/s，而 copy engine 达 ~50 GB/s。因此每个含 Host pages 的 text step（prefill chunk、
+  ordinary 或 MTP decode round）先由 `prepare` 把各 row 的 table words 复制到 staged tables，Host
+  words 改为紧凑 staging record 编号（多个 rows 共用一个 record 空间）；每个 full-attention layer
+  的 view 读 Device staging buffer，paged Ops 经 Host arm 从 Device 读取。两个 layer buffer 交替：
+  layer L 的 attention 期间，transfer stream 把 layer L+1 的 plane spans 复制到另一个 buffer（等待
+  该 buffer 此前的 readers），step stream 在 attention 前等待本层 copy。含 staging 的 decode round
+  以 eager 执行（实测 eager 仅慢 ~1%）；不含 Host pages 的 round 仍用 CUDA Graph。容量为每个 buffer
+  `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该 step
+  退回原地读取。MTP layer 自身的 pool 只有一层，保持原地读取。
 - 范围：Host record 为 page-major layout；QSA index pool、DFlash head-major pool 与 CausalScoring
   拒绝 `kv_stream`。启用 `kv_stream` 的 Engine 目前对所有 request 关闭 context cache（不 capture、
   不 publish continuation、不复用 prefix），因为 retain/restore 假设 Device-resident membership。
