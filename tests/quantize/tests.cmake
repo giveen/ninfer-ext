@@ -51,6 +51,14 @@ ninfer_add_test(ninfer_exl3_quantize_source_test
 target_include_directories(ninfer_exl3_quantize_source_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/quantize)
 
+ninfer_add_test(ninfer_exl3_trace_reader_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_trace_reader.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/trace_reader.cpp"
+          "${PROJECT_SOURCE_DIR}/apps/quantize/source_writer.cpp"
+  LIBRARIES ninfer_artifact)
+target_include_directories(ninfer_exl3_trace_reader_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/quantize)
+
 add_test(NAME ninfer_exl3_quantize_interop_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/quantize_interop.py"
     $<TARGET_FILE:ninfer-quantize>)

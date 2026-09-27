@@ -368,6 +368,10 @@ bit.
   `exl3_mul1` artifact, and the artifact's own planes decode to the source in FP64. Fixed
   `import_encoded`'s format probe to read a whole 16-row tile for EXL3.
 
+- 2026-09-27: Added the C++ packed-trace reader (`quantize/trace_reader.cpp`) that the calibration
+  stage will consume: `input_ids` I64 [rows, tokens] and `lengths` I64 [rows], validated and converted
+  to I32. `ninfer_exl3_trace_reader_test` covers the round trip and its rejections, CPU-only.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
