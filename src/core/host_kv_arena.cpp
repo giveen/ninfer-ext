@@ -292,6 +292,9 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
     // An arena smaller than one chunk is a single chunk of the pages it fits.
     const std::size_t packed_slots = capacity_bytes / stride_sum;
     if (packed_slots == 0) { return; }
+    while (chunk_pages > kHostKVMinChunkPages && packed_slots < std::size_t{16} * chunk_pages) {
+        chunk_pages = std::max(kHostKVMinChunkPages, chunk_pages / 2U);
+    }
     chunk_pages_ = static_cast<std::uint32_t>(std::min<std::size_t>(chunk_pages, packed_slots));
     layout_offsets_.reserve(layouts_.size());
     for (const HostKVPageLayout& layout : layouts_) {

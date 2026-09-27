@@ -371,7 +371,8 @@ Host replica 使用 logical-order、layer-major 的 `HostKVPageLayout`：
 - 不保存 Device page ID 或 block-table holes；
 - 每个 page 包含该 typed pool 的全部 grouped plane payload；一层的 planes 组成 256 B 对齐的
   layer span（`KVPageGeometry::layer_planes` 给出每层 plane 数），各层 span 等长；
-- Slots 按 chunk（默认 `kHostKVChunkPages` = 64 pages，按 2 MiB 对齐）分组；chunk c 依次存放
+- Slots 按 chunk（默认 `kHostKVChunkPages` = 64 pages，按 2 MiB 对齐；容量向下取整到整 chunk，不足 16 个 chunk
+  的 arena 把 chunk 减半，最小为 demotion group 的 16 pages）分组；chunk c 依次存放
   每个 layout 的 slots `[c·C, (c+1)·C)`，各自 layer-major：layer l 的 slot s 位于
   `chunk + layout offset + (l·C + s mod C) × layer_span`。同一 chunk 内同一层的相邻 pages 在内存中
   相邻，一次 copy run 每层是一段连续内存（run 在 chunk 边界处拆分）；

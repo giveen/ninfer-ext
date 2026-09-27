@@ -214,8 +214,11 @@ private:
     friend class HostKVArena;
 };
 
-// Default pages per HostKVArena chunk: a multiple of the KV streaming demotion group.
-inline constexpr std::uint32_t kHostKVChunkPages = 64;
+// Default pages per HostKVArena chunk. Usable capacity rounds down to whole chunks, so an arena
+// of fewer than 16 chunks halves them, down to kHostKVMinChunkPages (the KV streaming demotion
+// group); longer chunks give longer contiguous copy runs.
+inline constexpr std::uint32_t kHostKVChunkPages    = 64;
+inline constexpr std::uint32_t kHostKVMinChunkPages = 16;
 
 // Pinned Host pages for every supported layout. Each layout owns an equal number of page slots
 // (a page of one pool pairs with a page of another). Slots come in chunks of `chunk_pages`; chunk c
