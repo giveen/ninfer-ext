@@ -157,29 +157,7 @@ Other settings that matter for speed:
   `--host-cache-mib` (for example `16384`) so reusable prefixes survive in pinned RAM.
 - **Flash-Next:** keep `--expert-cache auto` (the default) and enough free host RAM that the n-gram
   table stays page-cache mapped (`--ngram-residency auto` decides).
-- **Contexts larger than GPU memory:** add `--kv-stream` with `--host-kv-mib`
-  sized for the spilled KV. Each request owns `--kv-capacity / --max-concurrency` of GPU KV and
-  borrows idle shares, which it gives back when another request needs them. Beyond that, older full
-  pages move to pinned RAM and are copied back per layer as each step needs them. Requests that fit
-  the free GPU KV run at full speed. Once a request spills, every step reads its spilled KV over
-  PCIe:
-  - Measured on 27B `nvfp4` with BF16 KV, 35k-token context and a 12k-token share: prefill ran
-    at the resident rate. Decode ran at 32 tok/s versus 71 tok/s resident.
-  - Use `--kv-dtype fp8`, which halves the bytes read.
-  - A lone request on a C=2 server borrowed the idle share and decoded at the resident rate.
-  - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
-    total at 262k with FP8, ~2 GB with BF16.
-  - A conversation that spilled still resumes from its previous turn: the next request reuses
-    that KV with the older pages left in RAM. 27B, BF16 KV, 30.6k-token chat with a 12k share:
-    the second turn's TTFT was 188 ms (resident 170 ms) instead of 4.2 s for a fresh prefill.
-    Branching and shared prefixes reuse the same way; outputs matched resident runs.
-  - Size `--host-kv-mib` for the spill: admission reserves Host KV for each request's prompt plus
-    output limit (`max_tokens`, default 8192) beyond its share. A request that does not fit waits
-    for running ones to finish; one that could never fit is rejected.
-  - Flash-Next keeps a GPU copy of spilled pages' attention-index records (~3.3 KB per token of
-    `--max-context` per concurrent request) and reads only the selected tokens' KV over PCIe. With
-    an 80k-token prompt and a 12k-token share, decode ran at 41–44 tok/s against 46–51 resident,
-    and prefill at the resident rate. Outputs were identical to resident runs.
+- **Contexts larger than GPU memory:** add `--kv-stream`; see [KV streaming](#kv-streaming).
 
 Example: Qwen3.8-27B `nvfp4` for four agents with long contexts:
 
@@ -189,6 +167,70 @@ Example: Qwen3.8-27B `nvfp4` for four agents with long contexts:
   --host-cache-mib 16384 \
   --spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft --preserve-thinking
 ```
+
+## KV streaming
+
+KV streaming lets a request's context grow past the KV cache that fits in GPU memory. The recent part
+of each context stays on the GPU. Older full pages of 64 tokens move to pinned host RAM, and the
+attention kernels read them from there. Context length is then bounded by `--max-context` (at most the
+model's `max_position_embeddings`) and the RAM you give the Host KV tier, not by VRAM.
+
+### How it works
+
+- Each active request owns an equal share of GPU KV, `--kv-capacity / --max-concurrency`. It borrows
+  idle shares and gives them back when another request needs them.
+- A request that outgrows its GPU KV moves its oldest full pages to Host KV (`--host-kv-mib`, or
+  `--host-cache-mib` for the whole Host tier). The first pages and the recent tail always stay on the
+  GPU.
+- Each step copies the spilled pages it reads to the GPU one layer at a time, overlapped with the
+  previous layer's compute. On Flash-Next the sparse attention reads only the selected tokens from
+  RAM and keeps a GPU copy of the attention index.
+- Admission reserves Host KV for each request's prompt plus output limit beyond its share. A request
+  that does not fit waits for running ones to finish; one that could never fit gets HTTP 400.
+- The context cache still works: follow-up turns, branches and shared prefixes reuse spilled KV in
+  place instead of prefilling again.
+
+### Usage
+
+Add `--kv-stream` and size the Host KV tier for the spill:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 262144 --kv-capacity auto --max-concurrency 2 --kv-dtype fp8 \
+  --kv-stream --host-kv-mib 65536
+```
+
+- **Host KV size:** each request can spill (prompt + `max_tokens` − share) tokens of KV. KV bytes per
+  token are full-attention layers × KV heads × head dimension × 2 (K and V) × bytes per element,
+  plus the MTP layer when it is enabled. Size `--host-kv-mib` for the spills you run concurrently.
+- **KV dtype:** `--kv-dtype fp8` halves the bytes each spilled step reads, compared with BF16.
+- **`--kv-capacity`:** larger shares keep more of each context on the GPU and spill less.
+- **GPU overhead:** two staging buffers hold one layer's KV each for a full `--max-context`, about
+  1 GB in total at 262k with FP8 and 2 GB with BF16.
+- **Pinned RAM:** Host KV is pinned for the Engine lifetime; leave room for the OS and page cache.
+
+### Performance
+
+Requests that fit their GPU share run at the resident speed. Once a request spills, each step reads
+its spilled KV over PCIe:
+
+| Workload (context / GPU share) | Streamed | Resident |
+|---|---|---|
+| 27B `nvfp4`, BF16 KV, 35k / 12k, decode | 31 tok/s | 71 tok/s |
+| Flash-Next, 80k prompt / 12k share, decode | 41–44 tok/s | 46–51 tok/s |
+| 27B chat, second turn over a spilled 30.6k context, TTFT | 188 ms | 170 ms (fresh prefill: 4.2 s) |
+
+Prefill ran at the resident rate in both cases, and streamed outputs matched resident runs.
+Dense-model decode is bound by host-to-GPU copy bandwidth
+(~50 GB/s), so it slows as the spilled share of the context grows; Flash-Next barely slows because
+it reads only the selected tokens.
+
+### Limits
+
+- DFlash and DFlash2 drafting and offline scoring (`ninfer-perplexity`) do not support `--kv-stream`.
+- Tested up to two concurrent ~236k-token FP8 requests on 27B and 80k tokens on Flash-Next.
+
+[Paged KV cache §6.5](docs/maintainer/paged-kv-cache.md) describes the design.
 
 ## Versus stock NInfer
 
@@ -552,6 +594,7 @@ describes the planner.
   DFlash2 on Qwen3.8-27B artifacts that carry the companion weights.
 - BF16, INT8, FP8, NVFP4 and K8V4 KV storage.
 - Private and shared exact-prefix reuse, with Device and Host retention.
+- KV streaming of contexts beyond GPU memory to pinned host RAM (`--kv-stream`).
 - Offline perplexity scoring (`ninfer-perplexity`).
 - OpenAI Responses and Chat Completions, and Anthropic Messages, including streaming, tools, token
   counting and usage.
@@ -561,7 +604,8 @@ describes the planner.
 - One RTX 5090, one resident model, and a startup-fixed one to eight active requests.
 - Bounded FIFO admission; no preemption, priority, multi-GPU or distributed serving.
 - `--max-context` is the per-request limit. `--kv-capacity` sizes the shared KV pool; `auto` sizes
-  it from the memory left after weights.
+  it from the memory left after weights. With `--kv-stream`, contexts beyond the pool spill to Host KV,
+  bounded by `--host-kv-mib`.
 - Tool calls are parsed and returned to the client; NInfer does not execute them.
 
 ## Documentation
