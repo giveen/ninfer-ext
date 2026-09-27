@@ -138,9 +138,12 @@ void test_trellis_geometry() {
     std::vector<std::byte> payload(half_rate.bytes);
     ninfer::WeightParent parent{half_rate, payload.data()};
     ninfer::WeightView view{{128, 128}, {{&parent, 0, half_rate.elements}}};
-    expect_throws<std::invalid_argument>(
-        [&] { (void)ninfer::native_weight(view); },
-        "the generic native Weight bridge must not misinterpret EXL3 planes");
+    const ninfer::Weight native = ninfer::native_weight(view);
+    expect(native.qtype == QType::EXL3_MUL1 && native.qdata == payload.data() &&
+               native.input_scales == payload.data() + half_rate.input_scale_offset &&
+               native.scales == payload.data() + half_rate.output_scale_offset &&
+               native.bitrate_half_bits == 3 && native.n == 128 && native.k == 128,
+           "the native Weight bridge must expose the EXL3 trellis and both scale planes");
     expect_throws<std::invalid_argument>(
         [&] { (void)ninfer::weight_row_planes(view.parts.front()); },
         "the generic row-plane view must not misinterpret EXL3 scales");

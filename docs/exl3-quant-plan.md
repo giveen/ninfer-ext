@@ -377,6 +377,23 @@ bit.
   converter's `exl3_matrix_source` reads that store back with the expected plane shapes (`codes [1,640,128]` U8,
   `su [10240]`, `sv [16]`) and rate 8. All 11 `ctest -R exl3` tests pass, including the M2 GPU kernels.
 
+- 2026-09-27: M3 quantizer calibration and native decode are in (`ee6eb28c`).
+  - Calibration: the model exposes a projection observer (`execution/calibration.h`), so
+    `ninfer-quantize --trace --activation-model` scores the packed trace through a servable
+    activation artifact, accumulates each projection's `E[XᵀX]` (transposed Hessian kernel for the
+    model's `[K,T]` activation) in device-budgeted layer groups, and writes per-parameter
+    `.h.f32`. Layer groups are separate passes over unchanged weights, so the Hessians are identical
+    to one pass while peak device memory stays bounded.
+  - Decode: `native_weight` bridges EXL3 and `src/ops/linear/exl3` decodes `trellis_t16_v1` with the
+    two 128-point Hadamards. `ninfer_linear_exl3_a16_test` passes the FP64 plane oracle at rates
+    3/4/8 and shapes up to `[384,256] x T=64`.
+  - First 4.0 bpw Text artifact produced by `qwen3_8_27b_exl3` from the quantizer store.
+- 2026-09-27: Remaining for full serving (the plan's M4 consumer set): `linear_add`,
+  `linear_swiglu`, `attn_input_proj` and `gdn_input_proj` need EXL3 paths; the attention/GDN fusion
+  gates in `ops/weight_input.cpp` must admit EXL3; and each shared-input group (attention
+  q/gate/k/v, GDN q/k/v/z, MLP gate+up) must be quantized as one parent with a shared `suh`, which
+  the app does not yet do.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
