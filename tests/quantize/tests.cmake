@@ -34,3 +34,8 @@ ninfer_add_test(ninfer_exl3_pipeline_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_pipeline.cpp"
   LIBRARIES ninfer_quantize ninfer_artifact)
 set_tests_properties(ninfer_exl3_pipeline_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Not a ctest: driven by tools/exl3/compare_tensor.py against exllamav3.
+add_executable(ninfer_exl3_tensor_probe "${CMAKE_CURRENT_LIST_DIR}/exl3_tensor_probe.cpp")
+ninfer_internal_includes(ninfer_exl3_tensor_probe)
+target_link_libraries(ninfer_exl3_tensor_probe PRIVATE ninfer_quantize)
