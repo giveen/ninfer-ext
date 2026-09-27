@@ -57,6 +57,8 @@ struct GenerationOutcome {
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
+    // Retained only when the server's dedicated generation-token trace is enabled.
+    std::vector<ninfer::TokenId> generated_token_ids;
 };
 
 struct StreamSink {

@@ -221,7 +221,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, logger),
+      generation_token_trace_jsonl_(options_.generation_token_trace_jsonl, std::move(logger)) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -244,7 +245,10 @@ bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
 }
 
 void HttpServer::RequestLifecycle::done(const GenerationOutcome& outcome) {
-    if (claim(State::Done)) { owner_->record_request_done(context_, outcome); }
+    if (claim(State::Done)) {
+        owner_->record_generation_token_trace(context_, outcome);
+        owner_->record_request_done(context_, outcome);
+    }
 }
 
 void HttpServer::RequestLifecycle::failure(const RequestFailure& failure) {
@@ -273,6 +277,14 @@ void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
+}
+
+void HttpServer::record_generation_token_trace(const RequestLogContext& context,
+                                               const GenerationOutcome& outcome) {
+    if (!generation_token_trace_jsonl_.enabled()) { return; }
+    if (outcome.prompt_tokens < 0) { return; }
+    (void)generation_token_trace_jsonl_.write(
+        context.id, static_cast<std::uint32_t>(outcome.prompt_tokens), outcome.generated_token_ids);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,

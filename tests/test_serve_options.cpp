@@ -1,6 +1,12 @@
 #include "serve/serve_options.h"
+#include "serve/generation_token_trace.h"
 #include "serve/translate.h"
 
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -35,6 +41,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.generation_token_trace_jsonl.empty(),
+                      "generated-token trace logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),
                       "external context-cost presets are unexpectedly configured by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
@@ -415,6 +423,52 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").contains("--request-log-jsonl"),
               "serve help omits --request-log-jsonl");
+    const ServeOptions token_trace =
+        parse({"ninfer-serve", "model.ninfer", "--generation-token-trace-jsonl", "tokens.jsonl"});
+    failures += check(token_trace.generation_token_trace_jsonl == "tokens.jsonl",
+                      "generation token trace path was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").contains("--generation-token-trace-jsonl"),
+                      "serve help omits --generation-token-trace-jsonl");
+    bool same_log_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl", "same.jsonl",
+                     "--generation-token-trace-jsonl", "same.jsonl"});
+    } catch (const std::invalid_argument&) { same_log_rejected = true; }
+    failures +=
+        check(same_log_rejected, "request and generated-token logs accepted the same output file");
+    const auto trace_json = nlohmann::json::parse(
+        format_generation_token_trace_json(7, 3, std::vector<ninfer::TokenId>{42, 99, 8}));
+    failures += check(trace_json.at("schema") == std::string(kGenerationTokenTraceSchema) &&
+                          trace_json.at("schema_version") == kGenerationTokenTraceSchemaVersion &&
+                          trace_json.at("request_id") == 7 && trace_json.at("prompt_tokens") == 3 &&
+                          trace_json.at("completion_tokens") == 3 &&
+                          trace_json.at("generated_token_ids") == std::vector<int>{42, 99, 8},
+                      "generation token trace formatter lost its exact token sequence");
+    const auto empty_trace = nlohmann::json::parse(
+        format_generation_token_trace_json(9, 5, std::vector<ninfer::TokenId>{}));
+    failures += check(empty_trace.at("completion_tokens") == 0 &&
+                          empty_trace.at("generated_token_ids").empty(),
+                      "an empty completion must still produce an ordered trace record");
+    const auto trace_path =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-generated-token-trace-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+    {
+        GenerationTokenTraceJsonl trace_log(trace_path.string());
+        failures += check(trace_log.enabled(), "token trace logger did not open its output");
+        failures += check(trace_log.write(8, 4, std::vector<ninfer::TokenId>{17, 19}),
+                          "token trace logger failed to append a record");
+    }
+    std::ifstream trace_file(trace_path);
+    std::string trace_line;
+    std::getline(trace_file, trace_line);
+    const auto trace_record = nlohmann::json::parse(trace_line);
+    failures += check(trace_record.at("request_id") == 8 &&
+                          trace_record.at("generated_token_ids") == std::vector<int>{17, 19},
+                      "token trace logger did not persist the exact generated IDs");
+    std::error_code remove_error;
+    std::filesystem::remove(trace_path, remove_error);
+    failures += check(!remove_error, "token trace test file cleanup failed");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {
