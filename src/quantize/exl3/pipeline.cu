@@ -273,7 +273,9 @@ TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std
     const double top =
         std::accumulate(root.begin(), root.begin() + static_cast<std::ptrdiff_t>(k / 50), 0.0);
     const double all  = std::accumulate(root.begin(), root.end(), 0.0);
-    report.out_scales = all > 0.0 && top / all < options.out_scale_skew_limit;
+    report.out_scales = options.out_scales == OutScales::Always ||
+                        (options.out_scales == OutScales::Auto && all > 0.0 &&
+                         top / all < options.out_scale_skew_limit);
 
     // Random signs.
     std::mt19937_64 rng(options.seed);
@@ -388,7 +390,10 @@ TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std
                 stream);
             DeviceArray<float> b(static_cast<std::size_t>(k), stream);
             row_dot(wq, hw.get(), k, n, b.get(), stream);
-            if (!solve_spd(a.get(), b.get(), vec_k.get(), k, stream)) { continue; }
+            if (!solve_spd(a.get(), b.get(), vec_k.get(), k, stream)) {
+                ++report.refit_input_skipped;
+                continue;
+            }
             std::vector<float> r = vec_k.download(static_cast<std::size_t>(k));
             for (std::size_t i = 0; i < r.size(); ++i) {
                 if (!std::isfinite(r[i]) || r[i] <= 0.0f) { r[i] = 1.0f; }

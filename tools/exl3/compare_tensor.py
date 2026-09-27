@@ -58,7 +58,7 @@ def proxy_error(w: torch.Tensor, wq: torch.Tensor, h: torch.Tensor) -> float:
     return float((e * (hd @ e)).sum() / (w.double() * (hd @ w.double())).sum())
 
 
-def run_exllamav3(w: torch.Tensor, h: torch.Tensor, bits: float, seed: int) -> dict:
+def run_exllamav3(w: torch.Tensor, h: torch.Tensor, bits: float, seed: int, out_scales: str) -> dict:
     from exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
 
     h_data = {"H": h.clone(), "count": 1, "finalized": False, "first_key": "probe"}
@@ -66,7 +66,7 @@ def run_exllamav3(w: torch.Tensor, h: torch.Tensor, bits: float, seed: int) -> d
         "K": int(bits) if float(bits).is_integer() else bits,
         "devices": [w.device.index or 0],
         "mul1": True,
-        "apply_out_scales": None,
+        "apply_out_scales": {"auto": None, "always": True, "never": False}[out_scales],
         "seed": seed,
         "sigma_reg": DAMPING,
     }
@@ -99,6 +99,7 @@ def main() -> int:
     )
     parser.add_argument("--bits", type=float, nargs="+", default=[2.0, 3.0, 4.0])
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--out-scales", choices=("auto", "always", "never"), default="auto")
     args = parser.parse_args()
 
     device = torch.device("cuda", 0)
@@ -116,13 +117,13 @@ def main() -> int:
             half_bits = int(round(bits * 2))
             ours = json.loads(
                 subprocess.run(
-                    [str(args.probe), str(k), str(n), str(half_bits), str(args.seed), str(w_path), str(h_path)],
+                    [str(args.probe), str(k), str(n), str(half_bits), str(args.seed), str(w_path), str(h_path), args.out_scales],
                     check=True,
                     capture_output=True,
                     text=True,
                 ).stdout
             )
-            theirs = run_exllamav3(w, h, bits, args.seed)
+            theirs = run_exllamav3(w, h, bits, args.seed, args.out_scales)
             results.append({"bits": bits, "ninfer": ours, "exllamav3": theirs})
             print(
                 f"K={bits}: proxy NInfer {ours['proxy_error']:.6f} (rotated {ours['proxy_error_rotated']:.6f}, "

@@ -13,12 +13,19 @@
 
 namespace ninfer::quantize::exl3 {
 
+enum class OutScales {
+    // Applied when the input is regular: the top 2% of sqrt(diag(H)) carry less than
+    // out_scale_skew_limit of its sum (exllamav3's measured cutoff).
+    Auto,
+    Always,
+    Never,
+};
+
 struct TensorOptions {
-    int bitrate_half_bits = 8;
-    std::uint64_t seed    = 0;
-    float damping         = 0.025f; // fraction of the mean Hessian diagonal
-    // Output-channel scales are applied when the input is regular: the top 2% of sqrt(diag(H))
-    // carry less than this fraction of its sum (after exllamav3's measured cutoff).
+    int bitrate_half_bits      = 8;
+    std::uint64_t seed         = 0;
+    float damping              = 0.025f; // fraction of the mean Hessian diagonal
+    OutScales out_scales       = OutScales::Auto;
     float out_scale_skew_limit = 0.15f;
     int refit_rounds           = 2;
 };
@@ -30,6 +37,7 @@ struct TensorReport {
     float global_scale              = 1.0f;
     bool out_scales                 = false;
     int damping_retries             = 0;
+    int refit_input_skipped         = 0; // refit rounds whose input-scale solve did not converge
 };
 
 // w: [k][n] FP32 device (rows are input channels), h: [k][k] FP32 device mean XᵀX (undamped; left

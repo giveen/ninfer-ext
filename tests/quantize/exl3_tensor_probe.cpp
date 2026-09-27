@@ -1,8 +1,9 @@
 // Runs the EXL3 single-tensor pipeline on raw FP32 inputs and prints its report as JSON.
 // Used by tools/exl3/compare_tensor.py to compare against exllamav3 on the same W and H.
 //
-// usage: ninfer_exl3_tensor_probe K N HALF_BITS SEED W.f32 H.f32
-//   W.f32: [K][N] row-major (rows are input channels); H.f32: [K][K] mean XᵀX (undamped).
+// usage: ninfer_exl3_tensor_probe K N HALF_BITS SEED W.f32 H.f32 [auto|always|never]
+//   W.f32: [K][N] row-major (rows are input channels); H.f32: [K][K] mean XᵀX (undamped). The
+//   last argument selects the output-scale mode (default auto).
 
 #include "quantize/exl3/pipeline.h"
 
@@ -31,16 +32,29 @@ std::vector<float> read_f32(const std::string& path, std::size_t count) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 7) {
-        std::cerr << "usage: " << argv[0] << " K N HALF_BITS SEED W.f32 H.f32\n";
+    if (argc != 7 && argc != 8) {
+        std::cerr << "usage: " << argv[0]
+                  << " K N HALF_BITS SEED W.f32 H.f32 [auto|always|never]\n";
         return 2;
     }
     const std::int64_t k = std::stoll(argv[1]), n = std::stoll(argv[2]);
     ninfer::quantize::exl3::TensorOptions options;
     options.bitrate_half_bits = std::stoi(argv[3]);
     options.seed              = std::stoull(argv[4]);
-    const auto w              = read_f32(argv[5], static_cast<std::size_t>(k * n));
-    const auto h              = read_f32(argv[6], static_cast<std::size_t>(k * k));
+    if (argc == 8) {
+        const std::string mode = argv[7];
+        using ninfer::quantize::exl3::OutScales;
+        if (mode == "always") {
+            options.out_scales = OutScales::Always;
+        } else if (mode == "never") {
+            options.out_scales = OutScales::Never;
+        } else if (mode != "auto") {
+            std::cerr << "output-scale mode must be auto, always or never\n";
+            return 2;
+        }
+    }
+    const auto w = read_f32(argv[5], static_cast<std::size_t>(k * n));
+    const auto h = read_f32(argv[6], static_cast<std::size_t>(k * k));
 
     float *d_w = nullptr, *d_h = nullptr, *d_su = nullptr, *d_sv = nullptr, *d_wq = nullptr;
     std::uint16_t* d_states = nullptr;
@@ -63,8 +77,9 @@ int main(int argc, char** argv) {
               << ", \"proxy_error\": " << report.proxy_error
               << ", \"global_scale\": " << report.global_scale
               << ", \"out_scales\": " << (report.out_scales ? "true" : "false")
-              << ", \"damping_retries\": " << report.damping_retries << ", \"seconds\": " << seconds
-              << "}\n";
+              << ", \"damping_retries\": " << report.damping_retries
+              << ", \"refit_input_skipped\": " << report.refit_input_skipped
+              << ", \"seconds\": " << seconds << "}\n";
     for (void* p :
          {static_cast<void*>(d_w), static_cast<void*>(d_h), static_cast<void*>(d_su),
           static_cast<void*>(d_sv), static_cast<void*>(d_wq), static_cast<void*>(d_states)}) {
