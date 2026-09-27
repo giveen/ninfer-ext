@@ -52,6 +52,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             geometry.planes.push_back({DType::BF16, ops::kQsaIndexRecordWords, 1, 256});
         }
     }
+    geometry.layer_planes = layer_storage.planes_per_layer() + (qsa_index ? 1U : 0U);
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
             builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
@@ -65,23 +66,6 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .layer_storage = layer_storage,
         .qsa_index     = qsa_index,
     };
-}
-
-// One layer's planes are adjacent in a Host record: [first plane offset, last plane end).
-struct HostLayerSpan {
-    std::size_t begin = 0;
-    std::size_t bytes = 0;
-};
-
-HostLayerSpan host_layer_span(const HostKVPageLayout& layout, std::size_t planes_per_layer,
-                              std::uint32_t layer) {
-    const std::size_t first = static_cast<std::size_t>(layer) * planes_per_layer;
-    if (planes_per_layer == 0 || first + planes_per_layer > layout.planes.size()) {
-        throw std::out_of_range("Host KV layer span is outside the record");
-    }
-    const HostKVPlaneLayout& last = layout.planes[first + planes_per_layer - 1];
-    return {.begin = layout.planes[first].offset,
-            .bytes = last.offset + last.page_payload_bytes - layout.planes[first].offset};
 }
 
 // Bytes of one page's index record of one layer: the last plane of each layer.
@@ -107,13 +91,7 @@ QsaIndexMirrorLayout plan_qsa_mirror(LayoutBuilder& builder, const PagedKVCacheL
 }
 
 std::size_t staging_record_stride(const PagedKVCacheLayout& cache) {
-    const HostKVPageLayout host = plan_host_kv_page_layout(cache.pages.spec.geometry);
-    const std::size_t planes    = host.planes.size() / cache.layers;
-    std::size_t stride          = 0;
-    for (std::uint32_t layer = 0; layer < cache.layers; ++layer) {
-        stride = std::max(stride, host_layer_span(host, planes, layer).bytes);
-    }
-    return (stride + kHostKVPageUnitBytes - 1) / kHostKVPageUnitBytes * kHostKVPageUnitBytes;
+    return plan_host_kv_page_layout(cache.pages.spec.geometry).layer_span;
 }
 
 } // namespace
@@ -214,33 +192,29 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .head_dim      = layer_storage_.head_dim,
         .num_kv_heads  = kv_heads_,
         .storage       = layer_storage_.storage,
-        .host          = host_base_ == nullptr
-                             ? PagedKVHostPlanes{}
-                             : PagedKVHostPlanes{
-                                   .k       = host_base_ + host_layout_.planes[base].offset,
-                                   .v       = host_base_ + host_layout_.planes[base + 1].offset,
-                                   .k_scale = layer_storage_.key.has_scale()
-                                                  ? host_base_ +
-                                                        host_layout_.planes[k_scale_index].offset
-                                                  : nullptr,
-                                   .v_scale = layer_storage_.value.has_scale()
-                                                  ? host_base_ +
-                                                        host_layout_.planes[v_scale_index].offset
-                                                  : nullptr,
-                               },
+        .host =
+            PagedKVHostPlanes{
+                .k       = host_plane(base),
+                .v       = host_plane(base + 1),
+                .k_scale = layer_storage_.key.has_scale() ? host_plane(k_scale_index) : nullptr,
+                .v_scale = layer_storage_.value.has_scale() ? host_plane(v_scale_index) : nullptr,
+            },
     };
 }
 
 void PagedKVCache::bind_host_records(const HostKVArena& arena) {
     const HostKVPageLayout* layout = arena.layout_for(pages_.geometry());
-    if (layout == nullptr || arena.base() == nullptr) {
+    if (layout == nullptr || arena.plane_base(*layout, 0) == nullptr) {
         throw std::invalid_argument("Paged KV streaming requires a Host arena for this pool");
     }
     if (pages_.geometry().device_plane_order != PagedKVPlaneOrder::PageMajor) {
         throw std::invalid_argument("Paged KV streaming requires page-major Device planes");
     }
     host_layout_ = *layout;
-    host_base_   = arena.base();
+    host_planes_.clear();
+    for (std::size_t plane = 0; plane < layout->planes.size(); ++plane) {
+        host_planes_.push_back(arena.plane_base(*layout, plane));
+    }
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
@@ -266,7 +240,7 @@ ops::QsaIndexPlane PagedKVCache::index_plane(std::uint32_t layer) const {
     return ops::QsaIndexPlane{
         .pages        = pages_.plane(index),
         .block_tables = execution_tables_.matrix(),
-        .host = host_base_ == nullptr ? nullptr : host_base_ + host_layout_.planes[index].offset,
+        .host         = host_plane(index),
     };
 }
 
@@ -323,9 +297,12 @@ bool KVHostStaging::prepare(std::span<const RowPages> rows, cudaStream_t stream,
     prefetched_layer_ = -1;
     stream_           = stream;
     transfer_         = transfer;
-    if (cache_->host_base() == nullptr) { return false; }
-    const auto page_units = static_cast<std::uint32_t>(cache_->host_layout().page_stride /
-                                                       kHostKVPageUnitBytes);
+    if (!cache_->host_bound()) { return false; }
+    if (cache_->host_layout().layer_span > record_stride_) {
+        throw std::logic_error("Host KV layer span exceeds the staging record");
+    }
+    const auto page_units =
+        static_cast<std::uint32_t>(cache_->host_layout().layer_span / kHostKVPageUnitBytes);
     const auto record_units = static_cast<std::uint32_t>(record_stride_ / kHostKVPageUnitBytes);
     const auto row_words    = static_cast<std::size_t>(tables_.ne[0]);
     // Every row's staged words, then one upload each; records are shared across the rows.
@@ -377,15 +354,21 @@ std::byte* KVHostStaging::buffer(std::uint32_t layer) const {
 }
 
 void KVHostStaging::copy_layer(std::uint32_t layer, cudaStream_t stream) const {
-    const HostKVPageLayout& host = cache_->host_layout();
-    const HostLayerSpan span     = host_layer_span(host, cache_->planes_per_layer(), layer);
-    std::byte* destination       = buffer(layer);
+    // A layer's first plane starts its span, so a run of adjacent Host pages is one copy.
+    const std::size_t span = cache_->host_layout().layer_span;
+    const std::byte* source =
+        cache_->host_plane(static_cast<std::size_t>(layer) * cache_->planes_per_layer());
+    std::byte* destination = buffer(layer);
     for (const Run& run : runs_) {
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            destination + static_cast<std::size_t>(run.index) * record_stride_, record_stride_,
-            cache_->host_base() + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes +
-                span.begin,
-            host.page_stride, span.bytes, run.count, cudaMemcpyHostToDevice, stream));
+        std::byte* target      = destination + static_cast<std::size_t>(run.index) * record_stride_;
+        const std::byte* first = source + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes;
+        if (span == record_stride_) {
+            CUDA_CHECK(
+                cudaMemcpyAsync(target, first, span * run.count, cudaMemcpyHostToDevice, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(target, record_stride_, first, span, span, run.count,
+                                         cudaMemcpyHostToDevice, stream));
+        }
     }
 }
 
@@ -406,12 +389,10 @@ PagedKVBatchLayerView KVHostStaging::stage(const PagedKVBatchLayerView& view,
         prefetched_layer_ = static_cast<std::int64_t>(layer) + 1;
     }
     const HostKVPageLayout& host = cache_->host_layout();
-    const std::size_t planes     = cache_->planes_per_layer();
-    const HostLayerSpan span     = host_layer_span(host, planes, layer);
-    const std::size_t first      = static_cast<std::size_t>(layer) * planes;
+    const std::size_t first      = static_cast<std::size_t>(layer) * cache_->planes_per_layer();
     std::byte* base              = buffer(layer);
     const auto plane             = [&](std::size_t index) -> const std::byte* {
-        return base + (host.planes[first + index].offset - span.begin);
+        return base + host.planes[first + index].offset;
     };
     PagedKVBatchLayerView staged = view;
     staged.block_tables          = tables_;
@@ -430,13 +411,11 @@ ops::QsaIndexPlane KVHostStaging::stage_index(const ops::QsaIndexPlane& plane,
                                               std::uint32_t layer) const {
     if (runs_.empty()) { throw std::logic_error("KV staging is not prepared"); }
     // The index plane is the last plane of the layer span stage(layer) made ready.
-    const HostKVPageLayout& host = cache_->host_layout();
-    const std::size_t planes     = cache_->planes_per_layer();
-    const HostLayerSpan span     = host_layer_span(host, planes, layer);
-    const std::size_t index      = static_cast<std::size_t>(layer) * planes + planes - 1U;
-    ops::QsaIndexPlane staged    = plane;
-    staged.block_tables          = tables_;
-    staged.host                  = buffer(layer) + (host.planes[index].offset - span.begin);
+    const std::size_t planes  = cache_->planes_per_layer();
+    const std::size_t index   = static_cast<std::size_t>(layer) * planes + planes - 1U;
+    ops::QsaIndexPlane staged = plane;
+    staged.block_tables       = tables_;
+    staged.host               = buffer(layer) + cache_->host_layout().planes[index].offset;
     return staged;
 }
 
@@ -464,9 +443,9 @@ void QsaIndexMirror::reset(std::int32_t row) noexcept {
 }
 
 bool QsaIndexMirror::prepare(std::span<const RowPages> rows, cudaStream_t stream) {
-    if (cache_->host_base() == nullptr) { return false; }
+    if (!cache_->host_bound()) { return false; }
     const HostKVPageLayout& host = cache_->host_layout();
-    const auto page_units = static_cast<std::uint32_t>(host.page_stride / kHostKVPageUnitBytes);
+    const auto page_units   = static_cast<std::uint32_t>(host.layer_span / kHostKVPageUnitBytes);
     const auto record_units = static_cast<std::uint32_t>(record_bytes_ / kHostKVPageUnitBytes);
     words_.clear();
     runs_.clear();
@@ -507,15 +486,14 @@ bool QsaIndexMirror::prepare(std::span<const RowPages> rows, cudaStream_t stream
     const std::size_t planes      = cache_->planes_per_layer();
     const std::size_t layer_bytes = record_bytes_ * static_cast<std::size_t>(records_.ne[1]);
     for (std::uint32_t layer = 0; layer < cache_->layers(); ++layer) {
-        const std::size_t offset =
-            host.planes[static_cast<std::size_t>(layer) * planes + planes - 1U].offset;
+        const std::byte* source =
+            cache_->host_plane(static_cast<std::size_t>(layer) * planes + planes - 1U);
         std::byte* destination = static_cast<std::byte*>(records_.data) + layer * layer_bytes;
         for (const Run& run : runs_) {
             CUDA_CHECK(cudaMemcpy2DAsync(
                 destination + static_cast<std::size_t>(run.record) * record_bytes_, record_bytes_,
-                cache_->host_base() + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes +
-                    offset,
-                host.page_stride, record_bytes_, run.count, cudaMemcpyHostToDevice, stream));
+                source + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes, host.layer_span,
+                record_bytes_, run.count, cudaMemcpyHostToDevice, stream));
         }
     }
     // Pageable source: each call returns once the words are captured, so words_ may be reused.

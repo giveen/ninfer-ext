@@ -6,10 +6,10 @@
 //   word >= 0 : DevicePageGroup(word)     plane page = plane base + word * plane page elements
 //   word <  0 : HostPageUnit(~word)       plane page = host plane base + ~word * 256 bytes
 //
-// The Host record of a logical page packs every plane of every layer (HostKVPageLayout); each
-// plane slice keeps the Device in-page element order, so in-page offsets are identical on both
-// arms. Records start at 256-byte multiples of the HostKVArena base, which lets one 31-bit word
-// address 512 GiB of arena without a per-layout stride.
+// Host pages are layer-major (HostKVPageLayout): within a HostKVArena chunk one layer's pages are
+// adjacent, each plane slice in the Device in-page element order, so in-page offsets are identical
+// on both arms. The unit counts 256-byte steps from the plane's base; every layer and plane of a
+// page sits at the same unit offset from its own base, so one word serves them all.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,7 +25,7 @@ namespace ninfer {
 /** Page group index inside one DeviceKVPagePool. */
 enum class DevicePageGroup : std::int32_t {};
 
-/** Offset of a Host page record from the HostKVArena base, in kHostKVPageUnitBytes. */
+/** Offset of a Host page from its plane's HostKVArena base, in kHostKVPageUnitBytes. */
 enum class HostPageUnit : std::uint32_t {};
 
 inline constexpr std::size_t kHostKVPageUnitBytes = 256;

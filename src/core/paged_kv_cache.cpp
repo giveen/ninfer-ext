@@ -586,23 +586,27 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
     while (begin < source.size()) {
         std::size_t end = begin + 1;
         while (end < source.size() && source[end].index_ == source[end - 1].index_ + 1) { ++end; }
+        // Host pages keep a fixed pitch only inside one arena chunk.
+        end = std::min<std::size_t>(
+            end, begin + destination.contiguous_pages(static_cast<std::uint32_t>(begin)));
         const std::size_t count  = end - begin;
         const std::int32_t first = source[begin].index_;
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
             const Tensor& plane                 = planes_[plane_index];
             const HostKVPlaneLayout& host_plane = host.planes[plane_index];
-            auto* host_base = destination.data() + begin * host.page_stride + host_plane.offset;
+            auto* host_base =
+                destination.plane_page(plane_index, static_cast<std::uint32_t>(begin));
             const auto* device_base = static_cast<const unsigned char*>(plane.data);
             if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
                 CUDA_CHECK(cudaMemcpy2DAsync(
-                    host_base, host.page_stride,
+                    host_base, host.layer_span,
                     device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
                     host_plane.page_payload_bytes, count, cudaMemcpyDeviceToHost, stream));
             } else {
                 for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
                     CUDA_CHECK(cudaMemcpy2DAsync(
                         host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
-                        host.page_stride,
+                        host.layer_span,
                         device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
                             static_cast<std::int64_t>(first) * plane.nb[2],
                         plane.nb[2], host_plane.head_payload_bytes, count, cudaMemcpyDeviceToHost,
@@ -631,17 +635,21 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
                destination[end].index_ == destination[end - 1].index_ + 1) {
             ++end;
         }
+        // Host pages keep a fixed pitch only inside one arena chunk.
+        end = std::min<std::size_t>(
+            end, begin + source.contiguous_pages(static_cast<std::uint32_t>(begin)));
         const std::size_t count  = end - begin;
         const std::int32_t first = destination[begin].index_;
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
             const Tensor& plane                 = planes_[plane_index];
             const HostKVPlaneLayout& host_plane = host.planes[plane_index];
-            const auto* host_base = source.data() + begin * host.page_stride + host_plane.offset;
+            const auto* host_base =
+                source.plane_page(plane_index, static_cast<std::uint32_t>(begin));
             auto* device_base     = static_cast<unsigned char*>(plane.data);
             if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
                 CUDA_CHECK(cudaMemcpy2DAsync(
                     device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
-                    host_base, host.page_stride, host_plane.page_payload_bytes, count,
+                    host_base, host.layer_span, host_plane.page_payload_bytes, count,
                     cudaMemcpyHostToDevice, stream));
             } else {
                 for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
@@ -650,7 +658,7 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
                             static_cast<std::int64_t>(first) * plane.nb[2],
                         plane.nb[2],
                         host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
-                        host.page_stride, host_plane.head_payload_bytes, count,
+                        host.layer_span, host_plane.head_payload_bytes, count,
                         cudaMemcpyHostToDevice, stream));
                 }
             }

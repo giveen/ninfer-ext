@@ -69,7 +69,6 @@ struct Options {
     CacheMode cache         = CacheMode::Cold;
     PageMapping mapping     = PageMapping::Identity;
     HostPages host_pages    = HostPages::None;
-    int host_record_layers  = 1;
     std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 12, 16, 1024};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192};
@@ -123,7 +122,6 @@ struct Result {
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] [--host-pages none|all|alternate|interior] "
-                 "[--host-record-layers N] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -258,10 +256,6 @@ Options parse_options(int argc, char** argv) {
                 options.host_pages = HostPages::Interior;
             else
                 usage("--host-pages expects none, all, alternate, or interior");
-        } else if (argument == "--host-record-layers") {
-            options.host_record_layers =
-                parse_i32(next("--host-record-layers requires a value"), 1, 64,
-                          "--host-record-layers");
         } else if (argument == "--graph-calls") {
             options.graph_calls =
                 parse_i32(next("--graph-calls requires a value"), 1, 128, "--graph-calls");
@@ -443,8 +437,7 @@ class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
-         std::span<const std::int32_t> table_rows, PageMapping mapping, HostPages host_pages,
-         int host_record_layers)
+         std::span<const std::int32_t> table_rows, PageMapping mapping, HostPages host_pages)
         : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
           batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::ranges::any_of(valid_columns,
@@ -544,7 +537,7 @@ public:
             CUDA_CHECK(cudaDeviceSynchronize());
         }
         if (host_pages != HostPages::None) {
-            stream_to_host(geometry, host_pages, host_record_layers, contexts, host_table);
+            stream_to_host(geometry, host_pages, contexts, host_table);
         }
     }
 
@@ -568,24 +561,21 @@ public:
 
     // Moves the selected populated pages of every row to Host records laid out by the production
     // HostKVPageLayout, then publishes Host words for them. Pages at or after a row's context stay
-    // Device-resident because the append entry writes them. A record holds `record_layers` layers,
-    // as a production record holds every full-attention layer; this benchmark's layer is the first.
-    void stream_to_host(const Geometry& geometry, HostPages host_pages, int record_layers,
+    // Device-resident because the append entry writes them. Records of one layer are adjacent, as
+    // in a production HostKVArena layer band.
+    void stream_to_host(const Geometry& geometry, HostPages host_pages,
                         std::span<const std::int32_t> contexts,
                         std::vector<std::int32_t>& host_table) {
         KVPageGeometry page_geometry;
         const auto add_plane = [&](DType dtype, std::int32_t extent) {
             page_geometry.planes.push_back({dtype, extent, geometry.kv_heads, 256});
         };
-        for (int layer = 0; layer < record_layers; ++layer) {
-            add_plane(storage_layout_.key.data_dtype, storage_layout_.key.data_leading_extent);
-            add_plane(storage_layout_.value.data_dtype, storage_layout_.value.data_leading_extent);
-            if (storage_layout_.key.has_scale())
-                add_plane(storage_layout_.key.scale_dtype, storage_layout_.key.scale_leading_extent);
-            if (storage_layout_.value.has_scale())
-                add_plane(storage_layout_.value.scale_dtype,
-                          storage_layout_.value.scale_leading_extent);
-        }
+        add_plane(storage_layout_.key.data_dtype, storage_layout_.key.data_leading_extent);
+        add_plane(storage_layout_.value.data_dtype, storage_layout_.value.data_leading_extent);
+        if (storage_layout_.key.has_scale())
+            add_plane(storage_layout_.key.scale_dtype, storage_layout_.key.scale_leading_extent);
+        if (storage_layout_.value.has_scale())
+            add_plane(storage_layout_.value.scale_dtype, storage_layout_.value.scale_leading_extent);
         const HostKVPageLayout layout = plan_host_kv_page_layout(page_geometry);
 
         std::vector<std::pair<std::int32_t, std::int32_t>> streamed; // (row, logical page)
@@ -992,7 +982,7 @@ int main(int argc, char** argv) {
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
-                      options.mapping, options.host_pages, options.host_record_layers);
+                      options.mapping, options.host_pages);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
@@ -1013,8 +1003,7 @@ int main(int argc, char** argv) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
-                                      rows.table_rows, options.mapping, options.host_pages,
-                                      options.host_record_layers);
+                                      rows.table_rows, options.mapping, options.host_pages);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||

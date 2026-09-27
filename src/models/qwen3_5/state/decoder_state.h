@@ -99,10 +99,15 @@ public:
 
     // KV streaming: layer views carry `arena`'s Host plane bases so execution rows may hold Host
     // words (KVPageRef). Bind before any view is captured into a CUDA Graph; the arena outlives
-    // the cache and its base is stable for the Engine lifetime.
+    // the cache and its bases are stable for the Engine lifetime.
     void bind_host_records(const HostKVArena& arena);
 
-    [[nodiscard]] const std::byte* host_base() const noexcept { return host_base_; }
+    [[nodiscard]] bool host_bound() const noexcept { return !host_planes_.empty(); }
+
+    // Base that Host words of plane `index` resolve against; null before bind_host_records.
+    [[nodiscard]] const std::byte* host_plane(std::size_t index) const noexcept {
+        return index < host_planes_.size() ? host_planes_[index] : nullptr;
+    }
     [[nodiscard]] const HostKVPageLayout& host_layout() const noexcept { return host_layout_; }
     [[nodiscard]] const PagedKVStorageLayout& layer_storage() const noexcept {
         return layer_storage_;
@@ -124,16 +129,16 @@ private:
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
     bool qsa_index_ = false;
-    const std::byte* host_base_ = nullptr;
+    std::vector<const std::byte*> host_planes_;
     HostKVPageLayout host_layout_;
 };
 
-// Device staging of streamed text KV for one execution step (paged-kv §6.5). Each layer's slice of
-// the step's Host pages is copied once, through the copy engine, into `buffer` as compact one-layer
-// records, and a staged copy of the execution tables points the Host words at those records; paged
-// Ops then resolve them through the Host arm from Device memory. A prompt chunk would otherwise read
-// every Host page over PCIe once per query tile; a decode round reads each once, but SM zero-copy
-// over the all-layer Host records reaches well under the copy engine's rate.
+// Device staging of streamed text KV for one execution step (paged-kv §6.5). Each layer's pages of
+// the step are copied once, through the copy engine, into `buffer` as one-layer records (a run of
+// adjacent Host pages is one contiguous copy, HostKVPageLayout), and a staged copy of the execution
+// tables points the Host words at those records; paged Ops then resolve them through the Host arm
+// from Device memory. A prompt chunk would otherwise read every Host page over PCIe once per query
+// tile; a decode round reads each once, but SM zero-copy reaches well under the copy engine's rate.
 struct KVHostStagingLayout {
     TensorRegion buffer; // U8 [record_stride, capacity_pages, 2]: two layer buffers
     TensorRegion tables; // I32 [logical pages, table rows], shaped like the execution tables

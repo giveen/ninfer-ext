@@ -19,9 +19,9 @@ namespace ninfer {
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 /**
- * Host page records of one layer that paged Ops read in place for Host block-table words
- * (KVPageRef). Each pointer is the HostKVArena base plus that plane's record offset; a record's
- * plane slice has the Device in-page element order. Null planes mean the cache has no Host arm,
+ * Host pages of one layer that paged Ops read in place for Host block-table words (KVPageRef).
+ * Each pointer is that plane's HostKVArena base (HostKVArena::plane_base); a page's plane slice has
+ * the Device in-page element order. Null planes mean the cache has no Host arm,
  * and its tables hold Device words only. Writes never target a Host record.
  */
 struct PagedKVHostPlanes {
@@ -79,6 +79,9 @@ struct KVPageGeometry {
     std::uint32_t page_tokens            = kPagedKVPageSize;
     PagedKVPlaneOrder device_plane_order = PagedKVPlaneOrder::PageMajor;
     std::vector<KVPlaneGeometry> planes;
+    // Planes per model layer, repeated in order for every layer; 0 treats all planes as one layer.
+    // The Host layout keeps each layer's pages contiguous (HostKVPageLayout).
+    std::uint32_t layer_planes = 0;
 
     friend bool operator==(const KVPageGeometry&, const KVPageGeometry&) = default;
 };

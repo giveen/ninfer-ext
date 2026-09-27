@@ -692,12 +692,10 @@ void test_kv_demotion(ninfer::DeviceContext& device) {
     expect(first.host() && second.host() && words[0] == first.word() &&
                words[1] == second.word() && words[2] == 2 && words[3] == 3,
            "demotion publishes Host words and leaves resident words unchanged");
-    const std::byte* host_base = host_arena.base();
+    const std::byte* host_base = host_arena.plane_base(host_layout, 0);
     bool bytes_match           = true;
     for (std::size_t page = 0; page < 2; ++page) {
-        const std::byte* record =
-            host_base + (page == 0 ? first : second).host_offset_bytes() +
-            host_layout.planes[0].offset;
+        const std::byte* record = host_base + (page == 0 ? first : second).host_offset_bytes();
         for (std::size_t byte = 0; byte < page_bytes; ++byte) {
             bytes_match = bytes_match && record[byte] == std::byte(0x10 + page);
         }

@@ -183,8 +183,10 @@ MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中�
 ### 3.5 Host capacity
 
 Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `HostKVArena`，但每个 allocation
-携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
-它不扩大 Device active entitlement 或单 sequence context ceiling。
+携带自己的 typed page layout。Arena 给每个 layout 相同数量的 page slots（同一 logical page 的 Main 与
+backend replicas 一起 demote/restore），因此 `capacity_bytes` 是 slots × Σ page stride，不足一个
+chunk 的余量与 chunk 对齐不计入。Host capacity 按实际 packed bytes 和 slot geometry 计费；它不扩大 Device active
+entitlement 或单 sequence context ceiling。
 
 ---
 
@@ -364,14 +366,22 @@ requests 可用的 global capacity。
 
 ### 5.3 Host replica
 
-Host replica 使用 logical-order packed `HostKVPageLayout`：
+Host replica 使用 logical-order、layer-major 的 `HostKVPageLayout`：
 
 - 不保存 Device page ID 或 block-table holes；
-- 每个 page 包含该 typed pool 的全部 grouped plane payload；
-- variable-size extent只为实际 page count 付费；
-- Main/backend layouts可以在同一 arena 中分配不同 stride 的 extents。
+- 每个 page 包含该 typed pool 的全部 grouped plane payload；一层的 planes 组成 256 B 对齐的
+  layer span（`KVPageGeometry::layer_planes` 给出每层 plane 数），各层 span 等长；
+- Slots 按 chunk（默认 `kHostKVChunkPages` = 64 pages，按 2 MiB 对齐）分组；chunk c 依次存放
+  每个 layout 的 slots `[c·C, (c+1)·C)`，各自 layer-major：layer l 的 slot s 位于
+  `chunk + layout offset + (l·C + s mod C) × layer_span`。同一 chunk 内同一层的相邻 pages 在内存中
+  相邻，一次 copy run 每层是一段连续内存（run 在 chunk 边界处拆分）；
+- First-fit 从 arena 起点填充 chunks，live pages 的地址范围随占用而非容量增长。把它们铺满一个大
+  pinned buffer 会同时拖慢 copy engine 与 PCIe 原地读取（实测 16 GiB arena 上每层整带布局：copy
+  52→48 GB/s，原地读 attention 约 2×，27B MTP decode 69→56 tok/s；chunk 后与 arena 大小无关）；
+- extent 是某 layout 的连续 slot range，只为实际 page count 付费。
 
-Host arena 是有界 variable-size allocator。Plan 必须针对完整 release/allocation recipe 验证 extent geometry；
+Host arena 是有界 slot allocator（每个 layout 各自的 free runs）。Plan 必须针对完整 release/allocation
+recipe 验证 slot geometry；
 `free_bytes` 只是占用摘要，不是可分配性的充分证明。
 
 ### 5.4 Replica transfer
@@ -469,8 +479,9 @@ block\_tables[N_{logical},C]
 \]
 
 其中 \(N_{logical}=L\)，\(C=max\_concurrency\)。每个 active address space lease 一行；每一项是 I32
-`KVPageRef` word：`>=0` 是 pool-local Device page-group ID，`<0` 是 `~HostPageUnit`，即该页 Host
-record 在 Host KV arena 中的偏移（256 B 单位）。Paged Ops 每个 tile 解析一次 page base，in-page
+`KVPageRef` word：`>=0` 是 pool-local Device page-group ID，`<0` 是 `~HostPageUnit`，即
+`(s div C) × chunk bytes + (s mod C) × layer_span`（256 B 单位）；每个 plane 的地址为 `HostKVArena::plane_base(layout, plane)` 加该偏移，
+同一 word 适用于该页的所有层与 planes。Paged Ops 每个 tile 解析一次 page base，in-page
 地址运算与 Device page 相同，因此两种 residency 的结果 bit-identical。
 
 Activation 将 address-space membership 的 Device page IDs 批量发布到所租 row。Inactive address space
@@ -512,12 +523,13 @@ Device window，更早的 full pages 由 Host records 原地读取：
   无引用 extents 再重试一次；仍失败时 decode lease 按 §7.2 settle；prefill 的 mapping 失败按 Device
   OOM（`std::bad_alloc`）恢复。
 - Host staging（`KVHostStaging`）：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host
-  pages 会让 PCIe 流量乘以 tile 数；decode 每页只读一次，但 SM zero-copy 读 all-layer Host records
-  只有 13–23 GB/s，而 copy engine 达 ~50 GB/s。因此每个含 Host pages 的 text step（prefill chunk、
+  pages 会让 PCIe 流量乘以 tile 数；decode 每页只读一次，但 SM zero-copy 读 Host pages
+  远低于 copy engine 的 ~50 GB/s。因此每个含 Host pages 的 text step（prefill chunk、
   ordinary 或 MTP decode round）先由 `prepare` 把各 row 的 table words 复制到 staged tables，Host
   words 改为紧凑 staging record 编号（多个 rows 共用一个 record 空间）；每个 full-attention layer
   的 view 读 Device staging buffer，paged Ops 经 Host arm 从 Device 读取。两个 layer buffer 交替：
-  layer L 的 attention 期间，transfer stream 把 layer L+1 的 plane spans 复制到另一个 buffer（等待
+  layer L 的 attention 期间，transfer stream 把 layer L+1 的 pages 复制到另一个 buffer（每个
+  相邻 Host run 是一次连续 copy；等待
   该 buffer 此前的 readers），step stream 在 attention 前等待本层 copy。含 staging 的 decode round
   以 eager 执行（实测 eager 仅慢 ~1%）；不含 Host pages 的 round 仍用 CUDA Graph。容量为每个 buffer
   `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该 step
