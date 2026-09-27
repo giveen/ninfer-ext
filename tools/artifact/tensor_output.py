@@ -14,6 +14,7 @@ from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
+    Exl3Format,
     Fp8RowFormat,
     Nvfp4Format,
     QuantFormat,
@@ -21,6 +22,7 @@ from .formats import (
 )
 from .layouts import (
     block_scale_geometry,
+    exl3_geometry,
     row_scale_geometry,
     row_split_geometry,
 )
@@ -38,6 +40,7 @@ class TensorOutput:
         self.format = get_format(obj.format)
         self._padding_initialized = False
         self._divisors: list[bytes | None] = [None] * obj.divisors
+        self._input_scales: bytes | None = None
 
     def write_bytes(self, offset: int, data: bytes | memoryview) -> None:
         self.writer.write_region(self.object.id, offset, data)
@@ -67,6 +70,12 @@ class TensorOutput:
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, Exl3Format):
+            g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits)
+            gaps = (
+                (g.trellis_bytes, g.input_scale_offset),
+                (g.input_scale_offset + g.input_scale_bytes, g.output_scale_offset),
+            )
         else:
             gaps = ()
         for begin, end in gaps:
@@ -80,8 +89,17 @@ class TensorOutput:
         codes: torch.Tensor,
         scales: torch.Tensor,
         weight_divisor: bytes | None = None,
+        input_scales: torch.Tensor | None = None,
     ) -> None:
+        """Write encoded rows [row_begin, row_begin + rows).
+
+        EXL3 codes are the rows' tiles, uint8 [rows/16, K/16, tile_bytes]; scales are their FP32
+        output scales and input_scales the tensor's FP32 input scales, identical for every call.
+        """
         obj = self.object
+        if isinstance(self.format, Exl3Format):
+            self._write_exl3(row_begin, codes, scales, input_scales)
+            return
         if len(obj.shape) != 2 or not 0 <= row_begin < obj.shape[0]:
             raise ValueError(f"{obj.id}: invalid encoded row origin {row_begin}")
         rows, k = codes.shape[0], obj.shape[1]
@@ -132,3 +150,50 @@ class TensorOutput:
                 raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")
+
+    def _write_exl3(
+        self,
+        row_begin: int,
+        tiles: torch.Tensor,
+        output_scales: torch.Tensor,
+        input_scales: torch.Tensor | None,
+    ) -> None:
+        obj = self.object
+        g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits)
+        rows = tiles.shape[0] * 16
+        if (
+            tiles.dtype != torch.uint8
+            or tuple(tiles.shape[1:]) != (g.tiles_k, g.tile_bytes)
+            or row_begin % 16
+            or rows == 0
+            or not 0 <= row_begin < row_begin + rows <= g.n
+        ):
+            raise ValueError(f"{obj.id}: EXL3 rows must be whole 16-row tiles of the parent")
+        if output_scales.dtype != torch.float32 or tuple(output_scales.shape) != (rows,):
+            raise ValueError(f"{obj.id}: EXL3 output scales must be FP32 [{rows}]")
+        if (
+            input_scales is None
+            or input_scales.dtype != torch.float32
+            or tuple(input_scales.shape) != (g.k,)
+        ):
+            raise ValueError(f"{obj.id}: EXL3 rows need FP32 input scales [{g.k}]")
+        for label, values in (("output", output_scales), ("input", input_scales)):
+            if not bool(torch.isfinite(values).all()):
+                raise ValueError(f"{obj.id}: EXL3 {label} scales must be finite")
+        self._padding()
+        su = input_scales.contiguous().cpu().numpy().tobytes()
+        if self._input_scales is None:
+            self.write_bytes(g.input_scale_offset, su)
+            self._input_scales = su
+        elif self._input_scales != su:
+            raise ValueError(
+                f"{obj.id}: EXL3 sources of one parent must share their input scales"
+            )
+        tile_row_bytes = g.tiles_k * g.tile_bytes
+        self.write_bytes(
+            row_begin // 16 * tile_row_bytes, tiles.contiguous().cpu().numpy().tobytes()
+        )
+        self.write_bytes(
+            g.output_scale_offset + row_begin * 4,
+            output_scales.contiguous().cpu().numpy().tobytes(),
+        )
