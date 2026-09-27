@@ -12,7 +12,7 @@ using ninfer::test::linear_add::WeightFormat;
 int q5_a16_conformance() {
     // Exercise the production transitions, including the same transitions in
     // a composite tail and the 192-token limit on that tail.
-    constexpr std::array<std::int32_t, 13> starts{5,  9,   17,  25,  33,  49, 65,
+    constexpr std::array<std::int32_t, 12> starts{2,   17,  25,  33,  49,  65,
                                                   97, 129, 161, 193, 257, 513};
     constexpr std::array<std::int32_t, 13> interiors{1,  2,   3,   7,   13,  20,  40,
                                                      80, 112, 144, 224, 768, 1024};

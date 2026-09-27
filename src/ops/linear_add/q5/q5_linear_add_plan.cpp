@@ -37,10 +37,9 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 13> kK6144Routes{{
-    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
-    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+constexpr std::array<RouteSpec, 12> kK6144Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{2, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
     {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
@@ -53,10 +52,9 @@ constexpr std::array<RouteSpec, 13> kK6144Routes{{
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};
 
-constexpr std::array<RouteSpec, 13> kK17408Routes{{
-    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
-    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+constexpr std::array<RouteSpec, 12> kK17408Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{2, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
     {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
@@ -125,10 +123,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     switch (schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::SlicedR16T8W4S2:
-        return "linear_add.q5.sliced.r16.t8.w4.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR16T16W4S2:
-        return "linear_add.q5.sliced.r16.t16.w4.s2.residual";
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        return "linear_add.q5.ksplit.mma.residual";
     case Q5LinearAddScheduleId::SlicedR16T24W4S2:
         return "linear_add.q5.sliced.r16.t24.w4.s2.residual";
     case Q5LinearAddScheduleId::SlicedR32T32W4S2:
@@ -196,11 +192,8 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::SlicedR16T8W4S2:
-        q5_linear_add_sliced_r16_t8_launch(x, w, residual_out, stream);
-        return;
-    case Q5LinearAddScheduleId::SlicedR16T16W4S2:
-        q5_linear_add_sliced_r16_t16_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        q5_linear_add_ksplit_mma_residual_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::SlicedR16T24W4S2:
         q5_linear_add_sliced_r16_t24_launch(x, w, residual_out, stream);

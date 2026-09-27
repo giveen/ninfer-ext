@@ -12,8 +12,7 @@ namespace ninfer::ops::detail {
 
 enum class Q5LinearAddScheduleId {
     Split2ExactResidual,
-    SlicedR16T8W4S2,
-    SlicedR16T16W4S2,
+    KSplitMmaResidual,
     SlicedR16T24W4S2,
     SlicedR32T32W4S2,
     SlicedR32T24W4S2Pairwise,

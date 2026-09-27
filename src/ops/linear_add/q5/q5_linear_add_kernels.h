@@ -5,8 +5,7 @@
 
 namespace ninfer::ops::detail {
 void q5_linear_add_split2_exact_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void q5_linear_add_sliced_r16_t8_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void q5_linear_add_sliced_r16_t16_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void q5_linear_add_ksplit_mma_residual_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_sliced_r16_t24_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_sliced_r32_t32_w4_s2_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_sliced_r32_t24_pairwise_launch(const Tensor&, const Weight&, Tensor&,

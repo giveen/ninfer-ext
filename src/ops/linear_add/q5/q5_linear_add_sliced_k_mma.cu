@@ -14,16 +14,6 @@ void launch_sliced(const Tensor& x, const Weight& w, Tensor& residual, cudaStrea
 }
 } // namespace
 
-void q5_linear_add_sliced_r16_t8_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                        cudaStream_t stream) {
-    launch_sliced<q5_instances::SlicedR16T8W4S2>(x, w, residual, stream);
-}
-
-void q5_linear_add_sliced_r16_t16_launch(const Tensor& x, const Weight& w, Tensor& residual,
-                                         cudaStream_t stream) {
-    launch_sliced<q5_instances::SlicedR16T16W4S2>(x, w, residual, stream);
-}
-
 void q5_linear_add_sliced_r16_t24_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                          cudaStream_t stream) {
     launch_sliced<q5_instances::SlicedR16T24W4S2>(x, w, residual, stream);
