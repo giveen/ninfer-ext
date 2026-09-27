@@ -192,7 +192,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 |---|---|---|---|
 | M0 | In progress | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
-| M2 | Pending | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
+| M2 | In progress | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Pending | Calibration Program + first artifact | `ninfer-quantize` produces a full 27B EXL3 artifact at 4.0 bpw with `-hq`, using a simple correct decode kernel for the sequential re-runs; artifact loads and serves; KLD recorded vs BF16 and vs exllamav3 |
 | M4 | Pending | Fast inference kernels | Decode GEMV, sliced-K MMA, prefill MMA with epilogue Hadamard; consumers `linear`, `swiglu`, `add`, `attn_input`, `gdn_input`, LM head, MTP; end-to-end speed report |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
@@ -247,6 +247,38 @@ bit.
   active GPU reference quantization. Installed `transformers`, `datasets`, and QBench plotting
   dependencies in the isolated EXL3 environment. A 3.0-bpw reference conversion is running from the
   local checkpoint at `/mnt/storage/models/qwen3.8/full`.
+- 2026-09-27: The exllamav3 3.0 bpw reference finished at 09:58, about 45 minutes including one resume:
+  `/mnt/storage/models/qwen3.8/exl3-reference/3bpw`, 13.5 GB, v1.5.2, mul1, `head_bits` 6, `mtp_bits` 4,
+  `out_scales` always, calibrated on exllamav3's built-in data (250 x 2048).
+- 2026-09-27: The sampler's prompt-token cross-check failed on tool rows (1857 vs 1881 tokens). NInfer's template
+  `tojson` uses Python's default `", "`/`": "` separators, and the server renders tools in its canonical form
+  (`name`, `parameters`, `strict: false`, `description`); the sampler now matches both (`7bfe1012`). The 100-row
+  evaluation trace (shards 02/03, `--max-new-tokens 256`, Q4 artifact) is in ignored
+  `profiles/exl3/traces/evaluation.*`: about 1,473 prompt + 261 sampled tokens per row.
+- 2026-09-27: M0 reference scoring with QBench (`profiles/exl3/qwen3_8_27b_reference.yaml`, results and plots
+  beside it) on the evaluation trace, against the layer-streamed HF BF16 source:
+
+  | Model | PPL | Mean KLD | Median KLD | p90 KLD |
+  |---|---:|---:|---:|---:|
+  | BF16 reference | 1.7406 | — | — | — |
+  | BF16 noise floor | 1.7409 | 0.000833 | 0.000136 | 0.00215 |
+  | exllamav3 3.0 bpw | 1.7832 | 0.034747 | 0.010227 | 0.094392 |
+
+  PPL is low because the trace is the model's own sampled continuations. The 4.0 bpw reference conversion is
+  running (`exl3-reference/4bpw`, `-hb 6`); add it to the QBench project when it finishes. The calibration trace
+  (250 rows, shards 00/01) remains to be sampled.
+- 2026-09-27: M2 started, in `ninfer_quantize` (`src/quantize/`, offline only, not linked into the Engine):
+  - `tests/quantize/exl3_viterbi_reference`: FP64 host oracle with exact tail-biting search (one constrained
+    Viterbi per ring overlap) and the two-pass method. The exact search matches brute-force enumeration of every
+    ring bitstream on small trellises. Unit-Gaussian MSE is 0.067 / 0.035 / 0.016 at K = 2 / 2.5 / 3, 5-11% above
+    the rate-distortion bound.
+  - `src/quantize/exl3/trellis_encoder`: GPU two-pass encoder with FP32 path costs (exllamav3 uses FP16) indexed by
+    carry node. Its rings are bit-identical to the FP64 reference at K = 1, 1.5, 2, 2.5, 3 and 4 (24/24 tiles each)
+    and pack through `trellis_t16_v1`. Cost buffers and back-pointers live in global scratch; shared-memory costs for
+    K >= 3 and packed back-pointers are pending throughput work.
+  - `src/quantize/exl3/hadamard`: in-place 128-point FWHT along rows and columns, checked against the explicit FP64
+    Sylvester product.
+  - Next: `XᵀX` accumulation, blocked LDL, LDLQ, scale refit, and the single-tensor FP64 pipeline comparison.
 
 ## Review notes (2026-09-27, external read-only review of `385bb9af` and the uncommitted sampler)
 
@@ -288,42 +320,20 @@ and the guards that keep EXL3 tensors out of `native_weight` and `weight_row_pla
    M3 needs the reference again.
 7. **Style.** The new enumerators in `src/core/weight.h` and the new fields in `src/core/weight_view.h` are not
    aligned with their neighbours. Run clang-format on the touched files.
-8. **Blocks M0: the BF16 reference cannot be loaded whole.** The 52 GB source does not fit on the 32 GB GPU,
-   so a plain Transformers or QBench load will run out of memory. Options, in order of preference:
-   1. **Layer-streamed reference forward (recommended).**
-      - For each layer ℓ, load only that layer's source tensors to the GPU, run every evaluation row through it,
-        keep the hidden states, and free the layer.
-      - Hidden states for 100 rows × 2048 tokens × 5120 in BF16 are about 2 GB. The source is read once, so a full
-        pass costs roughly the 52 GB disk read.
-      - At the end, apply the final norm and LM head, and store per-token top-k log-probs. Use k of about 64–128
-        plus the log of the tail mass, since full 248,320-way logits are too large to keep. KLD for any candidate
-        (EXL3 reference, our EXL3, Q4, NVFP4) is then computed against these stored log-probs.
-      - This is the same layer-streaming schedule the M3 calibration Program needs (item 1). Build it once and
-        reuse it: first as the BF16 reference scorer, then with the `XᵀX` observer and quantize-then-rerun steps
-        for calibration.
-      - A quick first version can run in the tooling venv with PyTorch and the HF layer modules loaded one at a time.
-      - The native C++23 version belongs to M3.
-   2. **Transformers with CPU offload** (`device_map="auto"`, about 28 GiB GPU budget, the rest in the 247 GB of
-      host RAM). No new code, but every forward streams about 25 GB of weights over PCIe. Acceptable for about 100
-      evaluation rows if batched, too slow for anything larger. Verify QBench's "streaming" backend really offloads
-      before relying on it.
-   3. **Near-lossless proxy.** An exllamav3 6.0 bpw quant (about 21 GB) fits in VRAM, and its KLD against BF16 is
-      far below the 3–4 bpw differences being measured. Acceptable for ranking quants, but label it clearly in M0
-      as a proxy, not BF16.
-   4. **CPU-only BF16.** It fits in RAM but takes hours for the evaluation trace. Not recommended.
-
-   Do not substitute the Q4/NVFP4 artifacts for the reference, as the progress log already notes.
-9. **The reference quant finished; record it.** The exllamav3 3.0 bpw conversion completed at 09:58, about 45 minutes
-   including one resume.
-   - Output: `/mnt/storage/models/qwen3.8/exl3-reference/3bpw`, 13.5 GB.
-   - Settings: v1.5.2, mul1, `head_bits` 6, `mtp_bits` 4, `out_scales` always.
-   - Calibration: exllamav3's built-in data (250 × 2048), not our self-sampled trace. Keep that in mind when
-     comparing KLD with our quant: calibration data is a confound unless both use the same trace, or unless it is
-     reported explicitly.
-   - The progress log still says "running".
-10. **Scope of the uncommitted `--generation-token-trace-jsonl` serve option.**
-    - Capturing exact generated token IDs is better than re-tokenizing text. But it changes the product server
-      (`http_server`, `generation_service`, `serve_options`, `docs/serving.md`), so it needs the normal serving
-      review and tests, not just EXL3 tooling review.
-    - The usage-text lines it touched in `serve_options.cpp` gained an extra space of indentation (`request-log`
-      and the new line). Restore the original alignment.
+8. **Resolved: the BF16 reference loads through QBench's layer-major streaming.** This item originally said a
+   whole-model load could not fit. QBench's `streaming: true` backend is exactly the recommended design: it builds a
+   meta skeleton, materializes one module at a time from the shards, pushes every row through it, then frees it, so
+   peak VRAM is one layer plus about 2 GB of activations. The 100-row evaluation pass plus its noise-floor pass took
+   minutes, even with Transformers' pure-PyTorch GDN fallbacks (no `fla`/`causal_conv1d` in the tooling venv).
+   Note that QBench infers row length from the last nonzero token, so a real trailing token id 0 would be dropped
+   (irrelevant for chat traces, which end in template tokens). The M3 calibration Program still needs its own native
+   layer streaming (item 1).
+9. **Resolved.** The 3.0 bpw reference is recorded in the progress log and scored below. Its calibration is still
+   exllamav3's built-in data, not our trace, so that confound remains when our quant is compared against it.
+10. **Resolved.** The serve option was reviewed and committed (`e587576b`). The review found that an empty completion
+    made the formatter throw, which permanently disabled the trace; empty completions are now valid records. The
+    indentation was restored.
+11. **Sampler: every evaluation response hit the 256-token cap mid-thinking.** All 100 rows report 261 sampled tokens
+    (256 plus template closers), so the 8% tool rows never reached an actual tool call and no follow-up turns were
+    produced. For the calibration trace, either raise `--max-new-tokens`, or sample tool rows with thinking disabled,
+    so the calibration activations include real tool-call syntax.
