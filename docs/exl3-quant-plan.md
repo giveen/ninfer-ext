@@ -190,7 +190,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 
 | # | Status | Deliverable | Done when |
 |---|---|---|---|
-| M0 | In progress (4.0 bpw reference and calibration trace pending) | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
+| M0 | Complete (calibration trace sampling) | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Pending | Calibration Program + first artifact | `ninfer-quantize` produces a full 27B EXL3 artifact at 4.0 bpw with `-hq`, using a simple correct decode kernel for the sequential re-runs; artifact loads and serves; KLD recorded vs BF16 and vs exllamav3 |
@@ -311,6 +311,62 @@ bit.
     - Back pointers use a byte per node (could pack).
     - The LDLQ compensation and refit GEMMs are SIMT FP32.
     - The encoder is about 93% of single-tensor time, so M3's full-model quantization time follows it.
+- 2026-09-27: M0 reference scoring finished. The exllamav3 4.0 bpw reference (`exl3-reference/4bpw`, `-hb 6`,
+  otherwise as 3.0) was added to the QBench project; the cached BF16 logits were reused.
+
+  | Model | PPL | Mean KLD | Median KLD | p90 KLD |
+  |---|---:|---:|---:|---:|
+  | BF16 reference | 1.7406 | — | — | — |
+  | BF16 noise floor | 1.7409 | 0.000833 | 0.000136 | 0.00215 |
+  | exllamav3 3.0 bpw | 1.7832 | 0.034747 | 0.010227 | 0.094392 |
+  | exllamav3 4.0 bpw | 1.7546 | 0.009969 | 0.002794 | 0.026393 |
+
+  - Output-scale mode: the references used always-on output scales. `TensorOptions::out_scales` now has
+    `Always`, and single-tensor parity holds in that mode too (in_proj_z K = 3/4 0.9989/0.9993, in_proj_qkv K = 3
+    0.9970).
+  - Largest shape: a k = 17408 down_proj probe (synthetic Hessian, K = 4) takes 9.9 s and about 13 GB of device
+    memory, with the CG input refit converged. `TensorReport::refit_input_skipped` now counts non-converged
+    solves.
+  - Sampler fixes (`5c3c58e9`, review item 11):
+    - Tool rows sample with thinking off by default, so they reach real tool calls and follow-ups.
+    - Follow-ups render without tool definitions when `tool_choice` is `"none"`, and with tool-call arguments as
+      objects, as ninfer-serve does.
+  - Calibration trace: 250 rows, shards 00/01, `--max-new-tokens 600`, sampling into ignored
+    `profiles/exl3/traces/calibration.*`. Check its log for completion.
+
+## Handoff (2026-09-27, before OpenCode resumes)
+
+Claude covered this session while OpenCode was rate-limited. Everything is committed on `feat/exl3-quantization`.
+
+**Before editing, OpenCode must re-read this file and `git log 385bb9af..HEAD`.** About 20 commits landed since its
+last session. An in-memory copy of this plan would overwrite the review notes, the progress log and this handoff.
+
+What landed:
+- The M0 baselines (above).
+- M2 complete in `src/quantize/exl3/` (`ninfer_quantize`), with tests in `tests/quantize/` and exllamav3 parity via
+  `tools/exl3/compare_tensor.py`.
+- The serve trace option and the sampler fixes.
+
+**Open M3 decisions**, not taken here because they change architecture or reverse an earlier user decision:
+1. **How the quantizer loads the model.** Section 4.1 still says "loads the BF16 artifact". The BF16 `.ninfer` was
+   waived for M0 only.
+   - AGENTS.md makes `.ninfer` the only C++ artifact and gives recipes ownership of sources, which points to a BF16
+     `.ninfer` read one layer at a time.
+   - Artifact materialization already supports lazily mapped file objects (`MaterializationPlan::file_objects`,
+     host access), so the quantizer can map it and upload layer by layer.
+   - Disk is not a constraint: `/mnt/storage` has 2.8 TB free for the 52 GB artifact.
+   - The alternative is a C++ safetensors reader for the source, which adds a second input format.
+   - This is a user decision.
+2. **Device allocations.** `quantize_tensor` allocates its temporaries internally (several k x k and k x n FP32
+   buffers; about 13 GB peak at k = 17408). Engine Programs must not allocate hidden device memory. Either the
+   quantization step stays in the offline `ninfer-quantize` app outside any Program, or it gets a workspace-size
+   query and caller-owned workspace.
+3. **The sequential re-run after each layer.** The plan says it uses the EXL3 inference kernels. Re-running with
+   the BF16 reconstruction (`wq`, already produced by `quantize_tensor`) through the existing BF16 linears would
+   decouple calibration from the M4 Op work. That is a plan deviation, so decide it explicitly.
+
+Not started: the EXL3 linear Op (a simple decode kernel qualified against an FP64 oracle decoded from the stored
+planes). Every M3 design needs it for "loads and serves".
 
 ## Review notes (2026-09-27, external read-only review of `385bb9af` and the uncommitted sampler)
 
