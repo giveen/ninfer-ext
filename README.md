@@ -170,8 +170,9 @@ Other settings that matter for speed:
   - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
     total at 262k with FP8, ~2 GB with BF16.
   - A conversation that spilled still resumes from its previous turn: the next request reuses
-    that KV with the older pages left in RAM. Checkpoint captures inside a prompt apply only to
-    prompts that fit the share.
+    that KV with the older pages left in RAM. 27B, BF16 KV, 30.6k-token chat with a 12k share:
+    the second turn's TTFT was 188 ms (resident 170 ms) instead of 4.2 s for a fresh prefill.
+    Shared-prefix captures apply only to prompts that fit the share.
   - Size `--host-kv-mib` for the spill: admission reserves Host KV for each request's prompt plus
     output limit (`max_tokens`, default 8192) beyond its share. A request that does not fit waits
     for running ones to finish; one that could never fit is rejected.

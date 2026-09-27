@@ -539,13 +539,15 @@ Device window，更早的 full pages 由 Host records 原地读取：
   `kv_stream`。
 - Context cache：active capture 要求 full pages Device-resident 且 immutable pages 在 mutable pages
   之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 生成
-  captures（`RequestBasePlanImpl::prompt_fits_window`）：其 prefill 从不 demote，captures 都在
-  window 内。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
+  shared-prefix 与 long-anchor captures（`RequestBasePlanImpl::prompt_fits_window`；更长 prompt
+  的 opportunities 被清空）：其 prefill 从不 demote，snapshot 都在 window 内。Private rewrite
+  checkpoint 不 snapshot KV，只保护 frontier，任何 prompt 都会 capture。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
   reference 唯一）；该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取
   residency，支持这种状态。已有 current Host replica 的 page 不复制，直接 demote。
 - Streamed reuse：demote 过的 request 仍在 finish 时发布 endpoint continuation。Prompt 超过 window
-  的 request 只能以 PrivateEndpoint + ConsumeToActive（无 prefix fork）复用自己上一轮的
-  endpoint：`inspect_lane` 给出 stream range `[kKVStreamSinkPages, full − kv_stream_tail_pages)`，
+  的 request 只能以 ConsumeToActive（无 prefix fork）复用自己上一轮的 endpoint 或 rewrite
+  checkpoint（chat 的常见路径 `private_response_replay`）；reuse frontier 所在页及其后的页必须
+  Device-resident 且无 Host replica（truncate 回 frontier 的要求），否则不生成候选：`inspect_lane` 给出 stream range `[kKVStreamSinkPages, full − kv_stream_tail_pages)`，
   其中可 stream 的 members（Host-only、full、committed、Host replica current、无共享引用，
   `LogicalKVPageStore::can_stream_active`）以 Host word 激活（`prepare_activation` 的 stream
   range），不获得 writer 身份，也不 restore；sinks、frontier tail 与其它 Host-only pages 照常

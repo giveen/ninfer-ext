@@ -253,15 +253,18 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
-    // With KV streaming, only a request whose prompt fits its Device window captures checkpoints:
-    // its prefill never demotes, so its captures stay within the window. A longer prompt may still
-    // reuse its own previous turn with the older pages left on Host, and publishes its endpoint.
+    // With KV streaming, a prompt longer than its Device window captures only its private rewrite
+    // checkpoint (no KV snapshot, only a protected frontier): shared prefixes and long anchors are
+    // reused by forking, which would restore the whole prefix to Device. It may reuse its own
+    // previous turn (endpoint or rewrite checkpoint) with the older pages left on Host.
     // Paged-kv §6.5.
     const bool prompt_fits_window =
         !kv_stream || kv_pages_for_tokens(std::min(capacity, base->summary.prompt_tokens +
                                                                  draft_window + 1U)) <=
                           kv_stream_window(*text_kv_pages);
     base->prompt_fits_window             = prompt_fits_window;
+    // Opportunities are shared-prefix and long-anchor captures, which such a prompt does not take.
+    if (!prompt_fits_window) { base->context_cache.opportunities.clear(); }
     const bool prefix_reuse              = options.allow_prefix_reuse;
     base->allow_prefix_reuse             = prefix_reuse;
     base->summary.publish_continuation =
@@ -368,7 +371,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
-    if (prefix_reuse && prompt.identity.reusable && context_cache.enabled && prompt_fits_window) {
+    if (prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
                                      bool long_anchor, SharedCandidateEvidence evidence) {
@@ -896,14 +899,34 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 partial_tail_cow_required(*backend_kv_addresses, *source_kv->backend,
                                           backend_frontier);
         }
-        // A streaming prompt longer than its window reuses only its own previous endpoint, moved
-        // in place with its older pages left on Host (paged-kv §6.5): a Fork would restore the
-        // whole prefix to Device. Members between the sinks and the frontier tail that are
-        // Host-only stay there; the tail is written and demotion assumes it resident.
+        // A streaming prompt longer than its window reuses only its own previous turn (endpoint
+        // or rewrite checkpoint), moved in place with its older pages left on Host (paged-kv
+        // §6.5): a Fork would restore the whole prefix to Device. Members between the sinks and
+        // the frontier tail that are Host-only stay there; the tail is written, demotion assumes
+        // it resident, and truncating back to the reuse frontier needs every later page on Device.
         if (!base.prompt_fits_window) {
-            if (source == nullptr || plan->reuse != ReusePath::PrivateEndpoint ||
+            const auto resident_from = [&](const KVAddressSpaceStore& addresses,
+                                           const LogicalKVPageStore& pages,
+                                           KVAddressSpaceHandle address, std::uint32_t frontier) {
+                for (std::uint32_t page = frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+                     page < addresses.mapped_pages(address); ++page) {
+                    const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                    if (!pages.device_resident(logical) || pages.host_resident(logical)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (source == nullptr ||
+                (plan->reuse != ReusePath::PrivateEndpoint &&
+                 !is_rewrite_checkpoint_restore(plan->reuse)) ||
                 plan->source_mode != runtime::PrivateSourceMode::ConsumeToActive ||
-                plan->text_prefix_fork_required || plan->backend_prefix_fork_required) {
+                plan->text_prefix_fork_required || plan->backend_prefix_fork_required ||
+                !resident_from(*text_kv_addresses, *text_kv_pages, source_kv->text,
+                               plan->reuse_base) ||
+                (source_kv->backend && backend_frontier != 0 &&
+                 !resident_from(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend,
+                                backend_frontier))) {
                 return std::nullopt;
             }
             const auto range = [&](std::uint32_t frontier, std::uint32_t& begin,
