@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -19,7 +20,7 @@ struct RequestLogContext {
     std::size_t media_item_count            = 0;
     int requested_output_tokens             = 0;
     bool requested_output_tokens_client_set = false;
-    std::size_t tool_count                  = 0;
+    std::vector<std::string> tool_names; // declared, in request order
     ToolChoice tool_choice;
     bool has_tool_history = false;
     bool enable_thinking  = true;
@@ -50,7 +51,7 @@ struct RequestRejectionLogContext {
     std::size_t media_item_count            = 0;
     int requested_output_tokens             = 0;
     bool requested_output_tokens_client_set = false;
-    std::size_t tool_count                  = 0;
+    std::vector<std::string> tool_names; // declared, in request order
     ToolChoice tool_choice;
     bool has_tool_history = false;
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;

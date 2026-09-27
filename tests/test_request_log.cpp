@@ -553,6 +553,25 @@ int main() {
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
 
+    // An undeclared tool name is reported next to the names the client declared.
+    RequestLogContext tool_context = context;
+    tool_context.tool_names        = {"read", "grep"};
+    GenerationOutcome undeclared   = fallback_outcome;
+    undeclared.tool_call_parse.fallback_reason = ninfer::ToolCallParseFallbackReason::UndeclaredTool;
+    const std::optional<OperationalRecord> undeclared_warning =
+        render_tool_call_fallback(tool_context, undeclared);
+    failures += check(undeclared_warning &&
+                          undeclared_warning->message ==
+                              "req#7 tool markup returned as text | undeclared tool | declared: "
+                              "read,grep",
+                      "undeclared-tool warning does not list the declared tools");
+    const Json tool_started =
+        Json::parse(format_request_start_json("serve-test", 2001, tool_context));
+    failures += check(tool_started.at("request").at("tool_count") == 2 &&
+                          tool_started.at("request").at("tool_names") ==
+                              Json::array({"read", "grep"}),
+                      "declared tool names missing from the request record");
+
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
     failures += check(error.at("event") == "request_error", "request error event mismatch");

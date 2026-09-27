@@ -3,6 +3,16 @@
 #include <utility>
 
 namespace ninfer::serve {
+namespace {
+
+std::vector<std::string> declared_tool_names(const GenerationRequest& request) {
+    std::vector<std::string> names;
+    names.reserve(request.tools.size());
+    for (const ToolDefinition& tool : request.tools) { names.push_back(tool.name); }
+    return names;
+}
+
+} // namespace
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
@@ -17,7 +27,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
     context.requested_output_tokens_client_set = metadata.output_tokens_explicit;
-    context.tool_count                         = request.tools.size();
+    context.tool_names                         = declared_tool_names(request);
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
@@ -48,7 +58,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
     context.requested_output_tokens_client_set = metadata.output_tokens_explicit;
-    context.tool_count                         = request.tools.size();
+    context.tool_names                         = declared_tool_names(request);
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.requested_reasoning_effort         = request.reasoning_effort;

@@ -201,7 +201,9 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
             out << ", prepared " << product::format_pretty_duration(context.preparation.seconds);
         }
     }
-    if (context.tool_count != 0) { append_counted_clause(out, "tools", context.tool_count); }
+    if (!context.tool_names.empty()) {
+        append_counted_clause(out, "tools", context.tool_names.size());
+    }
     if (context.preserve_thinking == true) { append_clause(out, "preserve thinking"); }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
@@ -224,7 +226,9 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
     if (context.media_item_count != 0) {
         append_counted_clause(out, "media", context.media_item_count);
     }
-    if (context.tool_count != 0) { append_counted_clause(out, "tools", context.tool_count); }
+    if (!context.tool_names.empty()) {
+        append_counted_clause(out, "tools", context.tool_names.size());
+    }
     return {.severity = failure_severity(failure.classification), .message = out.str()};
 }
 
@@ -310,10 +314,20 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         }
     }
 
+    // An undeclared name is only diagnosable next to the names the client declared.
+    std::string declared;
+    if (reason == ninfer::ToolCallParseFallbackReason::UndeclaredTool) {
+        declared = " | declared: ";
+        for (std::size_t index = 0; index < context.tool_names.size(); ++index) {
+            if (index != 0) { declared += ','; }
+            declared += context.tool_names[index];
+        }
+    }
+
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) + declared +
                    (snippet.empty() ? std::string{} : " | " + snippet),
     };
 }
