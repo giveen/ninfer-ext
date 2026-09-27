@@ -2612,8 +2612,10 @@ bool ProgramImpl::persistent_backfill_safe(
         }
         observed_lanes |= bit;
         borrowers = checked_resource_sum(borrowers, requests[lane].active_resources);
+        borrowers.host.kv_bytes += requests[lane].host_spill_budget;
     }
     borrowers = checked_resource_sum(borrowers, candidate.impl_->demand.active_entitlement);
+    borrowers.host.kv_bytes += candidate.impl_->host_spill_bytes;
 
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,

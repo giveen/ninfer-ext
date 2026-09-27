@@ -111,8 +111,9 @@ expected_host_records(const ninfer::DeviceKVPagePool& pool,
         for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
             const ninfer::Tensor& plane                 = pool.plane(plane_index);
             const ninfer::HostKVPlaneLayout& host_plane = host_layout.planes[plane_index];
-            std::byte* destination =
-                out.data() + logical * host_layout.page_stride + host_plane.offset;
+            std::byte* destination = out.data() + logical * host_layout.page_stride +
+                                     host_layout.layer_of(plane_index) * host_layout.layer_span +
+                                     host_plane.offset;
             if (pool.geometry().device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor) {
                 const unsigned char* source = device_planes[plane_index].data() +
                                               static_cast<std::size_t>(physical) * plane.nb[3];
@@ -132,26 +133,49 @@ expected_host_records(const ninfer::DeviceKVPagePool& pool,
     return out;
 }
 
+// Page-major copy of a layer-major Host allocation, in expected_host_records' order.
+std::vector<std::byte> gather_host_records(ninfer::HostKVAllocationConstView view) {
+    const ninfer::HostKVPageLayout& layout = view.layout();
+    std::vector<std::byte> out(layout.page_stride * view.page_count(), std::byte{0});
+    for (std::uint32_t page = 0; page < view.page_count(); ++page) {
+        for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+            std::memcpy(out.data() + page * layout.page_stride +
+                            layout.layer_of(plane) * layout.layer_span +
+                            layout.planes[plane].offset,
+                        view.plane_page(plane, page), layout.planes[plane].page_payload_bytes);
+        }
+    }
+    return out;
+}
+
+void fill_host_records(ninfer::HostKVAllocationView view, std::byte value) {
+    const ninfer::HostKVPageLayout& layout = view.layout();
+    for (std::uint32_t page = 0; page < view.page_count(); ++page) {
+        for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+            std::memset(view.plane_page(plane, page), static_cast<int>(value),
+                        layout.planes[plane].page_payload_bytes);
+        }
+    }
+}
+
 bool page_payload_equal(ninfer::HostKVAllocationConstView left_view, std::uint32_t left,
                         ninfer::HostKVAllocationConstView right_view, std::uint32_t right) {
     const ninfer::HostKVPageLayout& layout = left_view.layout();
     if (right_view.layout() != layout) { return false; }
-    for (const ninfer::HostKVPlaneLayout& plane : layout.planes) {
-        const std::byte* a =
-            left_view.data() + static_cast<std::size_t>(left) * layout.page_stride + plane.offset;
-        const std::byte* b =
-            right_view.data() + static_cast<std::size_t>(right) * layout.page_stride + plane.offset;
-        if (std::memcmp(a, b, plane.page_payload_bytes) != 0) { return false; }
+    for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+        if (std::memcmp(left_view.plane_page(plane, left), right_view.plane_page(plane, right),
+                        layout.planes[plane].page_payload_bytes) != 0) {
+            return false;
+        }
     }
     return true;
 }
 
 bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t page) {
     const ninfer::HostKVPageLayout& layout = view.layout();
-    for (const ninfer::HostKVPlaneLayout& plane : layout.planes) {
-        const std::byte* data =
-            view.data() + static_cast<std::size_t>(page) * layout.page_stride + plane.offset;
-        for (std::size_t index = 0; index < plane.page_payload_bytes; ++index) {
+    for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+        const std::byte* data = view.plane_page(plane, page);
+        for (std::size_t index = 0; index < layout.planes[plane].page_payload_bytes; ++index) {
             if (data[index] != std::byte{0}) { return false; }
         }
     }
@@ -278,21 +302,23 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     const ninfer::HostKVPageLayout host_layout =
         ninfer::plan_host_kv_page_layout(source.geometry());
     const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    // Four-page chunks: the five-page allocations below straddle a chunk boundary, including
+    // inside a physically contiguous Device run.
     ninfer::HostKVArena host_arena(host_layout.page_stride * 24,
-                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+                                   std::span<const ninfer::HostKVPageLayout>(layouts), 4);
     failures += expect(!host_arena.can_allocate(host_layout, 25),
                        label + " oversized Host extent was reported allocatable");
     std::optional<ninfer::HostKVAllocation> host =
         host_arena.allocate(host_layout, static_cast<std::uint32_t>(source_handles.size()));
     failures += expect(host.has_value(), label + " Host allocation failed");
     ninfer::HostKVAllocationView host_view = host_arena.writable_view(*host);
-    std::memset(host_view.data(), 0, host_layout.page_stride * host_view.page_count());
+    fill_host_records(host_view, std::byte{0});
     source.copy_to_host(source_handles, host_view, context.stream);
     context.synchronize();
 
     const std::vector<std::byte> expected =
         expected_host_records(source, physical_mapping, host_layout, device_bytes);
-    failures += expect(std::memcmp(host_view.data(), expected.data(), expected.size()) == 0,
+    failures += expect(gather_host_records(host_view) == expected,
                        label + " D2H canonical page records differ from Device payload");
 
     std::vector<ninfer::DeviceKVPageLease> restored                = materialize(destination, 5);
@@ -316,17 +342,17 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     std::optional<ninfer::HostKVAllocation> roundtrip = host_arena.allocate(host_layout, 5);
     failures += expect(roundtrip.has_value(), label + " roundtrip Host allocation failed");
     ninfer::HostKVAllocationView roundtrip_view = host_arena.writable_view(*roundtrip);
-    std::memset(roundtrip_view.data(), 0, host_layout.page_stride * roundtrip_view.page_count());
+    fill_host_records(roundtrip_view, std::byte{0});
     destination.copy_to_host(restored_handles, roundtrip_view, context.stream);
     context.synchronize();
-    failures += expect(std::memcmp(roundtrip_view.data(), host_view.data(), expected.size()) == 0,
+    failures += expect(gather_host_records(roundtrip_view) == gather_host_records(host_view),
                        label + " Device -> Host -> Device roundtrip changed bytes");
 
     destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream);
     const ninfer::DeviceKVPageHandle copied[] = {restored[0].handle(), restored[4].handle()};
     std::optional<ninfer::HostKVAllocation> copied_host = host_arena.allocate(host_layout, 2);
     ninfer::HostKVAllocationView copied_view            = host_arena.writable_view(*copied_host);
-    std::memset(copied_view.data(), 0, host_layout.page_stride * 2);
+    fill_host_records(copied_view, std::byte{0});
     destination.copy_to_host(copied, copied_view, context.stream);
     context.synchronize();
     const ninfer::HostKVAllocationConstView copied_contents = host_arena.view(*copied_host);
@@ -341,7 +367,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                                                            restored[1].handle()};
     std::optional<ninfer::HostKVAllocation> zero_host   = host_arena.allocate(host_layout, 2);
     ninfer::HostKVAllocationView zero_view              = host_arena.writable_view(*zero_host);
-    std::memset(zero_view.data(), 0x5a, host_layout.page_stride * 2);
+    fill_host_records(zero_view, std::byte{0x5a});
     destination.copy_to_host(zero_observation, zero_view, context.stream);
     context.synchronize();
     const ninfer::HostKVAllocationConstView zero_contents = host_arena.view(*zero_host);
@@ -419,6 +445,95 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
 
 } // namespace
 
+// Host words address pages layer-major: plane p of the page with unit u is at
+// plane_base(p) + u * 256, and adjacent slots of one layer are adjacent within a chunk.
+int exercise_layer_major_arena() {
+    int failures = 0;
+    const ninfer::KVPageGeometry wide{
+        .planes       = {{ninfer::DType::BF16, 64, 2, 256},
+                         {ninfer::DType::BF16, 64, 2, 256},
+                         {ninfer::DType::BF16, 64, 2, 256},
+                         {ninfer::DType::BF16, 64, 2, 256},
+                         {ninfer::DType::BF16, 64, 2, 256},
+                         {ninfer::DType::BF16, 64, 2, 256}},
+        .layer_planes = 2,
+    };
+    const ninfer::KVPageGeometry narrow{
+        .planes       = {{ninfer::DType::I8, 16, 1, 256}, {ninfer::DType::FP16, 1, 1, 256}},
+        .layer_planes = 2,
+    };
+    const ninfer::HostKVPageLayout layouts[] = {ninfer::plan_host_kv_page_layout(wide),
+                                                ninfer::plan_host_kv_page_layout(narrow)};
+    const ninfer::HostKVPageLayout& a        = layouts[0];
+    const ninfer::HostKVPageLayout& b        = layouts[1];
+    failures += expect(a.layers == 3 && a.layer_planes == 2 &&
+                           a.layer_span == std::size_t{2} * 64 * ninfer::kPagedKVPageSize * 2 * 2 &&
+                           a.page_stride == 3 * a.layer_span && a.planes[2].offset == 0 &&
+                           a.planes[3].offset == a.planes[1].offset,
+                       "layer-major Host layout repeats plane offsets per layer");
+
+    // Two chunks of four slots; `second` takes slots 2..4 across the chunk boundary.
+    ninfer::HostKVArena arena((a.page_stride + b.page_stride) * 9,
+                              std::span<const ninfer::HostKVPageLayout>(layouts), 4);
+    failures += expect(arena.capacity_bytes() == (a.page_stride + b.page_stride) * 8 &&
+                           arena.can_allocate(a, 8) && !arena.can_allocate(a, 9) &&
+                           arena.can_allocate(b, 8) && !arena.can_allocate(b, 9),
+                       "every Host layout owns the same whole-chunk slot count");
+
+    auto first  = arena.allocate(a, 2);
+    auto second = arena.allocate(a, 3);
+    auto other  = arena.allocate(b, 8);
+    failures += expect(first && second && other && !arena.can_allocate(b, 1) &&
+                           arena.occupied_bytes() == 5 * a.page_stride + 8 * b.page_stride,
+                       "slot allocation per layout");
+    const auto units = static_cast<std::uint32_t>(a.layer_span / ninfer::kHostKVPageUnitBytes);
+    const auto chunk_units = static_cast<std::uint32_t>(4 * (a.page_stride + b.page_stride) /
+                                                        ninfer::kHostKVPageUnitBytes);
+    const auto slot_unit   = [&](std::uint32_t slot) {
+        return slot / 4 * chunk_units + slot % 4 * units;
+    };
+    const ninfer::HostKVAllocationConstView view = arena.view(*second);
+    bool addressed = view.contiguous_pages(0) == 2 && view.contiguous_pages(1) == 1 &&
+                     view.contiguous_pages(2) == 1;
+    for (std::uint32_t page = 0; page < 3; ++page) {
+        const auto unit = static_cast<std::uint32_t>(arena.page_unit(*second, page));
+        addressed       = addressed && unit == slot_unit(2 + page);
+        for (std::size_t plane = 0; plane < a.planes.size(); ++plane) {
+            addressed =
+                addressed && arena.plane_base(a, plane) + static_cast<std::size_t>(unit) *
+                                                              ninfer::kHostKVPageUnitBytes ==
+                                 view.plane_page(plane, page);
+        }
+        addressed = addressed && view.plane_page(4, page) - view.plane_page(2, page) ==
+                                     view.plane_page(2, page) - view.plane_page(0, page);
+    }
+    addressed = addressed &&
+                view.plane_page(0, 1) - view.plane_page(0, 0) ==
+                    static_cast<std::ptrdiff_t>(a.layer_span) &&
+                view.subview(1, 2).plane_page(3, 0) == view.plane_page(3, 1) &&
+                arena.view(*first).plane_page(0, 0) + 2 * a.layer_span == view.plane_page(0, 0);
+    failures += expect(addressed, "Host words, views and layer bands agree");
+
+    auto [left, right] = arena.split(std::move(*second), 1);
+    failures += expect(static_cast<std::uint32_t>(arena.page_unit(right, 0)) == slot_unit(3),
+                       "a split keeps page slots");
+    first->release();
+    left.release();
+    failures += expect(arena.can_allocate(a, 3) && !arena.can_allocate(a, 4),
+                       "released slot runs coalesce");
+    const ninfer::HostKVAllocationHandle releases[] = {right.handle()};
+    const ninfer::HostKVAllocationRequest targets[] = {{.layout = &a, .pages = 8}};
+    auto recipe                                     = arena.plan_after_releases(releases, targets);
+    failures += expect(recipe.has_value(), "a recipe reuses every released slot");
+    std::array<ninfer::HostKVAllocation, 1> outputs;
+    ninfer::HostKVAllocation* release_inputs[] = {&right};
+    failures +=
+        expect(recipe && arena.apply_recipe(std::move(*recipe), release_inputs, outputs) &&
+                   static_cast<std::uint32_t>(arena.page_unit(outputs[0], 5)) == slot_unit(5),
+               "an applied recipe adopts its planned slots");
+    return failures;
+}
+
 int main() {
     int device_count              = 0;
     const cudaError_t count_error = cudaGetDeviceCount(&device_count);
@@ -443,8 +558,9 @@ int main() {
                         {ninfer::DType::I8, 8, 2, 256},
                         {ninfer::DType::FP16, 1, 2, 256},
                     },
+                .layer_planes = 1,
             },
-            "PageMajor");
+            "PageMajor two-layer");
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{
@@ -467,8 +583,10 @@ int main() {
                         {ninfer::DType::FP16, 1, 2, 256},
                         {ninfer::DType::U8, 16, 2, 256},
                     },
+                .layer_planes = 2,
             },
-            "K8V4 asymmetric PageMajor");
+            "K8V4 asymmetric PageMajor two-layer");
+        failures += exercise_layer_major_arena();
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

@@ -1,4 +1,6 @@
 #include "core/arena.h"
+#include "core/host_kv_arena.h"
+#include "core/kv_page_ref.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -1031,6 +1033,7 @@ public:
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.storage      = storage_;
+        result.host         = host_planes_;
         if (layout_.key.scale_extent != 0) {
             result.k_scale_pages = Tensor(
                 k_scale_.data(), layout_.key.scale_dtype,
@@ -1055,7 +1058,72 @@ public:
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
             .storage       = direct.storage,
+            .host          = direct.host,
         };
+    }
+
+    // Moves the named logical pages to Host page records that the Op reads in place (KVPageRef).
+    // Records use the production HostKVPageLayout and start at `first_unit`, so the page words
+    // exercise a nonzero record offset. The abandoned Device page groups are filled with 0xFF
+    // (NaN codes and scales), so any Device read of a streamed page changes the result.
+    void stream_to_host(std::span<const std::int32_t> logical_pages, std::uint32_t first_unit) {
+        KVPageGeometry page_geometry;
+        page_geometry.planes.push_back(
+            {layout_.key.code_dtype, layout_.key.code_extent, geometry_.kv_heads, 256});
+        page_geometry.planes.push_back(
+            {layout_.value.code_dtype, layout_.value.code_extent, geometry_.kv_heads, 256});
+        if (layout_.key.scale_extent != 0) {
+            page_geometry.planes.push_back(
+                {layout_.key.scale_dtype, layout_.key.scale_extent, geometry_.kv_heads, 256});
+        }
+        if (layout_.value.scale_extent != 0) {
+            page_geometry.planes.push_back(
+                {layout_.value.scale_dtype, layout_.value.scale_extent, geometry_.kv_heads, 256});
+        }
+        const HostKVPageLayout host_layout = plan_host_kv_page_layout(page_geometry);
+        const std::size_t first_byte =
+            static_cast<std::size_t>(first_unit) * kHostKVPageUnitBytes;
+        host_records_.emplace(first_byte + logical_pages.size() * host_layout.page_stride,
+                              PinnedHostPages::Huge);
+        auto* records = static_cast<std::byte*>(host_records_->data());
+        std::memset(records, 0xa5, host_records_->size());
+
+        GuardedDeviceBuffer* device_planes[] = {&k_, &v_, &k_scale_, &v_scale_};
+        std::vector<GuardedDeviceBuffer*> planes{device_planes[0], device_planes[1]};
+        if (layout_.key.scale_extent != 0) planes.push_back(device_planes[2]);
+        if (layout_.value.scale_extent != 0) planes.push_back(device_planes[3]);
+
+        published_table_ = block_table_host_;
+        for (std::size_t index = 0; index < logical_pages.size(); ++index) {
+            const std::int32_t logical  = logical_pages[index];
+            const std::int32_t physical = block_table_host_[static_cast<std::size_t>(logical)];
+            const std::size_t record    = first_byte + index * host_layout.page_stride;
+            for (std::size_t plane = 0; plane < planes.size(); ++plane) {
+                const std::size_t page_bytes = host_layout.planes[plane].page_payload_bytes;
+                auto* device_page = static_cast<std::byte*>(planes[plane]->data()) +
+                                    static_cast<std::size_t>(physical) * page_bytes;
+                cuda_check(cudaMemcpy(records + record + host_layout.planes[plane].offset,
+                                      device_page, page_bytes, cudaMemcpyDeviceToHost),
+                           "copy streamed KV page to Host");
+                cuda_check(cudaMemset(device_page, 0xff, page_bytes), "poison streamed KV page");
+            }
+            if (record % kHostKVPageUnitBytes != 0) {
+                throw std::logic_error("Host KV record is not unit aligned");
+            }
+            published_table_[static_cast<std::size_t>(logical)] =
+                KVPageRef(HostPageUnit{static_cast<std::uint32_t>(record / kHostKVPageUnitBytes)})
+                    .word();
+        }
+        block_table_.copy_from_host(published_table_.data(),
+                                    published_table_.size() * sizeof(std::int32_t));
+
+        const auto plane_base = [&](std::size_t plane) -> const std::byte* {
+            return records + host_layout.planes[plane].offset;
+        };
+        host_planes_ = PagedKVHostPlanes{.k = plane_base(0), .v = plane_base(1)};
+        std::size_t next = 2;
+        if (layout_.key.scale_extent != 0) host_planes_.k_scale = plane_base(next++);
+        if (layout_.value.scale_extent != 0) host_planes_.v_scale = plane_base(next++);
     }
 
     HostCache snapshot() const {
@@ -1137,7 +1205,7 @@ public:
         failures +=
             verify_exact((label + " block-table unchanged").c_str(),
                          copy_from_guarded<std::int32_t>(block_table_, block_table_host_.size()),
-                         block_table_host_);
+                         published_table_.empty() ? block_table_host_ : published_table_);
         return failures;
     }
 
@@ -1159,6 +1227,9 @@ private:
     GuardedDeviceBuffer k_scale_;
     GuardedDeviceBuffer v_scale_;
     GuardedDeviceBuffer block_table_;
+    std::vector<std::int32_t> published_table_;
+    std::optional<PinnedHostBuffer> host_records_;
+    PagedKVHostPlanes host_planes_;
 };
 
 class BatchDeviceCache {
@@ -1879,6 +1950,167 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     return failures;
 }
 
+// Which visible pages a Host-arm case moves to Host records. Pages that the call writes stay Device.
+enum class StreamPattern { All, Alternate, Interior };
+
+const char* stream_pattern_name(StreamPattern pattern) {
+    switch (pattern) {
+    case StreamPattern::All:
+        return "all";
+    case StreamPattern::Alternate:
+        return "alternate";
+    case StreamPattern::Interior:
+        return "interior";
+    }
+    return "unknown";
+}
+
+std::vector<std::int32_t> streamed_pages(StreamPattern pattern, std::int32_t readable_pages) {
+    std::vector<std::int32_t> pages;
+    for (std::int32_t page = 0; page < readable_pages; ++page) {
+        const bool stream = pattern == StreamPattern::All ||
+                            (pattern == StreamPattern::Alternate && page % 2 == 1) ||
+                            (pattern == StreamPattern::Interior && page > 0 &&
+                             page + 1 < readable_pages);
+        if (stream) pages.push_back(page);
+    }
+    return pages;
+}
+
+// A Host-resident page is read in place and must give bit-identical output to the all-Device
+// cache: the kernels resolve only a different page address, never different arithmetic. With
+// `append`, the fused route also writes this call's K/V, whose pages stay Device-resident.
+int run_host_arm_case(const Geometry& geometry, KvCacheStorage storage,
+                      const AttentionCase& test_case, MappingPattern mapping, StreamPattern pattern,
+                      bool append) {
+    const std::int32_t total       = test_case.base + test_case.tokens;
+    const std::int32_t max_context = static_cast<std::int32_t>(
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) * geometry.q_heads *
+                                   static_cast<std::size_t>(test_case.tokens);
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads *
+                                    static_cast<std::size_t>(test_case.tokens);
+    const std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    const std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
+    const std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = test_case.base + token;
+    }
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                                         test_case.envelope_max};
+    const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u);
+    HostCache expected      = initial;
+    if (append) append_cache(expected, k, v, positions);
+    const std::vector<double> reference = ideal_attention(q, expected, positions);
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    dtable_row.copy_from_host(&table_row, sizeof(table_row));
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
+    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+
+    const auto run = [&](DeviceCache& cache, const std::string& label) {
+        GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+        const std::vector<std::uint16_t> canary(q_bits.size(), kOutputCanary);
+        dout.copy_from_host(canary.data(), canary.size() * sizeof(std::uint16_t));
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        launch_attention_case(
+            [&](cudaStream_t stream) {
+                if (append) {
+                    ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
+                                                  op_geometry(geometry), kAttentionScale,
+                                                  cache.batch_view(), envelope, workspace, tout,
+                                                  stream);
+                } else {
+                    ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry),
+                                                         kAttentionScale, cache.view(), envelope,
+                                                         workspace, tout, stream);
+                }
+            },
+            test_case.graph_replay);
+        int failures = dout.verify_guards((label + " output").c_str());
+        failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+        failures += cache.verify_guards(label);
+        return std::pair{copy_from_guarded<std::uint16_t>(dout, q_bits.size()), failures};
+    };
+
+    const std::string label = case_label(append ? "host-arm causal_softmax_attention"
+                                                : "host-arm causal_softmax_attention_cached",
+                                         geometry, storage, test_case, mapping) +
+                              " stream=" + stream_pattern_name(pattern);
+    DeviceCache resident(initial, mapping);
+    auto [resident_bits, failures] = run(resident, label + " resident");
+
+    // Appended positions are written by this call, so their pages are never streamed.
+    const std::int32_t readable_pages =
+        append ? test_case.base / kPagedKVPageSize : (total + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    const std::vector<std::int32_t> pages = streamed_pages(pattern, readable_pages);
+    if (pages.empty()) {
+        std::cerr << label << ": case streams no pages\n";
+        return failures + 1;
+    }
+    DeviceCache streamed(initial, mapping);
+    streamed.stream_to_host(pages, 3);
+    auto [streamed_bits, streamed_failures] = run(streamed, label + " streamed");
+    failures += streamed_failures;
+    failures += verify_exact((label + " streamed == resident").c_str(), streamed_bits,
+                             resident_bits);
+    failures += verify_attention(label, bf16_bits_to_double(streamed_bits), reference,
+                                 attention_criterion(storage));
+    failures += verify_input(label + " q unchanged", dq, q_bits);
+    failures += verify_positions(label + " positions unchanged", dp, positions);
+    return failures;
+}
+
+// Host-arm routes: small-T decode/verify and prompt prefill widths of every KV storage.
+int run_host_arm_cases() {
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (const Geometry& geometry : kGeometries) {
+            for (const StreamPattern pattern :
+                 {StreamPattern::All, StreamPattern::Alternate, StreamPattern::Interior}) {
+                failures += run_host_arm_case(geometry, storage, {1, 255, 256, 901u},
+                                              MappingPattern::Fragmented, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {6, 250, 256, 902u},
+                                              MappingPattern::Offset, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {4, 256, 260, 903u},
+                                              MappingPattern::Fragmented, pattern, true);
+                // Prefill widths take the prompt route.
+                failures += run_host_arm_case(geometry, storage, {65, 191, 256, 906u},
+                                              MappingPattern::Fragmented, pattern, false);
+                failures += run_host_arm_case(geometry, storage, {64, 192, 256, 907u},
+                                              MappingPattern::Offset, pattern, true);
+            }
+        }
+        failures += run_host_arm_case(kGeometries[1], storage, {1, 16384, 16385, 904u},
+                                      MappingPattern::Fragmented, StreamPattern::Alternate, true);
+        failures += run_host_arm_case(kGeometries[0], storage, {1, 1000, 1001, 905u, false, true},
+                                      MappingPattern::Identity, StreamPattern::Interior, true);
+    }
+    return failures;
+}
+
 struct BatchAttentionCase {
     std::int32_t width;
     std::vector<std::int32_t> contexts;
@@ -2464,10 +2696,21 @@ int run_softmax_attention_causal_cache_tests() {
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_fp8_cases();
+    failures += run_host_arm_cases();
     failures += run_batch_cases();
     failures += run_dflash2_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_host_arm_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    const int failures = run_host_arm_cases();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention Host arm\n";
     return failures == 0 ? 0 : 1;
 }
 

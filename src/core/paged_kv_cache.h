@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/kv_page_ref.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
@@ -17,6 +18,19 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+/**
+ * Host pages of one layer that paged Ops read in place for Host block-table words (KVPageRef).
+ * Each pointer is that plane's HostKVArena base (HostKVArena::plane_base); a page's plane slice has
+ * the Device in-page element order. Null planes mean the cache has no Host arm,
+ * and its tables hold Device words only. Writes never target a Host record.
+ */
+struct PagedKVHostPlanes {
+    const std::byte* k       = nullptr;
+    const std::byte* v       = nullptr;
+    const std::byte* k_scale = nullptr;
+    const std::byte* v_scale = nullptr;
+};
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -27,6 +41,7 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVHostPlanes host;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -39,6 +54,7 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVHostPlanes host;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
@@ -63,6 +79,9 @@ struct KVPageGeometry {
     std::uint32_t page_tokens            = kPagedKVPageSize;
     PagedKVPlaneOrder device_plane_order = PagedKVPlaneOrder::PageMajor;
     std::vector<KVPlaneGeometry> planes;
+    // Planes per model layer, repeated in order for every layer; 0 treats all planes as one layer.
+    // The Host layout keeps each layer's pages contiguous (HostKVPageLayout).
+    std::uint32_t layer_planes = 0;
 
     friend bool operator==(const KVPageGeometry&, const KVPageGeometry&) = default;
 };
@@ -231,6 +250,11 @@ public:
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    cudaStream_t stream = nullptr) const;
 
+    /** Block-table Device word of a live page of this pool. */
+    [[nodiscard]] KVPageRef page_ref(DeviceKVPageHandle handle) const {
+        return KVPageRef(DevicePageGroup{physical_index(handle)});
+    }
+
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
@@ -346,10 +370,16 @@ public:
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
+    /** Publishes Device or Host block-table words (KVPageRef); Device words must name pages of
+     *  this pool, Host words are resolved by the consumer's PagedKVHostPlanes. */
+    void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                 std::span<const KVPageRef> pages, cudaStream_t stream = nullptr);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream = nullptr);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
+    /** The published words of row index `row` (its Host shadow), in logical page order. */
+    [[nodiscard]] std::span<const std::int32_t> published_words(std::int32_t row) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 

@@ -37,7 +37,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_fp8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
         std::uint8_t* cache_k, std::uint8_t* cache_v, __half* cache_k_scale, __half* cache_v_scale,
-        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        PagedKVHostPlanes host, const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
         float* partial_acc, float* partial_m, float* partial_l) {
@@ -302,27 +302,36 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l0 = 0.0F;
     float l1 = 0.0F;
 
+    // A tile never crosses a page, so each plane resolves its Device or Host page base once.
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        const std::uint8_t* k_page = paged_kv_read_page<kKVCacheFp8HeadDim, Geometry::KVHeads>(
+            cache_k, host.k, physical_page);
+        const std::uint8_t* v_page = paged_kv_read_page<kKVCacheFp8HeadDim, Geometry::KVHeads>(
+            cache_v, host.v, physical_page);
+        const __half* k_scale_page = paged_kv_read_page<kKVCacheFp8Groups, Geometry::KVHeads>(
+            cache_k_scale, host.k_scale, physical_page);
+        const __half* v_scale_page = paged_kv_read_page<kKVCacheFp8Groups, Geometry::KVHeads>(
+            cache_v_scale, host.v_scale, physical_page);
         if constexpr (TokenTile == 1 && Bc == 32) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
                 const int key                   = tile_k0 + key_l;
                 const int valid_keys            = max(0, min(8, split_end - key));
-                const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
-                    physical_page, kv_head, key & kPagedKVPageMask);
-                cp_async_zfill<16, Cache::cg>(&k_scale_s[key_l], &cache_k_scale[scale_offset],
+                const std::int64_t scale_offset = paged_kv_in_page_offset<kKVCacheFp8Groups>(
+                    kv_head, key & kPagedKVPageMask, 0);
+                cp_async_zfill<16, Cache::cg>(&k_scale_s[key_l], &k_scale_page[scale_offset],
                                               valid_keys * static_cast<int>(sizeof(__half)));
-                cp_async_zfill<16, Cache::cg>(&v_scale_s[key_l], &cache_v_scale[scale_offset],
+                cp_async_zfill<16, Cache::cg>(&v_scale_s[key_l], &v_scale_page[scale_offset],
                                               valid_keys * static_cast<int>(sizeof(__half)));
             }
         } else {
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
                 const int key = tile_k0 + key_l;
                 if (key >= split_start && key < split_end) {
-                    const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
-                        physical_page, kv_head, key & kPagedKVPageMask);
-                    k_scale_s[key_l] = cache_k_scale[scale_offset];
-                    v_scale_s[key_l] = cache_v_scale[scale_offset];
+                    const std::int64_t scale_offset = paged_kv_in_page_offset<kKVCacheFp8Groups>(
+                        kv_head, key & kPagedKVPageMask, 0);
+                    k_scale_s[key_l] = k_scale_page[scale_offset];
+                    v_scale_s[key_l] = v_scale_page[scale_offset];
                 } else {
                     k_scale_s[key_l] = __float2half_rn(0.0F);
                     v_scale_s[key_l] = __float2half_rn(0.0F);
@@ -337,10 +346,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_small_t_tc_swz(key_l, dc * 8)) * 2];
             if (key >= split_start && key < split_end) {
-                const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
-                cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
-                cp_async<16, Cache::cg>(&v_fp8[key_l * D + d], &cache_v[code_offset]);
+                const std::int64_t code_offset = paged_kv_in_page_offset<kKVCacheFp8HeadDim>(
+                    kv_head, key & kPagedKVPageMask, d);
+                cp_async<16, Cache::cg>(k_dst, &k_page[code_offset]);
+                cp_async<16, Cache::cg>(&v_fp8[key_l * D + d], &v_page[code_offset]);
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));
                 store_vec(&v_fp8[key_l * D + d], make_int4(0, 0, 0, 0));

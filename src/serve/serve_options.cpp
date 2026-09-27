@@ -83,7 +83,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--fixed-draft] [--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -111,6 +111,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --ngram-residency reads the Qwen4Exp n-gram table through the page cache "
            "(mapped) or with batched direct I/O (stream); auto maps it when host memory allows\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --kv-stream lets --kv-capacity be below --max-context: each request owns an equal "
+           "share, borrows idle shares, and moves older full pages to Host KV (--host-kv-mib) "
+           "beyond that, reserving Host KV at admission for prompt plus output limit beyond the share; "
+           "reused context keeps its older pages in Host KV\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,7), anchors=4; Host state=8 slots, Host KV=8192 MiB\n"
            "       --host-cache-mib sizes the whole Host cache tier from one pinned-RAM ceiling and replaces --host-state-slots and --host-kv-mib\n"
@@ -316,6 +320,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--kv-stream") {
+            options.kv_stream = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--chat-template") {
@@ -381,7 +387,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (!options.kv_stream && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

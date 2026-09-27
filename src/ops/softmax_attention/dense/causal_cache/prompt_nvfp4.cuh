@@ -51,7 +51,8 @@ __device__ __forceinline__ std::uint32_t causal_prompt_nvfp4_pack_f16x2(float lo
 template <typename Geometry>
 __device__ __forceinline__ void
 causal_prompt_nvfp4_decode_tile(__half* destination, const std::uint8_t* cache,
-                                const std::uint8_t* cache_scale, const std::int32_t* block_table,
+                                const std::uint8_t* cache_scale, const std::byte* host,
+                                const std::byte* host_scale, const std::int32_t* block_table,
                                 int kv_head, int tile_k0, int max_query_abs, int producer_tid) {
     constexpr int D               = kCausalPromptHeadDim;
     constexpr int Bc              = kCausalPromptNvfp4Bc;
@@ -59,6 +60,12 @@ causal_prompt_nvfp4_decode_tile(__half* destination, const std::uint8_t* cache,
     constexpr int ProducerThreads = kCausalPromptNvfp4ProducerThreads;
     const int physical_page       = block_table[tile_k0 >> kPagedKVPageShift];
     const int page_offset0        = tile_k0 & kPagedKVPageMask;
+    // One page per tile: resolve its Device or Host page (KVPageRef); page 0 of the index helpers
+    // is the in-page offset.
+    const std::uint8_t* page = paged_kv_read_page<kKVCacheNvfp4CodeBytes, Geometry::KVHeads>(
+        cache, host, physical_page);
+    const std::uint8_t* scale_page = paged_kv_read_page<kKVCacheNvfp4Groups, Geometry::KVHeads>(
+        cache_scale, host_scale, physical_page);
 
 #pragma unroll 1
     for (int task = producer_tid; task < GroupsPerTile; task += ProducerThreads) {
@@ -69,12 +76,12 @@ causal_prompt_nvfp4_decode_tile(__half* destination, const std::uint8_t* cache,
         __half* target_lo = destination + key_l * D + causal_prompt_swz(key_l, d);
         __half* target_hi = destination + key_l * D + causal_prompt_swz(key_l, d + 8);
         if (key <= max_query_abs) {
-            const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-                physical_page, kv_head, d, page_offset0 + key_l);
-            const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
-                physical_page, kv_head, group, page_offset0 + key_l);
+            const std::int64_t code_offset =
+                kv_cache_nvfp4_code_index<Geometry>(0, kv_head, d, page_offset0 + key_l);
+            const std::int64_t scale_offset =
+                kv_cache_nvfp4_scale_index<Geometry>(0, kv_head, group, page_offset0 + key_l);
             const auto represented =
-                kv_cache_nvfp4_dequant_f16x16(cache + code_offset, cache_scale[scale_offset]);
+                kv_cache_nvfp4_dequant_f16x16(page + code_offset, scale_page[scale_offset]);
             store_vec(target_lo, represented.lo);
             store_vec(target_hi, represented.hi);
         } else {
@@ -89,7 +96,7 @@ __global__
 __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
-    const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
+    const std::uint8_t* __restrict__ cache_v_scale, PagedKVHostPlanes host, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim;
@@ -163,14 +170,16 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
         for (int kb = 0; kb < key_blocks; ++kb) {
             const std::uint32_t empty_phase = 1U ^ static_cast<std::uint32_t>(kb & 1);
             cta_mbarrier_wait(&barriers->k_empty, empty_phase);
-            causal_prompt_nvfp4_decode_tile<Geometry>(k_f16, cache_k, cache_k_scale, block_table,
+            causal_prompt_nvfp4_decode_tile<Geometry>(k_f16, cache_k, cache_k_scale, host.k,
+                                                      host.k_scale, block_table,
                                                       kv_head, kb * Bc, max_query_abs,
                                                       producer_tid);
             asm volatile("bar.sync 1, %0;" : : "r"(kCausalPromptNvfp4ProducerThreads) : "memory");
             if (producer_tid == 0) { cta_mbarrier_arrive(&barriers->k_full); }
 
             cta_mbarrier_wait(&barriers->v_empty, empty_phase);
-            causal_prompt_nvfp4_decode_tile<Geometry>(v_f16, cache_v, cache_v_scale, block_table,
+            causal_prompt_nvfp4_decode_tile<Geometry>(v_f16, cache_v, cache_v_scale, host.v,
+                                                      host.v_scale, block_table,
                                                       kv_head, kb * Bc, max_query_abs,
                                                       producer_tid);
             asm volatile("bar.sync 1, %0;" : : "r"(kCausalPromptNvfp4ProducerThreads) : "memory");

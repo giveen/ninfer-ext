@@ -247,7 +247,17 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
     auto allocation = host.allocate(host_layout, region_pages);
     if (!allocation) { throw std::runtime_error("failed to allocate transfer fixture Host pages"); }
     HostKVAllocationView host_view = host.writable_view(*allocation);
-    fill_transfer_payload(host_view.data(), host_bytes, 0x7ac5d3e91b2468f0ULL);
+    // Each layer's pages are contiguous within an arena chunk (HostKVPageLayout).
+    for (std::uint32_t page = 0; page < region_pages;) {
+        const std::uint32_t run = host_view.contiguous_pages(page);
+        for (std::uint32_t layer = 0; layer < host_layout.layers; ++layer) {
+            fill_transfer_payload(
+                host_view.plane_page(static_cast<std::size_t>(layer) * host_layout.layer_planes,
+                                     page),
+                host_layout.layer_span * run, 0x7ac5d3e91b2468f0ULL + page * 131U + layer);
+        }
+        page += run;
+    }
     pool.copy_from_host(HostKVAllocationConstView(host_view),
                         std::span<const DeviceKVPageHandle>(handles).first(region_pages),
                         device.transfer_stream);

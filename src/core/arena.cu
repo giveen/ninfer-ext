@@ -2,7 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include <sys/mman.h>
+
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -44,11 +48,26 @@ void free_device(void*& ptr) noexcept {
     }
 }
 
-void free_pinned(void*& ptr) noexcept {
-    if (ptr != nullptr) {
+constexpr std::size_t kPinnedHugePageBytes = std::size_t{2} << 20;
+
+bool registered_pointers_are_device_pointers() {
+    int device = 0;
+    int usable = 0;
+    return cudaGetDevice(&device) == cudaSuccess &&
+           cudaDeviceGetAttribute(&usable, cudaDevAttrCanUseHostPointerForRegisteredMem, device) ==
+               cudaSuccess &&
+           usable != 0;
+}
+
+void free_pinned(void*& ptr, bool registered) noexcept {
+    if (ptr == nullptr) { return; }
+    if (registered) {
+        log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
+        std::free(ptr);
+    } else {
         log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
-        ptr = nullptr;
     }
+    ptr = nullptr;
 }
 
 } // namespace
@@ -241,8 +260,32 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, PinnedHostPages pages) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+
+    if (pages == PinnedHostPages::Huge && registered_pointers_are_device_pointers()) {
+        if (size_bytes > std::numeric_limits<std::size_t>::max() - kPinnedHugePageBytes) {
+            throw std::overflow_error("PinnedHostBuffer size overflow");
+        }
+        const std::size_t reserved =
+            (size_bytes + kPinnedHugePageBytes - 1) / kPinnedHugePageBytes * kPinnedHugePageBytes;
+        void* ptr = std::aligned_alloc(kPinnedHugePageBytes, reserved);
+        if (ptr == nullptr) { throw std::bad_alloc(); }
+        // Advisory: without transparent huge pages the buffer is still correct, only slower.
+        // Populate every page before registration, so the pinned mapping is built once over its
+        // final (huge) pages rather than faulted in piecewise by the registration itself.
+        (void)madvise(ptr, reserved, MADV_HUGEPAGE);
+        if (madvise(ptr, reserved, MADV_POPULATE_WRITE) != 0) { std::memset(ptr, 0, reserved); }
+        const cudaError_t err = cudaHostRegister(ptr, reserved, cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+            std::free(ptr);
+            throw std::runtime_error(cuda_error_message("cudaHostRegister failed", err));
+        }
+        data_       = ptr;
+        size_       = size_bytes;
+        registered_ = true;
+        return;
+    }
 
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
@@ -254,23 +297,26 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_, registered_); }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
+    : data_(other.data_), size_(other.size_), registered_(other.registered_) {
+    other.data_       = nullptr;
+    other.size_       = 0;
+    other.registered_ = false;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
-    data_ = other.data_;
-    size_ = other.size_;
+    free_pinned(data_, registered_);
+    data_       = other.data_;
+    size_       = other.size_;
+    registered_ = other.registered_;
 
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_       = nullptr;
+    other.size_       = 0;
+    other.registered_ = false;
     return *this;
 }
 

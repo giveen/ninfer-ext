@@ -183,8 +183,10 @@ MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中�
 ### 3.5 Host capacity
 
 Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `HostKVArena`，但每个 allocation
-携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
-它不扩大 Device active entitlement 或单 sequence context ceiling。
+携带自己的 typed page layout。Arena 给每个 layout 相同数量的 page slots（同一 logical page 的 Main 与
+backend replicas 一起 demote/restore），因此 `capacity_bytes` 是 slots × Σ page stride，不足一个
+chunk 的余量与 chunk 对齐不计入。Host capacity 按实际 packed bytes 和 slot geometry 计费；它不扩大 Device active
+entitlement 或单 sequence context ceiling。
 
 ---
 
@@ -364,14 +366,23 @@ requests 可用的 global capacity。
 
 ### 5.3 Host replica
 
-Host replica 使用 logical-order packed `HostKVPageLayout`：
+Host replica 使用 logical-order、layer-major 的 `HostKVPageLayout`：
 
 - 不保存 Device page ID 或 block-table holes；
-- 每个 page 包含该 typed pool 的全部 grouped plane payload；
-- variable-size extent只为实际 page count 付费；
-- Main/backend layouts可以在同一 arena 中分配不同 stride 的 extents。
+- 每个 page 包含该 typed pool 的全部 grouped plane payload；一层的 planes 组成 256 B 对齐的
+  layer span（`KVPageGeometry::layer_planes` 给出每层 plane 数），各层 span 等长；
+- Slots 按 chunk（默认 `kHostKVChunkPages` = 64 pages，按 2 MiB 对齐；容量向下取整到整 chunk，不足 16 个 chunk
+  的 arena 把 chunk 减半，最小为 demotion group 的 16 pages）分组；chunk c 依次存放
+  每个 layout 的 slots `[c·C, (c+1)·C)`，各自 layer-major：layer l 的 slot s 位于
+  `chunk + layout offset + (l·C + s mod C) × layer_span`。同一 chunk 内同一层的相邻 pages 在内存中
+  相邻，一次 copy run 每层是一段连续内存（run 在 chunk 边界处拆分）；
+- First-fit 从 arena 起点填充 chunks，live pages 的地址范围随占用而非容量增长。把它们铺满一个大
+  pinned buffer 会同时拖慢 copy engine 与 PCIe 原地读取（实测 16 GiB arena 上每层整带布局：copy
+  52→48 GB/s，原地读 attention 约 2×，27B MTP decode 69→56 tok/s；chunk 后与 arena 大小无关）；
+- extent 是某 layout 的连续 slot range，只为实际 page count 付费。
 
-Host arena 是有界 variable-size allocator。Plan 必须针对完整 release/allocation recipe 验证 extent geometry；
+Host arena 是有界 slot allocator（每个 layout 各自的 free runs）。Plan 必须针对完整 release/allocation
+recipe 验证 slot geometry；
 `free_bytes` 只是占用摘要，不是可分配性的充分证明。
 
 ### 5.4 Replica transfer
@@ -469,11 +480,105 @@ block\_tables[N_{logical},C]
 \]
 
 其中 \(N_{logical}=L\)，\(C=max\_concurrency\)。每个 active address space lease 一行；每一项是 I32
-pool-local physical page ID。
+`KVPageRef` word：`>=0` 是 pool-local Device page-group ID，`<0` 是 `~HostPageUnit`，即
+`(s div C) × chunk bytes + (s mod C) × layer_span`（256 B 单位）；每个 plane 的地址为 `HostKVArena::plane_base(layout, plane)` 加该偏移，
+同一 word 适用于该页的所有层与 planes。Paged Ops 每个 tile 解析一次 page base，in-page
+地址运算与 Device page 相同，因此两种 residency 的结果 bit-identical。
 
 Activation 将 address-space membership 的 Device page IDs 批量发布到所租 row。Inactive address space
 没有 row；同一个 continuation 下次 activation 可以取得另一行。Execution row 不拥有 logical page、
 reservation 或 frontier。
+
+### 6.5 KV streaming
+
+`EngineOptions::kv_stream`（`ninfer-serve --kv-stream`）让 active address space 只保留一个有界的
+Device window，更早的 full pages 由 Host records 原地读取：
+
+- Window：每个 pool 的 Device window 为 `capacity_pages / max_concurrency`。Admission entitlement
+  与 lease growth 都以 window 为上限；`kv_capacity` 因此可以小于 `max_context`，启动只要求每个 lane
+  至少容纳 sinks、一个 demotion group、frontier tail 与最宽的单步 mapping（prefill chunk 或
+  growth window）加 cushion（`planning/kv_stream.h`）。
+- Borrowing：window 是 request 拥有的份额。持有满 window 的 streaming lease 在需要更多 coverage
+  时先向 pool 借空闲 pages（lease growth 或 `stream_kv` 扩展 reservation），再考虑 demotion；
+  `active_resources` 只计到 window，`physical_occupancy` 把可回收的借用 pages（空闲 reservation 与
+  可 demote 的 pages，至多超出 window 的部分）视为可用。`prepare_materialization`、
+  `prepare_active_capture`，以及低于自身 window 的 lease 增长失败时，`reclaim_borrowed_kv` 先释放
+  其它 lanes 超出 window 的空闲 reservation，再把最旧 pages demote 并缩小 reservation，使它们回到
+  window；coverage 不变。
+- Demotion：当 mapping 或 lease growth 需要超过当前 coverage 时，从第
+  `kKVStreamSinkPages` 页之后、`kv_stream_tail_pages(draft)` 之前的最旧 full committed pages 起，
+  按 `kKVStreamGroupPages` 成组复制到新的 Host extent。Copy 在 publish 前同步完成（§5.4），然后
+  `KVAddressSpaceStore::demote` 将 Device lease 归还到同一 address space 的 reservation，并把该行
+  table word 改为 Host 引用。Demotion 只改变 residency，不改变 membership、frontier 或 epoch，
+  coverage 增加 demoted page 数。
+- Demotable page：full committed、恰一个 active reference、没有 Host replica 或 pending/pinned
+  状态。Sink 与 tail pages 永不 stream；被拒绝的 speculative round 只截断 tail。
+- Host capacity：admission 为 streaming request 预留其整个 context（prompt + effective output +
+  draft）超出各 pool window 的 pages × Host page stride（`RequestBasePlanImpl::host_spill_bytes`）。
+  该预留只进入 admission peak（`physical_peak_additional.host.kv_bytes`），不属于 active
+  entitlement（commit 校验 entitlement 等于实际拥有的对象）；commit 后记在
+  `RequestControl::host_spill_budget`，demotion copy 实际分配的 arena bytes 累加到
+  `host_spilled`，`physical_occupancy` 把未用部分计为 Host 占用。于是 Host 不足时新 request
+  等待、触发 Host pressure（淘汰 Host checkpoints），或在单独也放不下时被拒绝，而不是让运行中的
+  request 在中途失败；context cache 的 Host 写入也不能占用预留。Arena 碎片仍可能使分配失败：先释放
+  无引用 extents 再重试一次；仍失败时 decode lease 按 §7.2 settle；prefill 的 mapping 失败按 Device
+  OOM（`std::bad_alloc`）恢复。
+- Host staging（`KVHostStaging`）：prompt kernel 对每个 query tile 读取全部可见 pages，原地读 Host
+  pages 会让 PCIe 流量乘以 tile 数；decode 每页只读一次，但 SM zero-copy 读 Host pages
+  远低于 copy engine 的 ~50 GB/s。因此每个含 Host pages 的 text step（prefill chunk、
+  ordinary 或 MTP decode round）先由 `prepare` 把各 row 的 table words 复制到 staged tables，Host
+  words 改为紧凑 staging record 编号（多个 rows 共用一个 record 空间）；每个 full-attention layer
+  的 view 读 Device staging buffer，paged Ops 经 Host arm 从 Device 读取。两个 layer buffer 交替：
+  layer L 的 attention 期间，transfer stream 把 layer L+1 的 pages 复制到另一个 buffer（每个
+  相邻 Host run 是一次连续 copy；等待
+  该 buffer 此前的 readers），step stream 在 attention 前等待本层 copy。含 staging 的 decode round
+  以 eager 执行（实测 eager 仅慢 ~1%）；不含 Host pages 的 round 仍用 CUDA Graph。容量为每个 buffer
+  `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该 step
+  退回原地读取。Dense 模型的 MTP layer 自身的 pool 只有一层，保持原地读取。
+- QSA（Qwen4Exp）：index plane 是每层 page record 的最后一个 plane，随 page 一起 demote。
+  - Prefill chunk 用同一 staging（layer span 含 index plane），`stage_index` 给出 staged index
+    plane；`qsa_append` 仍经 published tables 写 Device tail。Qwen4Exp 在每个 chunk 上运行 MTP
+    layer（select + attention），因此 MTP pool 另有一份 `KVHostStaging`，与 text staging 共用
+    buffer（MTP layer 在同一 stream 上排在最后一个 text layer 之后）、各自持有 staged tables。
+  - Decode 不 staging K/V：`qsa_attention` 只读被选中的 tokens，经 Host arm 原地读取。
+    `qsa_select` 却每步扫描全部可见 index records，原地读会主导 decode（80k prompt、12k window：
+    21.7 vs 43.6 tok/s）。`QsaIndexMirror`（text 与 MTP pool 各一）为每个 (table row, logical page)
+    保留每层一条固定的 Device index record：step 首次从 Host 读取某页时由 Host record 复制
+    （copy engine，与 step 同 stream），并以 Host word 校验；mirrored tables 把 Host words 指向
+    这些 records，`qsa_select` 经 Host arm 从 Device 读取。Row 绑定新 sequence 时 `reset`。含 Host
+    index 的 round 以 eager 执行。Mirror 占用 table rows × pages(max_context) × 每页 index record
+    （BF16 272 B/token/layer），在 layout 中与 pool 大小无关。
+- 范围：Host record 为 page-major layout；DFlash head-major pool 与 CausalScoring 拒绝
+  `kv_stream`。
+- Context cache：streamed members 是 Host-only、full、committed、Host replica current、没有 writer
+  的 pages（`LogicalKVPageStore::can_stream`）。它们可以被 active address 引用而不回到 Device，
+  paged Ops 经 Host word 读取，永远不会成为 writer。
+  - Captures：private rewrite checkpoint 与 long anchor 只保护 frontier，与 residency 无关。
+    Shared-prefix capture 的 active snapshot 把 streamed members 原地共享（immutable，不受
+    "immutable 在 mutable 之前" 的顺序限制），`KVActiveSnapshotShape` 把 unique pages 分为
+    Device 与 Host replica 两类；checkpoint 接走的 active entitlement 不超过 entitlement 本身
+    （window 上限的 Device pages 与激活时移入的 Host bytes；demotion 产生的 Host bytes 记在
+    spill budget）。Streaming lane 占满其 window，snapshot 的 tail copy 没有空闲 page：
+    `kv_stream_capture_credit` 以 lane 自己可 demote 的最旧 pages 抵扣，`prepare_active_capture`
+    先 demote 它们并缩小 reservation。
+  - Decode demotion 可以作用于被 retained checkpoint 共享的 page（只要求 active reference 唯一）；
+    该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取 residency。已有
+    current Host replica 的 page 不复制，直接 demote。
+- Streamed reuse：demote 过的 request 仍在 finish 时发布 continuation。Prompt 超过 window 时
+  （`RequestBasePlanImpl::prompt_fits_window` 为 false），`inspect_lane` 给出 stream range
+  `[kKVStreamSinkPages, full − kv_stream_tail_pages)`；其中的 streamed members 不 restore：
+  - ConsumeToActive（endpoint、rewrite checkpoint，如 chat 的 `private_response_replay`）以
+    `prepare_activation` 的 stream range 移入；需要 tail COW 的 moved source 不 stream，reuse
+    frontier 所在页及其后的页必须 Device-resident 且无 Host replica（truncate 回 frontier）。
+    Plan 的 Device entitlement 为 `max(window 上限, 必须驻留的页数)`；address store 的
+    entitlement 是 coverage（mapped + reservation），prefill 恢复路径经
+    `resize_sequence_kv_device_entitlement` 换算。
+  - Retain、shared prefix 与 long anchor 的 prefix fork（`prepare_prefix_fork` 的 stream range）
+    按引用共享 streamed members，不 pin；fork 的 entitlement 是 coverage（Device 目标 + streamed
+    pages），retained-tail 容量检查不计 streamed pages。
+  - 共享的 streamed members 不计入 exclusive Device pages，也不作为 shared replicas restore。
+  - Reused prefix 已在 arena 中的 Host bytes（移入或共享，`host_prefix_bytes`）只从 spill budget
+    中扣除一次：admission peak 只加其余部分，`host_spilled` 从它们开始。
 
 ---
 
@@ -756,6 +861,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV。
 16. Checkpoint可复用性由完整target continuation证明，KV page存在本身不构成hit。
 17. 每个decode或forced launch所需的覆盖在round boundary上已被entitlement满足；shortfall不通过异常离开该步。
+18. Host-resident member 的 table word 只在其 Host replica copy 完成后发布；Device 与 Host residency
+    对同一 page 读出相同 bytes。
 
 ---
 

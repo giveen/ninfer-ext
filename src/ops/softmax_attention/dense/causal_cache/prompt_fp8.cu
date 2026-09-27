@@ -30,7 +30,7 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
             static_cast<const std::uint8_t*>(cache.k_pages.data),
             static_cast<const std::uint8_t*>(cache.v_pages.data),
             static_cast<const __half*>(cache.k_scale_pages.data),
-            static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+            static_cast<const __half*>(cache.v_scale_pages.data), cache.host, metadata,
             static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());

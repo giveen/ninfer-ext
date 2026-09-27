@@ -137,6 +137,9 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         }
         requests[lane].active_resources   = active;
         requests[lane].optional_resources = details.active_optional_resources;
+        requests[lane].host_spill_budget  = details.host_spill_bytes;
+        // Host pages of a reused prefix are already arena occupancy.
+        requests[lane].host_spilled       = details.host_prefix_bytes;
         invalidate_lane(lane);
         const SequenceHandle handle =
             ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
@@ -306,6 +309,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             const std::uint32_t base                 = sequence.execution_frontier;
             const std::uint32_t end                  = base + row_stride;
             const auto started                       = Clock::now();
+            select_sequence_kv_rows(sequence);
 
             if (is_masked_draft_backend(speculative_backend) &&
                 sequence.dflash_context_frontier < base) {
@@ -672,6 +676,8 @@ bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestContr
     unbind_sequence_kv(state);
     request.active_resources                    = {};
     request.optional_resources                  = {};
+    request.host_spill_budget                   = 0;
+    request.host_spilled                        = 0;
     // A published lane is free: any staged prefill bookkeeping belongs to the
     // finished request. The abort/salvage path publishes without going through
     // the commit decision loop that clears it on normal completion, so the

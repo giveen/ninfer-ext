@@ -72,6 +72,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_text_kv_staging(state.text_kv_staging);
+    card.set_mtp_kv_staging(state.mtp_kv_staging);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -95,6 +97,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_text_kv_staging(state.text_kv_staging);
+    card.set_mtp_kv_staging(state.mtp_kv_staging);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -590,8 +594,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_device_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                                  request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
             sequence.prefix_digests.truncate(base);
@@ -639,8 +643,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_device_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                                  request_plan.backend_kv_page_entitlement);
             sequence.tail_hidden_valid = base == prompt_tokens;
             sequence.ledger.resize(base);
             sequence.prefix_digests.truncate(base);
@@ -659,7 +663,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // A streamed prompt may exceed its Device window, so each chunk maps its own range.
+        if (!kv_stream) {
+            ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1018,6 +1025,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .timing  = timing.finish(),
             };
         }
+        select_sequence_kv_rows(sequence);
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
@@ -1099,6 +1107,33 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
 
                 const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens;
+                if (kv_stream) {
+                    const std::uint32_t chunk_end = staged.cursor + remaining;
+                    const std::uint32_t backend_end =
+                        speculative_backend != SpeculativeBackend::Mtp ? 0U
+                        : final_candidate && staged.initial_mtp_extent != 0
+                            ? std::min(capacity, chunk_end + staged.initial_mtp_extent - 1U)
+                            : chunk_end;
+                    ensure_sequence_kv_mapped(sequence, chunk_end, backend_end);
+                    // Stage the chunk's Host pages once per layer instead of re-reading them
+                    // from Host once per query tile.
+                    schedule_state.text_kv_staging =
+                        decoder->text_kv_staging &&
+                                decoder->text_kv_staging->prepare(
+                                    text_kv_addresses->bound_row(sequence.kv->text),
+                                    kv_pages_for_tokens(chunk_end), device.stream,
+                                    device.transfer_stream)
+                            ? &*decoder->text_kv_staging
+                            : nullptr;
+                    schedule_state.mtp_kv_staging =
+                        decoder->mtp_kv_staging && backend_end != 0 &&
+                                decoder->mtp_kv_staging->prepare(
+                                    backend_kv_addresses->bound_row(*sequence.kv->backend),
+                                    kv_pages_for_tokens(backend_end), device.stream,
+                                    device.transfer_stream)
+                            ? &*decoder->mtp_kv_staging
+                            : nullptr;
+                }
                 const std::optional<std::uint32_t> capture_frontier =
                     staged.next_capture < staged.capture_groups.size()
                         ? std::optional<std::uint32_t>(

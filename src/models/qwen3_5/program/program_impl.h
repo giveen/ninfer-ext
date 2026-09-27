@@ -9,6 +9,7 @@
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
+#include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -41,12 +42,6 @@ namespace ninfer::models::qwen3_5::detail {
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
-
-// Device KV is leased on demand. An active request holds a bounded window of its remaining
-// output rather than the whole client budget, and extends that window at a decode-round
-// boundary; a full window is requested first and a step-sized extension is enough when the pool
-// cannot spare one.
-inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -207,6 +202,10 @@ struct RequestBasePlanImpl {
     qwen3_5::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // KV streaming: Host KV bytes the request may spill beyond its Device windows (paged-kv §6.5).
+    std::size_t host_spill_bytes = 0;
+    // KV streaming: the prompt fits the request's Device window, so it may capture checkpoints.
+    bool prompt_fits_window = true;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -270,6 +269,21 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    std::size_t host_spill_bytes          = 0;
+    // KV streaming: source members in [begin, end) may activate Host-only (streamed reuse).
+    std::uint32_t text_stream_begin    = 0;
+    std::uint32_t text_stream_end      = 0;
+    std::uint32_t backend_stream_begin = 0;
+    std::uint32_t backend_stream_end   = 0;
+    // Source members inside those ranges that stay Host-only.
+    std::uint32_t text_streamed_pages    = 0;
+    std::uint32_t backend_streamed_pages = 0;
+    // Of those, the ones another address space also references.
+    std::uint32_t text_streamed_shared_pages    = 0;
+    std::uint32_t backend_streamed_shared_pages = 0;
+    // Host KV bytes of the reused prefix that the request's spill budget finds already in the
+    // arena (moved in or shared); RequestControl::host_spilled starts at them.
+    std::size_t host_prefix_bytes = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -433,6 +447,15 @@ struct RequestControl {
     // frontier its lease covers with its generation limit reason instead of failing a launch on
     // coverage.
     bool lease_settled = false;
+    // KV streaming: Host KV bytes reserved at admission for this request's demotions, and the
+    // bytes its demotions have allocated so far. The unspent part counts as Host occupancy, so
+    // admission and the context cache cannot take the space a running request may still spill.
+    std::size_t host_spill_budget = 0;
+    std::size_t host_spilled      = 0;
+
+    [[nodiscard]] std::size_t host_spill_reserved() const noexcept {
+        return host_spill_budget - std::min(host_spill_budget, host_spilled);
+    }
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -624,6 +647,9 @@ public:
     const bool plain_mtp_batches;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
+    // KV streaming (planning/kv_stream.h): full pages outside a request's Device window move to
+    // Host records that attention reads in place.
+    const bool kv_stream;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;
@@ -1250,7 +1276,25 @@ private:
                         runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
+    void resize_sequence_kv_device_entitlement(SequenceState& sequence, std::uint32_t text_pages,
+                                               std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
+    // Eager single-sequence execution (prefill chunks, forced tokens) reads its execution rows
+    // from io; lanes interleave, so every such step selects its own rows first.
+    void select_sequence_kv_rows(const SequenceState& sequence);
+    // KV streaming: stages the mapped text KV of `lanes` when any of it is Host-resident, so a
+    // round reads it once per layer from Device; null keeps the round on its graph.
+    [[nodiscard]] qwen3_5::KVHostStaging* stage_text_kv(std::span<const std::uint32_t> lanes);
+    // KV streaming: Device pages a shared capture's tail copy takes from its own lane by demoting
+    // that many of the lane's oldest pages (its window fills the pool); 0 when it cannot.
+    [[nodiscard]] std::uint32_t kv_stream_capture_credit(const LogicalKVPageStore& pages,
+                                                         const KVAddressSpaceStore& addresses,
+                                                         KVAddressSpaceHandle address,
+                                                         std::uint32_t copied_pages) const;
+    // KV streaming, QSA: mirrors the Device index records of `lanes`' Host pages (text, and the
+    // MTP cache when `mtp`); the mirrors are null where no page is Host-resident.
+    [[nodiscard]] qwen3_5::QsaIndexMirrors mirror_qsa_index(std::span<const std::uint32_t> lanes,
+                                                            bool mtp);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
@@ -1258,12 +1302,7 @@ private:
         return std::max(prefill_width, kKVLeaseGrowthMarginTokens);
     }
     [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
-        // One round's Backend requirement can sit a whole draft window above the frontier the
-        // previous round checked, so the cushion has to absorb that jump before the lease is
-        // extended again.
-        const auto page  = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const auto slack = 2U * draft_window + 2U;
-        return (slack + page - 1U) / page + 1U;
+        return detail::kv_lease_cushion_pages(draft_window);
     }
     // The Backend lease also covers the drafts a round may still verify past the sequence's
     // output ceiling, and one forced control span.
@@ -1276,6 +1315,30 @@ private:
     }
     void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                   std::uint32_t backend_tokens);
+    // KV streaming: a request's Device window in one pool, an equal share of that pool.
+    [[nodiscard]] std::uint32_t kv_stream_window(const LogicalKVPageStore& pages) const noexcept {
+        return pages.physical_pool().capacity_pages() / max_concurrency;
+    }
+    // Demotes the oldest demotable pages of `address` until it can map `tokens` within its window;
+    // false when too few pages can leave the Device. A request that demotes no longer publishes a
+    // continuation: capture and retain assume Device-resident active members.
+    [[nodiscard]] bool stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                 KVAddressSpaceHandle address, std::uint32_t tokens,
+                                 RequestControl& owner);
+    // Demotes up to `count` of the oldest demotable pages of `address` in runs of at least
+    // `group` where possible; returns how many left the Device.
+    std::uint32_t demote_oldest_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                   KVAddressSpaceHandle address, std::uint32_t count,
+                                   std::uint32_t group, RequestControl& owner);
+    // Device pages an active address space holds: its entitlement less its Host-resident members.
+    [[nodiscard]] std::uint32_t kv_device_held(const KVAddressSpaceStore& addresses,
+                                               KVAddressSpaceHandle address) const;
+    // Pages streaming leases hold beyond their windows that reclaim_borrowed_kv can return.
+    [[nodiscard]] detail::PhysicalResources reclaimable_borrowed_kv() const noexcept;
+    // Shrinks every streaming lease (but `except_lane`) back to its window; returns pages freed.
+    // Outside a context transaction it advances the resource revision when it frees any.
+    std::uint32_t reclaim_borrowed_kv(std::optional<std::uint32_t> except_lane = std::nullopt,
+                                      bool advance_revision = true);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

@@ -611,6 +611,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     }
 
     const auto prepare_started            = Clock::now();
+    // The plan counted pages streaming leases borrowed beyond their windows as available.
+    (void)reclaim_borrowed_kv(transaction.destination.value, false);
     const AdmissionCandidateImpl& details = *transaction.plan->impl_;
     const detail::PhysicalDemand& demand  = details.demand;
     const std::uint32_t lane              = transaction.destination.value;
@@ -778,7 +780,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             retained_source ? *transaction.root_text_address : text_address;
         transaction.text_activation.emplace(text_kv_addresses->prepare_activation(
             activation_address, details.text_kv_page_entitlement, static_cast<std::int32_t>(lane),
-            transaction.text_activation_frontier));
+            transaction.text_activation_frontier, details.text_stream_begin,
+            details.text_stream_end));
     }
     if (backend_address && backend_prefix_fork) {
         transaction.backend_source_restore_reservation.emplace(
@@ -788,13 +791,15 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             retained_source ? *transaction.root_backend_address : *backend_address;
         transaction.backend_activation.emplace(backend_kv_addresses->prepare_activation(
             activation_address, details.backend_kv_page_entitlement,
-            static_cast<std::int32_t>(lane), transaction.backend_activation_frontier));
+            static_cast<std::int32_t>(lane), transaction.backend_activation_frontier,
+            details.backend_stream_begin, details.backend_stream_end));
     }
 
     const auto prepare_kv_restores =
         [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages, KVAddressSpaceHandle address,
             std::optional<std::uint32_t> activation_frontier, bool source_reservation,
-            DeviceKVPageReservation& reservation,
+            const KVActivationReservation* activation, std::uint32_t stream_begin,
+            std::uint32_t stream_end, DeviceKVPageReservation& reservation,
             std::vector<MaterializationTransaction::KVRestorePage>& restores,
             std::vector<DeviceKVPageHandle>& destinations) {
             const std::uint32_t mapped = activation_frontier
@@ -803,16 +808,29 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             if (mapped > addresses.mapped_pages(address)) {
                 throw std::logic_error("KV activation frontier exceeds address membership");
             }
+            // Members a streamed activation or prefix fork keeps Host-only are read in place, not
+            // restored.
+            const auto streams = [&](std::uint32_t page) {
+                if (activation != nullptr) {
+                    return addresses.streams_on_activation(*activation, page);
+                }
+                return source_reservation && activation_frontier &&
+                       addresses.streams_on_prefix_fork(address, *activation_frontier,
+                                                        stream_begin, stream_end, page);
+            };
             std::uint32_t missing = 0;
             for (std::uint32_t page = 0; page < mapped; ++page) {
-                if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
+                if (!pages.device_resident(addresses.logical_page(address, page)) &&
+                    !streams(page)) {
+                    ++missing;
+                }
             }
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-                if (pages.device_resident(logical)) { continue; }
+                if (pages.device_resident(logical) || streams(page)) { continue; }
                 if (!pages.host_resident(logical) || !host_kv_extents) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
@@ -832,6 +850,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                          : text_kv_addresses->page_reservation(*transaction.text_activation);
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
                         transaction.text_activation_frontier, text_prefix_fork,
+                        transaction.text_activation ? &*transaction.text_activation : nullptr,
+                        details.text_stream_begin, details.text_stream_end,
                         text_restore_reservation, transaction.text_restores,
                         transaction.text_restore_destinations);
     if (backend_address) {
@@ -841,6 +861,9 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                 : backend_kv_addresses->page_reservation(*transaction.backend_activation);
         prepare_kv_restores(*backend_kv_addresses, *backend_kv_pages, *backend_address,
                             transaction.backend_activation_frontier, backend_prefix_fork,
+                            transaction.backend_activation ? &*transaction.backend_activation
+                                                           : nullptr,
+                            details.backend_stream_begin, details.backend_stream_end,
                             backend_restore_reservation, transaction.backend_restores,
                             transaction.backend_restore_destinations);
     }
@@ -926,7 +949,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             source_kv->text, *transaction.root_text_address, *transaction.text_activation_frontier,
             details.text_kv_page_entitlement,
             static_cast<std::int32_t>(transaction.destination.value),
-            details.text_retained_tail_release));
+            details.text_retained_tail_release, details.text_stream_begin,
+            details.text_stream_end));
         prepare_retained_tail_backup(
             *text_kv_addresses, *text_kv_pages, *transaction.text_prefix_fork,
             details.text_retained_tail_release, transaction.text_retained_tail,
@@ -958,7 +982,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             *source_kv->backend, *transaction.root_backend_address,
             *transaction.backend_activation_frontier, details.backend_kv_page_entitlement,
             static_cast<std::int32_t>(transaction.destination.value),
-            details.backend_retained_tail_release));
+            details.backend_retained_tail_release, details.backend_stream_begin,
+            details.backend_stream_end));
         prepare_retained_tail_backup(
             *backend_kv_addresses, *backend_kv_pages, *transaction.backend_prefix_fork,
             details.backend_retained_tail_release, transaction.backend_retained_tail,

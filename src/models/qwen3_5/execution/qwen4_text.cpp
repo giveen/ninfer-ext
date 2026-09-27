@@ -215,20 +215,34 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
         mrope ? *sequence.rope_positions : sequence.rope_positions->view({T, 1});
     const PagedKVBatchLayerView kv = cache.batch_layer_view(layer);
     const ops::QsaIndexPlane index = cache.index_plane(layer);
+    // Appends write the step's own Device tail through the published tables. A staged step reads
+    // its Host pages, K/V and index records, from the Device staging buffer instead of in place.
     ops::qsa_append(kn.view({head_dim, kv_heads, W, B}), v.view({head_dim, kv_heads, W, B}),
                     index_key.view({geometry.index_dim, W, B}), rope_rows, positions,
                     sequence.valid_columns, *sequence.table_rows, kv, index, s);
     if (y == nullptr) { return; }
 
+    const bool text                         = &cache == batch_text_kv_;
+    qwen3_5::KVHostStaging* staging         = text ? text_kv_staging_
+                                              : &cache == batch_mtp_kv_ ? mtp_kv_staging_
+                                                                        : nullptr;
+    const qwen3_5::QsaIndexMirror* mirror   = text ? qsa_index_mirrors_.text
+                                              : &cache == batch_mtp_kv_ ? qsa_index_mirrors_.mtp
+                                                                        : nullptr;
+    const PagedKVBatchLayerView read_kv     = staging ? staging->stage(kv, layer) : kv;
+    const ops::QsaIndexPlane read_index     = staging  ? staging->stage_index(index, layer)
+                                              : mirror ? mirror->plane(index, layer)
+                                                       : index;
     Tensor selected = roots.selected.view({geometry.max_selected(), W, B});
     Tensor counts   = roots.counts.view({W, B});
     ops::qsa_select(index_query.view({index_query_rows, W, B}), rope_rows, positions,
                     sequence.valid_columns, *sequence.table_rows, p.indexer_query_norm,
-                    p.indexer_key_norm, index, geometry, sequence.max_visible, work_, selected,
+                    p.indexer_key_norm, read_index, geometry, sequence.max_visible, work_, selected,
                     counts, s);
 
     Tensor a = roots.attention.view({head_dim, heads, W, B});
-    ops::qsa_attention(qn.view({head_dim, heads, W, B}), selected, counts, *sequence.table_rows, kv,
+    ops::qsa_attention(qn.view({head_dim, heads, W, B}), selected, counts, *sequence.table_rows,
+                       read_kv,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))), work_, a,
                        s);
     Tensor a_flat = a.view({qw, T});

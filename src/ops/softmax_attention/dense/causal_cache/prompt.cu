@@ -25,9 +25,17 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptSmemBytes);
     CUDA_CHECK(attr_bf16);
-    static const cudaError_t attr_i8 =
-        cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
+    static const cudaError_t attr_i8 = [] {
+        const cudaError_t device_arm =
+            cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kCausalPromptI8SmemBytes);
+        return device_arm != cudaSuccess
+                   ? device_arm
+                   : cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata, true>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          kCausalPromptI8SmemBytes);
+    }();
     CUDA_CHECK(attr_i8);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
@@ -36,15 +44,22 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        causal_attention_prompt_i8_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::int8_t*>(cache_k.data),
-                static_cast<const std::int8_t*>(cache_v.data),
-                static_cast<const __half*>(cache_k_scale.data),
-                static_cast<const __half*>(cache_v_scale.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        const auto launch = [&]<bool HostArm>() {
+            causal_attention_prompt_i8_kernel<Geometry, Metadata, HostArm>
+                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::int8_t*>(cache_k.data),
+                    static_cast<const std::int8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache_k_scale.data),
+                    static_cast<const __half*>(cache_v_scale.data), cache.host, metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        };
+        if (cache.host.k != nullptr) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
@@ -52,7 +67,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __half*>(cache_v.data), metadata,
+                static_cast<const __half*>(cache_v.data), cache.host, metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     }

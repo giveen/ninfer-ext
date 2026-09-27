@@ -55,6 +55,9 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // Streamed prefill: the prepared staging of this chunk's Host pages, or null.
+    qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    qwen3_5::KVHostStaging* mtp_kv_staging  = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -66,6 +69,10 @@ struct OrdinaryBatchContext {
     Tensor& continuation_hidden_store;
     // Set when the round also appends each sampled token's MTP-layer KV (plain MTP batches).
     const qwen3_5::PagedKVCache* mtp_cache = nullptr;
+    // Streamed round: the prepared staging of its Host text KV (eager only), or null.
+    qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
 struct MtpBatchContext {
@@ -76,6 +83,10 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Streamed round: the prepared staging of its Host text KV (eager only), or null.
+    qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
 struct DFlashBatchContext {

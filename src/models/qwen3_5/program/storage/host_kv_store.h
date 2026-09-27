@@ -88,13 +88,18 @@ public:
         return *layout;
     }
 
+    // `demotion` copies full members of one active address space
+    // (LogicalKVPageStore::can_pin_demotion_source); otherwise the sources are unwritten pages.
     [[nodiscard]] std::optional<HostKVExtentReservation>
-    prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+    prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership,
+            bool demotion = false) {
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            const bool pinnable =
+                demotion ? pages.can_pin_demotion_source(page) : pages.can_pin_source(page);
+            if (!pinnable || pages.host_resident(page)) { return std::nullopt; }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
@@ -192,11 +197,13 @@ public:
             Membership& entry = memberships_[node];
             try {
                 extent.page_store->attach_host_replica(
-                    entry.page, HostKVPageReplica{.extent            = capability,
-                                                  .page_offset       = index,
-                                                  .membership_node   = node,
-                                                  .content_epoch     = entry.epoch,
-                                                  .committed_columns = entry.coverage});
+                    entry.page,
+                    HostKVPageReplica{.extent            = capability,
+                                      .page_offset       = index,
+                                      .membership_node   = node,
+                                      .content_epoch     = entry.epoch,
+                                      .committed_columns = entry.coverage,
+                                      .unit = arena_->page_unit(*extent.allocation, index)});
             } catch (...) { std::terminate(); }
             extent.page_store->unpin_source(entry.page);
             node = entry.next;
@@ -643,7 +650,9 @@ private:
                                                              .page_offset       = offset,
                                                              .membership_node   = retained_node,
                                                              .content_epoch     = entry.epoch,
-                                                             .committed_columns = entry.coverage});
+                                                             .committed_columns = entry.coverage,
+                                                             .unit = arena_->page_unit(
+                                                                 *target.allocation, offset)});
                 entry.extent  = target_index;
                 entry.offset  = offset;
                 retained_node = next;

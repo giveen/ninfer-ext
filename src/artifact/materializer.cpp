@@ -282,7 +282,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (storage.pinned || object.bytes > std::numeric_limits<std::size_t>::max()) {
             throw ArtifactError("invalid or duplicate pinned placement");
         }
-        storage.pinned_data.emplace(static_cast<std::size_t>(object.bytes));
+        // Host-resident weights (Flash-Next experts) are read over PCIe by SM loads and copies.
+        storage.pinned_data.emplace(static_cast<std::size_t>(object.bytes), PinnedHostPages::Huge);
         auto* data = static_cast<std::byte*>(storage.pinned_data->data());
         parallel_read(reader, object.offset,
                       std::span(data, static_cast<std::size_t>(object.bytes)));

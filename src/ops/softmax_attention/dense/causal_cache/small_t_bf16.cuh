@@ -20,7 +20,7 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __half* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    __half* cache_v, PagedKVHostPlanes host, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
@@ -219,6 +219,12 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
+        // A tile never crosses a page: resolve its Device or Host page once (KVPageRef); page 0
+        // of the index helpers is the in-page offset.
+        const __nv_bfloat16* k_page =
+            paged_kv_read_page<kCausalHeadDim, Geometry::KVHeads>(cache_k, host.k, physical_page);
+        const __half* v_page =
+            paged_kv_read_page<kCausalHeadDim, Geometry::KVHeads>(cache_v, host.v, physical_page);
         // Stage BF16 K and persistent FP16 V with one cp.async wave (16B/thread, high MLP).
         // Current-step K comes from input and V from the row converted above; tail slots are
         // zeroed.
@@ -238,20 +244,20 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                         const std::int64_t off =
                             kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        const std::int64_t cache_off = causal_cache_index<Geometry>(
-                            physical_page, kv_head, d, key & kPagedKVPageMask);
-                        ninfer::ops::cp_async<16>(v_dst, &cache_v[cache_off]);
+                        const std::int64_t cache_off =
+                            causal_cache_index<Geometry>(0, kv_head, d, key & kPagedKVPageMask);
+                        ninfer::ops::cp_async<16>(v_dst, &v_page[cache_off]);
                     } else {
-                        const std::int64_t off = causal_cache_index<Geometry>(
-                            physical_page, kv_head, d, key & kPagedKVPageMask);
-                        ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                        const std::int64_t off =
+                            causal_cache_index<Geometry>(0, kv_head, d, key & kPagedKVPageMask);
+                        ninfer::ops::cp_async<16>(k_dst, &k_page[off]);
+                        ninfer::ops::cp_async<16>(v_dst, &v_page[off]);
                     }
                 } else {
-                    const std::int64_t off = causal_cache_index<Geometry>(physical_page, kv_head, d,
-                                                                          key & kPagedKVPageMask);
-                    ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                    ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    const std::int64_t off =
+                        causal_cache_index<Geometry>(0, kv_head, d, key & kPagedKVPageMask);
+                    ninfer::ops::cp_async<16>(k_dst, &k_page[off]);
+                    ninfer::ops::cp_async<16>(v_dst, &v_page[off]);
                 }
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));

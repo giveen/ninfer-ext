@@ -238,6 +238,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.device                   = options_.device;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
+    engine_options.kv_stream                = options_.kv_stream;
     engine_options.expert_cache             = options_.expert_cache;
     engine_options.ngram_residency          = options_.ngram_residency;
     engine_options.max_concurrency          = options_.max_concurrency;

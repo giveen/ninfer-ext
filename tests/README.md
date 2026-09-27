@@ -144,6 +144,16 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
 ```
 
+The concurrent-prefill and KV-streaming test runs two long prompts together (interleaved prefill
+chunks), then again with `kv_stream` and a small Device window, and requires each request's greedy
+tokens to equal the same request run alone. Two-turn conversations, one fitting the window and one
+spilling (plain and MTP), must resume from the first turn and match a resident engine:
+
+```bash
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_5_stream_real_test --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks

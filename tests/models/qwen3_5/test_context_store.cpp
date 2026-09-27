@@ -627,6 +627,163 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+// KV streaming: full members of an active address space move to Host replicas that paged Ops
+// read in place. The execution row carries their Host words, the Device leases return to the same
+// space's window, and growth reuses them.
+void test_kv_demotion(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 4,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 8, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, 16);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 3, 8);
+
+    const std::size_t page_bytes = host_layout.planes[0].page_payload_bytes;
+    const auto address           = addresses.create_active(4, 0);
+    expect(address.has_value(), "streaming KV address allocation");
+    addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    for (std::int32_t page = 0; page < 4; ++page) {
+        auto* data = static_cast<std::byte*>(physical_pages.plane(0).data) +
+                     static_cast<std::size_t>(page) * page_bytes;
+        CUDA_CHECK(cudaMemsetAsync(data, 0x10 + page, page_bytes, device.stream));
+    }
+    addresses.commit_frontier(*address, 250);
+    device.synchronize();
+
+    const std::array oldest{addresses.logical_page(*address, 0),
+                            addresses.logical_page(*address, 1)};
+    const std::array partial_tail{addresses.logical_page(*address, 3)};
+    expect(!extents.prepare(pages, oldest).has_value(),
+           "active writer pages are not ordinary retention sources");
+    expect(!extents.prepare(pages, partial_tail, true).has_value() &&
+               !pages.can_demote_active(partial_tail[0]),
+           "a partial tail page never leaves the Device");
+    auto copy = extents.prepare(pages, oldest, true);
+    expect(copy.has_value(), "full active members reserve a demotion extent");
+    physical_pages.copy_to_host(extents.device_sources(*copy), extents.writable_view(*copy),
+                                device.stream);
+    device.synchronize();
+    (void)extents.publish(std::move(*copy));
+    addresses.demote(*address, 0, 2, device.stream);
+    device.synchronize();
+
+    const auto words = read_block_table(physical_tables, 0, 4);
+    const ninfer::KVPageRef first  = pages.table_ref(oldest[0]);
+    const ninfer::KVPageRef second = pages.table_ref(oldest[1]);
+    expect(first.host() && second.host() && words[0] == first.word() &&
+               words[1] == second.word() && words[2] == 2 && words[3] == 3,
+           "demotion publishes Host words and leaves resident words unchanged");
+    const std::byte* host_base = host_arena.plane_base(host_layout, 0);
+    bool bytes_match           = true;
+    for (std::size_t page = 0; page < 2; ++page) {
+        const std::byte* record = host_base + (page == 0 ? first : second).host_offset_bytes();
+        for (std::size_t byte = 0; byte < page_bytes; ++byte) {
+            bytes_match = bytes_match && record[byte] == std::byte(0x10 + page);
+        }
+    }
+    expect(bytes_match, "Host words address the demoted pages' payload in place");
+    expect(addresses.device_resident_pages(*address) == 2 && addresses.mapped_pages(*address) == 4 &&
+               addresses.entitlement(*address) == 6 && physical_pages.allocated_pages() == 2 &&
+               physical_pages.reserved_pages() == 2 && pages.writer_references(oldest[0]) == 0,
+           "demoted Device leases return to the address's own window");
+
+    addresses.ensure_mapped_to_tokens(*address, 384, device.stream);
+    device.synchronize();
+    const auto grown = read_block_table(physical_tables, 0, 6);
+    expect(addresses.mapped_pages(*address) == 6 && physical_pages.allocated_pages() == 4 &&
+               physical_pages.reserved_pages() == 0 && grown[0] == first.word() &&
+               grown[1] == second.word() && !ninfer::KVPageRef::from_word(grown[4]).host() &&
+               !ninfer::KVPageRef::from_word(grown[5]).host(),
+           "growth past the Device window reuses the demoted leases");
+    bool demote_rejected = false;
+    try {
+        addresses.demote(*address, 3, 1, device.stream);
+    } catch (const std::logic_error&) { demote_rejected = true; }
+    expect(demote_rejected, "demoting the partial writer tail is rejected");
+
+    // Streamed activation: the retained Host-only members rejoin without a Device replica.
+    addresses.deactivate(*address);
+    auto streamed = addresses.prepare_activation(*address, 4, 0, std::nullopt, 0, 2);
+    expect(addresses.streams_on_activation(streamed, 0) &&
+               addresses.streams_on_activation(streamed, 1) &&
+               !addresses.streams_on_activation(streamed, 2),
+           "only Host-only full members inside the stream range activate streamed");
+    expect(addresses.page_reservation(streamed).pages() == 0,
+           "a streamed activation reserves Device pages only for its resident members");
+    addresses.commit_activation(std::move(streamed), device.stream);
+    device.synchronize();
+    const auto reactivated = read_block_table(physical_tables, 0, 6);
+    expect(addresses.active(*address) && reactivated[0] == first.word() &&
+               reactivated[1] == second.word() && pages.writer_references(oldest[0]) == 0 &&
+               pages.writer_references(addresses.logical_page(*address, 2)) == 1 &&
+               addresses.entitlement(*address) == 6 && physical_pages.reserved_pages() == 0,
+           "streamed members publish Host words and never become writers");
+
+    // Shared capture over streamed members: the snapshot shares them in place, still on Host.
+    addresses.destructive_truncate(*address, 250);
+    addresses.resize_entitlement(*address, 4);
+    const auto checkpoint = addresses.create_inactive();
+    expect(checkpoint.has_value(), "snapshot destination address allocation");
+    const store::KVActiveSnapshotShape shape = addresses.active_snapshot_shape(*address, 250);
+    expect(shape.full_pages == 3 && shape.unique_device_pages == 1 &&
+               shape.unique_host_replica_pages == 2 && shape.copied_pages() == 1,
+           "a snapshot counts streamed members as unique Host pages");
+    auto snapshot = addresses.prepare_active_snapshot(*address, *checkpoint, 250);
+    addresses.commit_active_snapshot(std::move(snapshot), device.stream);
+    device.synchronize();
+    const auto snapshot_words = read_block_table(physical_tables, 0, 4);
+    expect(addresses.active(*checkpoint) && !addresses.active(*address) &&
+               snapshot_words[0] == first.word() && snapshot_words[1] == second.word() &&
+               pages.address_references(oldest[0]) == 2 && pages.writer_references(oldest[0]) == 0,
+           "a snapshot shares streamed members by reference and republishes their Host words");
+
+    // Prefix fork of the captured address: streamed members are shared without a Device pin.
+    addresses.deactivate(*checkpoint);
+    const auto fork_destination = addresses.create_inactive();
+    expect(fork_destination.has_value(), "fork destination address allocation");
+    expect(addresses.streams_on_prefix_fork(*address, 250, 0, 2, 0) &&
+               !addresses.streams_on_prefix_fork(*address, 250, 0, 2, 2),
+           "only Host-only full members inside the range fork streamed");
+    auto fork = addresses.prepare_prefix_fork(*address, *fork_destination, 250, 4, 0, false, 0, 2);
+    expect(pages.source_pins(oldest[0]) == 0 &&
+               pages.source_pins(addresses.logical_page(*address, 2)) == 1,
+           "a streamed fork pins only its resident sources");
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    device.synchronize();
+    const auto fork_words = read_block_table(physical_tables, 0, 4);
+    expect(addresses.active(*fork_destination) && fork_words[0] == first.word() &&
+               fork_words[1] == second.word() && pages.address_references(oldest[0]) == 3 &&
+               pages.source_pins(addresses.logical_page(*address, 2)) == 0,
+           "a streamed fork publishes Host words for its shared Host-only members");
+
+    addresses.deactivate(*fork_destination);
+    expect(addresses.release(*fork_destination) && addresses.release(*checkpoint) &&
+               addresses.release(*address) &&
+               extents.release_unreferenced() == 2 * host_layout.page_stride &&
+               pages.occupied() == 0 && physical_pages.allocated_pages() == 0 &&
+               physical_pages.reserved_pages() == 0 && host_arena.occupied_bytes() == 0,
+           "streamed address spaces release Device and Host ownership without leaks");
+}
+
 } // namespace
 
 int main() {
@@ -642,6 +799,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_demotion(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
