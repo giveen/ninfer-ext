@@ -117,6 +117,14 @@ public:
         text_kv_staging_ = staging;
     }
 
+    // Streamed Qwen4Exp prefill: the MTP layer reads the chunk's Host pages from this staging.
+    void set_mtp_kv_staging(qwen3_5::KVHostStaging* staging) noexcept { mtp_kv_staging_ = staging; }
+
+    // Streamed decode: QSA layers score Host pages' index records from these mirrors.
+    void set_qsa_index_mirrors(qwen3_5::QsaIndexMirrors mirrors) noexcept {
+        qsa_index_mirrors_ = mirrors;
+    }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
@@ -293,6 +301,8 @@ private:
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
+    qwen3_5::KVHostStaging* mtp_kv_staging_  = nullptr;
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;

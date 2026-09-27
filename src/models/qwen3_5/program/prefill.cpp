@@ -73,6 +73,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_text_kv_staging(state.text_kv_staging);
+    card.set_mtp_kv_staging(state.mtp_kv_staging);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -97,6 +98,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_text_kv_staging(state.text_kv_staging);
+    card.set_mtp_kv_staging(state.mtp_kv_staging);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -1122,6 +1124,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                     kv_pages_for_tokens(chunk_end), device.stream,
                                     device.transfer_stream)
                             ? &*decoder->text_kv_staging
+                            : nullptr;
+                    schedule_state.mtp_kv_staging =
+                        decoder->mtp_kv_staging && backend_end != 0 &&
+                                decoder->mtp_kv_staging->prepare(
+                                    backend_kv_addresses->bound_row(*sequence.kv->backend),
+                                    kv_pages_for_tokens(backend_end), device.stream,
+                                    device.transfer_stream)
+                            ? &*decoder->mtp_kv_staging
                             : nullptr;
                 }
                 const std::optional<std::uint32_t> capture_frontier =

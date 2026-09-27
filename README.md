@@ -157,7 +157,7 @@ Other settings that matter for speed:
   `--host-cache-mib` (for example `16384`) so reusable prefixes survive in pinned RAM.
 - **Flash-Next:** keep `--expert-cache auto` (the default) and enough free host RAM that the n-gram
   table stays page-cache mapped (`--ngram-residency auto` decides).
-- **Contexts larger than GPU memory (dense 27B/35B-A3B):** add `--kv-stream` with `--host-kv-mib`
+- **Contexts larger than GPU memory:** add `--kv-stream` with `--host-kv-mib`
   sized for the spilled KV. Each request owns `--kv-capacity / --max-concurrency` of GPU KV and
   borrows idle shares, which it gives back when another request needs them. Beyond that, older full
   pages move to pinned RAM and are copied back per layer as each step needs them. Requests that fit
@@ -170,6 +170,10 @@ Other settings that matter for speed:
   - The two GPU staging buffers each hold one layer's KV for a full `--max-context`: ~1 GB in
     total at 262k with FP8, ~2 GB with BF16.
   - Only requests whose prompt fits their share use the context cache.
+  - Flash-Next keeps a GPU copy of spilled pages' attention-index records (~3.3 KB per token of
+    `--max-context` per concurrent request) and reads only the selected tokens' KV over PCIe. With
+    an 80k-token prompt and a 12k-token share, decode ran at 41–44 tok/s against 46–51 resident,
+    and prefill at the resident rate. Outputs were identical to resident runs.
 
 Example: Qwen3.8-27B `nvfp4` for four agents with long contexts:
 

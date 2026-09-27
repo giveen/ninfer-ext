@@ -739,6 +739,96 @@ int main() {
                                  run_bits(resident, trows, 1, decode_sel, decode_counts, 0x52U));
     }
 
+    // ---- Host arm of qsa_select: odd logical pages' index records read from Host records ----
+    // The abandoned Device records are 0xFF-poisoned (NaN keys), so selections must be identical
+    // to the resident call at the verify width and at decode width.
+    {
+        const std::size_t page_bytes = static_cast<std::size_t>(ops::kQsaIndexRecordWords) * kPage *
+                                       sizeof(std::uint16_t);
+        DeviceBuffer poisoned = to_device(std::vector<std::uint8_t>(page_bytes * kPages, 0));
+        cuda_check(cudaMemcpy(poisoned.p, records.p, page_bytes * kPages, cudaMemcpyDeviceToDevice),
+                   "copy index records");
+        std::vector<int> streamed_tables = tables;
+        // Host records are spaced two units past the payload so the words exercise a stride that
+        // differs from the Device page group.
+        const std::size_t record_stride =
+            (page_bytes / kHostKVPageUnitBytes + 2) * kHostKVPageUnitBytes;
+        PinnedHostBuffer host_records((tables.size() + 1) * record_stride, PinnedHostPages::Huge);
+        auto* host_base = static_cast<std::byte*>(host_records.data());
+        std::size_t next = 1; // record 0 unused: words carry a nonzero offset
+        for (std::size_t entry = 0; entry < tables.size(); ++entry) {
+            if ((entry % kPagesPerLane) % 2 == 0) continue;
+            auto* page = static_cast<std::byte*>(poisoned.p) +
+                         static_cast<std::size_t>(tables[entry]) * page_bytes;
+            const std::size_t record = next++ * record_stride;
+            cuda_check(cudaMemcpy(host_base + record, page, page_bytes, cudaMemcpyDeviceToHost),
+                       "stream index page");
+            cuda_check(cudaMemset(page, 0xff, page_bytes), "poison index page");
+            streamed_tables[entry] =
+                KVPageRef(HostPageUnit{static_cast<std::uint32_t>(record / kHostKVPageUnitBytes)})
+                    .word();
+        }
+        DeviceBuffer dstreamed = to_device_i32(streamed_tables);
+        const ops::QsaIndexPlane host_plane{
+            .pages = Tensor(poisoned.p, DType::BF16, {ops::kQsaIndexRecordWords, kPage, 1, kPages}),
+            .block_tables = Tensor(dstreamed.p, DType::I32, {kPagesPerLane, kLanes}),
+            .host         = host_base,
+        };
+        const auto select = [&](const ops::QsaIndexPlane& index, std::int32_t width) {
+            std::vector<int> rope(3 * width * kLanes);
+            for (int c = 0; c < width * kLanes; ++c) {
+                const int position = qcache[(c / width) * W + W - width + c % width];
+                for (int a = 0; a < 3; ++a) { rope[a * width * kLanes + c] = axis_position(position, a); }
+            }
+            DeviceBuffer drope = to_device_i32(rope);
+            DeviceBuffer dqc_w = to_device_i32([&] {
+                std::vector<int> positions(width * kLanes);
+                for (int c = 0; c < width * kLanes; ++c) {
+                    positions[c] = qcache[(c / width) * W + W - width + c % width];
+                }
+                return positions;
+            }());
+            DeviceBuffer diq_w = to_device(bits([&] {
+                std::vector<float> q;
+                const std::size_t column = static_cast<std::size_t>(kIndexHeads) * kIndexDim;
+                for (int b = 0; b < kLanes; ++b) {
+                    for (int w = W - width; w < W; ++w) {
+                        const auto first = index_query.begin() +
+                                           static_cast<std::ptrdiff_t>((b * W + w) * column);
+                        q.insert(q.end(), first, first + static_cast<std::ptrdiff_t>(column));
+                    }
+                }
+                return q;
+            }()));
+            const std::vector<int> valid = {width, width};
+            DeviceBuffer dvalid_w = to_device_i32(valid);
+            DeviceBuffer out_sel  = to_device_i32(std::vector<int>(g.max_selected() * width * kLanes, 0));
+            DeviceBuffer out_cnt  = to_device_i32(std::vector<int>(width * kLanes, 0));
+            WorkspaceArena workspace(ops::qsa_select_workspace_bytes(g, kTokens, width * kLanes));
+            Tensor sel(out_sel.p, DType::I32, {g.max_selected(), width, kLanes});
+            Tensor cnt(out_cnt.p, DType::I32, {width, kLanes});
+            Tensor valid_t(dvalid_w.p, DType::I32, {kLanes});
+            ops::qsa_select(Tensor(diq_w.p, DType::BF16, {kIndexHeads * kIndexDim, width, kLanes}),
+                            Tensor(drope.p, DType::I32, {width * kLanes, 3}),
+                            Tensor(dqc_w.p, DType::I32, {width, kLanes}), &valid_t, trows, tqn,
+                            tkn, index, g, kTokens, workspace, sel, cnt, nullptr);
+            cuda_synchronize();
+            auto result = from_device<int>(out_sel.p, g.max_selected() * width * kLanes);
+            const auto counts_out = from_device<int>(out_cnt.p, width * kLanes);
+            result.insert(result.end(), counts_out.begin(), counts_out.end());
+            return result;
+        };
+        for (const std::int32_t width : {W, 1}) {
+            const auto resident = select(plane, width);
+            const auto streamed = select(host_plane, width);
+            if (resident != streamed) {
+                std::cerr << "qsa_select host-arm width " << width
+                          << ": selections differ from the resident call\n";
+                ++failures;
+            }
+        }
+    }
+
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_attention correctness\n";
     return failures == 0 ? 0 : 1;
 }

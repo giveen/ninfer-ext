@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -171,6 +172,9 @@ public:
     // copy, and a buffer is refilled only after the readers enqueued before the refill.
     [[nodiscard]] PagedKVBatchLayerView stage(const PagedKVBatchLayerView& view,
                                               std::uint32_t layer);
+    // The staged QSA index plane of layer `layer`, read like stage(layer)'s view and only after it.
+    [[nodiscard]] ops::QsaIndexPlane stage_index(const ops::QsaIndexPlane& plane,
+                                                 std::uint32_t layer) const;
 
 private:
     struct EventDeleter {
@@ -201,10 +205,76 @@ private:
     std::int64_t prefetched_layer_ = -1;
 };
 
+// Device mirror of the QSA index records of streamed pages (paged-kv §6.5). qsa_select scores
+// every visible token's index record each step, so reading Host pages' records in place over PCIe
+// dominates a streamed decode step; K/V is read only for the selected tokens and stays in place.
+// Each (table row, logical page) owns one fixed mirror record per layer, filled from the Host
+// record the first time a step reads that page from Host, and a mirrored copy of the execution
+// tables points the Host words at those records.
+struct QsaIndexMirrorLayout {
+    TensorRegion records; // U8 [page record bytes, table rows * logical pages, layers]
+    TensorRegion tables;  // I32 [logical pages, table rows], shaped like the execution tables
+};
+
+class QsaIndexMirror {
+public:
+    QsaIndexMirror(DeviceSpan backing, const QsaIndexMirrorLayout& layout,
+                   const PagedKVCache& cache);
+
+    QsaIndexMirror(const QsaIndexMirror&)            = delete;
+    QsaIndexMirror& operator=(const QsaIndexMirror&) = delete;
+
+    struct RowPages {
+        std::int32_t row    = 0; // execution-table row
+        std::uint32_t pages = 0; // logical pages [0, pages) the step reads
+    };
+
+    // Forgets `row`'s mirrored records; called when the row is bound to a sequence, since a Host
+    // record may be reused by another sequence's page with the same word.
+    void reset(std::int32_t row) noexcept;
+
+    // Mirrors the rows' Host index records not yet mirrored and publishes the mirrored tables on
+    // `stream`. Returns false, changing nothing, when those pages hold no Host word.
+    [[nodiscard]] bool prepare(std::span<const RowPages> rows, cudaStream_t stream);
+
+    // `plane` reading the prepared rows' Host pages from the mirror.
+    [[nodiscard]] ops::QsaIndexPlane plane(const ops::QsaIndexPlane& plane,
+                                           std::uint32_t layer) const;
+
+private:
+    struct Run {
+        std::uint32_t unit   = 0; // Host unit of the first page
+        std::uint32_t record = 0; // mirror record of the first page
+        std::uint32_t count  = 0;
+    };
+
+    const PagedKVCache* cache_ = nullptr;
+    Tensor records_;
+    Tensor tables_;
+    std::size_t record_bytes_  = 0;
+    std::uint32_t row_pages_   = 0;
+    std::vector<std::int32_t> mirrored_; // Host word each record holds, 0 when none
+    std::vector<std::int32_t> words_;
+    std::vector<Run> runs_;
+};
+
+// The prepared index mirrors one streamed round reads, or null where its rows hold no Host page.
+struct QsaIndexMirrors {
+    const QsaIndexMirror* text = nullptr;
+    const QsaIndexMirror* mtp  = nullptr;
+
+    [[nodiscard]] bool active() const noexcept { return text != nullptr || mtp != nullptr; }
+};
+
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
     std::optional<KVHostStagingLayout> text_kv_staging;
+    // Prefill staging of the MTP layer's own cache (Qwen4Exp runs that layer over every chunk). It
+    // shares the text staging buffer: the MTP layer runs after the last text layer on one stream.
+    std::optional<KVHostStagingLayout> mtp_kv_staging;
+    std::optional<QsaIndexMirrorLayout> text_qsa_mirror;
+    std::optional<QsaIndexMirrorLayout> mtp_qsa_mirror;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
@@ -216,6 +286,9 @@ struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
     std::optional<KVHostStaging> text_kv_staging;
+    std::optional<KVHostStaging> mtp_kv_staging;
+    std::optional<QsaIndexMirror> text_qsa_mirror;
+    std::optional<QsaIndexMirror> mtp_qsa_mirror;
 
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
 

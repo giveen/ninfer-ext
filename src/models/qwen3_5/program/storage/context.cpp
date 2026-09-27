@@ -1408,6 +1408,9 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
                     *sequence.kv->backend,
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
+            // The row's mirrored index records belong to its previous sequence.
+            if (decoder->text_qsa_mirror) { decoder->text_qsa_mirror->reset(row); }
+            if (decoder->mtp_qsa_mirror) { decoder->mtp_qsa_mirror->reset(row); }
         }
         select_sequence_kv_rows(sequence);
     } catch (...) {
@@ -1432,7 +1435,9 @@ void ProgramImpl::select_sequence_kv_rows(const SequenceState& sequence) {
 }
 
 qwen3_5::KVHostStaging* ProgramImpl::stage_text_kv(std::span<const std::uint32_t> lanes) {
-    if (!decoder->text_kv_staging) { return nullptr; }
+    // Sparse attention reads only its selected tokens: a decode round reads Host K/V in place
+    // rather than copying every Host page.
+    if (!decoder->text_kv_staging || decoder->text_kv.has_qsa_index()) { return nullptr; }
     std::array<qwen3_5::KVHostStaging::RowPages, kMaximumConcurrency> rows{};
     if (lanes.size() > rows.size()) { throw std::logic_error("KV staging batch is too wide"); }
     for (std::size_t index = 0; index < lanes.size(); ++index) {
@@ -1445,6 +1450,36 @@ qwen3_5::KVHostStaging* ProgramImpl::stage_text_kv(std::span<const std::uint32_t
                device.stream, device.transfer_stream)
                ? &*decoder->text_kv_staging
                : nullptr;
+}
+
+qwen3_5::QsaIndexMirrors ProgramImpl::mirror_qsa_index(std::span<const std::uint32_t> lanes,
+                                                       bool mtp) {
+    qwen3_5::QsaIndexMirrors mirrors;
+    if (lanes.size() > kMaximumConcurrency) {
+        throw std::logic_error("QSA index mirror batch is too wide");
+    }
+    std::array<qwen3_5::QsaIndexMirror::RowPages, kMaximumConcurrency> rows{};
+    const auto prepare = [&](qwen3_5::QsaIndexMirror& mirror, KVAddressSpaceStore& addresses,
+                             const auto& address_of) -> const qwen3_5::QsaIndexMirror* {
+        for (std::size_t index = 0; index < lanes.size(); ++index) {
+            const KVAddressSpaceHandle address = address_of(active_sequence(lanes[index]));
+            rows[index] = {.row = addresses.bound_row(address), .pages = addresses.mapped_pages(address)};
+        }
+        return mirror.prepare(std::span<const qwen3_5::QsaIndexMirror::RowPages>(rows.data(),
+                                                                                 lanes.size()),
+                              device.stream)
+                   ? &mirror
+                   : nullptr;
+    };
+    if (decoder->text_qsa_mirror) {
+        mirrors.text = prepare(*decoder->text_qsa_mirror, *text_kv_addresses,
+                               [](const SequenceState& sequence) { return sequence.kv->text; });
+    }
+    if (mtp && decoder->mtp_qsa_mirror) {
+        mirrors.mtp = prepare(*decoder->mtp_qsa_mirror, *backend_kv_addresses,
+                              [](const SequenceState& sequence) { return *sequence.kv->backend; });
+    }
+    return mirrors;
 }
 
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {

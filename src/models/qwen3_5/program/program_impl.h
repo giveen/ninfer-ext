@@ -1255,6 +1255,10 @@ private:
     // KV streaming: stages the mapped text KV of `lanes` when any of it is Host-resident, so a
     // round reads it once per layer from Device; null keeps the round on its graph.
     [[nodiscard]] qwen3_5::KVHostStaging* stage_text_kv(std::span<const std::uint32_t> lanes);
+    // KV streaming, QSA: mirrors the Device index records of `lanes`' Host pages (text, and the
+    // MTP cache when `mtp`); the mirrors are null where no page is Host-resident.
+    [[nodiscard]] qwen3_5::QsaIndexMirrors mirror_qsa_index(std::span<const std::uint32_t> lanes,
+                                                            bool mtp);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);

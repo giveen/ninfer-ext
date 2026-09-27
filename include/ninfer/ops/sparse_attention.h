@@ -42,10 +42,16 @@ struct QsaGeometry {
     }
 };
 
-/** Paged indexer-key plane sharing the Text KV block tables (BF16 records, one per token). */
+/**
+ * Paged indexer-key plane (BF16 records, one per token). Its block tables may differ from the
+ * K/V tables: qsa_select resolves a Host word (KVPageRef) against `host`, whose page records have
+ * the same in-page layout as a Device page group of `pages`. qsa_append writes through the K/V
+ * tables into Device page groups of `pages`.
+ */
 struct QsaIndexPlane {
-    Tensor pages;        // BF16 [kQsaIndexRecordWords, page_tokens, 1, pages]
-    Tensor block_tables; // I32 [table_stride, rows]
+    Tensor pages;                  // BF16 [kQsaIndexRecordWords, page_tokens, 1, pages]
+    Tensor block_tables;           // I32 [table_stride, rows]
+    const std::byte* host = nullptr; // Host-arm base of the page records
 };
 
 /**

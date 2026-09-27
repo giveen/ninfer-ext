@@ -1047,10 +1047,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
     if (options.kv_stream) {
-        if (parameters.model.config().text.sparse_attention) {
-            throw std::invalid_argument(
-                "KV streaming does not support sparse attention (its index pages stay on Device)");
-        }
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument(
                 "KV streaming does not support DFlash drafts (their full-attention KV is "

@@ -214,6 +214,7 @@ struct SelectArgs {
     const std::int32_t* tables;
     std::int32_t table_stride;
     const __nv_bfloat16* records;
+    const std::byte* host_records; // Host arm of `records` (KVPageRef Host words)
     const __nv_bfloat16* query_norm;
     const __nv_bfloat16* key_norm;
     float* scores; // [max_blocks] per CTA
@@ -329,9 +330,11 @@ __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32
         std::int32_t kpos[3] = {0, 0, 0};
         for (int t = 0; t < ratio; ++t) {
             const std::int32_t token = b * ratio + t;
+            // The page resolves on the Device or Host arm; in-page offsets are the same on both.
             const __nv_bfloat16* record =
-                a.records +
-                record_offset(paged_kv_physical_page(table, token), token & kPagedKVPageMask);
+                paged_kv_read_page(a.records, a.host_records,
+                                   paged_kv_physical_page(table, token), record_offset(1, 0)) +
+                record_offset(0, token & kPagedKVPageMask);
             for (int r = 0; r < per; ++r) { key[r] += __bfloat162float(record[lane_id * per + r]); }
             if (t == 0) {
                 for (int axis = 0; axis < 3; ++axis) { kpos[axis] = read_position(record, axis); }
@@ -1095,6 +1098,7 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
     args.tables             = static_cast<const std::int32_t*>(index.block_tables.data);
     args.table_stride       = index.block_tables.ne[0];
     args.records            = static_cast<const __nv_bfloat16*>(index.pages.data);
+    args.host_records       = index.host;
     args.query_norm         = static_cast<const __nv_bfloat16*>(query_norm.data);
     args.key_norm           = static_cast<const __nv_bfloat16*>(key_norm.data);
     args.scores             = scores;

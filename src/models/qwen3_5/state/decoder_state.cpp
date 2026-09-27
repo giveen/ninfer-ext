@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/kv_page_ref.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -83,6 +84,28 @@ HostLayerSpan host_layer_span(const HostKVPageLayout& layout, std::size_t planes
             .bytes = last.offset + last.page_payload_bytes - layout.planes[first].offset};
 }
 
+// Bytes of one page's index record of one layer: the last plane of each layer.
+std::size_t qsa_index_record_bytes(const PagedKVCacheLayout& cache) {
+    const HostKVPageLayout host = plan_host_kv_page_layout(cache.pages.spec.geometry);
+    return host.planes[host.planes.size() / cache.layers - 1U].page_payload_bytes;
+}
+
+QsaIndexMirrorLayout plan_qsa_mirror(LayoutBuilder& builder, const PagedKVCacheLayout& cache,
+                                     const char* name) {
+    const std::size_t bytes = qsa_index_record_bytes(cache);
+    const auto pages        = cache.execution_tables.spec.logical_page_capacity;
+    const auto rows         = cache.execution_tables.spec.table_rows;
+    return QsaIndexMirrorLayout{
+        .records = builder.add_tensor(DType::U8,
+                                      {static_cast<std::int32_t>(bytes),
+                                       static_cast<std::int32_t>(pages) * rows,
+                                       static_cast<std::int32_t>(cache.layers)},
+                                      256, name),
+        .tables  = builder.add_tensor(DType::I32, {static_cast<std::int32_t>(pages), rows}, 256,
+                                      name),
+    };
+}
+
 std::size_t staging_record_stride(const PagedKVCacheLayout& cache) {
     const HostKVPageLayout host = plan_host_kv_page_layout(cache.pages.spec.geometry);
     const std::size_t planes    = host.planes.size() / cache.layers;
@@ -106,8 +129,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.mtp_physical_page_groups, spec.qsa_index, spec.kv_stream);
     }
     if (spec.kv_staging_pages != 0) {
-        if (!spec.kv_stream || spec.qsa_index) {
-            throw std::invalid_argument("prefill KV staging requires dense KV streaming");
+        if (!spec.kv_stream) {
+            throw std::invalid_argument("prefill KV staging requires KV streaming");
         }
         const std::size_t stride = staging_record_stride(layout.text_kv);
         layout.text_kv_staging = KVHostStagingLayout{
@@ -125,6 +148,24 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
             .record_stride  = stride,
             .capacity_pages = spec.kv_staging_pages,
         };
+        if (layout.mtp_kv && spec.qsa_index) {
+            if (staging_record_stride(*layout.mtp_kv) > stride) {
+                throw std::logic_error("MTP KV staging records exceed the text staging stride");
+            }
+            layout.mtp_kv_staging        = *layout.text_kv_staging;
+            layout.mtp_kv_staging->tables = builder.add_tensor(
+                DType::I32,
+                {static_cast<std::int32_t>(layout.mtp_kv->execution_tables.spec.logical_page_capacity),
+                 layout.mtp_kv->execution_tables.spec.table_rows},
+                256, "MTP Paged KV prefill staging tables");
+        }
+    }
+    if (spec.kv_stream && spec.qsa_index) {
+        layout.text_qsa_mirror = plan_qsa_mirror(builder, layout.text_kv, "QSA index mirror");
+        if (layout.mtp_kv) {
+            layout.mtp_qsa_mirror =
+                plan_qsa_mirror(builder, *layout.mtp_kv, "MTP QSA index mirror");
+        }
     }
     return layout;
 }
@@ -222,8 +263,11 @@ ops::QsaIndexPlane PagedKVCache::index_plane(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t index =
         static_cast<std::size_t>(layer) * layer_plane_stride() + layer_storage_.planes_per_layer();
-    return ops::QsaIndexPlane{.pages        = pages_.plane(index),
-                              .block_tables = execution_tables_.matrix()};
+    return ops::QsaIndexPlane{
+        .pages        = pages_.plane(index),
+        .block_tables = execution_tables_.matrix(),
+        .host = host_base_ == nullptr ? nullptr : host_base_ + host_layout_.planes[index].offset,
+    };
 }
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
@@ -235,6 +279,15 @@ DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
     if (layout.text_kv_staging) {
         text_kv_staging.emplace(backing, *layout.text_kv_staging, text_kv);
+    }
+    if (layout.mtp_kv_staging) {
+        if (!mtp_kv) { throw std::logic_error("MTP KV staging has no MTP KV cache"); }
+        mtp_kv_staging.emplace(backing, *layout.mtp_kv_staging, *mtp_kv);
+    }
+    if (layout.text_qsa_mirror) { text_qsa_mirror.emplace(backing, *layout.text_qsa_mirror, text_kv); }
+    if (layout.mtp_qsa_mirror) {
+        if (!mtp_kv) { throw std::logic_error("MTP QSA index mirror has no MTP KV cache"); }
+        mtp_qsa_mirror.emplace(backing, *layout.mtp_qsa_mirror, *mtp_kv);
     }
 }
 
@@ -371,6 +424,123 @@ PagedKVBatchLayerView KVHostStaging::stage(const PagedKVBatchLayerView& view,
                                         : nullptr,
     };
     return staged;
+}
+
+ops::QsaIndexPlane KVHostStaging::stage_index(const ops::QsaIndexPlane& plane,
+                                              std::uint32_t layer) const {
+    if (runs_.empty()) { throw std::logic_error("KV staging is not prepared"); }
+    // The index plane is the last plane of the layer span stage(layer) made ready.
+    const HostKVPageLayout& host = cache_->host_layout();
+    const std::size_t planes     = cache_->planes_per_layer();
+    const HostLayerSpan span     = host_layer_span(host, planes, layer);
+    const std::size_t index      = static_cast<std::size_t>(layer) * planes + planes - 1U;
+    ops::QsaIndexPlane staged    = plane;
+    staged.block_tables          = tables_;
+    staged.host                  = buffer(layer) + (host.planes[index].offset - span.begin);
+    return staged;
+}
+
+QsaIndexMirror::QsaIndexMirror(DeviceSpan backing, const QsaIndexMirrorLayout& layout,
+                               const PagedKVCache& cache)
+    : cache_(&cache), records_(layout.records.bind(backing)), tables_(layout.tables.bind(backing)) {
+    const Tensor& published = cache.execution_tables().matrix();
+    record_bytes_           = static_cast<std::size_t>(records_.ne[0]);
+    row_pages_              = static_cast<std::uint32_t>(tables_.ne[0]);
+    if (!cache.has_qsa_index() || record_bytes_ % kHostKVPageUnitBytes != 0 ||
+        tables_.ne[0] != published.ne[0] || tables_.ne[1] != published.ne[1] ||
+        records_.ne[1] != tables_.ne[0] * tables_.ne[1] ||
+        records_.ne[2] != static_cast<std::int32_t>(cache.layers())) {
+        throw std::logic_error("QSA index mirror layout is inconsistent");
+    }
+    mirrored_.assign(static_cast<std::size_t>(records_.ne[1]), 0);
+    words_.reserve(static_cast<std::size_t>(records_.ne[1]));
+    runs_.reserve(row_pages_);
+}
+
+void QsaIndexMirror::reset(std::int32_t row) noexcept {
+    if (row < 0 || row >= tables_.ne[1]) { return; }
+    const auto first = mirrored_.begin() + static_cast<std::ptrdiff_t>(row) * row_pages_;
+    std::fill(first, first + row_pages_, 0);
+}
+
+bool QsaIndexMirror::prepare(std::span<const RowPages> rows, cudaStream_t stream) {
+    if (cache_->host_base() == nullptr) { return false; }
+    const HostKVPageLayout& host = cache_->host_layout();
+    const auto page_units = static_cast<std::uint32_t>(host.page_stride / kHostKVPageUnitBytes);
+    const auto record_units = static_cast<std::uint32_t>(record_bytes_ / kHostKVPageUnitBytes);
+    words_.clear();
+    runs_.clear();
+    bool host_words = false;
+    for (const RowPages& request : rows) {
+        if (request.row < 0 || request.row >= tables_.ne[1]) {
+            throw std::out_of_range("QSA index mirror row is out of range");
+        }
+        const std::span<const std::int32_t> published =
+            cache_->execution_tables().published_words(request.row);
+        if (request.pages > published.size()) {
+            throw std::out_of_range("QSA index mirror reads past the execution row");
+        }
+        const std::size_t first = words_.size();
+        words_.insert(words_.end(), published.begin(), published.begin() + request.pages);
+        for (std::uint32_t page = 0; page < request.pages; ++page) {
+            std::int32_t& word = words_[first + page];
+            const KVPageRef ref = KVPageRef::from_word(word);
+            if (!ref.host()) { continue; }
+            host_words = true;
+            const auto record = static_cast<std::uint32_t>(request.row) * row_pages_ + page;
+            if (mirrored_[record] != word) {
+                const auto unit = static_cast<std::uint32_t>(ref.host_unit());
+                if (!runs_.empty() && runs_.back().record + runs_.back().count == record &&
+                    runs_.back().unit + runs_.back().count * page_units == unit) {
+                    ++runs_.back().count;
+                } else {
+                    runs_.push_back(Run{.unit = unit, .record = record, .count = 1});
+                }
+                mirrored_[record] = word;
+            }
+            word = KVPageRef(static_cast<HostPageUnit>(record * record_units)).word();
+        }
+    }
+    if (!host_words) { return false; }
+    // Host records are published after their copies complete (paged-kv §5.4) and stay referenced
+    // by these rows, so the pinned source is stable while the copies run.
+    const std::size_t planes      = cache_->planes_per_layer();
+    const std::size_t layer_bytes = record_bytes_ * static_cast<std::size_t>(records_.ne[1]);
+    for (std::uint32_t layer = 0; layer < cache_->layers(); ++layer) {
+        const std::size_t offset =
+            host.planes[static_cast<std::size_t>(layer) * planes + planes - 1U].offset;
+        std::byte* destination = static_cast<std::byte*>(records_.data) + layer * layer_bytes;
+        for (const Run& run : runs_) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                destination + static_cast<std::size_t>(run.record) * record_bytes_, record_bytes_,
+                cache_->host_base() + static_cast<std::size_t>(run.unit) * kHostKVPageUnitBytes +
+                    offset,
+                host.page_stride, record_bytes_, run.count, cudaMemcpyHostToDevice, stream));
+        }
+    }
+    // Pageable source: each call returns once the words are captured, so words_ may be reused.
+    const auto row_words = static_cast<std::size_t>(tables_.ne[0]);
+    std::size_t offset   = 0;
+    for (const RowPages& request : rows) {
+        auto* destination = static_cast<std::int32_t*>(tables_.data) +
+                            static_cast<std::size_t>(request.row) * row_words;
+        CUDA_CHECK(cudaMemcpyAsync(destination, words_.data() + offset,
+                                   request.pages * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   stream));
+        offset += request.pages;
+    }
+    return true;
+}
+
+ops::QsaIndexPlane QsaIndexMirror::plane(const ops::QsaIndexPlane& plane,
+                                         std::uint32_t layer) const {
+    if (layer >= cache_->layers()) { throw std::out_of_range("QSA index mirror layer is out of range"); }
+    ops::QsaIndexPlane mirrored = plane;
+    mirrored.block_tables       = tables_;
+    mirrored.host               = static_cast<const std::byte*>(records_.data) +
+                    static_cast<std::size_t>(layer) * record_bytes_ *
+                        static_cast<std::size_t>(records_.ne[1]);
+    return mirrored;
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

@@ -57,6 +57,7 @@ struct PrefillContext {
     const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     // Streamed prefill: the prepared staging of this chunk's Host pages, or null.
     qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    qwen3_5::KVHostStaging* mtp_kv_staging  = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -70,6 +71,8 @@ struct OrdinaryBatchContext {
     const qwen3_5::PagedKVCache* mtp_cache = nullptr;
     // Streamed round: the prepared staging of its Host text KV (eager only), or null.
     qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
 struct MtpBatchContext {
@@ -82,6 +85,8 @@ struct MtpBatchContext {
     Tensor& continuation_hidden_store;
     // Streamed round: the prepared staging of its Host text KV (eager only), or null.
     qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
 struct DFlashBatchContext {

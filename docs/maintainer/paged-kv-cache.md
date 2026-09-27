@@ -513,9 +513,22 @@ Device window，更早的 full pages 由 Host records 原地读取：
   该 buffer 此前的 readers），step stream 在 attention 前等待本层 copy。含 staging 的 decode round
   以 eager 执行（实测 eager 仅慢 ~1%）；不含 Host pages 的 round 仍用 CUDA Graph。容量为每个 buffer
   `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该 step
-  退回原地读取。MTP layer 自身的 pool 只有一层，保持原地读取。
-- 范围：Host record 为 page-major layout；QSA index pool、DFlash head-major pool 与 CausalScoring
-  拒绝 `kv_stream`。
+  退回原地读取。Dense 模型的 MTP layer 自身的 pool 只有一层，保持原地读取。
+- QSA（Qwen4Exp）：index plane 是每层 page record 的最后一个 plane，随 page 一起 demote。
+  - Prefill chunk 用同一 staging（layer span 含 index plane），`stage_index` 给出 staged index
+    plane；`qsa_append` 仍经 published tables 写 Device tail。Qwen4Exp 在每个 chunk 上运行 MTP
+    layer（select + attention），因此 MTP pool 另有一份 `KVHostStaging`，与 text staging 共用
+    buffer（MTP layer 在同一 stream 上排在最后一个 text layer 之后）、各自持有 staged tables。
+  - Decode 不 staging K/V：`qsa_attention` 只读被选中的 tokens，经 Host arm 原地读取。
+    `qsa_select` 却每步扫描全部可见 index records，原地读会主导 decode（80k prompt、12k window：
+    21.7 vs 43.6 tok/s）。`QsaIndexMirror`（text 与 MTP pool 各一）为每个 (table row, logical page)
+    保留每层一条固定的 Device index record：step 首次从 Host 读取某页时由 Host record 复制
+    （copy engine，与 step 同 stream），并以 Host word 校验；mirrored tables 把 Host words 指向
+    这些 records，`qsa_select` 经 Host arm 从 Device 读取。Row 绑定新 sequence 时 `reset`。含 Host
+    index 的 round 以 eager 执行。Mirror 占用 table rows × pages(max_context) × 每页 index record
+    （BF16 272 B/token/layer），在 layout 中与 pool 大小无关。
+- 范围：Host record 为 page-major layout；DFlash head-major pool 与 CausalScoring 拒绝
+  `kv_stream`。
 - Context cache：active capture 要求 full pages Device-resident 且 immutable pages 在 mutable pages
   之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 使用 context
   cache：其 prefill 从不 demote，captures 与 reuse sources（prompt 的前缀）都在 window 内。这样的
