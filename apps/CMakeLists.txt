@@ -27,8 +27,9 @@ add_executable(ninfer-quantize
   quantize/parameter_reader.cpp
   quantize/hessian_io.cpp
   quantize/source_writer.cpp
-  quantize/trace_reader.cpp)
+  quantize/trace_reader.cpp
+  quantize/calibration.cpp)
 ninfer_internal_includes(ninfer-quantize)
 target_include_directories(ninfer-quantize PRIVATE ${PROJECT_SOURCE_DIR}/apps/quantize)
 target_link_libraries(ninfer-quantize PRIVATE
-  ninfer_quantize ninfer_artifact ninfer::json)
+  ninfer_engine ninfer_quantize ninfer_artifact ninfer::json)

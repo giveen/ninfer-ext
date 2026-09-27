@@ -48,8 +48,11 @@ void require_rate(int half_bits, const char* label) {
 
 std::string quantize_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> --out DIR --hessians DIR [options]\n"
+           " <model.ninfer> --out DIR --hessians DIR [--trace FILE --activation-model PATH]\n"
            "       --device N              CUDA device index (default 0)\n"
+           "       --hessians DIR          per-parameter Hessian files; also their output dir\n"
+           "       --trace FILE            packed calibration trace to build Hessians from\n"
+           "       --activation-model PATH servable artifact whose activations are observed\n"
            "       --bits N                projection rate in half bits, 2..16 (default 8)\n"
            "       --head-bits N           output-head rate in half bits (default 12)\n"
            "       --hq                    promote attention and GDN control projections by 1 bit\n"
@@ -106,6 +109,14 @@ QuantizeOptions parse_quantize_options(int argc, char** argv) {
             output_set     = true;
         } else if (arg == "--hessians") {
             options.hessians = require_value("--hessians");
+        } else if (arg == "--trace") {
+            options.trace = require_value("--trace");
+        } else if (arg == "--activation-model") {
+            options.activation_model = require_value("--activation-model");
+        } else if (arg == "--calibration-rows") {
+            options.calibration_rows =
+                static_cast<std::uint32_t>(parse_int(require_value("--calibration-rows"),
+                                                     "calibration-rows"));
         } else if (arg == "--device") {
             options.device = parse_int(require_value("--device"), "device");
         } else if (arg == "--bits") {
@@ -138,6 +149,9 @@ QuantizeOptions parse_quantize_options(int argc, char** argv) {
     }
     if (options.hessians.empty()) {
         throw std::invalid_argument("--hessians is required in this version");
+    }
+    if (!options.trace.empty() && options.activation_model.empty()) {
+        throw std::invalid_argument("--trace requires --activation-model");
     }
     return options;
 }

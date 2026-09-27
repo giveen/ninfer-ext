@@ -14,4 +14,9 @@ namespace ninfer::quantize::exl3 {
 void accumulate_hessian(const __nv_bfloat16* x, std::int64_t tokens, std::int64_t k, float* h,
                         cudaStream_t stream);
 
+// Same reduction for the K x tokens activation a model linear Op takes (row stride tokens):
+// h[i][j] += sum_t x[i][t] * x[j][t]. k % 128 == 0.
+void accumulate_hessian_kt(const __nv_bfloat16* x_kt, std::int64_t tokens, std::int64_t k,
+                           float* h, cudaStream_t stream);
+
 } // namespace ninfer::quantize::exl3

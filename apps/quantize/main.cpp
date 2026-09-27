@@ -8,10 +8,12 @@
 // stage that produces them runs the model forward; it is the next step. The app is offline: it
 // owns its device allocations and is not linked into the Engine or serving.
 
+#include "calibration.h"
 #include "hessian_io.h"
 #include "options.h"
 #include "parameter_reader.h"
 #include "source_writer.h"
+#include "trace_reader.h"
 
 #include "artifact/reader.h"
 #include "quantize/exl3/pipeline.h"
@@ -118,6 +120,19 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(options.output);
         check(cudaSetDevice(options.device), "cudaSetDevice");
 
+        if (!options.trace.empty()) {
+            const app::CalibrationTrace trace = app::read_calibration_trace(options.trace);
+            const app::CalibrationResult calibration = app::calibrate(
+                options.activation_model, options.artifact, trace, options.hessians, options.device,
+                options.calibration_rows);
+            std::fprintf(stderr,
+                         "calibrated %u rows (%llu tokens): %llu Hessians, %llu names skipped\n",
+                         calibration.rows,
+                         static_cast<unsigned long long>(calibration.tokens),
+                         static_cast<unsigned long long>(calibration.hessians),
+                         static_cast<unsigned long long>(calibration.skipped_names));
+        }
+
         nlohmann::json report = {
             {"artifact", options.artifact.string()},
             {"bits_half", options.bits_half},
@@ -127,7 +142,8 @@ int main(int argc, char** argv) {
         };
 
         std::vector<app::SafetensorsTensor> tensors;
-        std::size_t done = 0;
+        std::size_t done    = 0;
+        std::size_t skipped = 0;
         for (const auto& parameter : parameters) {
             if (options.limit > 0 && done >= static_cast<std::size_t>(options.limit)) { break; }
             const int half_bits = app::bitrate_for_parameter(options, parameter.name);
@@ -136,9 +152,16 @@ int main(int argc, char** argv) {
             const std::string stem = app::sanitize_parameter_name(parameter.name);
 
             const std::vector<float> nk = app::read_parameter_matrix(reader, parameter);
+            const std::filesystem::path hessian_path =
+                options.hessians / (stem + ".h.f32");
+            if (!std::filesystem::is_regular_file(hessian_path)) {
+                // No calibration Hessian (for example an MTP projection): leave the parameter at
+                // its stored precision rather than quantizing it without calibration.
+                ++skipped;
+                continue;
+            }
             const std::vector<float> kn = app::transpose_to_kn(nk, n, k);
-            const std::vector<float> hessian =
-                app::read_hessian_f32(options.hessians / (stem + ".h.f32"), k);
+            const std::vector<float> hessian = app::read_hessian_f32(hessian_path, k);
 
             const std::uint64_t tile_states = (n / 16) * (k / 16) * 256;
             DeviceBuffer<float> d_w;
@@ -221,6 +244,7 @@ int main(int argc, char** argv) {
 
         app::write_safetensors(options.output / "exl3.safetensors", tensors);
         report["quantized"] = done;
+        report["skipped"]   = skipped;
         std::ofstream out(options.output / "report.json", std::ios::binary | std::ios::trunc);
         out << report.dump(2) << '\n';
         std::fprintf(stderr, "wrote %s (%zu tensors)\n",

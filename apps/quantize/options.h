@@ -21,6 +21,10 @@ struct QuantizeOptions {
     std::filesystem::path output;
     // Per-parameter Hessian files, named after the sanitized logical parameter (K*K FP32 words).
     std::filesystem::path hessians;
+    // When set, run the activation model over the packed trace first and write the Hessians.
+    std::filesystem::path trace;
+    std::filesystem::path activation_model;
+    std::uint32_t calibration_rows = 0; // 0 selects every trace row
     int device                  = 0;
     int bits_half               = 8;  // 4.0 bpw for ordinary projections
     int head_bits_half          = 12; // 6.0 bpw for the output head

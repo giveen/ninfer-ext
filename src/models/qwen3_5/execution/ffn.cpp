@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 
 #include "core/layout.h"
+#include "models/qwen3_5/execution/calibration.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -57,7 +58,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
-         bool mtp) {
+         bool mtp, int layer) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
@@ -73,6 +74,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& down = p.down.weight;
     if (mtp || gu.qtype == QType::Q6_G64_FP16) {
         Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
+        observe_projection(CalibrationSite::MlpInput, layer, hidden, stream);
         {
             auto call = workspace.scope();
             ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
@@ -80,6 +82,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
         ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
                       activation, stream);
+        observe_projection(CalibrationSite::MlpActivation, layer, activation, stream);
         if (mtp) {
             Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
             ops::linear(activation, down, delta, p.down.policy, workspace, stream);
@@ -90,10 +93,12 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+    observe_projection(CalibrationSite::MlpInput, layer, hidden, stream);
     {
         auto call = workspace.scope();
         ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
     }
+    observe_projection(CalibrationSite::MlpActivation, layer, activation, stream);
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
 }
 

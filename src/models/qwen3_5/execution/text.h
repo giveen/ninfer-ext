@@ -201,9 +201,9 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
+    void mlp_tail(const BlockParameters& weights, Tensor& x, int layer, Phase phase,
                   const ops::SparseMoeHints& hints);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);

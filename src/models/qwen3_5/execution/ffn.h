@@ -8,6 +8,6 @@ namespace ninfer::models::qwen3_5::execution {
                                               std::int32_t last, bool mtp = false);
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
-         bool mtp = false);
+         bool mtp = false, int layer = -1);
 
 } // namespace ninfer::models::qwen3_5::execution

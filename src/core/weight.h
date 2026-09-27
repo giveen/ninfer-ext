@@ -50,6 +50,12 @@ struct Weight {
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
 
+    // EXL3 mul1 only. `qdata` is the fail-safe trellis_t16_v1 plane, `input_scales` the FP32
+    // per-input-channel scales su[K], and `scales` the FP32 per-output-channel scales sv[N];
+    // `bitrate_half_bits` is the tensor's stored rate.
+    const void* input_scales         = nullptr;
+    std::uint32_t bitrate_half_bits  = 0;
+
     // An NVFP4 plane assembled from several source matrices carries one divisor per source, in the
     // payload after the scales. `weight_divisors` addresses them and `weight_divisor_rows` says how
     // many consecutive rows each covers, so the divisor of row r is element r /

@@ -288,9 +288,6 @@ Tensor weight_tensor(const WeightView& view, std::initializer_list<std::int32_t>
 Weight native_weight(const WeightView& view, float input_divisor) {
     const auto region = contiguous_weight_region(view);
     const auto& g     = region.parent->geometry;
-    if (g.layout == QuantLayout::TrellisT16) {
-        throw std::invalid_argument("EXL3 trellis weights have no native Op bridge yet");
-    }
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
@@ -305,6 +302,27 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.k = out.shape[1] = out.padded_shape[1] = dimension(view.shape[1]);
     if (g.layout == QuantLayout::Contiguous) {
         out.qdata = region.parent->data + mul(region.begin, word_bytes(g.format));
+        return out;
+    }
+    if (g.layout == QuantLayout::TrellisT16) {
+        // EXL3 planes are whole-object: the 128-point Hadamard blocks and tile geometry need the
+        // complete parent, so a row slice is not a valid operand.
+        if (g.format != QType::EXL3_MUL1 || !is_complete_weight(view)) {
+            throw std::invalid_argument("EXL3 native Weight requires the complete parent");
+        }
+        out.qdata            = region.parent->data;
+        out.input_scales     = region.parent->data + g.input_scale_offset;
+        out.scales           = region.parent->data + g.output_scale_offset;
+        out.group_size       = 16;
+        out.group            = 16;
+        out.scale_dtype      = DType::FP32;
+        out.bitrate_half_bits = static_cast<std::uint32_t>(g.bitrate_half_bits);
+        out.scale_ne[0]      = out.n;
+        out.scale_ne[1]      = out.k;
+        out.scale_nb[0]      = 4;
+        out.scale_nb[1]      = static_cast<std::int64_t>(out.n) * 4;
+        out.scale_nb[2]      = static_cast<std::int64_t>(out.k) * 4;
+        out.scale_nb[3]      = out.scale_nb[1] + out.scale_nb[2];
         return out;
     }
     if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/calibration.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
@@ -924,10 +925,12 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, int layer, Phase ph) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // Calibration always takes the unfused projection so the observer sees the normalized hidden.
+    const bool calibrating = static_cast<bool>(calibration_observer());
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
@@ -948,13 +951,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor k_flat      = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat      = v.view({dimension(config_.attention->key_width()), T});
     const auto* single = std::get_if<LinearParameters>(&p.projection);
-    if (single != nullptr &&
+    if (single != nullptr && !calibrating &&
         ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
                                                  single->policy, work_, s);
     } else {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+        observe_projection(CalibrationSite::AttentionInput, layer, h, s);
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
     }
 
@@ -1018,11 +1022,12 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor output_input = a.view({dimension(config_.attention->query_width()), T});
+    observe_projection(CalibrationSite::AttentionOutput, layer, output_input, s);
+    ops::linear_add(output_input, p.output.weight, x, p.output.policy, work_, s);
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, int layer, Phase ph) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1031,8 +1036,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
+    observe_projection(CalibrationSite::GdnResidual, layer, x, s);
     gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
                      ctx_.execution_view());
+    observe_projection(CalibrationSite::GdnInput, layer, h, s);
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1154,8 +1161,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor gdn_output = on.view({dimension(config_.gdn->value_width()), T});
+    observe_projection(CalibrationSite::GdnOutput, layer, gdn_output, s);
+    ops::linear_add(gdn_output, p.output.weight, x, p.output.policy, work_, s);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1164,11 +1172,11 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::SparseMoeHints{};
 }
 
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, int layer, Phase,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.stream);
+    ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, layer);
 }
 
 template <class Tap>
@@ -1190,9 +1198,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, static_cast<int>(layer), ph);
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    gdn_mix(block, x, compact, static_cast<int>(layer), ph);
                 }
             }
             {
@@ -1200,7 +1208,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                mlp_tail(block, x, static_cast<int>(layer), ph,
+                         next_projection_hints(static_cast<int>(layer)));
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
@@ -1372,6 +1381,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
+                observe_projection(CalibrationSite::OutputHead, -1, last_xf, s);
                 project(last_xf, *lm_head_, logits, work_, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
