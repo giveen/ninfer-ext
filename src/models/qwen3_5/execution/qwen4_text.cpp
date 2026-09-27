@@ -341,7 +341,7 @@ void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gi
         Tensor out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
         ops::gated_delta_net(q_r, k_r, v_r, g, beta, sc, /*normalize_qk=*/true, work_, in, out, o,
-                             s);
+                             ctx_.execution_view());
     }
 
     Tensor on = roots.normalized_output.view({dv, heads, T});
