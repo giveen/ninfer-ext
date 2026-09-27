@@ -372,6 +372,11 @@ bit.
   stage will consume: `input_ids` I64 [rows, tokens] and `lengths` I64 [rows], validated and converted
   to I32. `ninfer_exl3_trace_reader_test` covers the round trip and its rejections, CPU-only.
 
+- 2026-09-27: Verified the quantizer on the GPU. `ninfer-quantize bf16.ninfer --hessians <identity H> --limit 1`
+  quantized `mtp/input_projection` [5120,10240] in 2.7 s and wrote a 25 MiB `exl3.safetensors`. The Python
+  converter's `exl3_matrix_source` reads that store back with the expected plane shapes (`codes [1,640,128]` U8,
+  `su [10240]`, `sv [16]`) and rate 8. All 11 `ctest -R exl3` tests pass, including the M2 GPU kernels.
+
 ## M3 status and decisions
 
 M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
