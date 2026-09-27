@@ -1549,12 +1549,14 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
             !main_thin ||
             stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text,
                       std::min(kv_tokens_for_pages(kv_pages_for_tokens(main_tokens) + cushion),
-                               request.lease_ceiling));
+                               request.lease_ceiling),
+                      request);
         const bool backend_streamed =
             !backend_thin ||
             stream_kv(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
                       std::min(kv_tokens_for_pages(kv_pages_for_tokens(backend_tokens) + cushion),
-                               backend_ceiling));
+                               backend_ceiling),
+                      request);
         if (text_streamed && backend_streamed) { return; }
     }
 
@@ -1582,7 +1584,8 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
 }
 
 bool ProgramImpl::stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
-                            KVAddressSpaceHandle address, std::uint32_t tokens) {
+                            KVAddressSpaceHandle address, std::uint32_t tokens,
+                            RequestControl& owner) {
     const std::uint32_t needed = kv_pages_for_tokens(tokens);
     std::uint32_t coverage     = addresses.entitlement(address);
     if (needed <= coverage) { return true; }
@@ -1594,35 +1597,44 @@ bool ProgramImpl::stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addr
     std::vector<LogicalKVPageHandle> members;
     std::uint32_t page = detail::kKVStreamSinkPages;
     while (coverage < needed) {
-        while (page < end && !pages.can_pin_demotion_source(addresses.logical_page(address, page))) {
-            ++page;
-        }
+        // A page shared with a retained checkpoint may already hold a current Host replica: it
+        // leaves the Device without a copy.
+        const auto replicated = [&](std::uint32_t index) {
+            return pages.can_demote_active(addresses.logical_page(address, index));
+        };
+        const auto copyable = [&](std::uint32_t index) {
+            return pages.can_pin_demotion_source(addresses.logical_page(address, index));
+        };
+        while (page < end && !replicated(page) && !copyable(page)) { ++page; }
         if (page >= end) { return false; }
-        // The oldest run of demotable pages, a whole group when the window allows it.
+        // The oldest run of demotable pages of one kind, a whole group when the window allows it.
+        const bool copy          = !replicated(page);
         const std::uint32_t want = std::max(needed - coverage, detail::kKVStreamGroupPages);
         members.clear();
         while (page + members.size() < end && members.size() < want) {
-            const LogicalKVPageHandle logical =
-                addresses.logical_page(address, page + static_cast<std::uint32_t>(members.size()));
-            if (!pages.can_pin_demotion_source(logical)) { break; }
-            members.push_back(logical);
+            const auto index = page + static_cast<std::uint32_t>(members.size());
+            if (copy ? !copyable(index) : !replicated(index)) { break; }
+            members.push_back(addresses.logical_page(address, index));
         }
-        // A full Host arena first returns extents no page references, then retries once.
-        std::optional<HostKVExtentReservation> reservation = [&] {
-            if (auto first = host_kv_extents->prepare(pages, members, true)) { return first; }
-            (void)host_kv_extents->release_unreferenced();
-            return host_kv_extents->prepare(pages, members, true);
-        }();
-        if (!reservation) { return false; }
-        // Publication follows the completed copy (paged-kv §5.4): the Host replica is complete
-        // before anything, on any stream, can read or release it.
-        pages.physical_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
-                                           host_kv_extents->writable_view(*reservation),
-                                           device.stream);
-        CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        (void)host_kv_extents->publish(std::move(*reservation));
+        if (copy) {
+            // A full Host arena first returns extents no page references, then retries once.
+            std::optional<HostKVExtentReservation> reservation = [&] {
+                if (auto first = host_kv_extents->prepare(pages, members, true)) { return first; }
+                (void)host_kv_extents->release_unreferenced();
+                return host_kv_extents->prepare(pages, members, true);
+            }();
+            if (!reservation) { return false; }
+            // Publication follows the completed copy (paged-kv §5.4): the Host replica is complete
+            // before anything, on any stream, can read or release it.
+            pages.physical_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
+                                               host_kv_extents->writable_view(*reservation),
+                                               device.stream);
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            (void)host_kv_extents->publish(std::move(*reservation));
+        }
         const auto count = static_cast<std::uint32_t>(members.size());
         addresses.demote(address, page, count, device.stream);
+        owner.publish_continuation = false;
         coverage += count;
         page += count;
     }
@@ -1665,9 +1677,11 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     // Prefill maps each chunk against the admission window; streaming makes room for it. Host KV
     // is not reserved at admission, so a full arena fails the step as a capacity shortfall.
     if (kv_stream &&
-        (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens) ||
+        (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens,
+                    requests[sequence.lane]) ||
          (backend_tokens != 0 && !stream_kv(*backend_kv_pages, *backend_kv_addresses,
-                                            *sequence.kv->backend, backend_tokens)))) {
+                                            *sequence.kv->backend, backend_tokens,
+                                            requests[sequence.lane])))) {
         std::fprintf(stderr,
                      "warning: KV streaming cannot map lane %u to %u tokens (backend %u): Host KV "
                      "capacity is exhausted\n",

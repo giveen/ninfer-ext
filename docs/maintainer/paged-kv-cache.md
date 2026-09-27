@@ -508,8 +508,14 @@ Device window，更早的 full pages 由 Host records 原地读取：
   `pages(max_context) − 最小 window`（与 pool 大小无关，保持 layout 对 page 数仿射）；超出时该 step
   退回原地读取。MTP layer 自身的 pool 只有一层，保持原地读取。
 - 范围：Host record 为 page-major layout；QSA index pool、DFlash head-major pool 与 CausalScoring
-  拒绝 `kv_stream`。启用 `kv_stream` 的 Engine 目前对所有 request 关闭 context cache（不 capture、
-  不 publish continuation、不复用 prefix），因为 retain/restore 假设 Device-resident membership。
+  拒绝 `kv_stream`。
+- Context cache：active capture 要求 full pages Device-resident 且 immutable pages 在 mutable pages
+  之前，demotion 打破这两点。因此只有 prompt（加 draft slack）不超过 window 的 request 使用 context
+  cache：其 prefill 从不 demote，captures 与 reuse sources（prompt 的前缀）都在 window 内。这样的
+  request 若在 decode 中 demote，`stream_kv` 清除其 `publish_continuation`，finish 与 salvage 改为
+  release。Decode demotion 可以作用于同时被 retained checkpoint 引用的 page（只要求 active
+  reference 唯一）；该 inactive page 随之只剩 Host replica，pressure planner 与 restore 逐页读取
+  residency，支持这种状态。已有 current Host replica 的 page 不复制，直接 demote。
 
 ---
 

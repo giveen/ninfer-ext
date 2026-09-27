@@ -1280,9 +1280,11 @@ private:
         return pages.physical_pool().capacity_pages() / max_concurrency;
     }
     // Demotes the oldest demotable pages of `address` until it can map `tokens` within its window;
-    // false when too few pages can leave the Device.
+    // false when too few pages can leave the Device. A request that demotes no longer publishes a
+    // continuation: capture and retain assume Device-resident active members.
     [[nodiscard]] bool stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
-                                 KVAddressSpaceHandle address, std::uint32_t tokens);
+                                 KVAddressSpaceHandle address, std::uint32_t tokens,
+                                 RequestControl& owner);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

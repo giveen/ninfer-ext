@@ -253,9 +253,14 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
-    // A streaming Engine does not yet use the context cache for any request: retained checkpoints
-    // and restores assume Device-resident members (paged-kv §6.5).
-    const bool prefix_reuse              = options.allow_prefix_reuse && !kv_stream;
+    // With KV streaming, only a request whose prompt fits its Device window uses the context cache:
+    // its prefill never demotes, so its captures and reuse sources (prompt prefixes) stay within
+    // the window. One that demotes later stops publishing (stream_kv). Paged-kv §6.5.
+    const bool prompt_fits_window =
+        !kv_stream || kv_pages_for_tokens(std::min(capacity, base->summary.prompt_tokens +
+                                                                 draft_window + 1U)) <=
+                          kv_stream_window(*text_kv_pages);
+    const bool prefix_reuse              = options.allow_prefix_reuse && prompt_fits_window;
     base->allow_prefix_reuse             = prefix_reuse;
     base->summary.publish_continuation =
         prefix_reuse && prompt.identity.reusable && context_cache.enabled;

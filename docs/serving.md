@@ -877,7 +877,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--kv-stream` | keep each request's Device KV within an equal share of `--kv-capacity` (which may then be below `--max-context`) and read older full pages in place from Host KV; needs Host KV capacity, rejects QSA, DFlash and CausalScoring, and disables the context cache (prefix reuse) for every request on the server | off |
+| `--kv-stream` | keep each request's Device KV within an equal share of `--kv-capacity` (which may then be below `--max-context`) and read older full pages in place from Host KV; needs Host KV capacity, rejects QSA, DFlash and CausalScoring. Only a request whose prompt fits its share uses the context cache (prefix reuse and captures), and one that spills during decode releases instead of publishing its continuation | off |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |

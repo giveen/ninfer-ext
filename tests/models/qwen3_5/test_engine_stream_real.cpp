@@ -77,6 +77,30 @@ run_together(const ninfer::EngineOptions& options,
     return outputs;
 }
 
+struct Turns {
+    std::vector<ninfer::TokenId> first;
+    std::vector<ninfer::TokenId> second;
+    std::uint32_t reused = 0;
+};
+
+// Two conversation turns with prefix reuse: the second prompt extends the first turn's prompt and
+// output, so it can resume from the first turn's continuation.
+Turns run_turns(const ninfer::EngineOptions& options, std::vector<ninfer::TokenId> prompt,
+                std::uint32_t first_output, const std::vector<ninfer::TokenId>& follow_up) {
+    ninfer::Engine engine(options);
+    ninfer::RequestOptions request = greedy_request(first_output);
+    request.execution.allow_prefix_reuse = true;
+    Turns turns;
+    turns.first = engine.generate(engine.prepare_tokens(prompt), request).generated_token_ids;
+    prompt.insert(prompt.end(), turns.first.begin(), turns.first.end());
+    prompt.insert(prompt.end(), follow_up.begin(), follow_up.end());
+    request.execution.requested_output_tokens = kOutputTokens;
+    const ninfer::GenerationResult second = engine.generate(engine.prepare_tokens(prompt), request);
+    turns.second = second.generated_token_ids;
+    turns.reused = second.reused_prompt_tokens;
+    return turns;
+}
+
 // Each observed output must be a prefix of the request's resident reference.
 int compare(const std::string& label, const std::vector<std::vector<ninfer::TokenId>>& reference,
             const std::vector<std::vector<ninfer::TokenId>>& observed) {
@@ -136,6 +160,31 @@ int main() {
             failures += compare("kv-stream C=2" + suffix, reference,
                                 run_together(engine_options(artifact, 2, 11008, true), prompts,
                                              long_request));
+        }
+        // Context cache under streaming: a conversation that fits its window resumes from its
+        // continuation exactly as a resident engine does.
+        const std::vector<ninfer::TokenId> follow_up = make_prompt(4, 500);
+        const Turns resident =
+            run_turns(engine_options(artifact, 1, kMaxContext, false), make_prompt(3, 2000), 32,
+                      follow_up);
+        const Turns streamed =
+            run_turns(engine_options(artifact, 1, 5504, true), make_prompt(3, 2000), 32, follow_up);
+        if (streamed.reused == 0 || streamed.reused != resident.reused ||
+            streamed.first != resident.first || streamed.second != resident.second) {
+            std::cerr << "kv-stream cache: reused " << streamed.reused << " vs resident "
+                      << resident.reused << ", or tokens differ\n";
+            ++failures;
+        }
+        // A turn that spills during decode releases instead of publishing, and its longer follow-up
+        // no longer fits the window: it prefills from scratch and still completes.
+        const Turns spilled =
+            run_turns(engine_options(artifact, 1, 5504, true), make_prompt(5, 5000), 1500,
+                      follow_up);
+        if (spilled.first.size() != 1500 || spilled.second.size() != kOutputTokens ||
+            spilled.reused != 0) {
+            std::cerr << "kv-stream spill: turn sizes " << spilled.first.size() << "/"
+                      << spilled.second.size() << ", reused " << spilled.reused << "\n";
+            ++failures;
         }
         if (failures != 0) { return 1; }
     } catch (const std::exception& e) {
