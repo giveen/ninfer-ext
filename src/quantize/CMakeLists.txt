@@ -4,6 +4,8 @@ add_library(ninfer_quantize STATIC
   exl3/hadamard.cu
   exl3/hessian.cu
   exl3/ldlq.cu
+  exl3/linalg.cu
+  exl3/pipeline.cu
   exl3/trellis_encoder.cu
 )
 ninfer_internal_includes(ninfer_quantize)
