@@ -1,5 +1,6 @@
 # Offline weight quantization maths (EXL3). Not linked into the Engine, CLI or serving.
 add_library(ninfer_quantize STATIC
+  exl3/hadamard.cu
   exl3/trellis_encoder.cu
 )
 ninfer_internal_includes(ninfer_quantize)
