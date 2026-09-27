@@ -89,12 +89,37 @@ def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4):
         _assign(recipe, name, format)
 
 
+def _dense_bf16(model, recipe):
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    for name, parameter in model.parameters.items():
+        if not parameter.projection and name not in ("text/token_embedding", "text/output_head"):
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+        _assign(recipe, name, "bf16")
+    # DFlash/DFlash2 reuse the target's key/value matrices when the component is present.
+    for backend in ("dflash", "dflash2"):
+        if backend not in model.components:
+            continue
+        layers = model.components[backend]["config"]["num_hidden_layers"]
+        for layer in range(layers):
+            prefix = f"{backend}/layers/{layer}/attention/"
+            for role in ("key", "value"):
+                recipe.share(prefix + "context_" + role, prefix + role)
+
+
 def qwen3_6_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q6)
 
 
 def qwen3_8_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8)
+
+
+def qwen3_8_27b_bf16(model, recipe, sources):
+    """Full-precision BF16 weights, the native EXL3 quantizer's input artifact."""
+    _dense_bf16(model, recipe)
 
 
 def qwen3_8_27b_q6(model, recipe, sources):
@@ -316,6 +341,7 @@ RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
+    "qwen3_8_27b_bf16": qwen3_8_27b_bf16,
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,

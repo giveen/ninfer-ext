@@ -54,6 +54,7 @@ The built-in recipes are ordinary Python functions in
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
+| `qwen3_8_27b_bf16` | Every weight at full BF16 precision (the offline EXL3 quantizer's input) | None |
 | `qwen3_8_27b_q6` | Q4/Q5 projections, Q6 MLP gate/up, Q8 vocabulary weights | None |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |

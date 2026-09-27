@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 
 from tools.convert.model import Model, Parameter
-from tools.convert.official_recipes import RECIPES, qwen3_8_27b, qwen3_8_27b_q6
+from tools.convert.official_recipes import (
+    RECIPES,
+    qwen3_8_27b,
+    qwen3_8_27b_bf16,
+    qwen3_8_27b_q6,
+)
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
 
@@ -54,6 +59,14 @@ def _single(formats: dict[str, set[str]], name: str) -> str:
 
 def test_q6_recipe_is_registered() -> None:
     assert RECIPES["qwen3_8_27b_q6"] is qwen3_8_27b_q6
+
+
+def test_bf16_recipe_is_registered_and_matches_the_groupwise_layout() -> None:
+    assert RECIPES["qwen3_8_27b_bf16"] is qwen3_8_27b_bf16
+    formats = _formats(qwen3_8_27b_bf16)
+    assert set(formats) == set(_formats(qwen3_8_27b))
+    for name, values in formats.items():
+        assert values == {"bf16"}, f"{name} is not stored at full precision: {values}"
 
 
 def test_registered_recipe_gives_the_mlp_pair_q4() -> None:
