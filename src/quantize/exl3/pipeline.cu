@@ -165,7 +165,7 @@ float search_global_scale(const float* wr, std::int64_t k, std::int64_t n, int h
                 input.get() + static_cast<std::int64_t>(s) * count * 256);
         }
         CUDA_CHECK(cudaGetLastError());
-        constexpr int kBlocks           = 128;
+        const int kBlocks               = trellis_encoder_blocks();
         const std::size_t scratch_bytes = trellis_encoder_scratch_bytes(kBlocks, half_bits);
         DeviceArray<std::uint8_t> scratch(scratch_bytes, stream);
         DeviceArray<std::uint16_t> states(static_cast<std::size_t>(batch * 256), stream);

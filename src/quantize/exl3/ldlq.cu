@@ -23,7 +23,10 @@ struct Scratch {
 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
-int encoder_blocks(std::int64_t n) { return static_cast<int>(n / 16 < 256 ? n / 16 : 256); }
+int encoder_blocks(std::int64_t n) {
+    const int device_blocks = trellis_encoder_blocks();
+    return static_cast<int>(n / 16 < device_blocks ? n / 16 : device_blocks);
+}
 
 Scratch carve(void* base, std::int64_t n, int half_bits) {
     auto* p       = static_cast<std::uint8_t*>(base);

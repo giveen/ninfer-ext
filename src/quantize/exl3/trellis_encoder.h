@@ -19,6 +19,9 @@ namespace ninfer::quantize::exl3 {
 
 inline constexpr int kTrellisTileWeights = 256;
 
+// Concurrent tile blocks that fill the current device (one per SM).
+[[nodiscard]] int trellis_encoder_blocks();
+
 // Device scratch for `blocks` tiles encoded concurrently at this bitrate.
 [[nodiscard]] std::size_t trellis_encoder_scratch_bytes(int blocks, int bitrate_half_bits);
 
