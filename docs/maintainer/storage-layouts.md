@@ -7,7 +7,7 @@ ranges come from [`artifact-container.md`](artifact-container.md).
 
 ## 1. Registered identities
 
-The storage registry contains exactly these identities:
+The storage registry contains exactly these six identities:
 
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
@@ -15,6 +15,7 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `trellis_t16_v1` | tensor layout | `exl3_mul1` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 128 == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -377,3 +378,83 @@ parent as one native weight.
 Offline codecs can produce a standalone slice with its own plane offsets. The loader does not
 perform that transformation. An execution implementation that accepts additional view forms must
 consume the original parent geometry correctly.
+
+## 9. `trellis_t16_v1`
+
+### 9.1 Matrix and bitrate
+
+The logical matrix shape is `[N,K]` (output channels by input channels). Both dimensions must be
+positive multiples of 128. The tensor object must carry `bitrate_half_bits`, an integer in `[2,16]`;
+the bitrate in bits per weight is `bitrate_half_bits / 2`. This field is required only for
+`exl3_mul1` and is not inferred from the payload size.
+
+The tile grid and per-tile size are:
+
+```text
+tiles_n  = N / 16
+tiles_k  = K / 16
+tile_bytes = 16 * bitrate_half_bits
+trellis_bytes = tiles_n * tiles_k * tile_bytes
+```
+
+Both matrix dimensions are already tile- and Hadamard-aligned, so the layout adds no logical or
+physical matrix padding.
+
+### 9.2 Tile and bit order
+
+Tiles are output-major, then input-major:
+
+```text
+tile_index(n_tile, k_tile) = n_tile * tiles_k + k_tile
+```
+
+Each tile represents 16 output channels by 16 input channels. Its 256 states follow the
+`mma.m16n8k16` fragment order for the corresponding `[K,N]` operand tile. Stream bits are
+little-endian within each byte: bit zero of the first byte is the first stream bit. For state index
+`t`, the step width is `floor(bitrate_half_bits / 2)` plus one when `bitrate_half_bits` is odd and
+`t` is odd. Thus integer rates have a fixed step, while half-integer rates alternate the lower and
+upper step widths. The sum of all 256 widths is exactly `128 * bitrate_half_bits` bits.
+
+The 16-bit state is the circular 16-bit window ending after the current state's step; its low bit
+is the oldest stream bit. A valid tail-biting state sequence obeys:
+
+```text
+suffix[t] = state[t] >> (16 - width[t])
+state[t] = (state[t-1] >> width[t]) | (suffix[t] << (16 - width[t]))
+```
+
+where `state[-1]` means `state[255]` and `suffix[t]` is masked to `width[t]` bits. The `width[t]`
+suffix bits are appended least-significant bit first. The layout has no per-tile header or padding;
+each tile starts on a 16-byte boundary because every supported `tile_bytes` is a multiple of 16.
+
+### 9.3 Scale planes and encoded size
+
+The payload has three planes, in this order:
+
+```text
+trellis plane
+zero padding to a 256-byte boundary
+FP32 input-channel scales suh[K]
+zero padding to a 256-byte boundary
+FP32 output-channel scales svh[N]
+```
+
+Each scale word is stored as its exact little-endian binary32 bits. Plane offsets and object size are:
+
+```text
+trellis_offset       = 0
+suh_offset           = align_up(trellis_bytes, 256)
+suh_bytes            = 4 * K
+svh_offset           = align_up(suh_offset + suh_bytes, 256)
+svh_bytes            = 4 * N
+payload_bytes        = svh_offset + svh_bytes
+```
+
+There is no padding after `svh`. The tensor object's JSON `bytes` equals `payload_bytes`, excluding
+inter-object alignment. For the Qwen3.8 MLP shape `[17408,5120]` at four bits per weight
+(`bitrate_half_bits=8`), the trellis plane is 44,564,480 bytes and the complete object is
+44,654,592 bytes.
+
+The current EXL3 implementation defines and tests format metadata, plane geometry, and exact tile
+bit packing. It does not yet register a native Op consumer; support and row-view addressability are
+owned by the relevant native execution implementation, not implied by this storage registration.

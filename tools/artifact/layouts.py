@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    Exl3Format,
     Fp8RowFormat,
     Nvfp4Format,
     NumericFormat,
@@ -78,6 +79,22 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Exl3Geometry:
+    n: int
+    k: int
+    bitrate_half_bits: int
+    tiles_n: int
+    tiles_k: int
+    tile_bytes: int
+    trellis_bytes: int
+    input_scale_offset: int
+    input_scale_bytes: int
+    output_scale_offset: int
+    output_scale_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -94,6 +111,7 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+TRELLIS_T16_V1 = Layout("trellis_t16_v1", 256, frozenset(("exl3_mul1",)))
 
 LAYOUTS = MappingProxyType(
     {
@@ -103,6 +121,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            TRELLIS_T16_V1,
         )
     }
 )
@@ -257,11 +276,56 @@ def row_scale_geometry(
     )
 
 
+def exl3_geometry(
+    format: str | Exl3Format,
+    shape: Sequence[int],
+    bitrate_half_bits: int | None,
+) -> Exl3Geometry:
+    spec = _format(format)
+    if not isinstance(spec, Exl3Format):
+        raise ValueError("trellis_t16_v1 requires exl3_mul1")
+    if (
+        isinstance(bitrate_half_bits, bool)
+        or not isinstance(bitrate_half_bits, int)
+        or not 2 <= bitrate_half_bits <= 16
+    ):
+        raise ValueError("EXL3 bitrate_half_bits must be an integer in [2, 16]")
+    n, k = _shape(shape, rank=2)
+    if n % 128 or k % 128:
+        raise ValueError("trellis_t16_v1 requires both matrix dimensions divisible by 128")
+
+    tiles_n = n // 16
+    tiles_k = k // 16
+    tile_bytes = 16 * bitrate_half_bits
+    trellis_bytes = tiles_n * tiles_k * tile_bytes
+    input_scale_offset = align_up(trellis_bytes, PLANE_ALIGNMENT)
+    input_scale_bytes = k * 4
+    output_scale_offset = align_up(
+        input_scale_offset + input_scale_bytes, PLANE_ALIGNMENT
+    )
+    output_scale_bytes = n * 4
+    return Exl3Geometry(
+        n=n,
+        k=k,
+        bitrate_half_bits=bitrate_half_bits,
+        tiles_n=tiles_n,
+        tiles_k=tiles_k,
+        tile_bytes=tile_bytes,
+        trellis_bytes=trellis_bytes,
+        input_scale_offset=input_scale_offset,
+        input_scale_bytes=input_scale_bytes,
+        output_scale_offset=output_scale_offset,
+        output_scale_bytes=output_scale_bytes,
+        payload_bytes=output_scale_offset + output_scale_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
     shape: Sequence[int],
     divisors: int = 1,
+    bitrate_half_bits: int | None = None,
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
@@ -269,6 +333,8 @@ def encoded_size(
         raise ValueError(
             f"layout {layout_spec.name!r} stores one divisor, not {divisors}"
         )
+    if bitrate_half_bits is not None and not isinstance(numeric_spec, Exl3Format):
+        raise ValueError("bitrate_half_bits is only valid for exl3_mul1")
     if numeric_spec.name not in layout_spec.formats:
         raise ValueError(
             f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
@@ -292,4 +358,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TRELLIS_T16_V1:
+        if not isinstance(numeric_spec, Exl3Format):
+            raise ValueError("trellis_t16_v1 requires exl3_mul1")
+        return exl3_geometry(numeric_spec, shape, bitrate_half_bits).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

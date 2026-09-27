@@ -238,6 +238,7 @@ Target 引用须能找到对应组件，其数学关联由架构 binder 检查�
 | offset | U64 | 对象起点在逻辑 payload 中的字节偏移 |
 | bytes | PositiveU64 | 该对象完整编码的字节数 |
 | divisors | PositiveU64 | 可选，缺省为 1。堆叠进本平面且各自独立量化的源矩阵数量；每个源矩阵各持一个 NVFP4 权重除数，按平面行数均分。仅 `nvfp4` 与 `block_scale_k16_m128x4_v1` 允许大于 1 |
+| bitrate_half_bits | PositiveU64 | `exl3_mul1` 必需且取值 2..16，表示每权重 bitrate 的两倍；其他格式禁止此字段 |
 
 ```json
 {

@@ -41,6 +41,8 @@ struct TensorObject {
     // Source matrices this plane was assembled from, each with its own NVFP4 divisor. Absent means
     // one, which is every plane that is not a stack of separately quantised matrices.
     std::uint64_t divisors = 1;
+    // EXL3 bitrate in half-bit units (2..16); zero means not an EXL3 tensor.
+    std::uint64_t bitrate_half_bits = 0;
 };
 
 struct ResourceObject {

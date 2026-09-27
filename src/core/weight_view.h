@@ -48,11 +48,21 @@ struct WeightGeometry {
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
     std::uint64_t divisor_count       = 1;
+    std::uint64_t bitrate_half_bits   = 0;
+    std::uint64_t tiles_n             = 0;
+    std::uint64_t tiles_k             = 0;
+    std::uint64_t tile_bytes           = 0;
+    std::uint64_t trellis_bytes        = 0;
+    std::uint64_t input_scale_offset   = 0;
+    std::uint64_t input_scale_bytes    = 0;
+    std::uint64_t output_scale_offset  = 0;
+    std::uint64_t output_scale_bytes   = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape,
-                                             std::uint64_t divisors = 1);
+                                             std::uint64_t divisors = 1,
+                                             std::uint64_t bitrate_half_bits = 0);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
 struct WeightParent {

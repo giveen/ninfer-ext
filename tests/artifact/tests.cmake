@@ -2,6 +2,10 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+ninfer_add_test(ninfer_exl3_trellis_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_trellis.cpp"
+  LIBRARIES ninfer_artifact)
+
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_cuda_errors.cpp"
   LIBRARIES ninfer_artifact)

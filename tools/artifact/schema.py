@@ -69,6 +69,7 @@ class TensorSpec:
     # Source matrices stacked into this parent, each with its own NVFP4 divisor. One means the
     # parent has a single divisor, which is every parent that is not such a stack.
     divisors: int = 1
+    bitrate_half_bits: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,7 @@ class TensorObject:
     offset: int
     bytes: int
     divisors: int = 1
+    bitrate_half_bits: int | None = None
     kind: ClassVar[str] = "tensor"
 
     def to_json(self) -> dict:
@@ -95,6 +97,8 @@ class TensorObject:
         # objects would be a megabyte of directory that means nothing.
         if self.divisors == 1:
             del out["divisors"]
+        if self.bitrate_half_bits is None:
+            del out["bitrate_half_bits"]
         return out
 
 
@@ -155,7 +159,13 @@ def validate_encoding(obj: ArtifactObject) -> None:
             )
         return
     try:
-        size = encoded_size(obj.layout, obj.format, obj.shape, obj.divisors)
+        size = encoded_size(
+            obj.layout,
+            obj.format,
+            obj.shape,
+            obj.divisors,
+            obj.bitrate_half_bits,
+        )
         alignment = get_layout(obj.layout).alignment
     except (TypeError, ValueError) as error:
         raise ArtifactError(f"{obj.id}: {error}") from error
@@ -180,11 +190,24 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             dims = shape(spec.shape, name)
             try:
                 start = align_up(offset, get_layout(spec.layout).alignment)
-                size = encoded_size(spec.layout, spec.format, dims, spec.divisors)
+                size = encoded_size(
+                    spec.layout,
+                    spec.format,
+                    dims,
+                    spec.divisors,
+                    spec.bitrate_half_bits,
+                )
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error
             obj = TensorObject(
-                name, dims, spec.format, spec.layout, start, size, spec.divisors
+                name,
+                dims,
+                spec.format,
+                spec.layout,
+                start,
+                size,
+                spec.divisors,
+                spec.bitrate_half_bits,
             )
         elif isinstance(spec, ResourceSpec):
             obj = ResourceObject(name, spec.encoding, offset, spec.bytes)
@@ -207,7 +230,12 @@ def _parse_object(value: object) -> ArtifactObject:
     common = {"id", "kind", "offset", "bytes"}
     kind = value.get("kind")
     if kind == "tensor":
-        members(value, common | {"shape", "format", "layout"}, {"divisors"}, "tensor")
+        members(
+            value,
+            common | {"shape", "format", "layout"},
+            {"divisors", "bitrate_half_bits"},
+            "tensor",
+        )
     elif kind == "resource":
         members(value, common | {"encoding"}, set(), "resource")
     else:
@@ -226,6 +254,11 @@ def _parse_object(value: object) -> ArtifactObject:
         offset,
         size,
         integer(value.get("divisors", 1), f"{name} divisors", positive=True),
+        (
+            integer(value["bitrate_half_bits"], f"{name} bitrate_half_bits", positive=True)
+            if "bitrate_half_bits" in value
+            else None
+        ),
     )
 
 

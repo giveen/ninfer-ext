@@ -2,6 +2,7 @@ add_library(ninfer_artifact STATIC
   schema.cpp
   formats.cpp
   layouts.cpp
+  exl3_trellis.cpp
   file_io.cpp
   reader.cpp
   binder.cpp

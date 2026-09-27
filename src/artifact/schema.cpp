@@ -218,7 +218,7 @@ void parse_objects(Directory& out, const Json& objects) {
         const auto kind = require_id(value.at("kind"), "object kind");
         if (kind == "tensor") {
             require_members(value, {"id", "kind", "shape", "format", "layout", "offset", "bytes"},
-                            {"divisors"}, "tensor");
+                            {"divisors", "bitrate_half_bits"}, "tensor");
         } else if (kind == "resource") {
             require_members(value, {"id", "kind", "encoding", "offset", "bytes"}, {}, "resource");
         } else {
@@ -238,9 +238,14 @@ void parse_objects(Directory& out, const Json& objects) {
         if (kind == "tensor") {
             const std::uint64_t divisors =
                 value.contains("divisors") ? require_u64(value.at("divisors"), id, true) : 1;
+            const std::uint64_t bitrate_half_bits = value.contains("bitrate_half_bits")
+                                                        ? require_u64(value.at("bitrate_half_bits"),
+                                                                      id, true)
+                                                        : 0;
             out.objects.emplace_back(TensorObject{
                 id, parse_shape(value.at("shape"), id), require_id(value.at("format"), id),
-                require_id(value.at("layout"), id), offset, bytes, divisors});
+                require_id(value.at("layout"), id), offset, bytes, divisors,
+                bitrate_half_bits});
         } else {
             out.objects.emplace_back(
                 ResourceObject{id, require_id(value.at("encoding"), id), offset, bytes});

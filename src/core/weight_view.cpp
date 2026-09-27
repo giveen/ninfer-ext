@@ -77,9 +77,13 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
 }
 
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape, std::uint64_t divisors) {
+                               std::span<const std::uint64_t> shape, std::uint64_t divisors,
+                               std::uint64_t bitrate_half_bits) {
     if (divisors == 0 || (divisors != 1 && format != QType::NVFP4)) {
         throw std::invalid_argument("only an NVFP4 plane carries more than one divisor");
+    }
+    if (bitrate_half_bits != 0 && format != QType::EXL3_MUL1) {
+        throw std::invalid_argument("only EXL3 tensors carry bitrate_half_bits");
     }
     WeightGeometry out;
     out.format        = format;
@@ -146,6 +150,32 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::TrellisT16) {
+        if (format != QType::EXL3_MUL1) {
+            throw std::invalid_argument("TrellisT16 requires EXL3 mul1");
+        }
+        if (bitrate_half_bits < 2 || bitrate_half_bits > 16) {
+            throw std::invalid_argument("EXL3 bitrate_half_bits must be in [2, 16]");
+        }
+        if (n % 128 || k % 128) {
+            throw std::invalid_argument("EXL3 TrellisT16 requires N%128=0 and K%128=0");
+        }
+        out.bitrate_half_bits = bitrate_half_bits;
+        out.tiles_n           = n / 16;
+        out.tiles_k           = k / 16;
+        out.tile_bytes        = mul(16, bitrate_half_bits);
+        out.trellis_bytes = mul(mul(out.tiles_n, out.tiles_k), out.tile_bytes);
+        out.code_bytes = out.trellis_bytes;
+        out.input_scale_offset = aligned(out.trellis_bytes, 256);
+        out.input_scale_bytes = mul(k, 4);
+        out.output_scale_offset = aligned(add(out.input_scale_offset, out.input_scale_bytes), 256);
+        out.output_scale_bytes = mul(n, 4);
+        out.scale_offset = out.output_scale_offset;
+        out.scale_bytes = out.output_scale_bytes;
+        out.high_offset = out.input_scale_offset;
+        out.high_bytes = out.input_scale_bytes;
+        out.bytes = add(out.output_scale_offset, out.output_scale_bytes);
+        return out;
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
@@ -215,6 +245,9 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
+    if (g.layout == QuantLayout::TrellisT16) {
+        throw std::invalid_argument("EXL3 planes require an EXL3-specific row view");
+    }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
         throw std::invalid_argument("row view requires resident complete logical rows");
@@ -255,6 +288,9 @@ Tensor weight_tensor(const WeightView& view, std::initializer_list<std::int32_t>
 Weight native_weight(const WeightView& view, float input_divisor) {
     const auto region = contiguous_weight_region(view);
     const auto& g     = region.parent->geometry;
+    if (g.layout == QuantLayout::TrellisT16) {
+        throw std::invalid_argument("EXL3 trellis weights have no native Op bridge yet");
+    }
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }

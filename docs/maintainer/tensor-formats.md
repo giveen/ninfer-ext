@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the ten persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly ten persistent numeric tensor formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -39,6 +39,12 @@ The row-scaled floating-point weight format is:
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
+The transform-coded integer weight format is:
+
+| Canonical name | Codebook | Per-tensor rate | Scale vectors |
+|---|---|---|---|
+| `exl3_mul1` | 16-bit trellis state to signed integer `[-510,510]` | `bitrate_half_bits` 2..16 (1..8 bits/weight in half-bit increments) | FP32 input-channel and output-channel vectors |
+
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
 [`src/artifact/formats.cpp`](../../src/artifact/formats.cpp). Additional formats need an explicit
@@ -53,7 +59,8 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `nvfp4` format, and the row-scaled `fp8_e4m3fn_row_bf16` format. It does not
+the block-scaled `nvfp4` format, the row-scaled `fp8_e4m3fn_row_bf16` format, and the
+transform-coded `exl3_mul1` format. It does not
 identify a tensor's model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
@@ -76,7 +83,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+The seven quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -300,6 +307,40 @@ The format does not define how a floating-point source is assigned a scale or ro
 A recipe either preserves already selected code and scale words exactly or names its
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
+
+### 3.5 `exl3_mul1`
+
+`exl3_mul1` stores a transform-coded integer matrix. Its logical tensor shape is `[N,K]` (output
+channels, input channels), and both positive dimensions must be divisible by 128. The transform is
+defined on `W[K,N]`, the matrix used by `y = x·W`:
+
+```text
+W = diag(suh) · H_K · Z · H_N · diag(svh)
+```
+
+`H_K` and `H_N` are block-diagonal normalized Sylvester Hadamard transforms, with 128×128 blocks
+scaled by `1/sqrt(128)`. `Z` is the exact integer matrix decoded from the trellis. `suh[K]` and
+`svh[N]` are exact little-endian FP32 scale/sign words; the converter folds the mul1 constant `κ`
+into `svh`, so reconstruction uses `Z` directly and does not round the codebook values to FP16.
+The format defines these stored scale words, not the quantization procedure that selects them.
+
+For a 16-bit state `s`, the exact integer code is:
+
+```text
+p = (s * 0x83DCD12D) mod 2^32
+z(s) = (p[7:0] + p[15:8] + p[23:16] + p[31:24]) - 510
+```
+
+The product wraps as an unsigned 32-bit value, so `z(s)` is in `[-510,510]`. The scale and
+transform reconstruction above is the numeric interpretation; the rate and stream representation
+are object metadata and layout respectively.
+
+Every tensor object using this format carries the required integer `bitrate_half_bits` in `[2,16]`;
+its bits-per-weight value is `bitrate_half_bits / 2`. A tile contains 256 states. For an integer
+rate, every state advances by that many stream bits. For a half-integer rate, each state advances by
+`floor(rate)` bits except odd-numbered states, which advance by `ceil(rate)` bits. State windows are
+16 circular bits ending at each step; the low bit is the oldest bit. The stream uses the exact
+little-endian bit order specified by `trellis_t16_v1`.
 
 ## 4. Grouped signed-integer tensor model
 
@@ -559,6 +600,8 @@ A conforming producer must:
   finite positive FP32 weight divisor per stacked source matrix under Section 3.3;
 - for `fp8_e4m3fn_row_bf16`, emit only finite E4M3FN code words and valid BF16 row multipliers,
   with signed-zero codes as the only legal codes in a positive-zero-scale row under Section 3.4;
+- for `exl3_mul1`, emit an allowed `bitrate_half_bits`, exactly 256 circular states per tile, and
+  exact FP32 input/output scale words under Section 3.5;
 - record enough conversion provenance for the artifact producer to identify how the values
   were derived;
 - when an encoder converts floating-point source values, fail rather than silently quantize
@@ -587,6 +630,8 @@ The `.ninfer` container and each registered storage layout must:
   of the row's own source matrix under Section 3.3;
 - for `fp8_e4m3fn_row_bf16`, reconstruct every E4M3FN code word and its owning BF16 row multiplier
   under Section 3.4;
+- for `exl3_mul1`, reconstruct every trellis state and exact FP32 input/output scale word under
+  Section 3.5, using the tensor object's explicit bitrate;
 - define its canonical physical-padding contents and producer responsibilities, if it materializes
   padding;
 - reject unknown formats and unsupported format/layout combinations;
@@ -617,7 +662,7 @@ producer contract and the represented values.
 A consuming kernel or model component must interpret direct logical words according to Section 3.1,
 grouped signed-integer identities, codes, and scales according to Section 3.2 and Sections 5 and 6,
 `nvfp4` words and divisor according to Section 3.3, and row-scaled FP8 words according to Section
-3.4. It may choose its private fusion, reduction, staging, and intermediate precision; the
+3.4, and `exl3_mul1` codes, scales and transform according to Section 3.5. It may choose its private fusion, reduction, staging, and intermediate precision; the
 observable Op result is qualified against the independent oracle with the Op's named criterion for
 that implementation profile. Kernel implementation details do not alter the persistent format and
 must not be needed to decode an artifact independently.
@@ -639,6 +684,8 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
 - finite E4M3FN weight-code validity, BF16 row-scale validity, signed-zero rows, exact code/scale
   plane round trips, and the row-multiplier reconstruction equation for
   `fp8_e4m3fn_row_bf16`;
+- exact mul1 state decoding and pack/unpack round trips for every integer and half-integer bitrate,
+  circular tail-biting, the complete 16-bit codebook, and Qwen3.8 matrix geometry;
 - canonical binary16 scale rounding, reciprocal-multiply rather than direct division, positive and
   negative ties-to-even, minimum-subnormal rescue, and rejection of non-finite or overflowing source
   groups;
