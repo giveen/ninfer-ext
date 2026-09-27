@@ -105,16 +105,16 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                    spec.mtp_physical_page_groups, spec.qsa_index, spec.kv_stream);
     }
-    if (spec.prefill_staging_pages != 0) {
+    if (spec.kv_staging_pages != 0) {
         if (!spec.kv_stream || spec.qsa_index) {
             throw std::invalid_argument("prefill KV staging requires dense KV streaming");
         }
         const std::size_t stride = staging_record_stride(layout.text_kv);
-        layout.text_prefill_staging = KVPrefillStagingLayout{
+        layout.text_kv_staging = KVHostStagingLayout{
             .buffer = builder.add_tensor(
                 DType::U8,
                 {static_cast<std::int32_t>(stride),
-                 static_cast<std::int32_t>(spec.prefill_staging_pages)},
+                 static_cast<std::int32_t>(spec.kv_staging_pages)},
                 256, "Paged KV prefill staging"),
             .tables = builder.add_tensor(
                 DType::I32,
@@ -123,7 +123,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                  layout.text_kv.execution_tables.spec.table_rows},
                 256, "Paged KV prefill staging tables"),
             .record_stride  = stride,
-            .capacity_pages = spec.prefill_staging_pages,
+            .capacity_pages = spec.kv_staging_pages,
         };
     }
     return layout;
@@ -233,12 +233,12 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
     : text_kv(backing, layout.text_kv) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
-    if (layout.text_prefill_staging) {
-        text_prefill_staging.emplace(backing, *layout.text_prefill_staging, text_kv);
+    if (layout.text_kv_staging) {
+        text_kv_staging.emplace(backing, *layout.text_kv_staging, text_kv);
     }
 }
 
-KVPrefillStaging::KVPrefillStaging(DeviceSpan backing, const KVPrefillStagingLayout& layout,
+KVHostStaging::KVHostStaging(DeviceSpan backing, const KVHostStagingLayout& layout,
                                    const PagedKVCache& cache)
     : cache_(&cache), buffer_(layout.buffer.bind(backing)), tables_(layout.tables.bind(backing)),
       record_stride_(layout.record_stride), capacity_pages_(layout.capacity_pages) {
@@ -251,7 +251,7 @@ KVPrefillStaging::KVPrefillStaging(DeviceSpan backing, const KVPrefillStagingLay
     runs_.reserve(capacity_pages_);
 }
 
-bool KVPrefillStaging::prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream) {
+bool KVHostStaging::prepare(std::int32_t row, std::uint32_t pages, cudaStream_t stream) {
     runs_.clear();
     const std::span<const std::int32_t> published = cache_->execution_tables().published_words(row);
     if (pages > published.size()) {
@@ -288,7 +288,7 @@ bool KVPrefillStaging::prepare(std::int32_t row, std::uint32_t pages, cudaStream
     return true;
 }
 
-PagedKVBatchLayerView KVPrefillStaging::stage(const PagedKVBatchLayerView& view,
+PagedKVBatchLayerView KVHostStaging::stage(const PagedKVBatchLayerView& view,
                                               std::uint32_t layer, cudaStream_t stream) const {
     if (runs_.empty()) { throw std::logic_error("prefill KV staging is not prepared"); }
     const HostKVPageLayout& host = cache_->host_layout();

@@ -1116,11 +1116,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     // Stage the chunk's Host pages once per layer instead of re-reading them
                     // from Host once per query tile.
                     schedule_state.text_kv_staging =
-                        decoder->text_prefill_staging &&
-                                decoder->text_prefill_staging->prepare(
+                        decoder->text_kv_staging &&
+                                decoder->text_kv_staging->prepare(
                                     text_kv_addresses->bound_row(sequence.kv->text),
                                     kv_pages_for_tokens(chunk_end), device.stream)
-                            ? &*decoder->text_prefill_staging
+                            ? &*decoder->text_kv_staging
                             : nullptr;
                 }
                 const std::optional<std::uint32_t> capture_frontier =

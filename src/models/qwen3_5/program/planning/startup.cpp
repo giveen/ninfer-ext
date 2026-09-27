@@ -147,7 +147,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      // Every request's Device window is at least the startup minimum, so at most
                      // the rest of one sequence is Host-resident when a chunk stages it. The bound
                      // does not depend on the pool size, which keeps this layout affine in it.
-                     .prefill_staging_pages =
+                     .kv_staging_pages =
                          plan.kv_stream
                              ? logical_pages -
                                    std::min(logical_pages,

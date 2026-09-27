@@ -253,8 +253,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
-    // Streamed KV does not yet enter the context cache: retained checkpoints and restores assume
-    // Device-resident members (paged-kv §6.5).
+    // A streaming Engine does not yet use the context cache for any request: retained checkpoints
+    // and restores assume Device-resident members (paged-kv §6.5).
     const bool prefix_reuse              = options.allow_prefix_reuse && !kv_stream;
     base->allow_prefix_reuse             = prefix_reuse;
     base->summary.publish_continuation =

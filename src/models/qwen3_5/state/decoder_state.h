@@ -31,8 +31,8 @@ struct DecoderStateSpec {
     // KV streaming: the physical pools may be smaller than one full-capacity sequence, since
     // older pages are served from Host records.
     bool kv_stream = false;
-    // KV streaming: Host pages one text prefill chunk can stage on Device (KVPrefillStaging).
-    std::uint32_t prefill_staging_pages = 0;
+    // KV streaming: Host pages one text prefill chunk can stage on Device (KVHostStaging).
+    std::uint32_t kv_staging_pages = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -130,20 +130,20 @@ private:
 // tile count. Instead each layer's slice of the chunk's Host pages is copied once into `buffer`,
 // laid out as compact one-layer records, and a staged copy of the execution tables points the
 // Host words at those records; paged Ops then resolve them through the Host arm from Device memory.
-struct KVPrefillStagingLayout {
+struct KVHostStagingLayout {
     TensorRegion buffer; // U8 [record_stride, capacity_pages]
     TensorRegion tables; // I32 [logical pages, table rows], shaped like the execution tables
     std::size_t record_stride    = 0;
     std::uint32_t capacity_pages = 0;
 };
 
-class KVPrefillStaging {
+class KVHostStaging {
 public:
-    KVPrefillStaging(DeviceSpan backing, const KVPrefillStagingLayout& layout,
+    KVHostStaging(DeviceSpan backing, const KVHostStagingLayout& layout,
                      const PagedKVCache& cache);
 
-    KVPrefillStaging(const KVPrefillStaging&)            = delete;
-    KVPrefillStaging& operator=(const KVPrefillStaging&) = delete;
+    KVHostStaging(const KVHostStaging&)            = delete;
+    KVHostStaging& operator=(const KVHostStaging&) = delete;
 
     // Stages execution row `row` for a chunk that reads logical pages [0, pages). Returns false,
     // staging nothing, when those pages hold no Host word or more than the buffer fits; the chunk
@@ -175,7 +175,7 @@ private:
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
-    std::optional<KVPrefillStagingLayout> text_prefill_staging;
+    std::optional<KVHostStagingLayout> text_kv_staging;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
@@ -186,7 +186,7 @@ struct DecoderStateLayout {
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
-    std::optional<KVPrefillStaging> text_prefill_staging;
+    std::optional<KVHostStaging> text_kv_staging;
 
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
 

@@ -113,7 +113,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --kv-stream keeps each request's Device KV within an equal share of --kv-capacity, "
            "which may be below --max-context, and reads older full pages in place from Host KV "
-           "(--host-kv-mib); streamed requests skip the context cache\n"
+           "(--host-kv-mib); it disables the context cache (prefix reuse) for every request\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,7), anchors=4; Host state=8 slots, Host KV=8192 MiB\n"
            "       --host-cache-mib sizes the whole Host cache tier from one pinned-RAM ceiling and replaces --host-state-slots and --host-kv-mib\n"

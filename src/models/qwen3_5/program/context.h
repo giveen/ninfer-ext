@@ -56,7 +56,7 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     // Streamed prefill: the prepared staging of this chunk's Host pages, or null.
-    const qwen3_5::KVPrefillStaging* text_kv_staging = nullptr;
+    const qwen3_5::KVHostStaging* text_kv_staging = nullptr;
 };
 
 struct OrdinaryBatchContext {
