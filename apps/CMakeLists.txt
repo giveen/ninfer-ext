@@ -33,3 +33,14 @@ ninfer_internal_includes(ninfer-quantize)
 target_include_directories(ninfer-quantize PRIVATE ${PROJECT_SOURCE_DIR}/apps/quantize)
 target_link_libraries(ninfer-quantize PRIVATE
   ninfer_engine ninfer_quantize ninfer_artifact ninfer::json)
+
+# Offline EXL3 quantization sensitivity measurement: perturbs one projection at a time and scores the
+# loss, the input the bit allocation needs. One-shot tool, not a serving product.
+add_executable(ninfer-sensitivity
+  sensitivity/main.cpp
+  quantize/parameter_reader.cpp
+  quantize/trace_reader.cpp)
+ninfer_internal_includes(ninfer-sensitivity)
+target_include_directories(ninfer-sensitivity PRIVATE ${PROJECT_SOURCE_DIR}/apps/quantize)
+target_link_libraries(ninfer-sensitivity PRIVATE
+  ninfer_engine ninfer_artifact ninfer::json)

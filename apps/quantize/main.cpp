@@ -97,6 +97,23 @@ int main(int argc, char** argv) {
         std::fputs(app::quantize_usage_text(argv[0]).c_str(), stdout);
         return 0;
     }
+    if (!options.rates.empty()) {
+        try {
+            std::ifstream rates_file(options.rates);
+            if (!rates_file) {
+                throw std::runtime_error("cannot read " + options.rates.string());
+            }
+            const nlohmann::json rates = nlohmann::json::parse(rates_file);
+            for (const auto& [name, value] : rates.items()) {
+                options.rate_overrides.emplace(name, value.get<int>());
+            }
+            std::fprintf(stderr, "loaded %zu per-tensor rates from %s\n",
+                         options.rate_overrides.size(), options.rates.string().c_str());
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "ninfer-quantize: rates: %s\n", error.what());
+            return 1;
+        }
+    }
 
     try {
         const ninfer::artifact::Reader reader(options.artifact);

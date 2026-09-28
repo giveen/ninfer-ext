@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
 
@@ -34,6 +35,10 @@ struct QuantizeOptions {
     std::int64_t limit          = 0; // 0 selects every eligible parameter
     OutScaleMode out_scales     = OutScaleMode::Auto;
     bool help                   = false;
+    // Per-tensor rates in half bits from the M5 allocation, keyed by logical parameter name. A name
+    // present here overrides --bits/--head-bits/--hq; `rates` is the JSON the caller loads into it.
+    std::filesystem::path rates;
+    std::map<std::string, int> rate_overrides;
 };
 
 [[nodiscard]] QuantizeOptions parse_quantize_options(int argc, char** argv);

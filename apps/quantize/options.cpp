@@ -59,6 +59,7 @@ std::string quantize_usage_text(const char* argv0) {
            "       --seed N                quantizer RNG seed (default 0)\n"
            "       --out-scales auto|always|never  (default auto)\n"
            "       --limit N               quantize at most N eligible parameters (debug)\n"
+           "       --rates FILE            per-tensor half bits JSON from tools/exl3/allocate.py\n"
            "       --list                  list eligible parameters and exit without a device\n"
            "       --help                  print this message\n"
            "       quantizes each eligible BF16 projection and writes an exl3_mul1 source store\n"
@@ -75,6 +76,10 @@ std::string sanitize_parameter_name(std::string_view name) {
 }
 
 int bitrate_for_parameter(const QuantizeOptions& options, std::string_view name) {
+    const auto override_it = options.rate_overrides.find(std::string(name));
+    if (override_it != options.rate_overrides.end()) {
+        return std::clamp(override_it->second, 2, 16);
+    }
     int half_bits = options.bits_half;
     if (name == "text/output_head") {
         half_bits = options.head_bits_half;
@@ -133,6 +138,8 @@ QuantizeOptions parse_quantize_options(int argc, char** argv) {
             options.out_scales = parse_out_scales(require_value("--out-scales"));
         } else if (arg == "--limit") {
             options.limit = parse_int(require_value("--limit"), "limit");
+        } else if (arg == "--rates") {
+            options.rates = require_value("--rates");
         } else if (arg == "--list") {
             options.list_only = true;
         } else if (arg == "--help" || arg == "-h") {
