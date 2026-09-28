@@ -414,6 +414,39 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
             recipe.group(names)
 
 
+def qwen3_8_flash_next_q4(model, recipe, sources):
+    """Qwen3.8-Flash-Next (Qwen4Exp) with the routed experts re-encoded to groupwise.
+
+    The NVFP4 recipe keeps the ModelOpt expert codes and runs the W4A4 path. This one quantizes the
+    experts from full precision instead: Q4 gate/up with Q5 down, the `sparse_moe` main profile, and
+    Q8 shared experts. The expert banks are the bulk of the file and g64's per-64 FP16 scale is
+    cheaper than NVFP4's block-16 FP8 scale plus its per-tensor divisor, so this is smaller at the
+    cost of 4-bit activations. Everything else matches the NVFP4 recipe.
+    """
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    _assign(recipe, "text/output_head", Q6)
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") or not parameter.projection:
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
+            "text/token_embedding",
+            "text/output_head",
+        ):
+            continue
+        if "/moe/experts/" in name:
+            _assign(recipe, name, Q4 if name.endswith(("/gate", "/up")) else Q5)
+            continue
+        _assign(recipe, name, Q8)
+    # Each layer's gate/up and down banks become one parent so an expert is a fixed row range of
+    # its bank, addressed by the expert cache as a few contiguous spans.
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -425,4 +458,5 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_6_35b_a3b_nvfp4": qwen3_6_35b_a3b_nvfp4,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_q4": qwen3_8_flash_next_q4,
 }
