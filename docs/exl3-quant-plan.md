@@ -520,6 +520,22 @@ bit.
   sensitivity measurement is being built -- `Exl3WeightProbe` injects seeded Gaussian noise into one EXL3
   weight's decoded values (committed `b4c3cbc4`), and preparation registers each projection as a probe target
   (committed `6c4becd1`).
+- 2026-09-28: M5 sensitivity result and the layer allocation. The 16-row `ninfer-sensitivity` sweep (256
+  targets, seeded Gaussian `rfn` 0.145 on the 4.0 bpw weights) measures each projection's end-to-end ΔNLL. The
+  signal sits on the **layer** axis: the per-layer mean |ΔNLL| spans 84x, 9.3 (L63) to 784.2 (L8), and the 17
+  quietest layers (45-51, 54-63) are all below 100. The projection **type** axis is nearly flat, 1.28x
+  (gdn/query 230.6 to gdn/output 296.2), and the per-tensor signs flip between adjacent projections of one
+  layer -- so per-tensor allocation would fit mostly noise. `tools/exl3/allocate.py` therefore pools each Text
+  layer as one unit (`--group-by-layer`) and gives its projections a single rate, summing each member's KL at
+  the common rate through that member's **own** quantizer anchor,
+  `kld(k) = sum_m S_m (rfn0_m * 0.5 ** (k - k0_m)) ** 2` (`--hq` anchored attention and GDN a bit above the
+  MLP, so one anchor per layer misprices the MLP). Two bugs surfaced and are fixed: the error curve exponent
+  was inverted (`0.5 ** (k0 - k)` makes a lower rate *more* accurate) and the signed ΔNLL must enter as a
+  magnitude.
+  At the uniform 3.0 bpw body rate (6.1379 half bits, measured from the `--bits 6 --hq` report) the allocation
+  is a 4-7 half bit schedule (mean 6.126, 3.06 bpw): layers 0-44 keep 3.0-3.5 bpw and the quiet tail 45-63
+  drops to 2.0-2.5 (L56 2.0, L63 2.0); the head is unchanged at 12 half bits. `ninfer-quantize --rates` is
+  re-running over the same `hess-all`; the conversion, artifact replacement and full-corpus PPL follow.
 
 ## M3 status and decisions
 
