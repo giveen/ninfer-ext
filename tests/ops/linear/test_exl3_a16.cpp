@@ -304,6 +304,7 @@ void run_sampled_cases() {
     run_sampled_case(256, 128, 8, 2, 201U);      // oracle self-check against the exhaustive case
     run_sampled_case(384, 256, 8, 2, 202U);
     run_sampled_case(14336, 5120, 10, 2, 211U);  // attention q/key/gate/value parent
+    run_sampled_case(14336, 5120, 10, 32, 241U); // same parent through the tensor-core path
     run_sampled_case(16384, 5120, 8, 2, 223U);   // GDN q/key/value/z parent
     run_sampled_case(34816, 5120, 8, 2, 227U);   // MLP gate/up parent
     run_sampled_case(5120, 6144, 10, 2, 229U);   // attention output

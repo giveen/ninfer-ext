@@ -202,6 +202,135 @@ __global__ void exl3_contract_decode(const float* __restrict__ u,
     if (s == 0) { out[n] = __float2bfloat16(row[0][lane] * sv[n] * (1.0F / 128.0F)); }
 }
 
+// Two bf16 values in the 32-bit register the MMA atom consumes.
+__device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
+    const __nv_bfloat162 value = __halves2bfloat162(__float2bfloat16(lo), __float2bfloat16(hi));
+    std::uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+__device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4],
+                                             const std::uint32_t b[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Tensor-core contraction. A block covers one 128-row Hadamard block and up to 64 tokens. Warp w
+// decodes the trellis tile for n = 16w..16w+15 (both n8 fragments) and runs it against the four m16
+// token fragments. The stored tile order is the m16n8k16 B-fragment order, so a lane's eight
+// windows pack straight into two B fragments with no shuffle.
+constexpr int kExl3MmaN       = 128;
+constexpr int kExl3MmaT       = 64;
+constexpr int kExl3MmaThreads = 256;
+constexpr int kExl3MmaMinT    = 32;
+
+__global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+                         const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
+                         int k_extent, int n_extent, int columns, int half_bits) {
+    const int n_base  = blockIdx.x * kExl3MmaN;
+    const int t0      = blockIdx.y * kExl3MmaT;
+    const int lane    = threadIdx.x & 31;
+    const int warp    = threadIdx.x >> 5;
+    const int t_count = min(kExl3MmaT, columns - t0);
+    const int kt_tiles = k_extent / 16;
+    const int bits     = half_bits >> 1;
+    const int words    = 4 * half_bits;
+    const bool fast    = (half_bits & 1) == 0;
+
+    __shared__ __nv_bfloat16 us[kExl3MmaT][16];
+    __shared__ float vs[kExl3MmaT][kExl3MmaN];
+
+    float acc[2][4][4];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) { acc[h][m][c] = 0.0F; }
+
+    const std::size_t tile_stride = static_cast<std::size_t>(16 * half_bits);
+    const std::uint8_t* warp_tile =
+        trellis + static_cast<std::size_t>(blockIdx.x * 8 + warp) * kt_tiles * tile_stride;
+
+    for (int kt = 0; kt < kt_tiles; ++kt) {
+        for (int i = threadIdx.x; i < kExl3MmaT * 16; i += kExl3MmaThreads) {
+            const int t  = i >> 4;
+            const int kk = i & 15;
+            us[t][kk]    = (t0 + t < columns)
+                               ? __float2bfloat16(
+                                     u[static_cast<std::size_t>(t0 + t) * k_extent + kt * 16 + kk])
+                               : __float2bfloat16(0.0F);
+        }
+        __syncthreads();
+
+        const std::uint8_t* tile8 = warp_tile + static_cast<std::size_t>(kt) * tile_stride;
+        const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+        std::uint32_t b[2][2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            std::uint16_t st[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int t_idx = 8 * lane + 4 * h + r;
+                st[r]           = fast ? tile_state_fast(tile32, words, bits, t_idx)
+                                       : tile_state(tile8, half_bits, t_idx);
+            }
+            b[h][0] = pack_bf16x2(mul1_value(st[0]), mul1_value(st[1]));
+            b[h][1] = pack_bf16x2(mul1_value(st[2]), mul1_value(st[3]));
+        }
+
+        std::uint32_t a[4][4];
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+            const int row = mt * 16 + (lane >> 2);
+            const int col = (lane & 3) * 2;
+            a[mt][0]      = pack_bf16x2(us[row][col], us[row][col + 1]);
+            a[mt][1]      = pack_bf16x2(us[row + 8][col], us[row + 8][col + 1]);
+            a[mt][2]      = pack_bf16x2(us[row][col + 8], us[row][col + 9]);
+            a[mt][3]      = pack_bf16x2(us[row + 8][col + 8], us[row + 8][col + 9]);
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt) { mma_m16n8k16(acc[h][mt], a[mt], b[h]); }
+
+        __syncthreads();
+    }
+
+    // Publish the accumulators, then apply the output Hadamard over the 128 rows. Threads 0..127
+    // transform even columns and 128..255 odd ones; every thread still reaches the block barriers.
+    const int half_lane = threadIdx.x & 127;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+            const int n0        = (2 * warp + h) * 8 + (lane & 3) * 2;
+            const int t_a       = mt * 16 + (lane >> 2);
+            vs[t_a][n0]         = acc[h][mt][0];
+            vs[t_a][n0 + 1]     = acc[h][mt][1];
+            vs[t_a + 8][n0]     = acc[h][mt][2];
+            vs[t_a + 8][n0 + 1] = acc[h][mt][3];
+        }
+    }
+    __syncthreads();
+    for (int pair = 0; pair < kExl3MmaT / 2; ++pair) {
+        const int t_even = 2 * pair;
+        const int t_odd  = 2 * pair + 1;
+        float* target    = (threadIdx.x < 128) ? &vs[t_even][0] : &vs[t_odd][0];
+        butterfly128(target, half_lane);
+        const int t = (threadIdx.x < 128) ? t_even : t_odd;
+        if (t < t_count) {
+            const int n = n_base + half_lane;
+            out[n + static_cast<std::size_t>(t0 + t) * n_extent] =
+                __float2bfloat16(target[half_lane] * sv[n] * (1.0F / 128.0F));
+        }
+    }
+}
+
 } // namespace
 
 void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
@@ -232,7 +361,13 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     auto* output      = static_cast<__nv_bfloat16*>(out.data);
     exl3_input_transform<<<dim3(static_cast<unsigned>(w.k / 128), columns), 128, 0, stream>>>(
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
-    if (columns == 1) {
+    if (columns >= kExl3MmaMinT) {
+        exl3_mma<<<dim3(static_cast<unsigned>(w.n / 128),
+                        static_cast<unsigned>((columns + kExl3MmaT - 1) / kExl3MmaT)),
+                  kExl3MmaThreads, 0, stream>>>(
+            u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
+            output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+    } else if (columns == 1) {
         exl3_contract_decode<<<dim3(static_cast<unsigned>(w.n / 128)),
                                dim3(128, kExl3DecodeSplit), 0, stream>>>(
             u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),

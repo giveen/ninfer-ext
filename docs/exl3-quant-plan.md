@@ -195,7 +195,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete (functional) | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared `suh`) that loads and serves; bounded PPL and generation recorded; the full-corpus KLD and fast decode are M4 |
-| M4 | In progress | Fast inference kernels | Fused-window SIMT decode with K-split (decode) and T-tiled (prefill) contraction is in; consumers all covered; tensor-core MMA and the end-to-end speed report remain |
+| M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode) plus fused-window SIMT decode with K-split is in; all consumers covered; a dedicated decode GEMV and the end-to-end speed report remain |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Vision tower; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission |
 
@@ -430,6 +430,13 @@ bit.
   per slice) to lift occupancy. Measured on `perplexity-1m/00.txt` prefix (12,126 tokens, context/stride 512/256):
   scoring 5.4 -> 60 tok/s, and EXL3 PPL 2.0307 against Q4's 2.0399 at the same prefix; `ninfer-serve` decode
   1.75 -> 13.2 tok/s with coherent output. Tensor-core MMA and the full-corpus KLD remain.
+- 2026-09-27: M4 tensor cores. The stored trellis tile is already the `mma.m16n8k16` B-fragment order, so a
+  warp lane decodes its eight windows straight into two B fragments with no shuffle; a block covers one 128-row
+  Hadamard block and 64 tokens, warp `w` owning n = 16w..16w+15, and the epilogue applies the 128-point output
+  Hadamard (two columns at a time across 256 threads) and `sv`. The FP64 oracle now exercises the MMA path at
+  `[14336, 5120] x T=32` and `[256, 128] x T=64`. Measured on the same 12,126-token prefix: scoring
+  60 -> 318 tok/s and PPL 2.0291 (Q4 2.0399). Decode (`T=1`, verify) still uses the SIMT decode path; a
+  dedicated GEMV is the next step.
 
 ## M3 status and decisions
 
