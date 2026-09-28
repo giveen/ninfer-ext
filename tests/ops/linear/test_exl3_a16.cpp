@@ -310,6 +310,15 @@ void run_sampled_cases() {
     run_sampled_case(5120, 6144, 10, 2, 229U);   // attention output
     run_sampled_case(5120, 17408, 8, 2, 233U);   // MLP down
     run_sampled_case(248320, 5120, 12, 1, 239U); // vocabulary head
+    // Odd half rates (2.5 / 3.5 / 4.5 bpw) at the real projections: the 3.5 bpw artifact is body K=7
+    // with attention K=9, and these shapes were never exercised on the half-rate decode.
+    run_sampled_case(16384, 5120, 7, 2, 251U);   // GDN input parent at K=7
+    run_sampled_case(14336, 5120, 7, 2, 253U);   // attention q/key/gate/value at K=7
+    run_sampled_case(34816, 5120, 7, 2, 257U);   // MLP gate/up at K=7
+    run_sampled_case(5120, 17408, 7, 2, 259U);   // MLP down at K=7
+    run_sampled_case(5120, 6144, 9, 2, 263U);    // attention output at K=9
+    run_sampled_case(16384, 5120, 9, 2, 269U);   // GDN input parent at K=9
+    run_sampled_case(248320, 5120, 12, 1, 271U); // head self-check at an even rate, same seed family
 }
 
 } // namespace

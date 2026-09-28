@@ -229,9 +229,9 @@ void test_linear_swiglu(std::int32_t n, std::int32_t k, int half_bits, std::int3
     check(cudaFree(d_x), "cudaFree(x)");
 }
 
-void test_attn_input_proj(std::int32_t t, std::uint32_t seed) {
+void test_attn_input_proj(std::int32_t t, int half_bits, std::uint32_t seed) {
     constexpr std::int32_t k = 5120, q_rows = 6144, kv_rows = 1024, n = 14336;
-    Exl3Parent parent(n, k, 10, seed);
+    Exl3Parent parent(n, k, half_bits, seed);
     const auto x = host_bf16(static_cast<std::size_t>(k) * t, seed + 1U);
     const auto reference = linear_reference(parent, x.data(), k, n, t);
 
@@ -295,9 +295,9 @@ void test_attn_input_proj(std::int32_t t, std::uint32_t seed) {
     check(cudaFree(d_x), "cudaFree(x)");
 }
 
-void test_gdn_input_proj(std::int32_t t, std::uint32_t seed) {
+void test_gdn_input_proj(std::int32_t t, int half_bits, std::uint32_t seed) {
     constexpr std::int32_t k = 5120, qkv_rows = 10240, z_rows = 6144, n = 16384;
-    Exl3Parent parent(n, k, 8, seed);
+    Exl3Parent parent(n, k, half_bits, seed);
     const auto x = host_bf16(static_cast<std::size_t>(k) * t, seed + 1U);
     const auto reference = linear_reference(parent, x.data(), k, n, t);
 
@@ -361,8 +361,14 @@ int main() {
     try {
         test_linear_add(5120, 17408, 8, 2, 301U);
         test_linear_swiglu(34816, 5120, 8, 2, 303U);
-        test_attn_input_proj(2, 305U);
-        test_gdn_input_proj(2, 307U);
+        test_attn_input_proj(2, 10, 305U);
+        test_gdn_input_proj(2, 8, 307U);
+        // The 3.5 bpw artifact is attention K=9 with GDN K=7 -- the odd half rates the consumers take
+        // in production, and the combination that had never been run.
+        test_linear_add(5120, 17408, 7, 2, 311U);
+        test_linear_swiglu(34816, 5120, 7, 2, 313U);
+        test_attn_input_proj(2, 9, 317U);
+        test_gdn_input_proj(2, 7, 319U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " EXL3 fused consumers\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
