@@ -194,7 +194,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M0 | Complete (calibration trace sampling) | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
-| M3 | Complete (functional) | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared `suh`) that loads and serves; bounded PPL and generation recorded; the full-corpus KLD and fast decode are M4 |
+| M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
 | M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode) plus fused-window SIMT decode with K-split is in; all consumers covered; a dedicated decode GEMV and the end-to-end speed report remain |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Vision tower; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission |
@@ -442,6 +442,11 @@ bit.
   shift remain, and the decode kernel uses four accumulators to break the FMA chain. The decode kernel keeps
   four k-slices (eight exceeded the 1024-thread register budget). Measured on the same prefix: scoring
   318 -> 406 tok/s, decode 13.2 -> 15.5 tok/s, PPL unchanged at 2.0291. A dedicated decode GEMV remains.
+- 2026-09-27: Full-corpus quality. `ninfer-perplexity --corpus perplexity-1m/manifest.json --quick
+  --context 4096 --stride 2048 --kv-dtype fp8` over the same 261,167 tokens as the M0 baselines gives EXL3
+  4.0 bpw overall PPL **4.2939** (chinese 4.974, english_long_form 6.846, english_reference 6.007, code 1.649)
+  against Q4 4.3439 and NVFP4 4.3149, at 380.7 tok/s. The 4.0 bpw artifact is therefore the best PPL of the
+  three native routes on this corpus, and the run qualifies the tensor-core path at `T = 4096`.
 
 ## M3 status and decisions
 
