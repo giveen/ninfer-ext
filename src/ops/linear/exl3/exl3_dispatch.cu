@@ -127,6 +127,26 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
 // the four h=1 windows into n = L/4+8; a four-lane shuffle folds the k-split and one lane per n
 // atomically adds into a small FP32 buffer. A second kernel applies the 128-point output Hadamard.
 constexpr int kExl3GemvSplits = 32;
+
+// Seeded per-element Gaussian noise for the sensitivity probe. A 32-bit hash of (n, k, seed) drives
+// Box-Muller, so a trellis decode is exact but the perturbation is repeatable and independent of the
+// launch geometry.
+__device__ __forceinline__ float probe_gaussian(std::uint32_t n, std::uint32_t k,
+                                                std::uint32_t seed) {
+    const auto hash = [](std::uint32_t x) {
+        x ^= x >> 16;
+        x *= 0x7feb352dU;
+        x ^= x >> 15;
+        x *= 0x846ca68bU;
+        x ^= x >> 16;
+        return x;
+    };
+    const std::uint32_t h0 = hash(n * 0x9e3779b9U ^ k ^ seed);
+    const std::uint32_t h1 = hash(h0 ^ 0x85ebca6bU);
+    const float u0         = (static_cast<float>(h0 >> 8) + 0.5F) * (1.0F / 16777216.0F);
+    const float u1         = (static_cast<float>(h1 >> 8) + 0.5F) * (1.0F / 16777216.0F);
+    return sqrtf(-2.0F * logf(u0)) * cosf(6.283185307179586F * u1);
+}
 constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the tiled MMA at
 
 // T_MAX columns share one decode of the trellis tile: the weight is the expensive operand, and the
@@ -137,7 +157,8 @@ template <int T_MAX>
 __global__ void exl3_gemv_split(const float* __restrict__ u,
                                 const std::uint8_t* __restrict__ trellis,
                                 float* __restrict__ partial, int k_extent, int n_extent,
-                                int half_bits, int columns) {
+                                int half_bits, int columns, float probe_sigma,
+                                std::uint32_t probe_seed) {
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
     const int n_tile  = blockIdx.x * 8 + warp;
@@ -207,6 +228,15 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 d[r] = mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
+            }
+        }
+        if (probe_sigma > 0.0F) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int nn = n_base + (lane >> 2) + 8 * (r >> 2);
+                const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * ((r >> 1) & 1);
+                d[r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
+                                                     static_cast<std::uint32_t>(kk), probe_seed);
             }
         }
 #pragma unroll
@@ -377,7 +407,8 @@ constexpr int kExl3MmaSmallT  = 16; // columns per block at small T, so the grid
 template <int TILE_T>
 __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
-                         int k_extent, int n_extent, int columns, int half_bits) {
+                         int k_extent, int n_extent, int columns, int half_bits,
+                         float probe_sigma, std::uint32_t probe_seed) {
     constexpr int MT = TILE_T / 16;
     const int n_base  = blockIdx.x * kExl3MmaN;
     const int t0      = blockIdx.y * TILE_T;
@@ -421,17 +452,33 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
 
         const std::uint8_t* tile8 = warp_tile + static_cast<std::size_t>(kt) * tile_stride;
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+        float d[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                d[h][r] = fast ? exl3_window_value(tile32, plan[4 * h + r], words)
+                               : mul1_value(tile_state(tile8, half_bits, 8 * lane + 4 * h + r));
+            }
+        }
+        if (probe_sigma > 0.0F) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const int nn = n_base + h * 8 + (lane >> 2);
+                    const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
+                    d[h][r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
+                                                            static_cast<std::uint32_t>(kk),
+                                                            probe_seed);
+                }
+            }
+        }
         std::uint32_t b[2][2];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            float d[4];
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                d[r] = fast ? exl3_window_value(tile32, plan[4 * h + r], words)
-                            : mul1_value(tile_state(tile8, half_bits, 8 * lane + 4 * h + r));
-            }
-            b[h][0] = pack_bf16x2(d[0], d[1]);
-            b[h][1] = pack_bf16x2(d[2], d[3]);
+            b[h][0] = pack_bf16x2(d[h][0], d[h][1]);
+            b[h][1] = pack_bf16x2(d[h][2], d[h][3]);
         }
 
         std::uint32_t a[MT][4];
@@ -513,6 +560,13 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
 
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     auto* output      = static_cast<__nv_bfloat16*>(out.data);
+    // The sensitivity probe perturbs one weight's decoded values; it is off unless the registry names
+    // this weight's trellis plane. `probe_sigma` is the per-element standard deviation, so
+    // ||noise||_F = rfn * ||W||_F.
+    const Exl3WeightProbe& probe = exl3_weight_probe();
+    const float probe_sigma =
+        (probe.target == w.qdata && probe.rfn > 0.0F) ? probe.rfn * probe.rms : 0.0F;
+    const std::uint32_t probe_seed = probe.seed;
     exl3_input_transform<<<dim3(static_cast<unsigned>(w.k / 128), columns), 128, 0, stream>>>(
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
     if (columns > kExl3GemvMaxM) {
@@ -523,14 +577,16 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
                                                                   kExl3MmaSmallT)),
                                        kExl3MmaThreads, 0, stream>>>(
                 u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
-                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits), probe_sigma,
+                probe_seed);
         } else {
             exl3_mma<kExl3MmaT><<<dim3(static_cast<unsigned>(w.n / 128),
                                        static_cast<unsigned>((columns + kExl3MmaT - 1) /
                                                              kExl3MmaT)),
                                   kExl3MmaThreads, 0, stream>>>(
                 u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
-                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits), probe_sigma,
+                probe_seed);
         }
     } else {
         // One decode of every trellis tile serves all columns: the verify pass runs each weight
@@ -545,7 +601,8 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
         const dim3 grid(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits));
         if (columns == 1) {
-            exl3_gemv_split<1><<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits, 1);
+            exl3_gemv_split<1><<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits, 1,
+                                                         probe_sigma, probe_seed);
         } else {
             exl3_gemv_mma<<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits,
                                                     columns);
@@ -557,6 +614,11 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         }
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+Exl3WeightProbe& exl3_weight_probe() {
+    static Exl3WeightProbe probe;
+    return probe;
 }
 
 } // namespace ninfer::ops::detail

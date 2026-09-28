@@ -13,6 +13,20 @@ namespace ninfer::ops::detail {
 void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& workspace, cudaStream_t stream);
 
+// Measurement hook: one EXL3 weight can be perturbed by seeded Gaussian noise while a sensitivity
+// run is in flight, without touching the artifact. `target` is that weight's trellis plane; `rfn`
+// is the relative Frobenius norm of the added noise and `rms` the weight's per-element rms (the
+// noise anchor), both zero when disabled. The dispatch copies the active probe into its kernels as
+// scalars, so the host registry never races a launch that is already queued.
+struct Exl3WeightProbe {
+    const void* target = nullptr;
+    float rfn          = 0.0F;
+    float rms          = 0.0F;
+    std::uint32_t seed = 0;
+};
+
+[[nodiscard]] Exl3WeightProbe& exl3_weight_probe();
+
 // Copy `rows` complete rows of a column-major BF16 [*, columns] tensor to another from `source_row`.
 // Rows of a column-major tensor are strided, so this is a pitched 2D copy. The fused consumers split
 // one decoded parent into its member outputs this way.
