@@ -118,6 +118,7 @@ def select_rows(
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.input_scales,
         )
 
     return LogicalSource(
@@ -127,6 +128,7 @@ def select_rows(
         encoded if source.read_encoded is not None else None,
         source.weight_divisor,
         source.input_divisor,
+        source.bitrate_half_bits,
     )
 
 

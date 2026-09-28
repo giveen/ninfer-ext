@@ -77,13 +77,20 @@ def test_exl3_recipe_reads_the_native_quantizer_store(tmp_path) -> None:
     from tools.convert.sources.safetensors import SafetensorsSource
 
     n = k = 128
+    # The MLP gate/up pair is one shared-input parent, so the store holds one [256, 128] matrix
+    # keyed by the first member (gate) and the recipe binds both members to its row ranges.
+    parent_rows = 256
     half_bits = 3
     generator = torch.Generator().manual_seed(5)
     trellis = torch.randint(
-        0, 256, (n // 16, k // 16, 16 * half_bits), dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (parent_rows // 16, k // 16, 16 * half_bits),
+        dtype=torch.uint8,
+        generator=generator,
     )
     su = (torch.rand(k, generator=generator) + 0.5).float()
-    sv = (torch.rand(n, generator=generator) + 0.5).float()
+    sv = (torch.rand(parent_rows, generator=generator) + 0.5).float()
     save_file(
         {
             "text/layers/0/mlp/gate.trellis": trellis,
@@ -94,7 +101,7 @@ def test_exl3_recipe_reads_the_native_quantizer_store(tmp_path) -> None:
     )
 
     model = Model({"text": {"config": {}}})
-    for name in ("text/layers/0/mlp/gate", "text/layers/0/mlp/down"):
+    for name in ("text/layers/0/mlp/gate", "text/layers/0/mlp/up", "text/layers/0/mlp/down"):
         model.add(
             Parameter(
                 name,
@@ -103,6 +110,7 @@ def test_exl3_recipe_reads_the_native_quantizer_store(tmp_path) -> None:
                 inputs=("input",),
             )
         )
+    model.packing_groups.append(("text/layers/0/mlp/gate", "text/layers/0/mlp/up"))
     recipe = Recipe(model)
     with SafetensorsSource(tmp_path / "exl3.safetensors") as store:
         qwen3_8_27b_exl3(model, recipe, {"quantized": store})
@@ -111,8 +119,15 @@ def test_exl3_recipe_reads_the_native_quantizer_store(tmp_path) -> None:
             for name, selections in recipe.selections.items()
         }
         assert formats["text/layers/0/mlp/gate"] == {"exl3_mul1"}
+        assert formats["text/layers/0/mlp/up"] == {"exl3_mul1"}
         assert formats["text/layers/0/mlp/down"] == {"bf16"}
-        assert "text/layers/0/mlp/gate" in recipe.separate_parameters
+        # The stored members are bound as row ranges of one shared parent, not separately stored.
+        assert "text/layers/0/mlp/gate" not in recipe.separate_parameters
+        assert "text/layers/0/mlp/up" not in recipe.separate_parameters
+        gate_label = recipe.selections["text/layers/0/mlp/gate"][0].source.label
+        up_label = recipe.selections["text/layers/0/mlp/up"][0].source.label
+        assert "rows(" in gate_label and "rows(" in up_label
+        assert gate_label == up_label
 
 
 def test_registered_recipe_gives_the_mlp_pair_q4() -> None:

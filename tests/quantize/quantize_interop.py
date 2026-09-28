@@ -38,7 +38,7 @@ def main() -> int:
         if result.returncode:
             print(result.stderr, file=sys.stderr)
             return result.returncode
-        if "eligible projections: 1" not in result.stdout:
+        if "eligible parents: 1" not in result.stdout:
             print(result.stdout, file=sys.stderr)
             return 1
         if "text/layers/0/mlp/gate" not in result.stdout:

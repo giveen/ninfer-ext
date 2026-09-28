@@ -100,19 +100,21 @@ int main(int argc, char** argv) {
 
     try {
         const ninfer::artifact::Reader reader(options.artifact);
-        const std::vector<app::LinearParameter> parameters =
-            app::enumerate_linear_parameters(reader);
-        if (parameters.empty()) {
+        const std::vector<app::LinearParent> parents = app::enumerate_linear_parents(reader);
+        if (parents.empty()) {
             std::fprintf(stderr, "ninfer-quantize: no eligible BF16 projections\n");
             return 1;
         }
         if (options.list_only) {
-            std::printf("eligible projections: %zu\n", parameters.size());
-            for (const auto& parameter : parameters) {
-                std::printf("  %s [%llu, %llu] rate %d half bits\n", parameter.name.c_str(),
-                            static_cast<unsigned long long>(parameter.n),
-                            static_cast<unsigned long long>(parameter.k),
-                            app::bitrate_for_parameter(options, parameter.name));
+            std::size_t members = 0;
+            for (const auto& parent : parents) { members += parent.members.size(); }
+            std::printf("eligible parents: %zu (%zu projections)\n", parents.size(), members);
+            for (const auto& parent : parents) {
+                std::printf("  %s [%llu, %llu] rate %d half bits (%zu members)\n",
+                            parent.key.c_str(), static_cast<unsigned long long>(parent.n),
+                            static_cast<unsigned long long>(parent.k),
+                            app::bitrate_for_parameter(options, parent.key),
+                            parent.members.size());
             }
             return 0;
         }
@@ -144,12 +146,13 @@ int main(int argc, char** argv) {
         std::vector<app::SafetensorsTensor> tensors;
         std::size_t done    = 0;
         std::size_t skipped = 0;
-        for (const auto& parameter : parameters) {
+        for (const auto& parent : parents) {
             if (options.limit > 0 && done >= static_cast<std::size_t>(options.limit)) { break; }
-            const int half_bits = app::bitrate_for_parameter(options, parameter.name);
-            const std::uint64_t n = parameter.n;
-            const std::uint64_t k = parameter.k;
-            const std::string stem = app::sanitize_parameter_name(parameter.name);
+            const int half_bits = app::bitrate_for_parameter(options, parent.key);
+            const std::uint64_t n = parent.n;
+            const std::uint64_t k = parent.k;
+            const app::LinearParameter parameter{parent.key, n, k, parent.binding};
+            const std::string stem = app::sanitize_parameter_name(parent.key);
 
             const std::vector<float> nk = app::read_parameter_matrix(reader, parameter);
             const std::filesystem::path hessian_path =
@@ -166,13 +169,12 @@ int main(int argc, char** argv) {
             const std::uint64_t tile_states = (n / 16) * (k / 16) * 256;
             DeviceBuffer<float> d_w;
             DeviceBuffer<float> d_h;
-            DeviceBuffer<std::uint16_t> d_states;
             DeviceBuffer<float> d_su;
             DeviceBuffer<float> d_sv;
             DeviceBuffer<float> d_wq;
+            std::vector<std::uint16_t> states(tile_states);
             d_w.resize(kn.size());
             d_h.resize(hessian.size());
-            d_states.resize(tile_states);
             d_su.resize(k);
             d_sv.resize(n);
             d_wq.resize(kn.size());
@@ -191,17 +193,13 @@ int main(int argc, char** argv) {
             const auto start = std::chrono::steady_clock::now();
             const q::TensorReport tensor_report =
                 q::quantize_tensor(d_w.get(), d_h.get(), static_cast<std::int64_t>(k),
-                                   static_cast<std::int64_t>(n), tensor_options, d_states.get(),
+                                   static_cast<std::int64_t>(n), tensor_options, states.data(),
                                    d_su.get(), d_sv.get(), d_wq.get(), nullptr);
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-            std::vector<std::uint16_t> states(d_states.count());
             std::vector<float> su(k);
             std::vector<float> sv(n);
-            check(cudaMemcpy(states.data(), d_states.get(), states.size() * sizeof(std::uint16_t),
-                             cudaMemcpyDeviceToHost),
-                  "cudaMemcpy(states)");
             check(cudaMemcpy(su.data(), d_su.get(), su.size() * sizeof(float),
                              cudaMemcpyDeviceToHost),
                   "cudaMemcpy(su)");
@@ -216,17 +214,18 @@ int main(int argc, char** argv) {
                     app::pack_trellis_states(states.data() + tile * 256, half_bits);
                 trellis.insert(trellis.end(), packed.begin(), packed.end());
             }
-            tensors.push_back(app::SafetensorsTensor{parameter.name + ".trellis", "U8",
+            tensors.push_back(app::SafetensorsTensor{parent.key + ".trellis", "U8",
                                                      {n / 16, k / 16,
                                                       static_cast<std::uint64_t>(16 * half_bits)},
                                                      std::move(trellis)});
-            tensors.push_back(app::SafetensorsTensor{parameter.name + ".su", "F32", {k},
+            tensors.push_back(app::SafetensorsTensor{parent.key + ".su", "F32", {k},
                                                      to_bytes(su)});
-            tensors.push_back(app::SafetensorsTensor{parameter.name + ".sv", "F32", {n},
+            tensors.push_back(app::SafetensorsTensor{parent.key + ".sv", "F32", {n},
                                                      to_bytes(sv)});
 
             report["tensors"].push_back({
-                {"name", parameter.name},
+                {"name", parent.key},
+                {"members", parent.members},
                 {"half_bits", half_bits},
                 {"proxy_error", tensor_report.proxy_error},
                 {"proxy_error_before_refit", tensor_report.proxy_error_before_refit},
@@ -237,9 +236,8 @@ int main(int argc, char** argv) {
                 {"seconds", seconds},
             });
             ++done;
-            std::fprintf(stderr, "[%zu/%zu] %s rate %d: proxy %g (%.1f s)\n", done,
-                         parameters.size(), parameter.name.c_str(), half_bits,
-                         tensor_report.proxy_error, seconds);
+            std::fprintf(stderr, "[%zu/%zu] %s rate %d: proxy %g (%.1f s)\n", done, parents.size(),
+                         parent.key.c_str(), half_bits, tensor_report.proxy_error, seconds);
         }
 
         app::write_safetensors(options.output / "exl3.safetensors", tensors);

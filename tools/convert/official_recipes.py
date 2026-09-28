@@ -11,6 +11,7 @@ from .methods import (
 )
 from .sources.compressed_tensors import compressed_matrix_source
 from .sources.exl3 import exl3_matrix_source
+from .sources.logical import select_rows
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -126,24 +127,58 @@ def qwen3_8_27b_bf16(model, recipe, sources):
 def qwen3_8_27b_exl3(model, recipe, sources):
     """Qwen3.8-27B with EXL3 Text/MTP projections produced by `ninfer-quantize`.
 
-    `--source quantized=PATH` is the quantizer's `exl3.safetensors`. Every projection present in
-    that store becomes `exl3_mul1`; everything else (embedding, norms, GDN a/b, Vision) keeps its
-    default precision. The app quantizes each projection on its own, so parents stay separate:
-    a fused EXL3 parent needs one shared input-scale vector, which is later work.
+    `--source quantized=PATH` is the quantizer's `exl3.safetensors`. Each shared-input parent the
+    model executes as one weight (attention q/key/gate/value, GDN q/key/value/z, MLP gate/up) is
+    stored as one EXL3 matrix sharing its `suh`; the recipe binds its members to their row ranges so
+    the automatic grouping reproduces the parent. Everything absent from the store (embedding,
+    norms, GDN a/b, Vision, uncalibrated MTP) keeps its default precision.
     """
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     store = sources["quantized"]
-    for name, parameter in model.parameters.items():
-        if not parameter.projection or not store.has(name + ".trellis"):
+    parameters = model.parameters
+    # The GDN control projections stay BF16 as separate parents, exactly as the groupwise recipe
+    # keeps them; their dedicated gating Op consumes one 48-row weight per side.
+    for name in parameters:
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+
+    def assign(name, source):
+        recipe.assign(name, format="exl3_mul1", method=import_encoded, source=source)
+
+    assigned: set[str] = set()
+    # Longest packing group first, so a fully stored group wins over its stored sub-groups.
+    for names in sorted(model.packing_groups, key=len, reverse=True):
+        if not names or any(name in assigned for name in names):
             continue
-        recipe.assign(
-            name,
-            format="exl3_mul1",
-            method=import_encoded,
-            source=exl3_matrix_source(store, name, parameter.shape),
-        )
-        recipe.separate(name)
+        if any(name not in parameters for name in names):
+            continue
+        first = names[0]
+        if not store.has(first + ".trellis"):
+            continue
+        shapes = [parameters[name].shape for name in names]
+        if any(len(shape) != 2 for shape in shapes) or len({shape[1] for shape in shapes}) != 1:
+            continue
+        parent_shape = (sum(shape[0] for shape in shapes), shapes[0][1])
+        info = store.describe(first + ".trellis")
+        if tuple(info.shape[:2]) != (parent_shape[0] // 16, parent_shape[1] // 16):
+            continue
+        parent = exl3_matrix_source(store, first, parent_shape)
+        begin = 0
+        for name, shape in zip(names, shapes):
+            assign(name, select_rows(parent, ((begin, begin + shape[0]),)))
+            assigned.add(name)
+            begin += shape[0]
+
+    for name, parameter in parameters.items():
+        # The vocabulary head is a terminal parameter rather than a projection; it is stored and
+        # executed as a weight like any other, so it is assigned here too.
+        if name in assigned or not store.has(name + ".trellis"):
+            continue
+        if not parameter.projection and not name.endswith("output_head"):
+            continue
+        assign(name, exl3_matrix_source(store, name, parameter.shape))
+        assigned.add(name)
 
 
 def qwen3_8_27b_q6(model, recipe, sources):

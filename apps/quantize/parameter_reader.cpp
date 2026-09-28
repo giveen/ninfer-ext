@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::quantize::app {
 namespace {
@@ -48,6 +50,55 @@ std::vector<LinearParameter> enumerate_linear_parameters(const artifact::Reader&
         if (n % 128 != 0 || k % 128 != 0) { continue; }
         out.push_back(LinearParameter{name, n, k, binding});
     }
+    return out;
+}
+
+std::vector<LinearParent> enumerate_linear_parents(const artifact::Reader& reader) {
+    // Only eligible bindings define a parent. A non-eligible binding that aliases the same object
+    // (for example an embedding sharing storage with a projection) does not contribute rows, but
+    // the eligible rows must still cover the whole object: a partially eligible parent is left at
+    // its stored precision rather than quantized with unrepresented rows.
+    std::set<std::string, std::less<>> eligible;
+    for (const auto& parameter : enumerate_linear_parameters(reader)) {
+        eligible.insert(parameter.name);
+    }
+    std::map<std::size_t, std::vector<std::pair<std::uint64_t, std::string>>> members;
+    for (const auto& name : eligible) {
+        const auto& binding = reader.directory().bindings.at(name);
+        if (binding.parts.size() != 1) { continue; }
+        members[binding.parts.front().object.index].push_back({binding.parts.front().begin, name});
+    }
+
+    std::vector<LinearParent> out;
+    for (auto& [object, list] : members) {
+        if (list.empty()) { continue; }
+        std::sort(list.begin(), list.end());
+        const artifact::ObjectHandle handle{object};
+        const auto& geometry = reader.geometry(handle);
+        if (geometry.shape.size() != 2) { continue; }
+        LinearParent parent;
+        parent.n = geometry.shape[0];
+        parent.k = geometry.shape[1];
+        std::uint64_t cursor = 0;
+        bool contiguous = true;
+        for (const auto& [begin, name] : list) {
+            const auto& binding = reader.directory().bindings.at(name);
+            if (binding.parts.size() != 1 || binding.parts.front().begin != cursor) {
+                contiguous = false;
+                break;
+            }
+            parent.members.push_back(name);
+            parent.ranges.push_back({binding.parts.front().begin, binding.parts.front().end});
+            cursor = binding.parts.front().end;
+        }
+        if (!contiguous || cursor != parent.n * parent.k) { continue; }
+        parent.key = parent.members.front();
+        artifact::Part whole{handle, 0, parent.n * parent.k};
+        parent.binding = artifact::Binding{true, {whole}, parent.n * parent.k};
+        out.push_back(std::move(parent));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const LinearParent& a, const LinearParent& b) { return a.key < b.key; });
     return out;
 }
 

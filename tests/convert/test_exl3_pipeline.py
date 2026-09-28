@@ -108,3 +108,89 @@ def test_quantizer_store_flows_into_an_exl3_artifact(tmp_path) -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_grouped_parent_store_reassembles_one_shared_matrix(tmp_path) -> None:
+    """The model executes gate/up as one parent, so the store holds one [256, 128] matrix keyed by
+    gate and the recipe binds each member to its row range. The artifact must hold that parent
+    exactly, not a row-reordered or per-member copy."""
+    parent_rows = 256
+    k = 128
+    half_bits = 3
+    generator = torch.Generator().manual_seed(11)
+    trellis = torch.randint(
+        0,
+        256,
+        (parent_rows // 16, k // 16, 16 * half_bits),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    su = (torch.rand(k, generator=generator) + 0.5).float()
+    sv = (torch.rand(parent_rows, generator=generator) + 0.5).float()
+    directory = tmp_path / "grouped"
+    directory.mkdir()
+    save_file(
+        {
+            "text/layers/0/mlp/gate.trellis": trellis,
+            "text/layers/0/mlp/gate.su": su,
+            "text/layers/0/mlp/gate.sv": sv,
+        },
+        str(directory / "exl3.safetensors"),
+    )
+
+    model = Model({"text": {"config": {}}})
+    for name in ("text/layers/0/mlp/gate", "text/layers/0/mlp/up"):
+        model.add(
+            Parameter(
+                name,
+                (k, k),
+                array_source(torch.ones((k, k), dtype=torch.bfloat16), name),
+                inputs=("input",),
+            )
+        )
+    model.packing_groups.append(("text/layers/0/mlp/gate", "text/layers/0/mlp/up"))
+
+    recipe = Recipe(model)
+    with SafetensorsSource(directory / "exl3.safetensors") as store:
+        qwen3_8_27b_exl3(model, recipe, {"quantized": store})
+    output = tmp_path / "grouped.ninfer"
+    convert(model, recipe, output, device="cpu")
+
+    with Artifact(output) as artifact:
+        exl3_objects = [
+            obj for obj in artifact.objects if getattr(obj, "format", None) == "exl3_mul1"
+        ]
+        assert len(exl3_objects) == 1
+        obj = exl3_objects[0]
+        assert obj.shape == (parent_rows, k) and obj.bitrate_half_bits == half_bits
+        payload = artifact.read_object(obj.id)
+
+    geometry = exl3_geometry("exl3_mul1", (parent_rows, k), half_bits)
+    stored_trellis = torch.frombuffer(
+        bytearray(payload[0 : geometry.trellis_bytes]), dtype=torch.uint8
+    ).reshape(parent_rows // 16, k // 16, 16 * half_bits)
+    stored_su = torch.frombuffer(
+        bytearray(
+            payload[
+                geometry.input_scale_offset : geometry.input_scale_offset
+                + geometry.input_scale_bytes
+            ]
+        ),
+        dtype=torch.float32,
+    )
+    stored_sv = torch.frombuffer(
+        bytearray(
+            payload[
+                geometry.output_scale_offset : geometry.output_scale_offset
+                + geometry.output_scale_bytes
+            ]
+        ),
+        dtype=torch.float32,
+    )
+    assert torch.equal(stored_trellis, trellis)
+    assert torch.equal(stored_su, su)
+    assert torch.equal(stored_sv, sv)
+    assert torch.equal(
+        exl3.decode(stored_trellis, stored_su, stored_sv, half_bits),
+        exl3.decode(trellis, su, sv, half_bits),
+    )
