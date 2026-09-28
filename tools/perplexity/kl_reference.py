@@ -52,10 +52,13 @@ def write_reference(path, *, context, stride, text, positions, logits, vocab_siz
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest().encode("ascii")
     if len(digest) != 64:
         raise ValueError("malformed digest")
+    # 8-byte magic + six u32 = the 32-byte field block, then the 64-byte digest: the 96-byte header
+    # the C++ reader consumes.
     header = MAGIC + struct.pack("<IIIIII", VERSION, vocab_size, positions.size, context, stride, 0)
+    assert len(header) == HEADER_BYTES - 64
     with open(path, "wb") as handle:
-        handle.write(header.ljust(HEADER_BYTES, b"\0"))
-        handle.write(digest.ljust(64, b"\0"))
+        handle.write(header)
+        handle.write(digest)
         handle.write(positions.tobytes())
         handle.write(to_bf16_bits(logits).tobytes())
     return digest.decode("ascii")
@@ -88,16 +91,19 @@ def produce(args):
             if args.windows and index >= args.windows:
                 break
             ids = torch.tensor([tokens[begin:end]], device=model.device)
-            # Local predictors [first_target, end - begin) predict the tokens after them. Only the
-            # sampled ones are kept, and the head computes logits for exactly those, so the full-vocab
-            # output never materializes for the whole window.
-            scored = list(range(first_target, end - begin))
-            kept = [local for offset, local in enumerate(scored)
-                    if not (args.sample_stride > 1 and offset % args.sample_stride)]
-            keep = torch.tensor(kept, dtype=torch.long, device=model.device)
+            # Target index t is the token being predicted, and its distribution comes from the input
+            # position t - begin - 1 (the hidden state before token t). Only sampled targets are kept,
+            # and the head computes logits for exactly those.
+            kept = []  # (global target index, input position)
+            for offset, target in enumerate(range(target_begin, target_end)):
+                if args.sample_stride > 1 and offset % args.sample_stride:
+                    continue
+                kept.append((target, target - begin - 1))
+            keep = torch.tensor([position for _, position in kept], dtype=torch.long,
+                                device=model.device)
             logits = model(ids, logits_to_keep=keep, use_cache=False).logits[0]
-            for row, local in zip(logits, kept):
-                positions.append(target_begin + (local - first_target))
+            for row, (target, _) in zip(logits, kept):
+                positions.append(target)
                 rows.append(row.float().cpu().numpy())
             kept_total += len(kept)
             print(f" -- window {index + 1}/{len(windows)}: {kept_total} rows", file=sys.stderr)
