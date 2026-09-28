@@ -61,12 +61,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         if (gate_up_rows != 34816 || input_rows != 5120) {
             throw std::invalid_argument("linear_swiglu workspace: unsupported EXL3 profile");
         }
-        // The decoded gate/up parent [34816,T] plus the rotated activation [5120,T] and, at T = 1,
-        // the split-K GEMV's [34816] partial accumulator.
-        const std::size_t decoded =
-            static_cast<std::size_t>(max_tokens) * (34816ULL * 2 + 5120ULL * 4);
-        const std::size_t partial = 34816ULL * 2 + (34816ULL + 5120ULL) * 4;
-        return std::max(decoded, partial);
+        // The decoded gate/up parent [34816,T] plus the rotated activation [5120,T] and, for T <= 8,
+        // the per-column GEMV's [34816] partial accumulator.
+        return static_cast<std::size_t>(max_tokens) * (34816ULL * 2 + 5120ULL * 4) +
+               34816ULL * 4;
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }

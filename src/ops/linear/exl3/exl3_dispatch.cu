@@ -127,6 +127,7 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
 // the four h=1 windows into n = L/4+8; a four-lane shuffle folds the k-split and one lane per n
 // atomically adds into a small FP32 buffer. A second kernel applies the 128-point output Hadamard.
 constexpr int kExl3GemvSplits = 32;
+constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the tiled MMA at
 
 __global__ void exl3_gemv_split(const float* __restrict__ u,
                                 const std::uint8_t* __restrict__ trellis,
@@ -256,7 +257,6 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4
 constexpr int kExl3MmaN       = 128;
 constexpr int kExl3MmaT       = 64;
 constexpr int kExl3MmaThreads = 256;
-constexpr int kExl3MmaMinT    = 2;
 
 __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
@@ -387,7 +387,7 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     const std::size_t u_bytes =
         static_cast<std::size_t>(w.k) * static_cast<std::size_t>(columns) * sizeof(float);
     const std::size_t partial_bytes =
-        columns == 1 ? static_cast<std::size_t>(w.n) * sizeof(float) : 0;
+        columns <= kExl3GemvMaxM ? static_cast<std::size_t>(w.n) * sizeof(float) : 0;
     auto scope               = workspace.scope();
     const DeviceSpan scratch = workspace.alloc_bytes(u_bytes + partial_bytes, 16);
     float* u                 = static_cast<float*>(scratch.data);
@@ -397,24 +397,29 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     auto* output      = static_cast<__nv_bfloat16*>(out.data);
     exl3_input_transform<<<dim3(static_cast<unsigned>(w.k / 128), columns), 128, 0, stream>>>(
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
-    if (columns >= kExl3MmaMinT) {
+    if (columns > kExl3GemvMaxM) {
         exl3_mma<<<dim3(static_cast<unsigned>(w.n / 128),
                         static_cast<unsigned>((columns + kExl3MmaT - 1) / kExl3MmaT)),
                   kExl3MmaThreads, 0, stream>>>(
             u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
             output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
     } else {
+        // Up to kExl3GemvMaxM columns run the GEMV once per column, as exllamav3 does for m <= 8: the
+        // tiled MMA has too few blocks at small m, so re-decoding per column is faster than the pad.
         // Splitting K only pays while the grid is short of blocks; a vocabulary-sized head already has
         // thousands of row blocks, so it takes one slice and avoids a scheduling- and atomic-bound grid.
         const int n_blocks = static_cast<int>(w.n / 128);
         const int splits   = std::min<int>(kExl3GemvSplits, std::max<int>(1, 8192 / n_blocks));
-        CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
-        exl3_gemv_split<<<dim3(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits)), 256, 0,
-                          stream>>>(
-            u, static_cast<const std::uint8_t*>(w.qdata), partial, w.k, w.n,
-            static_cast<int>(w.bitrate_half_bits));
-        exl3_gemv_finish<<<dim3(static_cast<unsigned>(w.n / 128)), 128, 0, stream>>>(
-            partial, static_cast<const float*>(w.scales), output, w.n);
+        for (int t = 0; t < columns; ++t) {
+            CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
+            exl3_gemv_split<<<dim3(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits)),
+                              256, 0, stream>>>(
+                u + static_cast<std::size_t>(t) * w.k, static_cast<const std::uint8_t*>(w.qdata),
+                partial, w.k, w.n, static_cast<int>(w.bitrate_half_bits));
+            exl3_gemv_finish<<<dim3(static_cast<unsigned>(w.n / 128)), 128, 0, stream>>>(
+                partial, static_cast<const float*>(w.scales),
+                output + static_cast<std::size_t>(t) * w.n, w.n);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

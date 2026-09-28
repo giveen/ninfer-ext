@@ -323,6 +323,7 @@ int main() {
     try {
         for (const int rate : {3, 4, 8, 10, 12}) {
             run_case(128, 128, rate, 1, 101U);
+            run_case(128, 128, rate, 4, 102U);
             run_case(128, 128, rate, 7, 103U);
             run_case(256, 128, rate, 64, 107U);
             run_case(384, 256, rate, 3, 109U);
