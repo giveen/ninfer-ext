@@ -13,6 +13,7 @@ ninfer_add_test(ninfer_pretty_logging_test
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
           ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/reference.cpp
   LIBRARIES ninfer_core)
 
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
