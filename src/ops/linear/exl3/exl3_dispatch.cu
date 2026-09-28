@@ -23,6 +23,16 @@ namespace {
 
 constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 
+// The contraction kernels decode a trellis window per weight, so they are latency-bound rather than
+// DRAM-bound: NCU shows them register-limited at 2 blocks/SM (about 16% occupancy, SMs active 8% of
+// elapsed cycles). launch_bounds makes nvcc spend registers on occupancy instead, which is the whole
+// lever for decode and prefill alike. The two families peak differently -- the GEMV wants 5 blocks/SM
+// and the MMA 4, where a tighter cap starts spilling its accumulators -- so they carry separate
+// targets (measured on 4.0 bpw: 38.1 -> 62.4 tok/s decode, 314.6 -> 342.0 prefill).
+constexpr int kExl3Threads        = 256;
+constexpr int kExl3GemvMinBlocks = 5;
+constexpr int kExl3MmaMinBlocks  = 4;
+
 __device__ __forceinline__ float mul1_value(std::uint16_t state) {
     // The byte sum of the multiplied state is the mul1 codebook; one dp4a replaces six shift/mask/add
     // ops, which matters because every weight of the model passes through here.
@@ -187,11 +197,10 @@ constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the ti
 // accumulators (its two n8 groups by four k positions), which the tensor-core GEMV of the reference
 // gets from the C fragment; here it is 8 floats per column.
 template <int T_MAX>
-__global__ void exl3_gemv_split(const float* __restrict__ u,
-                                const std::uint8_t* __restrict__ trellis,
-                                float* __restrict__ partial, int k_extent, int n_extent,
-                                int half_bits, int columns, float probe_sigma,
-                                std::uint32_t probe_seed) {
+__global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_split(
+    const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+    float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns,
+    float probe_sigma, std::uint32_t probe_seed) {
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
     const int n_tile  = blockIdx.x * 8 + warp;
@@ -342,10 +351,9 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4
 // the m16n8k16 A fragment carries the tokens and one C fragment carries all of them. The reference's
 // exl3_gemv_kernel does exactly this for 2 <= m <= 8. The FFMA alternative needs eight accumulators
 // per column (128 registers at four columns, halving occupancy), which is why it loses.
-__global__ void exl3_gemv_mma(const float* __restrict__ u,
-                              const std::uint8_t* __restrict__ trellis,
-                              float* __restrict__ partial, int k_extent, int n_extent,
-                              int half_bits, int columns) {
+__global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_mma(
+    const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+    float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns) {
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
     const int n_tile  = blockIdx.x * 8 + warp;
@@ -442,10 +450,11 @@ constexpr int kExl3MmaSmallT  = 16; // columns per block at small T, so the grid
 // TILE_T is a multiple of 16 (the m16n8k16 m). A smaller tile gives the grid more blocks when the
 // column count is small, which is the difference between an occupancy-starved and a busy kernel.
 template <int TILE_T>
-__global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
-                         const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
-                         int k_extent, int n_extent, int columns, int half_bits,
-                         float probe_sigma, std::uint32_t probe_seed) {
+__global__ void __launch_bounds__(kExl3Threads, kExl3MmaMinBlocks)
+exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+         const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
+         int k_extent, int n_extent, int columns, int half_bits,
+         float probe_sigma, std::uint32_t probe_seed) {
     constexpr int MT = TILE_T / 16;
     const int n_base  = blockIdx.x * kExl3MmaN;
     const int t0      = blockIdx.y * TILE_T;
