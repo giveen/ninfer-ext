@@ -761,6 +761,20 @@ Staged so M5's evidence lands first:
   (+64%), prefill 314.6 -> 345.2, TTFT 224 -> 204 ms**, oracles unchanged. The earlier M4 claim that the GEMV
   sat at the DRAM floor came from a per-call figure on the largest projection; at model scale it was
   occupancy-bound. EXL3 still trails Q4 and NVFP4 on both, so the remaining gap is kernel work, not the format.
+- 2026-09-28: M4 prefill investigation -- located, not yet fixed. On an equal request EXL3's prefill is several
+  times behind the engine's other formats: at 0.5k / 7.8k prompt tokens, EXL3 4.0 495 / 579 tok/s, Q4 2,340 /
+  2,880, NVFP4 5,230 / 8,870. Decode is much closer (62 / 59 against 77 / 74 and 72 / 69), and the depth curve
+  disposed of the first hypothesis -- decode falls only about 5% from 0.5k to 7.8k for all three, so there is no
+  structural depth problem (the "144 ms per step" read was graphsignal's mean over a window mixing prefill and
+  decode). The prefill gap is not kernel time either: a trace of a 2,805-token prefill shows the EXL3 kernels at
+  0.62 s of a 5.1 s wall, with **4.03 s of blocking stream sync over 34 syncs (118 ms each)** while
+  `gpu_utilization_percent` reads 5% and process CPU 0.04%. Q4 and NVFP4 do not stall, so the stall is specific
+  to the EXL3 prefill path rather than engine scheduling. Two cheap levers are ruled out: chunk size barely moves
+  it (1024 / 2048 / 4096 -> 571 / 579 / 585 tok/s, and a single 4096 chunk still stalls), and this box's memory
+  clock is already 14,551 of 14,751 MHz, so the +4500 offset a comparable 2x5090 ExLlamaV3 setup relies on is not
+  available. Bounding the two 128-thread kernels (`exl3_input_transform`, `exl3_gemv_finish`) was tried and
+  reverted: no prefill change, and it pushed the fused-consumer oracle to 2.4e-3 on `gdn_input_proj` past its
+  1e-3 gate. Next: identify the sync site in the EXL3 prefill path.
 
 ## M3 status and decisions
 
