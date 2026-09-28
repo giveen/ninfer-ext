@@ -82,20 +82,25 @@ def produce(args):
 
     windows = plan_windows(len(tokens), args.context, args.stride)
     positions, rows = [], []
+    kept_total = 0
     with torch.no_grad():
         for index, (begin, end, target_begin, target_end, first_target) in enumerate(windows):
             if args.windows and index >= args.windows:
                 break
             ids = torch.tensor([tokens[begin:end]], device=model.device)
-            logits = model(ids).logits[0]
-            # Local predictors [first_target, end - begin) predict the tokens after them.
-            scored = range(first_target, end - begin)
-            for offset, local in enumerate(scored):
-                if args.sample_stride > 1 and offset % args.sample_stride:
-                    continue
+            # Local predictors [first_target, end - begin) predict the tokens after them. Only the
+            # sampled ones are kept, and the head computes logits for exactly those, so the full-vocab
+            # output never materializes for the whole window.
+            scored = list(range(first_target, end - begin))
+            kept = [local for offset, local in enumerate(scored)
+                    if not (args.sample_stride > 1 and offset % args.sample_stride)]
+            keep = torch.tensor(kept, dtype=torch.long, device=model.device)
+            logits = model(ids, logits_to_keep=keep, use_cache=False).logits[0]
+            for row, local in zip(logits, kept):
                 positions.append(target_begin + (local - first_target))
-                rows.append(logits[local].float().cpu().numpy())
-            print(f" -- window {index + 1}/{len(windows)}: {len(positions)} rows", file=sys.stderr)
+                rows.append(row.float().cpu().numpy())
+            kept_total += len(kept)
+            print(f" -- window {index + 1}/{len(windows)}: {kept_total} rows", file=sys.stderr)
     vocab_size = int(model.config.vocab_size)
     digest = write_reference(args.out, context=args.context, stride=args.stride, text=text,
                              positions=positions, logits=np.stack(rows), vocab_size=vocab_size)
