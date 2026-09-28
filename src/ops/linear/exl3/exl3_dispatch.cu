@@ -14,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -119,7 +120,8 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
     const int n_base  = n_tile * 16;
     if (n_base >= n_extent) { return; }
     const int kt_tiles = k_extent / 16;
-    const int per      = (kt_tiles + kExl3GemvSplits - 1) / kExl3GemvSplits;
+    const int splits   = gridDim.y;
+    const int per      = (kt_tiles + splits - 1) / splits;
     const int kt_begin = blockIdx.y * per;
     const int kt_end   = min(kt_tiles, kt_begin + per);
     const int bits     = half_bits >> 1;
@@ -130,8 +132,8 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
 #pragma unroll
     for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
 
-    float acc0 = 0.0F; // n = L/4
-    float acc1 = 0.0F; // n = L/4 + 8
+    float a0[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4
+    float a1[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4 + 8
     const std::uint8_t* tile_base =
         trellis + static_cast<std::size_t>(n_tile) * kt_tiles * (16 * half_bits);
     for (int kt = kt_begin; kt < kt_end; ++kt) {
@@ -146,12 +148,14 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
             const int local = r & 3;
             const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
             if (r < 4) {
-                acc0 = fmaf(d, uk[k], acc0);
+                a0[local] = fmaf(d, uk[k], a0[local]);
             } else {
-                acc1 = fmaf(d, uk[k], acc1);
+                a1[local] = fmaf(d, uk[k], a1[local]);
             }
         }
     }
+    float acc0 = (a0[0] + a0[1]) + (a0[2] + a0[3]);
+    float acc1 = (a1[0] + a1[1]) + (a1[2] + a1[3]);
     acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 2);
     acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 1);
     acc1 += __shfl_down_sync(0xFFFFFFFFU, acc1, 2);
@@ -347,8 +351,12 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
             u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
             output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
     } else {
+        // Splitting K only pays while the grid is short of blocks; a vocabulary-sized head already has
+        // thousands of row blocks, so it takes one slice and avoids a scheduling- and atomic-bound grid.
+        const int n_blocks = static_cast<int>(w.n / 128);
+        const int splits   = std::min<int>(kExl3GemvSplits, std::max<int>(1, 8192 / n_blocks));
         CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
-        exl3_gemv_split<<<dim3(static_cast<unsigned>(w.n / 128), kExl3GemvSplits), 256, 0,
+        exl3_gemv_split<<<dim3(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits)), 256, 0,
                           stream>>>(
             u, static_cast<const std::uint8_t*>(w.qdata), partial, w.k, w.n,
             static_cast<int>(w.bitrate_half_bits));
