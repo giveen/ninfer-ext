@@ -247,11 +247,10 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         }
         if (has_mtp) { break; }
     }
-    if (has_mtp) {
-        engine_options.speculative.backend      = SpeculativeBackend::Mtp;
-        engine_options.speculative.draft_tokens = 1;
-    }
-    ninfer::Engine engine(std::move(engine_options));
+    // The scoring Program rejects a speculative backend by design, so the MTP sites are observed in
+    // a separate generation pass below, not here. The engine is held in an optional so it can be
+    // released before the generation engine loads: both are ~16 GiB and do not fit together.
+    std::optional<ninfer::Engine> engine(std::in_place, std::move(engine_options));
 
     for (std::size_t group_index = 0; group_index < groups.size(); ++group_index) {
         std::map<Key, std::vector<std::string>> group_names;
@@ -273,13 +272,60 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                     static_cast<std::ptrdiff_t>(row) * trace.row_tokens,
                 trace.input_ids.begin() +
                     static_cast<std::ptrdiff_t>(row) * trace.row_tokens + length);
-            (void)engine.score_tokens(std::move(tokens), 1);
+            (void)engine->score_tokens(std::move(tokens), 1);
             if (group_index == 0) { result.tokens += static_cast<std::uint64_t>(length); }
         }
         result.hessians += accumulator.flush();
         std::fprintf(stderr, "calibration group %zu/%zu done (%llu Hessians so far)\n",
                      group_index + 1, groups.size(),
                      static_cast<unsigned long long>(result.hessians));
+    }
+    // The MTP layer only runs under generation, so its sites are observed in a second pass with a
+    // generation engine. Release the scoring engine first: both are ~16 GiB.
+    engine.reset();
+    if (has_mtp) {
+        std::map<Key, std::vector<std::string>> mtp_names;
+        for (const auto& [key, value] : names) {
+            for (const auto& name : value) {
+                if (name.starts_with("mtp/")) { mtp_names[key].push_back(name); }
+            }
+        }
+        if (!mtp_names.empty()) {
+            const std::uint32_t mtp_rows = std::min<std::uint32_t>(rows, 8);
+            // CUDA graphs are off: the observer allocates and copies, which graph capture forbids.
+            // The observer accumulates only the MTP names, so the Text Hessians are undisturbed.
+            ninfer::EngineOptions gen_options;
+            gen_options.artifact_path  = activation_model;
+            gen_options.purpose        = ninfer::EnginePurpose::Generation;
+            gen_options.device         = device;
+            gen_options.max_context    = trace.row_tokens;
+            gen_options.use_cuda_graph = false;
+            gen_options.speculative.backend      = SpeculativeBackend::Mtp;
+            gen_options.speculative.draft_tokens = 1;
+            ninfer::Engine gen(std::move(gen_options));
+            HessianGroup mtp_accumulator(hessians, std::move(mtp_names));
+            ObserverScope mtp_observer([&](Site site, int layer, const ninfer::Tensor& input,
+                                           cudaStream_t stream) {
+                mtp_accumulator.observe(site, layer, input, stream);
+            });
+            for (std::uint32_t row = 0; row < mtp_rows; ++row) {
+                const std::int32_t length = trace.lengths[row];
+                if (length < 2) { continue; }
+                std::vector<ninfer::TokenId> tokens(
+                    trace.input_ids.begin() +
+                        static_cast<std::ptrdiff_t>(row) * trace.row_tokens,
+                    trace.input_ids.begin() +
+                        static_cast<std::ptrdiff_t>(row) * trace.row_tokens + length);
+                ninfer::RequestOptions request;
+                request.execution.requested_output_tokens = 1;
+                request.execution.sampling.temperature    = 0.0F;
+                request.stop.include_model_defaults       = false;
+                (void)gen.generate(gen.prepare_tokens(std::move(tokens)), request);
+            }
+            result.hessians += mtp_accumulator.flush();
+            std::fprintf(stderr, "MTP calibration over %u rows (%llu Hessians so far)\n", mtp_rows,
+                         static_cast<unsigned long long>(result.hessians));
+        }
     }
     result.skipped_names = 0;
     return result;
