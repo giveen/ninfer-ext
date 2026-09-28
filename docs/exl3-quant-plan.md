@@ -506,12 +506,20 @@ bit.
   Q8 merger, Q4 qkv and fc1, Q5 else). `--components text,mtp,vision` builds a 15.35 GiB artifact that
   loads, answers an image prompt, and decodes 140 tok/s with MTP3 (vision) and 191 tok/s (text).
 - 2026-09-28: Canonical artifact name and the fully calibrated MTP. The artifact is
-  `/mnt/storage/models/qwen3.8/qwen3_8_27b_exl3_4bpw.ninfer` (15.35 GiB), named for its body rate the way the
-  other artifacts are (`qwen3_8_27b`, `qwen3_8_27b_nvfp4`); the superseded EXL3 artifacts are removed. With
-  the complete MTP Hessian set (the attention output observer now passes the projection's 2-D view, and the
-  generation pass runs four output tokens so `mtp_forward_tail` fires) every MTP projection is calibrated:
-  proxy errors 0.0066 (stem), 0.00035 (attention qkv), 0.000079 (attention output) and 0.00014-0.00016 (MLP),
-  against 0.0012-0.0045 uncalibrated.
+  `models/qwen3_8_27b_exl3_4bpw.ninfer` (15.35 GiB), named for its body rate the way the other artifacts are
+  (`qwen3_8_27b`, `qwen3_8_27b_nvfp4`); the superseded EXL3 artifacts are removed. With the complete MTP
+  Hessian set (the attention output observer now passes the projection's 2-D view, and the generation pass runs
+  four output tokens so `mtp_forward_tail` fires) every MTP projection is calibrated: proxy errors 0.0066
+  (stem), 0.00035 (attention qkv), 0.000079 (attention output) and 0.00014-0.00016 (MLP), against
+  0.0012-0.0045 uncalibrated.
+- 2026-09-28: M5 first point, uniform 3.0 bpw. `--bits 6 --hq` over the same combined Hessians gives
+  `models/qwen3_8_27b_exl3_3bpw.ninfer`, 12.47 GiB against 15.35 at 4.0 bpw, and full-corpus PPL **4.3840**
+  against 4.2939 (chinese 5.129/4.974, english_long_form 7.018/6.846, english_reference 6.062/6.007, code
+  1.680/1.649). So 19% smaller costs ~2% PPL, and uniform 3.0 bpw lands behind Q4 (4.3439) and NVFP4 (4.3149):
+  the allocation is what M5 has to fix, because the per-tensor sensitivities are far from equal. The
+  sensitivity measurement is being built -- `Exl3WeightProbe` injects seeded Gaussian noise into one EXL3
+  weight's decoded values (committed `b4c3cbc4`), and preparation registers each projection as a probe target
+  (committed `6c4becd1`).
 
 ## M3 status and decisions
 
