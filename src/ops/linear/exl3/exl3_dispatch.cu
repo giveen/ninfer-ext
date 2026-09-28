@@ -52,18 +52,24 @@ __device__ __forceinline__ std::uint16_t tile_state(const std::uint8_t* tile, in
     return static_cast<std::uint16_t>(state);
 }
 
-// Same window for an even (integer) bitrate, read as two 32-bit words and a funnel shift instead of
-// 16 per-bit extractions. `bits` is the integer rate, `words` the uint32 per 256-weight tile. The
-// window ends at bit (t+1)*bits of the circular stream.
-__device__ __forceinline__ std::uint16_t tile_state_fast(const std::uint32_t* tile, int words,
-                                                         int bits, int t) {
+// A window's position in the tile, precomputed once per thread and packed into 16 bits (word in the
+// low byte, shift in the high byte) so a 16-window plan costs eight registers instead of forty-eight.
+// The state index, bitrate and tile width are loop-invariant, so the two integer modulos that located
+// the window move out of the K loop entirely; only the two loads and the funnel shift remain.
+__device__ __forceinline__ std::uint16_t exl3_window(int state, int bits, int words) {
     const int total = words * 32;
-    const int start = ((t + 1) * bits + total - 16) % total;
-    const int word  = start >> 5;
-    const int shift = start & 31;
-    const std::uint32_t window =
-        __funnelshift_r(tile[word], tile[(word + 1) % words], shift);
-    return static_cast<std::uint16_t>(window & 0xFFFFU);
+    int start       = (state + 1) * bits - 16;
+    if (start < 0) { start += total; }
+    return static_cast<std::uint16_t>((start >> 5) | ((start & 31) << 8));
+}
+
+__device__ __forceinline__ float exl3_window_value(const std::uint32_t* tile,
+                                                   std::uint16_t window, int words) {
+    const int word  = window & 0xFF;
+    const int shift = (window >> 8) & 0x1F;
+    const int next  = (word + 1 == words) ? 0 : word + 1;
+    return mul1_value(static_cast<std::uint16_t>(
+        __funnelshift_r(tile[word], tile[next], shift) & 0xFFFFU));
 }
 
 // In-place unnormalized 128-point Sylvester Hadamard over 128 shared floats; all 128 threads join.
@@ -119,6 +125,10 @@ __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* _
 #pragma unroll
     for (int j = 0; j < kExl3ContractTile; ++j) { acc[j] = 0.0F; }
 
+    std::uint16_t plan[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { plan[i] = exl3_window(tile_state_index(i, n_local), bits, words); }
+
     for (int kt = 0; kt < kt_tiles; ++kt) {
         const std::uint8_t* tile8 =
             trellis + (static_cast<std::size_t>(nt) * kt_tiles + kt) * (16 * half_bits);
@@ -126,9 +136,8 @@ __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* _
         float d[16];
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const int t_idx = tile_state_index(i, n_local);
-            d[i]            = fast ? mul1_value(tile_state_fast(tile32, words, bits, t_idx))
-                                   : mul1_value(tile_state(tile8, half_bits, t_idx));
+            d[i] = fast ? exl3_window_value(tile32, plan[i], words)
+                        : mul1_value(tile_state(tile8, half_bits, tile_state_index(i, n_local)));
         }
 #pragma unroll
         for (int j = 0; j < kExl3ContractTile; ++j) {
@@ -156,7 +165,7 @@ __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* _
 // runs its own copy of the 128-point output Hadamard, which keeps the block-wide barriers valid for
 // all threads and costs almost nothing. This lifts decode occupancy from one 128-thread block per
 // 128 output rows to kExl3DecodeSplit of them.
-constexpr int kExl3DecodeSplit = 8;
+constexpr int kExl3DecodeSplit = 4;
 __global__ void exl3_contract_decode(const float* __restrict__ u,
                                      const std::uint8_t* __restrict__ trellis,
                                      const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
@@ -175,23 +184,27 @@ __global__ void exl3_contract_decode(const float* __restrict__ u,
     const int words    = 4 * half_bits;
     const bool fast    = (half_bits & 1) == 0;
 
-    float acc = 0.0F;
+    float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    std::uint16_t plan[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { plan[i] = exl3_window(tile_state_index(i, n_local), bits, words); }
     for (int kt = kt_begin; kt < kt_end; ++kt) {
         const std::uint8_t* tile8 =
             trellis + (static_cast<std::size_t>(nt) * kt_tiles + kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+        const float* uk = u + kt * 16;
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const int t_idx = tile_state_index(i, n_local);
-            const float d   = fast ? mul1_value(tile_state_fast(tile32, words, bits, t_idx))
-                                   : mul1_value(tile_state(tile8, half_bits, t_idx));
-            acc             = fmaf(d, u[kt * 16 + i], acc);
+            const float d = fast ? exl3_window_value(tile32, plan[i], words)
+                                 : mul1_value(tile_state(tile8, half_bits, tile_state_index(i, n_local)));
+            acc[i & 3] = fmaf(d, uk[i], acc[i & 3]);
         }
     }
+    const float total_acc = (acc[0] + acc[1]) + (acc[2] + acc[3]);
 
     __shared__ float sh[kExl3DecodeSplit][128];
     __shared__ float row[kExl3DecodeSplit][128];
-    sh[s][lane] = acc;
+    sh[s][lane] = total_acc;
     __syncthreads();
     float total = 0.0F;
 #pragma unroll
@@ -256,6 +269,10 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
     const std::uint8_t* warp_tile =
         trellis + static_cast<std::size_t>(blockIdx.x * 8 + warp) * kt_tiles * tile_stride;
 
+    std::uint16_t plan[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
+
     for (int kt = 0; kt < kt_tiles; ++kt) {
         for (int i = threadIdx.x; i < kExl3MmaT * 16; i += kExl3MmaThreads) {
             const int t  = i >> 4;
@@ -272,15 +289,14 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
         std::uint32_t b[2][2];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            std::uint16_t st[4];
+            float d[4];
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int t_idx = 8 * lane + 4 * h + r;
-                st[r]           = fast ? tile_state_fast(tile32, words, bits, t_idx)
-                                       : tile_state(tile8, half_bits, t_idx);
+                d[r] = fast ? exl3_window_value(tile32, plan[4 * h + r], words)
+                            : mul1_value(tile_state(tile8, half_bits, 8 * lane + 4 * h + r));
             }
-            b[h][0] = pack_bf16x2(mul1_value(st[0]), mul1_value(st[1]));
-            b[h][1] = pack_bf16x2(mul1_value(st[2]), mul1_value(st[3]));
+            b[h][0] = pack_bf16x2(d[0], d[1]);
+            b[h][1] = pack_bf16x2(d[2], d[3]);
         }
 
         std::uint32_t a[4][4];

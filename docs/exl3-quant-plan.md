@@ -437,6 +437,11 @@ bit.
   `[14336, 5120] x T=32` and `[256, 128] x T=64`. Measured on the same 12,126-token prefix: scoring
   60 -> 318 tok/s and PPL 2.0291 (Q4 2.0399). Decode (`T=1`, verify) still uses the SIMT decode path; a
   dedicated GEMV is the next step.
+- 2026-09-27: M4 window plan. The inner loop still did two integer modulos per window (state -> word and
+  shift). The plan is now computed once per thread and packed into 16 bits, so only two loads and a funnel
+  shift remain, and the decode kernel uses four accumulators to break the FMA chain. The decode kernel keeps
+  four k-slices (eight exceeded the 1024-thread register budget). Measured on the same prefix: scoring
+  318 -> 406 tok/s, decode 13.2 -> 15.5 tok/s, PPL unchanged at 2.0291. A dedicated decode GEMV remains.
 
 ## M3 status and decisions
 
