@@ -703,6 +703,16 @@ Staged so M5's evidence lands first:
   the CausalScoring Program and needs only a logits-export route. To land M5's evidence first, M7 splits into
   M7a (consumer: logits route, `--reference`, KL accumulator, reference produced externally) and M7b (the
   streamed BF16 producer).
+- 2026-09-28: M7a lands (the producer run is the remaining piece). `score_tokens` gained a defaulted
+  `LogitsSink`; the flush that already materializes the BF16 vocab logits copies them to a pinned buffer
+  (allocated on first use only) and hands back a `ScoredLogits` view. The real-artifact scoring test exports
+  them and re-derives the log probability from the column, agreeing to **1.8e-06**. `ninfer-perplexity
+  --reference FILE` reads a self-describing KL reference (magic, version, vocab, rows, context, stride, text
+  sha256, scored target indices, BF16 rows) and reports `KL(P_ref || P_model)` per stream and domain beside the
+  PPL, refusing a protocol mismatch and erroring when no position matches; `tools/perplexity/kl_reference.py`
+  writes that format from a BF16 Hugging Face run that mirrors `plan_windows`. Verified end to end with a
+  synthetic 300-row reference: 283/283 scored positions matched and a finite KL. Still owed: the interim
+  producer run over the real BF16 model, which needs the streaming M7b executor or an offloading HF pass.
 
 ## M3 status and decisions
 
