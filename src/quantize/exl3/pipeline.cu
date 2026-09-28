@@ -52,6 +52,15 @@ public:
 
     ~DeviceArray() { cudaFreeAsync(data_, stream_); }
 
+    // Free early so a later phase does not stack this buffer with the next one. For a vocabulary-
+    // sized tensor the pipeline is only feasible if each phase releases what the next does not need.
+    void release() noexcept {
+        if (data_ != nullptr) {
+            (void)cudaFreeAsync(data_, stream_);
+            data_ = nullptr;
+        }
+    }
+
     T* get() const { return data_; }
 
     void upload(const std::vector<T>& host) {
@@ -249,8 +258,8 @@ std::vector<float> reciprocal(const std::vector<float>& v) {
 } // namespace
 
 TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std::int64_t n,
-                             const TensorOptions& options, std::uint16_t* states, float* su_out,
-                             float* sv_out, float* wq, cudaStream_t stream) {
+                             const TensorOptions& options, std::uint16_t* states_host,
+                             float* su_out, float* sv_out, float* wq, cudaStream_t stream) {
     if (k <= 0 || n <= 0 || k % 128 || n % 128) {
         throw std::invalid_argument("EXL3 tensor quantization needs k % 128 == 0 and n % 128 == 0");
     }
@@ -333,24 +342,47 @@ TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std
     axpy(wr.get(), wr.get(), report.global_scale - 1.0f, static_cast<std::int64_t>(kn), stream);
     for (float& s : su) { s /= report.global_scale; }
 
-    // LDLQ in the rotated domain.
+    // LDLQ in the rotated domain. The trellis is copied to host as soon as it is written: the
+    // device states (n/16 * k/16 * 256 * 2 bytes) are the largest transient and nothing after LDLQ
+    // needs them, so releasing them here is what keeps a vocabulary-sized tensor inside 32 GiB.
     DeviceArray<float> qr(kn, stream);
+    const std::size_t state_count =
+        static_cast<std::size_t>(n / 16) * static_cast<std::size_t>(k / 16) * 256;
     {
         const std::size_t scratch_bytes = ldlq_scratch_bytes(k, n, half_bits);
         DeviceArray<std::uint8_t> scratch(scratch_bytes, stream);
-        ldlq_quantize(wr.get(), l.get(), k, n, half_bits, kCodebookUnit, states, qr.get(),
+        DeviceArray<std::uint16_t> states_dev(state_count, stream);
+        ldlq_quantize(wr.get(), l.get(), k, n, half_bits, kCodebookUnit, states_dev.get(), qr.get(),
                       scratch.get(), scratch_bytes, stream);
+        CUDA_CHECK(cudaMemcpyAsync(states_host, states_dev.get(),
+                                   state_count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    DeviceArray<float> e(kn, stream), he(kn, stream);
-    const auto proxy = [&](const float* hess, const float* ref, const float* approx) {
-        e.copy_from(ref, kn);
-        axpy(e.get(), approx, -1.0f, static_cast<std::int64_t>(kn), stream);
-        gemm(hess, e.get(), he.get(), k, n, k, false, stream);
-        const double num = dot(e.get(), he.get(), static_cast<std::int64_t>(kn), stream);
-        gemm(hess, ref, he.get(), k, n, k, false, stream);
-        return num / std::max(dot(ref, he.get(), static_cast<std::int64_t>(kn), stream), 1e-30);
+    l.release();
+
+    // Hessian-metric proxy error tr(Eᵀ H E)/tr(Wᵀ H W). The two scratch planes are caller-supplied
+    // so a finished buffer can be reused and no proxy keeps its scratch alive across the refit.
+    const auto proxy = [&](const float* hess, const float* ref, const float* approx,
+                           float* e_scratch, float* he_scratch) {
+        gemm(hess, ref, he_scratch, k, n, k, false, stream);
+        const double den = dot(ref, he_scratch, static_cast<std::int64_t>(kn), stream);
+        if (e_scratch != ref) {
+            CUDA_CHECK(cudaMemcpyAsync(e_scratch, ref, kn * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        axpy(e_scratch, approx, -1.0f, static_cast<std::int64_t>(kn), stream);
+        gemm(hess, e_scratch, he_scratch, k, n, k, false, stream);
+        const double num = dot(e_scratch, he_scratch, static_cast<std::int64_t>(kn), stream);
+        return num / std::max(den, 1e-30);
     };
-    report.proxy_error_rotated = proxy(hrot.get(), wr.get(), qr.get());
+    {
+        // The rotated proxy's reference is wr, which the refit never needs again.
+        DeviceArray<float> he(kn, stream);
+        report.proxy_error_rotated = proxy(hrot.get(), wr.get(), qr.get(), wr.get(), he.get());
+    }
+    hrot.release();
+    wr.release();
 
     // Back to the original domain: wq = diag(su) H_k Q H_n diag(sv).
     CUDA_CHECK(cudaMemcpyAsync(wq, qr.get(), kn * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -360,7 +392,11 @@ TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std
     hadamard128_rows(wq, k, n, stream);
     vec_n.upload(sv);
     scale_rows_cols(wq, k, n, nullptr, vec_n.get(), stream);
-    report.proxy_error_before_refit = proxy(hd.get(), w, wq);
+    qr.release();
+    {
+        DeviceArray<float> e(kn, stream), he(kn, stream);
+        report.proxy_error_before_refit = proxy(hd.get(), w, wq, e.get(), he.get());
+    }
 
     // Refit su and sv in the Hessian metric with the trellis fixed.
     {
@@ -403,7 +439,10 @@ TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std
             scale_rows_cols(wq, k, n, vec_k.get(), nullptr, stream);
         }
     }
-    report.proxy_error = proxy(hd.get(), w, wq);
+    {
+        DeviceArray<float> e(kn, stream), he(kn, stream);
+        report.proxy_error = proxy(hd.get(), w, wq, e.get(), he.get());
+    }
 
     for (float& s : sv) { s *= kCodebookUnit; }
     CUDA_CHECK(cudaMemcpyAsync(su_out, su.data(), su.size() * sizeof(float), cudaMemcpyHostToDevice,

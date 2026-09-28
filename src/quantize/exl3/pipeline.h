@@ -41,10 +41,12 @@ struct TensorReport {
 };
 
 // w: [k][n] FP32 device (rows are input channels), h: [k][k] FP32 device mean XᵀX (undamped; left
-// unchanged). k % 128 == 0, n % 128 == 0. Outputs (device): states [n/16][k/16][256] in
-// trellis_t16_v1 order, su [k], sv [n], and the reconstruction wq [k][n].
+// unchanged). k % 128 == 0, n % 128 == 0. Outputs: states_host receives [n/16][k/16][256] trellis
+// states in trellis_t16_v1 order (written by the call), su [k] and sv [n] are device vectors, and
+// wq [k][n] is the device reconstruction. The pipeline releases each device transient before the
+// phase that no longer needs it, so a vocabulary-sized [248320, 5120] tensor fits on one 32 GiB GPU.
 TensorReport quantize_tensor(const float* w, const float* h, std::int64_t k, std::int64_t n,
-                             const TensorOptions& options, std::uint16_t* states, float* su,
+                             const TensorOptions& options, std::uint16_t* states_host, float* su,
                              float* sv, float* wq, cudaStream_t stream);
 
 } // namespace ninfer::quantize::exl3

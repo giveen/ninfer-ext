@@ -103,31 +103,27 @@ void test_pipeline(int half_bits, double max_proxy) {
     }
 
     float *d_w = nullptr, *d_h = nullptr, *d_su = nullptr, *d_sv = nullptr, *d_wq = nullptr;
-    std::uint16_t* d_states = nullptr;
     cudaMalloc(&d_w, w.size() * sizeof(float));
     cudaMalloc(&d_h, h.size() * sizeof(float));
     cudaMalloc(&d_su, kK * sizeof(float));
     cudaMalloc(&d_sv, kN * sizeof(float));
     cudaMalloc(&d_wq, w.size() * sizeof(float));
-    cudaMalloc(&d_states, w.size() * sizeof(std::uint16_t));
     cudaMemcpy(d_w, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_h, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
     q::TensorOptions options;
     options.bitrate_half_bits = half_bits;
     options.seed              = 7;
-    const q::TensorReport report =
-        q::quantize_tensor(d_w, d_h, kK, kN, options, d_states, d_su, d_sv, d_wq, nullptr);
     std::vector<std::uint16_t> states(w.size());
+    const q::TensorReport report =
+        q::quantize_tensor(d_w, d_h, kK, kN, options, states.data(), d_su, d_sv, d_wq, nullptr);
     std::vector<float> su(kK), sv(kN), wq(w.size()), h_after(h.size());
-    cudaMemcpy(states.data(), d_states, states.size() * sizeof(std::uint16_t),
-               cudaMemcpyDeviceToHost);
     cudaMemcpy(su.data(), d_su, su.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(sv.data(), d_sv, sv.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(wq.data(), d_wq, wq.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_after.data(), d_h, h_after.size() * sizeof(float), cudaMemcpyDeviceToHost);
     for (void* p :
          {static_cast<void*>(d_w), static_cast<void*>(d_h), static_cast<void*>(d_su),
-          static_cast<void*>(d_sv), static_cast<void*>(d_wq), static_cast<void*>(d_states)}) {
+          static_cast<void*>(d_sv), static_cast<void*>(d_wq)}) {
         cudaFree(p);
     }
 

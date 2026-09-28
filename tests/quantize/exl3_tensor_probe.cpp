@@ -57,19 +57,19 @@ int main(int argc, char** argv) {
     const auto h = read_f32(argv[6], static_cast<std::size_t>(k * k));
 
     float *d_w = nullptr, *d_h = nullptr, *d_su = nullptr, *d_sv = nullptr, *d_wq = nullptr;
-    std::uint16_t* d_states = nullptr;
     cudaMalloc(&d_w, w.size() * sizeof(float));
     cudaMalloc(&d_h, h.size() * sizeof(float));
     cudaMalloc(&d_su, static_cast<std::size_t>(k) * sizeof(float));
     cudaMalloc(&d_sv, static_cast<std::size_t>(n) * sizeof(float));
     cudaMalloc(&d_wq, w.size() * sizeof(float));
-    cudaMalloc(&d_states, w.size() * sizeof(std::uint16_t));
     cudaMemcpy(d_w, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_h, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
 
+    std::vector<std::uint16_t> states(w.size());
     const auto start  = std::chrono::steady_clock::now();
-    const auto report = ninfer::quantize::exl3::quantize_tensor(d_w, d_h, k, n, options, d_states,
-                                                                d_su, d_sv, d_wq, nullptr);
+    const auto report = ninfer::quantize::exl3::quantize_tensor(d_w, d_h, k, n, options,
+                                                                states.data(), d_su, d_sv, d_wq,
+                                                                nullptr);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::cout << "{\"proxy_error_rotated\": " << report.proxy_error_rotated
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
               << ", \"seconds\": " << seconds << "}\n";
     for (void* p :
          {static_cast<void*>(d_w), static_cast<void*>(d_h), static_cast<void*>(d_su),
-          static_cast<void*>(d_sv), static_cast<void*>(d_wq), static_cast<void*>(d_states)}) {
+          static_cast<void*>(d_sv), static_cast<void*>(d_wq)}) {
         cudaFree(p);
     }
     return 0;
