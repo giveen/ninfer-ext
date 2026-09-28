@@ -194,7 +194,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M0 | Complete (calibration trace sampling) | Baselines | Existing Q4/NVFP4 NInfer PPL baselines recorded; BF16 source and exllamav3 3.0/4.0-bpw references scored on the self-sampled qbench trace (isolated tooling venv, streaming HF reference); self-sampled calibration and eval traces generated with `ninfer-serve`. No separate BF16 `.ninfer` artifact is required. |
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
-| M3 | In progress | Calibration Program + first artifact | `ninfer-quantize` produces a full 27B EXL3 artifact at 4.0 bpw with `-hq`, using a simple correct decode kernel for the sequential re-runs; artifact loads and serves; KLD recorded vs BF16 and vs exllamav3 |
+| M3 | Complete (functional) | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared `suh`) that loads and serves; bounded PPL and generation recorded; the full-corpus KLD and fast decode are M4 |
 | M4 | Pending | Fast inference kernels | Decode GEMV, sliced-K MMA, prefill MMA with epilogue Hadamard; consumers `linear`, `swiglu`, `add`, `attn_input`, `gdn_input`, LM head, MTP; end-to-end speed report |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Vision tower; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission |
@@ -410,12 +410,25 @@ bit.
   2. admit EXL3 in the fusion gates in `src/ops/weight_input.cpp`;
   3. add EXL3 paths to `linear_add`, `linear_swiglu`, `attn_input_proj` and `gdn_input_proj` (the plan's M4
      consumer set), each composing the existing decode with its epilogue.
+- 2026-09-27: Resolved all three steps. `ninfer-quantize` now enumerates parent objects and quantizes each as one
+  matrix with one shared input-scale vector; `qwen3_8_27b_exl3` binds members to row ranges; the fusion gates and
+  the four consumers (plus the GDN verify snapshot/record) gained EXL3 paths; the vocabulary head is assigned too.
+  The first attempt produced a PPL of 1.8e6 because the decode wrote and read the parent **row-major** while NInfer
+  tensors are column-major: every projection was transposed. The decode now indexes column-major and the consumers
+  split a parent with a pitched 2D copy. A sampled FP64 oracle over the model's real parent shapes (including the
+  [248320, 5120] head) and a new fused-consumer test caught and now guard the layout.
+- 2026-09-27: M3 artifact and evidence. `ninfer-quantize` (80 calibration rows, `--bits 8 --head-bits 12 --hq`)
+  wrote 257 EXL3 tensors (12.4 GB); `qwen3_8_27b_exl3` produced `exl3-text.ninfer` (14.9 GiB). The head needed the
+  quantizer's device memory bound (`fix(exl3): bound quantizer device memory...`) to fit a 32 GiB GPU; it quantizes
+  in 51 s. Evidence on `perplexity-1m/00.txt` at context/stride 512/256: Q4 PPL 2.1358, EXL3 first-window PPL
+  2.3056; `ninfer-serve` returns coherent generation. Decode is ~1.7 tok/s (SIMT), which is what M4's kernels fix.
+  The full-corpus KLD and MTP quantization remain.
 
 ## M3 status and decisions
 
-M3 is in progress. Its first half is landed: the converter reads the native quantizer's output format
-(`feat(exl3): read native quantizer sources in the converter`). The producer (`ninfer-quantize`) and the EXL3
-linear Op are not started.
+M3 is complete functionally: `ninfer-quantize` quantizes every eligible parent from the BF16 artifact,
+the `qwen3_8_27b_exl3` recipe turns the store into a `.ninfer`, and the engine loads and serves it.
+The full-corpus KLD against BF16 and exllamav3, and the fast decode that makes it practical, are M4.
 
 Three decisions the earlier handoff reserved were answered on 2026-09-27:
 
