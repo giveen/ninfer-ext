@@ -582,6 +582,14 @@ bit.
   a 36-word rate does not have). The guard is now `half_bits == 8`; the scoring path was unaffected because
   the tiled MMA branches on `half_bits & 1`, so the 3.5 bpw point's PPL was and is valid while its decode was
   not.
+- 2026-09-28: M5 curve, three points. Uniform `-hq` at 3.5 bpw (`--bits 7`, attention raised to 4.5 by the
+  promotion) gives `models/qwen3_8_27b_exl3_3p5bpw.ninfer`, 13.91 GiB, full-corpus PPL **4.310089** (chinese
+  5.009, english_long_form 6.914, english_reference 5.968, code 1.657) at 440 tok/s once the half-rate decode
+  landed. The three EXL3 points on the same 261,167-token corpus are 3.0 bpw 12.47 GiB / 4.38399, 3.5 bpw
+  13.91 GiB / 4.31009 and 4.0 bpw 15.35 GiB / 4.29390, against Q4 4.34389 at 16.96 GiB and NVFP4 4.31493 at
+  22.09 GiB. So **3.5 bpw beats both at 82% and 63% of their size**, 4.0 bpw beats them at 91% and 70%, and
+  3.0 bpw is 0.9% behind Q4's PPL at 74% of its size. The curve is monotone in every domain, and the two
+  redistributed 3.0 bpw artifacts (`_alloc` 4.595, `_even` 4.609) stay out of it.
 
 ## M3 status and decisions
 
