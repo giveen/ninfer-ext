@@ -195,7 +195,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete (functional) | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared `suh`) that loads and serves; bounded PPL and generation recorded; the full-corpus KLD and fast decode are M4 |
-| M4 | Pending | Fast inference kernels | Decode GEMV, sliced-K MMA, prefill MMA with epilogue Hadamard; consumers `linear`, `swiglu`, `add`, `attn_input`, `gdn_input`, LM head, MTP; end-to-end speed report |
+| M4 | In progress | Fast inference kernels | Fused-window SIMT decode with K-split (decode) and T-tiled (prefill) contraction is in; consumers all covered; tensor-core MMA and the end-to-end speed report remain |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Vision tower; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission |
 
@@ -423,6 +423,13 @@ bit.
   in 51 s. Evidence on `perplexity-1m/00.txt` at context/stride 512/256: Q4 PPL 2.1358, EXL3 first-window PPL
   2.3056; `ninfer-serve` returns coherent generation. Decode is ~1.7 tok/s (SIMT), which is what M4's kernels fix.
   The full-corpus KLD and MTP quantization remain.
+- 2026-09-27: M4 first step. The SIMT contraction re-decoded the trellis per `(n,t)` pair and extracted each
+  16-bit window bit by bit. It now reads the window as two 32-bit words and a funnel shift (even rates), and one
+  block covers 128 output rows and up to 16 columns so each window is decoded once and reused across them. For
+  `T = 1` the contraction splits K across eight 128-thread slice groups (with the 128-point output Hadamard run
+  per slice) to lift occupancy. Measured on `perplexity-1m/00.txt` prefix (12,126 tokens, context/stride 512/256):
+  scoring 5.4 -> 60 tok/s, and EXL3 PPL 2.0307 against Q4's 2.0399 at the same prefix; `ninfer-serve` decode
+  1.75 -> 13.2 tok/s with coherent output. Tensor-core MMA and the full-corpus KLD remain.
 
 ## M3 status and decisions
 

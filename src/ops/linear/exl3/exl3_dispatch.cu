@@ -52,6 +52,20 @@ __device__ __forceinline__ std::uint16_t tile_state(const std::uint8_t* tile, in
     return static_cast<std::uint16_t>(state);
 }
 
+// Same window for an even (integer) bitrate, read as two 32-bit words and a funnel shift instead of
+// 16 per-bit extractions. `bits` is the integer rate, `words` the uint32 per 256-weight tile. The
+// window ends at bit (t+1)*bits of the circular stream.
+__device__ __forceinline__ std::uint16_t tile_state_fast(const std::uint32_t* tile, int words,
+                                                         int bits, int t) {
+    const int total = words * 32;
+    const int start = ((t + 1) * bits + total - 16) % total;
+    const int word  = start >> 5;
+    const int shift = start & 31;
+    const std::uint32_t window =
+        __funnelshift_r(tile[word], tile[(word + 1) % words], shift);
+    return static_cast<std::uint16_t>(window & 0xFFFFU);
+}
+
 // In-place unnormalized 128-point Sylvester Hadamard over 128 shared floats; all 128 threads join.
 __device__ __forceinline__ void butterfly128(float* s, int lane) {
     for (int stride = 1; stride < 128; stride <<= 1) {
@@ -77,40 +91,115 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
     s[lane] = su[k] * __bfloat162float(x[k + static_cast<std::size_t>(t) * k_extent]);
     __syncthreads();
     butterfly128(s, lane);
-    u[k + static_cast<std::size_t>(t) * k_extent] = s[lane];
+    u[static_cast<std::size_t>(t) * k_extent + k] = s[lane];
 }
 
-// out[n,t] = sv[n] · H128( Σ_i Z[i,n] u[i,t] ) with the 1/128 from both Hadamards. The output is
-// column-major [N,T], matching every other Linear route.
+// out[n,t] = sv[n] · H128( Σ_i Z[i,n] u[i,t] ) with the 1/128 from both Hadamards. One block covers
+// 128 output rows and up to kExl3ContractTile columns; each trellis window is decoded once and
+// reused across those columns, so prefill is no longer decode-bound. u is t-major [T,K], so the 16
+// operands of one column are contiguous.
+constexpr int kExl3ContractTile = 16;
 __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                               const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
                               int k_extent, int n_extent, int columns, int half_bits) {
-    const int lane      = threadIdx.x; // n_local
-    const int n_block   = blockIdx.x;  // 128 output rows
-    const int t         = blockIdx.y;
-    const int n         = n_block * 128 + lane;
-    const int kt_tiles  = k_extent / 16;
-    if (n >= n_extent) { return; }
-    const int nt      = n >> 4;
-    const int n_local = n & 15;
+    const int lane    = threadIdx.x; // n_local
+    const int n_block = blockIdx.x;  // 128 output rows
+    const int t0      = blockIdx.y * kExl3ContractTile;
+    const int n       = n_block * 128 + lane;
+    if (n >= n_extent || t0 >= columns) { return; }
+    const int t_count  = min(kExl3ContractTile, columns - t0);
+    const int kt_tiles = k_extent / 16;
+    const int nt       = n >> 4;
+    const int n_local  = n & 15;
+    const int bits     = half_bits >> 1;
+    const int words    = 4 * half_bits;
+    const bool fast    = (half_bits & 1) == 0;
 
-    float v = 0.0F;
+    float acc[kExl3ContractTile];
+#pragma unroll
+    for (int j = 0; j < kExl3ContractTile; ++j) { acc[j] = 0.0F; }
+
     for (int kt = 0; kt < kt_tiles; ++kt) {
-        const std::uint8_t* tile =
+        const std::uint8_t* tile8 =
             trellis + (static_cast<std::size_t>(nt) * kt_tiles + kt) * (16 * half_bits);
+        const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+        float d[16];
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
             const int t_idx = tile_state_index(i, n_local);
-            v += mul1_value(tile_state(tile, half_bits, t_idx)) *
-                 u[(kt * 16 + i) + static_cast<std::size_t>(t) * k_extent];
+            d[i]            = fast ? mul1_value(tile_state_fast(tile32, words, bits, t_idx))
+                                   : mul1_value(tile_state(tile8, half_bits, t_idx));
+        }
+#pragma unroll
+        for (int j = 0; j < kExl3ContractTile; ++j) {
+            if (j >= t_count) { break; }
+            const float* uj = u + (static_cast<std::size_t>(t0 + j) * k_extent + kt * 16);
+            float sum       = acc[j];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) { sum = fmaf(d[i], uj[i], sum); }
+            acc[j] = sum;
         }
     }
+
     __shared__ float s[128];
-    s[lane] = v;
+    for (int j = 0; j < t_count; ++j) {
+        s[lane] = acc[j];
+        __syncthreads();
+        butterfly128(s, lane);
+        out[n + static_cast<std::size_t>(t0 + j) * n_extent] =
+            __float2bfloat16(s[lane] * sv[n] * (1.0F / 128.0F));
+    }
+}
+
+// Decode-shaped contraction: one column, so parallelism comes from splitting K. blockDim is
+// (128 n-rows, kExl3DecodeSplit k-slices); the slices are reduced in shared memory and every slice
+// runs its own copy of the 128-point output Hadamard, which keeps the block-wide barriers valid for
+// all threads and costs almost nothing. This lifts decode occupancy from one 128-thread block per
+// 128 output rows to kExl3DecodeSplit of them.
+constexpr int kExl3DecodeSplit = 8;
+__global__ void exl3_contract_decode(const float* __restrict__ u,
+                                     const std::uint8_t* __restrict__ trellis,
+                                     const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
+                                     int k_extent, int n_extent, int half_bits) {
+    const int lane = threadIdx.x; // n_local
+    const int s    = threadIdx.y; // k-slice
+    const int n    = blockIdx.x * 128 + lane;
+    if (n >= n_extent) { return; }
+    const int kt_tiles = k_extent / 16;
+    const int per      = (kt_tiles + kExl3DecodeSplit - 1) / kExl3DecodeSplit;
+    const int kt_begin = s * per;
+    const int kt_end   = min(kt_tiles, kt_begin + per);
+    const int nt       = n >> 4;
+    const int n_local  = n & 15;
+    const int bits     = half_bits >> 1;
+    const int words    = 4 * half_bits;
+    const bool fast    = (half_bits & 1) == 0;
+
+    float acc = 0.0F;
+    for (int kt = kt_begin; kt < kt_end; ++kt) {
+        const std::uint8_t* tile8 =
+            trellis + (static_cast<std::size_t>(nt) * kt_tiles + kt) * (16 * half_bits);
+        const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int t_idx = tile_state_index(i, n_local);
+            const float d   = fast ? mul1_value(tile_state_fast(tile32, words, bits, t_idx))
+                                   : mul1_value(tile_state(tile8, half_bits, t_idx));
+            acc             = fmaf(d, u[kt * 16 + i], acc);
+        }
+    }
+
+    __shared__ float sh[kExl3DecodeSplit][128];
+    __shared__ float row[kExl3DecodeSplit][128];
+    sh[s][lane] = acc;
     __syncthreads();
-    butterfly128(s, lane);
-    out[n + static_cast<std::size_t>(t) * n_extent] =
-        __float2bfloat16(s[lane] * sv[n] * (1.0F / 128.0F));
+    float total = 0.0F;
+#pragma unroll
+    for (int w = 0; w < kExl3DecodeSplit; ++w) { total += sh[w][lane]; }
+    row[s][lane] = total;
+    __syncthreads();
+    butterfly128(&row[s][0], lane);
+    if (s == 0) { out[n] = __float2bfloat16(row[0][lane] * sv[n] * (1.0F / 128.0F)); }
 }
 
 } // namespace
@@ -143,9 +232,19 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     auto* output      = static_cast<__nv_bfloat16*>(out.data);
     exl3_input_transform<<<dim3(static_cast<unsigned>(w.k / 128), columns), 128, 0, stream>>>(
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
-    exl3_contract<<<dim3(static_cast<unsigned>(w.n / 128), columns), 128, 0, stream>>>(
-        u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales), output,
-        w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+    if (columns == 1) {
+        exl3_contract_decode<<<dim3(static_cast<unsigned>(w.n / 128)),
+                               dim3(128, kExl3DecodeSplit), 0, stream>>>(
+            u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
+            output, w.k, w.n, static_cast<int>(w.bitrate_half_bits));
+    } else {
+        exl3_contract<<<dim3(static_cast<unsigned>(w.n / 128),
+                             static_cast<unsigned>((columns + kExl3ContractTile - 1) /
+                                                   kExl3ContractTile)),
+                       128, 0, stream>>>(
+            u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
+            output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
