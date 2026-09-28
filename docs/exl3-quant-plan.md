@@ -473,6 +473,11 @@ bit.
   against a 49 us DRAM floor for the largest layer projection, so the contraction is now bandwidth-bound and
   the remaining decode time is the MMA verify/prefill pass (391 ms) and the small ops. The Linear
   qualification test covers rates 10 and 12 at T = 1.
+- 2026-09-27: M4 small-m routing. graphsignal showed the tiled MMA at short T (a short prompt's prefill and
+  the verify pass) at 763 us/call, grid.y = 1 having too few blocks to fill the GPU; exllamav3 routes m = 1..8
+  to its GEMV and only m >= 16 to the tiled MMA. The dispatch now runs the GEMV once per column for T <= 8.
+  Short-prompt TTFT 985 -> 344 ms, long-prompt prefill 634 -> 733 tok/s, decode unchanged at 68.2 tok/s. The
+  workspace capacities include the GEMV partial for T <= 8 and the Linear test covers T = 4.
 
 ## M3 status and decisions
 
