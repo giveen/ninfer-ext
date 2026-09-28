@@ -9,11 +9,9 @@
 // The weight's per-element rms is read from the unquantized source: the noise is added to the decoded
 // (rotated) values, so `sigma = rfn * rms` makes the perturbation's relative norm exactly `rfn`.
 
-#include "artifact/reader.h"
 #include "models/qwen3_5/execution/probe_registry.h"
 #include "ninfer/engine.h"
 #include "ops/linear/exl3/exl3_dispatch.h"
-#include "parameter_reader.h"
 #include "trace_reader.h"
 
 #include <nlohmann/json.hpp>
@@ -35,23 +33,26 @@ namespace app = ninfer::quantize::app;
 
 struct Options {
     std::filesystem::path artifact;
-    std::filesystem::path source;
     std::filesystem::path trace;
     std::filesystem::path output;
-    float rfn        = 0.29F;
+    float rfn          = 0.145F;
+    // The probe adds noise to the decoded (rotated trellis) values, so the anchor is the codebook's
+    // rms, not the weight's. mul1 values are (bytesum(state * 0x83DCD12D) - 510) / 147.7, i.e. in
+    // [-3.45, 3.45], so the rms is about 2.
+    float codebook_rms = 2.0F;
     std::uint32_t rows = 0; // 0 selects every trace row
-    int device       = 0;
-    bool help        = false;
+    int device         = 0;
+    bool help          = false;
 };
 
 const char* usage() {
-    return "usage: ninfer-sensitivity <model.ninfer> --source <bf16.ninfer> --trace FILE --out FILE\n"
-           "       --source PATH   unquantized artifact, for each weight's rms\n"
-           "       --trace FILE    packed calibration trace (input_ids/lengths safetensors)\n"
-           "       --out FILE      JSON sensitivities\n"
-           "       --rfn F         relative Frobenius norm of the injected noise (default 0.29)\n"
-           "       --rows N        trace rows to score (default: every row)\n"
-           "       --device N      CUDA device index (default 0)\n";
+    return "usage: ninfer-sensitivity <model.ninfer> --trace FILE --out FILE\n"
+           "       --trace FILE     packed calibration trace (input_ids/lengths safetensors)\n"
+           "       --out FILE       JSON sensitivities\n"
+           "       --rfn F          relative Frobenius norm of the injected noise (default 0.145)\n"
+           "       --codebook-rms F rms of the decoded trellis values (default 2.0)\n"
+           "       --rows N         trace rows to score (default: every row)\n"
+           "       --device N       CUDA device index (default 0)\n";
 }
 
 Options parse(int argc, char** argv) {
@@ -64,14 +65,14 @@ Options parse(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             options.help = true;
-        } else if (arg == "--source") {
-            options.source = value(i);
         } else if (arg == "--trace") {
             options.trace = value(i);
         } else if (arg == "--out") {
             options.output = value(i);
         } else if (arg == "--rfn") {
             options.rfn = std::stof(value(i));
+        } else if (arg == "--codebook-rms") {
+            options.codebook_rms = std::stof(value(i));
         } else if (arg == "--rows") {
             options.rows = static_cast<std::uint32_t>(std::stoul(value(i)));
         } else if (arg == "--device") {
@@ -114,8 +115,7 @@ int main(int argc, char** argv) {
         std::fputs(usage(), stdout);
         return 0;
     }
-    if (options.artifact.empty() || options.source.empty() || options.trace.empty() ||
-        options.output.empty()) {
+    if (options.artifact.empty() || options.trace.empty() || options.output.empty()) {
         std::fputs(usage(), stderr);
         return 1;
     }
@@ -125,19 +125,6 @@ int main(int argc, char** argv) {
         const std::uint32_t rows =
             options.rows == 0 ? trace.rows : std::min(options.rows, trace.rows);
         if (rows == 0) { throw std::invalid_argument("trace is empty"); }
-
-        // Per-tensor weight rms from the unquantized source.
-        std::map<std::string, double> rms;
-        {
-            const ninfer::artifact::Reader reader(options.source);
-            for (const app::LinearParameter& parameter : app::enumerate_linear_parameters(reader)) {
-                const std::vector<float> matrix = app::read_parameter_matrix(reader, parameter);
-                double square = 0.0;
-                for (const float value : matrix) { square += static_cast<double>(value) * value; }
-                rms[parameter.name] =
-                    matrix.empty() ? 0.0 : std::sqrt(square / static_cast<double>(matrix.size()));
-            }
-        }
 
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path = options.artifact;
@@ -156,7 +143,7 @@ int main(int argc, char** argv) {
 
         nlohmann::json report = {
             {"artifact", options.artifact.string()},
-            {"source", options.source.string()},
+            {"codebook_rms", options.codebook_rms},
             {"rfn", options.rfn},
             {"rows", rows},
             {"clean_nll", clean},
@@ -164,15 +151,10 @@ int main(int argc, char** argv) {
         };
         std::size_t done = 0;
         for (const auto& target : targets) {
-            const auto rms_it = rms.find(target.name);
-            if (rms_it == rms.end() || rms_it->second <= 0.0) {
-                std::fprintf(stderr, "  skip %s (no source rms)\n", target.name.c_str());
-                continue;
-            }
             auto& probe        = ninfer::ops::detail::exl3_weight_probe();
             probe.target       = target.qdata;
             probe.rfn          = options.rfn;
-            probe.rms          = static_cast<float>(rms_it->second);
+            probe.rms          = options.codebook_rms;
             probe.seed         = 0x5eed1234U;
             const double perturbed = score_nll(engine, trace, rows);
             probe              = {};
@@ -182,7 +164,7 @@ int main(int argc, char** argv) {
                 {"n", target.n},
                 {"k", target.k},
                 {"numel", static_cast<std::uint64_t>(target.n) * target.k},
-                {"rms", rms_it->second},
+                {"codebook_rms", options.codebook_rms},
                 {"rfn", options.rfn},
                 {"nll", perturbed},
                 {"kld", kld},

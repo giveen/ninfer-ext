@@ -38,7 +38,6 @@ target_link_libraries(ninfer-quantize PRIVATE
 # loss, the input the bit allocation needs. One-shot tool, not a serving product.
 add_executable(ninfer-sensitivity
   sensitivity/main.cpp
-  quantize/parameter_reader.cpp
   quantize/trace_reader.cpp)
 ninfer_internal_includes(ninfer-sensitivity)
 target_include_directories(ninfer-sensitivity PRIVATE ${PROJECT_SOURCE_DIR}/apps/quantize)

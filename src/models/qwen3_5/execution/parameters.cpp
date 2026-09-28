@@ -20,6 +20,17 @@ auto with_context(const std::string& context, Function&& function) {
     }
 }
 
+// A fused parent prepared directly (attention qkv, GDN qkv/z, MLP gate/up) is not built through
+// `linear()`, so it is registered here for the sensitivity probe.
+void register_projection(const std::string& name, const ops::ProjectionWeights& projection) {
+    if (const auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
+        register_probe_target(name, single->weight);
+    } else if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection)) {
+        register_probe_target(name, pair->first);
+        register_probe_target(name, pair->second);
+    }
+}
+
 class Prepare {
 public:
     explicit Prepare(const Model& model) : model_(model) {}
@@ -59,8 +70,10 @@ public:
     DenseParameters dense(const DenseWeights& w) const {
         return {with_context(model_.weight(w.gate).name,
                              [&] {
-                                 return ops::prepare_linear_swiglu_weight(model_.input(w.gate),
-                                                                          model_.input(w.up));
+                                 auto prepared = ops::prepare_linear_swiglu_weight(
+                                     model_.input(w.gate), model_.input(w.up));
+                                 register_probe_target(model_.weight(w.gate).name, prepared.weight);
+                                 return prepared;
                              }),
                 linear(w.down)};
     }
@@ -93,17 +106,21 @@ public:
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
-            out.mixer = AttentionParameters{
-                ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
-                                                     model_.input(a->gate), model_.input(a->value)),
-                tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
+            auto projection = ops::prepare_attn_input_proj_weights(
+                model_.input(a->query), model_.input(a->key), model_.input(a->gate),
+                model_.input(a->value));
+            register_projection(model_.weight(a->query).name, projection);
+            out.mixer = AttentionParameters{std::move(projection), tensor(a->query_norm),
+                                            tensor(a->key_norm), linear(a->output)};
             out.projection_prefetch =
                 prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
+            auto gdn_input = ops::prepare_gdn_input_proj_weights(
+                model_.input(g.query), model_.input(g.key), model_.input(g.value), model_.input(g.z));
+            register_projection(model_.weight(g.query).name, gdn_input);
             out.mixer     = GdnParameters{
-                ops::prepare_gdn_input_proj_weights(model_.input(g.query), model_.input(g.key),
-                                                        model_.input(g.value), model_.input(g.z)),
+                std::move(gdn_input),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
                                                          model_.input(g.b_projection)),
                 tensor(g.a_log),
