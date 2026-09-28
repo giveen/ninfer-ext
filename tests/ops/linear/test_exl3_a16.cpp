@@ -326,6 +326,7 @@ int main() {
             run_case(128, 128, rate, 4, 102U);
             run_case(128, 128, rate, 7, 103U);
             run_case(256, 128, rate, 64, 107U);
+            run_case(256, 128, rate, 128, 108U);
             run_case(384, 256, rate, 3, 109U);
         }
         run_sampled_cases();

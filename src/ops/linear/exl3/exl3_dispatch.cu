@@ -255,30 +255,35 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4
 // token fragments. The stored tile order is the m16n8k16 B-fragment order, so a lane's eight
 // windows pack straight into two B fragments with no shuffle.
 constexpr int kExl3MmaN       = 128;
-constexpr int kExl3MmaT       = 64;
 constexpr int kExl3MmaThreads = 256;
+constexpr int kExl3MmaT       = 64; // columns per block at large T
+constexpr int kExl3MmaSmallT  = 16; // columns per block at small T, so the grid still has blocks
 
+// TILE_T is a multiple of 16 (the m16n8k16 m). A smaller tile gives the grid more blocks when the
+// column count is small, which is the difference between an occupancy-starved and a busy kernel.
+template <int TILE_T>
 __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
                          int k_extent, int n_extent, int columns, int half_bits) {
+    constexpr int MT = TILE_T / 16;
     const int n_base  = blockIdx.x * kExl3MmaN;
-    const int t0      = blockIdx.y * kExl3MmaT;
+    const int t0      = blockIdx.y * TILE_T;
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
-    const int t_count = min(kExl3MmaT, columns - t0);
+    const int t_count = min(TILE_T, columns - t0);
     const int kt_tiles = k_extent / 16;
     const int bits     = half_bits >> 1;
     const int words    = 4 * half_bits;
     const bool fast    = (half_bits & 1) == 0;
 
-    __shared__ __nv_bfloat16 us[kExl3MmaT][16];
-    __shared__ float vs[kExl3MmaT][kExl3MmaN];
+    __shared__ __nv_bfloat16 us[TILE_T][16];
+    __shared__ float vs[TILE_T][kExl3MmaN];
 
-    float acc[2][4][4];
+    float acc[2][MT][4];
 #pragma unroll
     for (int h = 0; h < 2; ++h)
 #pragma unroll
-        for (int m = 0; m < 4; ++m)
+        for (int m = 0; m < MT; ++m)
 #pragma unroll
             for (int c = 0; c < 4; ++c) { acc[h][m][c] = 0.0F; }
 
@@ -291,7 +296,7 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
     for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
 
     for (int kt = 0; kt < kt_tiles; ++kt) {
-        for (int i = threadIdx.x; i < kExl3MmaT * 16; i += kExl3MmaThreads) {
+        for (int i = threadIdx.x; i < TILE_T * 16; i += kExl3MmaThreads) {
             const int t  = i >> 4;
             const int kk = i & 15;
             us[t][kk]    = (t0 + t < columns)
@@ -316,9 +321,9 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
             b[h][1] = pack_bf16x2(d[2], d[3]);
         }
 
-        std::uint32_t a[4][4];
+        std::uint32_t a[MT][4];
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
+        for (int mt = 0; mt < MT; ++mt) {
             const int row = mt * 16 + (lane >> 2);
             const int col = (lane & 3) * 2;
             a[mt][0]      = pack_bf16x2(us[row][col], us[row][col + 1]);
@@ -329,7 +334,7 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
 #pragma unroll
         for (int h = 0; h < 2; ++h)
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) { mma_m16n8k16(acc[h][mt], a[mt], b[h]); }
+            for (int mt = 0; mt < MT; ++mt) { mma_m16n8k16(acc[h][mt], a[mt], b[h]); }
 
         __syncthreads();
     }
@@ -340,7 +345,7 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
+        for (int mt = 0; mt < MT; ++mt) {
             const int n0        = (2 * warp + h) * 8 + (lane & 3) * 2;
             const int t_a       = mt * 16 + (lane >> 2);
             vs[t_a][n0]         = acc[h][mt][0];
@@ -350,7 +355,7 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
         }
     }
     __syncthreads();
-    for (int pair = 0; pair < kExl3MmaT / 2; ++pair) {
+    for (int pair = 0; pair < TILE_T / 2; ++pair) {
         const int t_even = 2 * pair;
         const int t_odd  = 2 * pair + 1;
         float* target    = (threadIdx.x < 128) ? &vs[t_even][0] : &vs[t_odd][0];
@@ -398,11 +403,22 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     exl3_input_transform<<<dim3(static_cast<unsigned>(w.k / 128), columns), 128, 0, stream>>>(
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
     if (columns > kExl3GemvMaxM) {
-        exl3_mma<<<dim3(static_cast<unsigned>(w.n / 128),
-                        static_cast<unsigned>((columns + kExl3MmaT - 1) / kExl3MmaT)),
-                  kExl3MmaThreads, 0, stream>>>(
-            u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
-            output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+        // A small column count takes the smaller tile so the grid keeps enough blocks to fill the GPU.
+        if (columns <= 64) {
+            exl3_mma<kExl3MmaSmallT><<<dim3(static_cast<unsigned>(w.n / 128),
+                                            static_cast<unsigned>((columns + kExl3MmaSmallT - 1) /
+                                                                  kExl3MmaSmallT)),
+                                       kExl3MmaThreads, 0, stream>>>(
+                u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
+                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+        } else {
+            exl3_mma<kExl3MmaT><<<dim3(static_cast<unsigned>(w.n / 128),
+                                       static_cast<unsigned>((columns + kExl3MmaT - 1) /
+                                                             kExl3MmaT)),
+                                  kExl3MmaThreads, 0, stream>>>(
+                u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
+                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
+        }
     } else {
         // Up to kExl3GemvMaxM columns run the GEMV once per column, as exllamav3 does for m <= 8: the
         // tiled MMA has too few blocks at small m, so re-decoding per column is faster than the pad.
