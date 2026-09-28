@@ -42,7 +42,7 @@ def plan_windows(tokens: int, context: int, stride: int):
 
 
 def write_reference(path, *, context, stride, text, positions, logits, vocab_size):
-    """positions: [rows] int target indices; logits: [rows, vocab] float, stored BF16."""
+    """positions: [rows] int target indices; logits: [rows, vocab] floats, stored BF16."""
     positions = np.asarray(positions, dtype=np.uint32)
     logits = np.asarray(logits)
     if logits.shape != (positions.size, vocab_size):
@@ -57,13 +57,16 @@ def write_reference(path, *, context, stride, text, positions, logits, vocab_siz
         handle.write(header.ljust(HEADER_BYTES, b"\0"))
         handle.write(digest.ljust(64, b"\0"))
         handle.write(positions.tobytes())
-        handle.write(logits.astype(np.uint16).tobytes())
+        handle.write(to_bf16_bits(logits).tobytes())
     return digest.decode("ascii")
 
 
-def _bf16_bits(tensor):
-    """BF16 bit patterns as uint16, i.e. the top 16 bits of the FP32 representation."""
-    return (tensor.detach().float().cpu().numpy().view(np.uint32) >> 16).astype(np.uint16)
+def to_bf16_bits(values):
+    """BF16 bit patterns as uint16: round FP32 to nearest-even and keep the top 16 bits."""
+    fp32 = np.asarray(values, dtype=np.float32)
+    bits = fp32.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
+    return (rounded >> np.uint32(16)).astype(np.uint16)
 
 
 def produce(args):
@@ -88,7 +91,7 @@ def produce(args):
             # Local predictors [first_target, end - begin) predict the tokens after them.
             for local in range(first_target, end - begin):
                 positions.append(target_begin + (local - first_target))
-                rows.append(_bf16_bits(logits[local]))
+                rows.append(logits[local].float().cpu().numpy())
             print(f" -- window {index + 1}/{len(windows)}: {len(positions)} rows", file=sys.stderr)
     vocab_size = int(model.config.vocab_size)
     digest = write_reference(args.out, context=args.context, stride=args.stride, text=text,
