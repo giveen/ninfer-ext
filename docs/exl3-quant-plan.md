@@ -198,7 +198,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode), the decode GEMV (single-column FFMA plus the small-m tensor-core verify), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in; the end-to-end speed report remains |
 | M5 | In progress | Recipe optimization | Uniform `-hq` artifacts at 3.0 / 3.5 / 4.0 bpw -- 12.47 / 13.91 / 15.35 GiB, PPL 4.38399 / 4.31009 / 4.29390. The 3.5 and 4.0 points beat Q4 (4.34389 at 16.96 GiB) and NVFP4 (4.31493 at 22.09 GiB) at 82%/63% and 91%/70% of their size; 3.0 bpw is 0.9% behind Q4 at 74% of its size. The sensitivity-based layer allocation was measured and rejected (both redistributions lost ~0.22 PPL to the uniform rate), and the odd half-rate decode is now fast. Remaining evidence: the reference KLD of section 9 -- PPL separates too weakly to compare across engines. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
-| M7 | Pending | Reference KLD | `ninfer-reference` (offline) streams the BF16 `.ninfer` and writes an exact per-position distribution file; `ninfer-perplexity --reference` reads it and reports KLD beside the PPL. Done when the streamed BF16 logits match a trusted BF16 run within tolerance, the KLD agrees with an FP64 oracle, and every M5 point carries a KLD. Design in section 9. |
+| M7 | Pending | Reference KLD | **M7a**: a logits-export route plus `ninfer-perplexity --reference FILE` and a KL accumulator, with the reference produced externally -- this lands M5's KLD evidence. **M7b**: `ninfer-reference`, an offline app that streams the BF16 `.ninfer` and writes the exact per-position distribution file, removing the external dependency. Done when the KLD agrees with an FP64 oracle and every M5 point carries a KLD. Design and gaps in section 9. |
 
 **Order:** M0 baselines should precede M2/M3 quality work. M1 is independent of the reference
 quantization and self-trace work and can complete while M0 remains open. M0 → M1 → M2 → M3 gives the
@@ -247,21 +247,26 @@ The BF16 next-token distribution at each scored position. Full logits are 248,32
 exact (BF16 logits `[positions, vocab]`, the scored token ids, and the text/protocol tags so the consumer can
 check it scores the same thing). A top-k + logsumexp summary is a size option for later, not a correctness one.
 
-### 9.4 Streaming schedule
+### 9.4 Execution: a dedicated offline executor for the producer
 
-Weights stay memory-mapped in host RAM. The small always-resident pieces sit on the device (embedding, final
-norm, head, and the attention/GDN state and KV); the 64 blocks stream on demand with a double buffer: prefetch
-block `i+1` while computing block `i`, release `i`. A full 52 GiB pass is a couple of seconds of PCIe traffic,
-so a few hundred windows is minutes, and the device peak is one block plus the head and the activations -- far
-below the 30 GiB available.
+The open question is settled against reuse. The composed Program cannot run this: `construct_model` marks every
+weight `Residency::Device` and materializes one device arena of the whole payload (about 52 GiB on a 30 GiB
+device), planning already throws for the missing BF16 geometries, and `ProgramImpl` holds an immutable
+`const Parameters&` of baked device pointers with no weight-provider indirection. A resident-set contract would
+first have to be threaded through `TextContext`/`run_layers` and every Op -- a serving hot-path and ABI change
+far larger than an offline tool.
 
-The open design question is how much of the existing composition to reuse. The Executor builds a Program over
-resident weights; this needs the same mathematics with a demand-driven weight source. Two candidates: (a) a
-resident-set contract the Program declares, with the streamer filling the remainder just-in-time, keeping one
-execution path; (b) a dedicated reference executor sharing the Ops but not the scheduling, less invasive.
-Decide before implementing and record it here. BF16 Text/MTP linears already exist -- the quantizer's
-calibration pass re-runs each layer through them -- so the work is coverage at the scoring `T` plus the
-schedule, not new Op mathematics.
+Reuse happens one level lower, where the composition is already weight-agnostic:
+`execution::prefill_text_chunk` and `TextContext::run_layers` take weights, activations and state, so the
+reference app supplies one layer's weights from a double-buffered staging arena and owns its own KV, GDN state
+and workspace. `execution::Qwen4ExpertPager` is the in-tree precedent for on-demand device staging, though it
+is MoE-specific and pinned-host based. Weights stay memory-mapped or pread from the artifact in host RAM; the
+small pieces (embedding, final norm, head, state and KV) stay resident, and the 64 blocks stream with a
+prefetch: stage `i+1` while computing `i`, release `i`. A full 52 GiB pass is a couple of seconds of PCIe
+traffic, so a few hundred windows is minutes.
+
+The consumer does reuse the composed Program: the CausalScoring route already computes full vocab logits per
+position and fits the quantized artifact, so only a logits-export route is added.
 
 ### 9.5 Verification
 
@@ -278,6 +283,29 @@ schedule, not new Op mathematics.
 Offline only. The serving stance is unchanged -- one resident model, one to eight requests, no offload; this is
 not a serving capability and adds none. It is the KLD producer M5 asks for and, once built, a standing quality
 tool; the capability description moves to a maintainer doc when it lands.
+
+### 9.7 Gaps, and why the work is staged
+
+Reading the tree corrected two premises of the first sketch. There is **no BF16 forward anywhere**: the
+quantizer's calibration pass runs a servable *quantized* activation model, and the BF16 `linear` registry
+covers only `[14336,5120]`, `[5120,6144]` and `[256,5120]`, so MLP gate/up `[34816,5120]`, MLP down
+`[5120,17408]`, GDN input `[16384,5120]` and the head `[248320,5120]` have no BF16 route. And there is no
+public logits API: `Engine::score_tokens` returns target logprobs only, while the full logits exist transiently
+inside `ProgramImpl::causal_score`.
+
+The gaps are (1) a logits-export route through `Program::causal_score` -> `CausalScoreCore` -> `Engine`; (2)
+BF16 coverage for the missing Text geometries, or a reference-only generic BF16 GEMV/GEMM that leaves the
+serving registries untouched; (3) the streaming schedule plus the app's own state and workspace; (4) the
+reference-file format and the KL accumulator.
+
+Staged so M5's evidence lands first:
+
+- **M7a -- consumer.** The logits route, `ninfer-perplexity --reference FILE`, and the KL accumulator and
+  report fields, with the reference produced externally for now. Small, and it delivers the KLD comparison M5
+  needs.
+- **M7b -- producer.** `ninfer-reference`, the offline streaming BF16 executor above, which replaces the
+  external dependency. This is the large piece, and it is the milestone's own goal rather than a prerequisite
+  for the evidence.
 
 ## Progress log
 
@@ -664,6 +692,17 @@ tool; the capability description moves to a maintainer doc when it lands.
   raises `attention/*` by a bit while exllamav3's `select_hq_bits` is 0 on this dense model, so the two
   recipes are not bit-for-bit comparable at equal body bpw. That is the argument for the shared-reference KLD
   of section 9; this PPL pass stands as the cheap external check.
+- 2026-09-28: M7 scoped and staged. Mapping the tree corrected two premises of the section 9 sketch. There is
+  **no** BF16 forward anywhere -- the quantizer's calibration runs a servable *quantized* activation model, and
+  the BF16 `linear` registry has only `[14336,5120]`, `[5120,6144]` and `[256,5120]`, so the MLP, GDN input and
+  head geometries are missing -- and there is no public logits API (`score_tokens` returns target logprobs
+  only, while full logits live transiently in `ProgramImpl::causal_score`). The composed Program also cannot
+  run the reference: it materializes one ~52 GiB device arena and holds immutable baked pointers with no
+  weight-provider indirection. So the producer becomes a dedicated offline executor reusing
+  `prefill_text_chunk`/`run_layers` with a double-buffered per-layer staging arena, while the consumer reuses
+  the CausalScoring Program and needs only a logits-export route. To land M5's evidence first, M7 splits into
+  M7a (consumer: logits route, `--reference`, KL accumulator, reference produced externally) and M7b (the
+  streamed BF16 producer).
 
 ## M3 status and decisions
 
