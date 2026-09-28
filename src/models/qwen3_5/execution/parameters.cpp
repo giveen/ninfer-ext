@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "models/qwen3_5/execution/probe_registry.h"
 
 #include <limits>
 #include <stdexcept>
@@ -24,8 +25,11 @@ public:
     explicit Prepare(const Model& model) : model_(model) {}
 
     LinearParameters linear(WeightId id) const {
-        return with_context(model_.weight(id).name,
-                            [&] { return ops::prepare_linear_weight(model_.input(id)); });
+        return with_context(model_.weight(id).name, [&] {
+            auto prepared = ops::prepare_linear_weight(model_.input(id));
+            register_probe_target(model_.weight(id).name, prepared.weight);
+            return prepared;
+        });
     }
 
     LinearParameters linear(WeightUseId id) const {
