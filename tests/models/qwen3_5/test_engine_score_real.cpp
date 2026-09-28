@@ -3,9 +3,23 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
+
+namespace {
+
+// BF16 bits to float without pulling in a CUDA header.
+float bf16_to_float(std::uint16_t value) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+    float result             = 0.0F;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+} // namespace
 
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
@@ -65,6 +79,50 @@ int main() {
             return 1;
         }
     }
-    std::cout << "OK causal_score_real\n";
+    // The exported logits are the real distribution: the log softmax of a column at its target token
+    // reproduces the returned log probability, and asking for them does not change the result.
+    std::vector<ninfer::TokenId> export_tokens = tokens;
+    double worst_export_error                  = 0.0;
+    std::size_t exported_columns               = 0;
+    const ninfer::LogitsSink sink              = [&](const ninfer::ScoredLogits& view) {
+        for (std::uint32_t column = 0; column < view.columns; ++column) {
+            const std::uint32_t target = view.first_target + column;
+            const std::size_t index    = static_cast<std::size_t>(target) - 513U;
+            if (index >= suffix.size()) { continue; }
+            const std::uint16_t* values =
+                view.values.data() + static_cast<std::size_t>(column) * view.vocab_size;
+            float max_value = -std::numeric_limits<float>::infinity();
+            for (std::uint32_t vocab = 0; vocab < view.vocab_size; ++vocab) {
+                max_value = std::max(max_value, bf16_to_float(values[vocab]));
+            }
+            double sum = 0.0;
+            for (std::uint32_t vocab = 0; vocab < view.vocab_size; ++vocab) {
+                sum += std::exp(static_cast<double>(bf16_to_float(values[vocab]) - max_value));
+            }
+            const double logprob =
+                static_cast<double>(
+                    bf16_to_float(values[static_cast<std::uint32_t>(tokens[target])]) - max_value) -
+                std::log(sum);
+            worst_export_error = std::max(
+                worst_export_error, std::abs(logprob - static_cast<double>(suffix[index])));
+            ++exported_columns;
+        }
+    };
+    const std::vector<float> with_logits = engine.score_tokens(export_tokens, 513, sink);
+    if (exported_columns == 0) {
+        std::cerr << "the logits sink received no columns\n";
+        return 1;
+    }
+    if (with_logits.size() != suffix.size()) {
+        std::cerr << "the logits sink changed the scored result shape\n";
+        return 1;
+    }
+    if (worst_export_error > 2.0e-3) {
+        std::cerr << "exported logits disagree with the scored log probability: " << worst_export_error
+                  << '\n';
+        return 1;
+    }
+
+    std::cout << "OK causal_score_real (logits max |delta logprob| " << worst_export_error << ")\n";
     return 0;
 }
