@@ -196,7 +196,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
 | M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode), the decode GEMV (single-column FFMA plus the small-m tensor-core verify), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in; the end-to-end speed report remains |
-| M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
+| M5 | In progress | Recipe optimization | Uniform `-hq` recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3. The sensitivity-based layer allocation was measured and rejected: both redistributions lost ~0.22 PPL to the uniform rate (progress log 2026-09-28). Reviving it needs a sweep re-measured at the operating error. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
 
 **Order:** M0 baselines should precede M2/M3 quality work. M1 is independent of the reference
@@ -548,6 +548,18 @@ bit.
   promotes only `attention/*` (6.9% of the body numel) by two half bits, and per-layer pooling flattened it.
   `allocate.py` gained `--rate-step` (even-only rates stay on the fast path) and `--offset SUBSTRING:DELTA`
   (the type prior, inside the budget); the corrected 3.0 bpw point is re-running.
+- 2026-09-28: M5 allocation concluded negative. The corrected variant -- even rates plus the restored
+  attention offset, a pure layer redistribution at mean 6.110 half bits (12.42 GiB) -- scored **4.609115** on
+  the same corpus: no better than the first attempt's 4.595078 and 0.225 worse than the uniform 3.0 bpw
+  4.383991. Both redistributions lose by about the same amount, so pooled layer sensitivity does not identify
+  a profitable trade at a fixed budget. The per-layer |ΔNLL| spread is real, but the model built on it orders
+  the candidates **backwards** -- predicted KL 520.7 uniform / 356.5 odd / 461.5 even against measured PPL
+  4.384 / 4.595 / 4.609. The likely cause is the injected regime: the sweep used `rfn` 0.145 (a 14.5% relative
+  weight error) while the quantized tensors sit 1-5% from their anchors, so the tail's insensitivity at 14.5%
+  does not transfer to the demoted rates. The even schedule did fix the throughput (401 tok/s against the
+  odd run's 163), confirming the odd-half-bit fallback. M5 therefore keeps the uniform `-hq` recipe for its
+  points and reports the PPL-vs-size frontier; the layer allocation is dropped, and a sweep re-measured at
+  the operating error is the prerequisite for reviving it.
 
 ## M3 status and decisions
 
