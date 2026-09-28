@@ -447,6 +447,14 @@ bit.
   4.0 bpw overall PPL **4.2939** (chinese 4.974, english_long_form 6.846, english_reference 6.007, code 1.649)
   against Q4 4.3439 and NVFP4 4.3149, at 380.7 tok/s. The 4.0 bpw artifact is therefore the best PPL of the
   three native routes on this corpus, and the run qualifies the tensor-core path at `T = 4096`.
+- 2026-09-27: M4 decode GEMV. Graphsignal (`--cuda-graph-trace node`) showed the decode contraction at 77% of a
+  decode step. The GEMV now splits K across the grid into a small FP32 partial buffer (removing the block
+  register ceiling that capped it at four k-slices), and each lane decodes the eight m16n8k16 B-fragment
+  windows `t = 8L..8L+7`, which at 4 bits is one coalesced 32-bit word per lane. A dispatch trace showed the
+  serving decode is a `T = 2/3` verify pass plus a `T = 1` head, so those verify columns now use the MMA and
+  the T-tiled SIMT kernel is gone. Decode 15.2 -> 41.0 tok/s, prefill 61 -> 71 tok/s; the EXL3 workspace
+  capacities include the GEMV partial at `T = 1`. The remaining gap to the ~120 tok/s bandwidth floor is the
+  head GEMV (n = 248320) and per-round overhead.
 
 ## M3 status and decisions
 
