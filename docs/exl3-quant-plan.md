@@ -478,6 +478,10 @@ bit.
   to its GEMV and only m >= 16 to the tiled MMA. The dispatch now runs the GEMV once per column for T <= 8.
   Short-prompt TTFT 985 -> 344 ms, long-prompt prefill 634 -> 733 tok/s, decode unchanged at 68.2 tok/s. The
   workspace capacities include the GEMV partial for T <= 8 and the Linear test covers T = 4.
+- 2026-09-27: M4 small-T MMA tile. The tiled MMA covered 64 columns per block, so any T below 64 left
+  grid.y = 1 and occupancy-starved, a typical short prompt (T = 59) included. The kernel is now templated on
+  its tile and T <= 64 takes a 16-column tile. T = 59 TTFT 344 -> 274 ms; long prefill and decode unchanged
+  (726 and 68.0 tok/s). The Linear test covers T = 64 and 128.
 
 ## M3 status and decisions
 
