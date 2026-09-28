@@ -180,6 +180,24 @@ def qwen3_8_27b_exl3(model, recipe, sources):
         assign(name, exl3_matrix_source(store, name, parameter.shape))
         assigned.add(name)
 
+    # Vision is not EXL3: the tower's MLP intermediate (4304) is not a multiple of the 128-point
+    # Hadamard block the format's tiles need, so it keeps the groupwise formats every other official
+    # recipe uses (Q6 patch embedding, Q8 merger, Q4 qkv and fc1, Q5 the rest).
+    for name, parameter in parameters.items():
+        if not name.startswith("vision/") or not parameter.projection:
+            continue
+        if name == "vision/patch_embedding":
+            format = Q6
+        elif name.startswith("vision/merger/"):
+            format = Q8
+        elif name.endswith(
+            ("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")
+        ):
+            format = Q4
+        else:
+            format = Q5
+        _assign(recipe, name, format)
+
 
 def qwen3_8_27b_q6(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8, gate_up=Q6)
