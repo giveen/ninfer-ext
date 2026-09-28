@@ -455,6 +455,12 @@ bit.
   the T-tiled SIMT kernel is gone. Decode 15.2 -> 41.0 tok/s, prefill 61 -> 71 tok/s; the EXL3 workspace
   capacities include the GEMV partial at `T = 1`. The remaining gap to the ~120 tok/s bandwidth floor is the
   head GEMV (n = 248320) and per-round overhead.
+- 2026-09-27: M4 GEMV split tuning. Graphsignal telemetry (`ninfer_decode_device_wait_microseconds_per_round`
+  = 25.2 ms, `ninfer_decode_batch_average_size` = 1) plus a per-call sample count (252 GEMV calls per token,
+  87 us each) showed the head is only about 3% of the decode; the 251 layer projections are the cost. The
+  k-split is now adaptive, `min(32, max(1, 8192 / (N/128)))`, and each of the eight windows accumulates into
+  its own register. Decode 38.2 -> 41.2 tok/s on a 162-token paragraph; a smaller split target (25.9) and a
+  larger one (39.4) are both worse. The whole-model GEMV is still about 2.5x the DRAM floor.
 
 ## M3 status and decisions
 
