@@ -195,9 +195,9 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
-| M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode) plus fused-window SIMT decode with K-split is in; all consumers covered; a dedicated decode GEMV and the end-to-end speed report remain |
+| M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode), the decode GEMV (single-column FFMA plus the small-m tensor-core verify), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in; the end-to-end speed report remains |
 | M5 | Pending | Recipe optimization | Sensitivity measurement + greedy allocation through NInfer; recipe artifacts at 3.0 / 3.5 / 4.0 bpw with a KLD-vs-size curve against q4/NVFP4/exllamav3 |
-| M6 | Pending | Later | Two-sided YAQA LDLQ; Vision tower; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission |
+| M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
 
 **Order:** M0 baselines should precede M2/M3 quality work. M1 is independent of the reference
 quantization and self-trace work and can complete while M0 remains open. M0 → M1 → M2 → M3 gives the
@@ -493,6 +493,18 @@ bit.
   reference's `exl3_gemv_kernel` does for 2 <= m <= 8; the FFMA multi-column alternative needed 128 registers
   at four columns and lost 2.4x. Measured: `exl3-mtp.ninfer` `--spec mtp --draft-tokens 3 --fixed-draft` decodes
   130 tok/s against 71 plain (1.8x, 53% acceptance), verify 53.6 us/call, plain decode unchanged.
+- 2026-09-28: M4 MTP calibration and Vision. The MTP sites were observed but never fired: the scoring
+  Program rejects a speculative backend by design. `calibrate()` now runs a second pass with a generation
+  engine (CUDA graphs off, since the observer allocates and copies; the scoring engine is released first
+  through an optional because both engines are ~16 GiB). The stem proxy error fell 0.0458 -> 0.00656 (7x)
+  and the MTP attention input 0.00144 -> 0.00035 (4x); on predictable completions the acceptance rose
+  accordingly (counting 93.0% -> 96.7%, 160 -> 186 tok/s; code 71.9% -> 79.3%, 135 -> 166 tok/s). The
+  attention output observer now passes the projection's 2-D view (the head-major attention tensor failed
+  the observer's rank check). Vision is added to the recipe: it cannot be EXL3 (its MLP intermediate 4304
+  is not a multiple of the 128-point Hadamard block) and cannot stay BF16 (the BF16 registry carries only
+  the Text/MTP geometries), so it takes the groupwise formats every other official recipe uses (Q6 patch,
+  Q8 merger, Q4 qkv and fc1, Q5 else). `--components text,mtp,vision` builds a 15.35 GiB artifact that
+  loads, answers an image prompt, and decodes 140 tok/s with MTP3 (vision) and 191 tok/s (text).
 
 ## M3 status and decisions
 
