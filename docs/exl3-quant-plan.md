@@ -749,6 +749,18 @@ Staged so M5's evidence lands first:
   than the 4.0's, and the same message renders to 26 tokens on 3.5 against 68 on 4.0. The rule that prevents a
   repeat: build the app you are about to measure, not just its neighbours. The M4 log's 71 tok/s decode is now
   38.5, so a real decode regression remains to be explained.
+- 2026-09-28: The decode regression is explained, and fixed: contraction occupancy. On the identical
+  request: Q4 78.5 decode / 425.3 prefill, NVFP4 72.6 / 1.21k, EXL3 4.0 38.1 / 314.6 -- EXL3 slowest while
+  being the *smallest* artifact (15.35 GiB against 16.96 and 22.09), i.e. about 0.59 TB/s against NVFP4's
+  1.59. NCU on the three contraction kernels showed none of them near the DRAM floor: `Block Limit Registers
+  = 2` (2 blocks/SM, ~16% occupancy) with `SM Active Cycles` 743 of `Elapsed Cycles` 9,406, so they were
+  latency-bound -- waiting, not streaming. No kernel carried `__launch_bounds__`, so nvcc spent registers
+  until occupancy collapsed. Sweeping the target: 3 blocks 49.5 / 326.6, 4 -> 57.3 / 342.0, 5 -> 62.4 / 251.5,
+  6 -> 41.4 / 196.3, 8 -> 22.1 / 204.1 (decode / prefill). The families peak differently -- the GEMV at 5, the
+  MMA at 4 before its accumulators spill -- so they carry separate targets now: **decode 38.1 -> 62.5 tok/s
+  (+64%), prefill 314.6 -> 345.2, TTFT 224 -> 204 ms**, oracles unchanged. The earlier M4 claim that the GEMV
+  sat at the DRAM floor came from a per-call figure on the largest projection; at model scale it was
+  occupancy-bound. EXL3 still trails Q4 and NVFP4 on both, so the remaining gap is kernel work, not the format.
 
 ## M3 status and decisions
 
