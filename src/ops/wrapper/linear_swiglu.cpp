@@ -1,7 +1,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_swiglu.h"
 
+#include "ops/linear/exl3/exl3_dispatch.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ninfer/ops/silu_mul.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -55,6 +57,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::EXL3_MUL1) {
+        if (gate_up_rows != 34816 || input_rows != 5120) {
+            throw std::invalid_argument("linear_swiglu workspace: unsupported EXL3 profile");
+        }
+        // The decoded gate/up parent [34816,T] plus the rotated activation [5120,T].
+        return static_cast<std::size_t>(max_tokens) * (34816ULL * 2 + 5120ULL * 4);
+    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -87,6 +96,24 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
+    }
+
+    if (gate_up_weight.qtype == QType::EXL3_MUL1) {
+        constexpr std::int32_t kInput = 5120;
+        constexpr std::int32_t kHalf  = 17408;
+        constexpr std::int32_t kRows  = 2 * kHalf;
+        if (!large_shape || gate_up_weight.layout != QuantLayout::TrellisT16) {
+            throw std::invalid_argument("exl3 linear_swiglu: unsupported weight shape");
+        }
+        auto scope = ws.scope();
+        const DeviceSpan whole_storage =
+            ws.alloc_bytes(static_cast<std::size_t>(kRows) * t * 2, 16);
+        Tensor whole(whole_storage.data, DType::BF16, {kRows, t});
+        detail::exl3_dispatch(x, gate_up_weight, whole, policy, ws, stream);
+        Tensor gate = whole.slice(0, 0, kHalf);
+        Tensor up   = whole.slice(0, kHalf, kHalf);
+        ops::silu_mul(gate, up, out, stream);
+        return;
     }
 
     const bool common_row_split =

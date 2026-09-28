@@ -63,7 +63,8 @@ __device__ __forceinline__ void butterfly128(float* s, int lane) {
     }
 }
 
-// u[k,t] = H128(su[k] * x[k,t]) over 128-blocks of k. u is FP32 scratch [K,T].
+// u[k,t] = H128(su[k] * x[k,t]) over 128-blocks of k. u is FP32 scratch [K,T] in the same
+// column-major order as the caller's tensors (dim 0 is contiguous).
 __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
                                      const float* __restrict__ su, float* __restrict__ u,
                                      int k_extent, int columns) {
@@ -73,13 +74,14 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
     const int k     = block * 128 + lane;
     if (k >= k_extent) { return; }
     __shared__ float s[128];
-    s[lane] = su[k] * __bfloat162float(x[static_cast<std::size_t>(k) * columns + t]);
+    s[lane] = su[k] * __bfloat162float(x[k + static_cast<std::size_t>(t) * k_extent]);
     __syncthreads();
     butterfly128(s, lane);
-    u[static_cast<std::size_t>(k) * columns + t] = s[lane];
+    u[k + static_cast<std::size_t>(t) * k_extent] = s[lane];
 }
 
-// out[n,t] = sv[n] · H128( Σ_i Z[i,n] u[i,t] ) with the 1/128 from both Hadamards.
+// out[n,t] = sv[n] · H128( Σ_i Z[i,n] u[i,t] ) with the 1/128 from both Hadamards. The output is
+// column-major [N,T], matching every other Linear route.
 __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                               const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
                               int k_extent, int n_extent, int columns, int half_bits) {
@@ -100,14 +102,14 @@ __global__ void exl3_contract(const float* __restrict__ u, const std::uint8_t* _
         for (int i = 0; i < 16; ++i) {
             const int t_idx = tile_state_index(i, n_local);
             v += mul1_value(tile_state(tile, half_bits, t_idx)) *
-                 u[static_cast<std::size_t>(kt * 16 + i) * columns + t];
+                 u[(kt * 16 + i) + static_cast<std::size_t>(t) * k_extent];
         }
     }
     __shared__ float s[128];
     s[lane] = v;
     __syncthreads();
     butterfly128(s, lane);
-    out[static_cast<std::size_t>(n) * columns + t] =
+    out[n + static_cast<std::size_t>(t) * n_extent] =
         __float2bfloat16(s[lane] * sv[n] * (1.0F / 128.0F));
 }
 

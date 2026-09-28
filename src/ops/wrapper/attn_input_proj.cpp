@@ -6,6 +6,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+#include "ops/linear/exl3/exl3_dispatch.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -89,6 +90,33 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
+    if (weight.qtype == QType::EXL3_MUL1) {
+        // One parent holds query, key, gate and value in that row order.
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = kQRows + kKvRows + kQRows + kKvRows;
+        const std::int32_t columns     = x.ne[1];
+        if (columns <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        if (weight.n != kRows || weight.k != kHidden || workspace == nullptr) {
+            throw std::invalid_argument("exl3 attn_input_proj: unsupported weight shape");
+        }
+        require_matrix(x, kHidden, columns, "x");
+        require_matrix(q, kQRows, columns, "q");
+        require_matrix(gate, kQRows, columns, "gate");
+        require_matrix(k, kKvRows, columns, "k");
+        require_matrix(v, kKvRows, columns, "v");
+        auto scope = workspace->scope();
+        const DeviceSpan whole_storage =
+            workspace->alloc_bytes(static_cast<std::size_t>(kRows) * columns * 2, 16);
+        Tensor whole(whole_storage.data, DType::BF16, {kRows, columns});
+        detail::exl3_dispatch(x, weight, whole, policy, *workspace, stream);
+        detail::exl3_copy_rows(whole, 0, q, kQRows, columns, stream);
+        detail::exl3_copy_rows(whole, kQRows, k, kKvRows, columns, stream);
+        detail::exl3_copy_rows(whole, kQRows + kKvRows, gate, kQRows, columns, stream);
+        detail::exl3_copy_rows(whole, kQRows + kKvRows + kQRows, v, kKvRows, columns, stream);
+        return;
+    }
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -205,6 +233,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::FP32:
     case QType::INT32:
         break;
+    case QType::EXL3_MUL1:
+        if (parent_rows != 14336 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported EXL3 profile");
+        }
+        // The decoded parent [14336,T] plus the rotated activation [5120,T] it consumes.
+        return static_cast<std::size_t>(max_tokens) * (14336ULL * 2 + 5120ULL * 4);
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }

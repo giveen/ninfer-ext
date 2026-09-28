@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
+#include "ops/linear/exl3/exl3_dispatch.h"
+#include "ninfer/ops/residual_add.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -137,6 +139,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::EXL3_MUL1) {
+        // The decoded output [output_rows,T] plus the rotated activation [input_rows,T].
+        return static_cast<std::size_t>(max_tokens) *
+               (static_cast<std::uint64_t>(output_rows) * 2 +
+                static_cast<std::uint64_t>(input_rows) * 4);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -154,6 +162,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
+    }
+
+    if (w.qtype == QType::EXL3_MUL1) {
+        auto scope = ws.scope();
+        const DeviceSpan storage = ws.alloc_bytes(static_cast<std::size_t>(w.n) * t * 2, 16);
+        Tensor whole(storage.data, DType::BF16, {w.n, t});
+        detail::exl3_dispatch(x, w, whole, policy, ws, stream);
+        ops::residual_add(whole, residual_out, stream);
+        return;
     }
 
     if (w.qtype == QType::BF16) {
