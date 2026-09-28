@@ -196,7 +196,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
 | M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode), the decode GEMV (single-column FFMA plus the small-m tensor-core verify), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in; the end-to-end speed report remains |
-| M5 | In progress | Recipe optimization | Uniform `-hq` artifacts at 3.0 / 3.5 / 4.0 bpw -- 12.47 / 13.91 / 15.35 GiB, PPL 4.38399 / 4.31009 / 4.29390. On the plan's KLD-vs-BF16 metric the five artifacts rank 4.0 bpw 0.0332 < Q4 0.0429 < NVFP4 0.0510 < 3.5 bpw 0.0624 < 3.0 bpw 0.1018, reproduced in both halves of the reference: **4.0 bpw beats Q4 and NVFP4 on both metrics**, while 3.5 bpw's PPL advantage over them does not survive the divergence. The sensitivity-based layer allocation was measured and rejected; the odd half-rate decode is fast. |
+| M5 | Complete | Recipe optimization | Uniform `-hq` artifacts at 3.5 and 4.0 bpw -- 13.91 / 15.35 GiB, PPL 4.31009 / 4.29390. On the plan's KLD-vs-BF16 metric (2,940 positions at context 4096 / stride 2048, ordering reproduced in both halves of the reference) the artifacts rank 4.0 bpw 0.0332 < Q4 0.0429 < NVFP4 0.0510 < 3.5 bpw 0.0624: **4.0 bpw beats Q4 and NVFP4 on both metrics and is smaller than both**, while 3.5 bpw's PPL advantage over them does not survive the divergence. The 3.0 bpw tier was built, measured worst on both metrics, and removed. The sensitivity-based layer allocation was measured and rejected; the odd half-rate decode is fast. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
 | M7 | Pending | Reference KLD | **M7a**: a logits-export route plus `ninfer-perplexity --reference FILE` and a KL accumulator, with the reference produced externally -- this lands M5's KLD evidence. **M7b**: `ninfer-reference`, an offline app that streams the BF16 `.ninfer` and writes the exact per-position distribution file, removing the external dependency. Done when the KLD agrees with an FP64 oracle and every M5 point carries a KLD. Design and gaps in section 9. |
 
@@ -733,6 +733,10 @@ Staged so M5's evidence lands first:
   and the absurd magnitude gave them away. Guarded now by a Python test on the writer's byte layout, the C++
   reader/KL oracle test, and `tools/perplexity/check_reference.py`, which asserts a reference predicts its
   own text (argmax == next token, 60.8% healthy against 1.8% broken).
+- 2026-09-28: The 3.0 bpw tier is removed. It measured worst of the five on KL divergence (0.1018 against
+  4.0 bpw's 0.0332) and behind Q4 on PPL, so its only argument was being the smallest artifact, and the user
+  judged that not worth shipping. `models/qwen3_8_27b_exl3_3bpw.ninfer` and the two redistributed allocation
+  variants are deleted, leaving 3.5 and 4.0 bpw; the progress log keeps their measurements.
 
 ## M3 status and decisions
 
