@@ -169,7 +169,7 @@ int run_case(std::int32_t n, std::int32_t k, int half_bits, std::int32_t columns
     const double relative = max_abs > 0.0 ? max_error / max_abs : max_error;
     if (relative > 2.0e-2) {
         std::cerr << "EXL3 linear N=" << n << " K=" << k << " T=" << columns
-                  << " relative error " << relative << '\n';
+                  << " half_bits=" << half_bits << " relative error " << relative << '\n';
         ++failures;
     }
 
@@ -321,7 +321,7 @@ int main() {
         return 77;
     }
     try {
-        for (const int rate : {3, 4, 8, 10, 12}) {
+        for (const int rate : {3, 4, 5, 7, 8, 9, 10, 12}) {
             run_case(128, 128, rate, 1, 101U);
             run_case(128, 128, rate, 4, 102U);
             run_case(128, 128, rate, 7, 103U);

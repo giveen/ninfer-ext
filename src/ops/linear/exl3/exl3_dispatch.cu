@@ -92,6 +92,39 @@ __device__ __forceinline__ void exl3_windows_4bit(const std::uint32_t* tile, int
     d[7] = mul1_value(static_cast<std::uint16_t>((b >> 16) & 0xFFFFU));
 }
 
+// Odd half bits (KA + 0.5 bpw, mul1): positions alternate KA and KA+1 bits, so four consecutive
+// windows share one 18 + 3*KA bit field and a lane's eight windows are two such fields. One funnel
+// shift per field yields four windows by shifting the 32-bit result, the structure exllamav3's
+// dq8_half uses. The field must fit the funnel result, i.e. 18 + 3*KA <= 32 (up to 4.5 bpw, where
+// exllamav3's half-rate kernels stop); wider half rates keep the bitwise decode.
+__device__ __forceinline__ bool exl3_half_fast(int half_bits) {
+    return (half_bits & 1) != 0 && 18 + 3 * (half_bits >> 1) <= 32;
+}
+
+__device__ __forceinline__ void exl3_windows_half(const std::uint32_t* tile, int lane,
+                                                  int half_bits, float d[8]) {
+    const int ka     = half_bits >> 1;
+    const int span   = 18 + 3 * ka;
+    const int words  = 4 * half_bits;
+    const int total  = words * 32;
+    const int off[4] = {0, ka + 1, 2 * ka + 1, 3 * ka + 2};
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const int t0    = 8 * lane + 4 * g;
+        const int end   = (t0 + 4) * ka + (t0 + 4) / 2; // end bit of the group's last window
+        int begin       = end - span;
+        if (begin < 0) { begin += total; }
+        const int w0    = begin >> 5;
+        const int shift = begin & 31;
+        const int w1    = (w0 + 1 == words) ? 0 : w0 + 1;
+        const std::uint32_t field = __funnelshift_r(tile[w0], tile[w1], shift);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            d[4 * g + j] = mul1_value(static_cast<std::uint16_t>((field >> off[j]) & 0xFFFFU));
+        }
+    }
+}
+
 // In-place unnormalized 128-point Sylvester Hadamard over 128 shared floats; all 128 threads join.
 __device__ __forceinline__ void butterfly128(float* s, int lane) {
     for (int stride = 1; stride < 128; stride <<= 1) {
@@ -205,7 +238,7 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
             tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
         float d[8];
-        if (bits == 4) {
+        if (half_bits == 8) {
             exl3_windows_4bit(tile32, lane, d);
         } else if (fast) {
             // A four-window group can span more than 32 bits at 5 and 6 bits per weight, so resolve it
@@ -224,6 +257,8 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
                 d[4 + i] = mul1_value(
                     static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
             }
+        } else if (exl3_half_fast(half_bits)) {
+            exl3_windows_half(tile32, lane, half_bits, d);
         } else {
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
@@ -350,7 +385,7 @@ __global__ void exl3_gemv_mma(const float* __restrict__ u,
             tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
         float d[8];
-        if (bits == 4) {
+        if (half_bits == 8) {
             exl3_windows_4bit(tile32, lane, d);
         } else if (fast) {
             const unsigned long long w0 =
@@ -367,6 +402,8 @@ __global__ void exl3_gemv_mma(const float* __restrict__ u,
                 d[4 + i] = mul1_value(
                     static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
             }
+        } else if (exl3_half_fast(half_bits)) {
+            exl3_windows_half(tile32, lane, half_bits, d);
         } else {
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
@@ -452,13 +489,16 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
 
         const std::uint8_t* tile8 = warp_tile + static_cast<std::size_t>(kt) * tile_stride;
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
-        float d[2][4];
+        float d[8];
+        if (fast) {
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < 8; ++i) { d[i] = exl3_window_value(tile32, plan[i], words); }
+        } else if (exl3_half_fast(half_bits)) {
+            exl3_windows_half(tile32, lane, half_bits, d);
+        } else {
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                d[h][r] = fast ? exl3_window_value(tile32, plan[4 * h + r], words)
-                               : mul1_value(tile_state(tile8, half_bits, 8 * lane + 4 * h + r));
+            for (int i = 0; i < 8; ++i) {
+                d[i] = mul1_value(tile_state(tile8, half_bits, 8 * lane + i));
             }
         }
         if (probe_sigma > 0.0F) {
@@ -468,17 +508,17 @@ __global__ void exl3_mma(const float* __restrict__ u, const std::uint8_t* __rest
                 for (int r = 0; r < 4; ++r) {
                     const int nn = n_base + h * 8 + (lane >> 2);
                     const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
-                    d[h][r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
-                                                            static_cast<std::uint32_t>(kk),
-                                                            probe_seed);
+                    d[4 * h + r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
+                                                                 static_cast<std::uint32_t>(kk),
+                                                                 probe_seed);
                 }
             }
         }
         std::uint32_t b[2][2];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            b[h][0] = pack_bf16x2(d[h][0], d[h][1]);
-            b[h][1] = pack_bf16x2(d[h][2], d[h][3]);
+            b[h][0] = pack_bf16x2(d[4 * h + 0], d[4 * h + 1]);
+            b[h][1] = pack_bf16x2(d[4 * h + 2], d[4 * h + 3]);
         }
 
         std::uint32_t a[MT][4];

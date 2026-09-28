@@ -560,6 +560,28 @@ bit.
   odd run's 163), confirming the odd-half-bit fallback. M5 therefore keeps the uniform `-hq` recipe for its
   points and reports the PPL-vs-size frontier; the layer allocation is dropped, and a sweep re-measured at
   the operating error is the prerequisite for reviving it.
+- 2026-09-28: M5 consults exllamav3, and ports its half-rate decode. Reading the reference settled three
+  things. (1) EXL3 `K` is an integer 1..8 or a half-integer **1.5 / 2.5 / 3.5** (mul1 only;
+  `quant/bits_k.cuh`), and `k2_from_K = 2*bits + half` is exactly NInfer's `bitrate_half_bits` -- so 3.5 bpw
+  is a first-class rate and the M5 point is uniform 3.5, not a 6/8 mix. NInfer's 2..16 is a superset: it also
+  admits 4.5/5.5/6.5/7.5 bpw, which `bits_from_K` rejects. (2) exllamav3's
+  `conversion/allocation.py::create_q_strategy` floors every tensor at `floor(bpw)`, then spends the
+  remainder promoting groups one step at a time ordered by group priority and then by distance to the nearer
+  end of the forward pass -- "End layers contribute disproportionately to end-to-end error" -- with the
+  sensitivity recipe only an optional path (`create_q_strategy_from_recipe`). Its prior is the opposite of
+  our measured layer signal and agrees with what the corpus showed when the tail was demoted. Also
+  `-hq` is mostly an MoE knob: in `architecture/qwen3_5.py`, `select_hq_bits = 2 if use_moe else 0`, so on
+  this dense model exllamav3 promotes nothing while NInfer's `-hq` raises `attention/*` by a bit. (3)
+  exllamav3 decodes the half rates fast (`exl3_dq.cuh::dq8_half`, instances `comp_units/exl3_comp_unit_h{1,2,3}`):
+  consecutive windows alternate KA and KA+1 bits, so four share an `18 + 3*KA` bit field taken with one funnel
+  shift. NInfer's odd fallback was the 16-iteration `tile_state`; `exl3_windows_half` ports the funnel form
+  for `18 + 3*KA <= 32` (up to 4.5 bpw, where exllamav3 stops) in the GEMV, small-m GEMV and tiled MMA,
+  leaving wider half rates on the bitwise decode. Adding rates 5, 7 and 9 to the A16 oracle also exposed a
+  latent bug: both GEMVs guarded their 4-bit specialisation on `bits == 4`, and `bits = half_bits >> 1` is 4
+  for **both** 8 and 9, so 4.5 bpw was decoded with the 4-bit kernel (which also wraps in a 32-word tile that
+  a 36-word rate does not have). The guard is now `half_bits == 8`; the scoring path was unaffected because
+  the tiled MMA branches on `half_bits & 1`, so the 3.5 bpw point's PPL was and is valid while its decode was
+  not.
 
 ## M3 status and decisions
 
