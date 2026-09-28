@@ -43,6 +43,29 @@ std::optional<Key> site_for(const std::string& name) {
     if (name == "text/output_head") {
         return std::make_pair(static_cast<int>(Site::OutputHead), -1);
     }
+    // The MTP layer's activations: one layer (sentinel -1), the trunk's final hidden state plus the
+    // next-token embedding at the stem, then its own attention and MLP. Its MLP reuses the Mlp sites
+    // because ffn() observes them with the same -1 sentinel.
+    if (name == "mtp/input_projection") {
+        return std::make_pair(static_cast<int>(Site::MtpStem), -1);
+    }
+    const auto mtp_prefix = std::string("mtp/layers/");
+    if (name.starts_with(mtp_prefix)) {
+        const std::size_t slash = name.find('/', mtp_prefix.size());
+        if (slash == std::string::npos) { return std::nullopt; }
+        const std::string tail = name.substr(slash + 1);
+        const auto mtp_key     = [](Site site) {
+            return std::make_pair(static_cast<int>(site), -1);
+        };
+        if (tail == "attention/query" || tail == "attention/key" || tail == "attention/gate" ||
+            tail == "attention/value") {
+            return mtp_key(Site::MtpAttentionInput);
+        }
+        if (tail == "attention/output") { return mtp_key(Site::MtpAttentionOutput); }
+        if (tail == "mlp/gate" || tail == "mlp/up") { return mtp_key(Site::MlpInput); }
+        if (tail == "mlp/down") { return mtp_key(Site::MlpActivation); }
+        return std::nullopt;
+    }
     if (!name.starts_with(layer_prefix)) { return std::nullopt; }
     const std::size_t slash = name.find('/', layer_prefix.size());
     if (slash == std::string::npos) { return std::nullopt; }
@@ -211,6 +234,23 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
     engine_options.purpose       = ninfer::EnginePurpose::CausalScoring;
     engine_options.device        = device;
     engine_options.max_context   = trace.row_tokens;
+    // The MTP layer only runs when its backend is selected, so its activations would otherwise go
+    // unobserved and its Hessians unwritten. Scoring still returns the trunk's logits; the MTP
+    // prefill is extra work, done only for an artifact that carries an MTP component.
+    bool has_mtp = false;
+    for (const auto& [key, value] : names) {
+        for (const auto& name : value) {
+            if (name.starts_with("mtp/")) {
+                has_mtp = true;
+                break;
+            }
+        }
+        if (has_mtp) { break; }
+    }
+    if (has_mtp) {
+        engine_options.speculative.backend      = SpeculativeBackend::Mtp;
+        engine_options.speculative.draft_tokens = 1;
+    }
     ninfer::Engine engine(std::move(engine_options));
 
     for (std::size_t group_index = 0; group_index < groups.size(); ++group_index) {

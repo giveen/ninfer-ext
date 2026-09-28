@@ -32,4 +32,12 @@ void write_f32_file(const std::filesystem::path& path, std::span<const float> va
     if (!out) { throw std::runtime_error("write failed: " + path.string()); }
 }
 
+std::vector<float> identity_hessian(std::uint64_t k) {
+    std::vector<float> values(static_cast<std::size_t>(k * k), 0.0F);
+    for (std::uint64_t i = 0; i < k; ++i) {
+        values[static_cast<std::size_t>(i * k + i)] = 1.0F;
+    }
+    return values;
+}
+
 } // namespace ninfer::quantize::app

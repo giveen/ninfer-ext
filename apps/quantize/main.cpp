@@ -157,14 +157,21 @@ int main(int argc, char** argv) {
             const std::vector<float> nk = app::read_parameter_matrix(reader, parameter);
             const std::filesystem::path hessian_path =
                 options.hessians / (stem + ".h.f32");
-            if (!std::filesystem::is_regular_file(hessian_path)) {
-                // No calibration Hessian (for example an MTP projection): leave the parameter at
-                // its stored precision rather than quantizing it without calibration.
+            std::vector<float> hessian;
+            if (std::filesystem::is_regular_file(hessian_path)) {
+                hessian = app::read_hessian_f32(hessian_path, k);
+            } else if (parent.key.starts_with("mtp/")) {
+                // An MTP projection the calibration could not observe still has to be quantized:
+                // leaving it at its stored precision makes the artifact unloadable, because BF16 has
+                // no MTP geometry. Fall back to the uncalibrated identity Hessian.
+                hessian = app::identity_hessian(k);
+            } else {
+                // No calibration Hessian for a Text projection: leave the parameter at its stored
+                // precision rather than quantizing it without calibration.
                 ++skipped;
                 continue;
             }
             const std::vector<float> kn = app::transpose_to_kn(nk, n, k);
-            const std::vector<float> hessian = app::read_hessian_f32(hessian_path, k);
 
             const std::uint64_t tile_states = (n / 16) * (k / 16) * 256;
             DeviceBuffer<float> d_w;

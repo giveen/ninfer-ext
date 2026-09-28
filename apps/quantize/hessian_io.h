@@ -14,6 +14,10 @@ namespace ninfer::quantize::app {
 [[nodiscard]] std::vector<float> read_hessian_f32(const std::filesystem::path& path,
                                                   std::uint64_t k);
 
+// A k x k identity: the uncalibrated Hessian, which makes the quantizer minimize the plain
+// reconstruction error. Used for a projection the calibration cannot observe.
+[[nodiscard]] std::vector<float> identity_hessian(std::uint64_t k);
+
 void write_f32_file(const std::filesystem::path& path, std::span<const float> values);
 
 } // namespace ninfer::quantize::app

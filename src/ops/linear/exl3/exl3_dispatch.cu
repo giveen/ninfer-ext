@@ -129,10 +129,15 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
 constexpr int kExl3GemvSplits = 32;
 constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the tiled MMA at
 
+// T_MAX columns share one decode of the trellis tile: the weight is the expensive operand, and the
+// verify pass runs the same weight against every drafted token. Each lane keeps T_MAX x 8
+// accumulators (its two n8 groups by four k positions), which the tensor-core GEMV of the reference
+// gets from the C fragment; here it is 8 floats per column.
+template <int T_MAX>
 __global__ void exl3_gemv_split(const float* __restrict__ u,
                                 const std::uint8_t* __restrict__ trellis,
                                 float* __restrict__ partial, int k_extent, int n_extent,
-                                int half_bits) {
+                                int half_bits, int columns) {
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
     const int n_tile  = blockIdx.x * 8 + warp;
@@ -162,15 +167,22 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
         wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
     }
 
-    float a0[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4
-    float a1[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4 + 8
+    float a0[T_MAX][4];
+    float a1[T_MAX][4];
+#pragma unroll
+    for (int t = 0; t < T_MAX; ++t)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            a0[t][i] = 0.0F;
+            a1[t][i] = 0.0F;
+        }
+
     const std::uint8_t* tile_base =
         trellis + static_cast<std::size_t>(n_tile) * kt_tiles * (16 * half_bits);
     for (int kt = kt_begin; kt < kt_end; ++kt) {
         const std::uint8_t* tile8 =
             tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
-        const float* uk             = u + kt * 16;
         float d[8];
         if (bits == 4) {
             exl3_windows_4bit(tile32, lane, d);
@@ -198,26 +210,37 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
             }
         }
 #pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            const int local = r & 3;
-            const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
-            if (r < 4) {
-                a0[local] = fmaf(d[r], uk[k], a0[local]);
-            } else {
-                a1[local] = fmaf(d[r], uk[k], a1[local]);
+        for (int t = 0; t < T_MAX; ++t) {
+            const bool active = t < columns;
+            const float* uk   = u + static_cast<std::size_t>(active ? t : 0) * k_extent + kt * 16;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int local = r & 3;
+                const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
+                const float operand = active ? uk[k] : 0.0F;
+                if (r < 4) {
+                    a0[t][local] = fmaf(d[r], operand, a0[t][local]);
+                } else {
+                    a1[t][local] = fmaf(d[r], operand, a1[t][local]);
+                }
             }
         }
     }
-    float acc0 = (a0[0] + a0[1]) + (a0[2] + a0[3]);
-    float acc1 = (a1[0] + a1[1]) + (a1[2] + a1[3]);
-    acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 2);
-    acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 1);
-    acc1 += __shfl_down_sync(0xFFFFFFFFU, acc1, 2);
-    acc1 += __shfl_down_sync(0xFFFFFFFFU, acc1, 1);
-    if ((lane & 3) == 0) {
-        const int g = lane >> 2;
-        atomicAdd(&partial[n_base + g], acc0);
-        atomicAdd(&partial[n_base + g + 8], acc1);
+#pragma unroll
+    for (int t = 0; t < T_MAX; ++t) {
+        if (t >= columns) { break; }
+        float acc0 = (a0[t][0] + a0[t][1]) + (a0[t][2] + a0[t][3]);
+        float acc1 = (a1[t][0] + a1[t][1]) + (a1[t][2] + a1[t][3]);
+        acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 2);
+        acc0 += __shfl_down_sync(0xFFFFFFFFU, acc0, 1);
+        acc1 += __shfl_down_sync(0xFFFFFFFFU, acc1, 2);
+        acc1 += __shfl_down_sync(0xFFFFFFFFU, acc1, 1);
+        if ((lane & 3) == 0) {
+            const int g = lane >> 2;
+            float* column = partial + static_cast<std::size_t>(t) * n_extent;
+            atomicAdd(&column[n_base + g], acc0);
+            atomicAdd(&column[n_base + g + 8], acc1);
+        }
     }
 }
 
@@ -248,6 +271,96 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Small-m tensor-core GEMV: the verify pass runs one weight against up to eight drafted tokens, so
+// the m16n8k16 A fragment carries the tokens and one C fragment carries all of them. The reference's
+// exl3_gemv_kernel does exactly this for 2 <= m <= 8. The FFMA alternative needs eight accumulators
+// per column (128 registers at four columns, halving occupancy), which is why it loses.
+__global__ void exl3_gemv_mma(const float* __restrict__ u,
+                              const std::uint8_t* __restrict__ trellis,
+                              float* __restrict__ partial, int k_extent, int n_extent,
+                              int half_bits, int columns) {
+    const int lane    = threadIdx.x & 31;
+    const int warp    = threadIdx.x >> 5;
+    const int n_tile  = blockIdx.x * 8 + warp;
+    const int n_base  = n_tile * 16;
+    if (n_base >= n_extent) { return; }
+    const int kt_tiles = k_extent / 16;
+    const int splits   = gridDim.y;
+    const int per      = (kt_tiles + splits - 1) / splits;
+    const int kt_begin = blockIdx.y * per;
+    const int kt_end   = min(kt_tiles, kt_begin + per);
+    const int bits     = half_bits >> 1;
+    const int words    = 4 * half_bits;
+    const bool fast    = (half_bits & 1) == 0;
+
+    int wlo0 = 0, wn0 = 0, sft0 = 0, wlo1 = 0, wn1 = 0, sft1 = 0;
+    if (fast && bits != 4) {
+        const int total = words * 32;
+        const int s0    = ((8 * lane + 1) * bits - 16 + total) % total;
+        const int s1    = ((8 * lane + 5) * bits - 16 + total) % total;
+        wlo0            = s0 >> 5;
+        sft0            = s0 & 31;
+        wn0             = (wlo0 + 1 == words) ? 0 : wlo0 + 1;
+        wlo1            = s1 >> 5;
+        sft1            = s1 & 31;
+        wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
+    }
+
+    // A fragment: rows are the drafted tokens (only rows < columns exist), the k pair is the lane's.
+    const int row = lane >> 2;
+    const int col = (lane & 3) * 2;
+    float c[2][4] = {{0.0F, 0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 0.0F}};
+
+    const std::uint8_t* tile_base =
+        trellis + static_cast<std::size_t>(n_tile) * kt_tiles * (16 * half_bits);
+    for (int kt = kt_begin; kt < kt_end; ++kt) {
+        const std::uint8_t* tile8 =
+            tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
+        const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
+        float d[8];
+        if (bits == 4) {
+            exl3_windows_4bit(tile32, lane, d);
+        } else if (fast) {
+            const unsigned long long w0 =
+                (static_cast<unsigned long long>(tile32[wn0]) << 32) | tile32[wlo0];
+            const unsigned long long w1 =
+                (static_cast<unsigned long long>(tile32[wn1]) << 32) | tile32[wlo1];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[i] = mul1_value(
+                    static_cast<std::uint16_t>((w0 >> (sft0 + bits * i)) & 0xFFFFU));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[4 + i] = mul1_value(
+                    static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                d[r] = mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
+            }
+        }
+        const std::uint32_t b[2][2] = {{pack_bf16x2(d[0], d[1]), pack_bf16x2(d[2], d[3])},
+                                       {pack_bf16x2(d[4], d[5]), pack_bf16x2(d[6], d[7])}};
+        std::uint32_t a[4] = {0U, 0U, 0U, 0U};
+        if (row < columns) {
+            const float* urow = u + static_cast<std::size_t>(row) * k_extent + kt * 16;
+            a[0]              = pack_bf16x2(urow[col], urow[col + 1]);
+            a[2]              = pack_bf16x2(urow[col + 8], urow[col + 9]);
+        }
+        mma_m16n8k16(c[0], a, b[0]);
+        mma_m16n8k16(c[1], a, b[1]);
+    }
+    if (row < columns) {
+        float* out = partial + static_cast<std::size_t>(row) * n_extent + n_base + col;
+        atomicAdd(out, c[0][0]);
+        atomicAdd(out + 1, c[0][1]);
+        atomicAdd(out + 8, c[1][0]);
+        atomicAdd(out + 9, c[1][1]);
+    }
 }
 
 // Tensor-core contraction. A block covers one 128-row Hadamard block and up to 64 tokens. Warp w
@@ -392,7 +505,7 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     const std::size_t u_bytes =
         static_cast<std::size_t>(w.k) * static_cast<std::size_t>(columns) * sizeof(float);
     const std::size_t partial_bytes =
-        columns <= kExl3GemvMaxM ? static_cast<std::size_t>(w.n) * sizeof(float) : 0;
+        columns <= kExl3GemvMaxM ? static_cast<std::size_t>(columns) * w.n * sizeof(float) : 0;
     auto scope               = workspace.scope();
     const DeviceSpan scratch = workspace.alloc_bytes(u_bytes + partial_bytes, 16);
     float* u                 = static_cast<float*>(scratch.data);
@@ -420,20 +533,26 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
                 output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits));
         }
     } else {
-        // Up to kExl3GemvMaxM columns run the GEMV once per column, as exllamav3 does for m <= 8: the
-        // tiled MMA has too few blocks at small m, so re-decoding per column is faster than the pad.
-        // Splitting K only pays while the grid is short of blocks; a vocabulary-sized head already has
-        // thousands of row blocks, so it takes one slice and avoids a scheduling- and atomic-bound grid.
+        // One decode of every trellis tile serves all columns: the verify pass runs each weight
+        // against every drafted token, and the decode, not the multiply, is the cost. T_MAX = 1
+        // keeps the single-column decode byte-for-byte the same. Splitting K only pays while the grid
+        // is short of blocks; a vocabulary-sized head already has thousands of row blocks, so it takes
+        // one slice and avoids a scheduling- and atomic-bound grid.
         const int n_blocks = static_cast<int>(w.n / 128);
         const int splits   = std::min<int>(kExl3GemvSplits, std::max<int>(1, 8192 / n_blocks));
+        const int half_bits = static_cast<int>(w.bitrate_half_bits);
+        const auto* trellis = static_cast<const std::uint8_t*>(w.qdata);
+        CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
+        const dim3 grid(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits));
+        if (columns == 1) {
+            exl3_gemv_split<1><<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits, 1);
+        } else {
+            exl3_gemv_mma<<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits,
+                                                    columns);
+        }
         for (int t = 0; t < columns; ++t) {
-            CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
-            exl3_gemv_split<<<dim3(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits)),
-                              256, 0, stream>>>(
-                u + static_cast<std::size_t>(t) * w.k, static_cast<const std::uint8_t*>(w.qdata),
-                partial, w.k, w.n, static_cast<int>(w.bitrate_half_bits));
             exl3_gemv_finish<<<dim3(static_cast<unsigned>(w.n / 128)), 128, 0, stream>>>(
-                partial, static_cast<const float*>(w.scales),
+                partial + static_cast<std::size_t>(t) * w.n, static_cast<const float*>(w.scales),
                 output + static_cast<std::size_t>(t) * w.n, w.n);
         }
     }

@@ -135,8 +135,13 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
-        if (model_.config().text.architecture == Architecture::Qwen3_5) {
+        out.projection.packed = ops::prepare_linear_weight(inputs);
+        // The dense incremental path projects K/V and Q/gate independently through ops::linear_pair,
+        // which only implements Q8. Every other format runs the complete packed parent through
+        // ops::attn_input_proj instead, so it leaves `rows` empty. Ask the packed parent, not an
+        // individual projection: a row slice of an EXL3 parent is not a valid native Weight.
+        if (model_.config().text.architecture == Architecture::Qwen3_5 &&
+            out.projection.packed.weight.qtype == QType::Q8_G32_FP16) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         }
         out.query_norm  = tensor(a.query_norm);

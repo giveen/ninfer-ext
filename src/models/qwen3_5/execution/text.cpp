@@ -319,6 +319,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     Tensor fc_in = roots.packed_input;
     ops::mtp_pack_fc_input(e, h, fc_in, s);
 
+    observe_projection(CalibrationSite::MtpStem, -1, fc_in, s);
     x = roots.residual;
     project(fc_in, mtp_->input_projection, x, work_, s);
 
@@ -402,6 +403,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     const auto post = workspace::mtp_post_attention(work_, config_, T);
     Tensor o        = post.output;
+    observe_projection(CalibrationSite::MtpAttentionOutput, -1, a, s);
     project(a.view({dimension(config_.attention->query_width()), T}), mtp_->output, o, work_, s);
     ops::residual_add(o, x, s);
 

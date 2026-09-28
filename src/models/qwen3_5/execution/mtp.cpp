@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/mtp.h"
 
 #include "core/layout.h"
+#include "models/qwen3_5/execution/calibration.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/mtp_pack.h"
@@ -60,6 +61,7 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
                     Tensor& value, WorkspaceArena& workspace, cudaStream_t stream) {
     const auto& p = parameters.packed;
+    observe_projection(CalibrationSite::MtpAttentionInput, -1, hidden, stream);
     if (!parameters.rows) {
         ops::attn_input_proj(hidden, p.weight, query, gate, key, value, p.policy, workspace,
                              stream);
@@ -84,6 +86,7 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (parameters.rows) {
+        observe_projection(CalibrationSite::MtpAttentionInput, -1, hidden, stream);
         ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
                          value, stream);
         return;
@@ -98,6 +101,7 @@ void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParamete
                                const AttentionConfig& config, Tensor& query, Tensor& gate,
                                WorkspaceArena& workspace, cudaStream_t stream) {
     if (parameters.rows) {
+        observe_projection(CalibrationSite::MtpAttentionInput, -1, hidden, stream);
         const auto& q = (*parameters.rows)[0];
         const auto& g = (*parameters.rows)[2];
         {

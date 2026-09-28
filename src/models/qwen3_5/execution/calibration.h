@@ -24,6 +24,12 @@ enum class CalibrationSite : int {
     MlpInput,           // input to the MLP gate/up pair
     MlpActivation,      // input to the MLP down projection
     OutputHead,         // input to the vocabulary output head
+    // The MTP layer consumes the trunk's final hidden state and the next-token embedding, so its
+    // activations are not any Text layer's and need their own sites. Its MLP reuses MlpInput /
+    // MlpActivation with the MTP layer sentinel (-1), which no Text layer uses.
+    MtpStem,            // input to mtp/input_projection (the packed hidden + embedding)
+    MtpAttentionInput,  // input to the MTP attention q/k/gate/v parent
+    MtpAttentionOutput, // input to the MTP attention output projection
     Count,
 };
 
