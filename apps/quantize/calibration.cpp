@@ -317,7 +317,9 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                     trace.input_ids.begin() +
                         static_cast<std::ptrdiff_t>(row) * trace.row_tokens + length);
                 ninfer::RequestOptions request;
-                request.execution.requested_output_tokens = 1;
+                // A few output tokens, not one: the MTP attention output and MLP only run in
+                // mtp_forward_tail, which the prefill alone does not reach.
+                request.execution.requested_output_tokens = 4;
                 request.execution.sampling.temperature    = 0.0F;
                 request.stop.include_model_defaults       = false;
                 (void)gen.generate(gen.prepare_tokens(std::move(tokens)), request);

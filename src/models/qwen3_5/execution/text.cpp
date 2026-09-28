@@ -403,8 +403,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     const auto post = workspace::mtp_post_attention(work_, config_, T);
     Tensor o        = post.output;
-    observe_projection(CalibrationSite::MtpAttentionOutput, -1, a, s);
-    project(a.view({dimension(config_.attention->query_width()), T}), mtp_->output, o, work_, s);
+    // The observer wants the projection's 2-D input, not the head-major attention view.
+    Tensor a_flat   = a.view({dimension(config_.attention->query_width()), T});
+    observe_projection(CalibrationSite::MtpAttentionOutput, -1, a_flat, s);
+    project(a_flat, mtp_->output, o, work_, s);
     ops::residual_add(o, x, s);
 
     Tensor mh = post.post_mixer_hidden;
