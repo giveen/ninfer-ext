@@ -146,9 +146,20 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
     const int words    = 4 * half_bits;
     const bool fast    = (half_bits & 1) == 0;
 
-    std::uint16_t plan[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
+    // Even rates resolve the two four-window groups with two lane-constant funnel shifts (exllamav3's
+    // dq4 applied twice); the word indices and shifts do not depend on the k-tile.
+    int wlo0 = 0, wn0 = 0, sft0 = 0, wlo1 = 0, wn1 = 0, sft1 = 0;
+    if (fast && bits != 4) {
+        const int total = words * 32;
+        const int s0    = ((8 * lane + 1) * bits - 16 + total) % total;
+        const int s1    = ((8 * lane + 5) * bits - 16 + total) % total;
+        wlo0            = s0 >> 5;
+        sft0            = s0 & 31;
+        wn0             = (wlo0 + 1 == words) ? 0 : wlo0 + 1;
+        wlo1            = s1 >> 5;
+        sft1            = s1 & 31;
+        wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
+    }
 
     float a0[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4
     float a1[4] = {0.0F, 0.0F, 0.0F, 0.0F}; // n = L/4 + 8
@@ -162,11 +173,27 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
         float d[8];
         if (bits == 4) {
             exl3_windows_4bit(tile32, lane, d);
+        } else if (fast) {
+            // A four-window group can span more than 32 bits at 5 and 6 bits per weight, so resolve it
+            // from a 64-bit window over the lane's word and its successor.
+            const unsigned long long w0 =
+                (static_cast<unsigned long long>(tile32[wn0]) << 32) | tile32[wlo0];
+            const unsigned long long w1 =
+                (static_cast<unsigned long long>(tile32[wn1]) << 32) | tile32[wlo1];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[i] = mul1_value(
+                    static_cast<std::uint16_t>((w0 >> (sft0 + bits * i)) & 0xFFFFU));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[4 + i] = mul1_value(
+                    static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
+            }
         } else {
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
-                d[r] = fast ? exl3_window_value(tile32, plan[r], words)
-                            : mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
+                d[r] = mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
             }
         }
 #pragma unroll
