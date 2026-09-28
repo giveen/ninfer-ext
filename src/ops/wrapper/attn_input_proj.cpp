@@ -237,8 +237,10 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         if (parent_rows != 14336 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported EXL3 profile");
         }
-        // The decoded parent [14336,T] plus the rotated activation [5120,T] it consumes.
-        return static_cast<std::size_t>(max_tokens) * (14336ULL * 2 + 5120ULL * 4);
+        // The decoded parent [14336,T] plus the rotated activation [5120,T] and, at T = 1, the
+        // split-K GEMV's [14336] partial accumulator.
+        return std::max(static_cast<std::size_t>(max_tokens) * (14336ULL * 2 + 5120ULL * 4),
+                        14336ULL * 2 + (14336ULL + 5120ULL) * 4);
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }

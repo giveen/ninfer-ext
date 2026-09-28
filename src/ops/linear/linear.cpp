@@ -151,10 +151,14 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
     case QType::EXL3_MUL1: {
-        // The rotated activation scratch [K,T] FP32.
-        (void)output_rows;
-        return static_cast<std::size_t>(input_rows) *
-               static_cast<std::size_t>(max_tokens) * sizeof(float);
+        // The rotated activation scratch [K,T] FP32 plus, at T = 1, the split-K GEMV's [N] partial
+        // accumulator.
+        const std::size_t rotated = static_cast<std::size_t>(input_rows) *
+                                    static_cast<std::size_t>(max_tokens) * sizeof(float);
+        const std::size_t partial =
+            (static_cast<std::size_t>(input_rows) + static_cast<std::size_t>(output_rows)) *
+            sizeof(float);
+        return std::max(rotated, partial);
     }
     case QType::FP32:
     case QType::INT32:

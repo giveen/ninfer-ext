@@ -140,10 +140,16 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                                min_tokens, max_tokens);
     }
     if (qtype == QType::EXL3_MUL1) {
-        // The decoded output [output_rows,T] plus the rotated activation [input_rows,T].
-        return static_cast<std::size_t>(max_tokens) *
-               (static_cast<std::uint64_t>(output_rows) * 2 +
-                static_cast<std::uint64_t>(input_rows) * 4);
+        // The decoded output [output_rows,T] plus the rotated activation [input_rows,T] and, at
+        // T = 1, the split-K GEMV's [output_rows] partial accumulator.
+        const std::size_t decoded =
+            static_cast<std::size_t>(max_tokens) *
+            (static_cast<std::uint64_t>(output_rows) * 2 +
+             static_cast<std::uint64_t>(input_rows) * 4);
+        const std::size_t partial =
+            static_cast<std::size_t>(output_rows) * 2 +
+            (static_cast<std::size_t>(output_rows) + static_cast<std::size_t>(input_rows)) * 4;
+        return std::max(decoded, partial);
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
