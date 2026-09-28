@@ -196,13 +196,14 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
 | M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (fused trellis→B-fragment decode), the decode GEMV (single-column FFMA plus the small-m tensor-core verify), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in; the end-to-end speed report remains |
-| M5 | In progress | Recipe optimization | Uniform `-hq` artifacts at 3.0 / 3.5 / 4.0 bpw -- 12.47 / 13.91 / 15.35 GiB, PPL 4.38399 / 4.31009 / 4.29390. The 3.5 and 4.0 points beat Q4 (4.34389 at 16.96 GiB) and NVFP4 (4.31493 at 22.09 GiB) at 82%/63% and 91%/70% of their size; 3.0 bpw is 0.9% behind Q4 at 74% of its size. The sensitivity-based layer allocation was measured and rejected (both redistributions lost ~0.22 PPL to the uniform rate), and the odd half-rate decode is now fast. Remaining evidence: the exllamav3 same-text PPL comparison. |
+| M5 | In progress | Recipe optimization | Uniform `-hq` artifacts at 3.0 / 3.5 / 4.0 bpw -- 12.47 / 13.91 / 15.35 GiB, PPL 4.38399 / 4.31009 / 4.29390. The 3.5 and 4.0 points beat Q4 (4.34389 at 16.96 GiB) and NVFP4 (4.31493 at 22.09 GiB) at 82%/63% and 91%/70% of their size; 3.0 bpw is 0.9% behind Q4 at 74% of its size. The sensitivity-based layer allocation was measured and rejected (both redistributions lost ~0.22 PPL to the uniform rate), and the odd half-rate decode is now fast. Remaining evidence: the reference KLD of section 9 -- PPL separates too weakly to compare across engines. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
+| M7 | Pending | Reference KLD | `ninfer-reference` (offline) streams the BF16 `.ninfer` and writes an exact per-position distribution file; `ninfer-perplexity --reference` reads it and reports KLD beside the PPL. Done when the streamed BF16 logits match a trusted BF16 run within tolerance, the KLD agrees with an FP64 oracle, and every M5 point carries a KLD. Design in section 9. |
 
 **Order:** M0 baselines should precede M2/M3 quality work. M1 is independent of the reference
 quantization and self-trace work and can complete while M0 remains open. M0 → M1 → M2 → M3 gives the
 first real 27B EXL3 artifact with measured quality. M4 makes it fast; M5 makes it best-in-class per
-bit.
+bit. M7 supplies M5's KLD evidence and is independent of M4.
 
 ## 8. Risks
 
@@ -214,6 +215,69 @@ bit.
 - **Host-side FP64 oracles** are slow on 17408² Hessians, so they run on small and synthetic cases plus a few sampled real tensors.
 - **FP16 activation range.** Handled by the exact power-of-two prescale; verified on real activations in M3.
 - **27B has one MTP layer:** its quality at its own bitrate affects MTP acceptance, so acceptance rate is reported alongside KLD.
+
+## 9. Reference KLD through a streamed BF16 forward (sketch, 2026-09-28)
+
+M5's named metric is KLD against BF16, and PPL is a poor substitute: on wikitext-2 the exllamav3 3.0 and 4.0
+bpw references span only 0.018 PPL, and a cross-engine PPL needs a matching window protocol that NInfer
+forbids (`stride < context`) while exllamav3 fixes its stride at 2048. One shared BF16 reference removes both
+problems: every artifact is compared to the same distribution at the same scored positions, in either engine.
+
+### 9.1 NInfer can produce that reference itself
+
+The BF16 weights already exist as a streamable `.ninfer`: `models/qwen3.8/bf16.ninfer` (29.8 GiB) plus
+`bf16.ninfer.part-0001` (22.0 GiB), about 52 GiB, against 247 GiB of host RAM and a 30 GiB device. The
+precedent is in-tree: `ninfer-quantize` is a standalone offline app that walks that artifact one layer at a
+time and owns its device allocations. A reference forward is the same kind of tool, so the capability needs no
+other engine and does not touch the serving stance.
+
+### 9.2 Producer and consumer
+
+1. `ninfer-reference` (new offline app): stream the BF16 artifact, score a text under the window protocol
+   `ninfer-perplexity` uses, and write a compact reference file.
+2. `ninfer-perplexity --reference FILE`: score the artifact at the same positions and report KLD alongside the
+   existing per-domain PPL.
+
+Separating them means one reference is computed once and reused by every artifact and every bitrate.
+
+### 9.3 What the reference file holds
+
+The BF16 next-token distribution at each scored position. Full logits are 248,320 x N x 2 B, so a
+2,048-position reference is about 1 GiB in BF16 -- small enough to keep exact rather than approximate. Start
+exact (BF16 logits `[positions, vocab]`, the scored token ids, and the text/protocol tags so the consumer can
+check it scores the same thing). A top-k + logsumexp summary is a size option for later, not a correctness one.
+
+### 9.4 Streaming schedule
+
+Weights stay memory-mapped in host RAM. The small always-resident pieces sit on the device (embedding, final
+norm, head, and the attention/GDN state and KV); the 64 blocks stream on demand with a double buffer: prefetch
+block `i+1` while computing block `i`, release `i`. A full 52 GiB pass is a couple of seconds of PCIe traffic,
+so a few hundred windows is minutes, and the device peak is one block plus the head and the activations -- far
+below the 30 GiB available.
+
+The open design question is how much of the existing composition to reuse. The Executor builds a Program over
+resident weights; this needs the same mathematics with a demand-driven weight source. Two candidates: (a) a
+resident-set contract the Program declares, with the streamer filling the remainder just-in-time, keeping one
+execution path; (b) a dedicated reference executor sharing the Ops but not the scheduling, less invasive.
+Decide before implementing and record it here. BF16 Text/MTP linears already exist -- the quantizer's
+calibration pass re-runs each layer through them -- so the work is coverage at the scoring `T` plus the
+schedule, not new Op mathematics.
+
+### 9.5 Verification
+
+- **The streamed logits are the claim.** Check one window's BF16 logits against a trusted BF16 run on the same
+  text (exllamav3 `-hf`, or a Transformers backend) within BF16 tolerance. One-time evidence, not a runtime
+  dependency.
+- **The KLD agrees with a reference implementation**: compare against exllamav3's
+  `util/measures.py::compute_kl_div`, or an FP64 oracle, on the same two distributions.
+- **The scored positions match** `ninfer-perplexity`'s window protocol, on a short text whose windows can be
+  enumerated by hand.
+
+### 9.6 Scope and non-goals
+
+Offline only. The serving stance is unchanged -- one resident model, one to eight requests, no offload; this is
+not a serving capability and adds none. It is the KLD producer M5 asks for and, once built, a standing quality
+tool; the capability description moves to a maintainer doc when it lands.
 
 ## Progress log
 
