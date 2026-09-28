@@ -466,6 +466,13 @@ bit.
   weights (MLP and GDN at 8 half bits), so the decode GEMV now does the same instead of unpacking a plan and
   funnelling per window. Decode 41.2 -> 62.1 tok/s on a 162-token paragraph. The 5-bit (attention) and 6-bit
   (head) rates still use the generic path.
+- 2026-09-27: M4 5/6-bit extraction and the GEMV floor. The attention projections (5 bits after `-hq`) and
+  the head (6 bits) now resolve each four-window group from a 64-bit window over the lane's word and its
+  successor (exllamav3's `dq4`, widened because a 5- or 6-bit group can exceed 32 bits), with lane-constant
+  word indices and shifts. Decode 62.1 -> 68.6 tok/s; graphsignal then reads the GEMV at **48.4 us/call**
+  against a 49 us DRAM floor for the largest layer projection, so the contraction is now bandwidth-bound and
+  the remaining decode time is the MMA verify/prefill pass (391 ms) and the small ops. The Linear
+  qualification test covers rates 10 and 12 at T = 1.
 
 ## M3 status and decisions
 
