@@ -89,7 +89,10 @@ def produce(args):
             ids = torch.tensor([tokens[begin:end]], device=model.device)
             logits = model(ids).logits[0]
             # Local predictors [first_target, end - begin) predict the tokens after them.
-            for local in range(first_target, end - begin):
+            scored = range(first_target, end - begin)
+            for offset, local in enumerate(scored):
+                if args.sample_stride > 1 and offset % args.sample_stride:
+                    continue
                 positions.append(target_begin + (local - first_target))
                 rows.append(logits[local].float().cpu().numpy())
             print(f" -- window {index + 1}/{len(windows)}: {len(positions)} rows", file=sys.stderr)
@@ -109,6 +112,8 @@ def main():
     parser.add_argument("--stride", type=int, default=2048)
     parser.add_argument("--device-map", default="auto", help="Transformers device_map (auto offloads)")
     parser.add_argument("--windows", type=int, default=0, help="stop after N windows (0 = all)")
+    parser.add_argument("--sample-stride", type=int, default=1,
+                        help="keep every Nth scored position (a full row is 496 KB at vocab 248320)")
     produce(parser.parse_args())
 
 
