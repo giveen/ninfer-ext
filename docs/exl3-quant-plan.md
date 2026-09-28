@@ -737,6 +737,18 @@ Staged so M5's evidence lands first:
   4.0 bpw's 0.0332) and behind Q4 on PPL, so its only argument was being the smallest artifact, and the user
   judged that not worth shipping. `models/qwen3_8_27b_exl3_3bpw.ninfer` and the two redistributed allocation
   variants are deleted, leaving 3.5 and 4.0 bpw; the progress log keeps their measurements.
+- 2026-09-28: A stale-build trap, and the corrected M4 numbers. `build/apps/ninfer` and `build/apps/ninfer-serve`
+  had not been relinked since the M4 kernel rewrite, so the day's speed work was measuring the *pre-M4 SIMT*
+  path: a 1.7 tok/s decode (the M3 log's own SIMT number), a 0.61 s stream sync per token, and a 3.5 bpw
+  artifact that stopped after one token and repeated. `ninfer-perplexity` and the test binaries were fresh, so
+  the same artifacts scored and passed correctly while the apps did not -- which is exactly what made it
+  convincing. After `cmake --build build -j` (and deleting the unused `build-cxx23/` and `build-port/` trees),
+  the same sweep reads: 4.0 bpw 38.5 decode / 315.2 prefill, 97.5 decode with MTP3 at 51.3% acceptance; 3.5 bpw
+  36.7 / 147.6, 100.6 with MTP3 at 52.5%. So the 3.5 artifact is sound and the half-rate decode carries **no
+  decode penalty**, as the oracle tests said. Two items survive the correction: the 3.5 prefill is 2.1x slower
+  than the 4.0's, and the same message renders to 26 tokens on 3.5 against 68 on 4.0. The rule that prevents a
+  repeat: build the app you are about to measure, not just its neighbours. The M4 log's 71 tok/s decode is now
+  38.5, so a real decode regression remains to be explained.
 
 ## M3 status and decisions
 
