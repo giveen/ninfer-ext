@@ -461,6 +461,11 @@ bit.
   k-split is now adaptive, `min(32, max(1, 8192 / (N/128)))`, and each of the eight windows accumulates into
   its own register. Decode 38.2 -> 41.2 tok/s on a 162-token paragraph; a smaller split target (25.9) and a
   larger one (39.4) are both worse. The whole-model GEMV is still about 2.5x the DRAM floor.
+- 2026-09-27: M4 4-bit GEMV extraction. exllamav3's GEMV (`dq8_regs_4bits`) resolves a tile's two words
+  in-warp and takes the eight windows with one funnel plus five BFE16. The 4-bit rates are about 90% of the
+  weights (MLP and GDN at 8 half bits), so the decode GEMV now does the same instead of unpacking a plan and
+  funnelling per window. Decode 41.2 -> 62.1 tok/s on a 162-token paragraph. The 5-bit (attention) and 6-bit
+  (head) rates still use the generic path.
 
 ## M3 status and decisions
 
