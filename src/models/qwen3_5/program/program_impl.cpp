@@ -388,7 +388,8 @@ ProgramImpl::~ProgramImpl() noexcept {
 }
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+                                             std::uint32_t first_target,
+                                             const LogitsSink& logits_sink) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -455,12 +456,27 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             work.reset();
             mark_workspace_usage(workspace_plan.causal_score);
             const auto columns = static_cast<std::int32_t>(staged_columns);
-            Tensor logits      = work.alloc(
-                DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
+            const auto vocab   = static_cast<std::size_t>(
+                parameters.model.config().text.vocab_size);
+            // Global target index of this flush's first column: the logprobs already appended.
+            const std::uint32_t flush_first_target =
+                first_target + static_cast<std::uint32_t>(output.size());
+            Tensor logits = work.alloc(DType::BF16, {static_cast<std::int32_t>(vocab), columns});
             Tensor target_ids = work.alloc(DType::I32, {columns});
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
             execution::output_logits(parameters, hidden, logits, work, device.stream);
+            std::size_t logits_entries = 0;
+            if (logits_sink) {
+                // One staging buffer sized for a full tile, so a smaller later flush never reallocates.
+                logits_entries = vocab * static_cast<std::size_t>(columns);
+                if (!score_logits_host ||
+                    score_logits_host->size() < vocab * kCausalScoreTile * sizeof(std::uint16_t)) {
+                    score_logits_host.emplace(vocab * kCausalScoreTile * sizeof(std::uint16_t));
+                }
+                CUDA_CHECK(cudaMemcpyAsync(score_logits_host->data(), logits.data, logits.bytes(),
+                                                    cudaMemcpyDeviceToHost, device.stream));
+            }
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                                     cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids,
@@ -469,6 +485,14 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
                                                     cudaMemcpyDeviceToHost, device.stream));
             device.synchronize();
+            if (logits_sink) {
+                logits_sink(ScoredLogits{
+                    std::span<const std::uint16_t>(
+                        static_cast<const std::uint16_t*>(score_logits_host->data()),
+                        logits_entries),
+                    static_cast<std::uint32_t>(vocab), static_cast<std::uint32_t>(columns),
+                    flush_first_target});
+            }
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
             staged_targets.clear();

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,20 @@
 namespace ninfer {
 
 using TokenId = std::int32_t;
+
+// Per-position next-token logits from causal scoring: BF16, column-major over [vocab, columns].
+// Column j is the distribution predicting the token at global target index `first_target + j`, so
+// `values` holds `vocab_size * columns` entries. The view is only valid for the duration of the call.
+struct ScoredLogits {
+    std::span<const std::uint16_t> values;
+    std::uint32_t vocab_size   = 0;
+    std::uint32_t columns      = 0;
+    std::uint32_t first_target = 0;
+};
+
+// Invoked once per scoring flush on the scoring worker thread; the sink must return promptly, since
+// the next flush reuses the staging buffer behind `values`.
+using LogitsSink = std::function<void(const ScoredLogits&)>;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;

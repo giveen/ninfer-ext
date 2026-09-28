@@ -296,8 +296,10 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
     return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                         const LogitsSink& logits_sink) {
+    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
+                               logits_sink);
 }
 
 std::optional<AdmissionCandidate> Program::inspect_admission(

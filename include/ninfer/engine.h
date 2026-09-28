@@ -77,9 +77,11 @@ public:
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
-    // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
+    // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()). When `logits`
+    // is set it is also invoked once per scoring flush with the BF16 next-token logits.
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
-                                                  std::uint32_t first_target);
+                                                  std::uint32_t first_target,
+                                                  const LogitsSink& logits = {});
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
