@@ -654,6 +654,16 @@ tool; the capability description moves to a maintainer doc when it lands.
   22.09 GiB. So **3.5 bpw beats both at 82% and 63% of their size**, 4.0 bpw beats them at 91% and 70%, and
   3.0 bpw is 0.9% behind Q4's PPL at 74% of its size. The curve is monotone in every domain, and the two
   redistributed 3.0 bpw artifacts (`_alloc` 4.595, `_even` 4.609) stay out of it.
+- 2026-09-28: M5 external reference, first pass (cross-engine PPL). Both engines scored the identical
+  `wiki.test.raw` (sha256 `173c87a5...`) at 2048 context. NInfer (`--context 2048 --stride 2047`; 297,192
+  scored tokens) gives 3.0 bpw 6.977040, 3.5 bpw 6.895462, 4.0 bpw 6.868214. exllamav3's `eval/ppl.py` on its
+  `exl3-reference` 3bpw and 4bpw (non-overlapping 2048 rows, 145 rows) gives 7.056015 and 7.037993 -- its own
+  3.0 to 4.0 spacing is only 0.018, so the corpus is forgiving, yet NInfer measures 0.08 and 0.17 lower. Two
+  caveats keep this suggestive rather than a claim: NInfer cannot take `stride == context`, so its windows
+  overlap by one token and its scored-token count differs (297,192 against about 296,960); and NInfer's `-hq`
+  raises `attention/*` by a bit while exllamav3's `select_hq_bits` is 0 on this dense model, so the two
+  recipes are not bit-for-bit comparable at equal body bpw. That is the argument for the shared-reference KLD
+  of section 9; this PPL pass stands as the cheap external check.
 
 ## M3 status and decisions
 
