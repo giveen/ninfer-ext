@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/calibration.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/qwen4_expert_pager.h"
 #include "models/qwen3_5/execution/ple_gather.h"
@@ -111,6 +112,7 @@ void output_logits(const Parameters& parameters, const Tensor& hidden, Tensor& l
                    WorkspaceArena& work, cudaStream_t stream) {
     auto scope = work.scope();
     if (!parameters.qwen4) {
+        observe_projection(CalibrationSite::OutputHead, -1, hidden, stream);
         ops::linear(hidden, parameters.text.output_head.weight, logits,
                     parameters.text.output_head.policy, work, stream);
         return;
@@ -118,6 +120,7 @@ void output_logits(const Parameters& parameters, const Tensor& hidden, Tensor& l
     const auto& config = parameters.model.config().text;
     Tensor x           = work.alloc(DType::BF16, {dimension(config.hidden_size), hidden.ne[1]});
     hc_mix(config, parameters.qwen4->head, hidden, x, nullptr, work, stream);
+    observe_projection(CalibrationSite::OutputHead, -1, x, stream);
     ops::linear(x, parameters.text.output_head.weight, logits, parameters.text.output_head.policy,
                 work, stream);
 }
