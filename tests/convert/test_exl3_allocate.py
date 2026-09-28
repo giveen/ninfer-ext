@@ -56,6 +56,29 @@ def _run(tmp_path, layers, bitrate, extra=()):
     return json.loads(out.read_text())
 
 
+def _run_raw(tmp_path, targets, bitrate, extra=()):
+    """Run the allocator over explicit ``(name, numel, kld)`` targets with uniform anchors."""
+    tensors = [{"name": t["name"], "half_bits": 6, "proxy_error": 0.01} for t in targets]
+    (tmp_path / "measurement.json").write_text(
+        json.dumps({"rfn": RFN, "clean_nll": 190000.0, "targets": targets})
+    )
+    (tmp_path / "report.json").write_text(json.dumps({"tensors": tensors}))
+    out = tmp_path / "rates.json"
+    allocate.main(
+        [
+            "--measurement", str(tmp_path / "measurement.json"),
+            "--report", str(tmp_path / "report.json"),
+            "--bitrate", str(bitrate),
+            "--min-k", "2",
+            "--max-k", "16",
+            "--group-by-layer",
+            "--out", str(out),
+            *extra,
+        ]
+    )
+    return json.loads(out.read_text())
+
+
 def test_layer_pooling_and_sensitivity_ordering(tmp_path):
     # Layer 0 carries a large *signed* ΔNLL (the per-tensor sign is noise), layer 63 a small one,
     # and both members of a layer must share the layer's rate. The budget funds two promotions, both
@@ -86,3 +109,28 @@ def test_budget_is_respected_and_head_is_separate(tmp_path):
 def test_target_below_min_k_is_rejected(tmp_path):
     with pytest.raises(ValueError):
         _run(tmp_path, layers=[(0, 1000, [1.0, 1.0])], bitrate=1.0)
+
+
+def test_rate_step_keeps_every_rate_even(tmp_path):
+    # The contraction only fast-paths even half bits; an odd rate silently costs about 4x, so the
+    # even mode must not leak an odd value anywhere, including the head.
+    targets = [
+        {"name": "text/layers/0/mlp/down", "numel": 1000, "kld": 500.0},
+        {"name": "text/layers/1/mlp/down", "numel": 1000, "kld": 5.0},
+    ]
+    rates = _run_raw(tmp_path, targets, bitrate=6.0, extra=("--rate-step", "2"))
+    assert all(value % 2 == 0 for value in rates.values())
+
+
+def test_type_offset_rides_on_top_of_the_layer_base(tmp_path):
+    # attention/* takes the layer base plus the offset, and both the base and the offset are inside
+    # the requested mean.
+    targets = [
+        {"name": "text/layers/0/mlp/down", "numel": 1000, "kld": 500.0},
+        {"name": "text/layers/0/attention/query", "numel": 1000, "kld": 500.0},
+    ]
+    rates = _run_raw(tmp_path, targets, bitrate=6.0, extra=("--offset", "attention:2"))
+    assert rates["text/layers/0/attention/query"] == rates["text/layers/0/mlp/down"] + 2
+    total = sum(t["numel"] for t in targets)
+    spent = sum(t["numel"] * rates[t["name"]] for t in targets)
+    assert abs(spent - 6.0 * total) < total

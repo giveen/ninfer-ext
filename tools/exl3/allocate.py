@@ -39,6 +39,23 @@ def main(argv=None):
         "signal is dominated by the layer axis (about 84x) rather than the projection type (1.3x), "
         "so per-tensor allocation fits mostly noise.",
     )
+    parser.add_argument(
+        "--rate-step",
+        type=int,
+        default=1,
+        help="candidate base rates advance by this many half bits. Use 2 to keep every tensor on the "
+        "tensor-core fast path: the contraction special-cases even half bits and falls back to the "
+        "bit-by-bit reference decode for odd ones, which is about 4x slower.",
+    )
+    parser.add_argument(
+        "--offset",
+        action="append",
+        default=[],
+        metavar="SUBSTRING:DELTA",
+        help="add DELTA half bits to every tensor whose name contains SUBSTRING, e.g. "
+        "attention:2 to keep the uniform recipe's attention promotion. The offset is inside the "
+        "budget, so the base rates absorb it.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -54,6 +71,16 @@ def main(argv=None):
     def layer_key(name):
         match = re.search(r"layers/(\d+)/", name)
         return match.group(1) if match else None
+
+    offsets = []
+    for spec in args.offset:
+        substring, _, delta = spec.rpartition(":")
+        if not substring or not delta:
+            raise ValueError(f"bad --offset {spec!r}, expected SUBSTRING:DELTA")
+        offsets.append((substring, int(delta)))
+
+    def rate_offset(name):
+        return sum(delta for substring, delta in offsets if substring in name)
 
     tensors = []
     for measured in measurement["targets"]:
@@ -74,6 +101,7 @@ def main(argv=None):
                 "rfn0": rfn0,
                 "S": sensitivity,
                 "layer": layer_key(name),
+                "off": rate_offset(name),
             }
         )
 
@@ -98,22 +126,26 @@ def main(argv=None):
     else:
         units = [{"name": t["name"], "numel": t["numel"], "members": [t]} for t in tensors]
 
-    def kld_at(unit, k):
+    def kld_at(unit, base):
+        # Each member is quantized at its base plus its own type offset.
         return sum(
-            m["S"] * (m["rfn0"] * args.bit_ratio ** (k - m["k0"])) ** args.alpha
+            m["S"] * (m["rfn0"] * args.bit_ratio ** (base + m["off"] - m["k0"])) ** args.alpha
             for m in unit["members"]
         )
 
-    # Greedy: every unit starts at min_k, then one bit-per-weight increments go to the largest
-    # marginal KL reduction per storage bit until the budget is spent.
+    # Greedy: every unit starts at min_k, then bit-per-weight increments go to the largest marginal
+    # KL reduction per storage bit until the budget is spent. The type offsets are part of the
+    # budget, so the base rates absorb them:
+    #     sum_t numel_t * rate_t = sum_j unit_numel_j * base_j + sum_t numel_t * off_t
     total = sum(t["numel"] for t in units)
-    budget = args.bitrate * total
+    fixed = sum(t["numel"] * t["off"] for t in tensors)
+    budget = args.bitrate * total - fixed
     k = [args.min_k] * len(units)
     spent = args.min_k * total
     if spent > budget:
-        raise ValueError(f"target {args.bitrate} is below min_k = {args.min_k}")
+        raise ValueError(f"target {args.bitrate} is below min_k = {args.min_k} plus the offsets")
 
-    step = 1.0
+    step = float(args.rate_step)
     heap = []
     for i, t in enumerate(units):
         gain = kld_at(t, args.min_k) - kld_at(t, args.min_k + step)
@@ -135,11 +167,11 @@ def main(argv=None):
     rates = {}
     for i, unit in enumerate(units):
         for member in unit["members"]:
-            rates[member["name"]] = int(round(k[i]))
+            rates[member["name"]] = int(round(k[i])) + member["off"]
     rates["text/output_head"] = args.head_k
     json.dump(rates, open(args.out, "w"), indent=2, sort_keys=True)
 
-    mean_k = spent / total
+    mean_k = (spent + fixed) / total
     print(f" -- {len(units)} allocation units, mean {mean_k:.3f} half bits ({mean_k / 2:.3f} bpw)")
     print(f" -- predicted KL {predicted:.6g} (clean NLL {measurement['clean_nll']:.6f})")
     histogram = {}

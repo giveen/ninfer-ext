@@ -536,6 +536,18 @@ bit.
   is a 4-7 half bit schedule (mean 6.126, 3.06 bpw): layers 0-44 keep 3.0-3.5 bpw and the quiet tail 45-63
   drops to 2.0-2.5 (L56 2.0, L63 2.0); the head is unchanged at 12 half bits. `ninfer-quantize --rates` is
   re-running over the same `hess-all`; the conversion, artifact replacement and full-corpus PPL follow.
+- 2026-09-28: M5 allocation trial -- negative, and an odd-rate slow path. The 3.06 bpw layer allocation
+  converted to 12.44 GiB against the uniform 12.47, and scored **4.595078** on the same corpus -- worse than
+  the uniform 3.0 bpw 4.383991 by 0.21 -- while scoring at 163 tok/s against 452. Two causes are visible.
+  (1) The contraction resolves a window directly for **even** half bits and falls back to the bit-by-bit
+  `tile_state` reference decode for odd ones. The allocation put 40 of 64 layers on 5 or 7 half bits; the
+  fallback is about 4x slower, which is the whole 2.7x. (2) The demotion is real weight error -- the tail's
+  quantizer proxy error rose ~1.99x per half bit below the anchor (L56 0.0136 -> 0.0539, L63 0.0079 -> 0.0504)
+  while promotion only halved it, so `kld ~ rfn^2` over-credited trading the quiet tail for the loud middle.
+  The scheme the allocation displaced also keeps a type prior the pooled measurement does not see: `--hq`
+  promotes only `attention/*` (6.9% of the body numel) by two half bits, and per-layer pooling flattened it.
+  `allocate.py` gained `--rate-step` (even-only rates stay on the fast path) and `--offset SUBSTRING:DELTA`
+  (the type prior, inside the budget); the corrected 3.0 bpw point is re-running.
 
 ## M3 status and decisions
 
