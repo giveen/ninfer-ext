@@ -482,6 +482,17 @@ bit.
   grid.y = 1 and occupancy-starved, a typical short prompt (T = 59) included. The kernel is now templated on
   its tile and T <= 64 takes a 16-column tile. T = 59 TTFT 344 -> 274 ms; long prefill and decode unchanged
   (726 and 68.0 tok/s). The Linear test covers T = 64 and 128.
+- 2026-09-27: M4 MTP. The layer was never quantized: the quantizer skips a projection with no calibration
+  Hessian and MTP had no site, so it stayed BF16 and BF16 has no MTP geometry ([5120,10240] stem, [34816,5120]
+  MLP); the served artifact was Text-only. MTP now has observation sites (the stem, its attention, and the
+  MLP through ffn's existing sites at the -1 sentinel), `site_for` maps the `mtp/` names, and an unobserved MTP
+  projection falls back to the identity Hessian instead of being skipped (the scoring Program forbids a
+  speculative backend, so the calibration cannot enable MTP itself). `Prepare::mtp` builds its dense `rows`
+  split only for Q8, since `ops::linear_pair` implements Q8 alone and a row slice of an EXL3 parent is not a
+  valid native Weight. The verify pass carries the drafted tokens in the m16n8k16 A fragment, as the
+  reference's `exl3_gemv_kernel` does for 2 <= m <= 8; the FFMA multi-column alternative needed 128 registers
+  at four columns and lost 2.4x. Measured: `exl3-mtp.ninfer` `--spec mtp --draft-tokens 3 --fixed-draft` decodes
+  130 tok/s against 71 plain (1.8x, 53% acceptance), verify 53.6 us/call, plain decode unchanged.
 
 ## M3 status and decisions
 
