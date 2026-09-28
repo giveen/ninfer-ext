@@ -74,6 +74,24 @@ __device__ __forceinline__ float exl3_window_value(const std::uint32_t* tile,
         __funnelshift_r(tile[word], tile[next], shift) & 0xFFFFU));
 }
 
+// The eight B-fragment windows of one 16x16 tile at a 4-bit rate, resolved from the lane's word and
+// its circular predecessor with one funnel shift and five bit-field extracts (exllamav3's
+// dq8_regs_4bits). d[r] is the window for state 8*lane + r, which is the state the contraction
+// indexes. The tile is 32 words, so `lane - 1` wraps inside it.
+__device__ __forceinline__ void exl3_windows_4bit(const std::uint32_t* tile, int lane, float d[8]) {
+    const std::uint32_t b = tile[lane];
+    const std::uint32_t a = tile[(lane + 31) & 31];
+    const std::uint32_t s = __funnelshift_r(a, b, 20);
+    d[0] = mul1_value(static_cast<std::uint16_t>(s & 0xFFFFU));
+    d[1] = mul1_value(static_cast<std::uint16_t>((s >> 4) & 0xFFFFU));
+    d[2] = mul1_value(static_cast<std::uint16_t>((s >> 8) & 0xFFFFU));
+    d[3] = mul1_value(static_cast<std::uint16_t>(b & 0xFFFFU));
+    d[4] = mul1_value(static_cast<std::uint16_t>((b >> 4) & 0xFFFFU));
+    d[5] = mul1_value(static_cast<std::uint16_t>((b >> 8) & 0xFFFFU));
+    d[6] = mul1_value(static_cast<std::uint16_t>((b >> 12) & 0xFFFFU));
+    d[7] = mul1_value(static_cast<std::uint16_t>((b >> 16) & 0xFFFFU));
+}
+
 // In-place unnormalized 128-point Sylvester Hadamard over 128 shared floats; all 128 threads join.
 __device__ __forceinline__ void butterfly128(float* s, int lane) {
     for (int stride = 1; stride < 128; stride <<= 1) {
@@ -141,16 +159,24 @@ __global__ void exl3_gemv_split(const float* __restrict__ u,
             tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
         const float* uk             = u + kt * 16;
+        float d[8];
+        if (bits == 4) {
+            exl3_windows_4bit(tile32, lane, d);
+        } else {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                d[r] = fast ? exl3_window_value(tile32, plan[r], words)
+                            : mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
+            }
+        }
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const float d = fast ? exl3_window_value(tile32, plan[r], words)
-                                 : mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
             const int local = r & 3;
             const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
             if (r < 4) {
-                a0[local] = fmaf(d, uk[k], a0[local]);
+                a0[local] = fmaf(d[r], uk[k], a0[local]);
             } else {
-                a1[local] = fmaf(d, uk[k], a1[local]);
+                a1[local] = fmaf(d[r], uk[k], a1[local]);
             }
         }
     }
