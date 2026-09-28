@@ -1,5 +1,6 @@
 #include "corpus.h"
 #include "evaluation.h"
+#include "reference.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -34,6 +35,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using json  = nlohmann::json;
 using ninfer::perplexity::CorpusSelection;
+using ninfer::perplexity::KlAggregate;
 using ninfer::perplexity::ScoreAggregate;
 using ninfer::perplexity::WindowPlan;
 
@@ -42,6 +44,7 @@ struct Options {
     std::filesystem::path artifact;
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
+    std::optional<std::filesystem::path> reference;
     std::optional<std::filesystem::path> output;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -56,6 +59,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--reference <kl-reference>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -117,6 +121,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
+        } else if (option == "--reference") {
+            out.reference = std::filesystem::path(value("--reference"));
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -194,6 +200,13 @@ json aggregate_json(const ScoreAggregate& value) {
                 {"perplexity", value.ppl()}};
 }
 
+json kl_json(const KlAggregate& value) {
+    if (value.rows == 0) { return json{{"rows", 0}}; }
+    return json{{"rows", value.rows},
+                {"total_kl", value.total_kl},
+                {"mean_kl", value.mean_kl()}};
+}
+
 struct EvaluationStream {
     ninfer::perplexity::CorpusStream source;
     std::vector<ninfer::TokenId> tokens;
@@ -214,6 +227,18 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
+
+    ninfer::perplexity::Reference reference;
+    if (options.reference) {
+        reference.load(*options.reference);
+        if (reference.context() != options.context || reference.stride() != options.stride) {
+            throw std::runtime_error(std::format(
+                "reference was built for context/stride {}/{} but this run scores {}/{}",
+                reference.context(), reference.stride(), options.context, options.stride));
+        }
+        logger->info("kl reference | {} rows | vocab {} | text {}", reference.rows(),
+                     reference.vocab_size(), reference.text_digest());
+    }
 
     const Clock::time_point preflight_started = Clock::now();
     logger->info("preparing corpus");
@@ -256,6 +281,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     Clock::time_point next_progress = scoring_started + std::chrono::seconds(10);
     ScoreAggregate overall;
     std::map<std::string, ScoreAggregate> domains;
+    KlAggregate overall_kl;
+    std::map<std::string, KlAggregate> domains_kl;
     json stream_reports             = json::array();
     std::uint64_t completed_windows = 0;
 
@@ -273,6 +300,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         }
         const Clock::time_point stream_started = Clock::now();
         ScoreAggregate stream_score;
+        KlAggregate stream_kl;
         json window_reports = json::array();
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
@@ -281,8 +309,32 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
+            KlAggregate window_kl;
+            const ninfer::LogitsSink logits_sink =
+                options.reference
+                    ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
+                          if (view.vocab_size != reference.vocab_size()) {
+                              throw std::runtime_error(
+                                  "kl reference vocab does not match the model head");
+                          }
+                          for (std::uint32_t column = 0; column < view.columns; ++column) {
+                              const std::uint32_t local = view.first_target + column;
+                              const std::uint32_t target =
+                                  static_cast<std::uint32_t>(window.target_begin) +
+                                  (local - window.first_target);
+                              const std::uint16_t* reference_row = reference.row(target);
+                              if (reference_row == nullptr) { continue; }
+                              window_kl.add(ninfer::perplexity::kl_divergence_row(
+                                  reference_row,
+                                  view.values.data() +
+                                      static_cast<std::size_t>(column) * view.vocab_size,
+                                  view.vocab_size));
+                          }
+                      })
+                    : ninfer::LogitsSink{};
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                logprobs =
+                    engine.score_tokens(std::move(input), window.first_target, logits_sink);
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -297,6 +349,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             stream_score.add(window_score);
             overall.add(window_score);
             domains[stream.source.domain].add(window_score);
+            stream_kl.add(window_kl);
+            overall_kl.add(window_kl);
+            domains_kl[stream.source.domain].add(window_kl);
             ++completed_windows;
             json window_report            = aggregate_json(window_score);
             window_report["index"]        = window_index;
@@ -336,6 +391,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                      ninfer::product::format_pretty_count(stream_score.scored_tokens),
                      stream_score.ppl(), ninfer::product::format_pretty_duration(stream_seconds));
         json stream_report               = aggregate_json(stream_score);
+        stream_report["kl"]              = kl_json(stream_kl);
         stream_report["id"]              = stream.source.id;
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
@@ -344,6 +400,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["seconds"]         = stream_seconds;
         stream_report["windows"]         = std::move(window_reports);
         stream_reports.push_back(std::move(stream_report));
+    }
+
+    if (options.reference && overall_kl.rows == 0) {
+        throw std::runtime_error(
+            "the kl reference scored none of this run's positions (text or protocol mismatch)");
     }
 
     const double scoring_seconds = seconds_since(scoring_started);
@@ -357,6 +418,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     for (const auto& [domain, aggregate] : domains) {
         json item      = aggregate_json(aggregate);
         item["domain"] = domain;
+        item["kl"]     = kl_json(domains_kl.at(domain));
         domain_reports.push_back(std::move(item));
     }
 
@@ -393,6 +455,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"streams", std::move(stream_reports)},
         {"domains", std::move(domain_reports)},
         {"overall", aggregate_json(overall)},
+        {"kl", kl_json(overall_kl)},
     };
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";
@@ -417,6 +480,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     std::println("{:<24}{:>16}{:>16.6f}{:>16.6f}\n", "overall", overall.scored_tokens,
                  overall.mean_nll(), overall.ppl());
+    if (options.reference) {
+        std::println("{:<24}{:>16}{:>16}", "domain", "kl_rows", "mean_kl");
+        for (const auto& [domain, aggregate] : domains_kl) {
+            if (aggregate.rows == 0) { continue; }
+            std::println("{:<24}{:>16}{:>16.6f}", domain, aggregate.rows, aggregate.mean_kl());
+        }
+        std::println("{:<24}{:>16}{:>16.6f}\n", "overall", overall_kl.rows,
+                     overall_kl.mean_kl());
+    }
     std::println("score rate: {:.1f} tok/s",
                  static_cast<double>(overall.scored_tokens) / scoring_seconds);
     std::println("report: {:?}", final.string());

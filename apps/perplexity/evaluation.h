@@ -28,4 +28,18 @@ struct ScoreAggregate {
     [[nodiscard]] double ppl() const;
 };
 
+struct KlAggregate {
+    std::uint64_t rows = 0;
+    double total_kl    = 0.0;
+
+    void add(double kl) noexcept;
+    void add(const KlAggregate& other) noexcept;
+    [[nodiscard]] double mean_kl() const;
+};
+
+// KL(P_reference || P_model) at one position, from two BF16 logits rows of `vocab` entries. The
+// reference is the target distribution, matching exllamav3's util/measures.py::compute_kl_div.
+[[nodiscard]] double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* model,
+                                       std::uint32_t vocab);
+
 } // namespace ninfer::perplexity

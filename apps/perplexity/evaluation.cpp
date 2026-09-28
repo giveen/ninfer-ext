@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -65,5 +66,59 @@ double ScoreAggregate::mean_nll() const {
 }
 
 double ScoreAggregate::ppl() const { return std::exp(mean_nll()); }
+
+void KlAggregate::add(double kl) noexcept {
+    total_kl += kl;
+    ++rows;
+}
+
+void KlAggregate::add(const KlAggregate& other) noexcept {
+    total_kl += other.total_kl;
+    rows += other.rows;
+}
+
+double KlAggregate::mean_kl() const {
+    if (rows == 0) { throw std::logic_error("KL aggregate is empty"); }
+    return total_kl / static_cast<double>(rows);
+}
+
+namespace {
+
+float bf16_to_float(std::uint16_t value) noexcept {
+    const std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+    float result             = 0.0F;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+} // namespace
+
+double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* model,
+                         std::uint32_t vocab) {
+    if (reference == nullptr || model == nullptr || vocab == 0) {
+        throw std::invalid_argument("kl_divergence_row needs two non-empty rows");
+    }
+    float reference_max = -std::numeric_limits<float>::infinity();
+    float model_max     = -std::numeric_limits<float>::infinity();
+    for (std::uint32_t v = 0; v < vocab; ++v) {
+        reference_max = std::max(reference_max, bf16_to_float(reference[v]));
+        model_max     = std::max(model_max, bf16_to_float(model[v]));
+    }
+    double reference_sum = 0.0;
+    double model_sum     = 0.0;
+    for (std::uint32_t v = 0; v < vocab; ++v) {
+        reference_sum += std::exp(static_cast<double>(bf16_to_float(reference[v]) - reference_max));
+        model_sum += std::exp(static_cast<double>(bf16_to_float(model[v]) - model_max));
+    }
+    const double reference_lse = static_cast<double>(reference_max) + std::log(reference_sum);
+    const double model_lse     = static_cast<double>(model_max) + std::log(model_sum);
+    double divergence          = 0.0;
+    for (std::uint32_t v = 0; v < vocab; ++v) {
+        const double reference_logprob = static_cast<double>(bf16_to_float(reference[v])) - reference_lse;
+        const double model_logprob     = static_cast<double>(bf16_to_float(model[v])) - model_lse;
+        divergence += std::exp(reference_logprob) * (reference_logprob - model_logprob);
+    }
+    return divergence;
+}
 
 } // namespace ninfer::perplexity
