@@ -31,7 +31,7 @@ constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 // 5 blocks/SM and the MMA 6, where a tighter cap starts spilling its accumulators -- so they carry
 // separate targets.
 constexpr int kExl3Threads        = 256;
-constexpr int kExl3GemvMinBlocks = 5;
+constexpr int kExl3GemvMinBlocks = 6;
 // The MMA block keeps a [2][TILE_T/16][4] FP32 accumulator per thread; the 6-block register budget
 // (42 registers) cannot hold it and ptxas spills to local memory, so the register target is 3
 // blocks (85 registers) and the 16 KiB shared footprint leaves room for more if registers allow.
