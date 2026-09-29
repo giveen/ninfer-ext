@@ -112,6 +112,19 @@ hidden 5120, intermediate 17408, 64 layers (48 GDN + 16 full attention, `full_at
                       import_encoded from that source; everything else as in the BF16/NVFP4 recipes
 ```
 
+The exact step-4 invocation for the published artifacts (it takes `--proposal` for the indexed
+draft head and the fork's chat template; omitting either was a packaging bug, see the progress log):
+
+```bash
+.venv/bin/python -m tools.convert \
+  --model /mnt/storage/models/qwen3.8/full \
+  --recipe qwen3_8_27b_exl3 --source quantized=/mnt/storage/tmp/store-4bpw/exl3.safetensors \
+  --components text,mtp,vision \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --name qwen3.8-27b --out models/qwen3_8_27b_exl3_4bpw.ninfer \
+  --proposal --device cpu
+```
+
 - Artifact writing stays in one place (the converter). The maths lives in one native tool.
 - An official recipe wraps steps 3–4, so the user-facing flow matches today's: one command per artifact after the trace exists.
 
@@ -195,7 +208,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
-| M4 | Complete | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (per-warp trellis→B-fragment decode, double-buffered `cp.async` BF16 A stage, sub-tiled epilogue) and the decode GEMV (split-K FFMA at T = 1, small-m tensor-core verify at T = 2..8), all consumers, MTP (quantized, calibrated) and Vision are in. On one RTX 5090 at a 2,805-token prompt: prefill **2.29-2.47k tok/s** (TTFT 1.1-1.2 s) and decode **75.6-77.7 tok/s** at 4.0 bpw, against Q4's 2.86k and 78.4 on the same prompt -- 1.17x and 1.03x -- on an artifact 1.6 GiB smaller; the 3.5 bpw artifact prefills at 2.11k and decodes at 64.7, its heavier odd-rate decode being the price of the smaller file. The contraction issues exactly the required MMA count (89,128,960 at the MLP-up shape, identical to Q4's); what remains above Q4 is the funnel, bit-field extracts and `IMAD`/`DP4A` per decoded window that a 4-bit trellis costs and a nibble plane does not. The consumers oracle takes T = 32 and T = 96 so `exl3_mma` is exercised through the consumer row mapping at both tile sizes, and its tolerance is expressed in BF16 ULP of the largest magnitude: the split-K GEMV reassociates its atomic K reduction per launch, so two runs of one parent differ by a few ULP and a 1e-3 relative gate sat below one ULP of a near-max element. |
+| M4 | Complete | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (per-warp trellis→B-fragment decode, double-buffered `cp.async` BF16 A stage, sub-tiled epilogue) and the decode GEMV (split-K FFMA at T = 1, small-m tensor-core verify at T = 2..8), all consumers, MTP (quantized, calibrated, with the indexed proposal head) and Vision are in. On one RTX 5090 at a 7.6k-token prompt: prefill **2.33k tok/s** and decode **75 tok/s** (137 at MTP K=3, 145 at K=5) at 4.0 bpw, against Q4's 2.91k, 83 and 144 -- 1.25x, 1.10x and parity -- on an artifact 1.3 GiB smaller; the 3.5 bpw artifact is 1.72k / 64 / 130, its heavier odd-rate decode being the price of the smaller file. The contraction issues exactly the required MMA count (89,128,960 at the MLP-up shape, identical to Q4's); what remains above Q4 is the funnel, bit-field extracts and `IMAD`/`DP4A` per decoded window that a 4-bit trellis costs and a nibble plane does not. The consumers oracle takes T = 32 and T = 96 so `exl3_mma` is exercised through the consumer row mapping at both tile sizes, and its tolerance is expressed in BF16 ULP of the largest magnitude: the split-K GEMV reassociates its atomic K reduction per launch, so two runs of one parent differ by a few ULP and a 1e-3 relative gate sat below one ULP of a near-max element. |
 | M5 | Complete | Recipe optimization | Uniform `-hq` artifacts at 3.5 and 4.0 bpw -- 13.91 / 15.35 GiB, PPL 4.31009 / 4.29390. On the plan's KLD-vs-BF16 metric (2,940 positions at context 4096 / stride 2048, ordering reproduced in both halves of the reference) the artifacts rank 4.0 bpw 0.0332 < Q4 0.0429 < NVFP4 0.0510 < 3.5 bpw 0.0624: **4.0 bpw beats Q4 and NVFP4 on both metrics and is smaller than both**, while 3.5 bpw's PPL advantage over them does not survive the divergence. The 3.0 bpw tier was built, measured worst on both metrics, and removed. The sensitivity-based layer allocation was measured and rejected; the odd half-rate decode is fast. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
 | M7 | Pending | Reference KLD | **M7a**: a logits-export route plus `ninfer-perplexity --reference FILE` and a KL accumulator, with the reference produced externally -- this lands M5's KLD evidence. **M7b**: `ninfer-reference`, an offline app that streams the BF16 `.ninfer` and writes the exact per-position distribution file, removing the external dependency. Done when the KLD agrees with an FP64 oracle and every M5 point carries a KLD. Design and gaps in section 9. |
@@ -939,6 +952,19 @@ Staged so M5's evidence lands first:
   template and 542 under the base's). Both published tiers need rebuilding so the proposal head, the fork template
   and the corrected performance figures land together; the perplexity and MTP measurements above were taken on the
   artifacts as published, so they must be re-taken against the rebuilt ones.
+- 2026-09-29: Both tiers rebuilt, re-measured and republished. `--proposal --device cpu` with the fork template
+  produced 1060 objects each in ~48 s; the format counts against the old artifacts rise by exactly `q4_g64_fp16`
+  54 -> 55 and `int32` 0 -> 1, so the EXL3 weights are unchanged and only the draft head was added. Sizes are now
+  15.68 GiB (4.0 bpw) and 14.24 GiB (3.5 bpw), 0.33 GiB more each. The template fix is confirmed by token count:
+  the same 2,140-byte prefix is 584 tokens under the base checkpoint's template and 542 under the fork's, and the
+  rebuilt artifacts now both give 542.
+  Re-measured on the rebuilt artifacts, with Q4 and NVFP4 taken in the same session at the same prompt sizes:
+  prefill at 0.54k/7.6k tokens -- EXL3 4.0 bpw 1.97k/2.33k, 3.5 bpw 1.72k/2.11k, Q4 2.42k/2.91k, NVFP4 5.28k/8.60k;
+  decode plain 75 / 64 / 83 / 73; MTP K=3 137 / 130 / 134 / 142; MTP K=5 with `--lm-head-draft` 145 / 131 / 144 /
+  167. The draft head moved the 4.0 bpw tier from 124 to 137-145 tok/s, past Q4's 134-144, and the 3.5 bpw tier from
+  120 to 130-131. Full-corpus perplexity on the rebuilt artifacts is bit-identical again for both tiers (4.293931
+  and 4.310089, every domain), confirming the proposal head does not touch the text path. The card, the README and
+  the sizes were updated, and the artifacts and card re-uploaded.
   Vision was smoke-tested on the 4.0 bpw artifact with `--vision` against `examples/cli/media/visual_chart.png`, whose
   expected content is documented in `examples/cli/README.md`. It returned the title `NIFER VISION 731`, the three red
   circles and the blue square on the left, plus the `COUNT`/`POSITION` labels and a green triangle: HTTP 200 in 2.9 s,

@@ -34,9 +34,9 @@ single-GPU performance.
 
 | File | Size | Notes |
 |---|---|---|
-| [`qwen3_8_27b_exl3_4bpw.ninfer`](./qwen3_8_27b_exl3_4bpw.ninfer) | 15.35 GiB | Text + MTP + Vision, 4.0 bpw body |
+| [`qwen3_8_27b_exl3_4bpw.ninfer`](./qwen3_8_27b_exl3_4bpw.ninfer) | 15.68 GiB | Text + MTP + Vision, 4.0 bpw body |
 | `qwen3_8_27b_exl3_4bpw.ninfer.conversion.json` | 489 KiB | Conversion provenance and per-tensor rates |
-| [`qwen3_8_27b_exl3_3p5bpw.ninfer`](./qwen3_8_27b_exl3_3p5bpw.ninfer) | 13.91 GiB | Text + MTP + Vision, 3.5 bpw body |
+| [`qwen3_8_27b_exl3_3p5bpw.ninfer`](./qwen3_8_27b_exl3_3p5bpw.ninfer) | 14.24 GiB | Text + MTP + Vision, 3.5 bpw body |
 | `qwen3_8_27b_exl3_3p5bpw.ninfer.conversion.json` | 489 KiB | Conversion provenance and per-tensor rates |
 
 Both are the same model at two points on the size curve. **4.0 bpw is the one to lead with**: it is the
@@ -78,10 +78,10 @@ slice:
 
 | Artifact | Size | PPL | KL(P_BF16 ‖ P) |
 |---|---|---|---|
-| **EXL3 4.0 bpw** | **15.35 GiB** | **4.2939** | **0.0332** |
+| **EXL3 4.0 bpw** | **15.68 GiB** | **4.2939** | **0.0332** |
 | Groupwise INT4 | 16.96 GiB | 4.3439 | 0.0429 |
 | NVFP4 | 22.09 GiB | 4.3149 | 0.0510 |
-| EXL3 3.5 bpw | 13.91 GiB | 4.3101 | 0.0624 |
+| EXL3 3.5 bpw | 14.24 GiB | 4.3101 | 0.0624 |
 
 The two metrics rank these differently, and both are reported for that reason: **4.0 bpw wins on both**,
 but 3.5 bpw's better perplexity than INT4 and NVFP4 does *not* survive as divergence. Only the KL
@@ -95,24 +95,23 @@ Measured on one NVIDIA GeForce RTX 5090, CUDA 13.3, a single request, greedy, 64
 
 | Regime | EXL3 4.0 bpw | EXL3 3.5 bpw | Q4 | NVFP4 |
 |---|---|---|---|---|
-| Decode, plain | 76 tok/s | 64 tok/s | 78 tok/s | 71 tok/s |
-| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | 120 tok/s | 134 tok/s | 142 tok/s |
-| Prefill, 0.55k / 7.6k-token prompt | 2.01k / 2.38k tok/s | 1.69k / 2.08k tok/s | 2.35k / 2.82k tok/s | 5.18k / 8.43k tok/s |
+| Decode, plain | 75 tok/s | 64 tok/s | 83 tok/s | 73 tok/s |
+| Decode, MTP K=3 | 137 tok/s | 130 tok/s | 134 tok/s | 142 tok/s |
+| Decode, MTP K=5 + `--lm-head-draft` | 145 tok/s | 131 tok/s | 144 tok/s | 167 tok/s |
+| Prefill, 0.54k / 7.6k-token prompt | 1.97k / 2.33k tok/s | 1.72k / 2.11k tok/s | 2.42k / 2.91k tok/s | 5.28k / 8.60k tok/s |
 
-MTP is measured at a fixed three-token draft on all four so the row compares like with like. Q4 and
-NVFP4 can additionally use `--lm-head-draft`, which reaches 144 and 166 tok/s at K=5; **the EXL3
-artifacts cannot — they do not carry the separate draft-head projection those artifacts have**, so
-`--lm-head-draft` fails at startup with `selected proposal head is absent from artifact`, and raising
-K does not help them (124.6 tok/s at K=5 against 124 at K=3).
+Measuring MTP at **K=3** for all four keeps the draft length equal across formats; the K=5 row is each
+artifact's own best setting, which Q4 and NVFP4 reach with `--lm-head-draft`. Both EXL3 tiers carry the
+indexed proposal head that flag needs, so it is available to them too.
 
-**4.0 bpw** is close to the other native formats: prefill is 1.17–1.18x behind Q4 and decode is within
-3% of it, on an artifact 1.6 GiB smaller (15.35 against 16.96 GiB). NVFP4 remains the prefill leader —
-as it is for this engine's other models — because its tensor-core contraction needs no per-weight
-decoding, which a 4-bit trellis does: the contraction issues exactly the same number of MMAs as Q4's,
-and the difference is the funnel, bit-field extracts and `IMAD`/`DP4A` per decoded window that the
-trellis costs.
+**4.0 bpw** is close to the other native formats on every regime: prefill 1.19–1.23x behind Q4, plain
+decode within 10%, and at a comparable draft length its MTP matches Q4's exactly, on an artifact
+1.3 GiB smaller (15.68 against 16.96 GiB). NVFP4 remains the prefill leader — as it is for this
+engine's other models — because its tensor-core contraction needs no per-weight decoding, which a
+4-bit trellis does: the contraction issues exactly the same number of MMAs as Q4's, and the difference
+is the funnel, bit-field extracts and `IMAD`/`DP4A` per decoded window that the trellis costs.
 
-**3.5 bpw is slower than 4.0 bpw on both regimes**, on the same kernels. Its weights are 9% smaller,
+**3.5 bpw is slower than 4.0 bpw on every regime**, on the same kernels. Its weights are 9% smaller,
 but its odd half-rates take the heavier `exl3_windows_half` window decode — two funnel shifts for the
 eight windows against one funnel and five bit-field extracts — and that costs more than the bytes it
 saves. Its case is size and perplexity per byte, not speed.

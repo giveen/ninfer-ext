@@ -467,8 +467,8 @@ Two artifacts are published for Qwen3.8-27B, both Text + MTP + Vision:
 
 | Artifact | Size | PPL | KL(BF16 ‖ P) |
 |---|---|---:|---:|
-| `qwen3_8_27b_exl3_4bpw.ninfer` | 15.35 GiB | **4.2939** | **0.0332** |
-| `qwen3_8_27b_exl3_3p5bpw.ninfer` | 13.91 GiB | 4.3101 | 0.0624 |
+| `qwen3_8_27b_exl3_4bpw.ninfer` | 15.68 GiB | **4.2939** | **0.0332** |
+| `qwen3_8_27b_exl3_3p5bpw.ninfer` | 14.24 GiB | 4.3101 | 0.0624 |
 
 Perplexity is over 261,167 tokens (context/stride 4096/2048, FP8 KV, greedy) and KL divergence is
 against the full-precision model. 4.0 bpw is the smallest and the best of this fork's Qwen3.8-27B
@@ -481,18 +481,15 @@ Single-request speed on one RTX 5090 (CUDA 13.3, greedy, 64–256 output tokens)
 
 | Regime | EXL3 4.0 bpw | EXL3 3.5 bpw |
 |---|---|---|
-| Decode, plain | 76 tok/s | 64 tok/s |
-| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | 120 tok/s |
-| Prefill, ~0.55k / ~7.6k-token prompt | 2.01k / 2.38k tok/s | 1.69k / 2.08k tok/s |
+| Decode, plain | 75 tok/s | 64 tok/s |
+| Decode, MTP K=3 | 137 tok/s | 130 tok/s |
+| Decode, MTP K=5 + `--lm-head-draft` | 145 tok/s | 131 tok/s |
+| Prefill, ~0.54k / ~7.6k-token prompt | 1.97k / 2.33k tok/s | 1.72k / 2.11k tok/s |
 
-3.5 bpw is slower on both regimes: its odd half-rates take the heavier `exl3_windows_half` window
-decode, which costs more than the 9% of weight bytes it saves.
-
-One caveat on speculation: the EXL3 artifacts do not carry the separate draft-head projection the
-official artifacts have, so `--lm-head-draft` fails at startup
-(`selected proposal head is absent from artifact`) and MTP has to run with `--fixed-draft`. Q4 and
-NVFP4 reach 144 and 166 tok/s with that flag; EXL3 plateaus at ~124. Cross-format single-request
-numbers, the measurement protocol, and everything else about these artifacts are in their
+3.5 bpw is slower on every regime: its odd half-rates take the heavier `exl3_windows_half` window
+decode, which costs more than the 9% of weight bytes it saves. Both tiers carry the indexed proposal
+head `--lm-head-draft` needs. Cross-format single-request numbers, the measurement protocol, and
+everything else about these artifacts are in their
 [model card](../model-cards/ninfer-ext-models/README.md).
 
 ## Performance
