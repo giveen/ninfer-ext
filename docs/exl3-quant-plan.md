@@ -926,6 +926,19 @@ Staged so M5's evidence lands first:
   does not emit the separate draft-head projection the official artifacts carry -- the server refuses at startup with
   "selected proposal head is absent from artifact" and K=5 does not help (124.6). Emitting that projection is the
   follow-up that would close the gap.
+- 2026-09-29: The draft head landed -- one build flag, no code. The EXL3 artifacts simply were not built with
+  `--proposal`: `add_official_proposal` slices the indexed proposal head from
+  `recipe.model.parameters["text/output_head"].source`, which for this recipe is the *dense* base checkpoint's
+  `lm_head`, so it is independent of the head being stored as EXL3. `tools/convert --recipe qwen3_8_27b_exl3
+  --source quantized=... --components text,mtp,vision --proposal` (device cpu; the EXL3 tensors arrive pre-encoded
+  so nothing needs the GPU) writes `proposal/head` q4_g64_fp16 [131072, 5120] and `proposal/token_ids` int32
+  [131072], 1060 objects, 46.5 s. With it, `--lm-head-draft` starts and the 4.0 bpw artifact decodes **137.9-145.3
+  tok/s at K=3 and 146.8 at K=5** against 124 without it -- ahead of Q4's 144 and NVFP4's 166.5. The rebuild also
+  needed the fork's chat template: the recipe build in use had taken the base checkpoint's 8.9 KB one, and the two
+  produce different token counts for the same text (the same 12,000-byte prefix is 584 tokens under the fork
+  template and 542 under the base's). Both published tiers need rebuilding so the proposal head, the fork template
+  and the corrected performance figures land together; the perplexity and MTP measurements above were taken on the
+  artifacts as published, so they must be re-taken against the rebuilt ones.
   Vision was smoke-tested on the 4.0 bpw artifact with `--vision` against `examples/cli/media/visual_chart.png`, whose
   expected content is documented in `examples/cli/README.md`. It returned the title `NIFER VISION 731`, the three red
   circles and the blue square on the left, plus the `COUNT`/`POSITION` labels and a green triangle: HTTP 200 in 2.9 s,
