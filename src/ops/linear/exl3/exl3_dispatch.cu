@@ -201,7 +201,10 @@ constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the ti
 // the served path, where `probe_sigma` is zero: keeping it in the same instantiation costs a uniform
 // branch per k-tile per column and, worse, the probe's temporaries sit in the kernel's register
 // budget, which is what caps this GEMV at five blocks per SM.
-template <int T_MAX, bool kProbe>
+// `kRate4Bit` pins the 4-bit decode, which is the bulk of the model's projections by call count. As
+// a template parameter it removes the per-k-tile rate branch chain from the hot loop and keeps the
+// wide rates' six window registers out of this instantiation's register budget.
+template <int T_MAX, bool kProbe, bool kRate4Bit>
 __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_split(
     const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
     float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns,
@@ -220,23 +223,30 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_sp
     const int per      = (kt_tiles + splits - 1) / splits;
     const int kt_begin = blockIdx.y * per;
     const int kt_end   = min(kt_tiles, kt_begin + per);
-    const int bits     = half_bits >> 1;
-    const int words    = 4 * half_bits;
-    const bool fast    = (half_bits & 1) == 0;
+    const int bits  = half_bits >> 1;
+    const int words = 4 * half_bits;
+    const bool fast = (half_bits & 1) == 0;
+    if constexpr (kRate4Bit) {
+        (void)bits;
+        (void)words;
+        (void)fast;
+    }
 
     // Even rates resolve the two four-window groups with two lane-constant funnel shifts (exllamav3's
     // dq4 applied twice); the word indices and shifts do not depend on the k-tile.
     int wlo0 = 0, wn0 = 0, sft0 = 0, wlo1 = 0, wn1 = 0, sft1 = 0;
-    if (fast && bits != 4) {
-        const int total = words * 32;
-        const int s0    = ((8 * lane + 1) * bits - 16 + total) % total;
-        const int s1    = ((8 * lane + 5) * bits - 16 + total) % total;
-        wlo0            = s0 >> 5;
-        sft0            = s0 & 31;
-        wn0             = (wlo0 + 1 == words) ? 0 : wlo0 + 1;
-        wlo1            = s1 >> 5;
-        sft1            = s1 & 31;
-        wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
+    if constexpr (!kRate4Bit) {
+        if (fast && bits != 4) {
+            const int total = words * 32;
+            const int s0    = ((8 * lane + 1) * bits - 16 + total) % total;
+            const int s1    = ((8 * lane + 5) * bits - 16 + total) % total;
+            wlo0            = s0 >> 5;
+            sft0            = s0 & 31;
+            wn0             = (wlo0 + 1 == words) ? 0 : wlo0 + 1;
+            wlo1            = s1 >> 5;
+            sft1            = s1 & 31;
+            wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
+        }
     }
 
     float a0[T_MAX][4];
@@ -256,7 +266,9 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_sp
             tile_base + static_cast<std::size_t>(kt) * (16 * half_bits);
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
         float d[8];
-        if (half_bits == 8) {
+        if constexpr (kRate4Bit) {
+            exl3_windows_4bit(tile32, lane, d);
+        } else if (half_bits == 8) {
             exl3_windows_4bit(tile32, lane, d);
         } else if (fast) {
             // A four-window group can span more than 32 bits at 5 and 6 bits per weight, so resolve it
@@ -757,11 +769,24 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
         const dim3 grid(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits));
         if (columns == 1) {
-            if (probe_sigma > 0.0F) {
-                exl3_gemv_split<1, true><<<grid, 256, 0, stream>>>(
+            // The 4-bit rate covers most of the model's projections by call count, so pinning it
+            // keeps the rate branch chain and the wide rates' window registers out of that
+            // instantiation; the probe variant is only entered by `ninfer-sensitivity`.
+            const bool rate4 = half_bits == 8;
+            const bool probe = probe_sigma > 0.0F;
+            if (probe) {
+                if (rate4) {
+                    exl3_gemv_split<1, true, true><<<grid, 256, 0, stream>>>(
+                        u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
+                } else {
+                    exl3_gemv_split<1, true, false><<<grid, 256, 0, stream>>>(
+                        u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
+                }
+            } else if (rate4) {
+                exl3_gemv_split<1, false, true><<<grid, 256, 0, stream>>>(
                     u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
             } else {
-                exl3_gemv_split<1, false><<<grid, 256, 0, stream>>>(
+                exl3_gemv_split<1, false, false><<<grid, 256, 0, stream>>>(
                     u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
             }
         } else {
