@@ -447,7 +447,7 @@ int main() {
         return 77;
     }
 
-    int failures = 0;
+    int failures            = 0;
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
     for (int axes : {1, 3}) {

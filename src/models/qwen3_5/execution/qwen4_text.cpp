@@ -348,7 +348,8 @@ void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gi
     }
 
     Tensor on = roots.normalized_output.view({dv, heads, T});
-    ops::gated_rmsnorm_sigmoid(o, p.norm, z.view({dv, heads, T}), config_.rms_norm_eps, on, s);
+    ops::gated_rmsnorm_sigmoid(o, p.norm, z.view({dv, heads, T}), config_.rms_norm_eps, on,
+                               ctx_.execution_view());
     project(on.view({vwidth, T}), p.output, y, work_, s);
 }
 

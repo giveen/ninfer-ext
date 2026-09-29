@@ -592,8 +592,10 @@ private:
 class BenchmarkState {
 public:
     BenchmarkState(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                   ExpertDistribution distribution, std::uint32_t seed)
-        : fixture_(fixture), route_pattern_(make_route_pattern(tokens, distribution, seed)),
+                   ExpertDistribution distribution, std::uint32_t seed,
+                   DeviceExecutionView execution)
+        : fixture_(fixture), execution_(execution),
+          route_pattern_(make_route_pattern(tokens, distribution, seed)),
           input_(static_cast<std::size_t>(tokens) * kHidden * 2),
           residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
@@ -644,11 +646,12 @@ public:
 
     void launch(cudaStream_t stream) {
         ops::sparse_moe(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
-                        destination_tensor_, workspace_, stream);
+                        destination_tensor_, workspace_, execution_.on_stream(stream));
     }
 
 private:
     BenchmarkWeights& fixture_;
+    DeviceExecutionView execution_;
     RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_;
@@ -769,8 +772,10 @@ Stats measure_graph(BenchmarkState& state, const BodyTimedGraph& graph, CacheSta
 }
 
 std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                              const Options& options, cudaStream_t stream) {
-    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed);
+                              const Options& options, DeviceExecutionView device_execution) {
+    const cudaStream_t stream = device_execution.stream;
+    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed,
+                         device_execution);
 
     // Match the production graph lifecycle: materialize eagerly, capture from a
     // reset state, instantiate, then prime one replay before configured warmup.
@@ -878,7 +883,7 @@ int main(int argc, char** argv) {
                                      static_cast<std::size_t>(options.flush_bytes));
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
-                    run_point(fixture, profile, tokens, options, context.stream);
+                    run_point(fixture, profile, tokens, options, context.execution_view());
                 for (const Result& result : point) { print_result(result, peak_memory_gbps); }
                 results.insert(results.end(), std::make_move_iterator(point.begin()),
                                std::make_move_iterator(point.end()));
