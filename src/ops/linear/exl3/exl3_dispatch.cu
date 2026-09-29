@@ -500,13 +500,23 @@ constexpr int kExl3AStages = 2;
 
 // TILE_T is a multiple of 16 (the m16n8k16 m). A smaller tile gives the grid more blocks when the
 // column count is small, which is the difference between an occupancy-starved and a busy kernel.
-template <int TILE_T>
+//
+// `kProbe` and `kRate4Bit` are compile-time switches for the two branches that otherwise sit in the
+// hot K loop: the sensitivity probe's per-window Gaussian (never taken in service) and the
+// half_bits-class chain, which also carries the wide even rates' eight-register window plan. The
+// 4-bit rate is the bulk of the model, and nothing else needs `plan`, so the served 4-bit
+// instantiation carries neither.
+template <int TILE_T, bool kProbe = true, bool kRate4Bit = false>
 __global__ void __launch_bounds__(kExl3Threads, kExl3MmaTarget)
 exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
          int k_extent, int n_extent, int columns, int half_bits,
          float probe_sigma, std::uint32_t probe_seed) {
     constexpr int MT = TILE_T / 16;
+    if constexpr (!kProbe) {
+        (void)probe_sigma;
+        (void)probe_seed;
+    }
     const int n_base   = blockIdx.x * kExl3MmaN;
     const int t0       = blockIdx.y * TILE_T;
     const int lane     = threadIdx.x & 31;
@@ -539,9 +549,18 @@ exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ t
     const std::uint8_t* warp_tile =
         trellis + static_cast<std::size_t>(n_tile) * kt_tiles * tile_stride;
 
+    // The wide even rates resolve a window pair from a lane-constant word/shift plan; the 4-bit
+    // instantiation decodes the tile with `exl3_windows_4bit` and does not carry its eight registers.
     std::uint16_t plan[8];
+    if constexpr (kRate4Bit) {
+        (void)plan;
+        (void)bits;
+        (void)words;
+        (void)fast;
+    } else {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
+        for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
+    }
 
     // One [TILE_T][16] BF16 tile copies as TILE_T*2 16-byte copies (all 256 threads at
     // TILE_T = 64): copy 2c + p fetches token column c's plane p, i.e. its eight k values
@@ -580,7 +599,7 @@ exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ t
 
         const std::uint8_t* tile8 = warp_tile + static_cast<std::size_t>(kt) * tile_stride;
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
-        if (fast) {
+        if (!kRate4Bit && fast) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 float d[4];
@@ -588,14 +607,16 @@ exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ t
                 for (int i = 0; i < 4; ++i) {
                     d[i] = exl3_window_value(tile32, plan[4 * h + i], words);
                 }
-                if (probe_sigma > 0.0F) {
+                if constexpr (kProbe) {
+                    if (probe_sigma > 0.0F) {
 #pragma unroll
-                    for (int r = 0; r < 4; ++r) {
-                        const int nn = n_base + h * 8 + (lane >> 2);
-                        const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
-                        d[r] += probe_sigma *
-                                probe_gaussian(static_cast<std::uint32_t>(nn),
-                                               static_cast<std::uint32_t>(kk), probe_seed);
+                        for (int r = 0; r < 4; ++r) {
+                            const int nn = n_base + h * 8 + (lane >> 2);
+                            const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
+                            d[r] += probe_sigma *
+                                    probe_gaussian(static_cast<std::uint32_t>(nn),
+                                                   static_cast<std::uint32_t>(kk), probe_seed);
+                        }
                     }
                 }
                 const std::uint32_t b0 = pack_bf16x2(d[0], d[1]);
@@ -619,7 +640,9 @@ exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ t
             }
         } else {
             float d[8];
-            if (exl3_half_fast(half_bits)) {
+            if constexpr (kRate4Bit) {
+                exl3_windows_4bit(tile32, lane, d);
+            } else if (exl3_half_fast(half_bits)) {
                 exl3_windows_half(tile32, lane, half_bits, d);
             } else {
 #pragma unroll
@@ -627,16 +650,18 @@ exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ t
                     d[i] = mul1_value(tile_state(tile8, half_bits, 8 * lane + i));
                 }
             }
-            if (probe_sigma > 0.0F) {
+            if constexpr (kProbe) {
+                if (probe_sigma > 0.0F) {
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
+                    for (int h = 0; h < 2; ++h) {
 #pragma unroll
-                    for (int r = 0; r < 4; ++r) {
-                        const int nn = n_base + h * 8 + (lane >> 2);
-                        const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
-                        d[4 * h + r] += probe_sigma * probe_gaussian(
+                        for (int r = 0; r < 4; ++r) {
+                            const int nn = n_base + h * 8 + (lane >> 2);
+                            const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
+                            d[4 * h + r] += probe_sigma * probe_gaussian(
                                                         static_cast<std::uint32_t>(nn),
                                                         static_cast<std::uint32_t>(kk), probe_seed);
+                        }
                     }
                 }
             }
@@ -739,22 +764,46 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         input, static_cast<const float*>(w.input_scales), u, w.k, columns);
     if (columns > kExl3GemvMaxM) {
         // A small column count takes the smaller tile so the grid keeps enough blocks to fill the GPU.
+        // The 4-bit rate is pinned for service -- it carries most of the model's projections -- and
+        // the probe instantiation is only entered by `ninfer-sensitivity`.
+        const int mma_half_bits = static_cast<int>(w.bitrate_half_bits);
+        const auto* mma_trellis   = static_cast<const std::uint8_t*>(w.qdata);
+        const auto* mma_scales    = static_cast<const float*>(w.scales);
+        const bool rate4          = mma_half_bits == 8;
+        const bool probe_on       = probe_sigma > 0.0F;
         if (columns <= 64) {
-            exl3_mma<kExl3MmaSmallT><<<dim3(static_cast<unsigned>(w.n / 128),
-                                            static_cast<unsigned>((columns + kExl3MmaSmallT - 1) /
-                                                                  kExl3MmaSmallT)),
-                                       kExl3MmaThreads, 0, stream>>>(
-                u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
-                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits), probe_sigma,
-                probe_seed);
+            const dim3 tile_grid(static_cast<unsigned>(w.n / 128),
+                                 static_cast<unsigned>((columns + kExl3MmaSmallT - 1) /
+                                                       kExl3MmaSmallT));
+            if (probe_on) {
+                exl3_mma<kExl3MmaSmallT, true, false><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            } else if (rate4) {
+                exl3_mma<kExl3MmaSmallT, false, true><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            } else {
+                exl3_mma<kExl3MmaSmallT, false, false><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            }
         } else {
-            exl3_mma<kExl3MmaT><<<dim3(static_cast<unsigned>(w.n / 128),
-                                       static_cast<unsigned>((columns + kExl3MmaT - 1) /
-                                                             kExl3MmaT)),
-                                  kExl3MmaThreads, 0, stream>>>(
-                u, static_cast<const std::uint8_t*>(w.qdata), static_cast<const float*>(w.scales),
-                output, w.k, w.n, columns, static_cast<int>(w.bitrate_half_bits), probe_sigma,
-                probe_seed);
+            const dim3 tile_grid(static_cast<unsigned>(w.n / 128),
+                                 static_cast<unsigned>((columns + kExl3MmaT - 1) / kExl3MmaT));
+            if (probe_on) {
+                exl3_mma<kExl3MmaT, true, false><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            } else if (rate4) {
+                exl3_mma<kExl3MmaT, false, true><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            } else {
+                exl3_mma<kExl3MmaT, false, false><<<tile_grid, kExl3MmaThreads, 0, stream>>>(
+                    u, mma_trellis, mma_scales, output, w.k, w.n, columns, mma_half_bits,
+                    probe_sigma, probe_seed);
+            }
         }
     } else {
         // One decode of every trellis tile serves all columns: the verify pass runs each weight
