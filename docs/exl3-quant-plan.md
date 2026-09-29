@@ -195,7 +195,7 @@ Every route computes `y = svh' ∘ H_n( H_k(x ∘ suh) · Z )`, plus the consume
 | M1 | Complete | Format, layout, codec | `exl3_mul1` + `trellis_t16_v1` registered (Python + C++), docs written, tile and bit order chosen by microbenchmark, exact codec tests pass |
 | M2 | Complete | Quantizer maths | FWHT, `XᵀX`, blocked Cholesky/LDL, Viterbi (integer + half-integer K), LDLQ, pack, refit, all passing their oracles; single-tensor proxy error matches the FP64 host pipeline |
 | M3 | Complete | Calibration Program + first artifact | `ninfer-quantize` produces a 4.0 bpw `-hq` EXL3 artifact (shared-input parents, one shared input-scale vector) that loads and serves; full-corpus PPL 4.2939 beats Q4 4.3439 and NVFP4 4.3149 over 261,167 tokens; exllamav3 KLD comparison is M5 |
-| M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (per-warp trellis→B-fragment decode, double-buffered `cp.async` A stage, sub-tiled epilogue; prefill 555 -> ~830 tok/s at 4.0 bpw on the 2.8k prompt, was 18.8 -> 13.5 ms per kernel call at 2 blocks/SM), the decode GEMV (single-column FFMA plus the small-m tensor-core verify, 62.5 tok/s), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in. EXL3 prefill still trails Q4 (~2.9k) and NVFP4 (~9.5k) 3.5x/11x; next levers are wider N per block or a decoded-B smem stage. The consumers oracle now takes T = 32 and T = 96, so `exl3_mma` is exercised through the consumer row mapping at both tile sizes, and its tolerance is expressed in BF16 ULP of the largest magnitude: the split-K GEMV reassociates its atomic K reduction per launch, so two runs of one parent differ by a few ULP and the earlier 1e-3 relative gate sat below one ULP of a near-max element (45% and 40% spurious failures over 20 runs before and after the `exl3_mma` rewrite; 0/20 after the ULP gate). |
+| M4 | In progress | Fast inference kernels | Tensor-core `m16n8k16` contraction for prefill (per-warp trellis→B-fragment decode, double-buffered `cp.async` A stage, sub-tiled epilogue; prefill 555 -> ~830 tok/s at 4.0 bpw on the 2.8k prompt, was 18.8 -> 13.5 ms per kernel call at 2 blocks/SM), the decode GEMV (single-column FFMA plus the small-m tensor-core verify, 62.5 tok/s), all consumers, MTP (quantized, calibrated, 1.8x decode) and Vision are in. EXL3 prefill ran at ~1.41k tok/s once the A-staging bank conflict was removed (from 555 at the start of this row), still behind Q4 (~2.9k) by ~2x. The consumers oracle now takes T = 32 and T = 96, so `exl3_mma` is exercised through the consumer row mapping at both tile sizes, and its tolerance is expressed in BF16 ULP of the largest magnitude: the split-K GEMV reassociates its atomic K reduction per launch, so two runs of one parent differ by a few ULP and the earlier 1e-3 relative gate sat below one ULP of a near-max element (45% and 40% spurious failures over 20 runs before and after the `exl3_mma` rewrite; 0/20 after the ULP gate). |
 | M5 | Complete | Recipe optimization | Uniform `-hq` artifacts at 3.5 and 4.0 bpw -- 13.91 / 15.35 GiB, PPL 4.31009 / 4.29390. On the plan's KLD-vs-BF16 metric (2,940 positions at context 4096 / stride 2048, ordering reproduced in both halves of the reference) the artifacts rank 4.0 bpw 0.0332 < Q4 0.0429 < NVFP4 0.0510 < 3.5 bpw 0.0624: **4.0 bpw beats Q4 and NVFP4 on both metrics and is smaller than both**, while 3.5 bpw's PPL advantage over them does not survive the divergence. The 3.0 bpw tier was built, measured worst on both metrics, and removed. The sensitivity-based layer allocation was measured and rejected; the odd half-rate decode is fast. |
 | M6 | Pending | Later | Two-sided YAQA LDLQ; Flash-Next (GDN + MoE experts + expert pager); int8-activation route behind a permission. Vision is in the recipe but stays groupwise: its MLP intermediate is not 128-aligned. |
 | M7 | Pending | Reference KLD | **M7a**: a logits-export route plus `ninfer-perplexity --reference FILE` and a KL accumulator, with the reference produced externally -- this lands M5's KLD evidence. **M7b**: `ninfer-reference`, an offline app that streams the BF16 `.ninfer` and writes the exact per-position distribution file, removing the external dependency. Done when the KLD agrees with an FP64 oracle and every M5 point carries a KLD. Design and gaps in section 9. |
@@ -804,6 +804,37 @@ Staged so M5's evidence lands first:
   largest magnitude -- a row-mapping defect displaces whole rows by O(128) ULP -- and two T-above-the-cutoff cases
   (T = 32 and T = 96) take the consumer path through `exl3_mma` at both tile sizes. 0 failures in 20 runs; the A16
   oracle still passes.
+- 2026-09-28: M4 prefill, the A-staging bank conflict -- prefill 806 -> 1.41k tok/s. NCU on the real prefill
+  (`--prefill-chunk 1024`, 2,805-token prompt) put the contraction at 95.7% of GPU time: 768 `exl3_mma<64>` calls over
+  3.41 s (91.6%, 4.44 ms average), 256 `exl3_mma<16>` at 4.1%, `exl3_input_transform` at 0.9%; DRAM was 5% of peak, so
+  nothing was memory-bound. The limiter was the A operand: it was staged FP32 in a 16-wide shared row and every warp
+  re-read the whole `[TILE_T][16]` tile with eight strided loads per fragment per k-tile, which NCU measured as a
+  3.9-way bank conflict -- "64,167,936 excessive wavefronts, 74% of 87,197,184", estimated local speedup 51.85%. A is
+  now BF16 end to end (`exl3_input_transform` rounds once on store) and staged in two 8-wide k-planes: a plane row is
+  four shared banks, so the eight rows one fragment spans land exactly once on the 32 banks and each of the four A
+  registers becomes a single conflict-free 32-bit load -- no convert, no permute, half the scratch and half the
+  cp.async bytes. `exl3_mma<64>` fell 4.44 -> 2.46 ms per call (1.80x), `<16>` 0.59 -> 0.46 ms (1.30x), total GPU
+  3.73 -> 2.16 s, and the served 2,805-token prefill 806 -> 1.41k tok/s with TTFT 3.6 -> 2.0 s; decode is unchanged
+  (60-62 tok/s). Prefill arithmetic is bit-identical (the MMA always consumed BF16 A, so the rounding only moved from
+  the fragment pack into the transform); the T = 1 FFMA path used to keep A in FP32 and now shares that rounding,
+  which is the operand precision the T = 2..8 GEMV already had. Both EXL3 oracles pass.
+- 2026-09-28: M4 prefill, where the remaining time goes. After the A-staging fix the contraction measures
+  74.4% compute and 74.4% memory on the real `<64>` launch (grid 112x16, T = 1024, 1.90 ms): NCU calls it
+  balanced, the bank-conflict rules are gone, DRAM is 2.4%, L2 hit 97.8%, and IPC rose 1.82 -> 2.16. The
+  tensor pipe is only 43.9% of cycles while the ALU and LSU pipes sit near 74%, so the tensor cores are
+  starved by the work around them -- and that work is already at its floor: SASS shows one `IDP.4A` per
+  `mul1_value`, one `F2FP.BF16.F32.PACK_AB` per fragment register, `LDGSTS` for the cp.async stage, and the
+  A fragment is one 32-bit load per value, each used by exactly two mma (h = 0, 1). Amortising further means
+  more mma per decoded weight, which costs the other pipe: 2 n16 rows per warp halves the A loads but doubles
+  the accumulator. The one NCU still offers -- ~25% from occupancy -- is closed: 3 blocks/SM is already the
+  register limit (the `[2][MT][4]` FP32 accumulator), and raising the target to 4 spills and drops prefill
+  from 1,420 to 832 tok/s (measured, then reverted). So what is left is the intrinsic price of decoding the
+  weights at run time: Q4 dequantises for free and runs at ~74% of the BF16 peak, EXL3 lands at ~38% with the
+  tensor pipe at 44% -- the ~2x that separates them (1.43k tok/s against Q4's 2.86k on the same 2,805-token
+  prompt, TTFT 2.0 s against 0.98 s). The 3.5 bpw artifact prefills at 2.03k tok/s -- within 1.4x of Q4 -- with the
+  same A-staging fix, even though its odd-rate trellis decode is the heavier one on the decode side. Closing the 4.0
+  bpw gap needs the accumulator out of registers (a streamed sub-tile epilogue) so one decoded weight can serve more
+  tokens, not another launch-bounds or layout tweak.
 
 ## M3 status and decisions
 

@@ -35,6 +35,7 @@ constexpr int kExl3GemvMinBlocks = 5;
 // The MMA block keeps a [2][TILE_T/16][4] FP32 accumulator per thread; the 6-block register budget
 // (42 registers) cannot hold it and ptxas spills to local memory, so the register target is 3
 // blocks (85 registers) and the 16 KiB shared footprint leaves room for more if registers allow.
+// Measured: at 4 blocks the accumulator no longer fits and prefill falls to 832 tok/s from 1,420.
 constexpr int kExl3MmaTarget     = 3;
 
 __device__ __forceinline__ float mul1_value(std::uint16_t state) {
@@ -150,10 +151,13 @@ __device__ __forceinline__ void butterfly128(float* s, int lane) {
     }
 }
 
-// u[k,t] = H128(su[k] * x[k,t]) over 128-blocks of k. u is FP32 scratch [K,T] in the same
-// column-major order as the caller's tensors (dim 0 is contiguous).
+// u[k,t] = BF16(H128(su[k] * x[k,t])) over 128-blocks of k. u is BF16 scratch [K,T] in the same
+// column-major order as the caller's tensors (dim 0 is contiguous). The Hadamard runs in FP32 and
+// rounds once on store: every contraction consumes a BF16 A operand (the MMA atoms are BF16, and
+// the GEMV rounds on pack), so a FP32 stage would only round later while costing twice the scratch
+// traffic and, in the MMA, a bank-conflicted strided A read.
 __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
-                                     const float* __restrict__ su, float* __restrict__ u,
+                                     const float* __restrict__ su, __nv_bfloat16* __restrict__ u,
                                      int k_extent, int columns) {
     const int block = blockIdx.x;
     const int t     = blockIdx.y;
@@ -164,7 +168,7 @@ __global__ void exl3_input_transform(const __nv_bfloat16* __restrict__ x,
     s[lane] = su[k] * __bfloat162float(x[k + static_cast<std::size_t>(t) * k_extent]);
     __syncthreads();
     butterfly128(s, lane);
-    u[static_cast<std::size_t>(t) * k_extent + k] = s[lane];
+    u[static_cast<std::size_t>(t) * k_extent + k] = __float2bfloat16(s[lane]);
 }
 
 // Decode contraction: one column, so parallelism comes from splitting K across the grid. A warp owns
@@ -202,7 +206,7 @@ constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the ti
 // gets from the C fragment; here it is 8 floats per column.
 template <int T_MAX>
 __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_split(
-    const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+    const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
     float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns,
     float probe_sigma, std::uint32_t probe_seed) {
     const int lane    = threadIdx.x & 31;
@@ -290,12 +294,13 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_sp
 #pragma unroll
         for (int t = 0; t < T_MAX; ++t) {
             const bool active = t < columns;
-            const float* uk   = u + static_cast<std::size_t>(active ? t : 0) * k_extent + kt * 16;
+            const __nv_bfloat16* uk =
+                u + static_cast<std::size_t>(active ? t : 0) * k_extent + kt * 16;
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int local = r & 3;
                 const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
-                const float operand = active ? uk[k] : 0.0F;
+                const float operand = active ? __bfloat162float(uk[k]) : 0.0F;
                 if (r < 4) {
                     a0[t][local] = fmaf(d[r], operand, a0[t][local]);
                 } else {
@@ -342,6 +347,15 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     return bits;
 }
 
+// The same register for a pair that is already packed in storage: an aligned 32-bit load instead of
+// two converts and a permute. Both operands are BF16 in memory, so no rounding happens here.
+__device__ __forceinline__ std::uint32_t load_bf16x2(const __nv_bfloat16* pair) {
+    const __nv_bfloat162 value = *reinterpret_cast<const __nv_bfloat162*>(pair);
+    std::uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4],
                                              const std::uint32_t b[2]) {
     asm volatile(
@@ -356,7 +370,7 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], const std::uint32_t a[4
 // exl3_gemv_kernel does exactly this for 2 <= m <= 8. The FFMA alternative needs eight accumulators
 // per column (128 registers at four columns, halving occupancy), which is why it loses.
 __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_mma(
-    const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+    const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
     float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns) {
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
@@ -426,9 +440,10 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_mm
                                        {pack_bf16x2(d[4], d[5]), pack_bf16x2(d[6], d[7])}};
         std::uint32_t a[4] = {0U, 0U, 0U, 0U};
         if (row < columns) {
-            const float* urow = u + static_cast<std::size_t>(row) * k_extent + kt * 16;
-            a[0]              = pack_bf16x2(urow[col], urow[col + 1]);
-            a[2]              = pack_bf16x2(urow[col + 8], urow[col + 9]);
+            const __nv_bfloat16* urow =
+                u + static_cast<std::size_t>(row) * k_extent + kt * 16;
+            a[0] = load_bf16x2(urow + col);
+            a[2] = load_bf16x2(urow + col + 8);
         }
         mma_m16n8k16(c[0], a, b[0]);
         mma_m16n8k16(c[1], a, b[1]);
@@ -464,7 +479,7 @@ constexpr int kExl3AStages = 2;
 // column count is small, which is the difference between an occupancy-starved and a busy kernel.
 template <int TILE_T>
 __global__ void __launch_bounds__(kExl3Threads, kExl3MmaTarget)
-exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
+exl3_mma(const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
          int k_extent, int n_extent, int columns, int half_bits,
          float probe_sigma, std::uint32_t probe_seed) {
@@ -480,11 +495,12 @@ exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
     const int words    = 4 * half_bits;
     const bool fast    = (half_bits & 1) == 0;
 
-    // A is staged in FP32: a cp.async copy moves raw bytes, so staging BF16 directly would slice
-    // FP32 bit patterns into BF16 halves (NaN garbage); the BF16 rounding happens when the A
-    // fragment is packed instead, which is the same round-to-nearest conversion the reference
-    // applies to its operands.
-    __shared__ float us[kExl3AStages][TILE_T][16];
+    // A is staged as BF16 split into two k-planes: plane p holds k = 8p..8p+7 of the k-tile, so a
+    // plane row is 16 bytes (four shared banks) and the eight rows a fragment spans land on the 32
+    // banks one word apart. Each of a lane's four A-fragment registers is then a single 32-bit load
+    // with no conflict. Staging FP32 in one 16-wide row instead cost a measured 3.9-way conflict on
+    // every A load -- 74% of this kernel's shared wavefronts.
+    __shared__ __nv_bfloat16 us[kExl3AStages][2][TILE_T][8];
     // One 16-row sub-tile of pre-Hadamard outputs, reused across the MT rounds of the epilogue.
     // A full [TILE_T][128] buffer would double the block's footprint and cut occupancy in half.
     __shared__ float vs[16][kExl3MmaN];
@@ -504,18 +520,19 @@ exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
 #pragma unroll
     for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
 
-    // One [TILE_T][16] FP32 tile copies as TILE_T*4 16-byte copies (all 256 threads at
-    // TILE_T = 64): copy 4c + q fetches column c's floats 4q..4q+3, so a column's row is four
-    // coalesced 16-byte chunks. Columns past t_count zero-fill, which the mma consumes as padding.
+    // One [TILE_T][16] BF16 tile copies as TILE_T*2 16-byte copies (all 256 threads at
+    // TILE_T = 64): copy 2c + p fetches token column c's plane p, i.e. its eight k values
+    // 8p..8p+7, as one contiguous 16-byte row. Columns past t_count zero-fill, which the mma
+    // consumes as padding.
     const auto stage_tile = [&](int tile) {
         const int copy_id = static_cast<int>(threadIdx.x);
-        if (copy_id < TILE_T * 4) {
-            const int src_col = copy_id >> 2;         // 0..TILE_T-1: token column
-            const int quad    = (copy_id & 3) * 4;    // float offset 0/4/8/12 in the k-tile
+        if (copy_id < TILE_T * 2) {
+            const int src_col = copy_id >> 1;      // 0..TILE_T-1: token column
+            const int plane   = copy_id & 1;       // k 0..7 or 8..15 of the k-tile
             const int bytes   = (src_col < t_count) ? 16 : 0;
-            const float* source = u + static_cast<std::size_t>(t0 + src_col) * k_extent +
-                                  tile * 16 + quad;
-            cp_async_zfill<16>(&us[tile & (kExl3AStages - 1)][src_col][quad], source, bytes);
+            const __nv_bfloat16* source =
+                u + static_cast<std::size_t>(t0 + src_col) * k_extent + tile * 16 + plane * 8;
+            cp_async_zfill<16>(&us[tile & (kExl3AStages - 1)][plane][src_col][0], source, bytes);
         }
     };
 
@@ -562,19 +579,17 @@ exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                 const std::uint32_t b1 = pack_bf16x2(d[2], d[3]);
                 const std::uint32_t b[2] = {b0, b1};
                 // The m16n8k16 A fragment: rows groupID and groupID + 8, the lane's k pair and
-                // its +8 partner.
-                const int col = (lane & 3) * 2;
+                // its +8 partner. Plane 0 carries k 0..7 and plane 1 k 8..15, so the +8 partner of
+                // a[0]/a[1] is a[2]/a[3] at the same in-plane offset.
+                const int col = (lane & 3) * 2; // bf16 index within a plane row
                 const int grp = lane >> 2;
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const int t = mt * 16 + grp;
-                    const std::uint32_t a0 = pack_bf16x2(us[slot][t][col], us[slot][t][col + 1]);
-                    const std::uint32_t a1 =
-                        pack_bf16x2(us[slot][t + 8][col], us[slot][t + 8][col + 1]);
-                    const std::uint32_t a2 =
-                        pack_bf16x2(us[slot][t][col + 8], us[slot][t][col + 9]);
-                    const std::uint32_t a3 =
-                        pack_bf16x2(us[slot][t + 8][col + 8], us[slot][t + 8][col + 9]);
+                    const std::uint32_t a0 = load_bf16x2(&us[slot][0][t][col]);
+                    const std::uint32_t a1 = load_bf16x2(&us[slot][0][t + 8][col]);
+                    const std::uint32_t a2 = load_bf16x2(&us[slot][1][t][col]);
+                    const std::uint32_t a3 = load_bf16x2(&us[slot][1][t + 8][col]);
                     const std::uint32_t a[4] = {a0, a1, a2, a3};
                     mma_m16n8k16(acc[h][mt], a, b);
                 }
@@ -608,16 +623,15 @@ exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
                 b[h][0] = pack_bf16x2(d[4 * h + 0], d[4 * h + 1]);
                 b[h][1] = pack_bf16x2(d[4 * h + 2], d[4 * h + 3]);
             }
-            const int col = (lane & 3) * 2;
+            const int col = (lane & 3) * 2; // bf16 index within a plane row
             const int grp = lane >> 2;
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 const int t = mt * 16 + grp;
-                const std::uint32_t a0 = pack_bf16x2(us[slot][t][col], us[slot][t][col + 1]);
-                const std::uint32_t a1 = pack_bf16x2(us[slot][t + 8][col], us[slot][t + 8][col + 1]);
-                const std::uint32_t a2 = pack_bf16x2(us[slot][t][col + 8], us[slot][t][col + 9]);
-                const std::uint32_t a3 =
-                    pack_bf16x2(us[slot][t + 8][col + 8], us[slot][t + 8][col + 9]);
+                const std::uint32_t a0 = load_bf16x2(&us[slot][0][t][col]);
+                const std::uint32_t a1 = load_bf16x2(&us[slot][0][t + 8][col]);
+                const std::uint32_t a2 = load_bf16x2(&us[slot][1][t][col]);
+                const std::uint32_t a3 = load_bf16x2(&us[slot][1][t + 8][col]);
                 const std::uint32_t a[4] = {a0, a1, a2, a3};
                 mma_m16n8k16(acc[0][mt], a, b[0]);
                 mma_m16n8k16(acc[1][mt], a, b[1]);
@@ -681,12 +695,12 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
     if (columns <= 0) { throw std::invalid_argument("exl3 linear: T must be positive"); }
 
     const std::size_t u_bytes =
-        static_cast<std::size_t>(w.k) * static_cast<std::size_t>(columns) * sizeof(float);
+        static_cast<std::size_t>(w.k) * static_cast<std::size_t>(columns) * sizeof(__nv_bfloat16);
     const std::size_t partial_bytes =
         columns <= kExl3GemvMaxM ? static_cast<std::size_t>(columns) * w.n * sizeof(float) : 0;
     auto scope               = workspace.scope();
     const DeviceSpan scratch = workspace.alloc_bytes(u_bytes + partial_bytes, 16);
-    float* u                 = static_cast<float*>(scratch.data);
+    __nv_bfloat16* u         = static_cast<__nv_bfloat16*>(scratch.data);
     float* partial = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch.data) + u_bytes);
 
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
