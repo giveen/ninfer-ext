@@ -197,11 +197,19 @@ constexpr int kExl3GemvMaxM   = 8; // largest m the per-column GEMV beats the ti
 // verify pass runs the same weight against every drafted token. Each lane keeps T_MAX x 8
 // accumulators (its two n8 groups by four k positions), which the tensor-core GEMV of the reference
 // gets from the C fragment; here it is 8 floats per column.
-template <int T_MAX>
+// `kProbe` is a compile-time switch. The sensitivity probe's per-window Gaussian is dead weight in
+// the served path, where `probe_sigma` is zero: keeping it in the same instantiation costs a uniform
+// branch per k-tile per column and, worse, the probe's temporaries sit in the kernel's register
+// budget, which is what caps this GEMV at five blocks per SM.
+template <int T_MAX, bool kProbe>
 __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_split(
     const __nv_bfloat16* __restrict__ u, const std::uint8_t* __restrict__ trellis,
     float* __restrict__ partial, int k_extent, int n_extent, int half_bits, int columns,
     float probe_sigma, std::uint32_t probe_seed) {
+    if constexpr (!kProbe) {
+        (void)probe_sigma;
+        (void)probe_seed;
+    }
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
     const int n_tile  = blockIdx.x * 8 + warp;
@@ -275,13 +283,16 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_sp
                 d[r] = mul1_value(tile_state(tile8, half_bits, 8 * lane + r));
             }
         }
-        if (probe_sigma > 0.0F) {
+        if constexpr (kProbe) {
+            if (probe_sigma > 0.0F) {
 #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int nn = n_base + (lane >> 2) + 8 * (r >> 2);
-                const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * ((r >> 1) & 1);
-                d[r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
-                                                     static_cast<std::uint32_t>(kk), probe_seed);
+                for (int r = 0; r < 8; ++r) {
+                    const int nn = n_base + (lane >> 2) + 8 * (r >> 2);
+                    const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * ((r >> 1) & 1);
+                    d[r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
+                                                         static_cast<std::uint32_t>(kk),
+                                                         probe_seed);
+                }
             }
         }
 #pragma unroll
@@ -739,8 +750,13 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         CUDA_CHECK(cudaMemsetAsync(partial, 0, partial_bytes, stream));
         const dim3 grid(static_cast<unsigned>(n_blocks), static_cast<unsigned>(splits));
         if (columns == 1) {
-            exl3_gemv_split<1><<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits, 1,
-                                                         probe_sigma, probe_seed);
+            if (probe_sigma > 0.0F) {
+                exl3_gemv_split<1, true><<<grid, 256, 0, stream>>>(
+                    u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
+            } else {
+                exl3_gemv_split<1, false><<<grid, 256, 0, stream>>>(
+                    u, trellis, partial, w.k, w.n, half_bits, 1, probe_sigma, probe_seed);
+            }
         } else {
             exl3_gemv_mma<<<grid, 256, 0, stream>>>(u, trellis, partial, w.k, w.n, half_bits,
                                                     columns);
