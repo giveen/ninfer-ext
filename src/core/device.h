@@ -17,10 +17,9 @@ struct DeviceExecutionView {
     cudaStream_t stream               = nullptr;
     std::int32_t multiprocessor_count = 0;
 
-    // The same device facts on another stream. Callers that capture a graph or time an isolated
-    // launch keep the resolved physical SM count and substitute only the stream.
-    [[nodiscard]] DeviceExecutionView on_stream(cudaStream_t other) const noexcept {
-        return {.stream = other, .multiprocessor_count = multiprocessor_count};
+    [[nodiscard]] constexpr DeviceExecutionView
+    on_stream(cudaStream_t target_stream) const noexcept {
+        return {target_stream, multiprocessor_count};
     }
 };
 

@@ -378,6 +378,9 @@ int run_text_case(int query_heads, int key_heads, int tokens, int first_position
     const auto q_weight_bits      = bf16_bits(q_weight);
     const auto k_weight_bits      = bf16_bits(k_weight);
 
+    DeviceContext device;
+    const DeviceExecutionView execution = device.execution_view().on_stream(nullptr);
+
     DeviceBuffer q_in_device     = to_device(q_bits);
     DeviceBuffer k_in_device     = to_device(k_bits);
     DeviceBuffer q_weight_device = to_device(q_weight_bits);
@@ -409,7 +412,7 @@ int run_text_case(int query_heads, int key_heads, int tokens, int first_position
     ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
     ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
     ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
-              nullptr);
+              execution);
     cuda_synchronize();
 
     const std::string label = "rmsnorm_rope text Q=" + std::to_string(query_heads) +
@@ -450,6 +453,9 @@ int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t
     const auto k_weight_bits  = bf16_bits(make_bf16_values(kTextHeadDim, seed + 3U, 0.25F, 1.75F));
     const auto positions      = make_positions(tokens, 0);
 
+    DeviceContext device;
+    const DeviceExecutionView execution = device.execution_view().on_stream(nullptr);
+
     DeviceBuffer q_in_device     = to_device(q_bits);
     DeviceBuffer k_in_device     = to_device(k_bits);
     DeviceBuffer q_weight_device = to_device(q_weight_bits);
@@ -475,7 +481,7 @@ int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t
     ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
     ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
     ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
-              nullptr);
+              execution);
     cuda_synchronize();
 
     const std::string label =

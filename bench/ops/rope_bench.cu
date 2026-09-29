@@ -25,18 +25,19 @@ using namespace ninfer::bench;
 
 namespace {
 
-constexpr int kTextHeadDim            = 256;
-constexpr int kTextRotaryDim          = 64;
-constexpr int kDflashHeadDim          = 128;
-constexpr int kDflashRotaryDim        = 128;
-constexpr int kDflashQHeads           = 32;
-constexpr int kDflashKHeads           = 8;
-constexpr int kTextChunkMaxTokens     = 1024;
-constexpr int kLargeBlockWaveCapacity = 1020;
-constexpr float kTextTheta            = 1.0e7F;
-constexpr int kVisionHeadDim          = 72;
-constexpr int kVisionHeads            = 16;
-constexpr float kVisionTheta          = 10'000.0F;
+constexpr int kTextHeadDim        = 256;
+constexpr int kTextRotaryDim      = 64;
+constexpr int kDflashHeadDim      = 128;
+constexpr int kDflashRotaryDim    = 128;
+constexpr int kDflashQHeads       = 32;
+constexpr int kDflashKHeads       = 8;
+constexpr int kTextChunkMaxTokens = 1024;
+// The production 256-thread instance admits six resident CTAs per SM on the target.
+constexpr int kLargeBlockCtasPerSm = 6;
+constexpr float kTextTheta         = 1.0e7F;
+constexpr int kVisionHeadDim       = 72;
+constexpr int kVisionHeads         = 16;
+constexpr float kVisionTheta       = 10'000.0F;
 
 std::vector<int> parse_csv(const char* value) {
     std::vector<int> values;
@@ -210,11 +211,13 @@ __global__ void rope_split_payload_control_kernel(const std::int32_t* positions,
 }
 
 template <int QHeads, int KHeads>
-int production_text_block(int tokens) {
+int production_text_block(int tokens, DeviceExecutionView execution) {
+    const std::int64_t large_block_capacity =
+        static_cast<std::int64_t>(execution.multiprocessor_count) * kLargeBlockCtasPerSm;
     int block = 128;
     if (tokens <= 6) {
         block = (QHeads + KHeads) * 32;
-    } else if (tokens <= kLargeBlockWaveCapacity) {
+    } else if (tokens <= large_block_capacity) {
         block = 256;
     } else if (tokens <= kTextChunkMaxTokens) {
         block = 192;
@@ -226,9 +229,11 @@ int production_text_block(int tokens) {
 }
 
 template <int QHeads, int KHeads>
-void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStream_t stream) {
-    const int tokens = q.ne[2];
-    const int block  = production_text_block<QHeads, KHeads>(tokens);
+void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k,
+                         DeviceExecutionView execution) {
+    const int tokens  = q.ne[2];
+    const int block   = production_text_block<QHeads, KHeads>(tokens, execution);
+    const auto stream = execution.stream;
     if (positions.ne[1] == 1) {
         rope_payload_control_kernel<ops::RopeKernelMode::Text1D, kTextHeadDim, kTextRotaryDim,
                                     QHeads, KHeads><<<tokens, block, 0, stream>>>(
@@ -364,7 +369,8 @@ void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k
 }
 
 template <int Heads>
-void run_text_single(int tokens, int axes, bool control, const char* geometry, const char* role) {
+void run_text_single(DeviceExecutionView execution, int tokens, int axes, bool control,
+                     const char* geometry, const char* role) {
     const std::size_t elements = static_cast<std::size_t>(kTextHeadDim) * Heads * tokens;
     DeviceBuffer positions     = make_text_positions(tokens, axes);
     DeviceBuffer x             = make_bf16(elements);
@@ -375,16 +381,17 @@ void run_text_single(int tokens, int axes, bool control, const char* geometry, c
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             if (control) {
-                launch_text_control<Heads, 0>(tpos, tx, tx, stream);
+                launch_text_control<Heads, 0>(tpos, tx, tx, execution.on_stream(stream));
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, stream);
+                ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, execution.on_stream(stream));
             }
         },
         bytes);
-    const std::string label =
-        std::string("rope ") + (control ? "control" : "text") + " " + geometry + " " + role +
-        " axes=" + std::to_string(axes) + " route=fixed-b" +
-        std::to_string(production_text_block<Heads, 0>(tokens)) + " T=" + std::to_string(tokens);
+    const std::string label = std::string("rope ") + (control ? "control" : "text") + " " +
+                              geometry + " " + role + " axes=" + std::to_string(axes) +
+                              " route=fixed-b" +
+                              std::to_string(production_text_block<Heads, 0>(tokens, execution)) +
+                              " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
@@ -400,7 +407,8 @@ void launch_vision_control(const Tensor& positions, Tensor& q, Tensor& k, cudaSt
 }
 
 template <int QHeads, int KHeads>
-void run_text(int tokens, int axes, bool control, int candidate_block, const char* geometry) {
+void run_text(DeviceExecutionView execution, int tokens, int axes, bool control,
+              int candidate_block, const char* geometry) {
     const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * QHeads * tokens;
     const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * KHeads * tokens;
     DeviceBuffer positions       = make_text_positions(tokens, axes);
@@ -414,15 +422,15 @@ void run_text(int tokens, int axes, bool control, int candidate_block, const cha
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             if (control) {
-                launch_text_control<QHeads, KHeads>(tpos, tq, tk, stream);
+                launch_text_control<QHeads, KHeads>(tpos, tq, tk, execution.on_stream(stream));
             } else if (candidate_block != 0) {
                 launch_text_candidate<QHeads, KHeads>(tpos, tq, tk, candidate_block, stream);
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, stream);
+                ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
             }
         },
         bytes);
-    const int production_block = production_text_block<QHeads, KHeads>(tokens);
+    const int production_block = production_text_block<QHeads, KHeads>(tokens, execution);
     const std::string route    = control ? "control-b" + std::to_string(production_block)
                                  : candidate_block == 0
                                      ? "fixed-b" + std::to_string(production_block)
@@ -433,7 +441,8 @@ void run_text(int tokens, int axes, bool control, int candidate_block, const cha
     print_result(label.c_str(), result);
 }
 
-void run_dflash(int tokens, bool control, int candidate_block, int candidate_heads, bool profile) {
+void run_dflash(DeviceExecutionView execution, int tokens, bool control, int candidate_block,
+                int candidate_heads, bool profile) {
     const std::size_t q_elements =
         static_cast<std::size_t>(kDflashHeadDim) * kDflashQHeads * tokens;
     const std::size_t k_elements =
@@ -456,7 +465,7 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
         } else if (candidate_block != 0) {
             launch_dflash_candidate(tpos, tq, tk, block, stream);
         } else {
-            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, stream);
+            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
         }
     };
     if (profile) {
@@ -484,12 +493,13 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
     print_result(label.c_str(), result);
 }
 
-void run_dflash_single_k(int tokens, bool control) {
+void run_dflash_single_k(DeviceExecutionView execution, int tokens, bool control) {
     const std::size_t elements = static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
     DeviceBuffer positions     = make_text_positions(tokens, 1);
     DeviceBuffer x             = make_bf16(elements);
     Tensor tpos(positions.p, DType::I32, {tokens});
     Tensor tx(x.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    const int block    = production_text_block<kDflashKHeads, 0>(tokens, execution);
     const double bytes = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
                          sizeof(__nv_bfloat16);
     const Result result = bench_loop(
@@ -497,23 +507,23 @@ void run_dflash_single_k(int tokens, bool control) {
             if (control) {
                 rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
                                             kDflashRotaryDim, kDflashKHeads, 0>
-                    <<<tokens, kDflashKHeads * 32, 0, stream>>>(
+                    <<<tokens, block, 0, stream>>>(
                         static_cast<const std::int32_t*>(tpos.data),
                         static_cast<__nv_bfloat16*>(tx.data), nullptr, tokens,
                         tx.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), 0);
                 CUDA_CHECK(cudaGetLastError());
             } else {
-                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, stream);
+                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, execution.on_stream(stream));
             }
         },
         bytes);
-    const std::string label =
-        std::string("rope ") + (control ? "control" : "text") +
-        " dflash single-k axes=1 route=fixed-b256 T=" + std::to_string(tokens);
+    const std::string label = std::string("rope ") + (control ? "control" : "text") +
+                              " dflash single-k axes=1 route=fixed-b" + std::to_string(block) +
+                              " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
-void run_vision(int patches, bool control) {
+void run_vision(DeviceExecutionView execution, int patches, bool control) {
     constexpr int hidden   = kVisionHeadDim * kVisionHeads;
     constexpr int qkv      = hidden * 3;
     DeviceBuffer positions = make_vision_positions(patches);
@@ -530,7 +540,7 @@ void run_vision(int patches, bool control) {
             if (control) {
                 launch_vision_control(tpos, tq, tk, stream);
             } else {
-                ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, stream);
+                ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, execution.on_stream(stream));
             }
         },
         bytes);
@@ -652,48 +662,56 @@ int main(int argc, char** argv) {
     }
     try {
         const Options options = parse_options(argc, argv);
+        DeviceContext device;
+        const auto execution = device.execution_view();
         if (options.text) {
             if (options.geometryDflash && options.axes1 && options.pair) {
                 for (int tokens : options.tokens) {
-                    run_dflash(tokens, options.control, options.candidate_block,
+                    run_dflash(execution, tokens, options.control, options.candidate_block,
                                options.candidate_heads, options.profile);
                 }
             }
             if (options.geometryDflash && options.axes1 && options.single_k) {
-                for (int tokens : options.tokens) { run_dflash_single_k(tokens, options.control); }
+                for (int tokens : options.tokens) {
+                    run_dflash_single_k(execution, tokens, options.control);
+                }
             }
             for (int axes : {1, 3}) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }
                 for (int tokens : options.tokens) {
                     if (options.geometry27) {
                         if (options.pair) {
-                            run_text<24, 4>(tokens, axes, options.control, options.candidate_block,
-                                            "27b");
+                            run_text<24, 4>(execution, tokens, axes, options.control,
+                                            options.candidate_block, "27b");
                         }
                         if (options.single_q) {
-                            run_text_single<24>(tokens, axes, options.control, "27b", "q");
+                            run_text_single<24>(execution, tokens, axes, options.control, "27b",
+                                                "q");
                         }
                         if (options.single_k) {
-                            run_text_single<4>(tokens, axes, options.control, "27b", "k");
+                            run_text_single<4>(execution, tokens, axes, options.control, "27b",
+                                               "k");
                         }
                     }
                     if (options.geometry35) {
                         if (options.pair) {
-                            run_text<16, 2>(tokens, axes, options.control, options.candidate_block,
-                                            "35b");
+                            run_text<16, 2>(execution, tokens, axes, options.control,
+                                            options.candidate_block, "35b");
                         }
                         if (options.single_q) {
-                            run_text_single<16>(tokens, axes, options.control, "35b", "q");
+                            run_text_single<16>(execution, tokens, axes, options.control, "35b",
+                                                "q");
                         }
                         if (options.single_k) {
-                            run_text_single<2>(tokens, axes, options.control, "35b", "k");
+                            run_text_single<2>(execution, tokens, axes, options.control, "35b",
+                                               "k");
                         }
                     }
                 }
             }
         }
         if (options.vision) {
-            for (int patches : options.patches) run_vision(patches, options.control);
+            for (int patches : options.patches) run_vision(execution, patches, options.control);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());
