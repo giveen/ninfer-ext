@@ -894,6 +894,21 @@ Staged so M5's evidence lands first:
   latency, and the staging only added a shared round trip, a per-tile warp wait, and `cg` on a stream whose neighbour
   word used to be an L1 hit. Explicit staging pays when there are not enough warps to hide the latency; this kernel
   no longer is that case.
+- 2026-09-29: M4 prefill -- the two cold branches were the gap. Prefill 1.42-1.46k -> 2.29-2.47k tok/s on the
+  2,805-token prompt (+68%), TTFT 2.0 -> 1.2 s, by applying to `exl3_mma` what the decode GEMV had just taught: the
+  hot K loop carried the sensitivity probe's inline per-window Gaussian behind `if (probe_sigma > 0.0F)`, never taken
+  in service, and the 4-bit rate -- most of the model's projections by call count -- went through the wide-even-rate
+  `plan`/`exl3_window_value` path, eight funnel shifts per tile plus the eight registers holding the window plan. A
+  `kProbe` parameter compiles the first out of the served instantiation; a `kRate4Bit` parameter routes the second to
+  `exl3_windows_4bit`, one funnel and five bit-field extracts, the extraction the GEMV and the A16 oracle already
+  use. The register count falls 80 -> 77. The 3.5 bpw tier's rates are odd, so it gains only the probe removal
+  (2.04 -> 2.11k), which is what the split predicts.
+  That also closes the head-to-head from the entry above. At one identical shape Q4 issued 11.1 instructions per MMA
+  against EXL3's 42.2, both issuing exactly the required 89,128,960 MMAs -- Q4 tensor-bound at 94.6% of compute,
+  EXL3 issue-bound at 78.8% with its tensor pipe at 43.9%. The 31 extra instructions per MMA were not the decode but
+  the control around it, and removing two cold branches recovered most of them: served prefill is now 2.44k against
+  Q4's 2.86k (**1.17x**, from 3.5x) and decode 76-78 against 78.4 (**1.03x**), while the EXL3 artifact is 1.6 GiB
+  smaller (15.35 against 16.96 GiB).
 
 ## M3 status and decisions
 
