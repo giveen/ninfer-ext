@@ -486,8 +486,13 @@ Single-request speed on one RTX 5090 (CUDA 13.3, greedy, 64–256 output tokens)
 | Prefill, ~0.55k / ~7.6k-token prompt | 2.01k / 2.38k tok/s | 1.69k / 2.08k tok/s |
 
 3.5 bpw is slower on both regimes: its odd half-rates take the heavier `exl3_windows_half` window
-decode, which costs more than the 9% of weight bytes it saves. Cross-format single-request numbers,
-the measurement protocol, and everything else about these artifacts are in their
+decode, which costs more than the 9% of weight bytes it saves.
+
+One caveat on speculation: the EXL3 artifacts do not carry the separate draft-head projection the
+official artifacts have, so `--lm-head-draft` fails at startup
+(`selected proposal head is absent from artifact`) and MTP has to run with `--fixed-draft`. Q4 and
+NVFP4 reach 144 and 166 tok/s with that flag; EXL3 plateaus at ~124. Cross-format single-request
+numbers, the measurement protocol, and everything else about these artifacts are in their
 [model card](../model-cards/ninfer-ext-models/README.md).
 
 ## Performance

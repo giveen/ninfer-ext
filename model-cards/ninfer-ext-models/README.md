@@ -96,8 +96,14 @@ Measured on one NVIDIA GeForce RTX 5090, CUDA 13.3, a single request, greedy, 64
 | Regime | EXL3 4.0 bpw | EXL3 3.5 bpw | Q4 | NVFP4 |
 |---|---|---|---|---|
 | Decode, plain | 76 tok/s | 64 tok/s | 78 tok/s | 71 tok/s |
-| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | 120 tok/s | — | — |
+| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | 120 tok/s | 134 tok/s | 142 tok/s |
 | Prefill, 0.55k / 7.6k-token prompt | 2.01k / 2.38k tok/s | 1.69k / 2.08k tok/s | 2.35k / 2.82k tok/s | 5.18k / 8.43k tok/s |
+
+MTP is measured at a fixed three-token draft on all four so the row compares like with like. Q4 and
+NVFP4 can additionally use `--lm-head-draft`, which reaches 144 and 166 tok/s at K=5; **the EXL3
+artifacts cannot — they do not carry the separate draft-head projection those artifacts have**, so
+`--lm-head-draft` fails at startup with `selected proposal head is absent from artifact`, and raising
+K does not help them (124.6 tok/s at K=5 against 124 at K=3).
 
 **4.0 bpw** is close to the other native formats: prefill is 1.17–1.18x behind Q4 and decode is within
 3% of it, on an artifact 1.6 GiB smaller (15.35 against 16.96 GiB). NVFP4 remains the prefill leader —
