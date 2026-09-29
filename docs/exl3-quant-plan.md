@@ -914,6 +914,28 @@ Staged so M5's evidence lands first:
   89,128,960 in both before and after. So the 31 "extra" instructions per MMA really were control, not decode, and
   what remains above Q4 is roughly four instructions per MMA per tile -- the one funnel, five bit-field extracts and
   `IMAD`/`DP4A` per window that the 4-bit trellis costs and a nibble plane does not.
+- 2026-09-29: M4 release verification -- quality, MTP, Vision; the route is published. The full-corpus perplexity was
+  re-run on the current kernels for both tiers and is **bit-identical** to the published figures: 4.0 bpw overall
+  **4.293931** (chinese 4.974198, english_long_form 6.845779, english_reference 6.007342, ninfer_code 1.649449) and
+  3.5 bpw overall **4.310089** (5.008571, 6.914397, 5.967606, 1.657355). Both come from the large-T MMA path, where
+  the runtime work stayed bit-identical -- the BF16 A stage moved the rounding earlier rather than changing it -- and
+  KL divergence is computed from the same logits, so it carries over with them. The scoring pass itself now runs at
+  679.6 tok/s (4.0 bpw) and 993.6 (3.5 bpw) against the 380.7 and 440 recorded when those numbers were taken.
+  MTP measured for all four artifacts at a fixed three-token draft: EXL3 4.0 bpw 124, 3.5 bpw 120, Q4 134, NVFP4 142.
+  Q4 and NVFP4 reach 144 and 166 at K=5 with `--lm-head-draft`; **the EXL3 artifacts cannot**, because the conversion
+  does not emit the separate draft-head projection the official artifacts carry -- the server refuses at startup with
+  "selected proposal head is absent from artifact" and K=5 does not help (124.6). Emitting that projection is the
+  follow-up that would close the gap.
+  Vision was smoke-tested on the 4.0 bpw artifact with `--vision` against `examples/cli/media/visual_chart.png`, whose
+  expected content is documented in `examples/cli/README.md`. It returned the title `NIFER VISION 731`, the three red
+  circles and the blue square on the left, plus the `COUNT`/`POSITION` labels and a green triangle: HTTP 200 in 2.9 s,
+  media reported as 1 image prepared in 7.66 ms.
+  Documentation now publishes the route: the README gained a fourth "what the fork adds" bullet, artifact rows with
+  the download line, a recommended-settings row and an EXL3 quantization section; `docs/performance.md` gained
+  coverage rows (Not published for the methodology tables) with a pointer to the card; `docs/README.md` links the
+  Hugging Face repo and a versioned card; and `model-cards/ninfer-ext-models/README.md` is now the card's source in
+  the repository, rewritten where it was stale (it had claimed prefill was "several times slower" and "under active
+  work" at 495/579 tok/s). M4 is Complete.
 
 ## M3 status and decisions
 
