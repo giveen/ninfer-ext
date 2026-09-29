@@ -879,6 +879,21 @@ Staged so M5's evidence lands first:
   (programmatic dependent launch) for the transform/gemv/finish chain, which may or may not pay under a replayed
   graph. Its `Cache` policy is only `{ca, cg}` and Q4 uses `ca`, the same L1-cached path our trellis loads already
   take, so the "streaming weights" hint is not the difference.
+- 2026-09-29: M4 decode -- the 4-bit rate pinned, and the cp.async staging is a negative. Decode 71.0-71.2 -> 75.4-75.9
+  tok/s at 4.0 bpw (+21% over the 61.9-62.6 this work started from), prefill unchanged at 1.42-1.46k, both oracles
+  pass. The kernel evaluated `half_bits == 8 / fast / exl3_half_fast` once per k-tile; the 4-bit rate carries most of
+  the model's projections by call count, so pinning it as a template parameter removes that chain -- and the wide
+  rates' six window registers -- from the instantiation the bulk of the decode runs. It is the same lesson as the
+  probe block: a cold branch's reconvergence in the hot loop costs more than the work it guards, while the register
+  count did not move (40 either way). A seven-block target still overruns (REG:45) and is slower. Separately, the
+  pattern q4 (`AsyncVector16`) and nvfp4 (`Nvfp4GemvSharedStorage`, `cp_async_zfill<16, Cache::cg>`) both use --
+  stage the weight stream into shared memory with 16-byte L2-only copies so the DRAM fetch overlaps the decode -- was
+  built for this GEMV as a per-warp eight-tile ring with one committed group per tile and a warp-level wait. It is
+  correct (both oracles pass with it) but 9% slower, 71.0-71.2 -> 64.1-64.4 tok/s, so it is reverted: after the probe and
+  occupancy changes there are 48 warps per SM with two loads in flight each, the direct read already hides the DRAM
+  latency, and the staging only added a shared round trip, a per-tile warp wait, and `cg` on a stream whose neighbour
+  word used to be an L1 hit. Explicit staging pays when there are not enough warps to hide the latency; this kernel
+  no longer is that case.
 
 ## M3 status and decisions
 
