@@ -482,12 +482,12 @@ Single-request speed on one RTX 5090 (CUDA 13.3, greedy, 64–256 output tokens)
 | Regime | EXL3 4.0 bpw | EXL3 3.5 bpw |
 |---|---|---|
 | Decode, plain | 76 tok/s | 64 tok/s |
-| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | not measured |
-| Prefill, 584 / 7,633-token prompt | 2.01k / 2.38k tok/s | 2.11k at 2,763 |
+| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | 120 tok/s |
+| Prefill, ~0.55k / ~7.6k-token prompt | 2.01k / 2.38k tok/s | 1.69k / 2.08k tok/s |
 
-The 3.5 bpw decode is the slower one because its odd half-rates take a heavier trellis decode; its
-prefill uses the same kernels. Cross-format single-request numbers, the measurement protocol, and
-everything else about these artifacts are in their
+3.5 bpw is slower on both regimes: its odd half-rates take the heavier `exl3_windows_half` window
+decode, which costs more than the 9% of weight bytes it saves. Cross-format single-request numbers,
+the measurement protocol, and everything else about these artifacts are in their
 [model card](../model-cards/ninfer-ext-models/README.md).
 
 ## Performance
