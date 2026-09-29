@@ -51,10 +51,12 @@ struct PrefillContext {
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
-    std::int32_t state_source_slot                          = 0;
-    std::int32_t state_destination_slot                     = 0;
-    std::uint32_t mtp_proposal_extent                       = 0;
-    const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    std::int32_t state_source_slot                             = 0;
+    std::int32_t state_destination_slot                        = 0;
+    std::uint32_t mtp_proposal_extent                          = 0;
+    std::int32_t dflash_kv_table_row                           = 0;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    const qwen3_5::DFlashDecodeIngress* dflash_host_ingress    = nullptr;
     // Streamed prefill: the prepared staging of this chunk's Host pages, or null.
     qwen3_5::KVHostStaging* text_kv_staging = nullptr;
     qwen3_5::KVHostStaging* mtp_kv_staging  = nullptr;
