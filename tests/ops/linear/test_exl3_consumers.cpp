@@ -113,6 +113,27 @@ std::vector<__nv_bfloat16> linear_reference(const Exl3Parent& parent, const __nv
     return host;
 }
 
+// The reference and the consumer run the same split-K GEMV, whose FP32 K reduction is reassociated
+// per launch by its block-atomic accumulation, so identical inputs can differ by a few BF16 ULP. The
+// oracle bounds the worst element by a small multiple of one ULP of the largest magnitude present; a
+// row-mapping or epilogue defect displaces whole rows and lands orders of magnitude above that.
+double worst_error_in_ulps(const std::vector<__nv_bfloat16>& actual,
+                           const std::vector<__nv_bfloat16>& expected) {
+    double scale = 0.0, error = 0.0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const double a = static_cast<double>(__bfloat162float(actual[i]));
+        const double e = static_cast<double>(__bfloat162float(expected[i]));
+        scale = std::max(scale, std::abs(e));
+        error = std::max(error, std::abs(a - e));
+    }
+    if (scale == 0.0) { return error == 0.0 ? 0.0 : 1.0e9; }
+    return error / std::ldexp(1.0, std::ilogb(scale) - 7);
+}
+
+// A row-mapping defect moves an element by O(max), i.e. O(2^7) ULP of the largest magnitude, while
+// the split-K reassociation stays within a couple, so four keeps a wide margin on both sides.
+constexpr double kConsumerUlpBudget = 4.0;
+
 double max_relative(const std::vector<__nv_bfloat16>& actual,
                     const std::vector<__nv_bfloat16>& expected) {
     double scale = 0.0, error = 0.0;
@@ -279,13 +300,13 @@ void test_attn_input_proj(std::int32_t t, int half_bits, std::uint32_t seed) {
         }
         return out;
     };
-    const double q_err = max_relative(q_host, slice(0, q_rows));
-    const double k_err = max_relative(k_host, slice(q_rows, kv_rows));
-    const double g_err = max_relative(g_host, slice(q_rows + kv_rows, q_rows));
-    const double v_err = max_relative(v_host, slice(q_rows + kv_rows + q_rows, kv_rows));
-    if (std::max({q_err, k_err, g_err, v_err}) > 1.0e-3) {
-        std::cerr << "EXL3 attn_input_proj T=" << t << " errors q=" << q_err << " k=" << k_err
-                  << " gate=" << g_err << " value=" << v_err << '\n';
+    const double q_err = worst_error_in_ulps(q_host, slice(0, q_rows));
+    const double k_err = worst_error_in_ulps(k_host, slice(q_rows, kv_rows));
+    const double g_err = worst_error_in_ulps(g_host, slice(q_rows + kv_rows, q_rows));
+    const double v_err = worst_error_in_ulps(v_host, slice(q_rows + kv_rows + q_rows, kv_rows));
+    if (std::max({q_err, k_err, g_err, v_err}) > kConsumerUlpBudget) {
+        std::cerr << "EXL3 attn_input_proj T=" << t << " errors (BF16 ULP of max) q=" << q_err
+                  << " k=" << k_err << " gate=" << g_err << " value=" << v_err << '\n';
         ++failures;
     }
     check(cudaFree(d_v), "cudaFree(v)");
@@ -338,10 +359,10 @@ void test_gdn_input_proj(std::int32_t t, int half_bits, std::uint32_t seed) {
                 reference[(qkv_rows + r) + static_cast<std::size_t>(c) * n];
         }
     }
-    const double qkv_err = max_relative(qkv_host, qkv_ref);
-    const double z_err = max_relative(z_host, z_ref);
-    if (std::max(qkv_err, z_err) > 1.0e-3) {
-        std::cerr << "EXL3 gdn_input_proj T=" << t << " errors qkv=" << qkv_err
+    const double qkv_err = worst_error_in_ulps(qkv_host, qkv_ref);
+    const double z_err = worst_error_in_ulps(z_host, z_ref);
+    if (std::max(qkv_err, z_err) > kConsumerUlpBudget) {
+        std::cerr << "EXL3 gdn_input_proj T=" << t << " errors (BF16 ULP of max) qkv=" << qkv_err
                   << " z=" << z_err << '\n';
         ++failures;
     }
@@ -369,6 +390,10 @@ int main() {
         test_linear_swiglu(34816, 5120, 7, 2, 313U);
         test_attn_input_proj(2, 9, 317U);
         test_gdn_input_proj(2, 7, 319U);
+        // Above the GEMV cutoff the consumers take the tensor-core `exl3_mma`, at both tile sizes
+        // (T <= 64 selects the 16-row tile, larger T the 64-row one).
+        test_gdn_input_proj(32, 7, 331U);
+        test_gdn_input_proj(96, 8, 333U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " EXL3 fused consumers\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
