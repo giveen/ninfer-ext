@@ -835,6 +835,27 @@ Staged so M5's evidence lands first:
   same A-staging fix, even though its odd-rate trellis decode is the heavier one on the decode side. Closing the 4.0
   bpw gap needs the accumulator out of registers (a streamed sub-tile epilogue) so one decoded weight can serve more
   tokens, not another launch-bounds or layout tweak.
+- 2026-09-29: M4 decode -- measured, and the obvious levers closed. Graphsignal with `--cuda-graph-trace node` (the
+  decode replays CUDA graphs, which is why an nsys kernel sum saw only 309 ms of a 3.4 s request) puts
+  `exl3_gemv_split<1>` at 2.71 s of 3.3 s of kernel time over 200 tokens: 51,961 calls, 52 us each, 260 calls/token,
+  with the profiler itself costing 4% (57.7 against 60 tok/s). `ninfer_decode_device_wait_microseconds_per_round` is
+  15.8 ms against 1.6 ms of host and a batch of 1.0, so the GPU is busy and there is no batching slack. NCU on the
+  real shapes: the head (n = 248320, 6 bits) reaches 73.9% of DRAM, but the byte-heavy MLP projections sit at 44-60%
+  DRAM with the ALU pipe at 58% and an ALU-heavy instruction mix -- NCU's own "below 60% ... typically indicate
+  latency issues" -- at 5 blocks/SM and 78% achieved occupancy. That is 13.5 ms/token of GEMV against a ~8-9.5 ms
+  weight-read floor, so ~1.3x is reachable and Q4's 78.6 tok/s on the same prompt is the target.
+  `upstream/dev` (Neroued/ninfer, tip 2026-09-29) has no EXL3 but the same techniques: split-K with explicit FP32
+  partials and a merge kernel, caller-owned partial storage (21.25 MiB), native pair conversions in place of an
+  FP32/FP16 bridge, and a wider-vector T1 GEMV. Our own tree agrees that EXL3 is the outlier -- `grep atomicAdd
+  src/ops/linear/` hits only `exl3_dispatch.cu`, while q4/q5 use `ksplit_mma`, which "reduces FP32 partials in shared
+  memory". Two attempts at that lever lost and were reverted: an in-CTA row split on the `q5_ksplit_mma` shape (16 rows
+  per CTA, eight K warps, shared-memory reduce, no memset, no atomic) gave 52.2 tok/s against 61.5 because it trades
+  grid parallelism for locality -- the whole reason the grid-level split exists at T = 1 -- and a 6-block register
+  target spilled to 41.3 tok/s. So the atomic grid-level split-K is the right shape for T = 1, the load pipes are not
+  the limiter (`Mem Pipes Busy` 35%, `L1/TEX` 37.7%, so widening the operand loads cannot pay), and the one unspent
+  lever is software-pipelining the K loop to prefetch the next trellis word -- raising memory-level parallelism
+  without more warps, inside the 51-register budget. Decode holds at 61.9-62.6 tok/s and prefill at 1.44-1.45k, both
+  oracles pass, and the experiments left no trace in the tree.
 
 ## M3 status and decisions
 

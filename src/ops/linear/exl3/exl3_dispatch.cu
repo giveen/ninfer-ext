@@ -46,13 +46,6 @@ __device__ __forceinline__ float mul1_value(std::uint16_t state) {
     return static_cast<float>(static_cast<std::int32_t>(sum) - 510);
 }
 
-// State index whose 16x16 tile element is (k_local, n_local); the inverse of the trellis order in
-// storage-layouts.md 9.2, i.e. of k = 2 b3 + 4 b4 + b0 + 8 b1, n = b5 + 2 b6 + 4 b7 + 8 b2.
-__device__ __forceinline__ int tile_state_index(int k_local, int n_local) {
-    return (k_local & 1) | (((k_local >> 3) & 1) << 1) | (((n_local >> 3) & 1) << 2) |
-           (((k_local >> 1) & 1) << 3) | (((k_local >> 2) & 1) << 4) | ((n_local & 7) << 5);
-}
-
 // 16-bit circular window of the tile's tail-biting bitstream that decodes weight `t`.
 __device__ __forceinline__ std::uint16_t tile_state(const std::uint8_t* tile, int half_bits,
                                                     int t) {
