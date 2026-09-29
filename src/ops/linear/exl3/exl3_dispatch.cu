@@ -10,6 +10,7 @@
 #include "ops/linear/exl3/exl3_dispatch.h"
 
 #include "core/device.h"
+#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -23,15 +24,18 @@ namespace {
 
 constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 
-// The contraction kernels decode a trellis window per weight, so they are latency-bound rather than
-// DRAM-bound: NCU shows them register-limited at 2 blocks/SM (about 16% occupancy, SMs active 8% of
-// elapsed cycles). launch_bounds makes nvcc spend registers on occupancy instead, which is the whole
-// lever for decode and prefill alike. The two families peak differently -- the GEMV wants 5 blocks/SM
-// and the MMA 4, where a tighter cap starts spilling its accumulators -- so they carry separate
-// targets (measured on 4.0 bpw: 38.1 -> 62.4 tok/s decode, 314.6 -> 342.0 prefill).
+// The contraction kernels decode a trellis window per weight, so they are latency-bound rather
+// than DRAM-bound: NCU shows them register-limited at 2 blocks/SM (about 16% occupancy, SMs active
+// 8% of elapsed cycles). launch_bounds makes nvcc spend registers on occupancy instead, which is
+// the whole lever for decode and prefill alike. The two families peak differently -- the GEMV wants
+// 5 blocks/SM and the MMA 6, where a tighter cap starts spilling its accumulators -- so they carry
+// separate targets.
 constexpr int kExl3Threads        = 256;
 constexpr int kExl3GemvMinBlocks = 5;
-constexpr int kExl3MmaMinBlocks  = 4;
+// The MMA block keeps a [2][TILE_T/16][4] FP32 accumulator per thread; the 6-block register budget
+// (42 registers) cannot hold it and ptxas spills to local memory, so the register target is 3
+// blocks (85 registers) and the 16 KiB shared footprint leaves room for more if registers allow.
+constexpr int kExl3MmaTarget     = 3;
 
 __device__ __forceinline__ float mul1_value(std::uint16_t state) {
     // The byte sum of the multiplied state is the mul1 codebook; one dp4a replaces six shift/mask/add
@@ -438,37 +442,52 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_mm
     }
 }
 
-// Tensor-core contraction. A block covers one 128-row Hadamard block and up to 64 tokens. Warp w
-// decodes the trellis tile for n = 16w..16w+15 (both n8 fragments) and runs it against the four m16
-// token fragments. The stored tile order is the m16n8k16 B-fragment order, so a lane's eight
-// windows pack straight into two B fragments with no shuffle.
+// Tensor-core contraction. A block covers one 128-row Hadamard block and up to TILE_T tokens.
+// The stored tile order is the m16n8k16 B-fragment order, so each warp decodes the trellis tile for
+// its own 16 output rows straight into its two B fragments with no shuffle: every lane reads and
+// converts its eight windows exactly once per k-tile, instead of re-reading a full [TILE_T][16]
+// A tile from shared memory for every (fragment, h) pair after a whole-block barrier. The A stage
+// is a double-buffered __pipeline copy (the next k-tile overlaps the current mma chain). A first
+// version of this kernel shared one decoded B across the whole block and measured 2 blocks/SM and
+// 18.8 ms per [5120,34816]x64 call at 4.0 bpw; the per-warp form reaches 6 blocks/SM and 3.2 ms on
+// the same shape.
 constexpr int kExl3MmaN       = 128;
 constexpr int kExl3MmaThreads = 256;
 constexpr int kExl3MmaT       = 64; // columns per block at large T
 constexpr int kExl3MmaSmallT  = 16; // columns per block at small T, so the grid still has blocks
 
+// Double-buffered A staging via __pipeline: the next k-tile's 4 KiB copy overlaps the current
+// mma chain, so the shared-memory read and the u load stop serializing on the same barrier pair.
+constexpr int kExl3AStages = 2;
+
 // TILE_T is a multiple of 16 (the m16n8k16 m). A smaller tile gives the grid more blocks when the
 // column count is small, which is the difference between an occupancy-starved and a busy kernel.
 template <int TILE_T>
-__global__ void __launch_bounds__(kExl3Threads, kExl3MmaMinBlocks)
+__global__ void __launch_bounds__(kExl3Threads, kExl3MmaTarget)
 exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
          const float* __restrict__ sv, __nv_bfloat16* __restrict__ out,
          int k_extent, int n_extent, int columns, int half_bits,
          float probe_sigma, std::uint32_t probe_seed) {
     constexpr int MT = TILE_T / 16;
-    const int n_base  = blockIdx.x * kExl3MmaN;
-    const int t0      = blockIdx.y * TILE_T;
-    const int lane    = threadIdx.x & 31;
-    const int warp    = threadIdx.x >> 5;
-    const int t_count = min(TILE_T, columns - t0);
+    const int n_base   = blockIdx.x * kExl3MmaN;
+    const int t0       = blockIdx.y * TILE_T;
+    const int lane     = threadIdx.x & 31;
+    const int warp     = threadIdx.x >> 5;
+    const int t_count  = min(TILE_T, columns - t0);
+    const int n_tile   = blockIdx.x * 8 + warp;
     const int kt_tiles = k_extent / 16;
     const int bits     = half_bits >> 1;
     const int words    = 4 * half_bits;
     const bool fast    = (half_bits & 1) == 0;
 
-    __shared__ __nv_bfloat16 us[TILE_T][16];
-    __shared__ float vs[TILE_T][kExl3MmaN];
-
+    // A is staged in FP32: a cp.async copy moves raw bytes, so staging BF16 directly would slice
+    // FP32 bit patterns into BF16 halves (NaN garbage); the BF16 rounding happens when the A
+    // fragment is packed instead, which is the same round-to-nearest conversion the reference
+    // applies to its operands.
+    __shared__ float us[kExl3AStages][TILE_T][16];
+    // One 16-row sub-tile of pre-Hadamard outputs, reused across the MT rounds of the epilogue.
+    // A full [TILE_T][128] buffer would double the block's footprint and cut occupancy in half.
+    __shared__ float vs[16][kExl3MmaN];
     float acc[2][MT][4];
 #pragma unroll
     for (int h = 0; h < 2; ++h)
@@ -479,102 +498,165 @@ exl3_mma(const float* __restrict__ u, const std::uint8_t* __restrict__ trellis,
 
     const std::size_t tile_stride = static_cast<std::size_t>(16 * half_bits);
     const std::uint8_t* warp_tile =
-        trellis + static_cast<std::size_t>(blockIdx.x * 8 + warp) * kt_tiles * tile_stride;
+        trellis + static_cast<std::size_t>(n_tile) * kt_tiles * tile_stride;
 
     std::uint16_t plan[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) { plan[i] = exl3_window(8 * lane + i, bits, words); }
 
-    for (int kt = 0; kt < kt_tiles; ++kt) {
-        for (int i = threadIdx.x; i < TILE_T * 16; i += kExl3MmaThreads) {
-            const int t  = i >> 4;
-            const int kk = i & 15;
-            us[t][kk]    = (t0 + t < columns)
-                               ? __float2bfloat16(
-                                     u[static_cast<std::size_t>(t0 + t) * k_extent + kt * 16 + kk])
-                               : __float2bfloat16(0.0F);
+    // One [TILE_T][16] FP32 tile copies as TILE_T*4 16-byte copies (all 256 threads at
+    // TILE_T = 64): copy 4c + q fetches column c's floats 4q..4q+3, so a column's row is four
+    // coalesced 16-byte chunks. Columns past t_count zero-fill, which the mma consumes as padding.
+    const auto stage_tile = [&](int tile) {
+        const int copy_id = static_cast<int>(threadIdx.x);
+        if (copy_id < TILE_T * 4) {
+            const int src_col = copy_id >> 2;         // 0..TILE_T-1: token column
+            const int quad    = (copy_id & 3) * 4;    // float offset 0/4/8/12 in the k-tile
+            const int bytes   = (src_col < t_count) ? 16 : 0;
+            const float* source = u + static_cast<std::size_t>(t0 + src_col) * k_extent +
+                                  tile * 16 + quad;
+            cp_async_zfill<16>(&us[tile & (kExl3AStages - 1)][src_col][quad], source, bytes);
         }
+    };
+
+    // Iteration kt consumes the group staged for kt and issues the stage for kt + 1, whose DRAM
+    // latency hides behind kt's mma chain. The wait leaves only the groups issued after kt's
+    // pending, so kt's stage is complete; the trailing barrier keeps the next stage from
+    // overwriting a slot a warp is still reading. A first version staged and waited inside the
+    // same iteration with wait_group 0, which serialized every k-tile on its own load -- and,
+    // missing the wait at kt = 0, let the first mma read uninitialized shared memory.
+    if (kt_tiles > 0) { stage_tile(0); }
+    cp_commit();
+    for (int kt = 0; kt < kt_tiles; ++kt) {
+        // When a new stage joins the queue the wait can leave one group outstanding (the one just
+        // staged); the last iteration stages nothing, so its own tile is the only group left and
+        // the wait must drain it completely before the mma reads the slot.
+        if (kt + 1 < kt_tiles) { stage_tile(kt + 1); }
+        cp_commit();
+        if (kt + 1 < kt_tiles) { cp_wait<kExl3AStages - 1>(); } else { cp_wait<0>(); }
         __syncthreads();
+
+        const int slot = kt & (kExl3AStages - 1);
 
         const std::uint8_t* tile8 = warp_tile + static_cast<std::size_t>(kt) * tile_stride;
         const std::uint32_t* tile32 = reinterpret_cast<const std::uint32_t*>(tile8);
-        float d[8];
         if (fast) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) { d[i] = exl3_window_value(tile32, plan[i], words); }
-        } else if (exl3_half_fast(half_bits)) {
-            exl3_windows_half(tile32, lane, half_bits, d);
-        } else {
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                d[i] = mul1_value(tile_state(tile8, half_bits, 8 * lane + i));
-            }
-        }
-        if (probe_sigma > 0.0F) {
-#pragma unroll
             for (int h = 0; h < 2; ++h) {
+                float d[4];
 #pragma unroll
-                for (int r = 0; r < 4; ++r) {
-                    const int nn = n_base + h * 8 + (lane >> 2);
-                    const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
-                    d[4 * h + r] += probe_sigma * probe_gaussian(static_cast<std::uint32_t>(nn),
-                                                                 static_cast<std::uint32_t>(kk),
-                                                                 probe_seed);
+                for (int i = 0; i < 4; ++i) {
+                    d[i] = exl3_window_value(tile32, plan[4 * h + i], words);
+                }
+                if (probe_sigma > 0.0F) {
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        const int nn = n_base + h * 8 + (lane >> 2);
+                        const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
+                        d[r] += probe_sigma *
+                                probe_gaussian(static_cast<std::uint32_t>(nn),
+                                               static_cast<std::uint32_t>(kk), probe_seed);
+                    }
+                }
+                const std::uint32_t b0 = pack_bf16x2(d[0], d[1]);
+                const std::uint32_t b1 = pack_bf16x2(d[2], d[3]);
+                const std::uint32_t b[2] = {b0, b1};
+                // The m16n8k16 A fragment: rows groupID and groupID + 8, the lane's k pair and
+                // its +8 partner.
+                const int col = (lane & 3) * 2;
+                const int grp = lane >> 2;
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    const int t = mt * 16 + grp;
+                    const std::uint32_t a0 = pack_bf16x2(us[slot][t][col], us[slot][t][col + 1]);
+                    const std::uint32_t a1 =
+                        pack_bf16x2(us[slot][t + 8][col], us[slot][t + 8][col + 1]);
+                    const std::uint32_t a2 =
+                        pack_bf16x2(us[slot][t][col + 8], us[slot][t][col + 9]);
+                    const std::uint32_t a3 =
+                        pack_bf16x2(us[slot][t + 8][col + 8], us[slot][t + 8][col + 9]);
+                    const std::uint32_t a[4] = {a0, a1, a2, a3};
+                    mma_m16n8k16(acc[h][mt], a, b);
                 }
             }
-        }
-        std::uint32_t b[2][2];
+        } else {
+            float d[8];
+            if (exl3_half_fast(half_bits)) {
+                exl3_windows_half(tile32, lane, half_bits, d);
+            } else {
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            b[h][0] = pack_bf16x2(d[4 * h + 0], d[4 * h + 1]);
-            b[h][1] = pack_bf16x2(d[4 * h + 2], d[4 * h + 3]);
-        }
-
-        std::uint32_t a[MT][4];
+                for (int i = 0; i < 8; ++i) {
+                    d[i] = mul1_value(tile_state(tile8, half_bits, 8 * lane + i));
+                }
+            }
+            if (probe_sigma > 0.0F) {
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-            const int row = mt * 16 + (lane >> 2);
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        const int nn = n_base + h * 8 + (lane >> 2);
+                        const int kk = kt * 16 + 2 * (lane & 3) + (r & 1) + 8 * (r >> 1);
+                        d[4 * h + r] += probe_sigma * probe_gaussian(
+                                                        static_cast<std::uint32_t>(nn),
+                                                        static_cast<std::uint32_t>(kk), probe_seed);
+                    }
+                }
+            }
+            std::uint32_t b[2][2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                b[h][0] = pack_bf16x2(d[4 * h + 0], d[4 * h + 1]);
+                b[h][1] = pack_bf16x2(d[4 * h + 2], d[4 * h + 3]);
+            }
             const int col = (lane & 3) * 2;
-            a[mt][0]      = pack_bf16x2(us[row][col], us[row][col + 1]);
-            a[mt][1]      = pack_bf16x2(us[row + 8][col], us[row + 8][col + 1]);
-            a[mt][2]      = pack_bf16x2(us[row][col + 8], us[row][col + 9]);
-            a[mt][3]      = pack_bf16x2(us[row + 8][col + 8], us[row + 8][col + 9]);
+            const int grp = lane >> 2;
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const int t = mt * 16 + grp;
+                const std::uint32_t a0 = pack_bf16x2(us[slot][t][col], us[slot][t][col + 1]);
+                const std::uint32_t a1 = pack_bf16x2(us[slot][t + 8][col], us[slot][t + 8][col + 1]);
+                const std::uint32_t a2 = pack_bf16x2(us[slot][t][col + 8], us[slot][t][col + 9]);
+                const std::uint32_t a3 =
+                    pack_bf16x2(us[slot][t + 8][col + 8], us[slot][t + 8][col + 9]);
+                const std::uint32_t a[4] = {a0, a1, a2, a3};
+                mma_m16n8k16(acc[0][mt], a, b[0]);
+                mma_m16n8k16(acc[1][mt], a, b[1]);
+            }
         }
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int mt = 0; mt < MT; ++mt) { mma_m16n8k16(acc[h][mt], a[mt], b[h]); }
 
         __syncthreads();
     }
+    __syncthreads();
 
-    // Publish the accumulators, then apply the output Hadamard over the 128 rows. Threads 0..127
-    // transform even columns and 128..255 odd ones; every thread still reaches the block barriers.
+    // Publish one 16-row sub-tile at a time, apply the output Hadamard over its 128 columns, and
+    // store, then reuse the buffer for the next sub-tile. Threads 0..127 transform even rows and
+    // 128..255 odd ones; every thread reaches every barrier.
     const int half_lane = threadIdx.x & 127;
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
+    for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-            const int n0        = (2 * warp + h) * 8 + (lane & 3) * 2;
-            const int t_a       = mt * 16 + (lane >> 2);
-            vs[t_a][n0]         = acc[h][mt][0];
-            vs[t_a][n0 + 1]     = acc[h][mt][1];
-            vs[t_a + 8][n0]     = acc[h][mt][2];
+        for (int h = 0; h < 2; ++h) {
+            const int n0     = (2 * warp + h) * 8 + (lane & 3) * 2;
+            const int t_a    = lane >> 2;
+            vs[t_a][n0]      = acc[h][mt][0];
+            vs[t_a][n0 + 1]  = acc[h][mt][1];
+            vs[t_a + 8][n0]  = acc[h][mt][2];
             vs[t_a + 8][n0 + 1] = acc[h][mt][3];
         }
-    }
-    __syncthreads();
-    for (int pair = 0; pair < TILE_T / 2; ++pair) {
-        const int t_even = 2 * pair;
-        const int t_odd  = 2 * pair + 1;
-        float* target    = (threadIdx.x < 128) ? &vs[t_even][0] : &vs[t_odd][0];
-        butterfly128(target, half_lane);
-        const int t = (threadIdx.x < 128) ? t_even : t_odd;
-        if (t < t_count) {
-            const int n = n_base + half_lane;
-            out[n + static_cast<std::size_t>(t0 + t) * n_extent] =
-                __float2bfloat16(target[half_lane] * sv[n] * (1.0F / 128.0F));
+        __syncthreads();
+        for (int pair = 0; pair < 8; ++pair) {
+            const int t_even = 2 * pair;
+            const int t_odd  = 2 * pair + 1;
+            float* target    = (threadIdx.x < 128) ? &vs[t_even][0] : &vs[t_odd][0];
+            butterfly128(target, half_lane);
+            const int t = (threadIdx.x < 128) ? t_even : t_odd;
+            if (mt * 16 + t < t_count) {
+                const int n = n_base + half_lane;
+                out[n + static_cast<std::size_t>(t0 + mt * 16 + t) * n_extent] =
+                    __float2bfloat16(target[half_lane] * sv[n] * (1.0F / 128.0F));
+            }
         }
+        __syncthreads();
     }
 }
 
