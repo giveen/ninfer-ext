@@ -3,7 +3,7 @@
 ninfer-ext is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer), a
 from-scratch C++/CUDA inference engine for Qwen models on one NVIDIA GeForce RTX 5090.
 
-The fork adds three things on top of upstream's engine:
+The fork adds four things on top of upstream's engine:
 
 - **Qwen3.8-Flash-Next on one 32 GB GPU.** A ~180B-parameter MoE model whose routed experts live in
   pinned Host memory behind a device expert cache. Stock NInfer cannot load it.
@@ -11,6 +11,10 @@ The fork adds three things on top of upstream's engine:
   artifacts, DFlash2 serving is 13–48% faster at 1–4 concurrent requests, and MTP 8–32% faster.
 - **Serving work for long-running agents.** Context-cache salvage and anchoring, one Host-tier
   budget, OOM recovery, and protocol additions.
+- **EXL3 quantization for Qwen3.8-27B.** A trellis-coded format at 4.0 and 3.5 bpw with its own
+  C++/CUDA quantizer and kernels ([EXL3 quantization](#exl3-quantization)). The artifacts it
+  produces are the smallest of this fork's Qwen3.8-27B builds and the best on both perplexity and KL
+  divergence; nothing upstream can produce or run them.
 
 It is **not** faster than stock everywhere. Qwen3.8-27B `nvfp4` and Qwen3.6-35B-A3B tie with stock,
 and stock is ahead in two cases. [Versus stock NInfer](#versus-stock-ninfer) has both sides.
@@ -23,6 +27,7 @@ artifacts, and the OpenAI- and Anthropic-compatible server. The fork tracks upst
 - [Recommended settings](#recommended-settings)
 - [Versus stock NInfer](#versus-stock-ninfer)
 - [Qwen3.8-Flash-Next](#qwen38-flash-next)
+- [EXL3 quantization](#exl3-quantization)
 - [Performance](#performance)
 - [What else the fork changes](#what-else-the-fork-changes)
 - [Capabilities and limits](#capabilities-and-limits)
@@ -63,15 +68,20 @@ Upstream's official v3 artifacts work unchanged:
 |---|---|---|---|
 | Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
 | Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
+| Qwen3.8-27B | `exl3` 4.0 bpw | `qwen3_8_27b_exl3_4bpw.ninfer` | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models) |
+| Qwen3.8-27B | `exl3` 3.5 bpw | `qwen3_8_27b_exl3_3p5bpw.ninfer` | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models) |
 | Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [neroued/Qwen3.6-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
 | Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [neroued/Qwen3.6-27B-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [neroued/Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
+hf download jabbatheduck/ninfer-ext-models qwen3_8_27b_exl3_4bpw.ninfer --local-dir models
 ```
 
-Two artifacts have to be converted yourself: Qwen3.8-27B with DFlash2 weights
+The two `exl3` rows are this fork's own quantization, published on Hugging Face; they download and
+run unchanged ([EXL3 quantization](#exl3-quantization)). Two other artifacts have to be converted
+yourself: Qwen3.8-27B with DFlash2 weights
 ([instructions](#converting-a-dflash2-artifact)) and Qwen3.8-Flash-Next
 ([instructions](#convert-and-serve)). Converted artifacts embed this fork's chat template
 ([conversion guide](docs/weight-conversion.md)). An existing v2 download can be
@@ -124,6 +134,7 @@ whether it is used or not. Where a cell says the workload decides, the numbers b
 | Qwen3.8-27B `nvfp4` | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` | same | same |
 | Qwen3.8-27B `groupwise-int` with DFlash2 weights | `--spec dflash2 --draft-tokens 7 --lm-head-draft` | same | same |
 | Qwen3.8-27B `groupwise-int` (official artifact) | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` | `--spec mtp --lm-head-draft` | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` |
+| Qwen3.8-27B `exl3` 4.0 / 3.5 bpw | `--spec mtp --draft-tokens 3 --fixed-draft` | not measured | not measured |
 | Qwen3.6-35B-A3B | `--spec mtp --lm-head-draft` | same at 2; at 4, same for long reasoning and no `--spec` for short prose | `--spec dflash --draft-tokens 7 --lm-head-draft` for long reasoning; no `--spec` for short prose |
 | Qwen3.6-27B (both) | not measured; start from the Qwen3.8-27B row of the same weights | | |
 | Qwen3.8-Flash-Next | no `--spec` | no `--spec` | no `--spec` |
@@ -134,6 +145,8 @@ Why these:
   5-token MTP draft beat the adaptive default on `nvfp4` by 3–17%. On `groupwise-int` the adaptive
   default wins at 2–4 requests, and fixed K=5 at 1 and 8. DFlash2 is the fastest mode on
   `groupwise-int` whenever the artifact carries its weights.
+- **EXL3.** Only the single-request settings are measured: fixed 3-token MTP drafts, the same
+  speculative shape the other 27B artifacts use. Concurrency is not measured yet.
 - **35B-A3B.** For one or two requests, adaptive MTP is within 5% of the best fixed draft on long
   reasoning and ahead on short prompts. Speculation hurts short prose from 4 requests up: on
   512-token essays, plain decode is 14% faster than MTP at C=4 and 32% faster at C=8. On long
@@ -442,6 +455,40 @@ for a single request and prefilled about 350 tok/s. The main steps since then:
 
 The comparison engine used during development, FreeToken with `--moe-backend offload`, measured
 about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same machine (4k context).
+
+## EXL3 quantization
+
+EXL3 is this fork's own weight format: a trellis codebook (`exl3_mul1` + `trellis_t16_v1`) over 16x16
+tiles, with the input and output Hadamard rotations folded into the kernels. It is not exllamav3's
+checkpoint format and imports nothing from it — `ninfer-quantize` produces the weights from
+full-precision source tensors, and the loader and kernels live in this repository.
+
+Two artifacts are published for Qwen3.8-27B, both Text + MTP + Vision:
+
+| Artifact | Size | PPL | KL(BF16 ‖ P) |
+|---|---|---:|---:|
+| `qwen3_8_27b_exl3_4bpw.ninfer` | 15.35 GiB | **4.2939** | **0.0332** |
+| `qwen3_8_27b_exl3_3p5bpw.ninfer` | 13.91 GiB | 4.3101 | 0.0624 |
+
+Perplexity is over 261,167 tokens (context/stride 4096/2048, FP8 KV, greedy) and KL divergence is
+against the full-precision model. 4.0 bpw is the smallest and the best of this fork's Qwen3.8-27B
+builds on **both** metrics — `groupwise-int` is 16.96 GiB at 4.3439 / 0.0429 and `nvfp4` is
+22.09 GiB at 4.3149 / 0.0510. 3.5 bpw is the size tier: best perplexity per byte, but its advantage
+over INT4 and NVFP4 does not survive as divergence. The two metrics rank the set differently, so both
+are reported; only the KL *ordering* is comparable across runs.
+
+Single-request speed on one RTX 5090 (CUDA 13.3, greedy, 64–256 output tokens):
+
+| Regime | EXL3 4.0 bpw | EXL3 3.5 bpw |
+|---|---|---|
+| Decode, plain | 76 tok/s | 64 tok/s |
+| Decode, MTP K=3 (`--spec mtp --draft-tokens 3 --fixed-draft`) | 124 tok/s | not measured |
+| Prefill, 584 / 7,633-token prompt | 2.01k / 2.38k tok/s | 2.11k at 2,763 |
+
+The 3.5 bpw decode is the slower one because its odd half-rates take a heavier trellis decode; its
+prefill uses the same kernels. Cross-format single-request numbers, the measurement protocol, and
+everything else about these artifacts are in their
+[model card](../model-cards/ninfer-ext-models/README.md).
 
 ## Performance
 

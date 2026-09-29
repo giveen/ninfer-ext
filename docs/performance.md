@@ -20,11 +20,17 @@ not product support. C is configured request concurrency; K is the number of dra
 | Qwen3.6-35B-A3B / `groupwise-int` | [8K–256K](performance/qwen3.6-35b-a3b.md#no-speculation-context-profile) | [MTP3; DFlash K=7 stochastic/greedy](performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash C=1](performance/qwen3.6-35b-a3b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.6-35b-a3b.md#decode-saturation) |
 | Qwen3.8-27B / `groupwise-int` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | Not published |
 | Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
+| Qwen3.8-27B / `exl3` 4.0 bpw | Not published | Not published | Not published | Not published |
+| Qwen3.8-27B / `exl3` 3.5 bpw | Not published | Not published | Not published | Not published |
 
 Qwen3.8 and Qwen3.6-35B-A3B C=1 corpus points also supply their single-request phase tables.
 The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full makespan is
 not published here. The Qwen3.8 NVFP4 saturation reports retain configuration and
 values but no tested Git revision; the model page records that provenance limitation.
+
+The `exl3` artifacts have no methodology-conforming measurement yet — the coverage row above records
+that. Their single-request spot numbers and full-corpus quality figures live in the artifacts' model
+card: [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models).
 
 ## Reading the results
 
