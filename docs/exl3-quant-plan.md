@@ -856,6 +856,25 @@ Staged so M5's evidence lands first:
   lever is software-pipelining the K loop to prefetch the next trellis word -- raising memory-level parallelism
   without more warps, inside the 51-register budget. Decode holds at 61.9-62.6 tok/s and prefill at 1.44-1.45k, both
   oracles pass, and the experiments left no trace in the tree.
+- 2026-09-29: M4 decode -- the probe instantiation, and six blocks per SM. Decode 61.9-62.6 -> 69.8-70.4 tok/s at
+  4.0 bpw (+12%) and 57.6 -> ~63 at 3.5 bpw, prefill unchanged at 1.45-1.46k. Two changes. First, the served T = 1
+  GEMV carried the sensitivity probe's per-window Gaussian (`if (probe_sigma > 0.0F)`, never taken in service) in its
+  own instantiation; a `kProbe` template parameter compiles it out for service while `ninfer-sensitivity` keeps it.
+  That block was costing far more than the branch it guarded -- its reconvergence barriers sat in the hot K loop --
+  and it is what freed the register budget. Second, with the probe gone the kernel needs 40 registers and no stack
+  frame where the shared instantiation needed 48, so the launch bound moved from five blocks per SM to six (seven
+  makes ptxas abandon the allocation, REG:255, and decode collapses to 23.3 tok/s).
+  Reading q4/nvfp4 for the same idea turned up three house patterns we are not using. Q4's T = 1 GEMV
+  (`q4_instances.cuh`) runs **tiny row tiles** -- `GemvR1W8K5120` is one row with eight K-split warps, `GemvR4W1` four
+  rows -- with the K reduction inside the CTA and no global partial at all, which is only possible because its group
+  granularity is 64 k positions, not 16 rows; EXL3's decode yields a whole 16-row trellis tile per warp, so its row
+  tile cannot shrink below 16 and the grid-level K split is what supplies the CTAs (which is exactly why the in-CTA
+  row split lost). It stages codes with `CodeTransfer::AsyncVector16` -- a cp.async 16-byte ring -- where this GEMV
+  reads the trellis straight from global and consumes it in the same iteration, leaving the DRAM latency exposed; that
+  is the transferable idea, and the one unspent lever named above. And it launches through `pdl::launch_dependent`
+  (programmatic dependent launch) for the transform/gemv/finish chain, which may or may not pay under a replayed
+  graph. Its `Cache` policy is only `{ca, cg}` and Q4 uses `ca`, the same L1-cached path our trellis loads already
+  take, so the "streaming weights" hint is not the difference.
 
 ## M3 status and decisions
 
