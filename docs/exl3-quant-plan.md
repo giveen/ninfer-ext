@@ -909,6 +909,11 @@ Staged so M5's evidence lands first:
   the control around it, and removing two cold branches recovered most of them: served prefill is now 2.44k against
   Q4's 2.86k (**1.17x**, from 3.5x) and decode 76-78 against 78.4 (**1.03x**), while the EXL3 artifact is 1.6 GiB
   smaller (15.35 against 16.96 GiB).
+  The re-profile confirms it at that shape: `exl3_mma<64>` 4.25 -> 2.41 ms and its instruction count 3.759e9 -> 1.346e9,
+  i.e. **42.2 -> 15.1 instructions per MMA** against Q4's 11.1, with the tensor instruction count identical at
+  89,128,960 in both before and after. So the 31 "extra" instructions per MMA really were control, not decode, and
+  what remains above Q4 is roughly four instructions per MMA per tile -- the one funnel, five bit-field extracts and
+  `IMAD`/`DP4A` per window that the 4-bit trellis costs and a nibble plane does not.
 
 ## M3 status and decisions
 
