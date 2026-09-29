@@ -300,17 +300,24 @@ __global__ void __launch_bounds__(kExl3Threads, kExl3GemvMinBlocks) exl3_gemv_sp
             const bool active = t < columns;
             const __nv_bfloat16* uk =
                 u + static_cast<std::size_t>(active ? t : 0) * k_extent + kt * 16;
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int local = r & 3;
-                const int k     = 2 * (lane & 3) + (local & 1) + 8 * (local >> 1);
-                const float operand = active ? __bfloat162float(uk[k]) : 0.0F;
-                if (r < 4) {
-                    a0[t][local] = fmaf(d[r], operand, a0[t][local]);
-                } else {
-                    a1[t][local] = fmaf(d[r], operand, a1[t][local]);
-                }
-            }
+            // The lane's four k positions are the adjacent pairs 2c, 2c+1 and 2c+8, 2c+9, so one
+            // 32-bit BF16 pair load serves each half of the fragment instead of two 16-bit halves:
+            // two latency-bearing loads per column instead of four, on a kernel NCU calls latency
+            // bound rather than pipe bound.
+            const int c = 2 * (lane & 3);
+            const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(uk + c);
+            const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(uk + c + 8);
+            const float op[4] = {active ? __low2float(lo) : 0.0F, active ? __high2float(lo) : 0.0F,
+                                 active ? __low2float(hi) : 0.0F,
+                                 active ? __high2float(hi) : 0.0F};
+            a0[t][0] = fmaf(d[0], op[0], a0[t][0]);
+            a0[t][1] = fmaf(d[1], op[1], a0[t][1]);
+            a0[t][2] = fmaf(d[2], op[2], a0[t][2]);
+            a0[t][3] = fmaf(d[3], op[3], a0[t][3]);
+            a1[t][0] = fmaf(d[4], op[0], a1[t][0]);
+            a1[t][1] = fmaf(d[5], op[1], a1[t][1]);
+            a1[t][2] = fmaf(d[6], op[2], a1[t][2]);
+            a1[t][3] = fmaf(d[7], op[3], a1[t][3]);
         }
     }
 #pragma unroll

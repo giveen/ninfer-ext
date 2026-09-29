@@ -856,14 +856,18 @@ Staged so M5's evidence lands first:
   lever is software-pipelining the K loop to prefetch the next trellis word -- raising memory-level parallelism
   without more warps, inside the 51-register budget. Decode holds at 61.9-62.6 tok/s and prefill at 1.44-1.45k, both
   oracles pass, and the experiments left no trace in the tree.
-- 2026-09-29: M4 decode -- the probe instantiation, and six blocks per SM. Decode 61.9-62.6 -> 69.8-70.4 tok/s at
-  4.0 bpw (+12%) and 57.6 -> ~63 at 3.5 bpw, prefill unchanged at 1.45-1.46k. Two changes. First, the served T = 1
+- 2026-09-29: M4 decode -- the probe instantiation, six blocks per SM, and paired operand loads. Decode
+  61.9-62.6 -> 71.0-71.2 tok/s at 4.0 bpw (+15%) and 57.6 -> 64.5 at 3.5 bpw, prefill unchanged at 1.45-1.46k. Three
+  changes. First, the served T = 1
   GEMV carried the sensitivity probe's per-window Gaussian (`if (probe_sigma > 0.0F)`, never taken in service) in its
   own instantiation; a `kProbe` template parameter compiles it out for service while `ninfer-sensitivity` keeps it.
   That block was costing far more than the branch it guarded -- its reconvergence barriers sat in the hot K loop --
   and it is what freed the register budget. Second, with the probe gone the kernel needs 40 registers and no stack
   frame where the shared instantiation needed 48, so the launch bound moved from five blocks per SM to six (seven
-  makes ptxas abandon the allocation, REG:255, and decode collapses to 23.3 tok/s).
+  makes ptxas abandon the allocation, REG:255, and decode collapses to 23.3 tok/s). Third, the lane's four k
+  positions are the adjacent pairs 2c, 2c+1 and 2c+8, 2c+9, so one 32-bit BF16 pair load now serves each half of the
+  fragment instead of two 16-bit halves -- two latency-bearing loads per column instead of four, with the register
+  count unchanged at 40.
   Reading q4/nvfp4 for the same idea turned up three house patterns we are not using. Q4's T = 1 GEMV
   (`q4_instances.cuh`) runs **tiny row tiles** -- `GemvR1W8K5120` is one row with eight K-split warps, `GemvR4W1` four
   rows -- with the K reduction inside the CTA and no global partial at all, which is only possible because its group
