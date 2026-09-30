@@ -120,7 +120,7 @@ and Qwen3.6-35B-A3B, each with and without `--lookup-drafts`.
 - [x] `decode_mtp_batch` substitution and observation
 - [x] `SpeculativeStats` counters surfaced in the request log
 - [x] Build and run the affected test targets (full non-model suite passes)
-- [ ] A/B measurement on the edit/quote and reasoning/prose loads (needs a real artifact)
+- [x] A/B measurement on the edit/quote and reasoning/prose loads (see §9)
 
 Landing shape: `--spec mtp --draft-tokens K --fixed-draft --lookup-drafts auto` (or `always`) with
 `--lookup-min-match N`. The counters appear per request under `speculative.lookup_rounds`,
@@ -155,3 +155,48 @@ request log. `off` is bit-identical to the pre-change MTP path.
 
 - Does the adaptive MTP policy need to keep updating while lookup is on? Phase 2 should decide.
 - Should the index be bounded further for very long contexts (memory vs. coverage tradeoff)?
+
+## 9. Phase 1 results
+
+RTX 5090, CUDA graphs, FP8 KV, `--fixed-draft --draft-tokens 7`, greedy, thinking off, one
+1791-token prompt (a header file returned with an identifier renamed), 400 new tokens. Flash-Next
+used `--expert-cache auto` (8090 experts, 20.8 GiB). Same prompt and settings for 35B-A3B, which
+has device-resident experts.
+
+| Model / load | mode | decode tok/s | rounds | tok/round | lookup rounds | lookup acc. |
+|---|---|---:|---:|---:|---:|---:|
+| Flash-Next, edit | off | 118.7 / 121.7 | 56 | 7.11 (MTP) | – | – |
+| Flash-Next, edit | auto | 132.1 | 53 | 7.53 | 42 | 100% |
+| Flash-Next, edit | always | 143.7 / 142.9 | 51 | 7.89 | 46 | 100% |
+| Flash-Next, prose | off / auto / always | 57.3 / 57.2 / 57.3 | 100 | 2.53 (MTP) | 0 | – |
+| 35B-A3B, edit | off | 971.7 | 53 | 7.53 (MTP) | – | – |
+| 35B-A3B, edit | auto | 967.5 | 53 | 7.53 | 0 | – |
+| 35B-A3B, edit | always | 1.01k | 51 | 7.96 | 46 | 100% |
+
+Findings:
+
+- **Correctness holds.** Greedy output is byte-identical across `off`/`auto`/`always` on both models
+  and both prompts, so the substituted drafts do not change what the model commits.
+- **Lookup wins on verbatim/echo text.** Flash-Next edit: +19% decode (two runs each) and 56 -> 51
+  rounds; 35B-A3B edit: +4% and 53 -> 51 rounds. Lookup acceptance was 100%, all from match buckets
+  2 and 3 (12-23 and >=24 tokens); the proposal is only truncated by the MTP frame's seven drafts.
+- **No cost on novel text.** The prose load produced no proposal at all (no repeated suffix) and
+  `off`/`auto`/`always` are identical there. Enabling lookup cannot regress a non-repeating load.
+- **`auto` is too conservative.** On 35B-A3B it never fired although `always` was a clean win; on
+  Flash-Next it used only bucket 3. The bucket-3 prior (0.92) understates the measured ~1.0, and a
+  conservative prior is never overridden for a bucket the policy does not try. This is the first
+  Phase 2 action: exploration or a measured-in-engine bootstrap (Strata probes unseen window sizes
+  for the same reason).
+- **The MTP frame is the ceiling.** Lookup matched 24+ tokens and accepted every draft, yet the
+  round still verified at most seven. A lookup-only backend with a wider window (DFlash's domain is
+  15) is where the deep-match advantage would actually be collected; Phase 1's +4-19% is the part
+  that survives sharing MTP's seven-draft frame.
+
+Reproduce:
+
+```bash
+./build/apps/ninfer models/Qwen3.8-Flash-NVFP4/qwen3_8_flash_next_nvfp4.ninfer \
+  --prompt "$(cat prompt.txt)" --max-context 32768 --kv-capacity auto --kv-dtype fp8 \
+  --expert-cache auto --spec mtp --draft-tokens 7 --fixed-draft \
+  --lookup-drafts off|auto|always --max-new 400 --greedy --no-thinking
+```
