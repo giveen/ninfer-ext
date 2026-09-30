@@ -32,6 +32,40 @@ The `exl3` artifacts have no methodology-conforming measurement yet — the cove
 that. Their single-request spot numbers and full-corpus quality figures live in the artifacts' model
 card: [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models).
 
+## Causal attention architecture migration
+
+The causal-cache attention Op was replaced with the upstream per-format architecture (shared causal
+primitives, one grouped/tiled plan per KV storage, split-KV prefill for FP8 and K8V4). This section
+records the engineering measurement of that change. It is an **Op-level** result, not a serving
+measurement, and it is not a cell in the coverage table above.
+
+Conditions: RTX 5090, CUDA 13.3, `build` with `-O3`; baseline is the pre-migration fork attention.
+Op numbers come from `ninfer_causal_softmax_attention_bench` (CUDA-graph execution, median of 11
+repetitions; repeated runs of one binary agree within 1.04×, so a difference below that is noise).
+End-to-end numbers come from `ninfer_bench` on Qwen3.8-27B `nvfp4`, `-p 32768 --max-ctx 32768`,
+best-of-N over 15 interleaved samples per side.
+
+Append-and-attend prefill, W=1024, fragmented mapping:
+
+| KV storage | L=8192 | L=32768 | Op workspace |
+|---|---|---|---|
+| BF16 | 1.05× | 1.09× | unchanged |
+| FP8-E4M3-row256 | 1.32× | 1.60× | 0 → 177.5 MB |
+| INT8-G64 | 1.00× | 1.01× | unchanged |
+| K8V4 | 1.29× | 1.56× | 0 → 177.5 MB |
+| NVFP4-G16 | 1.00× | 1.04× | unchanged |
+
+Decode (W=1 and W=16, B=1 and B=8, L=32768, graph execution) is 1.00–1.56×, except INT8 W=1 B=1,
+which regresses 57.3 → 63.5 µs (0.90×, stable and above the noise floor; 6 µs).
+
+End-to-end 27B prefill at 32K is unchanged: FP8 KV 0.986–0.997×, BF16 KV 0.999–1.007×. Model
+workspace is unchanged at 430.8 MiB — the Op's 177 MB fits inside the existing model allocation.
+The Op gain does not move end-to-end throughput because a 1024-token prefill chunk saves about
+1.7 ms of a 3.4 s prefill (~1.6%), below the ~1–2% end-to-end noise floor. That noise comes from
+the host: this machine runs a 475 W power limit (575 W default) with unlocked clocks, and `-lgc`
+needs privileges that were unavailable. End-to-end runs were therefore interleaved and reduced
+best-of-N. A single earlier FP8 reading of +6.2% was an outlier and is not reported.
+
 ## Reading the results
 
 | Question | Metric to use |
