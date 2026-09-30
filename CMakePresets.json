@@ -33,6 +33,22 @@
       "name": "dev",
       "configurePreset": "dev",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "fast",
+      "displayName": "Parallel non-GPU tests (real-model tests excluded)",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "real" } },
+      "execution": { "jobs": 0, "noTestsAction": "error" }
+    },
+    {
+      "name": "real",
+      "displayName": "Serial real-model Engine tests",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "real" } },
+      "execution": { "jobs": 1 }
     }
   ]
 }

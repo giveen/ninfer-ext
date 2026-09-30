@@ -47,6 +47,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The suite is CPU-bound and single-threaded per test, so it is much faster to run the
+non-model tests in parallel. `ctest --preset fast` runs every test except the `real`
+label with a job per core; `ctest --preset real` runs the artifact-dependent model tests
+serially, since each loads a multi-gigabyte model onto the one GPU and they must not
+overlap. Use `--preset dev` for the whole suite in one serial pass when ordering matters.
+
+```bash
+ctest --preset fast    # parallel, excludes real
+ctest --preset real    # serial, real only
+```
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
