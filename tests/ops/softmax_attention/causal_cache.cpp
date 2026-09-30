@@ -1743,6 +1743,20 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
            (test_case.graph_replay ? " graph-replay" : "");
 }
 
+// Physical SM count for this test's device, resolved once. Capacity queries and execution must
+// agree on the count, so both go through test_execution().
+int test_sm_count() {
+    static const int count = [] {
+        int value = 0;
+        cuda_check(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, 0),
+                   "query multiprocessor count");
+        return value;
+    }();
+    return count;
+}
+
+DeviceExecutionView test_execution(cudaStream_t stream) { return {stream, test_sm_count()}; }
+
 template <class Launch>
 void launch_attention_case(Launch&& launch, bool graph_replay) {
     if (!graph_replay) {
@@ -1841,7 +1855,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens,
+        test_execution(nullptr));
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1849,7 +1864,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
-                                          cache.batch_view(), envelope, workspace, tout, stream);
+                                          cache.batch_view(), envelope, workspace, tout,
+                                          test_execution(stream));
         },
         test_case.graph_replay);
 
@@ -1920,14 +1936,16 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens,
+        test_execution(nullptr));
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     launch_attention_case(
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                                 cache.view(), envelope, workspace, tout, stream);
+                                                 cache.view(), envelope, workspace, tout,
+                                                 test_execution(stream));
         },
         test_case.graph_replay);
 
@@ -2024,7 +2042,8 @@ int run_host_arm_case(const Geometry& geometry, KvCacheStorage storage,
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens,
+        test_execution(nullptr));
 
     const auto run = [&](DeviceCache& cache, const std::string& label) {
         GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
@@ -2039,11 +2058,11 @@ int run_host_arm_case(const Geometry& geometry, KvCacheStorage storage,
                     ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                                   op_geometry(geometry), kAttentionScale,
                                                   cache.batch_view(), envelope, workspace, tout,
-                                                  stream);
+                                                  test_execution(stream));
                 } else {
                     ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry),
                                                          kAttentionScale, cache.view(), envelope,
-                                                         workspace, tout, stream);
+                                                         workspace, tout, test_execution(stream));
                 }
             },
             test_case.graph_replay);
@@ -2195,18 +2214,19 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     Tensor tp(dp.data(), DType::I32, {width, batch}), tvalid(dvalid.data(), DType::I32, {batch}),
         tlanes(dlanes.data(), DType::I32, {batch});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
-    const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, batch, width, width);
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    const auto capacity   = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, batch, width, width, execution);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    DeviceContext device;
     const bool masked =
         test_case.graph_replay ||
         std::ranges::any_of(test_case.valid_columns, [&](int count) { return count != width; });
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, device.stream);
+                                      envelope, workspace, tout, execution);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -2624,11 +2644,12 @@ int verify_workspace_capacity_contract() {
         constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
         constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
         const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
-            geometry, storage, envelope, 1, 1, 17);
+            geometry, storage, envelope, 1, 1, 17, test_execution(nullptr));
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                            geometry, storage, envelope, 1, tokens, tokens));
+                                            geometry, storage, envelope, 1, tokens, tokens,
+                                            test_execution(nullptr)));
         }
         if (interval != witness) {
             std::cerr << "causal_softmax_attention interval capacity has no exact route witness\n";
@@ -2638,7 +2659,7 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumVisibleKeys}, 1, 1, 1, test_execution(nullptr));
     } catch (const std::invalid_argument&) {
         std::cerr << "causal_softmax_attention rejected its maximum visible-key envelope\n";
         ++failures;
@@ -2646,7 +2667,7 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, 1, 1, 1, test_execution(nullptr));
         std::cerr << "causal_softmax_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

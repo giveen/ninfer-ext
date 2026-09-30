@@ -119,8 +119,10 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream) {
-    const auto plan = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope);
+                              Tensor& out, DeviceExecutionView execution) {
+    const cudaStream_t stream = execution.stream;
+    const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                         execution.multiprocessor_count);
     if (plan.family != Int8KvFamily::Grouped) {
         kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
@@ -141,8 +143,10 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
                               const PagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream) {
-    const auto plan = make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope);
+                              Tensor& out, DeviceExecutionView execution) {
+    const cudaStream_t stream = execution.stream;
+    const auto plan =
+        make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Tiled)
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),

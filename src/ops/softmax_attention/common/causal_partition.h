@@ -1,11 +1,10 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cstdint>
 
 namespace ninfer::ops::detail {
-
-// RTX 5090 target. Wave budgets remain owned by each dtype plan.
-inline constexpr int kCausalAttentionSmCount = 170;
 
 // Capture reserves partials for the largest live row. Producer and merge use
 // the same live count; a wider capture never changes a row's work partition.
@@ -20,5 +19,19 @@ struct CausalKvPartition {
         return count < target ? count : target;
     }
 };
+
+// Complete groups of independent query tiles should fill at least 90% of the SMs.
+// Each dtype chooses whether a shortfall warrants a larger CTA budget.
+inline constexpr bool causal_query_tiles_underfill_sms(int independent_tiles,
+                                                       int multiprocessor_count) {
+    const std::int64_t filled =
+        (multiprocessor_count / independent_tiles) * static_cast<std::int64_t>(independent_tiles);
+    return filled < static_cast<std::int64_t>(multiprocessor_count) * 9 / 10;
+}
+
+inline constexpr int causal_partition_target(std::int64_t cta_budget, int independent_tiles) {
+    return static_cast<int>(
+        std::clamp<std::int64_t>(cta_budget / independent_tiles, 1, CausalKvPartition::kMaxSplits));
+}
 
 } // namespace ninfer::ops::detail

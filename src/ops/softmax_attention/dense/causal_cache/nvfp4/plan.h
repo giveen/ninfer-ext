@@ -16,8 +16,10 @@ struct Nvfp4KvCausalPlan {
 };
 
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
-                                            CausalAttentionExecutionEnvelope envelope);
+                                            CausalAttentionExecutionEnvelope envelope,
+                                            int multiprocessor_count);
 std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
-                                     CausalAttentionExecutionEnvelope envelope);
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     int multiprocessor_count);
 
 } // namespace ninfer::ops::detail

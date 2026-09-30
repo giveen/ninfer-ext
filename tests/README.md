@@ -92,6 +92,10 @@ The variable-width DFlash2 target-attention subset can be run with
 `./build/tests/ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
+Large causal reference calculations use at most eight CPU workers while preserving each output's
+FP64 accumulation order; small cases remain serial. Cache fixtures populate the reachable KV
+prefix while reserving the full execution-envelope page table. The runner reports elapsed time
+per KV type.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
