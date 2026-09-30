@@ -3,6 +3,8 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
+#include "ops/softmax_attention/dense/causal_cache/bf16/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
@@ -410,6 +412,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
+    if (cache_storage == KvCacheStorage::BFloat16) {
+        return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope);
+    }
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits = detail::causal_attention_split_capacity(
@@ -467,6 +472,14 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
+    // The BF16 cache uses the upstream per-format attention architecture: one append entry point and
+    // one cached entry point select their own grouped or tiled schedule. The other formats still use
+    // the fork's route-based launch until they are migrated.
+    if (cache.storage == KvCacheStorage::BFloat16) {
+        detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                         cache, envelope, workspace, out, stream);
+        return;
+    }
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
@@ -497,6 +510,11 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
+    if (cache.storage == KvCacheStorage::BFloat16) {
+        detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                         stream);
+        return;
+    }
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
