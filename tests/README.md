@@ -47,6 +47,23 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The suite is largely CPU-bound and single-threaded per test, while each test still
+allocates device fixtures, so a small bounded job count is much faster than a serial run
+and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways
+(142 tests in about 2.3 min against about 16 min serially); `ctest --preset real` runs the
+artifact-dependent model tests one at a time.
+
+```bash
+ctest --preset fast    # six-way parallel, excludes real
+ctest --preset real    # serial, real only
+```
+
+The job count is deliberately bounded rather than one per core: individual Op tests peak
+around 0.6-1.9 GiB of device memory, so an unbounded `-j` exhausts a 32 GiB GPU and fails
+unrelated tests with `cudaErrorMemoryAllocation`. Six passes the whole non-model suite
+cleanly; eight through twelve also pass but no longer get faster, because what remains is
+serialized on the GPU.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.

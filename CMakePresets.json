@@ -33,6 +33,22 @@
       "name": "dev",
       "configurePreset": "dev",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "fast",
+      "displayName": "Six-way parallel non-model tests",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "real" } },
+      "execution": { "jobs": 6 }
+    },
+    {
+      "name": "real",
+      "displayName": "Serial real-model Engine tests",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "real" } },
+      "execution": { "jobs": 1 }
     }
   ]
 }
