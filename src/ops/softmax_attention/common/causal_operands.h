@@ -81,6 +81,9 @@ struct QuantizedCausalCacheView {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     int table_stride, kv_heads;
+    // Host pages read in place for negative block-table words (KVPageRef). Null planes mean the
+    // cache has no Host arm and its tables hold Device words only; writes never target a record.
+    PagedKVHostPlanes host;
 };
 
 template <class View>
@@ -94,7 +97,8 @@ View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
             valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
             cache.block_tables.ne[0],
-            cache.num_kv_heads};
+            cache.num_kv_heads,
+            cache.host};
 }
 
 template <class G, class View>
