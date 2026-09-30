@@ -139,6 +139,14 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
+    const ServeOptions lookup =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+               "--lookup-drafts", "auto", "--lookup-min-match", "10"});
+    failures += check(lookup.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          lookup.speculative.lookup_drafts == ninfer::LookupDraftMode::Auto &&
+                          lookup.speculative.lookup_min_match == 10,
+                      "serve options did not preserve lookup drafting");
+
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto options = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
                                     "--draft-tokens", std::to_string(k), "--lm-head-draft"});

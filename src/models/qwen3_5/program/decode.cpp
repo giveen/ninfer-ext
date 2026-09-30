@@ -154,7 +154,23 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .draft_window           = draft_window,
         .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
         .rounds_by_draft_length = std::vector<std::uint64_t>(draft_window, 0),
+        .lookup_drafted_by_match_bucket =
+            std::vector<std::uint64_t>(LookupAcceptance::kBuckets, 0),
+        .lookup_accepted_by_match_bucket =
+            std::vector<std::uint64_t>(LookupAcceptance::kBuckets, 0),
     };
+    // Prompt-lookup drafting belongs to the request that owns the sequence: a fresh index makes a
+    // reused continuation draft only from its own tokens.
+    if (lookup_drafts != LookupDraftMode::Off) {
+        if (!sequence.lookup) {
+            sequence.lookup.emplace(capacity);
+        } else {
+            sequence.lookup->reset();
+        }
+        sequence.lookup_policy = LookupPolicy(lookup_min_match);
+    } else {
+        sequence.lookup.reset();
+    }
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
@@ -496,6 +512,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, k, capacity);
         }
 
+        // Prompt-lookup drafts: a lane may substitute its proposal for the MTP drafts when the
+        // policy predicts it commits more. `lookup_extent`/`lookup_match` record the choice so the
+        // round's outcome trains the lookup model rather than the MTP's.
+        std::array<std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts>, kMaximumConcurrency>
+            lookup_tokens{};
+        std::array<std::uint32_t, kMaximumConcurrency> lookup_extent{};
+        std::array<std::uint32_t, kMaximumConcurrency> lookup_match{};
+
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
@@ -503,17 +527,41 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent     = std::min({sequence.mtp_draft_count, k, max_by_budget,
-                                                       capacity - sequence.execution_frontier - 1});
+            // The round width is shared by every lane; per-lane extents stay within it.
+            const std::uint32_t structural_cap =
+                std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
+            std::uint32_t extent = std::min(sequence.mtp_draft_count, structural_cap);
+
+            if (sequence.lookup) {
+                sequence.lookup->sync(sequence.ledger);
+                const std::uint32_t proposed =
+                    sequence.lookup->propose(structural_cap, lookup_tokens[row].data());
+                if (proposed > 0) {
+                    const std::uint32_t match = sequence.lookup->match_length();
+                    const double mtp_expected = sequence.mtp_acceptance.expected_tokens(extent);
+                    const std::uint32_t chosen = sequence.lookup_policy.choose(
+                        proposed, match, mtp_expected, lookup_drafts == LookupDraftMode::Always);
+                    if (chosen > 0) {
+                        extent             = chosen;
+                        lookup_extent[row] = chosen;
+                        lookup_match[row]  = match;
+                    }
+                }
+            }
+
             mtp_host_ingress->anchors[row] = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
+            const std::span<const TokenId> drafts =
+                lookup_extent[row] > 0
+                    ? std::span<const TokenId>(lookup_tokens[row].data(), lookup_extent[row])
+                    : std::span<const TokenId>(sequence.mtp_drafts.data(), extent);
             for (std::uint32_t j = 0; j < k; ++j) {
                 mtp_host_ingress->current_drafts[row * k + j] =
-                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+                    j < extent ? drafts[j] : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
@@ -602,14 +650,29 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             if (pcur == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.rounds_by_draft_length[k - 1U] += 1;
-                request.speculative_stats.drafted_tokens += pcur;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+                auto& stats = request.speculative_stats;
+                stats.rounds += 1;
+                stats.rounds_by_draft_length[k - 1U] += 1;
+                stats.drafted_tokens += pcur;
+                stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                if (lookup_extent[row] > 0) {
+                    // The drafts verified were lookup's, so this outcome trains the lookup model
+                    // and not the MTP's.
+                    const std::size_t bucket    = LookupAcceptance::bucket(lookup_match[row]);
+                    const std::uint32_t lookup  = lookup_extent[row];
+                    sequence.lookup_policy.observe(lookup_match[row], lookup,
+                                                   static_cast<std::uint32_t>(accepted_i));
+                    stats.lookup_rounds += 1;
+                    stats.lookup_drafted_tokens += lookup;
+                    stats.lookup_accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                    stats.lookup_drafted_by_match_bucket[bucket] += lookup;
+                    stats.lookup_accepted_by_match_bucket[bucket] +=
+                        static_cast<std::uint64_t>(accepted_i);
+                } else {
+                    sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+                }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
+                    stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
                 }
             }
             request.pending = PendingCandidate{

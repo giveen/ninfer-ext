@@ -136,6 +136,30 @@ int main() {
                       "--fixed-draft was accepted for DFlash");
     failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--fixed-draft"),
                       "CLI help omits --fixed-draft");
+    const ninfer::cli::Options lookup =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+               "--draft-tokens", "3", "--lookup-drafts", "always", "--lookup-min-match", "6"});
+    failures += check(lookup.speculative.lookup_drafts == ninfer::LookupDraftMode::Always &&
+                          lookup.speculative.lookup_min_match == 6,
+                      "CLI did not preserve the lookup-drafts settings");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--lookup-drafts", "auto"});
+                      }),
+                      "lookup drafts were accepted without a speculative backend");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash", "--draft-tokens", "7", "--lookup-drafts", "auto"});
+                      }),
+                      "lookup drafts were accepted for DFlash");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--lookup-drafts", "auto",
+                                       "--lookup-min-match", "2"});
+                      }),
+                      "CLI accepted a lookup min match below 3");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--lookup-drafts"),
+                      "CLI help omits --lookup-drafts");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

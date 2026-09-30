@@ -12,6 +12,8 @@
 #include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
+#include "models/qwen3_5/program/speculative/lookup_policy.h"
+#include "models/qwen3_5/program/speculative/suffix_drafter.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -396,6 +398,11 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     // How far this sequence's drafts get accepted; steers the draft length of its rounds.
     MtpAcceptanceEstimate mtp_acceptance;
+    // Prompt-lookup drafts: the suffix index for this sequence's ledger and the source choice.
+    // The index is created when the sequence begins (only when lookup drafting is enabled), so a
+    // sequence that never uses it pays nothing.
+    std::optional<SuffixDrafter> lookup;
+    LookupPolicy lookup_policy;
     bool tail_hidden_valid = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -647,6 +654,9 @@ public:
     // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
     const bool plain_mtp_batches;
     const SpeculativeBackend speculative_backend;
+    // Prompt-lookup (suffix) drafts substitute for the MTP drafts inside the same round.
+    const LookupDraftMode lookup_drafts;
+    const std::uint32_t lookup_min_match;
     const KvCacheStorage kv_storage;
     // KV streaming (planning/kv_stream.h): full pages outside a request's Device window move to
     // Host records that attention reads in place.

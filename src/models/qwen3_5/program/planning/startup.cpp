@@ -1103,6 +1103,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    if (options.speculative.lookup_drafts != LookupDraftMode::Off) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("lookup drafts require the MTP speculative backend");
+        }
+        if (options.speculative.lookup_min_match < 3 || options.speculative.lookup_min_match > 32) {
+            throw std::invalid_argument("lookup min match must be in [3,32]");
+        }
+    }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
@@ -1225,6 +1233,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
+    impl->lookup_drafts       = inputs.lookup_drafts;
+    impl->lookup_min_match    = inputs.lookup_min_match;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
@@ -1414,6 +1424,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
                           !options.speculative.fixed_draft,
         .speculative_backend = options.speculative.backend,
+        .lookup_drafts       = options.speculative.lookup_drafts,
+        .lookup_min_match    = options.speculative.lookup_min_match,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,
         .features            = models::load_options(options),

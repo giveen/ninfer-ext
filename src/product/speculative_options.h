@@ -29,7 +29,34 @@ namespace ninfer::product {
     return "unknown";
 }
 
+[[nodiscard]] inline LookupDraftMode parse_lookup_draft_mode(std::string_view value) {
+    if (value == "off") { return LookupDraftMode::Off; }
+    if (value == "auto") { return LookupDraftMode::Auto; }
+    if (value == "always") { return LookupDraftMode::Always; }
+    throw std::invalid_argument("invalid lookup-drafts mode: " + std::string(value));
+}
+
+[[nodiscard]] inline const char* lookup_draft_mode_name(LookupDraftMode mode) noexcept {
+    switch (mode) {
+    case LookupDraftMode::Off:
+        return "off";
+    case LookupDraftMode::Auto:
+        return "auto";
+    case LookupDraftMode::Always:
+        return "always";
+    }
+    return "unknown";
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.lookup_drafts != LookupDraftMode::Off) {
+        if (options.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("--lookup-drafts requires --spec mtp");
+        }
+        if (options.lookup_min_match < 3 || options.lookup_min_match > 32) {
+            throw std::invalid_argument("--lookup-min-match must be in [3,32]");
+        }
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||

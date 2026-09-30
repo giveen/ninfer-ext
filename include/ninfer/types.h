@@ -120,6 +120,16 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// Prompt-lookup (suffix) draft source, shared with the MTP backend. It proposes tokens that
+// followed an earlier occurrence of the current suffix and needs no draft weights, no draft KV and
+// no GPU work. `Auto` uses it only for a lane where it is predicted to commit more tokens than the
+// MTP drafts; `Always` uses it whenever it proposes, for measurement.
+enum class LookupDraftMode : std::uint8_t {
+    Off,
+    Auto,
+    Always,
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: DFlash and DFlash2 1..15 (query width K+1). For MTP 1..7 it is the largest
@@ -128,6 +138,10 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     bool fixed_draft           = false;
+    // Lookup drafts substitute for the MTP drafts inside the same round; only meaningful with MTP.
+    LookupDraftMode lookup_drafts = LookupDraftMode::Off;
+    // Shortest match whose proposal may be used (3..32).
+    std::uint32_t lookup_min_match = 8;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -763,6 +777,14 @@ struct SpeculativeStats {
     // Rounds run at each draft length: entry k-1 counts rounds that drafted k tokens. MTP varies
     // the length per round; a fixed window puts every round in its last entry.
     std::vector<std::uint64_t> rounds_by_draft_length;
+    // Prompt-lookup drafts, counted separately from the MTP drafts they replaced, so the two
+    // sources can be compared on the same run. The buckets are the lookup acceptance model's match
+    // length buckets (<6, <12, <24, >=24).
+    std::uint64_t lookup_rounds          = 0;
+    std::uint64_t lookup_drafted_tokens  = 0;
+    std::uint64_t lookup_accepted_tokens = 0;
+    std::vector<std::uint64_t> lookup_drafted_by_match_bucket;
+    std::vector<std::uint64_t> lookup_accepted_by_match_bucket;
 };
 
 struct ThinkingBudgetStats {
