@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "real_test_artifact.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -255,6 +256,7 @@ int main() {
         return 77;
     }
 
+    try {
     {
         ninfer::Engine engine(engine_options(artifact));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
@@ -264,4 +266,7 @@ int main() {
     if (const int result = exercise_maximum_configuration(artifact); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;
+    } catch (const std::exception& error) {
+        return ninfer::test::real_test_error(error);
+    }
 }

@@ -1,5 +1,7 @@
 #include "ninfer/engine.h"
 
+#include "real_test_artifact.h"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -3400,6 +3402,9 @@ int main() {
         throw std::invalid_argument("unknown prefix integration scenario");
     }
     } catch (const std::exception& e) {
+        if (ninfer::test::artifact_component_mismatch(e)) {
+            return ninfer::test::real_test_error(e);
+        }
         std::cerr << "uncaught exception in scenario '" << scenario << "': " << e.what() << '\n';
         std::cerr.flush();
         return 1;

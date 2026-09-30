@@ -1,14 +1,24 @@
-ninfer_add_test(ninfer_qwen3_5_loading_real_test
+# Opt-in real-model artifacts, selected by explicit path so a run never depends
+# on glob order or modification time. Configure the ones you have and run
+# `ctest -L real`; an artifact variable left empty makes its test skip (77).
+# The Windows build supplies no artifact.
+set(NINFER_ARTIFACT_LOADING "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_loading_real_test")
+set(NINFER_ARTIFACT_PREFIX  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_prefix_real_test")
+set(NINFER_ARTIFACT_SCORE   "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_score_real_test")
+set(NINFER_ARTIFACT_VISION  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_vision_workspace_test")
+set(NINFER_ARTIFACT_DFLASH2 "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash2_real_test")
+set(NINFER_ARTIFACT_MOE     "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_moe_real_test")
+set(NINFER_ARTIFACT_DFLASH  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_real_test")
+set(NINFER_ARTIFACT_STREAM  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_stream_real_test")
+
+ninfer_add_real_test(ninfer_qwen3_5_loading_real_test NINFER_ARTIFACT_LOADING
+  ARGS --vision --speculative mtp --proposal optimized
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)
 
 ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
-
-set_tests_properties(
-  ninfer_qwen3_5_loading_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_5_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
@@ -39,53 +49,29 @@ set_tests_properties(
   ninfer_qwen3_5_context_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_test(ninfer_qwen3_5_prefix_real_test
+ninfer_add_real_test(ninfer_qwen3_5_prefix_real_test NINFER_ARTIFACT_PREFIX
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
   LIBRARIES ninfer_engine)
 
-set_tests_properties(
-  ninfer_qwen3_5_prefix_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_qwen3_5_score_real_test
+ninfer_add_real_test(ninfer_qwen3_5_score_real_test NINFER_ARTIFACT_SCORE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES ninfer_engine)
 
-set_tests_properties(
-  ninfer_qwen3_5_score_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
+ninfer_add_real_test(ninfer_qwen3_5_vision_workspace_test NINFER_ARTIFACT_VISION
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_workspace.cpp"
   LIBRARIES ninfer_model_runtime ninfer_engine)
 
-set_tests_properties(
-  ninfer_qwen3_5_vision_workspace_test
-  PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
+ninfer_add_real_test(ninfer_qwen3_5_dflash2_real_test NINFER_ARTIFACT_DFLASH2
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_real.cpp"
   LIBRARIES ninfer_engine)
 
-set_tests_properties(
-  ninfer_qwen3_5_dflash2_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_qwen3_5_moe_real_test
+ninfer_add_real_test(ninfer_qwen3_5_moe_real_test NINFER_ARTIFACT_MOE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
   LIBRARIES ninfer_engine)
 
-set_tests_properties(
-  ninfer_qwen3_5_moe_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_qwen3_5_dflash_real_test
+ninfer_add_real_test(ninfer_qwen3_5_dflash_real_test NINFER_ARTIFACT_DFLASH
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
   LIBRARIES ninfer_engine)
-
-set_tests_properties(
-  ninfer_qwen3_5_dflash_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
@@ -108,10 +94,6 @@ ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_qwen3_5_ple_gather_test PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_test(ninfer_qwen3_5_stream_real_test
+ninfer_add_real_test(ninfer_qwen3_5_stream_real_test NINFER_ARTIFACT_STREAM
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stream_real.cpp"
   LIBRARIES ninfer_engine)
-
-set_tests_properties(
-  ninfer_qwen3_5_stream_real_test
-  PROPERTIES SKIP_RETURN_CODE 77)

@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "real_test_artifact.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -63,7 +64,6 @@ int main() {
         std::cout << "Vision workspace remains bounded for long text context\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }

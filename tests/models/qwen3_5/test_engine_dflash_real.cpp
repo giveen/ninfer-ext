@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 #include "speculative_page_boundary.h"
+#include "real_test_artifact.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -384,6 +385,7 @@ int main() {
         248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
         1710,   248046, 198, 248045, 74455, 198,   248068, 198,
     };
+    try {
     if (const int result = exercise_vision_dflash(artifact, prompt); result != 0) { return result; }
 
     {
@@ -438,4 +440,7 @@ int main() {
 
     std::cout << "ok\n";
     return 0;
+    } catch (const std::exception& error) {
+        return ninfer::test::real_test_error(error);
+    }
 }

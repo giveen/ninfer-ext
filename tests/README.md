@@ -154,10 +154,22 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_stream_real_test --output-on-failure
 ```
 
-Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
+Without an artifact, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks
 use behavior and state accounting rather than another numerical path's generated tokens as a golden.
+
+The eight artifact-dependent tests carry the `real` label and each reads its artifact from its own
+`NINFER_ARTIFACT_*` CMake cache variable, so one run serves mutually incompatible artifacts and any
+test whose artifact is unset skips cleanly:
+
+```bash
+cmake -S . -B build -DNINFER_ARTIFACT_STREAM=$PWD/models/qwen3_8_27b_nvfp4.ninfer
+ctest --test-dir build -L real --output-on-failure
+```
+
+See [Opt-in real-model Engine tests](../docs/maintainer/real-model-tests.md) for the full variable
+table, coverage, and selection rules.
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
 

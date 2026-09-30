@@ -1,5 +1,7 @@
 #include "ninfer/engine.h"
 
+#include "real_test_artifact.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -27,7 +29,7 @@ int main() {
         std::cout << "SKIP: NINFER_TEST_ARTIFACT is not set\n";
         return 77;
     }
-
+    try {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     options.purpose       = ninfer::EnginePurpose::CausalScoring;
@@ -125,4 +127,7 @@ int main() {
 
     std::cout << "OK causal_score_real (logits max |delta logprob| " << worst_export_error << ")\n";
     return 0;
+    } catch (const std::exception& error) {
+        return ninfer::test::real_test_error(error);
+    }
 }
