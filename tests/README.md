@@ -47,6 +47,23 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The suite is largely CPU-bound and single-threaded per test, while each test still
+allocates device fixtures, so a small bounded job count is much faster than a serial run
+and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways
+(142 tests in about 2.3 min against about 16 min serially); `ctest --preset real` runs the
+artifact-dependent model tests one at a time.
+
+```bash
+ctest --preset fast    # six-way parallel, excludes real
+ctest --preset real    # serial, real only
+```
+
+The job count is deliberately bounded rather than one per core: individual Op tests peak
+around 0.6-1.9 GiB of device memory, so an unbounded `-j` exhausts a 32 GiB GPU and fails
+unrelated tests with `cudaErrorMemoryAllocation`. Six passes the whole non-model suite
+cleanly; eight through twelve also pass but no longer get faster, because what remains is
+serialized on the GPU.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
@@ -75,6 +92,10 @@ The variable-width DFlash2 target-attention subset can be run with
 `./build/tests/ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
+Large causal reference calculations use at most eight CPU workers while preserving each output's
+FP64 accumulation order; small cases remain serial. Cache fixtures populate the reachable KV
+prefix while reserving the full execution-envelope page table. The runner reports elapsed time
+per KV type.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
@@ -226,11 +247,24 @@ broad additions without a concrete regression risk do not belong in the permanen
 
 ## DFlash2 Engine integration
 
-The real test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
-penalty-enabled sampling, compact batches with unequal budgets, same-route same-seed replay,
-retained/fresh prefix behavior and absence of a full backend KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
-boundary, stops after one target column at token 64, and checks the exact retained frontier and
-subsequent generation with and without reuse.
+The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting
+decode binding, including shortened chunks and oversized local/full KV appends. It uses native
+Program storage and the production prefill route; select the draft component stored in the artifact:
+
+```bash
+cmake --build build -j --target ninfer_qwen3_5_dflash_prefill_real_test
+NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash2
+NINFER_TEST_ARTIFACT=out/qwen3_6_35b_a3b.ninfer \
+  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash
+```
+
+The Engine test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
+forced thinking-control append, penalty-enabled sampling, compact batches with unequal budgets,
+same-route same-seed replay, retained/fresh prefix behavior and absence of a full backend KV pool.
+A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page boundary, stops
+after one target column at token 64, and checks the exact retained frontier and subsequent generation
+with and without reuse.
 The KV Store test checks exact mapping and reservation accounting for the same transition.
 K>=7 also exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
 local ring wrap, and the logical context-capacity tail. Optional Vision runs image/video capture

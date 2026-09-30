@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
 
 namespace ninfer::models::qwen3_5::execution {
@@ -12,9 +13,9 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
                           WorkspaceArena& workspace, cudaStream_t stream);
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
-               cudaStream_t stream);
+               DeviceExecutionView execution);
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               cudaStream_t stream);
+               DeviceExecutionView execution);
 
 // Normalize q and k and rotate them. Where the fused Op covers the geometry this is one graph node
 // instead of three; everywhere else it is the three calls it replaces, which are the same
@@ -23,6 +24,6 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
-                       Tensor& normalized_key, cudaStream_t stream);
+                       Tensor& normalized_key, DeviceExecutionView execution);
 
 } // namespace ninfer::models::qwen3_5::execution

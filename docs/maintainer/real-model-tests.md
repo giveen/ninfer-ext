@@ -47,6 +47,13 @@ loads a model onto the single GPU, so parallel runs exhaust device memory.
 `ctest -L real` runs whatever is configured and skips the rest, so the same command works with a
 partial artifact set. Re-running `cmake` with a variable set to `""` returns that test to skipping.
 
+Budget for runtime. Each test loads its artifact and uploads weights, so cost is dominated by model
+loads, not arithmetic. Most construct one Engine. `stream_real` is the outlier: it builds about
+fifteen, one per scenario, because each scenario needs different Engine options (streaming window,
+concurrency, MTP). It is therefore the slowest test by a wide margin and the first to hit an
+external process or job timeout. On a host with such a limit, run it on its own; its scenarios are
+independent, so a subset in one process is equivalent to the whole set.
+
 ## The tests
 
 | Variable | Test | Artifact carry | Covers |

@@ -463,11 +463,9 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_small_ro
     }
 }
 
-constexpr int kRtx5090SmCount = 170;
 // Upper bound on the persistent grid. The routed GEMMs stride their work list by gridDim.x,
-// so any grid is correct; this caps the launch when the work list is long.
-constexpr int kPrefillMaxBlocksPerSm = 32;
-constexpr int kPrefillMaxBlocks      = kPrefillMaxBlocksPerSm * kRtx5090SmCount;
+// so any positive grid is correct. This is a queued CTA budget, not simultaneous residency.
+constexpr int kPrefillQueuedCtasPerSm = 32;
 
 // The narrow routed gate/up ships in both depths and the route picks one. A job is one nonempty
 // column tile of one expert, so more than one job per touched expert means an expert's rows
@@ -1834,10 +1832,14 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoePrefillWorkspace& workspace,
+                               DeviceExecutionView execution) {
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
+    const cudaStream_t stream = execution.stream;
+    const std::int64_t max_prefill_blocks =
+        static_cast<std::int64_t>(execution.multiprocessor_count) * kPrefillQueuedCtasPerSm;
 
     const auto* router = static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata);
     const auto* routed_gate_codes = static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata);
@@ -1933,10 +1935,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         // groupwise routes it was measured at zero and is not this change's to make.
         const int max_route_jobs =
             assignments / route_job_bn + (nvfp4 ? std::min(kExperts, assignments) : kExperts);
-        const int routed_gate_work   = max_route_jobs * (kIntermediate / (kExpertBM / 2));
-        const int routed_down_work   = max_route_jobs * (kHidden / kExpertBM);
-        const int routed_gate_blocks = std::min(routed_gate_work, kPrefillMaxBlocks);
-        const int routed_down_blocks = std::min(routed_down_work, kPrefillMaxBlocks);
+        const int routed_gate_work = max_route_jobs * (kIntermediate / (kExpertBM / 2));
+        const int routed_down_work = max_route_jobs * (kHidden / kExpertBM);
+        const int routed_gate_blocks =
+            static_cast<int>(std::min<std::int64_t>(routed_gate_work, max_prefill_blocks));
+        const int routed_down_blocks =
+            static_cast<int>(std::min<std::int64_t>(routed_down_work, max_prefill_blocks));
         if (!fused_route) {
             sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
                 tile_counts, tile_bases, offsets, route_job_experts, route_job_columns,

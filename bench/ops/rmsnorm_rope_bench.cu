@@ -240,7 +240,8 @@ void run_single(const Options& options, int tokens, cudaStream_t stream) {
 // The text profile of the two registered geometries. `split` is what every full-attention layer
 // issues today: normalize q, normalize k, rotate both. `fused` is the Op that replaces the three.
 void run_text(const Options& options, int query_heads, int key_heads, int tokens,
-              cudaStream_t stream) {
+              DeviceExecutionView execution) {
+    const cudaStream_t stream  = execution.stream;
     const auto positions_host = host_positions(tokens);
     DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
     positions.copy_from_host(positions_host.data(), positions.bytes);
@@ -267,7 +268,8 @@ void run_text(const Options& options, int query_heads, int key_heads, int tokens
         }
         ops::rmsnorm(t_q, t_q_weight, kTextEps, true, t_qn, launch_stream);
         ops::rmsnorm(t_k, t_k_weight, kTextEps, true, t_kn, launch_stream);
-        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn, launch_stream);
+        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn,
+                  execution.on_stream(launch_stream));
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) launch(stream);
@@ -299,8 +301,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         Options options     = parse_options(argc, argv);
+        DeviceContext device;
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const DeviceExecutionView execution = device.execution_view().on_stream(stream);
         if (options.form == Form::Pair) {
             for (int width : options.widths)
                 for (int batch : options.batches) run_pair(options, width, batch, stream);
@@ -308,8 +312,8 @@ int main(int argc, char** argv) {
             for (int tokens : options.tokens) run_single(options, tokens, stream);
         } else {
             for (int tokens : options.tokens) {
-                run_text(options, 16, 2, tokens, stream);
-                run_text(options, 24, 4, tokens, stream);
+                run_text(options, 16, 2, tokens, execution);
+                run_text(options, 24, 4, tokens, execution);
             }
         }
         CUDA_CHECK(cudaStreamDestroy(stream));

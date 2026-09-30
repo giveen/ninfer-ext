@@ -160,12 +160,16 @@ The runners also drive a stock upstream `ninfer-serve` (`--serve PATH`):
 - **Adaptive mode.** `mtp_adaptive` is rejected on it.
 - **Request log.** Both upstream's schema-v21 log and this fork's v24 are accepted.
 Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
+Both serving runners accept `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` (default: `int8`).
+Specify it explicitly when recording a new campaign; the Qwen3.8 performance profile uses
+`--kv-dtype fp8`. The runner verifies the loaded KV representation and records the selection in
+its results. A serial run cannot resume records collected with a different KV dtype.
 
 The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under
 `server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
 category summaries. The output directory is supplied explicitly with `--output`.
 
-Its schema-v7 result and flattened summaries retain the actual `prefill_signature`, request Host
+Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
 exposure, and decode Host/Device-wait time per round received from the schema-v21 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
@@ -182,14 +186,15 @@ records the actual Engine configuration, automatic KV capacity, shuffle seed whe
 dispatch method, and per-request positions. Servers use int8 KV unless `--kv-dtype` selects
 another storage; Qwen4Exp artifacts need `--kv-dtype bf16` or `fp8`.
 
-Schema-v3 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
-`summary.md`. Corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
+Schema-v4 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+`summary.md`. C=1 corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
 per-request phase summaries in that directory; older campaigns may have only point reports and
 server logs. Historical model pages identify the report directory associated with each table.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --kv-dtype int8 \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
@@ -197,6 +202,7 @@ python3 tools/bench/run_serve_concurrency.py \
 
 python3 tools/bench/run_serve_concurrency.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --kv-dtype int8 \
   --mode mtp3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus

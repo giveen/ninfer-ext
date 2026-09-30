@@ -1,8 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -18,16 +17,17 @@ namespace ninfer::ops {
  * inputs. The BF16 output is promoted and compared directly with that result; output storage
  * rounding belongs to the Op's numerical criterion, not the oracle. Kernel reduction, staging,
  * and accumulator precision are implementation choices. There is no workspace or persistent state
- * side effect.
+ * side effect. `execution` supplies the stream and the selected device's positive physical SM
+ * count for launch selection.
  */
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
-                   cudaStream_t stream);
+                   DeviceExecutionView execution);
 
 /**
  * The same contract with a sigmoid gate: ideal[d,r] = x[d,r] * inv_r * weight[d] * sigmoid(z[d,r]).
  * Qwen4Exp GDN output normalization uses this gate.
  */
 void gated_rmsnorm_sigmoid(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
-                           Tensor& out, cudaStream_t stream);
+                           Tensor& out, DeviceExecutionView execution);
 
 } // namespace ninfer::ops

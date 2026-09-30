@@ -9,6 +9,7 @@ set(NINFER_ARTIFACT_VISION  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_visio
 set(NINFER_ARTIFACT_DFLASH2 "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash2_real_test")
 set(NINFER_ARTIFACT_MOE     "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_moe_real_test")
 set(NINFER_ARTIFACT_DFLASH  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_real_test")
+set(NINFER_ARTIFACT_DFLASH_PREFILL "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_prefill_real_test")
 set(NINFER_ARTIFACT_STREAM  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_stream_real_test")
 
 ninfer_add_real_test(ninfer_qwen3_5_loading_real_test NINFER_ARTIFACT_LOADING
@@ -48,6 +49,10 @@ ninfer_add_test(ninfer_qwen3_5_context_store_test
 set_tests_properties(
   ninfer_qwen3_5_context_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_real_test(ninfer_qwen3_5_dflash_prefill_real_test NINFER_ARTIFACT_DFLASH_PREFILL
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
 
 ninfer_add_real_test(ninfer_qwen3_5_prefix_real_test NINFER_ARTIFACT_PREFIX
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"

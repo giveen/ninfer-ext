@@ -394,12 +394,13 @@ PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, De
 }
 
 std::size_t workspace_capacity(const Geometry& geometry, KvCacheStorage storage,
-                               std::int32_t tokens, std::int32_t batch, std::int32_t visible) {
+                               std::int32_t tokens, std::int32_t batch, std::int32_t visible,
+                               DeviceExecutionView execution) {
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
                                                          static_cast<std::uint32_t>(visible)};
     return ops::causal_softmax_attention_workspace_capacity_bytes(
         {kHeadDim, geometry.query_heads, geometry.kv_heads}, storage, envelope, batch, tokens,
-        tokens);
+        tokens, execution);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,
@@ -437,8 +438,9 @@ class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
-         std::span<const std::int32_t> table_rows, PageMapping mapping, HostPages host_pages)
-        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
+         std::span<const std::int32_t> table_rows, PageMapping mapping, HostPages host_pages,
+         DeviceExecutionView execution)
+        : execution_(execution), storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
           batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::ranges::any_of(valid_columns,
                                       [tokens](std::int32_t valid) { return valid != tokens; })),
@@ -471,7 +473,8 @@ public:
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
-          workspace_bytes_(workspace_capacity(geometry, storage, tokens, batch_, visible_)),
+          workspace_bytes_(
+              workspace_capacity(geometry, storage, tokens, batch_, visible_, execution_)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
           k_tensor_(k_.p, DType::BF16, {kHeadDim, geometry.kv_heads, tokens, batch_}),
@@ -549,11 +552,12 @@ public:
             ops::causal_softmax_attention(
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream);
+                workspace_, output_tensor_, execution_.on_stream(stream));
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
-                kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
+                kScale, cache_view_, envelope_, workspace_, output_tensor_,
+                execution_.on_stream(stream));
         }
     }
 
@@ -631,6 +635,7 @@ public:
     }
 
 private:
+    DeviceExecutionView execution_;
     PagedKVStorageLayout storage_layout_;
     std::int32_t batch_;
     bool masked_;
@@ -966,8 +971,9 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
-        cudaStream_t stream   = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        DeviceContext device;
+        const auto execution = device.execution_view();
+        const auto stream    = execution.stream;
         DeviceBuffer flush(kFlushBytes);
         const std::vector<Geometry> geometries     = selected_geometries(options.geometry);
         const std::vector<KvCacheStorage> storages = selected_storages(options.kv);
@@ -982,13 +988,12 @@ int main(int argc, char** argv) {
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
-                      options.mapping, options.host_pages);
+                      options.mapping, options.host_pages, execution);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
             profile(data, entry, geometry, storage, options, batch, width, context_name, valid_name,
                     table_name, flush, stream);
-            CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
 
@@ -1003,7 +1008,8 @@ int main(int argc, char** argv) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
-                                      rows.table_rows, options.mapping, options.host_pages);
+                                      rows.table_rows, options.mapping, options.host_pages,
+                                      execution);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||
@@ -1089,7 +1095,6 @@ int main(int argc, char** argv) {
             }
         }
         write_csv(options, results);
-        CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer_causal_softmax_attention_bench: %s\n", error.what());

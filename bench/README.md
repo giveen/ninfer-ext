@@ -583,7 +583,7 @@ counts, or kernel-name filters in these benchmarks.
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
 with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV storage. Production dispatch
-receives the caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV
+receives the caller-visible execution envelope and owns prefill, decode/spec and work-partition
 choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
@@ -603,9 +603,13 @@ not 32 speculative rounds. Cold measurements require one call per graph.
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
-  --entry both --geometry all --kv-dtype all --batch 1 \
-  --tokens 1,2,4,6,8,12,16 --context 0,128,2048,8192 \
+  --entry append --geometry all --kv-dtype all --batch 1,2,4,8 \
+  --tokens 1,2,4,8,16 --context 8192,32768,131072 --mapping fragmented \
   --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry all --kv-dtype all --batch 1 \
+  --tokens 1024 --context 8192,32768,131072 --mapping fragmented \
+  --execution eager --cache cold --warmup 10 --repeat 61
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry append --geometry d256-h16-kv2 --kv-dtype int8 \
   --batch 3 --tokens 6 --row-contexts 127,2047,63 \
@@ -614,14 +618,6 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
   --tokens 16 --context 8192 --execution graph --cache cold --profile
-./build/bench/ninfer_causal_softmax_attention_bench \
-  --entry append --geometry all --kv-dtype fp8 --batch 1 \
-  --tokens 1 --context 16384 --mapping fragmented \
-  --execution graph --cache cold --warmup 100 --repeat 201
-./build/bench/ninfer_causal_softmax_attention_bench \
-  --entry append --geometry all --kv-dtype fp8 --batch 1 \
-  --tokens 1024 --context 16384 --mapping fragmented \
-  --execution eager --cache cold --warmup 10 --repeat 61
 ```
 
 The report exposes separate QK/PV logical FLOPs, their full-public-Op-equivalent TFLOP/s,
@@ -631,6 +627,14 @@ vector are 516 for FP8, 288 for NVFP4, and 402 for K8V4 (258-byte K plus 144-byt
 complete Op latency. Payload rates exclude repeated reads and do not measure DRAM bandwidth.
 Logical FLOPs do not model private operand conversion, padding, or additional quantization work;
 the benchmark therefore does not infer Tensor Core utilization from a storage-format label.
+
+Use ordinary benchmark latency `t`, not profiler replay duration, for effective roofline fractions:
+`unique_kv_bytes / (t * peak_bandwidth)` and
+`(qk_flops / peak_qk_ops + pv_flops / peak_pv_ops) / t`, with consistent units and explicitly stated
+hardware peaks. Current INT8 QK uses native INT8, FP8/K8V4 QK uses native FP8, and BF16/NVFP4 QK
+and all PV use 16-bit Tensor Core throughput references. In particular, NVFP4 KV storage does not
+imply native FP4 QK. These useful-work fractions differ from profiler pipeline activity and actual
+DRAM traffic; use targeted profiling to explain the remaining gap.
 
 `ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
@@ -787,8 +791,9 @@ cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
 ## NVFP4 LinearSwiGLU Op benchmark
 
 `ninfer_nvfp4_linear_swiglu_bench` measures the public NVFP4
-`[34816,5120] -> [17408,T]` profile. The A4 sweep includes both fused route seams and the
-larger materialized/TMA paths.
+`[34816,5120] -> [17408,T]` profile. Each sample measures the complete production-dispatched call,
+including activation quantization and caller-owned workspace when required. The fused epilogue
+consumes FP32 gate/up accumulators and writes only the final BF16 output.
 
 ```bash
 cmake --build build --parallel --target ninfer_nvfp4_linear_swiglu_bench
@@ -830,17 +835,17 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
 ## BF16 LinearAdd Op benchmark
 
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
-in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
-aggregate MMA through `T=48`, and the large-T MMA afterward.
-Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
+in-place BF16 residual epilogue. Each production sample measures one complete public call after
+restoring the residual outside the timed region and flushing L2.
+Effective bandwidth counts the weight once, the activation once, and
 the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
 references.
 
 ```bash
 cmake --build build --parallel --target ninfer_bf16_linear_add_bench
 ./build/bench/ninfer_bf16_linear_add_bench \
-  --sweep 1:48:1 --route production --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/bf16_linear_add_t1_48.csv
+  --sweep 1:128:1 --route production --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/bf16_linear_add_t1_128.csv
 ./build/bench/ninfer_bf16_linear_add_bench \
   --t-sweep 1024,1536,2048 --route production --warmup 10 --repeat 50
 ./build/bench/ninfer_bf16_linear_add_bench \
@@ -1088,7 +1093,7 @@ measure Engine inference.
 
 ## 35B dFlash causal Attention qualification
 
-The public causal benchmark covers exact verify widths `W=1..16`, both KV codecs, and the
+The public causal benchmark covers exact verify widths `W=1..16`, all five KV types, and the
 append-and-attend and already-cached entries for the D256 H16/KV2 geometry. Batched target
 qualification uses the append entry:
 

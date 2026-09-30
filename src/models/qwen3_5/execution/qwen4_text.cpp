@@ -204,7 +204,7 @@ void TextContext::qwen4_qsa(const QsaParameters& p, const Tensor& x, const Qwen4
     const bool mrope = active_sequence_batch_ == 0 && sequence.rope_positions->ne[1] == 3;
     Tensor rope      = mrope ? *sequence.rope_positions : sequence.rope_positions->view({T});
     text_qk_norm_rope(rope, *config_.rope_parameters, attention, config_.rms_norm_eps, p.query_norm,
-                      p.key_norm, q3, k3, qn, kn, s);
+                      p.key_norm, q3, k3, qn, kn, ctx_.execution_view());
 
     project(x, p.indexer, roots.indexer, work_, s);
     const std::int32_t index_query_rows = geometry.index_heads * geometry.index_dim;
@@ -348,7 +348,8 @@ void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gi
     }
 
     Tensor on = roots.normalized_output.view({dv, heads, T});
-    ops::gated_rmsnorm_sigmoid(o, p.norm, z.view({dv, heads, T}), config_.rms_norm_eps, on, s);
+    ops::gated_rmsnorm_sigmoid(o, p.norm, z.view({dv, heads, T}), config_.rms_norm_eps, on,
+                               ctx_.execution_view());
     project(on.view({vwidth, T}), p.output, y, work_, s);
 }
 
