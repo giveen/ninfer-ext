@@ -7,6 +7,8 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
@@ -420,6 +422,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     if (cache_storage == KvCacheStorage::Fp8E4M3Row256) {
         return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope);
     }
+    if (cache_storage == KvCacheStorage::Int8Group64) {
+        return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope);
+    }
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits = detail::causal_attention_split_capacity(
@@ -490,6 +495,11 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                                         cache, envelope, workspace, out, stream);
         return;
     }
+    if (cache.storage == KvCacheStorage::Int8Group64) {
+        detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                         cache, envelope, workspace, out, stream);
+        return;
+    }
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
@@ -528,6 +538,11 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::fp8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                         stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Int8Group64) {
+        detail::int8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                         stream);
         return;
     }
     const detail::CausalAttentionRoute route =
