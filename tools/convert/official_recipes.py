@@ -370,12 +370,14 @@ def qwen3_6_35b_a3b_nvfp4(model, recipe, sources):
 
 
 def qwen3_8_flash_next_nvfp4(model, recipe, sources):
-    """Qwen3.8-Flash-Next (Qwen4Exp) from the ModelOpt NVFP4 checkpoint.
+    """Qwen3.8-Flash-Next (Qwen4Exp) with one NVFP4 block-scaled route for every routed expert.
 
-    Routed Text experts keep their NVFP4 codes, block scales and divisors; the MTP bank is
-    re-encoded from block FP8 to NVFP4 so every routed expert uses one execution path. The n-gram
-    table keeps its FP8 codes under the shared multiplier. Dense projections become Q8 (the output
-    head Q6); routers, shared-expert gates, norms and small vectors stay direct.
+    An encoded source (ModelOpt) keeps its NVFP4 codes, block scales and divisors; a full-precision
+    source is quantized with nvfp4_absmax. A full-precision source carries no calibrated activation
+    divisor, so its bank reports a zero A4 divisor and executes the BF16-activation route; an
+    encoded source keeps its calibrated divisors and runs W4A4. The n-gram table keeps its FP8 codes
+    when the source stores them and is row-quantized otherwise. Dense projections become Q8 (the
+    output head Q6); routers, shared-expert gates, norms and small vectors stay direct.
     """
     if model.config.get("model_type") != "qwen4_exp_text":
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -386,10 +388,12 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
     for name, parameter in model.parameters.items():
         if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
             continue
+        encoded = parameter.source.read_encoded is not None
         if name.endswith("/ple/table"):
-            recipe.assign(
-                name, format=FP8, method=import_encoded, source=parameter.source
-            )
+            if encoded:
+                recipe.assign(name, format=FP8, method=import_encoded, source=parameter.source)
+            else:
+                recipe.assign(name, format=FP8, method=fp8_row_maxabs)
             continue
         if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
             "text/token_embedding",
@@ -397,11 +401,10 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
         ):
             continue
         if "/moe/experts/" in name:
-            text = name.startswith("text/")
             recipe.assign(
                 name,
                 format="nvfp4",
-                method=import_encoded if text else nvfp4_absmax,
+                method=import_encoded if encoded else nvfp4_absmax,
                 source=parameter.source,
                 activation_policy="AllowA4",
             )

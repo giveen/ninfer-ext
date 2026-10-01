@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import torch
 
+from dataclasses import replace
+
+from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
@@ -63,9 +66,64 @@ def test_q6_recipe_is_registered() -> None:
     assert RECIPES["qwen3_8_27b_q6"] is qwen3_8_27b_q6
 
 
+def _flash_next_model(*, encoded: bool = False) -> Model:
+    model = Model({"text": {"config": {"model_type": "qwen4_exp_text"}}})
+
+    def add(name: str, shape: tuple[int, ...], inputs: tuple[str, ...]) -> None:
+        source = array_source(torch.ones(shape, dtype=torch.bfloat16), name)
+        if encoded:
+            source = replace(source, read_encoded=lambda begin, rows: None)
+        model.add(Parameter(name, shape, source, inputs=inputs))
+
+    add("text/token_embedding", (8, 4), ())
+    add("text/output_head", (8, 4), ())
+    add("text/layers/0/moe/router", (8, 4), ("x",))
+    add("text/layers/0/moe/experts/gate", (4, 4), ("x",))
+    add("text/layers/0/moe/experts/up", (4, 4), ("x",))
+    add("text/layers/0/moe/experts/down", (4, 4), ("p",))
+    add("text/layers/0/moe/shared/gate", (4, 4), ("x",))
+    # The n-gram table is a value source: it has no inputs, so it is not a "projection" and a
+    # recipe that only visits projections would leave all 51 B parameters at BF16.
+    add("text/layers/1/ple/table", (4, 4), ())
+    model.packing_groups.append(
+        ("text/layers/0/moe/experts/gate", "text/layers/0/moe/experts/up")
+    )
+    return model
+
+
+def _method(model: Model, function, name: str):
+    recipe = Recipe(model)
+    function(model, recipe, {})
+    selections = recipe.selections[name]
+    assert len(selections) == 1, f"{name} is split across {len(selections)} selections"
+    return selections[0]
+
+
 def test_flash_next_recipes_are_registered() -> None:
     # Exercising it needs a full Qwen4Exp sparse-MoE model, so this pins the wiring.
     assert RECIPES["qwen3_8_flash_next_nvfp4"] is qwen3_8_flash_next_nvfp4
+
+
+def test_flash_next_nvfp4_quantizes_a_full_precision_source() -> None:
+    # A full-precision checkpoint has no NVFP4 codes to import, so the experts are quantized and
+    # run the BF16-activation route (no calibrated A4 divisor), and the table is row-quantized.
+    model = _flash_next_model()
+    experts = _method(model, qwen3_8_flash_next_nvfp4, "text/layers/0/moe/experts/gate")
+    assert experts.format == "nvfp4"
+    assert experts.method is nvfp4_absmax
+    table = _method(model, qwen3_8_flash_next_nvfp4, "text/layers/1/ple/table")
+    assert table.format == "fp8_e4m3fn_row_bf16"
+    assert table.method is fp8_row_maxabs
+
+
+def test_flash_next_nvfp4_imports_an_encoded_source() -> None:
+    # ModelOpt ships NVFP4 codes and calibrated divisors, which are kept so the bank runs W4A4.
+    model = _flash_next_model(encoded=True)
+    experts = _method(model, qwen3_8_flash_next_nvfp4, "text/layers/0/moe/experts/gate")
+    assert experts.format == "nvfp4"
+    assert experts.method is import_encoded
+    table = _method(model, qwen3_8_flash_next_nvfp4, "text/layers/1/ple/table")
+    assert table.method is import_encoded
 
 
 def test_bf16_recipe_is_registered_and_matches_the_groupwise_layout() -> None:
