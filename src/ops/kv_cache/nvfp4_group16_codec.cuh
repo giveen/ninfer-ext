@@ -83,7 +83,6 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
     // therefore the exact FP16 expansion boundary, not an additional approximation.
     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
-    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
     __nv_fp8_e4m3 encoded_scale;
     encoded_scale.__x    = scale_code;
     const __half scale   = static_cast<__half>(encoded_scale);
@@ -92,7 +91,8 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
 #pragma unroll
     for (int pair = 0; pair < 4; ++pair) {
         __nv_fp4x2_e2m1 encoded;
-        encoded.__x         = bytes[pair];
+        encoded.__x =
+            static_cast<std::uint8_t>(byte_of_word(packed, static_cast<unsigned>(pair)));
         const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
     }
@@ -107,8 +107,7 @@ struct KVCacheNvfp4DequantizedF16x16 {
 
 __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
 kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
-    const int2 packed         = load_vec<int2>(codes);
-    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
+    const int2 packed = load_vec<int2>(codes);
     __nv_fp8_e4m3 encoded_scale;
     encoded_scale.__x    = scale_code;
     const __half scale   = static_cast<__half>(encoded_scale);
@@ -117,7 +116,10 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
         __nv_fp4x2_e2m1 encoded;
-        encoded.__x         = bytes[pair];
+        const unsigned word = pair < 4 ? static_cast<unsigned>(packed.x)
+                                       : static_cast<unsigned>(packed.y);
+        encoded.__x = static_cast<std::uint8_t>(
+            byte_of_word(word, static_cast<unsigned>(pair) & 3u));
         const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
     }

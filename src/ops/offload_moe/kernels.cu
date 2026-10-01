@@ -726,12 +726,14 @@ __device__ __forceinline__ void gemv_group(uint2 codes, float scale,
                                            const __nv_bfloat16* __restrict__ xs, int k, int tokens,
                                            float (&acc)[kGemvTokens]) {
     float w[16];
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&codes);
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
-        const float2 pair = decode_nvfp4_e2m1x2(bytes[b]);
-        w[2 * b]          = pair.x * scale;
-        w[2 * b + 1]      = pair.y * scale;
+        const unsigned word =
+            b < 4 ? static_cast<unsigned>(codes.x) : static_cast<unsigned>(codes.y);
+        const float2 pair = decode_nvfp4_e2m1x2(
+            static_cast<std::uint8_t>(byte_of_word(word, static_cast<unsigned>(b) & 3u)));
+        w[2 * b]     = pair.x * scale;
+        w[2 * b + 1] = pair.y * scale;
     }
 #pragma unroll
     for (int j = 0; j < kGemvTokens; ++j) {

@@ -28,6 +28,17 @@ __device__ __forceinline__ void store_vec(T* ptr, V value) {
     *reinterpret_cast<V*>(ptr) = value;
 }
 
+// One byte of a packed 32-bit word, zero-extended, selected by `__byte_perm`.
+//
+// Byte extraction from a packed word must go through the intrinsic rather than
+// `reinterpret_cast<const std::uint8_t*>(&word)[index]`: nvcc targeting sm_120 has miscompiled
+// that form (the byte mask is dropped and the index expression can run out of range), producing
+// wrong dequantized values. `index` must be in [0,4); a caller extracting from a wider value passes
+// the relevant 32-bit half and `index & 3`.
+__device__ __forceinline__ unsigned byte_of_word(unsigned word, unsigned index) {
+    return __byte_perm(word, 0u, 0x4440u | index);
+}
+
 __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
 }
