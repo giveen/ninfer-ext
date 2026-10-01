@@ -33,15 +33,62 @@ def divisor_for(amax: float) -> bytes:
     return struct.pack("<f", _E2M1_MAX * _E4M3_MAX / amax)
 
 
-def quantize_rows(values: torch.Tensor, divisor: bytes, device: str = "cpu") -> Nvfp4Rows:
-    """Quantize ``values [rows, K]`` against the given divisor."""
+def e4m3_scale_candidates(device: str | torch.device = "cpu") -> torch.Tensor:
+    """The 126 positive finite E4M3FN values, the per-block scale candidates ModelOpt sweeps."""
+    words = torch.arange(0, 128, dtype=torch.uint8, device=device)
+    values = words.view(torch.float8_e4m3fn).float()
+    return values[torch.isfinite(values) & (values > 0)]
+
+
+def _mse_scale(x: torch.Tensor) -> torch.Tensor:
+    """Per-block E4M3 scale minimising ``sum((x - decode(x))^2)`` over the candidate set.
+
+    ``x`` is ``[rows, blocks, 16]`` already scaled by the divisor. The search mirrors ModelOpt's
+    NVFP4 weight-MSE FP8 sweep: every block evaluates all 126 representable E4M3 scales and keeps
+    the one with the smallest reconstruction error, rather than the max-magnitude scale.
+    """
+    candidates = e4m3_scale_candidates(x.device)
+    magnitudes = _MAGNITUDES.to(x.device)
+    midpoints = _MIDPOINTS.to(x.device)
+    best_error = None
+    best_scale = None
+    for candidate in candidates:
+        scale = torch.full(x.shape[:-1], float(candidate), device=x.device, dtype=torch.float32)
+        scaled = (x / scale[..., None]).clamp(-_E2M1_MAX, _E2M1_MAX)
+        magnitude = torch.bucketize(scaled.abs(), midpoints, right=False)
+        decoded = torch.where(scaled < 0, -1.0, 1.0) * magnitudes[magnitude] * scale[..., None]
+        error = ((x - decoded) ** 2).sum(dim=-1)
+        if best_error is None:
+            best_error, best_scale = error, scale
+        else:
+            better = error < best_error
+            best_error = torch.where(better, error, best_error)
+            best_scale = torch.where(better, scale, best_scale)
+    # An all-zero block stores a zero scale, matching the max-magnitude convention, rather than
+    # the smallest positive candidate the sweep would otherwise keep.
+    empty = x.abs().amax(dim=-1) == 0
+    return torch.where(empty, torch.zeros_like(best_scale), best_scale)
+
+
+def quantize_rows(values: torch.Tensor, divisor: bytes, device: str = "cpu",
+                  scale_search: str = "absmax") -> Nvfp4Rows:
+    """Quantize ``values [rows, K]`` against the given divisor.
+
+    ``scale_search`` selects each 16-column block's E4M3 scale: ``"absmax"`` uses the
+    max-magnitude scale, ``"mse"`` the reconstruction-error-minimising scale.
+    """
     rows, k = values.shape
     if k % 16:
         raise ValueError("NVFP4 rows require K divisible by 16")
     d = struct.unpack("<f", divisor)[0]
     x = values.to(device=device, dtype=torch.float32).reshape(rows, k // 16, 16) * d
-    amax = x.abs().amax(dim=-1)
-    scale = (amax / _E2M1_MAX).clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn)
+    if scale_search == "absmax":
+        amax = x.abs().amax(dim=-1)
+        scale = (amax / _E2M1_MAX).clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn)
+    elif scale_search == "mse":
+        scale = _mse_scale(x).to(torch.float8_e4m3fn)
+    else:
+        raise ValueError(f"unknown NVFP4 scale search: {scale_search!r}")
     decoded = scale.float()
     safe = torch.where(decoded > 0, decoded, torch.ones_like(decoded))
     scaled = (x / safe[..., None]).clamp(-_E2M1_MAX, _E2M1_MAX)
