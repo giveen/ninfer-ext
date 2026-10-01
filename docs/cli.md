@@ -296,8 +296,8 @@ cache that routed experts are fetched into. `auto` first reserves the KV floor (
 free device memory, less 1 GiB of headroom, to the cache, up to every expert. An explicit MiB
 value must hold one verify round (10 experts per decoded column). The two prefill staging banks
 (two whole expert layers, about 2.6 GiB) also serve as cache slots between long prefill chunks, so
-the decode cache holds 1024 experts more than `--expert-cache` sizes. Qwen4Exp supports the `bf16`
-and `fp8` KV types and `--spec mtp`.
+the decode cache holds 1024 experts more than `--expert-cache` sizes. Qwen4Exp supports every KV type
+(`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`) and `--spec mtp`.
 
 The 51 GB n-gram table is never loaded. `--ngram-residency mapped` faults its rows through the
 page cache: fastest once warm, but the cached share competes with the pinned experts, and a cold
