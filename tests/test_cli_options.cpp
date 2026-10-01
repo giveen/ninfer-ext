@@ -176,28 +176,6 @@ int main() {
                                        "mtp", "--draft-tokens", "15", "--lookup-drafts", "always"});
                       }),
                       "a wide lookup window was accepted without --fixed-draft");
-    const auto chain =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
-               "--draft-tokens", "7", "--chain-drafts", "--chain-mtp", "3"});
-    failures += check(chain.speculative.chain_drafts && chain.speculative.chain_mtp == 3,
-                      "CLI did not preserve chained-draft settings");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                       "mtp", "--draft-tokens", "3", "--chain-drafts",
-                                       "--lookup-drafts", "auto"});
-                      }),
-                      "chained and lookup drafts were accepted together");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--chain-drafts"});
-                      }),
-                      "chained drafts were accepted without a speculative backend");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                       "mtp", "--draft-tokens", "3", "--chain-drafts",
-                                       "--chain-mtp", "4"});
-                      }),
-                      "chain MTP drafts above the draft window were accepted");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

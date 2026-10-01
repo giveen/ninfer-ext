@@ -85,7 +85,6 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--fixed-draft] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
-           "[--chain-drafts [--chain-mtp N]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -320,11 +319,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--lookup-min-match") {
             options.speculative.lookup_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--lookup-min-match"), "lookup-min-match"));
-        } else if (arg == "--chain-drafts") {
-            options.speculative.chain_drafts = true;
-        } else if (arg == "--chain-mtp") {
-            options.speculative.chain_mtp = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--chain-mtp"), "chain-mtp"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

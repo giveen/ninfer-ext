@@ -49,9 +49,6 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
-    if (options.chain_drafts && options.backend != SpeculativeBackend::Mtp) {
-        throw std::invalid_argument("--chain-drafts requires --spec mtp");
-    }
     if (options.lookup_drafts != LookupDraftMode::Off) {
         if (options.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("--lookup-drafts requires --spec mtp");
@@ -70,28 +67,17 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::Mtp: {
-        // Lookup rounds may verify a wider window than the MTP layer drafts, because they skip the
-        // MTP draft phases; a chained round may too, because the MTP part stays within the layer's
-        // own draft limit. A wider window therefore implies lookup or chained drafts.
-        const bool wide = options.lookup_drafts != LookupDraftMode::Off || options.chain_drafts;
-        const std::uint32_t max_drafts = wide ? 15U : 7U;
+        // Prompt-lookup rounds may verify a wider window than the MTP layer can draft, because they
+        // skip the MTP draft phases. A wider window therefore implies lookup-only rounds.
+        const std::uint32_t max_drafts =
+            options.lookup_drafts != LookupDraftMode::Off ? 15U : 7U;
         if (options.draft_tokens == 0 || options.draft_tokens > max_drafts) {
             throw std::invalid_argument(
-                "--spec mtp requires --draft-tokens in [1,7], or [8,15] with --lookup-drafts or "
-                "--chain-drafts");
+                "--spec mtp requires --draft-tokens in [1,7], or [8,15] with --lookup-drafts");
         }
         if (options.draft_tokens > 7 && !options.fixed_draft) {
             throw std::invalid_argument(
-                "a draft window above 7 requires --fixed-draft");
-        }
-        if (options.chain_drafts) {
-            if (options.lookup_drafts != LookupDraftMode::Off) {
-                throw std::invalid_argument(
-                    "--chain-drafts and --lookup-drafts are separate modes");
-            }
-            if (options.chain_mtp < 1 || options.chain_mtp > options.draft_tokens) {
-                throw std::invalid_argument("--chain-mtp must be in [1, --draft-tokens]");
-            }
+                "--lookup-drafts above 7 draft tokens requires --fixed-draft");
         }
         return;
     }

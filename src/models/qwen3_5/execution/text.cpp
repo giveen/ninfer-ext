@@ -862,7 +862,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpForwardDrafts + 1) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
@@ -895,7 +895,7 @@ void TextContext::mtp_append_decode_batch(const Tensor& ids, const Tensor& hidde
     }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpForwardDrafts + 1) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("MTP KV append shape is outside the supported domain");
     }

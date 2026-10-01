@@ -142,11 +142,6 @@ struct SpeculativeOptions {
     LookupDraftMode lookup_drafts = LookupDraftMode::Off;
     // Shortest match whose proposal may be used (3..32).
     std::uint32_t lookup_min_match = 8;
-    // MTP-only: chain the suffix drafter's continuation after the MTP drafts in the same round,
-    // filling the rest of the rung. Chained drafts are verified, so they cannot change the output.
-    bool chain_drafts = false;
-    // MTP drafts the chain starts from (1..7); the pool fills the remaining rung slots.
-    std::uint32_t chain_mtp = 3;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -790,8 +785,6 @@ struct SpeculativeStats {
     std::uint64_t lookup_accepted_tokens = 0;
     std::vector<std::uint64_t> lookup_drafted_by_match_bucket;
     std::vector<std::uint64_t> lookup_accepted_by_match_bucket;
-    // Rounds where the chain extended the MTP drafts; its drafts/accepted are the lookup counters.
-    std::uint64_t chain_rounds          = 0;
 };
 
 struct ThinkingBudgetStats {

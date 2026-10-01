@@ -1088,19 +1088,18 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         break;
     case SpeculativeBackend::Mtp:
         {
-            // With lookup or chained drafting the round may verify up to the frame's width and does
-            // not run the MTP layer beyond its own draft limit.
-            const bool wide = options.speculative.lookup_drafts != LookupDraftMode::Off ||
-                              options.speculative.chain_drafts;
-            const std::uint32_t max_drafts = wide ? 15U : 7U;
+            // With prompt-lookup drafting the round may verify up to the lookup frame's width and
+            // skip the MTP draft phases, so the MTP layer's own [1,7] bound does not apply.
+            const std::uint32_t max_drafts =
+                options.speculative.lookup_drafts != LookupDraftMode::Off ? 15U : 7U;
             if (options.speculative.draft_tokens == 0 ||
                 options.speculative.draft_tokens > max_drafts) {
                 throw std::invalid_argument(
-                    "MTP draft window must be in [1,7], or [8,15] with lookup or chained drafts");
+                    "MTP draft window must be in [1,7], or [8,15] with lookup drafting");
             }
             if (options.speculative.draft_tokens > 7 && !options.speculative.fixed_draft) {
                 throw std::invalid_argument(
-                    "a draft window above 7 requires a fixed draft length");
+                    "lookup drafting above 7 draft tokens requires a fixed draft length");
             }
         }
         break;
@@ -1122,18 +1121,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.lookup_min_match < 3 || options.speculative.lookup_min_match > 32) {
             throw std::invalid_argument("lookup min match must be in [3,32]");
-        }
-    }
-    if (options.speculative.chain_drafts) {
-        if (options.speculative.backend != SpeculativeBackend::Mtp) {
-            throw std::invalid_argument("chained drafts require the MTP speculative backend");
-        }
-        if (options.speculative.lookup_drafts != LookupDraftMode::Off) {
-            throw std::invalid_argument("chained and lookup drafts are separate modes");
-        }
-        if (options.speculative.chain_mtp < 1 ||
-            options.speculative.chain_mtp > options.speculative.draft_tokens) {
-            throw std::invalid_argument("chain MTP drafts must be in [1, draft window]");
         }
     }
     if (device.compute_capability() != 120) {
@@ -1260,8 +1247,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->lookup_drafts       = inputs.lookup_drafts;
     impl->lookup_min_match    = inputs.lookup_min_match;
-    impl->chain_drafts        = inputs.chain_drafts;
-    impl->chain_mtp           = inputs.chain_mtp;
     impl->lookup_only         = inputs.lookup_only;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -1458,8 +1443,6 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend = options.speculative.backend,
         .lookup_drafts       = options.speculative.lookup_drafts,
         .lookup_min_match    = options.speculative.lookup_min_match,
-        .chain_drafts        = options.speculative.chain_drafts,
-        .chain_mtp           = options.speculative.chain_mtp,
         .lookup_only         = options.speculative.lookup_drafts != LookupDraftMode::Off &&
                        options.speculative.draft_tokens > 7,
         .kv_storage          = options.kv_cache,

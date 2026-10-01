@@ -193,10 +193,10 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 // different current and next proposal extent while the model traversal remains batched.
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes, bool lookup_only,
-                              std::uint32_t mtp_out, DecodeGraphDefinition& definition);
+                              DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
-                      bool lookup_only, std::uint32_t mtp_out);
+                      bool lookup_only);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

@@ -400,37 +400,3 @@ ordering, on the engine's own tokenization.
 
 The pool might still earn a place as the *chain* extension (§3.7's MTP+ngram interleave), which is a
 different question this simulation does not answer.
-
-### 9.5 Chaining (experimental)
-
-The n-gram chain plan's core: a round's drafts are `[MTP proposal][suffix continuation]`, verified
-together, so one round can take MTP tokens for novel spans and copied tokens for repeated ones.
-Implemented as `--chain-drafts [--chain-mtp N]`:
-
-- `SuffixDrafter::propose_after(tail, ...)` searches the suffix `history + tail`, so the index
-  continues the MTP proposal rather than only the committed ledger.
-- Both widths are supported: within the MTP frame (`--draft-tokens ≤ 7`) and wide
-  (`8..15`, requiring `--fixed-draft`). The wide case needed the MTP alignment forward and
-  `mtp_prepare_next_round` raised from 8 to 16 columns; the MTP part stays at its own seven-draft
-  limit and only that part feeds the next round.
-- Attribution follows §3.2 trap 1: the MTP estimate sees `min(accepted, mtp_part)` and the pool
-  estimate sees the rest.
-
-Measured on 35B-A3B, 400 tokens, greedy (tok/s):
-
-| Load | MTP K=7 | chain K=7 (mtp 3) | lookup K=15 `auto` | chain K=15 (mtp 3) |
-|---|---:|---:|---:|---:|
-| edit (copy) | 944 | 987 | **1560** | 1440 |
-| mixed (copy + prose) | 960 | 982 | **1540** | 1440 |
-| prose | 346 | 349 | **394** | 290 |
-
-Greedy output is byte-identical to MTP on the edit and mixed loads; prose diverges at a near-tie as
-usual.
-
-**Decision: keep it experimental and off by default; it does not beat `--lookup-drafts` on any load
-measured.** On copied text the pool alone beats MTP-then-pool (lookup commits 15.9/round against the
-chain's 14.3), and on novel text the wide rung is wasted (290 vs 394). Chaining would need interleaved
-copy/novel text *within a window*, and a rung that falls back to narrow when the chain is short, to
-find a win the pool-only wide mode does not already have. The MTP-width widening and the `T = 16`
-`mtp_prepare_next_round` bound are kept: they are what makes any future chain work possible and are
-inert otherwise.

@@ -46,7 +46,6 @@ struct GenerationMetrics {
     std::uint64_t speculative_lookup_accepted_tokens = 0;
     std::vector<std::uint64_t> speculative_lookup_drafted_by_match_bucket;
     std::vector<std::uint64_t> speculative_lookup_accepted_by_match_bucket;
-    std::uint64_t speculative_chain_rounds = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;

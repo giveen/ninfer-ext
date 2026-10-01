@@ -120,8 +120,6 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;
     std::uint32_t lookup_min_match          = 8;
-    bool chain_drafts                       = false;
-    std::uint32_t chain_mtp                 = 3;
     // A draft window wider than the MTP layer can draft; every round is then a lookup round and the
     // MTP draft phases are skipped.
     bool lookup_only                        = false;
@@ -155,8 +153,6 @@ struct SequencePlanImpl {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;
     std::uint32_t lookup_min_match          = 8;
-    bool chain_drafts                       = false;
-    std::uint32_t chain_mtp                 = 3;
     // A draft window wider than the MTP layer can draft; every round is then a lookup round and the
     // MTP draft phases are skipped.
     bool lookup_only                        = false;

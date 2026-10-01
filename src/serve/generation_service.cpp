@@ -469,7 +469,6 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::move(result.speculative.lookup_drafted_by_match_bucket);
     outcome.metrics.speculative_lookup_accepted_by_match_bucket =
         std::move(result.speculative.lookup_accepted_by_match_bucket);
-    outcome.metrics.speculative_chain_rounds = result.speculative.chain_rounds;
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;

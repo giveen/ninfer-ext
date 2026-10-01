@@ -875,8 +875,6 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
 | `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |
-| `--chain-drafts` | MTP only: chain the suffix-draft continuation after the MTP drafts in the same round. **Experimental**: measured slower than `--lookup-drafts` on every load tried so far | off |
-| `--chain-mtp N` | MTP drafts a chained round starts from (`1..--draft-tokens`) | `3` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |

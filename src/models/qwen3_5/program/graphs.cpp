@@ -389,12 +389,11 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
             const GraphExecutionProfile code_warm = planned_profiles.front();
-            const std::uint32_t mtp_out = chain_drafts ? std::min(k, chain_mtp) : k;
             prepare_representative(code_warm.min, 1, k);
             device.synchronize();
             execution::mtp_decode_batch(mtp_state, 1, k,
                                         mtp_causal_attention_envelopes(code_warm.max, k, capacity),
-                                        nullptr, lookup_only, mtp_out);
+                                        nullptr, lookup_only);
             device.synchronize();
 
             rung.graphs.profiles.reserve(planned_profiles.size() * batch_limit);
@@ -410,7 +409,7 @@ void ProgramImpl::prepare_graphs() {
                     execution::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), k,
                         mtp_causal_attention_envelopes(planned.max, k, capacity), lookup_only,
-                        mtp_out, profile.definition);
+                        profile.definition);
                 }
             }
         }

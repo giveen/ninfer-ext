@@ -125,8 +125,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     return failures;
 }
 
-// The frame domain is K in [1,15]: T = K + 1 columns must be rejected outside [2,16]. MTP drafts at
-// most seven, but a chained round verifies the whole window.
+// The frame domain is K in [1,7]: T = K + 1 columns must be rejected outside [2,8].
 int expect_rejected(int k) {
     try {
         (void)run_case(k, {0});
@@ -149,9 +148,8 @@ int main() {
     failures += run_case(4, {4, 0, 3});
     failures += run_case(5, {0, 2, 5});
     failures += run_case(7, {0, 4, 7, 7, 1, 6, 3, 7});
-    failures += run_case(15, {0, 8, 15, 15, 1, 14, 3, 15});
     failures += expect_rejected(0);
-    failures += expect_rejected(16);
+    failures += expect_rejected(8);
 
     if (failures != 0) {
         std::cerr << "mtp_round failures=" << failures << '\n';

@@ -161,7 +161,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     };
     // Prompt-lookup drafting belongs to the request that owns the sequence: a fresh index makes a
     // reused continuation draft only from its own tokens.
-    if (lookup_drafts != LookupDraftMode::Off || chain_drafts) {
+    if (lookup_drafts != LookupDraftMode::Off) {
         if (!sequence.lookup) {
             sequence.lookup.emplace(capacity);
         } else {
@@ -538,9 +538,6 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     MtpRung& rung             = mtp_rungs[mtp_round_rung];
     const std::uint32_t k     = rung.k;
     const std::uint32_t width = k + 1;
-    // A chained round only needs the MTP layer's own draft limit for the next round; the rest of
-    // the window is filled by the suffix index.
-    const std::uint32_t mtp_out = chain_drafts ? std::min(k, chain_mtp) : k;
 
     const auto started = Clock::now();
     try {
@@ -563,10 +560,6 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         // round's outcome trains the lookup model rather than the MTP's.
         std::array<std::array<TokenId, qwen3_5::kLookupDecodeMaximumDrafts>, kMaximumConcurrency>
             lookup_tokens{};
-        // Chained rounds hold [MTP drafts][pool continuation] in one buffer.
-        std::array<std::array<TokenId, qwen3_5::kLookupDecodeMaximumDrafts>, kMaximumConcurrency>
-            chain_tokens{};
-        std::array<std::uint32_t, kMaximumConcurrency> chain_mtp_part{};
         std::array<std::uint32_t, kMaximumConcurrency> lookup_extent{};
         std::array<std::uint32_t, kMaximumConcurrency> lookup_match{};
 
@@ -584,33 +577,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
             std::uint32_t extent =
                 lookup_only ? 0U : std::min(sequence.mtp_draft_count, structural_cap);
-            const TokenId* draft_source = sequence.mtp_drafts.data();
 
-            if (chain_drafts && !lookup_only && sequence.lookup && extent > 0) {
-                // Chained round: the MTP drafts come first, then the suffix index continues them.
-                // The continuation is a prediction for after the MTP proposal, verified like any
-                // draft, so it cannot change the output.
-                sequence.lookup->sync(sequence.ledger);
-                const std::uint32_t mtp_part = std::min(extent, chain_mtp);
-                const std::uint32_t room = structural_cap > mtp_part ? structural_cap - mtp_part : 0U;
-                TokenId* pool = lookup_tokens[row].data();
-                const std::uint32_t proposed = sequence.lookup->propose_after(
-                    std::span<const TokenId>(sequence.mtp_drafts.data(), mtp_part), room, pool);
-                if (proposed > 0 &&
-                    sequence.lookup->match_length() >= sequence.lookup_policy.min_match()) {
-                    for (std::uint32_t j = 0; j < mtp_part; ++j) {
-                        chain_tokens[row][j] = sequence.mtp_drafts[j];
-                    }
-                    for (std::uint32_t j = 0; j < proposed; ++j) {
-                        chain_tokens[row][mtp_part + j] = pool[j];
-                    }
-                    extent              = mtp_part + proposed;
-                    draft_source        = chain_tokens[row].data();
-                    chain_mtp_part[row] = mtp_part;
-                    lookup_extent[row]  = proposed;
-                    lookup_match[row]   = sequence.lookup->match_length();
-                }
-            } else if (sequence.lookup) {
+            if (sequence.lookup) {
                 sequence.lookup->sync(sequence.ledger);
                 const std::uint32_t proposed =
                     sequence.lookup->propose(structural_cap, lookup_tokens[row].data());
@@ -628,7 +596,6 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         sequence.lookup_policy.choose(proposed, match, alternative, ratio, force);
                     if (chosen > 0) {
                         extent             = chosen;
-                        draft_source       = lookup_tokens[row].data();
                         lookup_extent[row] = chosen;
                         lookup_match[row]  = match;
                     }
@@ -641,7 +608,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            const std::span<const TokenId> drafts(draft_source, extent);
+            const std::span<const TokenId> drafts =
+                lookup_extent[row] > 0
+                    ? std::span<const TokenId>(lookup_tokens[row].data(), lookup_extent[row])
+                    : std::span<const TokenId>(sequence.mtp_drafts.data(), extent);
             for (std::uint32_t j = 0; j < k; ++j) {
                 mtp_host_ingress->current_drafts[row * k + j] =
                     j < extent ? drafts[j] : sequence.ledger.back();
@@ -697,7 +667,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,
-                                    envelopes, executable, lookup_only, mtp_out);
+                                    envelopes, executable, lookup_only);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -744,23 +714,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 stats.rounds_by_draft_length[k - 1U] += 1;
                 stats.drafted_tokens += pcur;
                 stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                if (chain_mtp_part[row] > 0) {
-                    // Chained round: attribute the accepted prefix to its source, so the MTP and
-                    // the pool estimates each see only their own positions.
-                    const std::uint32_t mtp_part = chain_mtp_part[row];
-                    const std::uint32_t pool     = lookup_extent[row];
-                    const std::uint32_t accepted = static_cast<std::uint32_t>(accepted_i);
-                    const std::uint32_t pool_accepted =
-                        accepted > mtp_part ? accepted - mtp_part : 0U;
-                    sequence.mtp_acceptance.observe(mtp_part, std::min(accepted, mtp_part));
-                    const std::size_t bucket = LookupAcceptance::bucket(lookup_match[row]);
-                    sequence.lookup_policy.observe(lookup_match[row], pool, pool_accepted);
-                    stats.chain_rounds += 1;
-                    stats.lookup_drafted_tokens += pool;
-                    stats.lookup_accepted_tokens += pool_accepted;
-                    stats.lookup_drafted_by_match_bucket[bucket] += pool;
-                    stats.lookup_accepted_by_match_bucket[bucket] += pool_accepted;
-                } else if (lookup_extent[row] > 0) {
+                if (lookup_extent[row] > 0) {
                     // The drafts verified were lookup's, so this outcome trains the lookup model
                     // and not the MTP's.
                     const std::size_t bucket    = LookupAcceptance::bucket(lookup_match[row]);

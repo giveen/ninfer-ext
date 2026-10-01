@@ -40,13 +40,10 @@ void SuffixDrafter::reset() {
     full_    = false;
 }
 
-std::uint64_t SuffixDrafter::key_at(std::uint32_t end, std::span<const TokenId> tail) const {
-    const auto at = [&](std::uint32_t index) {
-        return index < history_.size() ? history_[index] : tail[index - history_.size()];
-    };
-    const auto a = static_cast<std::uint32_t>(at(end - 2U));
-    const auto b = static_cast<std::uint32_t>(at(end - 1U));
-    const auto c = static_cast<std::uint32_t>(at(end));
+std::uint64_t SuffixDrafter::key_at(std::uint32_t end) const {
+    const auto a = static_cast<std::uint32_t>(history_[end - 2U]);
+    const auto b = static_cast<std::uint32_t>(history_[end - 1U]);
+    const auto c = static_cast<std::uint32_t>(history_[end]);
     const std::uint64_t key =
         mix(static_cast<std::uint64_t>(a) * 0x9E3779B97F4A7C15ULL ^
             mix(static_cast<std::uint64_t>(b) + 0x632BE59BD9B4E019ULL) ^
@@ -85,7 +82,7 @@ void SuffixDrafter::sync(std::span<const TokenId> tokens) {
         const std::uint32_t end = indexed_;
         ++indexed_;
         if (end < 2U) { continue; }
-        Slot* slot = find_slot(key_at(end, {}), true);
+        Slot* slot = find_slot(key_at(end), true);
         if (slot == nullptr) {
             // The table is full. Keep the history (it is still the comparison source) but stop
             // inserting: an uninserted trigram simply proposes nothing.
@@ -101,19 +98,11 @@ void SuffixDrafter::sync(std::span<const TokenId> tokens) {
 }
 
 std::uint32_t SuffixDrafter::propose(std::uint32_t max_drafts, TokenId* out) {
-    return propose_after({}, max_drafts, out);
-}
-
-std::uint32_t SuffixDrafter::propose_after(std::span<const TokenId> tail, std::uint32_t max_drafts,
-                                           TokenId* out) {
     match_ = 0;
-    const std::size_t size = history_.size() + tail.size();
+    const std::size_t size = history_.size();
     if (size < 4U || max_drafts == 0U) { return 0; }
-    const auto at = [&](std::uint32_t index) -> TokenId {
-        return index < history_.size() ? history_[index] : tail[index - history_.size()];
-    };
     const std::uint32_t current = static_cast<std::uint32_t>(size - 1U);
-    const Slot* slot            = find_slot(key_at(current, tail), false);
+    const Slot* slot            = find_slot(key_at(current), false);
     if (slot == nullptr) { return 0; }
 
     std::uint32_t best_end = 0;
@@ -123,7 +112,7 @@ std::uint32_t SuffixDrafter::propose_after(std::span<const TokenId> tail, std::u
         if (candidate >= current) { continue; } // the current suffix itself
         std::uint32_t length = 0;
         while (length < kMaxMatch && length <= candidate &&
-               at(candidate - length) == at(current - length)) {
+               history_[candidate - length] == history_[current - length]) {
             ++length;
         }
         // Positions are newest-first, so a strict comparison keeps the most recent winner.
@@ -136,11 +125,11 @@ std::uint32_t SuffixDrafter::propose_after(std::span<const TokenId> tail, std::u
     match_ = best_len;
 
     std::uint32_t count = 0;
-    // The continuation may run into the current suffix (periodic text); reading up to `current` is
-    // valid and is exactly what a repeat implies.
+    // The continuation may run into the current suffix (periodic text); reading history up to
+    // `current` is valid and is exactly what a repeat implies.
     for (std::uint32_t position = best_end + 1U; position <= current && count < max_drafts;
          ++position) {
-        out[count++] = at(position);
+        out[count++] = history_[position];
     }
     return count;
 }
