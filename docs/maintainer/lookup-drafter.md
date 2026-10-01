@@ -62,7 +62,9 @@ Host-only, in `src/models/qwen3_5/program/speculative/`. Faithful to Strata:
   `0` to keep the MTP drafts. `available` is the proposal length, `mtp_expected` the tokens the MTP
   drafts are predicted to commit (`MtpAcceptanceEstimate::expected_tokens`). Lookup is taken when its
   expected tokens exceed the MTP's by `margin` (default 0, so ties keep the already-paid MTP path),
-  or unconditionally when `force` (the `always` measurement mode).
+  or unconditionally when `force` (the `always` measurement mode). A promising bucket the engine has
+  not measured yet (`kProbes` = 3 rounds, `kProbeRate` = 0.80) is tried anyway, so a conservative
+  prior cannot permanently veto a bucket it would win.
 
 ### 3.3 Integration
 
@@ -166,31 +168,37 @@ has device-resident experts.
 | Model / load | mode | decode tok/s | rounds | tok/round | lookup rounds | lookup acc. |
 |---|---|---:|---:|---:|---:|---:|
 | Flash-Next, edit | off | 118.7 / 121.7 | 56 | 7.11 (MTP) | – | – |
-| Flash-Next, edit | auto | 132.1 | 53 | 7.53 | 42 | 100% |
-| Flash-Next, edit | always | 143.7 / 142.9 | 51 | 7.89 | 46 | 100% |
-| Flash-Next, prose | off / auto / always | 57.3 / 57.2 / 57.3 | 100 | 2.53 (MTP) | 0 | – |
+| Flash-Next, edit | `always` | 143.7 / 142.9 | 51 | 7.89 | 46 | 100% |
+| Flash-Next, edit | `auto` before probing | 132.1 | 53 | 7.53 | 42 | 100% |
+| Flash-Next, edit | `auto` with probing | 143.3 | 51 | 7.89 | 46 | 100% |
+| Flash-Next, prose | off / `always` | 57.3 / 57.3 | 100 | 2.53 (MTP) | 0 | – |
+| Flash-Next, prose | `auto` with probing | 58.7 | 100 | 2.53 (MTP) | 0 | – |
 | 35B-A3B, edit | off | 971.7 | 53 | 7.53 (MTP) | – | – |
-| 35B-A3B, edit | auto | 967.5 | 53 | 7.53 | 0 | – |
-| 35B-A3B, edit | always | 1.01k | 51 | 7.96 | 46 | 100% |
+| 35B-A3B, edit | `always` | 1.01k | 51 | 7.96 | 46 | 100% |
+| 35B-A3B, edit | `auto` before probing | 967.5 | 53 | 7.53 | 0 | – |
+| 35B-A3B, edit | `auto` with probing | 994.8 | 51 | 7.96 | 46 | 100% |
 
 Findings:
 
 - **Correctness holds.** Greedy output is byte-identical across `off`/`auto`/`always` on both models
   and both prompts, so the substituted drafts do not change what the model commits.
-- **Lookup wins on verbatim/echo text.** Flash-Next edit: +19% decode (two runs each) and 56 -> 51
-  rounds; 35B-A3B edit: +4% and 53 -> 51 rounds. Lookup acceptance was 100%, all from match buckets
-  2 and 3 (12-23 and >=24 tokens); the proposal is only truncated by the MTP frame's seven drafts.
-- **No cost on novel text.** The prose load produced no proposal at all (no repeated suffix) and
-  `off`/`auto`/`always` are identical there. Enabling lookup cannot regress a non-repeating load.
-- **`auto` is too conservative.** On 35B-A3B it never fired although `always` was a clean win; on
-  Flash-Next it used only bucket 3. The bucket-3 prior (0.92) understates the measured ~1.0, and a
-  conservative prior is never overridden for a bucket the policy does not try. This is the first
-  Phase 2 action: exploration or a measured-in-engine bootstrap (Strata probes unseen window sizes
-  for the same reason).
+- **Lookup wins on verbatim/echo text.** Flash-Next edit: 118.7/121.7 -> 143.7/142.9 tok/s
+  (`always`, two runs each) and 56 -> 51 rounds; 35B-A3B edit: 971.7 -> 1.01k tok/s and 53 -> 51
+  rounds. Lookup acceptance was 100%, all from match buckets 2 and 3 (12-23 and >=24 tokens).
+- **No cost on novel text.** The prose load produced no proposal at all (no repeated suffix);
+  `off`/`auto`/`always` are identical there, and probing caused no attempt. Enabling lookup cannot
+  regress a non-repeating load.
+- **A conservative prior needs probing, and cannot veto a bucket it never tries.** Before probing,
+  `auto` scored 132.1 (Flash-Next) and 967.5 (35B-A3B): on 35B-A3B it never fired although `always`
+  was a clean win, and on Flash-Next it used only bucket 3, because its bucket-3 prior (0.92)
+  understated the measured ~1.0 and bucket 2 was never sampled. `LookupPolicy::kProbes` now verifies
+  an unmeasured bucket at or above `kProbeRate` (0.80) for three rounds before the measured rate may
+  veto it. `auto` then matches `always` on both models, still with no attempt on prose. This mirrors
+  Strata's `kProbes` for the same reason.
 - **The MTP frame is the ceiling.** Lookup matched 24+ tokens and accepted every draft, yet the
   round still verified at most seven. A lookup-only backend with a wider window (DFlash's domain is
-  15) is where the deep-match advantage would actually be collected; Phase 1's +4-19% is the part
-  that survives sharing MTP's seven-draft frame.
+  15) is where the deep-match advantage would actually be collected; Phase 1's gain is the part that
+  survives sharing MTP's seven-draft frame.
 
 Reproduce:
 

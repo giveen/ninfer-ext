@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/speculative/lookup_policy.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -23,6 +24,9 @@ void LookupAcceptance::observe(std::uint32_t match, std::uint32_t drafted,
     drafted_[index]  = kDecay * drafted_[index] + static_cast<double>(drafted);
     accepted_[index] = kDecay * accepted_[index] +
                        static_cast<double>(std::min(accepted, drafted));
+    if (observations_[index] < std::numeric_limits<std::uint32_t>::max()) {
+        ++observations_[index];
+    }
 }
 
 double LookupAcceptance::expected_tokens(std::uint32_t drafts, double q) noexcept {
@@ -44,6 +48,10 @@ std::uint32_t LookupPolicy::choose(std::uint32_t available, std::uint32_t match,
     if (LookupAcceptance::expected_tokens(extent, q) > mtp_expected * (1.0 + margin_)) {
         return extent;
     }
+    // A promising bucket the engine has barely measured is tried anyway: the measured rate may be
+    // far better than the prior, and the only way to find out is to verify its drafts once or
+    // twice. Bounded to kProbes rounds per bucket per request.
+    if (acceptance_.observations(match) < kProbes && q >= kProbeRate) { return extent; }
     return 0U;
 }
 

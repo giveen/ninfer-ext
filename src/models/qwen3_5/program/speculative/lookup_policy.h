@@ -28,6 +28,11 @@ public:
     // P(accept) for one draft whose match had this length.
     [[nodiscard]] double rate(std::uint32_t match) const noexcept;
 
+    // Rounds observed for this match bucket. Zero means the prior is still the only evidence.
+    [[nodiscard]] std::uint32_t observations(std::uint32_t match) const noexcept {
+        return observations_[bucket(match)];
+    }
+
     // `drafted` drafts from a match of `match` were verified; `accepted` were committed.
     void observe(std::uint32_t match, std::uint32_t drafted, std::uint32_t accepted) noexcept;
 
@@ -39,12 +44,19 @@ private:
     static constexpr double kDecay  = 0.97;
     std::array<double, kBuckets> accepted_{};
     std::array<double, kBuckets> drafted_{};
+    std::array<std::uint32_t, kBuckets> observations_{};
 };
 
 class LookupPolicy {
 public:
     // Largest lookup window the MTP frame can verify (its own window is at most seven).
     static constexpr std::uint32_t kMaxDrafts = 15;
+    // Rounds a promising but unmeasured match bucket is tried before its measured rate may veto it.
+    static constexpr std::uint32_t kProbes = 3;
+    // A bucket is "promising" from its prior (or measurement) at or above this rate. Without this,
+    // a conservative prior that the policy never contradicts would keep a bucket it would win
+    // permanently disabled.
+    static constexpr double kProbeRate = 0.80;
 
     LookupPolicy() = default;
     explicit LookupPolicy(std::uint32_t min_match, double margin = 0.0)

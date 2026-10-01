@@ -139,6 +139,20 @@ void test_policy_choice() {
     expect(policy.choose(3, 30, 100.0, true) == 3, "force uses the proposal");
 }
 
+void test_policy_explores() {
+    // A promising but unmeasured bucket is tried even when the MTP looks stronger, so its measured
+    // rate can contradict the prior; a few failures then stop it.
+    q36::LookupPolicy policy(8);
+    expect(policy.choose(4, 20, 100.0, false) == 4, "an unmeasured promising bucket is probed");
+    for (int i = 0; i < static_cast<int>(q36::LookupPolicy::kProbes); ++i) {
+        policy.observe(20, 4, 0);
+    }
+    expect(policy.choose(4, 20, 100.0, false) == 0, "a measured poor bucket is rejected");
+    // A bucket whose prior is below the probe rate is not explored.
+    q36::LookupPolicy weak(8);
+    expect(weak.choose(4, 8, 100.0, false) == 0, "a weak unmeasured bucket is not probed");
+}
+
 void test_policy_learns() {
     q36::LookupPolicy policy(3);
     const double prior = policy.rate(10);
@@ -162,6 +176,7 @@ int main() {
     test_sync_prefix_is_idempotent();
     test_policy_priors();
     test_policy_choice();
+    test_policy_explores();
     test_policy_learns();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
