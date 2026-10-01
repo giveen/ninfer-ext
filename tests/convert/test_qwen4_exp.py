@@ -195,10 +195,17 @@ def _checkpoint(tmp_path):
     (path / "config.json").write_text(json.dumps(config))
     save_file(tensors, path / "model.safetensors")
     (path / "tokenizer.json").write_text(
-        json.dumps({"model": {"vocab": {str(i): i for i in range(VOCAB)}}})
+        json.dumps(
+            {
+                "model": {"vocab": {str(i): i for i in range(VOCAB)}, "merges": []},
+                "added_tokens": [],
+            }
+        )
     )
-    for role in ("tokenizer_config.json", "generation_config.json"):
-        (path / role).write_text("{}")
+    (path / "tokenizer_config.json").write_text(
+        json.dumps({"added_tokens_decoder": {}})
+    )
+    (path / "generation_config.json").write_text(json.dumps({"eos_token_id": 3}))
     (path / "chat_template.jinja").write_text("{{ messages }}")
     return path, tensors, table, mtp_expected
 

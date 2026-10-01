@@ -14,6 +14,233 @@ TEXT_RESOURCES = (
 )
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
+# The tokenizer transformation the runtime implements. A checkpoint's tokenizer.json may describe
+# an equivalent pipeline with a different description (for example a newer Transformers split regex
+# without the combining-mark class); the runtime validates the description exactly, so the resource
+# is normalized to this form at conversion time.
+QWEN_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# Values the compiled Vision pixel pipeline in
+# src/models/qwen3_5/frontend/frontend.cpp expects from the preprocessor resources. The compiled
+# 16/2/2 patch geometry is cross-checked against the model's Vision config by load_resources, since a
+# synthetic model may use a smaller geometry for mapping tests.
+VISION_RESCALE_FACTOR = 1.0 / 255.0
+VISION_VIDEO_FPS = 2.0
+VISION_VIDEO_MIN_FRAMES = 4
+VISION_VIDEO_MAX_FRAMES = 768
+
+
+def normalize_tokenizer(tokenizer: dict) -> bool:
+    """Rewrite the tokenizer pipeline to the form the runtime implements. Returns True when the
+    value changed. Vocabulary and special tokens are untouched."""
+    pre = tokenizer.get("pre_tokenizer")
+    if not isinstance(pre, dict) or pre.get("type") != "Sequence":
+        return False
+    parts = pre.get("pretokenizers")
+    if not isinstance(parts, list) or len(parts) != 2:
+        return False
+    split, bytes_level = parts
+    if not isinstance(split, dict) or split.get("type") != "Split":
+        return False
+    if not isinstance(bytes_level, dict) or bytes_level.get("type") != "ByteLevel":
+        return False
+    changed = False
+    if split.setdefault("pattern", {}).get("Regex") != QWEN_SPLIT_PATTERN:
+        split["pattern"] = {"Regex": QWEN_SPLIT_PATTERN}
+        changed = True
+    if split.get("behavior") != "Isolated":
+        split["behavior"] = "Isolated"
+        changed = True
+    if split.get("invert", False) is not False:
+        split["invert"] = False
+        changed = True
+    if bytes_level.get("add_prefix_space", True) is not False:
+        bytes_level["add_prefix_space"] = False
+        changed = True
+    if bytes_level.get("use_regex", True) is not False:
+        bytes_level["use_regex"] = False
+        changed = True
+    return changed
+
+
+def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
+    """Rewrite tokenizer_config.json to the contract the runtime enforces: the added-token decoder
+    map it cross-checks, the Qwen prefix semantics, and the official pad token. Newer Transformers
+    writes added tokens only in tokenizer.json and omits add_bos_token; the runtime requires both.
+    Returns True when the value changed."""
+    changed = False
+    if config.get("add_bos_token", True) is not False:
+        config["add_bos_token"] = False
+        changed = True
+    if config.get("add_prefix_space", True) is not False:
+        config["add_prefix_space"] = False
+        changed = True
+    if config.get("pad_token") != "<|endoftext|>":
+        config["pad_token"] = "<|endoftext|>"
+        changed = True
+    existing = config.get("added_tokens_decoder")
+    if isinstance(existing, dict) and existing:
+        return changed
+    added = tokenizer.get("added_tokens")
+    if not isinstance(added, list) or not added:
+        return changed
+    decoder: dict[str, dict] = {}
+    for item in added:
+        if not isinstance(item, dict) or "id" not in item or "content" not in item:
+            continue
+        decoder[str(item["id"])] = {
+            "content": item["content"],
+            "single_word": item.get("single_word", False),
+            "lstrip": item.get("lstrip", False),
+            "rstrip": item.get("rstrip", False),
+            "normalized": item.get("normalized", False),
+            "special": item.get("special", False),
+        }
+    if not decoder:
+        return changed
+    config["added_tokens_decoder"] = decoder
+    return True
+
+
+def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict) -> None:
+    """Reject a resource set the runtime tokenizer loader would refuse, before writing the artifact.
+
+    Mirrors the checks in src/models/qwen3_5/frontend/tokenizer.cpp: the pipeline description, the
+    model fields, the added-token entries of both resources, and the generation eos token."""
+
+    def fail(message: str) -> None:
+        raise ValueError(f"tokenizer resources the runtime cannot load: {message}")
+
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or not isinstance(model.get("vocab"), dict):
+        fail("tokenizer.json model.vocab is required")
+    if not isinstance(model.get("merges"), list):
+        fail("tokenizer.json model.merges must be an array")
+    if model.get("ignore_merges", False) is not False:
+        fail("tokenizer.json model.ignore_merges must be false")
+    if model.get("dropout") not in (None, 0):
+        fail("tokenizer.json model.dropout must be null or zero")
+    for field in ("continuing_subword_prefix", "end_of_word_suffix"):
+        if model.get(field) not in (None, ""):
+            fail(f"tokenizer.json model.{field} must be empty")
+    normalizer = tokenizer.get("normalizer")
+    if normalizer is not None and normalizer.get("type") != "NFC":
+        fail("tokenizer.json normalizer must be NFC")
+    pre = tokenizer.get("pre_tokenizer")
+    if pre is not None:
+        parts = pre.get("pretokenizers")
+        if pre.get("type") != "Sequence" or not isinstance(parts, list) or len(parts) != 2:
+            fail("tokenizer.json pre_tokenizer must be a two-step Sequence")
+        split, bytes_level = parts
+        if (
+            split.get("type") != "Split"
+            or not isinstance(split.get("pattern"), dict)
+            or split["pattern"].get("Regex") != QWEN_SPLIT_PATTERN
+            or split.get("behavior") != "Isolated"
+            or split.get("invert", False) is not False
+        ):
+            fail("tokenizer.json pre_tokenizer.Split does not match the runtime pattern")
+        if (
+            bytes_level.get("type") != "ByteLevel"
+            or bytes_level.get("add_prefix_space", True) is not False
+            or bytes_level.get("use_regex", True) is not False
+        ):
+            fail("tokenizer.json pre_tokenizer.ByteLevel flags are unsupported")
+    decoder = tokenizer.get("decoder")
+    if decoder is not None and decoder.get("type") != "ByteLevel":
+        fail("tokenizer.json decoder must be ByteLevel")
+    post = tokenizer.get("post_processor")
+    if post is not None and post.get("type") != "ByteLevel":
+        fail("tokenizer.json post_processor must be ByteLevel or null")
+    added = tokenizer.get("added_tokens")
+    if not isinstance(added, list):
+        fail("tokenizer.json added_tokens must be an array")
+    required = ("id", "content", "single_word", "lstrip", "rstrip", "normalized", "special")
+    for item in added:
+        if not isinstance(item, dict) or any(field not in item for field in required):
+            fail("tokenizer.json added_tokens items need id/content and their boolean flags")
+        if not isinstance(item["content"], str) or not item["content"]:
+            fail("tokenizer.json added_tokens items need non-empty content")
+        if item["single_word"] or item["lstrip"] or item["rstrip"] or item["normalized"]:
+            fail("tokenizer.json added_tokens only support single_word/lstrip/rstrip/normalized false")
+    decoder_map = config.get("added_tokens_decoder")
+    if not isinstance(decoder_map, dict):
+        fail("tokenizer_config.json added_tokens_decoder is required")
+    for key, item in decoder_map.items():
+        if not key.isdigit():
+            fail("tokenizer_config.json added_tokens_decoder keys must be token ids")
+        if not isinstance(item, dict) or any(field not in item for field in required[1:]):
+            fail("tokenizer_config.json added_tokens_decoder items need content and their flags")
+        if not isinstance(item["content"], str) or not item["content"]:
+            fail("tokenizer_config.json added_tokens_decoder items need non-empty content")
+        if (
+            item["single_word"]
+            or item["lstrip"]
+            or item["rstrip"]
+            or item["normalized"]
+        ):
+            fail("tokenizer_config.json added_tokens_decoder only supports false token flags")
+    if config.get("add_bos_token", True) is not False:
+        fail("tokenizer_config.json add_bos_token must be false")
+    if config.get("add_prefix_space", True) is not False:
+        fail("tokenizer_config.json add_prefix_space must be false")
+    if config.get("pad_token") != "<|endoftext|>":
+        fail("tokenizer_config.json pad_token must be <|endoftext|>")
+    eos = generation.get("eos_token_id")
+    if type(eos) is not int and not (isinstance(eos, list) and eos and all(type(v) is int for v in eos)):
+        fail("generation_config.json eos_token_id must be an integer or a non-empty array")
+
+
+def normalize_vision_config(config: dict) -> bool:
+    """Drop JSON null members. The runtime reads an absent member as its default, but a present null
+    is invalid, so a checkpoint that writes null for "unset" is rewritten to the default form."""
+    nulls = [key for key, value in config.items() if value is None]
+    for key in nulls:
+        del config[key]
+    return bool(nulls)
+
+
+def validate_vision_resources(preprocessor: dict, video: dict) -> None:
+    """Reject a vision resource set the runtime's pixel preprocessor would refuse.
+
+    Mirrors validate_pixel_pipeline and processor_options in
+    src/models/qwen3_5/frontend/frontend.cpp."""
+
+    def fail(message: str) -> None:
+        raise ValueError(f"vision resources the runtime cannot load: {message}")
+
+    for name, config in (
+        ("preprocessor_config.json", preprocessor),
+        ("video_preprocessor_config.json", video),
+    ):
+        for flag in ("do_resize", "do_rescale", "do_normalize", "do_convert_rgb"):
+            if flag in config and config[flag] is not True:
+                fail(f"{name}.{flag} must be true")
+        if "resample" in config and config["resample"] != 3:
+            fail(f"{name}.resample must be 3 (bicubic)")
+        for field in ("image_mean", "image_std"):
+            values = config.get(field)
+            if not isinstance(values, list) or len(values) != 3 or any(v != 0.5 for v in values):
+                fail(f"{name}.{field} must be three 0.5 values")
+        if "rescale_factor" in config and config["rescale_factor"] != VISION_RESCALE_FACTOR:
+            fail(f"{name}.rescale_factor must be {VISION_RESCALE_FACTOR}")
+        size = config.get("size")
+        if not isinstance(size, dict):
+            fail(f"{name}.size must be an object")
+        for edge in ("shortest_edge", "longest_edge"):
+            value = size.get(edge)
+            if type(value) is not int or value <= 0:
+                fail(f"{name}.size.{edge} must be a positive integer")
+    if video.get("fps", VISION_VIDEO_FPS) != VISION_VIDEO_FPS:
+        fail("video_preprocessor_config.json.fps must be 2")
+    if video.get("min_frames", VISION_VIDEO_MIN_FRAMES) != VISION_VIDEO_MIN_FRAMES:
+        fail("video_preprocessor_config.json.min_frames must be 4")
+    if video.get("max_frames", VISION_VIDEO_MAX_FRAMES) != VISION_VIDEO_MAX_FRAMES:
+        fail("video_preprocessor_config.json.max_frames must be 768")
+
 
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
@@ -110,6 +337,30 @@ def load_resources(
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data
+    if normalize_tokenizer(parsed["tokenizer.json"]):
+        payloads["resource/text/tokenizer.json"] = json.dumps(
+            parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    if normalize_tokenizer_config(
+        parsed["tokenizer.json"], parsed["tokenizer_config.json"]
+    ):
+        payloads["resource/text/tokenizer_config.json"] = json.dumps(
+            parsed["tokenizer_config.json"], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    if "vision" in roles:
+        for role in VISION_RESOURCES:
+            if normalize_vision_config(parsed[role]):
+                payloads[f"resource/vision/{role}"] = json.dumps(
+                    parsed[role], ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+        validate_vision_resources(
+            parsed["preprocessor_config.json"], parsed["video_preprocessor_config.json"]
+        )
+    validate_tokenizer_resources(
+        parsed["tokenizer.json"],
+        parsed["tokenizer_config.json"],
+        parsed.get("generation_config.json", {}),
+    )
     count, special = token_domain(
         parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size
     )
