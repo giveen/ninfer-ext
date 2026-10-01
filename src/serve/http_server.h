@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/generation_token_trace.h"
+#include "serve/http_transport.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -13,6 +14,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -74,6 +76,14 @@ private:
     };
 
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
+
+    // Drives one streamed response: SSE transport, cancellation latch, engine run, and request
+    // lifecycle. The encoder owns the wire shape; write_error renders a protocol JSON error when
+    // the stream cannot be set up.
+    void stream_generation(httplib::Response& response, std::shared_ptr<HttpGenerationStream> stream,
+                           std::shared_ptr<RequestLifecycle> lifecycle,
+                           std::shared_ptr<SseStreamEncoder> encoder,
+                           std::function<void(const ApiError&)> write_error);
 
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
