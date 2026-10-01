@@ -27,6 +27,8 @@ from .methods import (
     grouped_absmax,
     fp8_row_maxabs,
     import_encoded,
+    nvfp4_absmax,
+    nvfp4_mse,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -322,6 +324,11 @@ class Recipe:
             """
             if selection.format != "nvfp4" or len(sources) < 2:
                 return 1
+            # Only imported encoded sources carry a per-source weight divisor. A parent built by a
+            # quantising method (nvfp4_absmax/nvfp4_mse) always stores one divisor for all of its
+            # sources, so it must not ask a plain value source for a divisor it does not have.
+            if selection.method is not import_encoded:
+                return 1
             words = [
                 source.weight_divisor() if source.weight_divisor else None
                 for source in sources
@@ -437,7 +444,14 @@ class Recipe:
                 )
             emit([(name, self.selections[name][0]) for name in names], chosen)
             used.update(names)
-        standard = (cast_direct, grouped_absmax, fp8_row_maxabs, import_encoded)
+        standard = (
+            cast_direct,
+            grouped_absmax,
+            fp8_row_maxabs,
+            import_encoded,
+            nvfp4_absmax,
+            nvfp4_mse,
+        )
         for names in self.model.packing_groups:
             if any(
                 name in used or name in self.aliases or name in self.separate_parameters

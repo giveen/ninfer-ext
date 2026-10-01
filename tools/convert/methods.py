@@ -268,17 +268,11 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
-def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
-    """Quantize values to NVFP4 against one divisor for the whole parent.
-
-    The divisor maps the parent's largest magnitude onto the largest block scale times the
-    largest E2M1 code, so a stacked bank stores a single divisor word. Activation calibration is
-    not produced; Uses keep whatever policy and auxiliaries the recipe states.
-    """
+def _nvfp4_weight(request: PrepareRequest, scale_search: str) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
-        raise ValueError("nvfp4_absmax requires an NVFP4 matrix target")
+        raise ValueError(f"nvfp4_{scale_search} requires an NVFP4 matrix target")
     if request.target.divisors != 1:
-        raise ValueError("nvfp4_absmax writes one divisor per parent")
+        raise ValueError(f"nvfp4_{scale_search} writes one divisor per parent")
     _preflight(request)
     n, k = request.target.shape
     chunk = max(128, request.rows_per_chunk // 128 * 128)
@@ -286,7 +280,7 @@ def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
     def rows(begin, end):
         values = request.values(begin * k, end * k).reshape(end - begin, k)
         if not values.dtype.is_floating_point:
-            raise TypeError("nvfp4_absmax source must provide floating-point values")
+            raise TypeError(f"nvfp4_{scale_search} source must provide floating-point values")
         return values
 
     def produce(output):
@@ -297,11 +291,34 @@ def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
         divisor = divisor_for(amax)
         for begin in range(0, n, chunk):
             encoded = quantize_nvfp4_rows(
-                rows(begin, min(n, begin + chunk)), divisor, device=request.device
+                rows(begin, min(n, begin + chunk)),
+                divisor,
+                device=request.device,
+                scale_search=scale_search,
             )
             output.write_codes(begin, encoded.codes, encoded.scales, encoded.divisor)
 
     return request.job(produce=produce)
+
+
+def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
+    """Quantize values to NVFP4 against one divisor for the whole parent.
+
+    The divisor maps the parent's largest magnitude onto the largest block scale times the
+    largest E2M1 code, so a stacked bank stores a single divisor word. Activation calibration is
+    not produced; Uses keep whatever policy and auxiliaries the recipe states.
+    """
+    return _nvfp4_weight(request, "absmax")
+
+
+def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
+    """Quantize values to NVFP4 with a reconstruction-error-minimising per-block scale.
+
+    The divisor is the same global-amax word as ``nvfp4_absmax``; only each 16-column block's
+    E4M3 scale is chosen by sweeping the 126 representable E4M3 values (ModelOpt's
+    NVFP4 weight-MSE FP8 scale sweep). Activation calibration is not produced.
+    """
+    return _nvfp4_weight(request, "mse")
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
@@ -405,4 +422,5 @@ METHODS: dict[str, Method] = {
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
     "nvfp4_absmax": nvfp4_absmax,
+    "nvfp4_mse": nvfp4_mse,
 }
