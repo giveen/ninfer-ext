@@ -53,14 +53,14 @@ only artifact here that beats both of the engine's other Qwen3.8-27B builds on *
 divergence, while being smaller than either (see Quality). 3.5 bpw is the size-optimised tier — best PPL
 per byte, but it does not carry that advantage into divergence.
 
-### Qwen3.8-Flash-Next NVFP4 — coming soon
+### Qwen3.8-Flash-Next NVFP4
 
 | Folder | Size | Notes |
 |---|---|---|
-| `qwen3.8-flash-next/` | 119 GB | Text + MTP + Vision, NVFP4 routed experts (W4A4), FP8 n-gram table |
+| [`qwen3.8-flash-next/`](./qwen3.8-flash-next/) | 119 GB | Text + MTP + Vision, NVFP4 routed experts (W4A4), FP8 n-gram table, 4 shards |
 
-Built and measured (see [Qwen3.8-Flash-Next](#qwen38-flash-next)); the files will be uploaded to that
-folder shortly.
+Converted from the ModelOpt [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+checkpoint; measured numbers are in [Qwen3.8-Flash-Next](#qwen38-flash-next).
 
 More NInfer artifacts will be added to this repository over time.
 
