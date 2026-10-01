@@ -5,11 +5,18 @@ language:
   - zh
   - code
 library_name: ninfer-ext
-pipeline_tag: text-generation
-base_model: Qwen/Qwen3.8-27B
+pipeline_tag: image-text-to-text
+base_model:
+  - Qwen/Qwen3.8-27B
+  - Qwen/Qwen3.8-Flash-Next
+  - nvidia/Qwen3.8-Flash-Next-NVFP4
 tags:
   - exl3
   - trellis
+  - nvfp4
+  - moe
+  - expert-offload
+  - blackwell
   - quantization
   - ninfer
   - cuda
@@ -18,7 +25,7 @@ tags:
   - speculative-decoding
 ---
 
-# NInfer models — Qwen3.8-27B EXL3
+# NInfer models
 
 Quantized artifacts for **NInfer Ext**, a from-scratch C++/CUDA inference engine for maximum
 single-GPU performance.
@@ -27,10 +34,12 @@ single-GPU performance.
 > **These artifacts only work with [giveen/ninfer-ext](https://github.com/giveen/ninfer-ext).**
 > They are not Transformers checkpoints, not GGUF, not safetensors weights, and cannot be loaded by
 > `transformers`, `vLLM`, `llama.cpp`, or exllamav3. `.ninfer` is NInfer's own artifact format, and the
-> EXL3 trellis layout is decoded by kernels that live in that repository. Loading them anywhere else
-> will fail.
+> EXL3 trellis and NVFP4 layouts are decoded by kernels that live in that repository. Loading them
+> anywhere else will fail.
 
 ## Contents
+
+### Qwen3.8-27B EXL3
 
 | File | Size | Notes |
 |---|---|---|
@@ -44,14 +53,25 @@ only artifact here that beats both of the engine's other Qwen3.8-27B builds on *
 divergence, while being smaller than either (see Quality). 3.5 bpw is the size-optimised tier — best PPL
 per byte, but it does not carry that advantage into divergence.
 
+### Qwen3.8-Flash-Next NVFP4 — coming soon
+
+| Folder | Size | Notes |
+|---|---|---|
+| `qwen3.8-flash-next/` | 119 GB | Text + MTP + Vision, NVFP4 routed experts (W4A4), FP8 n-gram table |
+
+Built and measured (see [Qwen3.8-Flash-Next](#qwen38-flash-next)); the files will be uploaded to that
+folder shortly.
+
 More NInfer artifacts will be added to this repository over time.
 
-## Model
+## Qwen3.8-27B EXL3
+
+### Model
 
 Qwen3.8-27B (`Qwen3_5ForCausalLM`): 64 layers (48 GDN linear-attention, 16 full attention), hidden
 5120, intermediate 17408, vocab 248,320, plus a separate MTP layer and a Vision tower.
 
-## Quantization
+### Quantization
 
 NInfer's native EXL3 format (`exl3_mul1` + `trellis_t16_v1`) — a three-instruction trellis codebook
 over 16x16 tiles, with the input and output Hadamard rotations folded into the kernels. Weights are
@@ -70,7 +90,7 @@ Per-tensor rates (half bits, i.e. X.5 bpw, are first-class trellis rates):
 
 The MTP layer is calibrated from the final hidden states and next-token embeddings.
 
-## Quality
+### Quality
 
 Full-corpus perplexity over 261,167 tokens (context/stride 4096/2048, FP8 KV, greedy), and KL
 divergence against the full-precision model over the same 2,940 positions of a 23.5k-token wikitext
@@ -88,7 +108,7 @@ but 3.5 bpw's better perplexity than INT4 and NVFP4 does *not* survive as diverg
 *ordering* should be compared across runs — the absolute values move by roughly 2× with the text, and
 the ordering was reproduced in both halves of the reference.
 
-## Performance
+### Performance
 
 Measured on one NVIDIA GeForce RTX 5090, CUDA 13.3, a single request, greedy, 64-256 output tokens,
 `--prefill-chunk 1024`:
@@ -120,6 +140,47 @@ These are single-request spot measurements, not the engine's methodology-conform
 tables; [docs/performance.md](https://github.com/giveen/ninfer-ext/blob/master/docs/performance.md)
 records the published coverage and the difference.
 
+## Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) has about 180B parameters: about 121B are 512 routed
+experts per layer, and 51B are an n-gram embedding table. This artifact is converted from
+[nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) with the
+`qwen3_8_flash_next_nvfp4` recipe, and contains Text, MTP and Vision.
+
+### Representation
+
+| Weights | Stored as | Runtime residency |
+|---|---|---|
+| Routed experts (48 × 512, plus the MTP layer) | NVFP4, imported codes and scales; MTP re-encoded from block FP8 | pinned Host, fetched into a device expert cache |
+| N-gram PLE table (320M × 160) | FP8 rows with BF16 multipliers | page-cache mapped or streamed from NVMe, gathered on the Host per token |
+| Attention, GDN, hyper-connection, shared expert, PLE projections | Q8 | device |
+| Token embedding / output head | Q8 / Q6 | device |
+| Routers, shared-expert gates, norms, small vectors | BF16/FP32 direct | device |
+
+The routed experts run on the W4A4 tensor-core route; each MoE layer resolves its top-10 experts
+against an LRU device expert cache.
+
+### Measured
+
+One RTX 5090 (32 GB, sm_120a), CUDA 13.3, `--expert-cache auto`, fp8 KV, `--spec mtp`:
+
+| Metric | Value |
+|---|---|
+| Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | 3.518 |
+| Prefill (1,457-token prompt) | 922 tok/s |
+| Decode (greedy, MTP K=3) | 81 tok/s |
+| Peak host RSS (`--ngram-residency stream`) | ~65 GiB |
+| Artifact size | 119 GB, 4 sharded files |
+
+### Requirements
+
+- One RTX 5090 (sm_120a) and CUDA 13.3.
+- About 70 GB of host RAM (measured ~65 GiB peak RSS) for the pinned experts with
+  `--ngram-residency stream`, which reads the n-gram table from NVMe. Keeping the ~52 GB table in the
+  page cache (`mapped`, chosen automatically when memory allows) needs more RAM and is faster once
+  warm.
+- KV storage `bf16` or `fp8`; speculative decoding `--spec mtp`.
+
 ## Usage
 
 Build the engine from source, then serve an artifact:
@@ -129,8 +190,14 @@ git clone https://github.com/giveen/ninfer-ext
 cd ninfer-ext && cmake -B build -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE=$PWD/.venv/bin/python && cmake --build build -j
 
+# Qwen3.8-27B EXL3
 build/apps/ninfer-serve qwen3_8_27b_exl3_4bpw.ninfer \
   --port 8099 --spec mtp --draft-tokens 3 --fixed-draft
+
+# Qwen3.8-Flash-Next NVFP4
+build/apps/ninfer-serve qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer \
+  --model-id qwen3.8-flash-next --max-context 229376 --kv-capacity 458752 \
+  --kv-dtype fp8 --expert-cache auto --ngram-residency stream --spec mtp
 ```
 
 `--vision` enables image input; the Vision tower loads lazily. See the repository's `README.md`,
