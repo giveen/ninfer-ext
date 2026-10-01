@@ -61,7 +61,7 @@ MTP speculative decoding (`--spec mtp`).
   `--ngram-residency stream`, which reads the n-gram table from NVMe; keeping the ~52 GB table in
   the page cache (`mapped`, chosen automatically when memory allows) needs more RAM and is faster
   once warm;
-- KV storage `bf16` or `fp8`; speculative decoding `--spec mtp`.
+- KV storage `bf16`, `int8`, `fp8`, `nvfp4` or `k8v4`; speculative decoding `--spec mtp`.
 
 ## Serve
 
