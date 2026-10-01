@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
@@ -22,10 +23,6 @@ constexpr std::int32_t kSides           = 2;
 constexpr std::int32_t kCoefficientRows = kGroups * kTaps * kSides;
 constexpr const char* kPrepareOp        = "dynamic grouped conv prepare";
 constexpr const char* kAddOp            = "linear dynamic grouped conv add";
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int32_t d1,
                     std::int32_t d2, std::int32_t d3, const char* op, const char* label) {

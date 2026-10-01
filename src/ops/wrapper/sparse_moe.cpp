@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -31,10 +32,6 @@ struct AddressRange {
     std::uintptr_t end   = 0;
     std::string name;
 };
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 AddressRange address_range(const void* pointer, std::size_t bytes, std::string name) {
     if (pointer == nullptr || bytes == 0) {

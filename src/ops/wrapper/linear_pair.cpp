@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
@@ -12,10 +13,6 @@
 
 namespace ninfer::ops {
 namespace {
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label) {
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||

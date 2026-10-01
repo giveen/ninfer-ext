@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
@@ -31,10 +32,6 @@ std::int64_t checked_numel(const Tensor& tensor, const char* label) {
         total *= extent;
     }
     return total;
-}
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
 void validate_linear_policy(LinearPolicy policy) {

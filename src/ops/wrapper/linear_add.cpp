@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
@@ -60,10 +61,6 @@ void require_bf16(const Weight& w) {
     if (w.qtype != QType::BF16 || w.layout != QuantLayout::Contiguous || w.qdata == nullptr) {
         throw std::invalid_argument("linear_add: weight must be contiguous BF16");
     }
-}
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
 bool overlaps(const Tensor& lhs, const Tensor& rhs) {

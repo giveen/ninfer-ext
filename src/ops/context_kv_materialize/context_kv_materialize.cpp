@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/context_kv_materialize.h"
 
@@ -21,10 +22,6 @@ constexpr std::int32_t kKVHeads    = 8;
 constexpr std::int32_t kCapacity   = 2048;
 constexpr std::int32_t kBlockWidth = 16;
 constexpr const char* kOp          = "context_kv_materialize";
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int32_t n1,
                     std::int32_t n2, std::int32_t n3, std::size_t alignment, const char* name) {

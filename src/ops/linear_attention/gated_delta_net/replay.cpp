@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_replay.h"
 
@@ -20,10 +21,6 @@ namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
 constexpr std::int32_t kMaximumRows = 8;
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_tensor(const Tensor& tensor, DType dtype, std::initializer_list<std::int32_t> shape,
                     std::uintptr_t alignment, const char* op, const char* label) {

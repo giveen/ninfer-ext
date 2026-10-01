@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 
@@ -10,10 +11,6 @@
 
 namespace ninfer::ops {
 namespace {
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_bf16_weight(const Weight& w, std::int32_t rows, std::int32_t input_rows,
                          const char* name) {

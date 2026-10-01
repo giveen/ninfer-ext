@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "ninfer/ops/rmsnorm_rope.h"
 
 #include "ops/rmsnorm_rope/launch.h"
@@ -21,10 +22,6 @@ constexpr std::int32_t kTextHeadDim   = 256;
 // launch grid, and even the largest supported context stays four orders of magnitude below it.
 constexpr std::int64_t kMaximumTextGrid       = 2147483647;
 constexpr std::int32_t kMaximumTextHeadGroups = 10;
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 void require_tensor(const Tensor& tensor, DType dtype, const std::array<std::int32_t, 4>& shape,
                     const char* label) {

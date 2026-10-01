@@ -1,3 +1,4 @@
+#include "core/checked_math.h"
 #include "core/weight.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -10,10 +11,6 @@
 
 namespace ninfer::ops::detail {
 namespace {
-
-bool aligned_to(const void* pointer, std::uintptr_t alignment) {
-    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
 
 std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right, const char* operation) {
     if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
