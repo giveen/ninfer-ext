@@ -344,4 +344,17 @@ one-column decode. On the unambiguous edit load `auto`/`always`/plain are byte-i
 prose with forced short matches the lookup round flips an early near-tie, exactly as the MTP path
 already does (§9.2, last finding). The feature does not change the distribution.
 
+**Confirmation with `auto`.** Re-running the same coding task with `--lookup-drafts auto` on both
+models:
+
+| Model | lookup rounds | share of rounds | acceptance | E per lookup round | rounds saved vs plain |
+|---|---:|---:|---:|---:|---:|
+| Flash-Next | 49 | 0.25% | 62.7% | 10.47 | 464 (2.4%) |
+| 35B-A3B | 814 | 3.68% | 69.0% | 11.34 | 8416 (38%) |
+
+The gate changed *which* rounds run, not just how many: acceptance rose from 5-22% to 62.7% on
+Flash-Next because `auto` rejects the short-match rounds (E ~3 was below its ratio near 8) and keeps
+the bucket-3 ones (E ~10), so the 49 wide rounds now pay for themselves where `always` was a net
+loss. On 35B-A3B it keeps the same deep matches and the 38% round reduction stands.
+
 `auto` is now the recommended mode; `always` remains the measurement override.
