@@ -75,6 +75,14 @@ int main() {
     failures += run_case("add_bias [1152,1]", 1152, 1, 101u);
     failures += run_case("add_bias [3456,64]", 3456, 64, 201u);
     failures += run_case("add_bias [4304,257]", 4304, 257, 301u);
+    // BF16x2 guard-route coverage: even channel count that is not a multiple of
+    // eight exercises the per-pair bounded stream.
+    failures += run_case("add_bias [4302,257]", 4302, 257, 401u);
+    // BF16x2 pack-route coverage: complete 16-byte packs with a row stride that is
+    // not a 128-byte multiple, above the cache-sized boundary and via the
+    // vector-row cap.
+    failures += run_case("add_bias [4304,8192]", 4304, 8192, 501u);
+    failures += run_case("add_bias [8,300000]", 8, 300000, 601u);
     std::cout << (failures ? "FAIL" : "OK") << " add_bias\n";
     return failures ? 1 : 0;
 }

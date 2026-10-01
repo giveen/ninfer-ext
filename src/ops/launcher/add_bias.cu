@@ -46,9 +46,24 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
             static_cast<unsigned>(div_up(pairs, block * kAddBiasPairsPerThread));
         const unsigned grid_y = static_cast<unsigned>(
             std::min<std::int64_t>(rows, std::numeric_limits<unsigned short>::max()));
-        add_bias_bf16x2_kernel<block><<<dim3(grid_x, grid_y, 1u), block, 0, stream>>>(
-            static_cast<const __nv_bfloat162*>(bias.data), static_cast<__nv_bfloat162*>(x.data),
-            pairs, static_cast<std::int32_t>(rows));
+        // A row stride that is not a multiple of the 128-byte L2 line makes the
+        // scalar stream's warp requests straddle an extra line; the 16-byte pack
+        // stream avoids the extra L2 read sectors. Keep the scalar stream when the
+        // stride is line-aligned, where it is already at the bandwidth roofline.
+        const bool full_packs = (pairs % kAddBiasPairsPerThread) == 0 &&
+                                (reinterpret_cast<std::uintptr_t>(x.data) & (alignof(uint4) - 1)) == 0;
+        const bool straddles_lines = ((static_cast<std::int64_t>(x.ne[0]) * 2) % 128) != 0;
+        if (full_packs && straddles_lines) {
+            add_bias_bf16x2_pack_kernel<block><<<dim3(grid_x, grid_y, 1u), block, 0, stream>>>(
+                static_cast<const __nv_bfloat162*>(bias.data),
+                static_cast<__nv_bfloat162*>(x.data), pairs,
+                static_cast<std::int32_t>(rows));
+        } else {
+            add_bias_bf16x2_kernel<block><<<dim3(grid_x, grid_y, 1u), block, 0, stream>>>(
+                static_cast<const __nv_bfloat162*>(bias.data),
+                static_cast<__nv_bfloat162*>(x.data), pairs,
+                static_cast<std::int32_t>(rows));
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
