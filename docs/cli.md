@@ -289,7 +289,8 @@ CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 
 Qwen4Exp artifacts (Qwen3.8-Flash-Next) keep routed experts in pinned Host memory and the n-gram
-table file-mapped, so the host needs roughly 128 GB of RAM. `--expert-cache` sizes the device
+table file-mapped or streamed, so the host needs roughly 65 GiB of RAM for the pinned experts;
+`--ngram-residency stream` keeps the table out of RAM. `--expert-cache` sizes the device
 cache that routed experts are fetched into. `auto` first reserves the KV floor (the explicit
 `--kv-capacity`, or one `--max-context` when the capacity is `auto`), then gives the rest of the
 free device memory, less 1 GiB of headroom, to the cache, up to every expert. An explicit MiB

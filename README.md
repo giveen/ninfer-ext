@@ -43,8 +43,8 @@ artifacts, and the OpenAI- and Anthropic-compatible server. The fork tracks upst
 - CMake 3.28 or newer, a C++23 host compiler, Ninja and `pkg-config`.
 - FFmpeg development libraries (`libavformat`, `libavcodec`, `libavutil`, `libswscale`) and
   `libcurl >= 7.85`.
-- For Qwen3.8-Flash-Next only: about 128 GB of host RAM and 127 GB of disk
-  ([details](#requirements)).
+- For Qwen3.8-Flash-Next only: about 65 GiB of host RAM for the pinned experts and 127 GB of disk;
+  `--ngram-residency stream` keeps the 51 GB n-gram table off RAM ([details](#requirements)).
 
 ### 2. Build
 
@@ -174,8 +174,9 @@ Other settings that matter for speed:
   after a 2,048-token prompt; on the other models its speed effect hasn't been measured here.
 - **Agent loops that resend long histories:** give the Host cache tier room with
   `--host-cache-mib` (for example `16384`) so reusable prefixes survive in pinned RAM.
-- **Flash-Next:** keep `--expert-cache auto` (the default) and enough free host RAM that the n-gram
-  table stays page-cache mapped (`--ngram-residency auto` decides).
+- **Flash-Next:** keep `--expert-cache auto` (the default). If host RAM is tight, use
+  `--ngram-residency stream` so the n-gram table is read from NVMe instead of held in the page
+  cache; `auto` maps it when host memory allows.
 - **Contexts larger than GPU memory:** add `--kv-stream`; see [KV streaming](#kv-streaming).
 
 Example: Qwen3.8-27B `nvfp4` for four agents with long contexts:
@@ -381,8 +382,10 @@ an FP64 oracle checks them in `tests/models/qwen4_exp/`.
 ### Requirements
 
 - One RTX 5090.
-- About 128 GB of host RAM for the pinned experts, plus room for the n-gram table in the page cache
-  if you want it mapped (otherwise it streams from NVMe).
+- About 65 GiB of host RAM for the pinned experts (peak RSS loading and generating one token with
+  `--ngram-residency stream`). The 51 GB n-gram table is never fully resident — `mapped` faults its
+  rows through the page cache and `stream` reads them from NVMe — so it does not raise that floor,
+  but a warm page cache speeds the table up and competes with the pinned experts for RAM.
 - About 127 GB of disk for the artifact, split into `.part-NNNN` files next to the `.ninfer` file.
 
 ### Convert and serve
