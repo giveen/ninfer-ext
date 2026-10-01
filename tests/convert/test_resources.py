@@ -9,7 +9,9 @@ from tools.convert.resources import (
     QWEN_SPLIT_PATTERN,
     normalize_tokenizer,
     normalize_tokenizer_config,
+    normalize_vision_config,
     validate_tokenizer_resources,
+    validate_vision_resources,
 )
 
 
@@ -136,6 +138,52 @@ def test_validate_rejects_an_unsupported_resource_set(mutate) -> None:
     mutate(tokenizer, config, generation)
     with pytest.raises(ValueError):
         validate_tokenizer_resources(tokenizer, config, generation)
+
+
+def _valid_vision() -> tuple[dict, dict]:
+    config = {
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "size": {"shortest_edge": 65536, "longest_edge": 16777216},
+    }
+    return dict(config), dict(config)
+
+
+def test_normalize_vision_drops_null_members() -> None:
+    # A present JSON null is invalid for the runtime, which reads an absent member as its default.
+    config = {"rescale_factor": None, "patch_size": 16}
+    assert normalize_vision_config(config) is True
+    assert config == {"patch_size": 16}
+    assert normalize_vision_config(config) is False
+
+
+def test_validate_vision_accepts_a_supported_resource_set() -> None:
+    validate_vision_resources(*_valid_vision())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda i, v: i.update({"do_resize": False}), id="disabled-pipeline"),
+        pytest.param(lambda i, v: i.update({"resample": 2}), id="non-bicubic-resample"),
+        pytest.param(lambda i, v: i.update({"image_mean": [0.5, 0.5]}), id="bad-mean"),
+        pytest.param(lambda i, v: i.update({"rescale_factor": 1.0}), id="bad-rescale"),
+        pytest.param(lambda i, v: i.pop("image_std"), id="missing-std"),
+        pytest.param(lambda i, v: i.pop("size"), id="missing-size"),
+        pytest.param(lambda i, v: i.update({"size": {"shortest_edge": 0}}), id="bad-edge"),
+        pytest.param(lambda i, v: v.update({"fps": 1.0}), id="bad-fps"),
+        pytest.param(lambda i, v: v.update({"min_frames": 1}), id="bad-min-frames"),
+        pytest.param(lambda i, v: v.update({"max_frames": 1}), id="bad-max-frames"),
+    ],
+)
+def test_validate_vision_rejects_an_unsupported_resource_set(mutate) -> None:
+    preprocessor, video = _valid_vision()
+    mutate(preprocessor, video)
+    with pytest.raises(ValueError):
+        validate_vision_resources(preprocessor, video)
 
 
 def test_converter_pattern_matches_the_runtime() -> None:

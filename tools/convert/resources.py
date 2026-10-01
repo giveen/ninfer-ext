@@ -23,6 +23,15 @@ QWEN_SPLIT_PATTERN = (
     r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
+# Values the compiled Vision pixel pipeline in
+# src/models/qwen3_5/frontend/frontend.cpp expects from the preprocessor resources. The compiled
+# 16/2/2 patch geometry is cross-checked against the model's Vision config by load_resources, since a
+# synthetic model may use a smaller geometry for mapping tests.
+VISION_RESCALE_FACTOR = 1.0 / 255.0
+VISION_VIDEO_FPS = 2.0
+VISION_VIDEO_MIN_FRAMES = 4
+VISION_VIDEO_MAX_FRAMES = 768
+
 
 def normalize_tokenizer(tokenizer: dict) -> bool:
     """Rewrite the tokenizer pipeline to the form the runtime implements. Returns True when the
@@ -185,6 +194,54 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
         fail("generation_config.json eos_token_id must be an integer or a non-empty array")
 
 
+def normalize_vision_config(config: dict) -> bool:
+    """Drop JSON null members. The runtime reads an absent member as its default, but a present null
+    is invalid, so a checkpoint that writes null for "unset" is rewritten to the default form."""
+    nulls = [key for key, value in config.items() if value is None]
+    for key in nulls:
+        del config[key]
+    return bool(nulls)
+
+
+def validate_vision_resources(preprocessor: dict, video: dict) -> None:
+    """Reject a vision resource set the runtime's pixel preprocessor would refuse.
+
+    Mirrors validate_pixel_pipeline and processor_options in
+    src/models/qwen3_5/frontend/frontend.cpp."""
+
+    def fail(message: str) -> None:
+        raise ValueError(f"vision resources the runtime cannot load: {message}")
+
+    for name, config in (
+        ("preprocessor_config.json", preprocessor),
+        ("video_preprocessor_config.json", video),
+    ):
+        for flag in ("do_resize", "do_rescale", "do_normalize", "do_convert_rgb"):
+            if flag in config and config[flag] is not True:
+                fail(f"{name}.{flag} must be true")
+        if "resample" in config and config["resample"] != 3:
+            fail(f"{name}.resample must be 3 (bicubic)")
+        for field in ("image_mean", "image_std"):
+            values = config.get(field)
+            if not isinstance(values, list) or len(values) != 3 or any(v != 0.5 for v in values):
+                fail(f"{name}.{field} must be three 0.5 values")
+        if "rescale_factor" in config and config["rescale_factor"] != VISION_RESCALE_FACTOR:
+            fail(f"{name}.rescale_factor must be {VISION_RESCALE_FACTOR}")
+        size = config.get("size")
+        if not isinstance(size, dict):
+            fail(f"{name}.size must be an object")
+        for edge in ("shortest_edge", "longest_edge"):
+            value = size.get(edge)
+            if type(value) is not int or value <= 0:
+                fail(f"{name}.size.{edge} must be a positive integer")
+    if video.get("fps", VISION_VIDEO_FPS) != VISION_VIDEO_FPS:
+        fail("video_preprocessor_config.json.fps must be 2")
+    if video.get("min_frames", VISION_VIDEO_MIN_FRAMES) != VISION_VIDEO_MIN_FRAMES:
+        fail("video_preprocessor_config.json.min_frames must be 4")
+    if video.get("max_frames", VISION_VIDEO_MAX_FRAMES) != VISION_VIDEO_MAX_FRAMES:
+        fail("video_preprocessor_config.json.max_frames must be 768")
+
+
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
 ) -> tuple[int, tuple[int, ...]]:
@@ -290,6 +347,15 @@ def load_resources(
         payloads["resource/text/tokenizer_config.json"] = json.dumps(
             parsed["tokenizer_config.json"], ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+    if "vision" in roles:
+        for role in VISION_RESOURCES:
+            if normalize_vision_config(parsed[role]):
+                payloads[f"resource/vision/{role}"] = json.dumps(
+                    parsed[role], ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+        validate_vision_resources(
+            parsed["preprocessor_config.json"], parsed["video_preprocessor_config.json"]
+        )
     validate_tokenizer_resources(
         parsed["tokenizer.json"],
         parsed["tokenizer_config.json"],

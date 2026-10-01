@@ -76,6 +76,9 @@ def _checkpoint(path, config, tensors):
                 "temporal_patch_size", 2
             ),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "size": {"shortest_edge": 4, "longest_edge": 16},
         },
         "video_preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
@@ -83,6 +86,9 @@ def _checkpoint(path, config, tensors):
                 "temporal_patch_size", 2
             ),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "size": {"shortest_edge": 4, "longest_edge": 16},
         },
     }.items():
         (path / role).write_text(json.dumps(value))
