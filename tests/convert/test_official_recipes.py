@@ -10,7 +10,6 @@ from tools.convert.official_recipes import (
     qwen3_8_27b_exl3,
     qwen3_8_27b_q6,
     qwen3_8_flash_next_nvfp4,
-    qwen3_8_flash_next_q4,
 )
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
@@ -65,11 +64,8 @@ def test_q6_recipe_is_registered() -> None:
 
 
 def test_flash_next_recipes_are_registered() -> None:
-    # Exercising them needs a full Qwen4Exp sparse-MoE model, so this pins the wiring and that the
-    # two entry points stay distinct: Q4 re-encodes the experts, NVFP4 imports ModelOpt codes.
+    # Exercising it needs a full Qwen4Exp sparse-MoE model, so this pins the wiring.
     assert RECIPES["qwen3_8_flash_next_nvfp4"] is qwen3_8_flash_next_nvfp4
-    assert RECIPES["qwen3_8_flash_next_q4"] is qwen3_8_flash_next_q4
-    assert qwen3_8_flash_next_q4 is not qwen3_8_flash_next_nvfp4
 
 
 def test_bf16_recipe_is_registered_and_matches_the_groupwise_layout() -> None:
