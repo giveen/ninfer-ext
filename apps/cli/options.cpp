@@ -88,7 +88,7 @@ std::string usage_text(const char* argv0) {
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft] [--fixed-draft] [--lookup-drafts off|auto|always]\n"
-           "       [--lookup-min-match N]\n"
+           "       [--lookup-min-match N] [--chain-drafts [--chain-mtp N]]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -107,6 +107,8 @@ std::string usage_text(const char* argv0) {
            "--lookup-drafts adds prompt-lookup drafts to MTP: tokens that followed an earlier\n"
            "occurrence of the current suffix. auto uses them only where they are predicted to\n"
            "commit more than the MTP drafts; always uses every proposal (measurement).\n"
+           "--chain-drafts chains that continuation after the MTP drafts in the same round\n"
+           "(experimental; measured slower than --lookup-drafts on the loads tried).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--expert-cache sizes the device cache of host-resident routed experts (Qwen4Exp);\n"
@@ -172,6 +174,10 @@ Options parse_options(int argc, char** argv) {
             options.speculative.lookup_drafts = product::parse_lookup_draft_mode(value(arg));
         } else if (arg == "--lookup-min-match") {
             options.speculative.lookup_min_match = parse_u32(value(arg), "lookup-min-match");
+        } else if (arg == "--chain-drafts") {
+            options.speculative.chain_drafts = true;
+        } else if (arg == "--chain-mtp") {
+            options.speculative.chain_mtp = parse_u32(value(arg), "chain-mtp");
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {

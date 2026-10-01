@@ -53,8 +53,11 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 8) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,8]");
+    // T = K + 1 where K is the round's draft window. MTP drafts at most seven, but a chained round
+    // may verify up to the MTP frame's width, so the transition covers the whole window.
+    constexpr std::int32_t kMaxT = 16;
+    if (T < 2 || T > kMaxT) {
+        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,16]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {

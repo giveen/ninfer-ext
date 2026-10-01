@@ -961,9 +961,14 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
-                    const std::int32_t next  = mtp_host_egress->next_extents[row];
-                    sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
-                    for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
+                    const std::int32_t next = mtp_host_egress->next_extents[row];
+                    // A chained round only carries the MTP layer's own drafts into the next round;
+                    // the rest of the window comes from the suffix index.
+                    std::uint32_t count = static_cast<std::uint32_t>(next);
+                    if (chain_drafts) { count = std::min(count, chain_mtp); }
+                    count = std::min(count, static_cast<std::uint32_t>(sequence.mtp_drafts.size()));
+                    sequence.mtp_draft_count = count;
+                    for (std::uint32_t step = 0; step < count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
                     }

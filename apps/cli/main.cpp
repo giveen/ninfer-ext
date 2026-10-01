@@ -254,6 +254,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                        speculative.lookup_drafted_by_match_bucket[i]);
             }
             if (!buckets.empty()) { print_metric("lookup accepted by match bucket", buckets); }
+            if (speculative.chain_rounds != 0) {
+                print_metric("chain rounds", std::to_string(speculative.chain_rounds));
+            }
         }
     }
 }

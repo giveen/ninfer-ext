@@ -659,6 +659,9 @@ public:
     const std::uint32_t lookup_min_match;
     // Every round is a lookup round and the MTP draft phases are skipped (window above 7).
     const bool lookup_only;
+    // Chain the suffix drafter after the MTP drafts within the same round.
+    const bool chain_drafts;
+    const std::uint32_t chain_mtp;
     // Lookup-only programs price a wide verify against an ordinary round with the measured
     // single-request wall times of each (EMAs). A lookup round must commit more tokens than their
     // ratio to be worth running, and that ratio depends on the model's expert residency, so it is

@@ -303,7 +303,8 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"lookup_drafted_by_match_bucket",
                  metrics.speculative_lookup_drafted_by_match_bucket},
                 {"lookup_accepted_by_match_bucket",
-                 metrics.speculative_lookup_accepted_by_match_bucket}};
+                 metrics.speculative_lookup_accepted_by_match_bucket},
+                {"chain_rounds", metrics.speculative_chain_rounds}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {

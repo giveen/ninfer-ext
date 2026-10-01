@@ -112,6 +112,27 @@ void test_sync_prefix_is_idempotent() {
     expect(before == after && drafter.indexed() == history.size(), "re-syncing a prefix appends nothing");
 }
 
+void test_propose_after_tail() {
+    // A tail stands in for MTP drafts: the search suffix is history followed by the tail, and the
+    // earlier occurrence's continuation is proposed.
+    q36::SuffixDrafter drafter(1024);
+    drafter.sync(Tokens{1, 2, 3, 4, 5, 6, 9, 9, 1, 2, 3, 4});
+    std::array<ninfer::TokenId, 8> out{};
+    const std::uint32_t count =
+        drafter.propose_after(Tokens{5, 6}, 8, out.data());
+    expect(count >= 2 && out[0] == 9 && out[1] == 9,
+           "propose_after continues the earlier occurrence of history+tail");
+    // An empty tail is exactly propose().
+    q36::SuffixDrafter plain(1024);
+    plain.sync(Tokens{1, 2, 3, 4, 5, 1, 2, 3, 4});
+    std::array<ninfer::TokenId, 8> a{};
+    std::array<ninfer::TokenId, 8> b{};
+    const std::uint32_t na = plain.propose(8, a.data());
+    const std::uint32_t nb = plain.propose_after({}, 8, b.data());
+    expect(na == nb && std::equal(a.begin(), a.begin() + na, b.begin()),
+           "an empty tail matches propose()");
+}
+
 void test_policy_priors() {
     q36::LookupPolicy policy(3);
     expect_near(policy.rate(3), 0.35, 1e-12, "short-match prior");
@@ -197,6 +218,7 @@ int main() {
     test_incremental_sync_matches_at_once();
     test_reset();
     test_sync_prefix_is_idempotent();
+    test_propose_after_tail();
     test_policy_priors();
     test_policy_choice();
     test_policy_costs();

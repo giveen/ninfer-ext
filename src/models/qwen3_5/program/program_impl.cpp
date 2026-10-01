@@ -49,6 +49,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       speculative_backend(plan.speculative_backend),
       lookup_drafts(plan.lookup_drafts), lookup_min_match(plan.lookup_min_match),
       lookup_only(plan.lookup_only),
+      chain_drafts(plan.chain_drafts), chain_mtp(plan.chain_mtp),
       kv_storage(plan.kv_storage), kv_stream(plan.kv_stream), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),

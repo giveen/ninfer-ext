@@ -58,6 +58,11 @@ public:
     // Write up to `max_drafts` proposed tokens to `out`; return the count (0 = no usable match).
     std::uint32_t propose(std::uint32_t max_drafts, TokenId* out);
 
+    // As `propose`, but the search suffix is `history` followed by `tail`. The tail stands in for
+    // drafts the engine already has (MTP proposals), so the pool can continue them; it is not
+    // indexed and a proposal never reads past the tail. Used for chained rounds.
+    std::uint32_t propose_after(std::span<const TokenId> tail, std::uint32_t max_drafts, TokenId* out);
+
     // Match length behind the last proposal (0 when none).
     [[nodiscard]] std::uint32_t match_length() const noexcept { return match_; }
     // Tokens indexed so far.
@@ -70,7 +75,8 @@ private:
         std::uint8_t count = 0;
     };
 
-    [[nodiscard]] std::uint64_t key_at(std::uint32_t end) const;
+    [[nodiscard]] std::uint64_t key_at(std::uint32_t end,
+                                       std::span<const TokenId> tail) const;
     [[nodiscard]] Slot* find_slot(std::uint64_t key, bool insert);
 
     std::vector<TokenId> history_;
