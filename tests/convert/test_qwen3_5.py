@@ -64,9 +64,12 @@ def _checkpoint(path, config, tensors):
     (path / "config.json").write_text(json.dumps(config))
     save_file(tensors, path / "model.safetensors")
     for role, value in {
-        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
-        "tokenizer_config.json": {},
-        "generation_config.json": {},
+        "tokenizer.json": {
+            "model": {"vocab": {str(i): i for i in range(6)}, "merges": []},
+            "added_tokens": [],
+        },
+        "tokenizer_config.json": {"added_tokens_decoder": {}},
+        "generation_config.json": {"eos_token_id": 0},
         "preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
             "temporal_patch_size": config.get("vision_config", {}).get(

@@ -28,9 +28,12 @@ def test_cli_custom_sources_method_template_and_shards(tmp_path):
     }
     (source / "config.json").write_text(json.dumps(config))
     for name, value in {
-        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
-        "tokenizer_config.json": {},
-        "generation_config.json": {},
+        "tokenizer.json": {
+            "model": {"vocab": {str(i): i for i in range(6)}, "merges": []},
+            "added_tokens": [],
+        },
+        "tokenizer_config.json": {"added_tokens_decoder": {}},
+        "generation_config.json": {"eos_token_id": 0},
     }.items():
         (source / name).write_text(json.dumps(value))
     template = tmp_path / "template.jinja"

@@ -3,7 +3,14 @@ from __future__ import annotations
 import pathlib
 import re
 
-from tools.convert.resources import QWEN_SPLIT_PATTERN, normalize_tokenizer
+import pytest
+
+from tools.convert.resources import (
+    QWEN_SPLIT_PATTERN,
+    normalize_tokenizer,
+    normalize_tokenizer_config,
+    validate_tokenizer_resources,
+)
 
 
 def _pipeline(split_regex: str, *, add_prefix_space: bool = True, use_regex: bool = True) -> dict:
@@ -27,6 +34,36 @@ def _pipeline(split_regex: str, *, add_prefix_space: bool = True, use_regex: boo
     }
 
 
+def _added_token(index: int, content: str, *, special: bool = False) -> dict:
+    return {
+        "id": index,
+        "content": content,
+        "single_word": False,
+        "lstrip": False,
+        "rstrip": False,
+        "normalized": False,
+        "special": special,
+    }
+
+
+def _valid_resources() -> tuple[dict, dict, dict]:
+    tokenizer = {
+        "model": {"vocab": {"a": 0, "b": 1}, "merges": []},
+        "added_tokens": [_added_token(2, "<|endoftext|>", special=True)],
+    }
+    tokenizer.update(_pipeline(QWEN_SPLIT_PATTERN, add_prefix_space=False, use_regex=False))
+    config = {"added_tokens_decoder": {"2": {
+        "content": "<|endoftext|>",
+        "single_word": False,
+        "lstrip": False,
+        "rstrip": False,
+        "normalized": False,
+        "special": True,
+    }}}
+    generation = {"eos_token_id": 2}
+    return tokenizer, config, generation
+
+
 def test_normalize_rewrites_an_unsupported_split() -> None:
     # swift-next ships a newer Transformers split regex without the combining-mark class; the
     # runtime validates the description exactly, so it is rewritten.
@@ -48,6 +85,46 @@ def test_normalize_leaves_a_supported_pipeline_alone() -> None:
 def test_normalize_ignores_a_pipeline_it_does_not_understand() -> None:
     assert normalize_tokenizer({}) is False
     assert normalize_tokenizer({"pre_tokenizer": {"type": "Metaspace"}}) is False
+
+
+def test_normalize_config_synthesizes_the_decoder_map() -> None:
+    # Newer Transformers writes added tokens only in tokenizer.json; the runtime requires the
+    # decoder map in tokenizer_config.json and cross-checks it.
+    tokenizer = {"added_tokens": [_added_token(2, "<|endoftext|>", special=True)]}
+    config: dict = {}
+    assert normalize_tokenizer_config(tokenizer, config) is True
+    entry = config["added_tokens_decoder"]["2"]
+    assert entry["content"] == "<|endoftext|>"
+    assert entry["special"] is True
+    assert entry["single_word"] is False
+    # A config that already has a map is untouched.
+    assert normalize_tokenizer_config(tokenizer, dict(config)) is False
+
+
+def test_validate_accepts_a_supported_resource_set() -> None:
+    validate_tokenizer_resources(*_valid_resources())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda t, c, g: t["model"].pop("vocab"), id="missing-vocab"),
+        pytest.param(lambda t, c, g: t["model"].update({"ignore_merges": True}), id="ignore-merges"),
+        pytest.param(lambda t, c, g: t.update(_pipeline(r"\p{L}+")), id="split-pattern"),
+        pytest.param(lambda t, c, g: t.update({"normalizer": {"type": "NFD"}}), id="normalizer"),
+        pytest.param(lambda t, c, g: c.pop("added_tokens_decoder"), id="missing-decoder"),
+        pytest.param(
+            lambda t, c, g: c["added_tokens_decoder"]["2"].update({"lstrip": True}),
+            id="unsupported-flag",
+        ),
+        pytest.param(lambda t, c, g: g.pop("eos_token_id"), id="missing-eos"),
+    ],
+)
+def test_validate_rejects_an_unsupported_resource_set(mutate) -> None:
+    tokenizer, config, generation = _valid_resources()
+    mutate(tokenizer, config, generation)
+    with pytest.raises(ValueError):
+        validate_tokenizer_resources(tokenizer, config, generation)
 
 
 def test_converter_pattern_matches_the_runtime() -> None:

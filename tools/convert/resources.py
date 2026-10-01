@@ -57,6 +57,117 @@ def normalize_tokenizer(tokenizer: dict) -> bool:
     return changed
 
 
+def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
+    """Ensure tokenizer_config.json carries the added_tokens_decoder the runtime requires. Newer
+    Transformers writes added tokens only in tokenizer.json; the runtime cross-checks the two, so the
+    decoder map is synthesized from the tokenizer's own entries. Returns True when it changed."""
+    existing = config.get("added_tokens_decoder")
+    if isinstance(existing, dict) and existing:
+        return False
+    added = tokenizer.get("added_tokens")
+    if not isinstance(added, list) or not added:
+        return False
+    decoder: dict[str, dict] = {}
+    for item in added:
+        if not isinstance(item, dict) or "id" not in item or "content" not in item:
+            continue
+        decoder[str(item["id"])] = {
+            "content": item["content"],
+            "single_word": item.get("single_word", False),
+            "lstrip": item.get("lstrip", False),
+            "rstrip": item.get("rstrip", False),
+            "normalized": item.get("normalized", False),
+            "special": item.get("special", False),
+        }
+    if not decoder:
+        return False
+    config["added_tokens_decoder"] = decoder
+    return True
+
+
+def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict) -> None:
+    """Reject a resource set the runtime tokenizer loader would refuse, before writing the artifact.
+
+    Mirrors the checks in src/models/qwen3_5/frontend/tokenizer.cpp: the pipeline description, the
+    model fields, the added-token entries of both resources, and the generation eos token."""
+
+    def fail(message: str) -> None:
+        raise ValueError(f"tokenizer resources the runtime cannot load: {message}")
+
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or not isinstance(model.get("vocab"), dict):
+        fail("tokenizer.json model.vocab is required")
+    if not isinstance(model.get("merges"), list):
+        fail("tokenizer.json model.merges must be an array")
+    if model.get("ignore_merges", False) is not False:
+        fail("tokenizer.json model.ignore_merges must be false")
+    if model.get("dropout") not in (None, 0):
+        fail("tokenizer.json model.dropout must be null or zero")
+    for field in ("continuing_subword_prefix", "end_of_word_suffix"):
+        if model.get(field) not in (None, ""):
+            fail(f"tokenizer.json model.{field} must be empty")
+    normalizer = tokenizer.get("normalizer")
+    if normalizer is not None and normalizer.get("type") != "NFC":
+        fail("tokenizer.json normalizer must be NFC")
+    pre = tokenizer.get("pre_tokenizer")
+    if pre is not None:
+        parts = pre.get("pretokenizers")
+        if pre.get("type") != "Sequence" or not isinstance(parts, list) or len(parts) != 2:
+            fail("tokenizer.json pre_tokenizer must be a two-step Sequence")
+        split, bytes_level = parts
+        if (
+            split.get("type") != "Split"
+            or not isinstance(split.get("pattern"), dict)
+            or split["pattern"].get("Regex") != QWEN_SPLIT_PATTERN
+            or split.get("behavior") != "Isolated"
+            or split.get("invert", False) is not False
+        ):
+            fail("tokenizer.json pre_tokenizer.Split does not match the runtime pattern")
+        if (
+            bytes_level.get("type") != "ByteLevel"
+            or bytes_level.get("add_prefix_space", True) is not False
+            or bytes_level.get("use_regex", True) is not False
+        ):
+            fail("tokenizer.json pre_tokenizer.ByteLevel flags are unsupported")
+    decoder = tokenizer.get("decoder")
+    if decoder is not None and decoder.get("type") != "ByteLevel":
+        fail("tokenizer.json decoder must be ByteLevel")
+    post = tokenizer.get("post_processor")
+    if post is not None and post.get("type") != "ByteLevel":
+        fail("tokenizer.json post_processor must be ByteLevel or null")
+    added = tokenizer.get("added_tokens")
+    if not isinstance(added, list):
+        fail("tokenizer.json added_tokens must be an array")
+    required = ("id", "content", "single_word", "lstrip", "rstrip", "normalized", "special")
+    for item in added:
+        if not isinstance(item, dict) or any(field not in item for field in required):
+            fail("tokenizer.json added_tokens items need id/content and their boolean flags")
+        if not isinstance(item["content"], str) or not item["content"]:
+            fail("tokenizer.json added_tokens items need non-empty content")
+        if item["single_word"] or item["lstrip"] or item["rstrip"] or item["normalized"]:
+            fail("tokenizer.json added_tokens only support single_word/lstrip/rstrip/normalized false")
+    decoder_map = config.get("added_tokens_decoder")
+    if not isinstance(decoder_map, dict):
+        fail("tokenizer_config.json added_tokens_decoder is required")
+    for key, item in decoder_map.items():
+        if not key.isdigit():
+            fail("tokenizer_config.json added_tokens_decoder keys must be token ids")
+        if not isinstance(item, dict) or any(field not in item for field in required[1:]):
+            fail("tokenizer_config.json added_tokens_decoder items need content and their flags")
+        if not isinstance(item["content"], str) or not item["content"]:
+            fail("tokenizer_config.json added_tokens_decoder items need non-empty content")
+        if (
+            item["single_word"]
+            or item["lstrip"]
+            or item["rstrip"]
+            or item["normalized"]
+        ):
+            fail("tokenizer_config.json added_tokens_decoder only supports false token flags")
+    eos = generation.get("eos_token_id")
+    if type(eos) is not int and not (isinstance(eos, list) and eos and all(type(v) is int for v in eos)):
+        fail("generation_config.json eos_token_id must be an integer or a non-empty array")
+
+
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
 ) -> tuple[int, tuple[int, ...]]:
@@ -156,6 +267,17 @@ def load_resources(
         payloads["resource/text/tokenizer.json"] = json.dumps(
             parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+    if normalize_tokenizer_config(
+        parsed["tokenizer.json"], parsed["tokenizer_config.json"]
+    ):
+        payloads["resource/text/tokenizer_config.json"] = json.dumps(
+            parsed["tokenizer_config.json"], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    validate_tokenizer_resources(
+        parsed["tokenizer.json"],
+        parsed["tokenizer_config.json"],
+        parsed.get("generation_config.json", {}),
+    )
     count, special = token_domain(
         parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size
     )
