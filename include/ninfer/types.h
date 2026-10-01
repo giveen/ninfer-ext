@@ -426,6 +426,9 @@ struct ToolCallParseDiagnostics {
     std::uint32_t schema_mismatch_arguments       = 0;
     std::uint32_t duplicate_parameters_repaired   = 0;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
+    // A tolerant parse kept the region's complete calls and discarded a malformed trailing
+    // segment; false means the strict structure was accepted as-is.
+    bool tolerant_recovered                        = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -504,6 +507,10 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Recover a terminal tool-call region whose structure is malformed (a missing outer close, or a
+    // malformed trailing call) instead of returning the whole response as content. Only complete
+    // `<function>...</function>` blocks are kept; trailing content still falls back to content.
+    bool tolerant_tool_calls = false;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
