@@ -61,6 +61,39 @@ __launch_bounds__(Block) __global__
     }
 }
 
+// Large-domain BF16 stream that reads/writes 16-byte packs and holds the bias
+// pack in registers. Callers select it only for 16-byte-aligned storage whose
+// pair count is a multiple of kAddBiasPairsPerThread, so every active thread
+// owns a complete 16-byte pack and the per-pair bound check is unnecessary.
+// Used when the row stride is not a multiple of the 128-byte L2 line: the
+// scalar stream then requests straddling lines and pays extra L2 read sectors,
+// which this pack stream avoids.
+template <int Block>
+__launch_bounds__(Block) __global__
+    void add_bias_bf16x2_pack_kernel(const __nv_bfloat162* bias, __nv_bfloat162* x,
+                                     std::int32_t pairs, std::int32_t rows) {
+    const std::int32_t first =
+        (static_cast<std::int32_t>(blockIdx.x) * Block + static_cast<std::int32_t>(threadIdx.x)) *
+        kAddBiasPairsPerThread;
+    if (first >= pairs) { return; }
+    __nv_bfloat162 bias_pack[kAddBiasPairsPerThread];
+#pragma unroll
+    for (int item = 0; item < kAddBiasPairsPerThread; ++item) {
+        bias_pack[item] = __ldg(bias + first + item);
+    }
+    const std::int32_t step = static_cast<std::int32_t>(gridDim.y);
+    for (std::int32_t row = static_cast<std::int32_t>(blockIdx.y); row < rows; row += step) {
+        const std::int64_t base = static_cast<std::int64_t>(row) * pairs + first;
+        uint4 value             = *reinterpret_cast<const uint4*>(x + base);
+        auto* pack              = reinterpret_cast<__nv_bfloat162*>(&value);
+#pragma unroll
+        for (int item = 0; item < kAddBiasPairsPerThread; ++item) {
+            pack[item] = add_bias_pair(pack[item], bias_pack[item]);
+        }
+        *reinterpret_cast<uint4*>(x + base) = value;
+    }
+}
+
 __global__ void add_bias_kernel(const __nv_bfloat16* bias, __nv_bfloat16* x, std::int32_t d,
                                 std::int64_t n) {
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
