@@ -358,3 +358,38 @@ the bucket-3 ones (E ~10), so the 49 wide rounds now pay for themselves where `a
 loss. On 35B-A3B it keeps the same deep matches and the 38% round reduction stands.
 
 `auto` is now the recommended mode; `always` remains the measurement override.
+
+### 9.4 Pool design evaluation
+
+The n-gram chain plan (`ngram-chain-mtp-plan.md`, kept on the desktop) proposes replacing the
+suffix index with the fork's pool: `hash(last n tokens) -> the token that most recently followed
+that window` (last-writer-wins, fixed table, 14-bit tag, no probing). `tools/spec_sim/ngram.py`
+replays token ledgers through both designs so the choice is made before engine work. Self-replay
+makes tokens/round an upper bound; the comparison, and the gate-profitability counts, are the point.
+
+Ledgers are built by tokenizing repository sources with the local Qwen3.8-27B tokenizer (248,044
+entries) — the closest available to Flash-Next's 248,320, so a design comparison and not a numeric
+oracle. `edit` is a header followed by its lightly-renamed copy, `code` is several sources, `prose`
+is the docs.
+
+| Ledger | design | firings | accepted/firing | gate-profitable firings E>8 | tokens from E>8 |
+|---|---|---:|---:|---:|---:|
+| edit | trigram (shipped) | 221 | 6.46 | 87 | **1347** |
+| edit | pool n=8 | 108 | **11.61** | 83 | 1276 |
+| code | trigram | 9147 | 2.21 | 731 | **9403** |
+| code | pool n=8 | 2466 | **3.59** | 385 | 5003 |
+| prose | trigram | 2660 | 1.11 | 74 | **985** |
+| prose | pool n=8 | 233 | **3.92** | 46 | 627 |
+
+Sweeping the pool key length n = 4..12 does not close the gap: no n beats the trigram on E>8 tokens
+(edit 972-1276 vs 1347; code 3692-6638 vs 9403). Every pool miss is `empty` (the n-gram was never
+observed), not a tag collision (1-161 out of tens of thousands), so a longer key trades recall for
+precision that the gate already supplies: the trigram's noisy firings are rejected by the cost gate
+and cost only a host check, while the pool's lost firings are simply gone.
+
+**Decision: keep the trigram index; do not adopt the last-follower pool as a replacement.** It is a
+subset of the trigram's firings with no additional recall, and its precision advantage does not
+translate into more committed tokens. Revisit only with real model ledgers — the trace format
+carries generated ids but not prompt ids, so a real replay needs `prompt_token_ids` added to
+`--generation-token-trace-jsonl` first. The pool might still earn a place as the *chain* extension
+(§3.7's MTP+ngram interleave), which is a different question this simulation does not answer.
