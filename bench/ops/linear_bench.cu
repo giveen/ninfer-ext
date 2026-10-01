@@ -827,9 +827,7 @@ std::string csv_quote(std::string_view value) {
 }
 
 void write_csv(const std::filesystem::path& path, const std::vector<Result>& results) {
-    if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream out(path);
-    if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
+    std::ofstream out = bench::open_csv(path);
     out << "label,qtype,policy,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,"
            "useful_flops,median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"

@@ -119,10 +119,7 @@ Options parse_options(int argc, char** argv) {
     bool have_sweep  = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        const auto next = [&](const char* label) -> std::string_view {
-            if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
-            return argv[index];
-        };
+        const auto next = bench::required_argument(index, argc, argv);
         if (argument == "--tokens") {
             options.tokens = parse_tokens(next("--tokens value"));
             have_tokens    = true;

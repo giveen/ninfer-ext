@@ -45,33 +45,11 @@ struct Result {
     double useful_tflops;
 };
 
-std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        const auto next = [&](const char* label) -> std::string_view {
-            if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
-            return argv[index];
-        };
+        const auto next = bench::required_argument(index, argc, argv);
         if (argument == "--n") {
             options.n = std::stoi(std::string(next("--n")));
         } else if (argument == "--k") {
@@ -86,7 +64,7 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--policy must be a16 or a4");
             }
         } else if (argument == "--t-sweep") {
-            options.t_sweep = parse_t_sweep(next("--t-sweep"));
+            options.t_sweep = bench::parse_i32_list(next("--t-sweep"), "--t-sweep");
         } else if (argument == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup")));
         } else if (argument == "--repeat") {
@@ -124,10 +102,7 @@ const char* policy_name(ops::LinearPolicy policy) {
 void write_csv(const Options& options, const std::vector<Result>& results,
                std::uint64_t weight_bytes) {
     if (options.csv_out.empty()) { return; }
-    const std::filesystem::path path(options.csv_out);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream out(path);
-    if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
+    std::ofstream out = bench::open_csv(options.csv_out);
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {

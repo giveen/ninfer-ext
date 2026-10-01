@@ -838,10 +838,7 @@ void report(const Result& result) {
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
     if (options.csv_out.empty()) { return; }
-    const std::filesystem::path path(options.csv_out);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream output(path);
-    if (!output) { throw std::runtime_error("failed to open CSV output"); }
+    std::ofstream output = bench::open_csv(options.csv_out);
     output
         << "entry,geometry,kv_dtype,mapping,host_pages,host_bytes,execution,cache,B,W,row_contexts,valid_columns,"
            "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
