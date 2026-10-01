@@ -11,6 +11,7 @@ namespace ninfer::serve {
 
 std::string format_generation_token_trace_json(std::uint64_t request_id,
                                                std::uint32_t prompt_tokens,
+                                               const std::vector<TokenId>& prompt_token_ids,
                                                const std::vector<TokenId>& generated_token_ids) {
     // An empty completion is a valid record: skipping it would misalign request order.
     const nlohmann::json record = {
@@ -19,6 +20,7 @@ std::string format_generation_token_trace_json(std::uint64_t request_id,
         {"request_id", request_id},
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", generated_token_ids.size()},
+        {"prompt_token_ids", prompt_token_ids},
         {"generated_token_ids", generated_token_ids},
     };
     return record.dump();
@@ -33,12 +35,13 @@ GenerationTokenTraceJsonl::GenerationTokenTraceJsonl(const std::string& path,
 }
 
 bool GenerationTokenTraceJsonl::write(std::uint64_t request_id, std::uint32_t prompt_tokens,
+                                      const std::vector<TokenId>& prompt_token_ids,
                                       const std::vector<TokenId>& generated_token_ids) {
     if (!enabled()) { return true; }
     std::lock_guard lock(mutex_);
     if (failed_) { return false; }
     try {
-        output_ << format_generation_token_trace_json(request_id, prompt_tokens,
+        output_ << format_generation_token_trace_json(request_id, prompt_tokens, prompt_token_ids,
                                                       generated_token_ids)
                 << '\n';
         output_.flush();

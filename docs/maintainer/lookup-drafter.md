@@ -389,7 +389,14 @@ and cost only a host check, while the pool's lost firings are simply gone.
 
 **Decision: keep the trigram index; do not adopt the last-follower pool as a replacement.** It is a
 subset of the trigram's firings with no additional recall, and its precision advantage does not
-translate into more committed tokens. Revisit only with real model ledgers — the trace format
-carries generated ids but not prompt ids, so a real replay needs `prompt_token_ids` added to
-`--generation-token-trace-jsonl` first. The pool might still earn a place as the *chain* extension
-(§3.7's MTP+ngram interleave), which is a different question this simulation does not answer.
+translate into more committed tokens.
+
+The decision holds on a **real ledger**. `--generation-token-trace-jsonl` now records
+`prompt_token_ids` alongside the generated ids (schema version 2, `prompt.token_ids()` on
+`PreparedPrompt`), so `ngram.py --trace FILE` replays an actual served request instead of a
+tokenized fixture. A live 35B-A3B edit request (1789 prompt + 300 generated tokens) gives trigram
+188 firings / 1.84 accepted per firing / 171 E>8 tokens against the pool's 25 / 4.80 / 84 — the same
+ordering, on the engine's own tokenization.
+
+The pool might still earn a place as the *chain* extension (§3.7's MTP+ngram interleave), which is a
+different question this simulation does not answer.

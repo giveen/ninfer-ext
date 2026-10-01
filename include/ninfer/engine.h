@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -22,6 +23,9 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // Exact Engine token IDs of the prepared prompt (chat template and special tokens included).
+    // A diagnostic view into the prompt; it borrows storage and is invalid after the prompt moves.
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

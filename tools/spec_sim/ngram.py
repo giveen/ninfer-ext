@@ -16,6 +16,10 @@ prediction; the point is the *comparison* between the two designs under the same
 
 Usage:
   .venv/bin/python tools/spec_sim/ngram.py [--ledger edit|code|prose|all] [--max-k N] [--limit N]
+  .venv/bin/python tools/spec_sim/ngram.py --trace served-tokens.jsonl
+
+`--trace` replays the prompt and generated token IDs recorded by
+`ninfer-serve --generation-token-trace-jsonl`, one ledger per request.
 """
 
 from __future__ import annotations
@@ -261,15 +265,82 @@ def build_ledgers(tok, limit):
     return {k: v[:limit] for k, v in ledgers.items()}
 
 
+def iter_traces(path: str):
+    """Yield (request_id, ledger) from a --generation-token-trace-jsonl file."""
+    import json
+
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("schema") != "ninfer_generated_token_trace":
+                continue
+            ledger = list(record.get("prompt_token_ids", [])) + list(
+                record.get("generated_token_ids", [])
+            )
+            if ledger:
+                yield record.get("request_id"), ledger
+
+
+def merge(stats_list):
+    merged = {
+        "steps": 0, "tokens": 0, "fired": 0, "sum_accepted": 0, "sum_drafted": 0,
+        "profit_rounds": {2: 0, 4: 0, 8: 0}, "profit_tokens": {2: 0, 4: 0, 8: 0},
+        "misses": collections.Counter(),
+    }
+    for s in stats_list:
+        for key in ("steps", "tokens", "fired", "sum_accepted", "sum_drafted"):
+            merged[key] += s[key]
+        for be in (2, 4, 8):
+            merged["profit_rounds"][be] += s["profit_rounds"][be]
+            merged["profit_tokens"][be] += s["profit_tokens"][be]
+        for k, v in s["misses"].items():
+            merged["misses"][k] += v
+    merged["accepted_per_firing"] = (
+        merged["sum_accepted"] / merged["fired"] if merged["fired"] else 0.0
+    )
+    merged["tokens_per_round"] = (
+        1.0 + merged["sum_accepted"] / merged["tokens"] if merged["tokens"] else 0.0
+    )
+    return merged
+
+
+def report(label, stats):
+    pr = stats["profit_rounds"]
+    print(f"  {label:20s} firings={stats['fired']:6d} "
+          f"accepted/firing={stats['accepted_per_firing']:5.2f} "
+          f"tokens/round={stats['tokens_per_round']:5.2f}")
+    print(f"  {'':20s} gate-profitable firings (E>2/4/8): {pr[2]}/{pr[4]}/{pr[8]} "
+          f"tokens {stats['profit_tokens'][2]}/{stats['profit_tokens'][4]}/"
+          f"{stats['profit_tokens'][8]}"
+          + (f"  misses={dict(stats['misses'])}" if stats["misses"] else ""))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ledger", default="all", choices=["edit", "code", "prose", "all"])
+    ap.add_argument("--trace", default=None,
+                    help="a --generation-token-trace-jsonl file; replays its prompt+generated ledgers")
     ap.add_argument("--max-k", type=int, default=15)
     ap.add_argument("--limit", type=int, default=120000)
     ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER)
     ap.add_argument("--pool-n", type=int, default=8)
     ap.add_argument("--pool-entries", type=int, default=1 << 22)
     args = ap.parse_args()
+
+    designs = (("trigram", lambda: TrigramIndex()),
+               (f"last_follower n={args.pool_n}",
+                lambda: LastFollowerPool(args.pool_n, args.pool_entries)))
+
+    if args.trace:
+        ledgers = [ledger for _, ledger in iter_traces(args.trace)]
+        print(f"=== trace {args.trace}: {len(ledgers)} request ledger(s) ===")
+        for label, make in designs:
+            report(label, merge([simulate(make(), ledger, args.max_k) for ledger in ledgers]))
+        print()
+        return 0
 
     tok = load_tokenizer(args.tokenizer)
     if tok is None:
@@ -287,18 +358,8 @@ def main() -> int:
     for name in names:
         tokens = ledgers[name]
         print(f"=== ledger {name}: {len(tokens)} tokens ===")
-        for label, make in (("trigram", lambda: TrigramIndex()),
-                            (f"last_follower n={args.pool_n}",
-                             lambda: LastFollowerPool(args.pool_n, args.pool_entries))):
-            stats = simulate(make(), tokens, args.max_k)
-            pr = stats["profit_rounds"]
-            print(f"  {label:20s} firings={stats['fired']:6d} "
-                  f"accepted/firing={stats['accepted_per_firing']:5.2f} "
-                  f"tokens/round={stats['tokens_per_round']:5.2f}")
-            print(f"  {'':20s} gate-profitable firings (E>2/4/8): {pr[2]}/{pr[4]}/{pr[8]} "
-                  f"tokens {stats['profit_tokens'][2]}/{stats['profit_tokens'][4]}/"
-                  f"{stats['profit_tokens'][8]}"
-                  + (f"  misses={stats['misses']}" if stats["misses"] else ""))
+        for label, make in designs:
+            report(label, simulate(make(), tokens, args.max_k))
         print()
     return 0
 

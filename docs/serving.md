@@ -865,7 +865,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
-| `--generation-token-trace-jsonl FILE` | opt-in JSONL of generated token IDs, separate from API responses and request logs | disabled |
+| `--generation-token-trace-jsonl FILE` | opt-in JSONL of the prompt's and the generated token IDs, separate from API responses and request logs; the prompt IDs let a request's ledger be replayed offline | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |

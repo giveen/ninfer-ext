@@ -354,6 +354,10 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        if (!options_.generation_token_trace_jsonl.empty()) {
+            const std::span<const ninfer::TokenId> ids = prompt.token_ids();
+            prepared.prompt_token_ids.assign(ids.begin(), ids.end());
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
@@ -424,6 +428,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     if (!options_.generation_token_trace_jsonl.empty()) {
+        outcome.prompt_token_ids   = std::move(prepared.prompt_token_ids);
         outcome.generated_token_ids = std::move(result.generated_token_ids);
     }
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);

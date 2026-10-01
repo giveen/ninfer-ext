@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -78,6 +79,11 @@ const PromptSummary& PreparedPrompt::summary() const noexcept {
 const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept {
     static const PromptPreparationStats empty;
     return impl_ != nullptr ? impl_->prepare : empty;
+}
+
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    if (impl_ == nullptr) { return {}; }
+    return models::qwen3_5::PreparedPromptAccess::view(impl_->value).token_ids;
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }

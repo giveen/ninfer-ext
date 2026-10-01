@@ -64,6 +64,7 @@ struct GenerationOutcome {
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
     // Retained only when the server's dedicated generation-token trace is enabled.
+    std::vector<ninfer::TokenId> prompt_token_ids;
     std::vector<ninfer::TokenId> generated_token_ids;
 };
 
@@ -94,6 +95,8 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    // Prompt Engine token IDs, retained only when the generation-token trace is enabled.
+    std::vector<ninfer::TokenId> prompt_token_ids;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
