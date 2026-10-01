@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/request_events.h"
 #include "serve/request_json.h"
 
 #include <httplib.h>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +31,7 @@ public:
 
 struct HttpGenerationStream {
     explicit HttpGenerationStream(PreparedRequest request) : prepared(std::move(request)) {}
+    HttpGenerationStream() = default;
 
     PreparedRequest prepared;
     std::atomic<bool> cancelled{false};
@@ -63,15 +66,41 @@ private:
     Clock::time_point last_write_;
 };
 
-template <class Render>
-void render_and_write(SseTransport& transport, Render&& render) {
-    try {
-        auto payload = std::forward<Render>(render)();
-        transport.write(payload);
-    } catch (const ClientDisconnected&) { throw; } catch (const ResponseRenderFailure&) {
-        throw;
-    } catch (const std::exception& exception) { throw ResponseRenderFailure(exception.what()); }
-}
+// Result of a protocol stream's final step. When `failure` is set the driver reports it and sends
+// `error` instead of `events`, so a closing step keeps ownership of its failure phase.
+struct SseStreamClose {
+    std::vector<std::string> events;
+    std::optional<RequestFailure> failure;
+    ApiError error;
+};
+
+// The wire half of one streamed response. HttpServer::stream_generation owns the transport, the
+// cancellation latch, the engine run, and the request lifecycle; an encoder owns only the shape of
+// the events. Any method that produces events may throw ResponseRenderFailure (a render error, which
+// the driver reports against ResponseRender) or ClientDisconnected (a transport error).
+class SseStreamEncoder {
+public:
+    virtual ~SseStreamEncoder() = default;
+
+    // Events written before the engine runs.
+    virtual std::vector<std::string> open() = 0;
+    // The engine's generation start; may emit the stream's opening events.
+    virtual std::vector<std::string> on_start(const ninfer::GenerationStart&) { return {}; }
+    virtual std::vector<std::string> on_progress(const ninfer::PromptProgress&) { return {}; }
+    virtual void on_timing(const ninfer::GenerationTimingObservation&) {}
+    virtual std::vector<std::string> reasoning_delta(const std::string& text) = 0;
+    virtual std::vector<std::string> content_delta(const std::string& text) = 0;
+    // The protocol's error event(s) for an already-normalized error.
+    virtual std::vector<std::string> error_event(const ApiError& error) = 0;
+    // Everything still to write after the engine run, including any store commit.
+    virtual SseStreamClose close(const GenerationOutcome& outcome) = 0;
+    // The protocol's error normalization for an Engine exception (identity by default).
+    virtual ApiError normalize(ApiError error) { return error; }
+    // The protocol's internal (500) error shape.
+    virtual ApiError internal_error(const std::string& message) const {
+        return ApiError{500, "internal_error", message};
+    }
+};
 
 RequestJson parse_json_body(const httplib::Request& request);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
