@@ -218,7 +218,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 | `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
 | `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no proposal decodes ordinarily | off |
+| `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
 | `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

@@ -202,6 +202,12 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
+void ProgramImpl::update_seconds_ema(double& value, double sample) noexcept {
+    if (!(sample > 0.0)) { return; }
+    constexpr double kAlpha = 0.2;
+    value = value > 0.0 ? value + kAlpha * (sample - value) : sample;
+}
+
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
                                                 std::span<const std::uint32_t> counts) {
@@ -407,6 +413,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        if (lookup_only) { update_seconds_ema(plain_round_seconds_, seconds); }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = active_sequence(lanes[row]);
             RequestControl& request    = requests[lanes[row]];
@@ -491,18 +498,31 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    const bool lookup_force = lookup_drafts == LookupDraftMode::Always;
+    const bool lookup_cost_measured = lookup_only && lookup_cost_known();
+    double lookup_ratio = 1.0;
     if (lookup_only) {
-        // Lookup-only program: every round would otherwise be a wide verify. When no lane has a
-        // usable proposal (novel text), an ordinary one-token round is both cheaper and correct, so
-        // the wide frame never runs empty.
+        // The first round must measure an ordinary round before anything can be priced against it.
+        if (plain_round_seconds_ <= 0.0) {
+            return decode_ordinary_batch(lanes, budgets, failed_timing);
+        }
+        lookup_ratio = lookup_cost_measured ? lookup_cost_ratio() : 1.0;
+        // Lookup-only program: a wide verify is only run when it is predicted to commit more tokens
+        // than the ordinary round it replaces, scaled by their measured cost ratio. Until the wide
+        // round's own cost is measured once, one proposal is taken to measure it; after that the
+        // gate decides. A round with nothing worth verifying is an ordinary one-token round.
+        const bool force = lookup_force || !lookup_cost_measured;
         bool any_proposal = false;
         for (const std::uint32_t lane : lanes) {
             SequenceState& sequence = active_sequence(lane);
             if (!sequence.lookup) { continue; }
             sequence.lookup->sync(sequence.ledger);
             std::array<TokenId, qwen3_5::kLookupDecodeMaximumDrafts> probe{};
-            if (sequence.lookup->propose(qwen3_5::kLookupDecodeMaximumDrafts, probe.data()) > 0 &&
-                sequence.lookup->match_length() >= sequence.lookup_policy.min_match()) {
+            const std::uint32_t proposed =
+                sequence.lookup->propose(qwen3_5::kLookupDecodeMaximumDrafts, probe.data());
+            if (proposed == 0) { continue; }
+            if (sequence.lookup_policy.choose(proposed, sequence.lookup->match_length(), 1.0,
+                                              lookup_ratio, force) > 0) {
                 any_proposal = true;
                 break;
             }
@@ -550,10 +570,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            // The round width is shared by every lane; per-lane extents stay within it.
+            // The round width is shared by every lane; per-lane extents stay within it. A
+            // lookup-only round has no MTP source, so a lane that does not use lookup verifies its
+            // anchor alone.
             const std::uint32_t structural_cap =
                 std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
-            std::uint32_t extent = std::min(sequence.mtp_draft_count, structural_cap);
+            std::uint32_t extent =
+                lookup_only ? 0U : std::min(sequence.mtp_draft_count, structural_cap);
 
             if (sequence.lookup) {
                 sequence.lookup->sync(sequence.ledger);
@@ -561,10 +584,16 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     sequence.lookup->propose(structural_cap, lookup_tokens[row].data());
                 if (proposed > 0) {
                     const std::uint32_t match = sequence.lookup->match_length();
-                    const double mtp_expected = sequence.mtp_acceptance.expected_tokens(extent);
-                    const std::uint32_t chosen = sequence.lookup_policy.choose(
-                        proposed, match, mtp_expected,
-                        lookup_only || lookup_drafts == LookupDraftMode::Always);
+                    // The alternative is an MTP draft in this same round (ratio 1), or, in a
+                    // lookup-only program, an ordinary round whose measured cost sets the ratio.
+                    const double alternative = lookup_only
+                                                   ? 1.0
+                                                   : sequence.mtp_acceptance.expected_tokens(extent);
+                    const double ratio = lookup_only ? lookup_ratio : 1.0;
+                    const bool force   = lookup_only ? (lookup_force || !lookup_cost_measured)
+                                                     : lookup_drafts == LookupDraftMode::Always;
+                    const std::uint32_t chosen =
+                        sequence.lookup_policy.choose(proposed, match, alternative, ratio, force);
                     if (chosen > 0) {
                         extent             = chosen;
                         lookup_extent[row] = chosen;
@@ -650,6 +679,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         if (lanes.size() == 1) { mtp_policy.observe_round(mtp_round_rung, seconds); }
+        if (lookup_only &&
+            std::any_of(lookup_extent.begin(),
+                        lookup_extent.begin() + static_cast<std::ptrdiff_t>(lanes.size()),
+                        [](std::uint32_t extent) { return extent > 0; })) {
+            update_seconds_ema(lookup_round_seconds_, seconds);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];

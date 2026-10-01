@@ -1,10 +1,10 @@
 # Prompt-lookup speculative decoding (suffix drafter)
 
-Status: **Phase 1 and Phase 2 implemented.** This is the active work record for porting the
-prompt-lookup (suffix) draft source that Strata uses (`src/spec/suffix_drafter.cpp`,
-`draft_policy.cpp`, `controller.cpp`). It states the design, the phases, and the evidence each phase
-must produce. It is not yet a stable contract; promote the final design into the model/runtime
-reference when the work settles.
+Status: **Phases 1-3 implemented.** This is the active work record for porting the prompt-lookup
+(suffix) draft source that Strata uses (`src/spec/suffix_drafter.cpp`, `draft_policy.cpp`,
+`controller.cpp`). It states the design, the phases, and the evidence each phase must produce. It is
+not yet a stable contract; promote the final design into the model/runtime reference when the work
+settles.
 
 ## 1. Goal and scope
 
@@ -54,9 +54,12 @@ Host-only, in `src/models/qwen3_5/program/speculative/`. Faithful to Strata:
 
 ### 3.2 Acceptance model and choice (`LookupPolicy`)
 
-- `LookupAcceptance`: per-bucket probability `q` that a draft from a match of that length is
-  accepted, EMA-updated from (drafted, accepted) per round. Priors `{0.35, 0.6, 0.8, 0.92}`
-  (Strata's controller priors; a conservative corner of the measured range).
+- `LookupAcceptance`: per-bucket **conditional** probability `q` that a draft is accepted given its
+  prefix was, estimated from `(drafted, accepted)` per round as Strata's `DraftPolicy` does
+  (`q ~ accepted / (accepted + partial_rounds)`, so `q/(1-q)` matches the realized accepted per
+  round). Using `accepted / drafted` instead would understate `q` by the window width; the real logs
+  show a ~3x error from that, which is why the estimator is stated explicitly. Priors
+  `{0.35, 0.6, 0.8, 0.92}` (Strata's controller corner).
 - `expected_tokens(drafts, q) = 1 + sum_{i=1..drafts} q^i`.
 - `LookupPolicy::choose(available, match, mtp_expected, force)`: returns the lookup extent to verify,
   `0` to keep the MTP drafts. `available` is the proposal length, `mtp_expected` the tokens the MTP
@@ -123,13 +126,39 @@ adds no new backend. The cost is that lookup-only requests cannot fall back to M
 target verify of a wide round is more expensive per round; the measurement below shows where that is
 worth it.
 
+### 3.7 Cost-aware selection (Phase 3)
+
+A lookup round commits `E` tokens where an ordinary round commits one, but it also costs more. The
+break-even is therefore `E > lookup_ms / ordinary_ms`, not `E > 1`:
+
+- The engine measures the single-request wall time of an ordinary round and of a wide lookup round
+  as EMAs (`lookup_round_seconds_`, `plain_round_seconds_`). Their ratio is model- and
+  context-dependent: about 8 on host-resident Flash-Next, about 4 on device-resident 35B-A3B, and
+  it is learned from the run rather than assumed.
+- `LookupPolicy::choose(available, match, alternative_tokens, cost_ratio, force)` takes the lookup
+  only when `E_lookup(n, q) > alternative_tokens * cost_ratio * (1 + margin)`. For the MTP hybrid
+  the alternative is the MTP draft in the same round (`alternative_tokens` = MTP expected,
+  `cost_ratio` = 1); for a lookup-only program it is an ordinary round (`alternative_tokens` = 1,
+  `cost_ratio` = the measured ratio).
+- The first round of a lookup-only request is an ordinary round, so the denominator is measured
+  before anything is priced against it. Until the wide round's cost is also measured once, one
+  proposal is taken per request to measure it; then the gate decides. A round with nothing worth
+  verifying runs ordinary.
+- Probing an unmeasured match bucket is itself a round, so it is skipped when the lookup round is
+  more than `kMaxProbeCostRatio` (2) times an ordinary one.
+
+What this fixes comes straight from the real request logs: on Flash-Next agent traffic lookup fires
+on 0.1-2.5% of rounds with 5-22% acceptance and commits 1.75-4.27 tokens per wide round, which is a
+net loss against a ratio near 8; on 35B-A3B the same gate accepts the deep matches (bucket 3 at
+87-89% acceptance) that make the feature worth having.
+
 ## 4. Phases
 
 | Phase | Deliverable | Decision it informs |
 |---|---|---|
 | **1 (done)** | Host index + policy + substitution in the MTP round + counters + tests | Whether lookup beats the MTP draft on any real load; acceptance by match bucket |
 | **2 (done)** | Wider lookup-only rounds inside the MTP frame (window up to 15, MTP draft phases skipped, ordinary fallback) + tests | Whether a wider verify collects the deep matches, and for which models |
-| 3 | Joint `{none, lookup, MTP}` source selection with measured per-source round costs | Whether to ship it on by default, and per-model gating |
+| **3 (done)** | Cost-aware lookup selection (corrected conditional acceptance + measured lookup/ordinary round-cost ratio) + tests | Whether to ship it on by default: reject rounds that cannot out-commit a cheaper round |
 
 ## 5. Work checklist (Phase 1)
 
@@ -143,6 +172,7 @@ worth it.
 - [x] Build and run the affected test targets (full non-model suite passes)
 - [x] A/B measurement on the edit/quote and reasoning/prose loads (see §9)
 - [x] Phase 2: wide lookup-only rounds, ordinary fallback, validation and tests (see §3.6, §9.2)
+- [x] Phase 3: conditional acceptance model + measured lookup/ordinary cost ratio gate (§3.7, §9.3)
 
 Landing shape: `--spec mtp --draft-tokens K --fixed-draft --lookup-drafts auto` (or `always`) with
 `--lookup-min-match N`. The counters appear per request under `speculative.lookup_rounds`,
@@ -175,11 +205,12 @@ request log. `off` is bit-identical to the pre-change MTP path.
 
 ## 8. Open questions
 
-- Phase 3 should choose between MTP and lookup per round; lookup-only requests cannot use MTP
-  drafts today, and a request with both is the remaining design work.
-- The wide round's cost on host-resident experts is not yet modeled: the policy should predict the
-  distinct-expert cost of the window, as Strata's controller does, instead of always preferring the
-  deepest match.
+- Interleaving MTP and wide lookup in one request: lookup-only requests cannot use MTP drafts today
+  because the MTP layer cannot run at the wide width, so a request with both sources is the
+  remaining design work.
+- The cost gate compares a whole wide round with a whole ordinary round. It does not yet price the
+  extra distinct experts a wide verify fetches from the host expert cache as a function of the
+  window, which Strata's controller models directly; the measured ratio captures it in aggregate.
 - Should the index be bounded further for very long contexts (memory vs. coverage tradeoff)?
 
 ## 9. Results
@@ -257,9 +288,10 @@ bytes at 217/228 positions and 35% of positions would accept more than seven).
 
 Findings:
 
-- **Correctness holds.** The greedy output is byte-identical to plain decode on both models:
+- **Correctness on this load.** The greedy output is byte-identical to plain decode on both models:
   Flash-Next K15 == plain, 35B-A3B K15 == plain. Lookup drafts are verified by the same accept path,
-  so the committed text does not change.
+  so they cannot change the model's distribution; a near-tie-heavy input can still round differently
+  from a one-column decode (§9.3).
 - **Device-resident experts want the wide window; host-resident experts do not much.** 35B-A3B
   (experts in Device memory) gains most of all: 390 -> 1,610 tok/s, **x4.1** over plain and **+66%**
   over MTP K7, because its round cost grows with compute while the committed tokens grow with the
@@ -282,3 +314,34 @@ Reproduce:
   --expert-cache auto --spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts always \
   --max-new 400 --greedy --no-thinking
 ```
+
+### 9.3 Phase 3: real-task logs and the cost gate
+
+Two real agentic logs (`ninfer-serve`, OpenAI chat completions, tools, thinking mixed,
+`--spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts always`); the 35B-A3B server ran
+`--max-concurrency 4`.
+
+| Model | lookup rounds/request | acceptance | E per lookup round | decode tok/s |
+|---|---:|---:|---:|---:|
+| Flash-Next (35k prompt, 77 tools) | 8-62 | 5-22% (bucket 1) | 1.75-4.27 | 70-77 |
+| 35B-A3B | 8-628 | 22-66% (bucket 3: 87-89%) | 4.09-11.0 | 359-576 |
+
+What the logs establish:
+
+- **The acceptance estimator was wrong by ~3x.** `accepted / drafted` gave 0.16 where the realized
+  mean accepted per round implies `q ~ 0.7`. The estimator is now the conditional rate
+  (`accepted / (accepted + partial_rounds)`), so `E` matches the measured tokens per round; without
+  this the gate would have rejected profitable 35B rounds.
+- **The gate is model-appropriate.** Flash-Next's measured ratio is near 8, so bucket-1 rounds
+  (E 1.75-4.27) are rejected; 35B-A3B's is near 4, so its bucket-2/3 rounds (E up to 11) are taken.
+- **Validated A/B:** on the 35B edit load `auto` matches `always` (1.56k vs 1.61k tok/s); on prose
+  forced to short matches (`--lookup-min-match 3`) `auto` runs one bootstrap lookup, then rejects
+  (91.5 vs 95.5 tok/s plain, versus 86.1 for `always`, which kept burning wide rounds).
+
+**Correctness scope.** Speculative decoding preserves the model's *distribution*, not always the
+byte-identical greedy text: a 15-column target verify can round a near-tie differently from a
+one-column decode. On the unambiguous edit load `auto`/`always`/plain are byte-identical (§9.2); on
+prose with forced short matches the lookup round flips an early near-tie, exactly as the MTP path
+already does (§9.2, last finding). The feature does not change the distribution.
+
+`auto` is now the recommended mode; `always` remains the measurement override.

@@ -127,30 +127,53 @@ void test_policy_priors() {
 void test_policy_choice() {
     q36::LookupPolicy policy(8);
     // A weak match does not beat a healthy MTP.
-    expect(policy.choose(4, 8, 3.0, false) == 0, "a short match loses to a strong MTP");
+    expect(policy.choose(4, 8, 3.0, 1.0, false) == 0, "a short match loses to a strong MTP");
     // A long match does.
-    expect(policy.choose(4, 30, 2.0, false) == 4, "a long match beats a moderate MTP");
+    expect(policy.choose(4, 30, 2.0, 1.0, false) == 4, "a long match beats a moderate MTP");
     // Below the minimum match the proposal is not considered at all, even in measurement mode.
-    expect(policy.choose(4, 4, 1.0, false) == 0, "a match below the minimum is rejected");
-    expect(policy.choose(4, 4, 1.0, true) == 0, "the minimum applies in measurement mode too");
+    expect(policy.choose(4, 4, 1.0, 1.0, false) == 0, "a match below the minimum is rejected");
+    expect(policy.choose(4, 4, 1.0, 1.0, true) == 0, "the minimum applies in measurement mode too");
     // No proposal.
-    expect(policy.choose(0, 30, 1.0, true) == 0, "an empty proposal is never used");
+    expect(policy.choose(0, 30, 1.0, 1.0, true) == 0, "an empty proposal is never used");
     // Measurement mode ignores the value comparison.
-    expect(policy.choose(3, 30, 100.0, true) == 3, "force uses the proposal");
+    expect(policy.choose(3, 30, 100.0, 1.0, true) == 3, "force uses the proposal");
+}
+
+void test_policy_costs() {
+    // The break-even is the lookup round's cost relative to the round it replaces. A wide lookup
+    // round that costs eight ordinary rounds must commit more than that to be worth running.
+    q36::LookupPolicy policy(3);
+    expect(policy.choose(15, 30, 1.0, 8.0, false) == 15, "a deep match pays for a costly round");
+    expect(policy.choose(15, 10, 1.0, 8.0, false) == 0, "a short match does not");
+    // A cheap lookup round (device-resident experts) lowers the bar and may probe.
+    expect(policy.choose(15, 20, 1.0, 1.5, false) == 15, "a cheap round accepts a mid match");
+    // Probing is a measurement, so it is not paid for when the round is expensive.
+    expect(policy.choose(15, 20, 1.0, 8.0, false) == 0, "no probing when the round is costly");
 }
 
 void test_policy_explores() {
     // A promising but unmeasured bucket is tried even when the MTP looks stronger, so its measured
     // rate can contradict the prior; a few failures then stop it.
     q36::LookupPolicy policy(8);
-    expect(policy.choose(4, 20, 100.0, false) == 4, "an unmeasured promising bucket is probed");
+    expect(policy.choose(4, 20, 100.0, 1.0, false) == 4, "an unmeasured promising bucket is probed");
     for (int i = 0; i < static_cast<int>(q36::LookupPolicy::kProbes); ++i) {
         policy.observe(20, 4, 0);
     }
-    expect(policy.choose(4, 20, 100.0, false) == 0, "a measured poor bucket is rejected");
+    expect(policy.choose(4, 20, 100.0, 1.0, false) == 0, "a measured poor bucket is rejected");
     // A bucket whose prior is below the probe rate is not explored.
     q36::LookupPolicy weak(8);
-    expect(weak.choose(4, 8, 100.0, false) == 0, "a weak unmeasured bucket is not probed");
+    expect(weak.choose(4, 8, 100.0, 1.0, false) == 0, "a weak unmeasured bucket is not probed");
+}
+
+void test_policy_conditional_rate() {
+    // The rate is the conditional per-position probability: rounds that draft 15 and commit 3 are
+    // evidence that E(15) ~= 4, i.e. q ~= 0.75 - not accepted/drafted = 0.2.
+    q36::LookupPolicy policy(8);
+    for (int i = 0; i < 40; ++i) { policy.observe(20, 15, 3); }
+    const double q = policy.rate(20);
+    expect(q > 0.6 && q < 0.85, "conditional rate is not the accepted/drafted ratio");
+    const double e = q36::LookupAcceptance::expected_tokens(15, q);
+    expect(e > 3.0 && e < 5.0, "expected tokens match the realized accepted per round");
 }
 
 void test_policy_learns() {
@@ -176,7 +199,9 @@ int main() {
     test_sync_prefix_is_idempotent();
     test_policy_priors();
     test_policy_choice();
+    test_policy_costs();
     test_policy_explores();
+    test_policy_conditional_rate();
     test_policy_learns();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
