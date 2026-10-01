@@ -60,5 +60,7 @@ tools/freq_corpus/fixtures/*
 profiles/
 .chatgpt/
 
-# Claude Code personal/local settings (may contain API tokens)
-.claude/settings.local.json
+# Personal agent tooling (local settings, hooks, project ids)
+.claude/
+.codex/
+.freebuff/
