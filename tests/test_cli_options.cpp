@@ -160,6 +160,22 @@ int main() {
                       "CLI accepted a lookup min match below 3");
     failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--lookup-drafts"),
                       "CLI help omits --lookup-drafts");
+    const ninfer::cli::Options wide_lookup =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+               "--draft-tokens", "15", "--fixed-draft", "--lookup-drafts", "always"});
+    failures += check(wide_lookup.speculative.draft_tokens == 15 &&
+                          wide_lookup.speculative.fixed_draft,
+                      "CLI did not accept a lookup-width draft window");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "15", "--fixed-draft"});
+                      }),
+                      "a draft window above 7 was accepted without lookup drafting");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "15", "--lookup-drafts", "always"});
+                      }),
+                      "a wide lookup window was accepted without --fixed-draft");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

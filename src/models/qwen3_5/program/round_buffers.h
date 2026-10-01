@@ -14,6 +14,12 @@ namespace ninfer::models::qwen3_5 {
 
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 7;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
+// Widest verify frame the MTP round machinery carries. MTP itself drafts at most seven tokens (the
+// MTP layer's domain); a prompt-lookup round verifies up to this many and skips the MTP draft
+// phases, so the transfer arrays are sized for it while an MTP state binds a narrower prefix of the
+// same region.
+inline constexpr std::uint32_t kLookupDecodeMaximumDrafts = 15;
+inline constexpr std::uint32_t kLookupDecodeMaximumWidth  = kLookupDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
@@ -26,6 +32,9 @@ struct RoundStateSpec {
     bool causal_scoring          = false;
     // A speculative program that also runs ordinary rounds for batches.
     bool plain_batches = false;
+    // A lookup-only program runs ordinary rounds when it has no proposal (its frame is wider than
+    // the MTP layer's), so it needs the ordinary round resources too.
+    bool lookup_only = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -54,8 +63,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
+    std::array<TokenId, kMaximumConcurrency * kLookupDecodeMaximumDrafts> current_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency * kLookupDecodeMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
@@ -65,11 +74,11 @@ struct MtpDecodeIngress {
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, kMaximumConcurrency * kLookupDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
+    std::array<TokenId, kMaximumConcurrency * kLookupDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
 };
 

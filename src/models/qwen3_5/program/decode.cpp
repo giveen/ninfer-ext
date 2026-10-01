@@ -298,9 +298,11 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    // A plain MTP batch keeps the MTP layer's KV current alongside the target.
-    const bool append_mtp = speculative_backend == SpeculativeBackend::Mtp;
-    if (speculative_backend != SpeculativeBackend::None &&
+    // A plain MTP batch keeps the MTP layer's KV current alongside the target. A lookup-only
+    // program runs ordinary rounds too, but never reads the MTP layer, so it only keeps the
+    // backend KV pages mapped for the committed frontier, not written.
+    const bool append_mtp = speculative_backend == SpeculativeBackend::Mtp && !lookup_only;
+    if (speculative_backend != SpeculativeBackend::None && !lookup_only &&
         !(append_mtp && plain_mtp_batches && lanes.size() > 1)) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
@@ -368,7 +370,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->sampling[row] = request.sampling_host;
             const std::span<const TokenId> ledger(sequence.ledger);
             stage_qwen4_round_column(ledger.first(ledger.size() - 1U), ledger.last(1), 0, row);
-            ensure_sequence_kv_mapped(sequence, frontier + 1, append_mtp ? frontier + 1 : 0);
+            ensure_sequence_kv_mapped(sequence, frontier + 1,
+                                      (append_mtp || lookup_only) ? frontier + 1 : 0);
         }
         // A round over streamed KV runs eager so its Host pages can be staged per layer.
         qwen3_5::KVHostStaging* staging          = stage_text_kv(lanes);
@@ -412,7 +415,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const TokenId token        = ordinary_host_egress->sampled_tokens[row];
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
             sequence.text_kv_valid = base_E + 1;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, append_mtp ? base_E + 1 : 0);
+            commit_sequence_kv(sequence, sequence.text_kv_valid,
+                               (append_mtp || lookup_only) ? base_E + 1 : 0);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
@@ -487,6 +491,25 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    if (lookup_only) {
+        // Lookup-only program: every round would otherwise be a wide verify. When no lane has a
+        // usable proposal (novel text), an ordinary one-token round is both cheaper and correct, so
+        // the wide frame never runs empty.
+        bool any_proposal = false;
+        for (const std::uint32_t lane : lanes) {
+            SequenceState& sequence = active_sequence(lane);
+            if (!sequence.lookup) { continue; }
+            sequence.lookup->sync(sequence.ledger);
+            std::array<TokenId, qwen3_5::kLookupDecodeMaximumDrafts> probe{};
+            if (sequence.lookup->propose(qwen3_5::kLookupDecodeMaximumDrafts, probe.data()) > 0 &&
+                sequence.lookup->match_length() >= sequence.lookup_policy.min_match()) {
+                any_proposal = true;
+                break;
+            }
+        }
+        if (!any_proposal) { return decode_ordinary_batch(lanes, budgets, failed_timing); }
+    }
+
     // Every lane shares this round's draft length: the rung whose graphs are predicted to commit
     // the most tokens per second for the lanes' measured acceptance.
     mtp_round_rung = mtp_policy.select(
@@ -515,7 +538,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         // Prompt-lookup drafts: a lane may substitute its proposal for the MTP drafts when the
         // policy predicts it commits more. `lookup_extent`/`lookup_match` record the choice so the
         // round's outcome trains the lookup model rather than the MTP's.
-        std::array<std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts>, kMaximumConcurrency>
+        std::array<std::array<TokenId, qwen3_5::kLookupDecodeMaximumDrafts>, kMaximumConcurrency>
             lookup_tokens{};
         std::array<std::uint32_t, kMaximumConcurrency> lookup_extent{};
         std::array<std::uint32_t, kMaximumConcurrency> lookup_match{};
@@ -540,7 +563,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     const std::uint32_t match = sequence.lookup->match_length();
                     const double mtp_expected = sequence.mtp_acceptance.expected_tokens(extent);
                     const std::uint32_t chosen = sequence.lookup_policy.choose(
-                        proposed, match, mtp_expected, lookup_drafts == LookupDraftMode::Always);
+                        proposed, match, mtp_expected,
+                        lookup_only || lookup_drafts == LookupDraftMode::Always);
                     if (chosen > 0) {
                         extent             = chosen;
                         lookup_extent[row] = chosen;
@@ -614,7 +638,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,
-                                    envelopes, executable);
+                                    envelopes, executable, lookup_only);
         submit_range.reset();
         timing.begin_wait();
         {

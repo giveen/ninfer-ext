@@ -66,11 +66,21 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
                 "mtp|dflash|dflash2");
         }
         return;
-    case SpeculativeBackend::Mtp:
-        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
+    case SpeculativeBackend::Mtp: {
+        // Prompt-lookup rounds may verify a wider window than the MTP layer can draft, because they
+        // skip the MTP draft phases. A wider window therefore implies lookup-only rounds.
+        const std::uint32_t max_drafts =
+            options.lookup_drafts != LookupDraftMode::Off ? 15U : 7U;
+        if (options.draft_tokens == 0 || options.draft_tokens > max_drafts) {
+            throw std::invalid_argument(
+                "--spec mtp requires --draft-tokens in [1,7], or [8,15] with --lookup-drafts");
+        }
+        if (options.draft_tokens > 7 && !options.fixed_draft) {
+            throw std::invalid_argument(
+                "--lookup-drafts above 7 draft tokens requires --fixed-draft");
         }
         return;
+    }
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");

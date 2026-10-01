@@ -1,10 +1,10 @@
 # Prompt-lookup speculative decoding (suffix drafter)
 
-Status: **Phase 1 in progress.** This is the active work record for porting the prompt-lookup
-(suffix) draft source that Strata uses (`src/spec/suffix_drafter.cpp`, `draft_policy.cpp`,
-`controller.cpp`). It states the design, the phases, and the evidence each phase must produce. It is
-not yet a stable contract; promote the final design into the model/runtime reference when the work
-settles.
+Status: **Phase 1 and Phase 2 implemented.** This is the active work record for porting the
+prompt-lookup (suffix) draft source that Strata uses (`src/spec/suffix_drafter.cpp`,
+`draft_policy.cpp`, `controller.cpp`). It states the design, the phases, and the evidence each phase
+must produce. It is not yet a stable contract; promote the final design into the model/runtime
+reference when the work settles.
 
 ## 1. Goal and scope
 
@@ -104,12 +104,31 @@ A/B harness: the edit/quote load (a file returned with a rename — where the dr
 win), a code load, and the existing long-reasoning and prose loads, at C=1..8, on Qwen3.8-Flash-Next
 and Qwen3.6-35B-A3B, each with and without `--lookup-drafts`.
 
+### 3.6 Wide lookup-only rounds (Phase 2)
+
+The MTP layer drafts at most seven tokens, so a round that runs its draft phases cannot verify a
+wider lookup proposal. When `--draft-tokens` is above 7 (which requires `--fixed-draft` and
+`--lookup-drafts`), the program is **lookup-only**:
+
+- The MTP round frame is planned at the requested width (up to `kLookupDecodeMaximumDrafts`, 15) and
+  the ladder has one rung, so the graph family is a single wider verify.
+- The round body skips `mtp_prepare_next_round`, the MTP layer forward and the proposal head, and
+  reports no next drafts. The MTP layer's KV is therefore never read; its pages are still mapped and
+  committed so the existing KV bookkeeping stays valid.
+- When no lane has a proposal at or above `--lookup-min-match`, the round runs as an ordinary
+  one-token round instead, so non-repeating text does not pay for an empty wide verify.
+
+This reuses the entire MTP execution path (frame, graph capture, dispatch, ReplaySSM settle) and
+adds no new backend. The cost is that lookup-only requests cannot fall back to MTP drafts, and the
+target verify of a wide round is more expensive per round; the measurement below shows where that is
+worth it.
+
 ## 4. Phases
 
 | Phase | Deliverable | Decision it informs |
 |---|---|---|
-| **1 (active)** | Host index + policy + substitution in the MTP round + counters + tests | Whether lookup beats the MTP draft on any real load; acceptance by match bucket |
-| 2 | Lookup-only verify backend (no MTP forward/head), its own graph family | Whether the round can be made cheaper than MTP |
+| **1 (done)** | Host index + policy + substitution in the MTP round + counters + tests | Whether lookup beats the MTP draft on any real load; acceptance by match bucket |
+| **2 (done)** | Wider lookup-only rounds inside the MTP frame (window up to 15, MTP draft phases skipped, ordinary fallback) + tests | Whether a wider verify collects the deep matches, and for which models |
 | 3 | Joint `{none, lookup, MTP}` source selection with measured per-source round costs | Whether to ship it on by default, and per-model gating |
 
 ## 5. Work checklist (Phase 1)
@@ -123,6 +142,7 @@ and Qwen3.6-35B-A3B, each with and without `--lookup-drafts`.
 - [x] `SpeculativeStats` counters surfaced in the request log
 - [x] Build and run the affected test targets (full non-model suite passes)
 - [x] A/B measurement on the edit/quote and reasoning/prose loads (see §9)
+- [x] Phase 2: wide lookup-only rounds, ordinary fallback, validation and tests (see §3.6, §9.2)
 
 Landing shape: `--spec mtp --draft-tokens K --fixed-draft --lookup-drafts auto` (or `always`) with
 `--lookup-min-match N`. The counters appear per request under `speculative.lookup_rounds`,
@@ -155,10 +175,16 @@ request log. `off` is bit-identical to the pre-change MTP path.
 
 ## 8. Open questions
 
-- Does the adaptive MTP policy need to keep updating while lookup is on? Phase 2 should decide.
+- Phase 3 should choose between MTP and lookup per round; lookup-only requests cannot use MTP
+  drafts today, and a request with both is the remaining design work.
+- The wide round's cost on host-resident experts is not yet modeled: the policy should predict the
+  distinct-expert cost of the window, as Strata's controller does, instead of always preferring the
+  deepest match.
 - Should the index be bounded further for very long contexts (memory vs. coverage tradeoff)?
 
-## 9. Phase 1 results
+## 9. Results
+
+### 9.1 Phase 1 (window within the MTP layer's seven drafts)
 
 RTX 5090, CUDA graphs, FP8 KV, `--fixed-draft --draft-tokens 7`, greedy, thinking off, one
 1791-token prompt (a header file returned with an identifier renamed), 400 new tokens. Flash-Next
@@ -207,4 +233,52 @@ Reproduce:
   --prompt "$(cat prompt.txt)" --max-context 32768 --kv-capacity auto --kv-dtype fp8 \
   --expert-cache auto --spec mtp --draft-tokens 7 --fixed-draft \
   --lookup-drafts off|auto|always --max-new 400 --greedy --no-thinking
+```
+
+### 9.2 Phase 2 (window above the MTP layer's seven drafts)
+
+Same machine, prompt and settings, `--draft-tokens 15 --fixed-draft --lookup-drafts always`
+(lookup-only). The prompt is returned verbatim by the model, so a 15-draft window accepts ~15.2-15.8
+tokens per round; the depth probe on the Phase 1 output predicted this (the drafter proposed 15/15
+bytes at 217/228 positions and 35% of positions would accept more than seven).
+
+| Model / load | mode | decode tok/s | rounds | tok/round | ordinary fallback |
+|---|---|---:|---:|---:|---:|
+| Flash-Next, edit | plain (no spec) | 76.4 | 400 | 1.0 | – |
+| Flash-Next, edit | MTP K7 | 118.7 / 121.7 | 56 | 7.11 | – |
+| Flash-Next, edit | lookup K7 `always` | 143.7 / 142.9 | 51 | 7.89 | – |
+| Flash-Next, edit | lookup K15 | 155.8 / 157.8 / 165.0 | 24 | 15.75 | – |
+| Flash-Next, prose | plain | 95.9 | – | 1.0 | n/a |
+| Flash-Next, prose | lookup K15 | 96.4 | 0 lookup | 1.0 | all rounds |
+| 35B-A3B, edit | plain (no spec) | 390.1 | 400 | 1.0 | – |
+| 35B-A3B, edit | MTP K7 | 971.7 | 53 | 7.53 | – |
+| 35B-A3B, edit | lookup K7 `always` | 1.01k | 51 | 7.96 | – |
+| 35B-A3B, edit | lookup K15 | 1.61k / 1.63k | 25 | 15.36 | – |
+
+Findings:
+
+- **Correctness holds.** The greedy output is byte-identical to plain decode on both models:
+  Flash-Next K15 == plain, 35B-A3B K15 == plain. Lookup drafts are verified by the same accept path,
+  so the committed text does not change.
+- **Device-resident experts want the wide window; host-resident experts do not much.** 35B-A3B
+  (experts in Device memory) gains most of all: 390 -> 1,610 tok/s, **x4.1** over plain and **+66%**
+  over MTP K7, because its round cost grows with compute while the committed tokens grow with the
+  window. Flash-Next (experts in Host memory behind the PCIe expert cache) gains 118.7 -> 157.8
+  (**+33%** over MTP K7, +107% over plain): the wider verify also widens the distinct-expert set it
+  must fetch, so the round cost grows nearly with the window and the gain is bounded.
+- **A wide window is harmless on non-repeating text** because of the ordinary fallback: Flash-Next
+  prose with K15 = 96.4 tok/s, byte-identical to plain decode (95.9). Without the fallback the same
+  request ran 80.6 tok/s (empty wide verifies).
+- **The MTP path itself is not bit-identical to plain decode on prose.** Flash-Next prose with MTP
+  K7 diverges from plain decode at byte 210 while the lookup-only run (all ordinary) matches plain
+  exactly. That is the MTP backend's own batched-verify near-tie, not a lookup result: the Phase 2
+  runs exercised zero lookup rounds on that text. It is pre-existing and worth a separate look.
+
+Reproduce:
+
+```bash
+./build/apps/ninfer models/Qwen3.8-Flash-NVFP4/qwen3_8_flash_next_nvfp4.ninfer \
+  --prompt "$(cat prompt.txt)" --max-context 32768 --kv-capacity auto --kv-dtype fp8 \
+  --expert-cache auto --spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts always \
+  --max-new 400 --greedy --no-thinking
 ```

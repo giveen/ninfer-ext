@@ -657,6 +657,8 @@ public:
     // Prompt-lookup (suffix) drafts substitute for the MTP drafts inside the same round.
     const LookupDraftMode lookup_drafts;
     const std::uint32_t lookup_min_match;
+    // Every round is a lookup round and the MTP draft phases are skipped (window above 7).
+    const bool lookup_only;
     const KvCacheStorage kv_storage;
     // KV streaming (planning/kv_stream.h): full pages outside a request's Device window move to
     // Host records that attention reads in place.

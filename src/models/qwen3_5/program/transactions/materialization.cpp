@@ -315,10 +315,12 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         materialization_prefix_digests_.assign(prompt);
 
         // The first round runs on the policy's starting rung, so prefill drafts exactly that many
-        // tokens; a longer draft would only be truncated.
+        // tokens; a longer draft would only be truncated. The MTP layer itself drafts at most
+        // kMtpDecodeMaximumDrafts, which also bounds a wider prompt-lookup round's frame.
         const std::uint32_t initial_mtp_extent =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min({mtp_rungs[mtp_policy.initial_rung()].k,
+                            qwen3_5::kMtpDecodeMaximumDrafts,
                             request_plan.summary.effective_output_tokens > 1
                                 ? request_plan.summary.effective_output_tokens - 2
                                 : 0U,

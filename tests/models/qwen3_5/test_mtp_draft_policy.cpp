@@ -49,8 +49,11 @@ void test_ladder() {
     expect(q36::mtp_draft_ladder(2, true) == Ladder({2}), "window 2 ladder");
     expect(q36::mtp_draft_ladder(1, true) == Ladder({1}), "window 1 ladder");
     expect(q36::mtp_draft_ladder(7, false) == Ladder({7}), "fixed window is one rung");
+    expect(q36::mtp_draft_ladder(q36::kLookupDecodeMaximumDrafts, false) ==
+               Ladder({q36::kLookupDecodeMaximumDrafts}),
+           "a lookup width is one fixed rung");
     expect(throws([] { (void)q36::mtp_draft_ladder(0, true); }), "window 0 is invalid");
-    expect(throws([] { (void)q36::mtp_draft_ladder(q36::kMtpDecodeMaximumDrafts + 1, true); }),
+    expect(throws([] { (void)q36::mtp_draft_ladder(q36::kLookupDecodeMaximumDrafts + 1, true); }),
            "window above the frame domain is invalid");
 
     expect(q36::mtp_batch_rung(Ladder({2, 3, 4, 7})) == 1, "batch rung is K=3 on the full ladder");
@@ -230,7 +233,10 @@ void test_policy_validation() {
            "descending ladder");
     expect(throws([] { (void)q36::MtpDraftPolicy(Ladder({2, 2}), Seconds{1.0, 1.0}); }),
            "duplicate rungs");
-    expect(throws([] { (void)q36::MtpDraftPolicy(Ladder({2, 8}), Seconds{1.0, 1.0}); }),
+    expect(throws([] {
+               (void)q36::MtpDraftPolicy(Ladder({2, q36::kLookupDecodeMaximumDrafts + 1}),
+                                         Seconds{1.0, 1.0});
+           }),
            "rung above the frame domain");
     expect(throws([] { (void)q36::MtpDraftPolicy(Ladder({2, 4}), Seconds{1.0}); }),
            "round times must cover every rung");

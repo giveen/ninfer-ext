@@ -393,7 +393,7 @@ void ProgramImpl::prepare_graphs() {
             device.synchronize();
             execution::mtp_decode_batch(mtp_state, 1, k,
                                         mtp_causal_attention_envelopes(code_warm.max, k, capacity),
-                                        nullptr);
+                                        nullptr, lookup_only);
             device.synchronize();
 
             rung.graphs.profiles.reserve(planned_profiles.size() * batch_limit);
@@ -408,7 +408,7 @@ void ProgramImpl::prepare_graphs() {
                         planned.topology_class * max_concurrency + (batch_size - 1U);
                     execution::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), k,
-                        mtp_causal_attention_envelopes(planned.max, k, capacity),
+                        mtp_causal_attention_envelopes(planned.max, k, capacity), lookup_only,
                         profile.definition);
                 }
             }
