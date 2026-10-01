@@ -47,6 +47,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
+      lookup_drafts(plan.lookup_drafts), lookup_min_match(plan.lookup_min_match),
+      lookup_only(plan.lookup_only),
       kv_storage(plan.kv_storage), kv_stream(plan.kv_stream), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -62,7 +64,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                               : std::nullopt),
       ordinary_host(
           !plan.causal_scoring &&
-                  (plan.speculative_backend == SpeculativeBackend::None || plan.plain_mtp_batches)
+                  (plan.speculative_backend == SpeculativeBackend::None || plan.plain_mtp_batches ||
+                   plan.lookup_only)
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
@@ -256,7 +259,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (io.ordinary.has_value() !=
         (!causal_scoring &&
-         (speculative_backend == SpeculativeBackend::None || plain_mtp_batches))) {
+         (speculative_backend == SpeculativeBackend::None || plain_mtp_batches || lookup_only))) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {
@@ -693,7 +696,8 @@ void ProgramImpl::stage_qwen4_round_column(std::span<const TokenId> history,
                                            std::size_t staging_column) {
     if (!qwen4_runtime || ple_gather == nullptr) { return; }
     const std::size_t context = parameters.model.config().text.ple->ngram_size - 1U;
-    std::array<std::int32_t, 16> tokens{};
+    // Sized for the n-gram context plus the widest verify round (the MTP frame's lookup width).
+    std::array<std::int32_t, 32> tokens{};
     if (context + column_in_round + 1U > tokens.size() || column_in_round >= round.size()) {
         throw std::logic_error("Qwen4Exp round PLE column exceeds its n-gram window");
     }

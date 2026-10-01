@@ -139,6 +139,14 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
+    const ServeOptions lookup =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+               "--lookup-drafts", "auto", "--lookup-min-match", "10"});
+    failures += check(lookup.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          lookup.speculative.lookup_drafts == ninfer::LookupDraftMode::Auto &&
+                          lookup.speculative.lookup_min_match == 10,
+                      "serve options did not preserve lookup drafting");
+
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto options = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
                                     "--draft-tokens", std::to_string(k), "--lm-head-draft"});
@@ -436,18 +444,20 @@ int main() {
     } catch (const std::invalid_argument&) { same_log_rejected = true; }
     failures +=
         check(same_log_rejected, "request and generated-token logs accepted the same output file");
-    const auto trace_json = nlohmann::json::parse(
-        format_generation_token_trace_json(7, 3, std::vector<ninfer::TokenId>{42, 99, 8}));
+    const auto trace_json = nlohmann::json::parse(format_generation_token_trace_json(
+        7, 3, std::vector<ninfer::TokenId>{1, 2, 3}, std::vector<ninfer::TokenId>{42, 99, 8}));
     failures += check(trace_json.at("schema") == std::string(kGenerationTokenTraceSchema) &&
                           trace_json.at("schema_version") == kGenerationTokenTraceSchemaVersion &&
                           trace_json.at("request_id") == 7 && trace_json.at("prompt_tokens") == 3 &&
                           trace_json.at("completion_tokens") == 3 &&
+                          trace_json.at("prompt_token_ids") == std::vector<int>{1, 2, 3} &&
                           trace_json.at("generated_token_ids") == std::vector<int>{42, 99, 8},
                       "generation token trace formatter lost its exact token sequence");
-    const auto empty_trace = nlohmann::json::parse(
-        format_generation_token_trace_json(9, 5, std::vector<ninfer::TokenId>{}));
+    const auto empty_trace = nlohmann::json::parse(format_generation_token_trace_json(
+        9, 5, std::vector<ninfer::TokenId>{}, std::vector<ninfer::TokenId>{}));
     failures += check(empty_trace.at("completion_tokens") == 0 &&
-                          empty_trace.at("generated_token_ids").empty(),
+                          empty_trace.at("generated_token_ids").empty() &&
+                          empty_trace.at("prompt_token_ids").empty(),
                       "an empty completion must still produce an ordered trace record");
     const auto trace_path =
         std::filesystem::temp_directory_path() /
@@ -456,7 +466,8 @@ int main() {
     {
         GenerationTokenTraceJsonl trace_log(trace_path.string());
         failures += check(trace_log.enabled(), "token trace logger did not open its output");
-        failures += check(trace_log.write(8, 4, std::vector<ninfer::TokenId>{17, 19}),
+        failures += check(trace_log.write(8, 4, std::vector<ninfer::TokenId>{1, 2},
+                                          std::vector<ninfer::TokenId>{17, 19}),
                           "token trace logger failed to append a record");
     }
     std::ifstream trace_file(trace_path);
@@ -464,8 +475,9 @@ int main() {
     std::getline(trace_file, trace_line);
     const auto trace_record = nlohmann::json::parse(trace_line);
     failures += check(trace_record.at("request_id") == 8 &&
+                          trace_record.at("prompt_token_ids") == std::vector<int>{1, 2} &&
                           trace_record.at("generated_token_ids") == std::vector<int>{17, 19},
-                      "token trace logger did not persist the exact generated IDs");
+                      "token trace logger did not persist the exact token IDs");
     std::error_code remove_error;
     std::filesystem::remove(trace_path, remove_error);
     failures += check(!remove_error, "token trace test file cleanup failed");

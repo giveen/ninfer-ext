@@ -12,6 +12,8 @@
 #include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
+#include "models/qwen3_5/program/speculative/lookup_policy.h"
+#include "models/qwen3_5/program/speculative/suffix_drafter.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -396,6 +398,11 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     // How far this sequence's drafts get accepted; steers the draft length of its rounds.
     MtpAcceptanceEstimate mtp_acceptance;
+    // Prompt-lookup drafts: the suffix index for this sequence's ledger and the source choice.
+    // The index is created when the sequence begins (only when lookup drafting is enabled), so a
+    // sequence that never uses it pays nothing.
+    std::optional<SuffixDrafter> lookup;
+    LookupPolicy lookup_policy;
     bool tail_hidden_valid = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -647,6 +654,17 @@ public:
     // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
     const bool plain_mtp_batches;
     const SpeculativeBackend speculative_backend;
+    // Prompt-lookup (suffix) drafts substitute for the MTP drafts inside the same round.
+    const LookupDraftMode lookup_drafts;
+    const std::uint32_t lookup_min_match;
+    // Every round is a lookup round and the MTP draft phases are skipped (window above 7).
+    const bool lookup_only;
+    // Lookup-only programs price a wide verify against an ordinary round with the measured
+    // single-request wall times of each (EMAs). A lookup round must commit more tokens than their
+    // ratio to be worth running, and that ratio depends on the model's expert residency, so it is
+    // learned from the run rather than assumed.
+    double lookup_round_seconds_ = 0.0;
+    double plain_round_seconds_  = 0.0;
     const KvCacheStorage kv_storage;
     // KV streaming (planning/kv_stream.h): full pages outside a request's Device window move to
     // Host records that attention reads in place.
@@ -1266,6 +1284,16 @@ private:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // Fold one round's wall time into an EMA (the first sample sets it).
+    static void update_seconds_ema(double& value, double sample) noexcept;
+    // Cost of a wide lookup round relative to an ordinary one. Valid only once both have been
+    // measured; callers gate on the two fields before using it.
+    [[nodiscard]] double lookup_cost_ratio() const noexcept {
+        return lookup_round_seconds_ / plain_round_seconds_;
+    }
+    [[nodiscard]] bool lookup_cost_known() const noexcept {
+        return lookup_round_seconds_ > 0.0 && plain_round_seconds_ > 0.0;
+    }
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,

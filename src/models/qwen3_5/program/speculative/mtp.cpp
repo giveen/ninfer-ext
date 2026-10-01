@@ -68,10 +68,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpCausalAttentionEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+                           MtpCausalAttentionEnvelopes envelopes, bool lookup_only) {
+    return [&state, batch_size, k, envelopes, lookup_only] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kMtpDecodeMaximumDrafts) {
+            k == 0 || k > kLookupDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
 
@@ -152,7 +152,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  envelopes.target_verify);
         }
 
-        {
+        if (!lookup_only) {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
             ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
@@ -194,6 +194,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));
             }
+        } else {
+            // Lookup-only round: the MTP layer's draft phases do not run, because the round's drafts
+            // come from the sequence's suffix index and may be wider than the MTP layer can draft.
+            // `next_extents` must read as zero so the settle records no MTP drafts.
+            CUDA_CHECK(cudaMemsetAsync(frame.next_extents.data, 0, frame.next_extents.bytes(),
+                                       state.execution.device.stream));
         }
 
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
@@ -203,15 +209,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 }
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpCausalAttentionEnvelopes envelopes,
+                              MtpCausalAttentionEnvelopes envelopes, bool lookup_only,
                               DecodeGraphDefinition& definition) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, lookup_only);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
+                      bool lookup_only) {
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, lookup_only);
     run_prepared(state, executable, body);
 }
 

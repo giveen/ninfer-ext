@@ -137,7 +137,7 @@ whether it is used or not. Where a cell says the workload decides, the numbers b
 | Qwen3.8-27B `exl3` 4.0 / 3.5 bpw | `--spec mtp --draft-tokens 3 --fixed-draft` | not measured | not measured |
 | Qwen3.6-35B-A3B | `--spec mtp --lm-head-draft` | same at 2; at 4, same for long reasoning and no `--spec` for short prose | `--spec dflash --draft-tokens 7 --lm-head-draft` for long reasoning; no `--spec` for short prose |
 | Qwen3.6-27B (both) | not measured; start from the Qwen3.8-27B row of the same weights | | |
-| Qwen3.8-Flash-Next | no `--spec` | no `--spec` | no `--spec` |
+| Qwen3.8-Flash-Next | `--spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts auto` | same | same |
 
 Why these:
 
@@ -151,9 +151,15 @@ Why these:
   reasoning and ahead on short prompts. Speculation hurts short prose from 4 requests up: on
   512-token essays, plain decode is 14% faster than MTP at C=4 and 32% faster at C=8. On long
   reasoning at C=8, DFlash with 7 drafts is the fastest mode.
-- **Flash-Next.** Decode is bound by fetching experts over PCIe. A verify round routes up to four
-  columns, which touches more experts than the accepted drafts save. Plain decode was 26% faster
-  than MTP for a single request and 6% faster at C=8.
+- **Copy-heavy work (edits, refactors, quoting, repeated tool arguments).** On any MTP model use
+  `--spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts auto`. It is the fastest mode measured
+  on that traffic and, where nothing repeats, the cost gate falls back to ordinary decode, so it
+  matches plain decode rather than regressing.
+- **Flash-Next.** Decode is bound by fetching experts over PCIe, so an MTP verify routes up to four
+  columns and touches more experts than the accepted drafts save: plain decode was 26% faster than
+  MTP for a single request and 6% faster at C=8. The lookup window is the exception — it only runs a
+  wide verify where the text repeats earlier context — so use it for copy-heavy work and plain
+  decode otherwise.
 - **The adaptive default (`--spec mtp` alone)** is a reasonable choice when the workload is unknown
   or mixed; see [Adaptive MTP draft length](#adaptive-mtp-draft-length).
 
@@ -589,6 +595,30 @@ fixed K=5 was faster on 27B `nvfp4` and at C=8 on 35B-A3B.
 
 ## What else the fork changes
 
+### Prompt-lookup draft source
+
+A host-side suffix index drafts the tokens that followed an earlier occurrence of the current
+suffix — a copied file, a quoted document, a repeated tool argument. It is model-free (a trigram
+key with four recent positions and a backward extension), and every draft is verified by the target,
+so it cannot change the output distribution.
+
+- **`--lookup-drafts off|auto|always`** (MTP only) adds it to the MTP round; with
+  **`--draft-tokens 15 --fixed-draft`** the round becomes a wide lookup-only verify that skips the
+  MTP draft phases and falls back to ordinary decode when nothing repeats.
+- **Cost gate.** The engine measures the wall time of a wide lookup round and of an ordinary round
+  and takes lookup only when it is predicted to commit more than their ratio, so `auto` is safe by
+  construction. Round times and per-match acceptance are learned per run.
+- **Measured**, 400 tokens, greedy, RTX 5090: on copy-heavy edits 35B-A3B goes 390 → 1,610 tok/s
+  (×4.1 over plain, +66% over MTP K=7) and Flash-Next 76 → 158 (+33% over MTP K=7); on prose the
+  wide window is byte-identical to plain decode and the cost gate never fires. Request logs and the
+  CLI summary carry per-request `lookup_*`/`chain_rounds` counters.
+- **Rejected alternatives** (recorded so they are not repeated): the last-follower n-gram pool has
+  worse recall than the trigram index, chaining MTP with the pool is dominated by the pool-only wide
+  window, and the 15-draft verify ceiling is structural (target verify and GDN conv-record cap
+  `T` at 16).
+
+[Prompt-lookup suffix drafter](docs/maintainer/lookup-drafter.md) is the authority.
+
 ### Context cache and serving
 
 - **Aborted requests keep their prefill.** A cancelled or disconnected request salvages its
@@ -640,7 +670,8 @@ describes the planner.
 - Image, multi-image, video and mixed multimodal input (`--vision`).
 - Chunked prefill, and CUDA Graph decode of one to eight concurrent requests.
 - Speculative decoding: MTP on every model, DFlash (draft windows 1–15) on Qwen3.6-35B-A3B, and
-  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights.
+  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights. A host prompt-lookup (suffix)
+  draft source rides any MTP model, with a measured cost gate (`--lookup-drafts`).
 - BF16, INT8, FP8, NVFP4 and K8V4 KV storage.
 - Private and shared exact-prefix reuse, with Device and Host retention.
 - KV streaming of contexts beyond GPU memory to pinned host RAM (`--kv-stream`).

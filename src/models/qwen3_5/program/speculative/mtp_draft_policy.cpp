@@ -34,7 +34,7 @@ std::vector<std::size_t> mtp_batch_rungs(std::span<const std::uint32_t> ladder) 
 }
 
 std::vector<std::uint32_t> mtp_draft_ladder(std::uint32_t draft_window, bool adaptive) {
-    if (draft_window == 0 || draft_window > kMtpDecodeMaximumDrafts) {
+    if (draft_window == 0 || draft_window > kLookupDecodeMaximumDrafts) {
         throw std::invalid_argument("MTP draft window is outside the supported domain");
     }
     std::vector<std::uint32_t> ladder;
@@ -92,7 +92,7 @@ MtpDraftPolicy::MtpDraftPolicy(std::vector<std::uint32_t> ladder, std::vector<do
     : ladder_(std::move(ladder)), round_seconds_(std::move(round_seconds)) {
     if (ladder_.empty() || !std::ranges::is_sorted(ladder_) ||
         std::ranges::adjacent_find(ladder_) != ladder_.end() || ladder_.front() == 0 ||
-        ladder_.back() > kMtpDecodeMaximumDrafts) {
+        ladder_.back() > kLookupDecodeMaximumDrafts) {
         throw std::invalid_argument("MTP draft ladder must be ascending and within the window");
     }
     if (round_seconds_.size() != ladder_.size() ||

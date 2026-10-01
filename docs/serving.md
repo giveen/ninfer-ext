@@ -865,7 +865,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
-| `--generation-token-trace-jsonl FILE` | opt-in JSONL of generated token IDs, separate from API responses and request logs | disabled |
+| `--generation-token-trace-jsonl FILE` | opt-in JSONL of the prompt's and the generated token IDs, separate from API responses and request logs; the prompt IDs let a request's ledger be replayed offline | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
@@ -873,6 +873,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
 | `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
+| `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |

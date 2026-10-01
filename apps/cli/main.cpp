@@ -232,6 +232,29 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             lengths += std::format("K{}={}", i + 1, speculative.rounds_by_draft_length[i]);
         }
         if (!lengths.empty()) { print_metric(backend + " rounds by length", lengths); }
+        if (speculative.lookup_drafted_tokens != 0 || speculative.lookup_rounds != 0) {
+            print_metric("lookup rounds", std::to_string(speculative.lookup_rounds));
+            print_metric("lookup drafted tokens", std::to_string(speculative.lookup_drafted_tokens));
+            print_metric("lookup accepted tokens",
+                         std::to_string(speculative.lookup_accepted_tokens));
+            print_metric("lookup acceptance rate",
+                         format_percent(speculative.lookup_accepted_tokens,
+                                        speculative.lookup_drafted_tokens));
+            if (speculative.lookup_rounds != 0) {
+                const double length =
+                    1.0 + static_cast<double>(speculative.lookup_accepted_tokens) /
+                              static_cast<double>(speculative.lookup_rounds);
+                print_metric("lookup acceptance length", std::format("{:.2f} tok/round", length));
+            }
+            std::string buckets;
+            for (std::size_t i = 0; i < speculative.lookup_drafted_by_match_bucket.size(); ++i) {
+                if (i != 0) { buckets += ' '; }
+                buckets += std::format("b{}={}/{}", i,
+                                       speculative.lookup_accepted_by_match_bucket[i],
+                                       speculative.lookup_drafted_by_match_bucket[i]);
+            }
+            if (!buckets.empty()) { print_metric("lookup accepted by match bucket", buckets); }
+        }
     }
 }
 

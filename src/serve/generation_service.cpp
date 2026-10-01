@@ -354,6 +354,10 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        if (!options_.generation_token_trace_jsonl.empty()) {
+            const std::span<const ninfer::TokenId> ids = prompt.token_ids();
+            prepared.prompt_token_ids.assign(ids.begin(), ids.end());
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
@@ -424,6 +428,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     if (!options_.generation_token_trace_jsonl.empty()) {
+        outcome.prompt_token_ids   = std::move(prepared.prompt_token_ids);
         outcome.generated_token_ids = std::move(result.generated_token_ids);
     }
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
@@ -457,6 +462,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::move(result.speculative.accepted_per_position);
     outcome.metrics.speculative_rounds_by_draft_length =
         std::move(result.speculative.rounds_by_draft_length);
+    outcome.metrics.speculative_lookup_rounds          = result.speculative.lookup_rounds;
+    outcome.metrics.speculative_lookup_draft_tokens    = result.speculative.lookup_drafted_tokens;
+    outcome.metrics.speculative_lookup_accepted_tokens = result.speculative.lookup_accepted_tokens;
+    outcome.metrics.speculative_lookup_drafted_by_match_bucket =
+        std::move(result.speculative.lookup_drafted_by_match_bucket);
+    outcome.metrics.speculative_lookup_accepted_by_match_bucket =
+        std::move(result.speculative.lookup_accepted_by_match_bucket);
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;

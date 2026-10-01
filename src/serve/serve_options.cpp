@@ -84,7 +84,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--generation-token-trace-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--fixed-draft] [--default-max-tokens N] [--default-thinking-budget N] "
+           "[--fixed-draft] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
+           "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
@@ -100,8 +101,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --generation-token-trace-jsonl appends generated token IDs to a separate JSONL "
-           "file\n"
+           "       --generation-token-trace-jsonl appends prompt and generated token IDs to a "
+           "separate JSONL file\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -312,6 +313,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--fixed-draft") {
             options.speculative.fixed_draft = true;
+        } else if (arg == "--lookup-drafts") {
+            options.speculative.lookup_drafts =
+                product::parse_lookup_draft_mode(require_value("--lookup-drafts"));
+        } else if (arg == "--lookup-min-match") {
+            options.speculative.lookup_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lookup-min-match"), "lookup-min-match"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

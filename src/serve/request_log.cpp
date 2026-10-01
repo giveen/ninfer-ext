@@ -296,7 +296,14 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position},
-                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length}};
+                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length},
+                {"lookup_rounds", metrics.speculative_lookup_rounds},
+                {"lookup_drafted_tokens", metrics.speculative_lookup_draft_tokens},
+                {"lookup_accepted_tokens", metrics.speculative_lookup_accepted_tokens},
+                {"lookup_drafted_by_match_bucket",
+                 metrics.speculative_lookup_drafted_by_match_bucket},
+                {"lookup_accepted_by_match_bucket",
+                 metrics.speculative_lookup_accepted_by_match_bucket}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {

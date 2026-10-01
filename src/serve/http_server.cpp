@@ -284,7 +284,8 @@ void HttpServer::record_generation_token_trace(const RequestLogContext& context,
     if (!generation_token_trace_jsonl_.enabled()) { return; }
     if (outcome.prompt_tokens < 0) { return; }
     (void)generation_token_trace_jsonl_.write(
-        context.id, static_cast<std::uint32_t>(outcome.prompt_tokens), outcome.generated_token_ids);
+        context.id, static_cast<std::uint32_t>(outcome.prompt_tokens), outcome.prompt_token_ids,
+        outcome.generated_token_ids);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,

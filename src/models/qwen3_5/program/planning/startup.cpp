@@ -267,7 +267,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring,
-                                         .plain_batches  = plan.plain_mtp_batches});
+                                         .plain_batches  = plan.plain_mtp_batches,
+                                         .lookup_only    = plan.lookup_only});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16,
                    {dimension(config.residual_width()), effective_prefill_chunk},
@@ -1086,9 +1087,20 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     case SpeculativeBackend::Mtp:
-        if (options.speculative.draft_tokens == 0 ||
-            options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,7]");
+        {
+            // With prompt-lookup drafting the round may verify up to the lookup frame's width and
+            // skip the MTP draft phases, so the MTP layer's own [1,7] bound does not apply.
+            const std::uint32_t max_drafts =
+                options.speculative.lookup_drafts != LookupDraftMode::Off ? 15U : 7U;
+            if (options.speculative.draft_tokens == 0 ||
+                options.speculative.draft_tokens > max_drafts) {
+                throw std::invalid_argument(
+                    "MTP draft window must be in [1,7], or [8,15] with lookup drafting");
+            }
+            if (options.speculative.draft_tokens > 7 && !options.speculative.fixed_draft) {
+                throw std::invalid_argument(
+                    "lookup drafting above 7 draft tokens requires a fixed draft length");
+            }
         }
         break;
     case SpeculativeBackend::DFlash:
@@ -1102,6 +1114,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    }
+    if (options.speculative.lookup_drafts != LookupDraftMode::Off) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("lookup drafts require the MTP speculative backend");
+        }
+        if (options.speculative.lookup_min_match < 3 || options.speculative.lookup_min_match > 32) {
+            throw std::invalid_argument("lookup min match must be in [3,32]");
+        }
     }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
@@ -1225,6 +1245,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
+    impl->lookup_drafts       = inputs.lookup_drafts;
+    impl->lookup_min_match    = inputs.lookup_min_match;
+    impl->lookup_only         = inputs.lookup_only;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
@@ -1270,11 +1293,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const std::vector<std::uint32_t> ladder =
                 mtp_draft_ladder(impl->draft_window, impl->adaptive_draft);
             const std::vector<std::size_t> batch_rungs = mtp_batch_rungs(ladder);
-            // Plain batches replay ordinary graphs for two or more requests instead.
+            // Plain batches replay ordinary graphs for two or more requests instead. A lookup-only
+            // program also replays ordinary graphs whenever it has no proposal, for any batch size.
             std::size_t allowance =
                 impl->plain_mtp_batches
                     ? checked_mul(12ULL * kMiB, impl->max_concurrency - 1U,
                                   "ordinary exact-b graph allowance")
+                : impl->lookup_only
+                    ? checked_mul(12ULL * kMiB, impl->max_concurrency,
+                                  "lookup ordinary exact-b graph allowance")
                     : 0;
             for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
                 const std::uint32_t k = ladder[rung];
@@ -1414,6 +1441,10 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
                           !options.speculative.fixed_draft,
         .speculative_backend = options.speculative.backend,
+        .lookup_drafts       = options.speculative.lookup_drafts,
+        .lookup_min_match    = options.speculative.lookup_min_match,
+        .lookup_only         = options.speculative.lookup_drafts != LookupDraftMode::Off &&
+                       options.speculative.draft_tokens > 7,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,
         .features            = models::load_options(options),

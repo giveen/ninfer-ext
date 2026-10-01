@@ -87,7 +87,8 @@ std::string usage_text(const char* argv0) {
            "       [--device N] [--expert-cache auto|MiB] [--ngram-residency auto|mapped|stream]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
-           "       [--lm-head-draft] [--fixed-draft]\n"
+           "       [--lm-head-draft] [--fixed-draft] [--lookup-drafts off|auto|always]\n"
+           "       [--lookup-min-match N]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -103,6 +104,9 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--spec mtp adapts the draft length of a single request per round (up to 7 tokens, or\n"
            "--draft-tokens N); --fixed-draft always drafts exactly N.\n"
+           "--lookup-drafts adds prompt-lookup drafts to MTP: tokens that followed an earlier\n"
+           "occurrence of the current suffix. auto uses them only where they are predicted to\n"
+           "commit more than the MTP drafts; always uses every proposal (measurement).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--expert-cache sizes the device cache of host-resident routed experts (Qwen4Exp);\n"
@@ -164,6 +168,10 @@ Options parse_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--fixed-draft") {
             options.speculative.fixed_draft = true;
+        } else if (arg == "--lookup-drafts") {
+            options.speculative.lookup_drafts = product::parse_lookup_draft_mode(value(arg));
+        } else if (arg == "--lookup-min-match") {
+            options.speculative.lookup_min_match = parse_u32(value(arg), "lookup-min-match");
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
