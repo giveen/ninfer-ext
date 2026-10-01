@@ -51,6 +51,12 @@ fi::ToolCallOutputContract contract_for(const std::string& tool_name, Json prope
     return *output_contract_for(tool_name, std::move(properties));
 }
 
+fi::ToolCallOutputContract tolerant_contract_for(const std::string& tool_name, Json properties) {
+    const std::vector<std::string> definitions = {tool_definition(tool_name, std::move(properties))};
+    return *fi::build_tool_call_output_contract(
+        std::span<const std::string>(definitions.data(), definitions.size()), true, true);
+}
+
 std::string
 tool_call(std::string_view tool_name,
           std::initializer_list<std::pair<std::string_view, std::string_view>> parameters = {}) {
@@ -820,6 +826,58 @@ int test_duplicate_parameter_keeps_last_value() {
     return failures;
 }
 
+int test_tolerant_recovers_complete_calls() {
+    int failures = 0;
+    const auto bash_properties = Json{{"command", Json{{"type", "string"}}}};
+    const auto tolerant_contract = tolerant_contract_for("bash", bash_properties);
+    const auto strict_contract   = contract_for("bash", bash_properties);
+
+    // A complete function missing its outer close: strict keeps the whole response as content.
+    std::string missing_close = tool_call("bash", {{"command", "ls -la"}});
+    missing_close.erase(missing_close.rfind("</tool_call>"));
+    const auto strict = fi::parse_qwen_tool_call_output(missing_close, 64, strict_contract);
+    failures += check(!strict.is_tool_call_response && strict.content == missing_close &&
+                          strict.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure &&
+                          !strict.diagnostics.tolerant_recovered,
+                      "strict mode keeps a missing outer close as content");
+    const auto tolerant = fi::parse_qwen_tool_call_output(missing_close, 64, tolerant_contract);
+    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                          tolerant.tool_calls.front().arguments_json ==
+                              Json{{"command", "ls -la"}}.dump() &&
+                          tolerant.content.empty() && tolerant.diagnostics.tolerant_recovered,
+                      "tolerant mode recovers a function with a missing outer close");
+
+    // A truncated trailing call must not hide the complete call before it.
+    const std::string truncated_tail =
+        tool_call("bash", {{"command", "ls"}}) +
+        "\n<tool_call>\n<function=bash>\n<parameter=command>pwd</parameter>\n";
+    const auto recovered = fi::parse_qwen_tool_call_output(truncated_tail, 64, tolerant_contract);
+    failures += check(recovered.is_tool_call_response && recovered.tool_calls.size() == 1 &&
+                          recovered.tool_calls.front().arguments_json ==
+                              Json{{"command", "ls"}}.dump() &&
+                          recovered.diagnostics.tolerant_recovered,
+                      "tolerant mode keeps the complete call before a truncated one");
+
+    // Trailing content is still not recovered: a quoted example stays ordinary content.
+    const std::string with_prose = tool_call("bash", {{"command", "ls"}}) + "\nthen I waited.";
+    const auto prose = fi::parse_qwen_tool_call_output(with_prose, 64, tolerant_contract);
+    failures += check(!prose.is_tool_call_response && prose.content == with_prose &&
+                          prose.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::TrailingContent &&
+                          !prose.diagnostics.tolerant_recovered,
+                      "tolerant mode does not recover across trailing content");
+
+    // Nothing is recovered when no function is complete.
+    const std::string malformed =
+        "<tool_call>\n<function=bash>\n<parameter=command>ls\n</function>\n</tool_call>";
+    const auto bad = fi::parse_qwen_tool_call_output(malformed, 64, tolerant_contract);
+    failures += check(!bad.is_tool_call_response && bad.content == malformed &&
+                          !bad.diagnostics.tolerant_recovered,
+                      "tolerant mode still falls back when no call is complete");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -845,6 +903,7 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_tolerant_recovers_complete_calls();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

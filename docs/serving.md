@@ -217,6 +217,14 @@ structured turn, and any quoted markup before it stays ordinary content.
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.
 
+`--tolerant-tool-calls` relaxes only the terminal structural failure. When the region that reaches
+the end of the response holds complete `<function>...</function>` blocks but is otherwise malformed —
+a missing outer `</tool_call>`, or a truncated or malformed trailing call — those complete calls
+become the structured turn and the malformed tail is discarded; the request log records
+`tool_call_parse.tolerant_recovered`. It never recovers across trailing content, so a quoted example
+followed by prose stays ordinary content. A region whose first function is incomplete stays content
+in both modes.
+
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
 retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
@@ -890,6 +898,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation; the engine anchors up to N message boundaries automatically, on a grid that doubles the gap walking back from the prompt end (1024 tokens at the first step), so short tool-loop turns do not each cost an anchor and deep history stays covered. `--host-cache-mib` raises N within the state inventory it funds and never lowers it. | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--tolerant-tool-calls` | recover the complete calls of a malformed terminal tool-call region (missing outer close, truncated trailing call) instead of returning the whole response as content; trailing content still falls back | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |

@@ -3,7 +3,6 @@
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -13,6 +12,60 @@
 #include <vector>
 
 namespace ninfer::serve {
+
+namespace {
+
+class MessagesSseEncoder final : public SseStreamEncoder {
+public:
+    MessagesSseEncoder(AnthropicResponseIdentity identity, int input_tokens, bool hide_thinking)
+        : stream_(std::move(identity), input_tokens, hide_thinking) {}
+
+    std::vector<std::string> open() override { return {}; }
+
+    std::vector<std::string> on_start(const ninfer::GenerationStart& start) override {
+        return {stream_.start(start)};
+    }
+
+    std::vector<std::string> reasoning_delta(const std::string& text) override {
+        return stream_.reasoning_delta(text);
+    }
+
+    std::vector<std::string> content_delta(const std::string& text) override {
+        return stream_.content_delta(text);
+    }
+
+    std::vector<std::string> error_event(const ApiError& error) override {
+        std::vector<std::string> events;
+        if (!stream_.started()) { events.push_back(stream_.start()); }
+        events.push_back(stream_.error(error));
+        return events;
+    }
+
+    SseStreamClose close(const GenerationOutcome& outcome) override {
+        SseStreamClose result;
+        try {
+            result.events = stream_.finish(outcome);
+        } catch (const std::exception& exception) {
+            result.failure = make_internal_request_failure(RequestFailurePhase::ResponseRender,
+                                                           exception.what());
+            result.error   = internal_error(exception.what());
+        }
+        return result;
+    }
+
+    ApiError normalize(ApiError error) override {
+        return normalize_anthropic_error(std::move(error));
+    }
+
+    ApiError internal_error(const std::string& message) const override {
+        return ApiError{500, "invalid_request_error", message};
+    }
+
+private:
+    AnthropicMessagesStream stream_;
+};
+
+} // namespace
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = new_anthropic_request_id();
@@ -132,115 +185,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    try {
-        auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
-                                                                 request.hide_thinking);
-
-        prepare_sse_response(res);
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
-                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
-                    sink.done();
-                    return true;
-                }
-                SseTransport transport(sink, stream->cancelled);
-                const auto send_error = [&](const ApiError& error) {
-                    try {
-                        if (!encoder->started()) {
-                            render_and_write(transport, [&] { return encoder->start(); });
-                        }
-                        render_and_write(transport, [&] { return encoder->error(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
-                };
-
-                GenerationOutcome outcome;
-                try {
-                    StreamSink output;
-                    output.on_start = [&](const ninfer::GenerationStart& start) {
-                        render_and_write(transport, [&] { return encoder->start(start); });
-                    };
-                    output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
-                    };
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
-                    };
-                    output.is_cancelled = [&] { return transport.poll(); };
-
-                    outcome = service_->run(stream->prepared, &output);
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = normalize_anthropic_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_error(error);
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-
-                lifecycle->done(outcome);
-                std::vector<std::string> terminal;
-                try {
-                    terminal = encoder->finish(outcome);
-                } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-            },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
-    } catch (const std::exception& exception) {
-        lifecycle->failure(
-            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
-    }
+    auto stream = std::make_shared<HttpGenerationStream>(std::move(prepared));
+    auto encoder =
+        std::make_shared<MessagesSseEncoder>(identity, input_tokens, request.hide_thinking);
+    stream_generation(
+        res, std::move(stream), std::move(lifecycle), std::move(encoder),
+        [&res, &request_id](const ApiError& error) {
+            write_anthropic_error(res, error, request_id);
+        });
 }
 
 } // namespace ninfer::serve

@@ -64,15 +64,21 @@ def _checkpoint(path, config, tensors):
     (path / "config.json").write_text(json.dumps(config))
     save_file(tensors, path / "model.safetensors")
     for role, value in {
-        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
-        "tokenizer_config.json": {},
-        "generation_config.json": {},
+        "tokenizer.json": {
+            "model": {"vocab": {str(i): i for i in range(6)}, "merges": []},
+            "added_tokens": [],
+        },
+        "tokenizer_config.json": {"added_tokens_decoder": {}},
+        "generation_config.json": {"eos_token_id": 0},
         "preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
             "temporal_patch_size": config.get("vision_config", {}).get(
                 "temporal_patch_size", 2
             ),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "size": {"shortest_edge": 4, "longest_edge": 16},
         },
         "video_preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
@@ -80,6 +86,9 @@ def _checkpoint(path, config, tensors):
                 "temporal_patch_size", 2
             ),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "size": {"shortest_edge": 4, "longest_edge": 16},
         },
     }.items():
         (path / role).write_text(json.dumps(value))

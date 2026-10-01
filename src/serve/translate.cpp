@@ -154,6 +154,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .enable_thinking           = thinking ? thinking : server.enable_thinking,
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
         .chat_template_kwargs_json = kwargs.dump(),
+        .tolerant_tool_calls       = server.tolerant_tool_calls,
     };
     if (effort) {
         const bool enables = *effort != RequestedReasoningEffort::None;
@@ -290,6 +291,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.add_vision_id                    = false;
+    input.options.tolerant_tool_calls              = semantics.tolerant_tool_calls;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {

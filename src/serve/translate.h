@@ -20,6 +20,7 @@ struct ResolvedPromptSemantics {
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
+    bool tolerant_tool_calls = false;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,

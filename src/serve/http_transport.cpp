@@ -1,5 +1,6 @@
 #include "serve/http_transport.h"
 
+#include "serve/http_server.h"
 #include "serve/request_validation.h"
 
 #if defined(__linux__)
@@ -93,6 +94,139 @@ void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
     response.user_data.set("ninfer.request_lifetime", std::move(lifetime));
+}
+
+void HttpServer::stream_generation(httplib::Response& res,
+                                   std::shared_ptr<HttpGenerationStream> stream,
+                                   std::shared_ptr<RequestLifecycle> lifecycle,
+                                   std::shared_ptr<SseStreamEncoder> encoder,
+                                   std::function<void(const ApiError&)> write_error) {
+    // Wrap a protocol encoder call so a render failure stays distinguishable from a transport one.
+    const auto render = [](auto&& produce) -> std::vector<std::string> {
+        try {
+            return produce();
+        } catch (const ClientDisconnected&) {
+            throw;
+        } catch (const ResponseRenderFailure&) {
+            throw;
+        } catch (const std::exception& exception) {
+            throw ResponseRenderFailure(exception.what());
+        }
+    };
+
+    try {
+        prepare_sse_response(res);
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, stream, lifecycle, encoder,
+             render](std::size_t, httplib::DataSink& sink) -> bool {
+                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
+                    sink.done();
+                    return true;
+                }
+                SseTransport transport(sink, stream->cancelled);
+                const auto send_error = [&](const ApiError& error) -> bool {
+                    try {
+                        transport.write(render([&] { return encoder->error_event(error); }));
+                        sink.done();
+                        return true;
+                    } catch (const ClientDisconnected&) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception.what()));
+                        return false;
+                    }
+                };
+
+                try {
+                    transport.write(render([&] { return encoder->open(); }));
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_error(encoder->internal_error(exception.what()));
+                }
+
+                GenerationOutcome outcome;
+                try {
+                    StreamSink output;
+                    output.on_start = [&](const ninfer::GenerationStart& start) {
+                        transport.write(render([&] { return encoder->on_start(start); }));
+                    };
+                    output.on_progress = [&](const ninfer::PromptProgress& progress) {
+                        transport.write(render([&] { return encoder->on_progress(progress); }));
+                    };
+                    output.on_timing = [&](const ninfer::GenerationTimingObservation& timing) {
+                        encoder->on_timing(timing);
+                    };
+                    output.on_reasoning = [&](const std::string& text) {
+                        transport.write(render([&] { return encoder->reasoning_delta(text); }));
+                    };
+                    output.on_content = [&](const std::string& text) {
+                        transport.write(render([&] { return encoder->content_delta(text); }));
+                    };
+                    output.is_cancelled = [&] { return transport.poll(); };
+
+                    outcome = service_->run(stream->prepared, &output);
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_error(encoder->internal_error(exception.what()));
+                } catch (const ApiException& exception) {
+                    const ApiError error = encoder->normalize(exception.error());
+                    lifecycle->failure(make_generation_request_failure(error));
+                    return send_error(error);
+                } catch (const std::exception& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::Generation, exception.what()));
+                    return send_error(encoder->internal_error(exception.what()));
+                }
+
+                lifecycle->done(outcome);
+                SseStreamClose closing;
+                try {
+                    closing = encoder->close(outcome);
+                } catch (const std::exception& exception) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_error(encoder->internal_error(exception.what()));
+                }
+                if (closing.failure) {
+                    lifecycle->response_failure(*closing.failure);
+                    return send_error(closing.error);
+                }
+                try {
+                    transport.write(closing.events);
+                    sink.done();
+                    return true;
+                } catch (const ClientDisconnected&) {
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
+            },
+            [stream, lifecycle](bool successful) {
+                stream->cancelled.store(true, std::memory_order_release);
+                if (!successful || !stream->started.load(std::memory_order_acquire)) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                }
+            });
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+        write_error(encoder->internal_error(exception.what()));
+    }
 }
 
 } // namespace ninfer::serve

@@ -603,10 +603,7 @@ void report(const Result& result) {
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
     if (options.csv_out.empty()) { return; }
-    const std::filesystem::path path(options.csv_out);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream output(path);
-    if (!output) { throw std::runtime_error("failed to open CSV output"); }
+    std::ofstream output = bench::open_csv(options.csv_out);
     output << "mode,geometry,kv_dtype,layout,batch,cyclic_capacity,execution,cache,T,committed,max_"
               "count,graph_nodes,graph_calls,"
               "logical_cache_bytes,key_vector_bytes,value_vector_bytes,physical_cache_bytes,"
