@@ -28,8 +28,8 @@ A NInfer v3 artifact of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qw
 [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) with the
 `qwen3_8_flash_next_nvfp4` recipe. It contains Text, MTP and Vision.
 
-**Status:** measured on the development RTX 5090; the artifact files and checksums are
-**coming soon** (upload pending). The numbers below are from that machine.
+**Status:** measured on the development RTX 5090. The artifact files and `SHA256SUMS` are in this
+folder.
 
 ## Representation
 
