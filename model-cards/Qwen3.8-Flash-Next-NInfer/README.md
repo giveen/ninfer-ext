@@ -28,8 +28,8 @@ A NInfer v3 artifact of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qw
 [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) with the
 `qwen3_8_flash_next_nvfp4` recipe. It contains Text, MTP and Vision.
 
-**Status:** execution is implemented but not yet measured on hardware. This card will list the
-artifact size, checksums, accuracy and throughput once they have been measured.
+**Status:** measured on the development RTX 5090; the artifact files and checksums are
+**coming soon** (upload pending). The numbers below are from that machine.
 
 ## Representation
 
@@ -41,12 +41,26 @@ artifact size, checksums, accuracy and throughput once they have been measured.
 | Token embedding / output head | Q8 / Q6 | device |
 | Routers, shared-expert gates, norms, small vectors | BF16/FP32 direct | device |
 
+## Measured
+
+Development machine: one RTX 5090 (32 GB, sm_120a), CUDA 13.3, `--expert-cache auto`, fp8 KV,
+MTP speculative decoding (`--spec mtp`).
+
+| Metric | Value |
+|---|---|
+| Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | **3.518** |
+| Prefill (1,457-token prompt) | **922 tok/s** |
+| Decode (greedy, MTP K=3) | **81 tok/s** |
+| Peak host RSS (`--ngram-residency stream`) | **~65 GiB** |
+| Artifact size | **119 GB**, 4 sharded files |
+
 ## Requirements
 
 - one RTX 5090 (sm_120a) and CUDA 13.3;
-- about 80 GB of host RAM for the ~69 GB of pinned experts with `--ngram-residency stream`
-  (the n-gram table is read from NVMe); about 128 GB to keep the 52 GB table in the page cache
-  (`mapped`, chosen automatically when memory allows);
+- about 70 GB of host RAM (measured ~65 GiB peak RSS) for the pinned experts with
+  `--ngram-residency stream`, which reads the n-gram table from NVMe; keeping the ~52 GB table in
+  the page cache (`mapped`, chosen automatically when memory allows) needs more RAM and is faster
+  once warm;
 - KV storage `bf16` or `fp8`; speculative decoding `--spec mtp`.
 
 ## Serve
@@ -55,11 +69,13 @@ artifact size, checksums, accuracy and throughput once they have been measured.
 ./build/apps/ninfer-serve qwen3_8_flash_next_nvfp4.ninfer \
   --model-id qwen3.8-flash-next --max-concurrency 2 \
   --max-context 229376 --kv-capacity 458752 --kv-dtype fp8 \
-  --expert-cache auto --spec mtp
+  --expert-cache auto --ngram-residency stream --spec mtp
 ```
 
 `--expert-cache auto` plans the KV pool first, then gives the remaining device memory to the
 routed-expert cache. The reasoning (`<think>`) and `qwen3_coder` tool-call parsers are built in.
+`--ngram-residency stream` keeps the n-gram table out of RAM (about 65 GiB total); omit it to
+map the table through the page cache when host memory allows.
 
 ## Convert
 
