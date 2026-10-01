@@ -14,6 +14,48 @@ TEXT_RESOURCES = (
 )
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
+# The tokenizer transformation the runtime implements. A checkpoint's tokenizer.json may describe
+# an equivalent pipeline with a different description (for example a newer Transformers split regex
+# without the combining-mark class); the runtime validates the description exactly, so the resource
+# is normalized to this form at conversion time.
+QWEN_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def normalize_tokenizer(tokenizer: dict) -> bool:
+    """Rewrite the tokenizer pipeline to the form the runtime implements. Returns True when the
+    value changed. Vocabulary and special tokens are untouched."""
+    pre = tokenizer.get("pre_tokenizer")
+    if not isinstance(pre, dict) or pre.get("type") != "Sequence":
+        return False
+    parts = pre.get("pretokenizers")
+    if not isinstance(parts, list) or len(parts) != 2:
+        return False
+    split, bytes_level = parts
+    if not isinstance(split, dict) or split.get("type") != "Split":
+        return False
+    if not isinstance(bytes_level, dict) or bytes_level.get("type") != "ByteLevel":
+        return False
+    changed = False
+    if split.setdefault("pattern", {}).get("Regex") != QWEN_SPLIT_PATTERN:
+        split["pattern"] = {"Regex": QWEN_SPLIT_PATTERN}
+        changed = True
+    if split.get("behavior") != "Isolated":
+        split["behavior"] = "Isolated"
+        changed = True
+    if split.get("invert", False) is not False:
+        split["invert"] = False
+        changed = True
+    if bytes_level.get("add_prefix_space", True) is not False:
+        bytes_level["add_prefix_space"] = False
+        changed = True
+    if bytes_level.get("use_regex", True) is not False:
+        bytes_level["use_regex"] = False
+        changed = True
+    return changed
+
 
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
@@ -110,6 +152,10 @@ def load_resources(
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data
+    if normalize_tokenizer(parsed["tokenizer.json"]):
+        payloads["resource/text/tokenizer.json"] = json.dumps(
+            parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
     count, special = token_domain(
         parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size
     )
