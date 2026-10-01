@@ -21,8 +21,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -401,6 +406,49 @@ inline void print_result(const char* tag, const Result& r) {
         "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
         "roofline)\n",
         tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
+}
+
+// Host-side CLI and report helpers shared by the L1 op benchmarks.
+
+// Bind once per argument loop; each call advances `index` to the next argv entry and returns it,
+// throwing when an option is missing its value. `const auto next = required_argument(index, argc,
+// argv);` keeps the call sites `next("--flag")` unchanged.
+inline auto required_argument(int& index, int argc, char** argv) {
+    return [&index, argc, argv](const char* label) -> std::string_view {
+        if (++index >= argc) {
+            throw std::invalid_argument(std::string("missing ") + label);
+        }
+        return argv[index];
+    };
+}
+
+// Parse a comma-separated list of positive int32 values, e.g. a T sweep "1,4,8,16". `flag` names the
+// option in the error.
+inline std::vector<std::int32_t> parse_i32_list(std::string_view raw, const char* flag) {
+    std::vector<std::int32_t> result;
+    std::size_t begin = 0;
+    while (begin < raw.size()) {
+        const std::size_t end = raw.find(',', begin);
+        const std::string token(
+            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
+        const long value = std::stol(token);
+        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument(std::string(flag) + " values must be positive int32");
+        }
+        result.push_back(static_cast<std::int32_t>(value));
+        if (end == std::string_view::npos) { break; }
+        begin = end + 1;
+    }
+    if (result.empty()) { throw std::invalid_argument(std::string(flag) + " must not be empty"); }
+    return result;
+}
+
+// Open a CSV path for writing, creating parent directories, and fail rather than writing nothing.
+inline std::ofstream open_csv(const std::filesystem::path& path) {
+    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
+    std::ofstream out(path);
+    if (!out) { throw std::runtime_error("failed to open CSV: " + path.string()); }
+    return out;
 }
 
 } // namespace ninfer::bench

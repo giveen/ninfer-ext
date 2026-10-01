@@ -263,10 +263,7 @@ Options parse_options(int argc, char** argv) {
     bool have_sweep  = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        const auto next = [&](const char* label) -> std::string_view {
-            if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
-            return argv[index];
-        };
+        const auto next = bench::required_argument(index, argc, argv);
         if (argument == "--format") {
             options.format = parse_format(next("format"));
         } else if (argument == "--form") {
@@ -879,12 +876,7 @@ void print_result(const Result& result) {
 void write_csv(const std::string& path, const std::vector<Result>& results, const Options& options,
                const DeviceContext& context) {
     if (path.empty()) { return; }
-    const std::filesystem::path output(path);
-    if (!output.parent_path().empty()) {
-        std::filesystem::create_directories(output.parent_path());
-    }
-    std::ofstream stream(output);
-    if (!stream) { throw std::runtime_error("failed to open CSV output"); }
+    std::ofstream stream = bench::open_csv(path);
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
     stream << "profile,form,tokens,batch,execution,timed_scope,cache,median_us,min_us,p95_us,"

@@ -126,10 +126,7 @@ Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        const auto next = [&](const char* label) -> std::string_view {
-            if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
-            return argv[index];
-        };
+        const auto next = bench::required_argument(index, argc, argv);
         if (argument == "--t-sweep") {
             options.tokens = parse_list(next("--t-sweep value"));
         } else if (argument == "--sweep") {
@@ -262,9 +259,7 @@ void print_result(const Result& result) {
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
     if (options.csv_out.empty()) { return; }
-    const std::filesystem::path path(options.csv_out);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream out(path);
+    std::ofstream out = bench::open_csv(options.csv_out);
     out << "route,T,median_us,min_us,p95_us,logical_bytes,useful_flops,effective_gbs,"
            "sustained_read_pct,useful_tflops,bf16_tc_pct,memory_floor_us,compute_floor_us,"
            "roofline_pct,warmup,repeat,flush_bytes\n";
