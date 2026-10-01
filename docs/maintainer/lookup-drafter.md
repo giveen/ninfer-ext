@@ -398,5 +398,13 @@ tokenized fixture. A live 35B-A3B edit request (1789 prompt + 300 generated toke
 188 firings / 1.84 accepted per firing / 171 E>8 tokens against the pool's 25 / 4.80 / 84 — the same
 ordering, on the engine's own tokenization.
 
-The pool might still earn a place as the *chain* extension (§3.7's MTP+ngram interleave), which is a
-different question this simulation does not answer.
+**Chaining was implemented and rejected (2026-09-30).** The plan's other half — a round whose
+drafts are `[MTP][suffix continuation]` — was built behind `--chain-drafts` and measured on
+35B-A3B, 400 tokens, greedy: chain K=7 gave +2-4.5% over MTP K=7, but the wide lookup window
+dominated everywhere (edit 1560 lookup vs 1440 chain-15 vs 944 MTP; mixed 1540 / 1440 / 960; prose
+394 / 290 / 346). The wide chain needed the MTP alignment forward and `mtp_prepare_next_round`
+raised from 8 to 16 columns, and the MTP part capped at seven. It was reverted because on copied
+text the pool alone beats MTP-then-pool and on novel text a wide rung is wasted; a chained round
+would need interleaved copy/novel text inside a window *and* a rung that falls back to narrow when
+the chain is short. Output was greedy-identical to MTP on the copy and mixed loads. Do not rebuild
+it without a workload that shows the pool-only wide mode losing.
