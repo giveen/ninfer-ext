@@ -408,3 +408,12 @@ text the pool alone beats MTP-then-pool and on novel text a wide rung is wasted;
 would need interleaved copy/novel text inside a window *and* a rung that falls back to narrow when
 the chain is short. Output was greedy-identical to MTP on the copy and mixed loads. Do not rebuild
 it without a workload that shows the pool-only wide mode losing.
+
+**The 15-draft window is a structural ceiling (2026-09-30).** Raising it was tried: the target
+verify and the GDN conv-record op both bound `T` at 16 (`target_verify_batch_impl`,
+`require_record_capacity_domain`), so a wider verify is a multi-op change, not a config bump. The
+depth is also already near saturation where it matters: on 35B-A3B copy-heavy output the pool
+accepts ~15.9 tokens per round (at the cap), and replaying the edit fixture at an unbounded window
+moves accepted per firing only 6.5 (K=15) -> 8.6 (K=31) -> 10.2 (K=63). Extending the operate
+domains is a real project with a modest, uncertain payoff; the shipped 15 is a reasonable operating
+point.
