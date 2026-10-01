@@ -58,15 +58,26 @@ def normalize_tokenizer(tokenizer: dict) -> bool:
 
 
 def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
-    """Ensure tokenizer_config.json carries the added_tokens_decoder the runtime requires. Newer
-    Transformers writes added tokens only in tokenizer.json; the runtime cross-checks the two, so the
-    decoder map is synthesized from the tokenizer's own entries. Returns True when it changed."""
+    """Rewrite tokenizer_config.json to the contract the runtime enforces: the added-token decoder
+    map it cross-checks, the Qwen prefix semantics, and the official pad token. Newer Transformers
+    writes added tokens only in tokenizer.json and omits add_bos_token; the runtime requires both.
+    Returns True when the value changed."""
+    changed = False
+    if config.get("add_bos_token", True) is not False:
+        config["add_bos_token"] = False
+        changed = True
+    if config.get("add_prefix_space", True) is not False:
+        config["add_prefix_space"] = False
+        changed = True
+    if config.get("pad_token") != "<|endoftext|>":
+        config["pad_token"] = "<|endoftext|>"
+        changed = True
     existing = config.get("added_tokens_decoder")
     if isinstance(existing, dict) and existing:
-        return False
+        return changed
     added = tokenizer.get("added_tokens")
     if not isinstance(added, list) or not added:
-        return False
+        return changed
     decoder: dict[str, dict] = {}
     for item in added:
         if not isinstance(item, dict) or "id" not in item or "content" not in item:
@@ -80,7 +91,7 @@ def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
             "special": item.get("special", False),
         }
     if not decoder:
-        return False
+        return changed
     config["added_tokens_decoder"] = decoder
     return True
 
@@ -163,6 +174,12 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
             or item["normalized"]
         ):
             fail("tokenizer_config.json added_tokens_decoder only supports false token flags")
+    if config.get("add_bos_token", True) is not False:
+        fail("tokenizer_config.json add_bos_token must be false")
+    if config.get("add_prefix_space", True) is not False:
+        fail("tokenizer_config.json add_prefix_space must be false")
+    if config.get("pad_token") != "<|endoftext|>":
+        fail("tokenizer_config.json pad_token must be <|endoftext|>")
     eos = generation.get("eos_token_id")
     if type(eos) is not int and not (isinstance(eos, list) and eos and all(type(v) is int for v in eos)):
         fail("generation_config.json eos_token_id must be an integer or a non-empty array")

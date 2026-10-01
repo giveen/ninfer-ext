@@ -52,14 +52,19 @@ def _valid_resources() -> tuple[dict, dict, dict]:
         "added_tokens": [_added_token(2, "<|endoftext|>", special=True)],
     }
     tokenizer.update(_pipeline(QWEN_SPLIT_PATTERN, add_prefix_space=False, use_regex=False))
-    config = {"added_tokens_decoder": {"2": {
-        "content": "<|endoftext|>",
-        "single_word": False,
-        "lstrip": False,
-        "rstrip": False,
-        "normalized": False,
-        "special": True,
-    }}}
+    config = {
+        "add_bos_token": False,
+        "add_prefix_space": False,
+        "pad_token": "<|endoftext|>",
+        "added_tokens_decoder": {"2": {
+            "content": "<|endoftext|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }},
+    }
     generation = {"eos_token_id": 2}
     return tokenizer, config, generation
 
@@ -87,9 +92,9 @@ def test_normalize_ignores_a_pipeline_it_does_not_understand() -> None:
     assert normalize_tokenizer({"pre_tokenizer": {"type": "Metaspace"}}) is False
 
 
-def test_normalize_config_synthesizes_the_decoder_map() -> None:
-    # Newer Transformers writes added tokens only in tokenizer.json; the runtime requires the
-    # decoder map in tokenizer_config.json and cross-checks it.
+def test_normalize_config_synthesizes_the_decoder_map_and_prefix_semantics() -> None:
+    # Newer Transformers writes added tokens only in tokenizer.json and omits add_bos_token; the
+    # runtime requires the decoder map, the prefix flags, and the official pad token.
     tokenizer = {"added_tokens": [_added_token(2, "<|endoftext|>", special=True)]}
     config: dict = {}
     assert normalize_tokenizer_config(tokenizer, config) is True
@@ -97,7 +102,10 @@ def test_normalize_config_synthesizes_the_decoder_map() -> None:
     assert entry["content"] == "<|endoftext|>"
     assert entry["special"] is True
     assert entry["single_word"] is False
-    # A config that already has a map is untouched.
+    assert config["add_bos_token"] is False
+    assert config["add_prefix_space"] is False
+    assert config["pad_token"] == "<|endoftext|>"
+    # A config that already matches is untouched.
     assert normalize_tokenizer_config(tokenizer, dict(config)) is False
 
 
@@ -113,6 +121,9 @@ def test_validate_accepts_a_supported_resource_set() -> None:
         pytest.param(lambda t, c, g: t.update(_pipeline(r"\p{L}+")), id="split-pattern"),
         pytest.param(lambda t, c, g: t.update({"normalizer": {"type": "NFD"}}), id="normalizer"),
         pytest.param(lambda t, c, g: c.pop("added_tokens_decoder"), id="missing-decoder"),
+        pytest.param(lambda t, c, g: c.update({"add_bos_token": True}), id="add-bos-token"),
+        pytest.param(lambda t, c, g: c.pop("add_bos_token"), id="missing-add-bos-token"),
+        pytest.param(lambda t, c, g: c.update({"pad_token": "<|pad|>"}), id="wrong-pad-token"),
         pytest.param(
             lambda t, c, g: c["added_tokens_decoder"]["2"].update({"lstrip": True}),
             id="unsupported-flag",
