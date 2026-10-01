@@ -88,6 +88,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--tolerant-tool-calls] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -128,6 +129,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --tolerant-tool-calls recovers a malformed terminal tool-call region's complete\n"
+           "       calls instead of returning the whole response as content\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -346,6 +349,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

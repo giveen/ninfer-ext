@@ -407,11 +407,13 @@ class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
                          const Contract& contract)
-        : text_(text), max_name_length_(max_name_length), contract_(contract) {}
+        : text_(text), max_name_length_(max_name_length), contract_(contract),
+          tolerant_(contract.tolerant) {}
 
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
     }
+    [[nodiscard]] bool tolerant_recovered() const noexcept { return tolerant_recovered_; }
 
     FallbackReason parse(std::vector<RawToolCall>& calls) {
         std::size_t pos = 0;
@@ -426,9 +428,18 @@ public:
             }
 
             RawToolCall call;
-            const FallbackReason failure = parse_tool_call(pos, call);
-            if (failure != FallbackReason::None) { return failure; }
-            calls.push_back(std::move(call));
+            const FallbackReason failure = parse_tool_call(pos, call, calls);
+            if (failure != FallbackReason::None) {
+                // Tolerant mode keeps the complete calls parsed before the malformed tail. A
+                // missing outer close leaves its still-complete function in `calls`; trailing
+                // content after a complete region is not recovered, so a quoted example is not
+                // mistaken for a real turn.
+                if (tolerant_ && failure == FallbackReason::MalformedStructure && !calls.empty()) {
+                    tolerant_recovered_ = true;
+                    return FallbackReason::None;
+                }
+                return failure;
+            }
         }
     }
 
@@ -439,12 +450,16 @@ private:
         return true;
     }
 
-    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
+    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call,
+                                   std::vector<RawToolCall>& calls) {
         if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
+        // The function is complete. Keep it even when the outer close is missing, so tolerant mode
+        // can still return it; strict mode discards the whole candidate region on failure.
+        calls.push_back(std::move(call));
         return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
     }
 
@@ -544,6 +559,8 @@ private:
     std::string_view text_;
     std::size_t max_name_length_;
     const Contract& contract_;
+    bool tolerant_                               = false;
+    bool tolerant_recovered_                     = false;
     std::uint32_t duplicate_parameters_repaired_ = 0;
 };
 
@@ -590,10 +607,12 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
+                                bool tolerant) {
     if (!enabled) { return {}; }
     auto contract                    = std::make_shared<ToolCallOutputContract>();
     contract->enforce_declared_names = true;
+    contract->tolerant               = tolerant;
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
@@ -618,6 +637,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     std::vector<RawToolCall> raw_calls;
     std::size_t accepted         = std::string::npos;
     decltype(out.diagnostics.duplicate_parameters_repaired) repaired{};
+    bool tolerant_recovered      = false;
     FallbackReason first_failure = FallbackReason::MalformedStructure;
     bool first_failure_recorded  = false;
     while (candidate != std::string::npos) {
@@ -625,9 +645,10 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract);
         const FallbackReason failure = parser.parse(calls);
         if (failure == FallbackReason::None) {
-            accepted  = candidate;
-            raw_calls = std::move(calls);
-            repaired  = parser.duplicate_parameters_repaired();
+            accepted           = candidate;
+            raw_calls          = std::move(calls);
+            repaired           = parser.duplicate_parameters_repaired();
+            tolerant_recovered = parser.tolerant_recovered();
             break;
         }
         if (!first_failure_recorded) {
@@ -648,6 +669,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     }
 
     out.diagnostics.duplicate_parameters_repaired = repaired;
+    out.diagnostics.tolerant_recovered            = tolerant_recovered;
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
     return out;
