@@ -460,7 +460,9 @@ for a single request and prefilled about 350 tok/s. The main steps since then:
 - single-column projection splits as views instead of device copies, removing about 218 graph copy
   nodes per decode token (+2.5% at C=1);
 - pinned weights and Host KV on prefaulted 2 MiB pages, so the GPU's TLB covers the expert stream
-  (+16% prefill, +11% serving at C=1, +32% at C=8).
+  (+16% prefill, +11% serving at C=1, +32% at C=8);
+- cache-route expert fetches on the pager's own stream, with the cache-resident experts' GEMVs
+  running while the misses arrive (decode after a 2,048-token prompt 79.1 → 84.2 tok/s, +6.5%).
 
 The comparison engine used during development, FreeToken with `--moe-backend offload`, measured
 about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same machine (4k context).

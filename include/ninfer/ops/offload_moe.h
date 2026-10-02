@@ -158,11 +158,20 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * BF16 `[2560,T]`. Code planes of `weights_source` are 16-byte aligned (base and stride), scale
  * planes 2-byte aligned. The oracle decodes each NVFP4 weight exactly and evaluates in FP64;
  * routing terms are summed in k order, so results do not depend on cache placement.
+ *
+ * With `pending`, the slots listed in `pending->misses` (an expert_cache_resolve miss list) may
+ * still be filling: the other assignments run first, then `stream` waits on `pending->fetched`
+ * before the listed slots are read. The result is identical to a call made after the fetch.
  */
+struct MoeExpertsPending {
+    const Tensor* misses;
+    cudaEvent_t fetched;
+};
+
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream);
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr);
 
 [[nodiscard]] std::size_t moe_experts_a4_workspace_bytes(std::int32_t tokens);
 

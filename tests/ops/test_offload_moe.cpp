@@ -1,8 +1,9 @@
 // Qwen4Exp offloaded MoE Ops: routing against an FP64 oracle, expert-cache residency semantics,
 // and routed expert SwiGLU against an FP64 oracle that decodes each NVFP4 weight independently.
-// The staged-bank and cache routes must produce identical bits.
+// The staged-bank, cache and pending-fetch routes must produce identical bits.
 #include "ninfer/ops/offload_moe.h"
 
+#include "core/device.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -631,6 +632,57 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
                          ty_cached, nullptr);
         cuda_synchronize();
     }
+    // Pending fetch: resolve on one stream, fetch the misses on another, and let moe_experts run
+    // the resident experts before it waits for the fetch. The pool starts as 0xFF (NaN block
+    // scales) and half the routed experts are resident beforehand, so a missed slot read before
+    // its fetch lands changes the output bits.
+    DeviceCache pending_cache(slots, 1);
+    CUDA_CHECK(cudaMemset(pending_cache.pool.p, 0xFF,
+                          static_cast<std::size_t>(slots) * ops::kExpertSlotBytes));
+    std::vector<int> warm(ids.begin(), ids.begin() + K / 2);
+    warm.resize(K, -1);
+    for (std::size_t i = K / 2; i < warm.size(); ++i) {
+        // Fill the column with experts the call does not route, so only half of it is resident.
+        int e = static_cast<int>(i);
+        while (std::find(ids.begin(), ids.end(), e) != ids.end() ||
+               std::find(warm.begin(), warm.end(), e) != warm.end()) {
+            e = (e + 1) % E;
+        }
+        warm[i] = e;
+    }
+    (void)resolve(pending_cache, bank, 0, warm);
+    DeviceBuffer pending_slots  = to_device_i32(std::vector<int>(ids.size(), -7));
+    DeviceBuffer pending_misses = to_device_i32(std::vector<int>(2 * ids.size() + 1, -9));
+    Tensor tpending_slots(pending_slots.p, DType::I32, {K, tokens});
+    Tensor tpending_misses(pending_misses.p, DType::I32,
+                           {static_cast<std::int32_t>(2 * ids.size() + 1)});
+    GuardedDeviceBuffer pending(static_cast<std::size_t>(H) * tokens * 2);
+    Tensor ty_pending(pending.data(), DType::BF16, {H, tokens});
+    {
+        cudaStream_t main = nullptr, fetch = nullptr;
+        cudaEvent_t resolved = nullptr, fetched = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&main, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&fetch, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&resolved, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&fetched, cudaEventDisableTiming));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots));
+        ops::expert_cache_resolve(tids, 0, pending_cache.state, tpending_slots, tpending_misses,
+                                  main);
+        CUDA_CHECK(cudaEventRecord(resolved, main));
+        CUDA_CHECK(cudaStreamWaitEvent(fetch, resolved));
+        ops::expert_cache_fetch(bank.weights, tpending_misses, static_cast<std::int32_t>(ids.size()),
+                                pending_cache.state, fetch);
+        CUDA_CHECK(cudaEventRecord(fetched, fetch));
+        const ops::MoeExpertsPending wait{&tpending_misses, fetched};
+        ops::moe_experts(tx, tids, tpending_slots, tw, tsg, tshared,
+                         ops::expert_cache_weights(pending_cache.state, bank.weights), slots,
+                         workspace, ty_pending, main, &wait);
+        cuda_synchronize();
+        CUDA_CHECK(cudaEventDestroy(fetched));
+        CUDA_CHECK(cudaEventDestroy(resolved));
+        CUDA_CHECK(cudaStreamDestroy(fetch));
+        CUDA_CHECK(cudaStreamDestroy(main));
+    }
     const std::string label =
         "moe_experts T=" + std::to_string(tokens) + (pool > 0 ? " concentrated" : "");
     const std::size_t n = static_cast<std::size_t>(H) * tokens;
@@ -639,7 +691,17 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     failures += verify_exact((label + " cache route bits").c_str(),
                              from_device<std::uint16_t>(cached.data(), n),
                              from_device<std::uint16_t>(staged.data(), n));
-    failures += staged.verify_guards(label) + cached.verify_guards(label);
+    failures += verify_exact((label + " pending fetch bits").c_str(),
+                             from_device<std::uint16_t>(pending.data(), n),
+                             from_device<std::uint16_t>(staged.data(), n));
+    const std::vector<int> listed = from_device<int>(pending_misses, 1);
+    if (listed[0] <= 0 || listed[0] >= static_cast<int>(ids.size())) {
+        std::cerr << label << ": pending case needs both resident and missed experts, got "
+                  << listed[0] << " misses of " << ids.size() << '\n';
+        ++failures;
+    }
+    failures += staged.verify_guards(label) + cached.verify_guards(label) +
+                pending.verify_guards(label);
     return failures;
 }
 
