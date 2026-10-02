@@ -534,12 +534,33 @@ the expert cache, so C=8 decoded 19% slower and unevenly (its slowest request ra
 against a mean of 31.9). Prefill slows as the prompt grows: about 1,000 tok/s averaged over the
 241k-token prompt, against about 2,200 at 2,048 tokens.
 
+The QSA block selection was the long-context bottleneck: it re-pooled, re-normalized and re-RoPE'd
+each block's index keys once per query column, so a 256-column pass repeated that work 256 times.
+Pooling them once per call (commit `697ff0c7`, bit-identical) moved the 64k-prompt prefill from
+2,363 to 3,498 tok/s and the 256k prompt from 875 to 2,218. Single request, FP8 KV, 262,144-token
+context budget, the NIAH fixtures:
+
+| Prompt tokens | Before | After | Speedup |
+|---:|---:|---:|---:|
+| 7,680 | 3,571 | 3,666 | 1.03x |
+| 64,512 | 2,363 | 3,498 | 1.48x |
+| 130,048 | 1,553 | 2,908 | 1.87x |
+| 260,096 | 875 | 2,218 | 2.53x |
+
+```bash
+# Starts ninfer-serve (262,144-token budget, FP8 KV, expert cache auto) and sends the NIAH prompts
+# at C=1, three times each, reading prefill seconds from the request log.
+STRATA_AB_DIR=/tmp/strata-ab python3 tools/bench/qwen4_prefill_width/bench.py auto:prefill
+```
+
 **How it got here.** When Flash-Next support first landed (`e68225b7`), it decoded about 19.5 tok/s
 for a single request and prefilled about 350 tok/s. The main steps since then:
 
 - a tensor-core W4A4 route for staged prefill experts, and double-buffered layer staging that skips
   cached experts;
 - Tensor Core QSA attention for BF16 and FP8 KV;
+- pooling each QSA block's index keys once per select call instead of once per query column
+  (`697ff0c7`, bit-identical), which lifts long-context prefill: 64k 1.48x, 128k 1.87x, 256k 2.53x;
 - the SM-streamed router with a decode expert GEMV;
 - a fixed 64-CTA expert fetch, which holds about 36 GB/s over PCIe where the per-miss grid fell to
   20–28 GB/s (+13% serving at C=1, +37% at C=8);
