@@ -525,14 +525,31 @@ struct JobView {
     int expert;
 };
 
-// First assignment and slot of this CTA's job; count 0 when the CTA has no job.
+// Selects which jobs a projection pass runs: all of them, or only the slots that are (not) listed
+// in a resolve miss list.
+struct JobFilter {
+    const std::int32_t* misses; // [count, (slot, expert)...]; null runs every job
+    bool missed;                // run the listed slots (true) or the others (false)
+
+    __device__ __forceinline__ bool admits(int slot) const {
+        if (misses == nullptr) { return true; }
+        const int count = misses[0];
+        bool listed     = false;
+        for (int j = 0; j < count && !listed; ++j) { listed = misses[1 + 2 * j] == slot; }
+        return listed == missed;
+    }
+};
+
+// First assignment and slot of this CTA's job; count 0 when the CTA has no job or `filter` skips
+// it.
 __device__ __forceinline__ JobView job_head(const std::int32_t* jobs, const std::int32_t* job_count,
-                                            const std::int32_t* sorted_slot) {
+                                            const std::int32_t* sorted_slot, JobFilter filter) {
     JobView view{-1, 0, -1, -1};
     const int job = static_cast<int>(blockIdx.x);
     if (job >= *job_count) { return view; }
     view.begin = jobs[job];
     view.slot  = sorted_slot[view.begin];
+    if (!filter.admits(view.slot)) { return view; }
     view.count = 1;
     return view;
 }
@@ -553,8 +570,9 @@ __device__ __forceinline__ void job_tail(JobView& view, const std::int32_t* sort
 __device__ __forceinline__ JobView load_job(const std::int32_t* jobs, const std::int32_t* job_count,
                                             const std::int32_t* sorted_slot,
                                             const std::int32_t* sorted_assign,
-                                            const std::int32_t* expert_ids, int assignments) {
-    JobView view = job_head(jobs, job_count, sorted_slot);
+                                            const std::int32_t* expert_ids, int assignments,
+                                            JobFilter filter) {
+    JobView view = job_head(jobs, job_count, sorted_slot, filter);
     if (view.count == 0) { return view; }
     job_tail(view, sorted_slot, sorted_assign, expert_ids, assignments);
     return view;
@@ -564,11 +582,12 @@ __global__ void __launch_bounds__(256) moe_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ expert_ids,
     const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
     const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, __nv_bfloat16* __restrict__ act) {
+    std::int32_t assignments, JobFilter filter, ExpertWeights weights,
+    __nv_bfloat16* __restrict__ act) {
     __shared__ float xs[kJobTokens][kTile + 1];
     __shared__ float ws[kTile][kTile + 1];
     const JobView job =
-        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments);
+        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments, filter);
     if (job.count == 0) { return; }
     const int tid  = static_cast<int>(threadIdx.x);
     const int ty   = tid / 16;                          // rows ty*4 .. ty*4+3 of the 64-row tile
@@ -628,11 +647,12 @@ __global__ void __launch_bounds__(256) moe_down_kernel(
     const __nv_bfloat16* __restrict__ act, const std::int32_t* __restrict__ expert_ids,
     const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
     const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, float* __restrict__ partial) {
+    std::int32_t assignments, JobFilter filter, ExpertWeights weights,
+    float* __restrict__ partial) {
     __shared__ float xs[kJobTokens][kTile + 1];
     __shared__ float ws[kTile][kTile + 1];
     const JobView job =
-        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments);
+        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments, filter);
     if (job.count == 0) { return; }
     const int tid  = static_cast<int>(threadIdx.x);
     const int ty   = tid / 16;
@@ -789,10 +809,11 @@ __global__ void __launch_bounds__(kGemvThreads) moe_gate_up_gemv_kernel(
     const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ expert_ids,
     const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
     const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, __nv_bfloat16* __restrict__ act) {
+    std::int32_t assignments, JobFilter filter, ExpertWeights weights,
+    __nv_bfloat16* __restrict__ act) {
     __shared__ __align__(16) __nv_bfloat16 xs[kGemvTokens * H];
     const JobView job =
-        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments);
+        load_job(jobs, job_count, sorted_slot, sorted_assign, expert_ids, assignments, filter);
     if (job.count == 0) { return; }
     const int tid   = static_cast<int>(threadIdx.x);
     const int warp  = tid >> 5;
@@ -851,9 +872,10 @@ __global__ void __launch_bounds__(kGemvThreads) moe_down_gemv_kernel(
     const __nv_bfloat16* __restrict__ act, const std::int32_t* __restrict__ expert_ids,
     const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
     const std::int32_t* __restrict__ jobs, const std::int32_t* __restrict__ job_count,
-    std::int32_t assignments, ExpertWeights weights, float* __restrict__ partial) {
+    std::int32_t assignments, JobFilter filter, ExpertWeights weights,
+    float* __restrict__ partial) {
     __shared__ __align__(16) __nv_bfloat16 xs[kGemvTokens * I];
-    JobView job = job_head(jobs, job_count, sorted_slot);
+    JobView job = job_head(jobs, job_count, sorted_slot, filter);
     if (job.count == 0) { return; }
     const int tid = static_cast<int>(threadIdx.x);
     const int sub = tid % kDownLanes;
@@ -960,31 +982,49 @@ void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+// Gate/up then down for the jobs `filter` admits.
+void moe_project(const MoeChunk& chunk, JobFilter filter, cudaStream_t stream) {
+    const int assignments = chunk.columns * K;
+    if (assignments <= kGemvAssignments) {
+        moe_gate_up_gemv_kernel<<<dim3(assignments, I / (kGemvWarps * kGateUpPairsPerWarp)),
+                                  kGemvThreads, 0, stream>>>(
+            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+            chunk.job_count, assignments, filter, chunk.source, chunk.act);
+        CUDA_CHECK(cudaGetLastError());
+        moe_down_gemv_kernel<<<dim3(assignments, H / kDownRowsPerCta), kGemvThreads, 0, stream>>>(
+            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+            chunk.job_count, assignments, filter, chunk.source, chunk.partial);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        moe_gate_up_kernel<<<dim3(assignments, I / 32), 256, 0, stream>>>(
+            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+            chunk.job_count, assignments, filter, chunk.source, chunk.act);
+        CUDA_CHECK(cudaGetLastError());
+        moe_down_kernel<<<dim3(assignments, H / kTile), 256, 0, stream>>>(
+            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
+            chunk.job_count, assignments, filter, chunk.source, chunk.partial);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+} // namespace
+
 void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream) {
     const int assignments = chunk.columns * K;
     moe_jobs_kernel<<<1, kJobThreads, 0, stream>>>(chunk.slot_ids, assignments, chunk.slots,
                                                    chunk.counts, chunk.sorted_assign,
                                                    chunk.sorted_slot, chunk.jobs, chunk.job_count);
     CUDA_CHECK(cudaGetLastError());
-    if (assignments <= kGemvAssignments) {
-        moe_gate_up_gemv_kernel<<<dim3(assignments, I / (kGemvWarps * kGateUpPairsPerWarp)),
-                                  kGemvThreads, 0, stream>>>(
-            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.act);
-        CUDA_CHECK(cudaGetLastError());
-        moe_down_gemv_kernel<<<dim3(assignments, H / kDownRowsPerCta), kGemvThreads, 0, stream>>>(
-            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.partial);
-        CUDA_CHECK(cudaGetLastError());
+    if (chunk.misses == nullptr) {
+        moe_project(chunk, JobFilter{nullptr, false}, stream);
     } else {
-        moe_gate_up_kernel<<<dim3(assignments, I / 32), 256, 0, stream>>>(
-            chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.act);
-        CUDA_CHECK(cudaGetLastError());
-        moe_down_kernel<<<dim3(assignments, H / kTile), 256, 0, stream>>>(
-            chunk.act, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
-            chunk.job_count, assignments, chunk.source, chunk.partial);
-        CUDA_CHECK(cudaGetLastError());
+        // Cache-resident experts run while the fetch fills the missed slots; each assignment
+        // writes its own partial row, so the split leaves every result unchanged.
+        moe_project(chunk, JobFilter{chunk.misses, false}, stream);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, chunk.fetched));
+        moe_project(chunk, JobFilter{chunk.misses, true}, stream);
     }
     const std::int64_t total = static_cast<std::int64_t>(chunk.columns) * H;
     const int grid = static_cast<int>(std::min<std::int64_t>((total + 255) / 256, 1 << 16));

@@ -26,6 +26,8 @@ Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache,
         CUDA_CHECK(cudaEventCreateWithFlags(&released_[b], cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&reclaimed_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&resolved_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&fetched_, cudaEventDisableTiming));
 }
 
 Qwen4ExpertPager::~Qwen4ExpertPager() {
@@ -35,7 +37,9 @@ Qwen4ExpertPager::~Qwen4ExpertPager() {
         if (ready_[b] != nullptr) { (void)cudaEventDestroy(ready_[b]); }
         if (released_[b] != nullptr) { (void)cudaEventDestroy(released_[b]); }
     }
-    if (reclaimed_ != nullptr) { (void)cudaEventDestroy(reclaimed_); }
+    for (cudaEvent_t event : {reclaimed_, resolved_, fetched_}) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
     if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
     if (resident_ != nullptr) { (void)cudaFreeHost(resident_); }
 }
@@ -159,15 +163,20 @@ std::int32_t Qwen4ExpertPager::max_resolve_columns() const noexcept {
     return std::min(cache_.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache_.slots));
 }
 
-void Qwen4ExpertPager::resolve(const Tensor& ids, std::int32_t layer,
-                               const ops::ExpertWeights& bank, Tensor& slot_ids, Tensor& misses,
-                               cudaStream_t stream) {
+cudaEvent_t Qwen4ExpertPager::resolve(const Tensor& ids, std::int32_t layer,
+                                      const ops::ExpertWeights& bank, Tensor& slot_ids,
+                                      Tensor& misses, cudaStream_t stream) {
     const auto columns = static_cast<std::int32_t>(ids.ne[1]);
     if (columns > max_resolve_columns()) {
         throw std::logic_error("Qwen4Exp resolve exceeds the expert cache's column capacity");
     }
     ops::expert_cache_resolve(ids, layer, cache_, slot_ids, misses, stream);
-    ops::expert_cache_fetch(bank, misses, columns * ops::kOffloadMoeTopK, cache_, stream);
+    // The fetch writes only the slots it lists, which resident-slot work on `stream` never reads.
+    CUDA_CHECK(cudaEventRecord(resolved_, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, resolved_));
+    ops::expert_cache_fetch(bank, misses, columns * ops::kOffloadMoeTopK, cache_, stream_);
+    CUDA_CHECK(cudaEventRecord(fetched_, stream_));
+    return fetched_;
 }
 
 } // namespace ninfer::models::qwen3_5::execution

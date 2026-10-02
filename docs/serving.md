@@ -1090,7 +1090,7 @@ batched direct I/O (`--ngram-residency`, see the [CLI guide](cli.md)); `server_s
 records the resolved `ngram_residency`. Two concurrent 229,376-token requests with FP8 KV:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_flash_next_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer \
   --model-id qwen3.8-flash-next --max-concurrency 2 \
   --max-context 229376 --kv-capacity 458752 --kv-dtype fp8 \
   --expert-cache auto --spec mtp

@@ -72,7 +72,9 @@ it does not select kernels.
 layer's routed experts are stored expert-major so that one expert is a few contiguous spans, and
 the 128 n-gram table shards become one row-scaled FP8 matrix. The Engine keeps both off the device:
 experts are read into pinned Host memory and the table is file-mapped (see
-[Qwen4Exp model reference](maintainer/qwen4-exp-model.md)).
+[Qwen4Exp model reference](maintainer/qwen4-exp-model.md)). The converted artifact is also
+published in
+[jabbatheduck/ninfer-ext-models/qwen3.8-flash-next](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next).
 
 ```bash
 python3 -m tools.convert \
@@ -81,7 +83,7 @@ python3 -m tools.convert \
   --components text,vision,mtp \
   --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --name qwen3.8-flash-next \
-  --out models/qwen3_8_flash_next_nvfp4.ninfer
+  --out models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer
 ```
 
 `qwen3_8_27b_q6` differs from `qwen3_8_27b` in one place: the MLP gate and up projections carry Q6

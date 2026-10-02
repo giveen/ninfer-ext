@@ -75,11 +75,15 @@ public:
 
     /**
      * Cache route. Resolves the routed experts `ids` I32 `[10,T]` of `layer` to cache slots in
-     * `slot_ids` and copies every miss from `bank` into its slot, both on `stream`. `misses` is
-     * scratch of at least `2*(10*T)+1` words. T must not exceed `max_resolve_columns`.
+     * `slot_ids` on `stream`, then copies every miss listed in `misses` from `bank` into its slot
+     * on the pager's stream. The returned event completes that copy: work on `stream` may read the
+     * resident slots at once and must wait on the event before reading a listed slot (and before
+     * the next resolve reuses `misses`). `misses` is scratch of at least `2*(10*T)+1` words. T must
+     * not exceed `max_resolve_columns`.
      */
-    void resolve(const Tensor& ids, std::int32_t layer, const ops::ExpertWeights& bank,
-                 Tensor& slot_ids, Tensor& misses, cudaStream_t stream);
+    [[nodiscard]] cudaEvent_t resolve(const Tensor& ids, std::int32_t layer,
+                                      const ops::ExpertWeights& bank, Tensor& slot_ids,
+                                      Tensor& misses, cudaStream_t stream);
 
     // Slot-pool addressing of the cache for experts whose divisors come from `bank`.
     [[nodiscard]] ops::ExpertWeights slot_weights(const ops::ExpertWeights& bank) const {
@@ -104,6 +108,9 @@ private:
     cudaEvent_t ready_[2]    = {};
     cudaEvent_t released_[2] = {};
     cudaEvent_t reclaimed_   = nullptr;
+    // Cache route: the fetch starts after `resolved_` and records `fetched_`.
+    cudaEvent_t resolved_    = nullptr;
+    cudaEvent_t fetched_     = nullptr;
     std::int32_t layer_[2]   = {-1, -1};
     // Pinned Host snapshot of the cache's slot_of, taken before a forward's first fill. Fills skip
     // the Host copy of experts it marks resident; while `resident_valid_` is false (a captured

@@ -28,6 +28,8 @@ struct MoeChunk {
     std::int32_t* job_count;
     __nv_bfloat16* act;
     float* partial;
+    const std::int32_t* misses; // resolve miss list still being fetched, or null
+    cudaEvent_t fetched;        // completes the fetch of `misses`
 };
 
 // One A4 job is one 64-column tile of one expert's grouped assignments.

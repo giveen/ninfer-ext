@@ -73,17 +73,17 @@ Upstream's official v3 artifacts work unchanged:
 | Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [neroued/Qwen3.6-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
 | Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [neroued/Qwen3.6-27B-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [neroued/Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+| Qwen3.8-Flash-Next | `nvfp4` | `qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer` (+ 3 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
 hf download jabbatheduck/ninfer-ext-models qwen3_8_27b_exl3_4bpw.ninfer --local-dir models
 ```
 
-The two `exl3` rows are this fork's own quantization, published on Hugging Face; they download and
-run unchanged ([EXL3 quantization](#exl3-quantization)). Two other artifacts have to be converted
-yourself: Qwen3.8-27B with DFlash2 weights
-([instructions](#converting-a-dflash2-artifact)) and Qwen3.8-Flash-Next
-([instructions](#convert-and-serve)). Converted artifacts embed this fork's chat template
+The two `exl3` rows and Qwen3.8-Flash-Next are this fork's own artifacts, published on Hugging
+Face; they download and run unchanged ([EXL3 quantization](#exl3-quantization),
+[Qwen3.8-Flash-Next](#download-and-serve)). Qwen3.8-27B with DFlash2 weights has to be converted
+yourself ([instructions](#converting-a-dflash2-artifact)). Converted artifacts embed this fork's chat template
 ([conversion guide](docs/weight-conversion.md)). An existing v2 download can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
 
@@ -156,10 +156,10 @@ Why these:
   on that traffic and, where nothing repeats, the cost gate falls back to ordinary decode, so it
   matches plain decode rather than regressing.
 - **Flash-Next.** Decode is bound by fetching experts over PCIe, so an MTP verify routes up to four
-  columns and touches more experts than the accepted drafts save: plain decode was 26% faster than
-  MTP for a single request and 6% faster at C=8. The lookup window is the exception — it only runs a
-  wide verify where the text repeats earlier context — so use it for copy-heavy work and plain
-  decode otherwise.
+  columns and touches more experts than the accepted drafts save: on 512-token essays plain decode
+  was 20% faster than MTP for a single request and 2% faster at C=8. The lookup window is the
+  exception — it only runs a wide verify where the text repeats earlier context — so use it for
+  copy-heavy work and plain decode otherwise.
 - **The adaptive default (`--spec mtp` alone)** is a reasonable choice when the workload is unknown
   or mixed; see [Adaptive MTP draft length](#adaptive-mtp-draft-length).
 
@@ -388,9 +388,18 @@ an FP64 oracle checks them in `tests/models/qwen4_exp/`.
   but a warm page cache speeds the table up and competes with the pinned experts for RAM.
 - About 127 GB of disk for the artifact, split into `.part-NNNN` files next to the `.ninfer` file.
 
-### Convert and serve
+### Download and serve
 
-There is no published Flash-Next artifact. Convert it from
+The artifact is published in
+[jabbatheduck/ninfer-ext-models/qwen3.8-flash-next](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next),
+with its `SHA256SUMS` and conversion report. Download the whole folder; the `.part-NNNN` files must
+stay next to the `.ninfer` file:
+
+```bash
+hf download jabbatheduck/ninfer-ext-models --include "qwen3.8-flash-next/*" --local-dir models
+```
+
+To build it yourself instead, convert
 [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4); it takes
 about 7.6 minutes on the development machine:
 
@@ -401,13 +410,13 @@ python3 -m tools.convert \
   --components text,vision,mtp \
   --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
   --name qwen3.8-flash-next \
-  --out models/qwen3_8_flash_next_nvfp4.ninfer
+  --out models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer
 ```
 
 Serve two concurrent 64k-token requests at full speed:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_flash_next_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer \
   --model-id qwen3.8-flash-next --max-concurrency 2 \
   --max-context 65536 --kv-capacity auto --kv-dtype fp8 --expert-cache auto
 ```
@@ -417,32 +426,109 @@ expert-cache room and so of decode speed.
 
 ### Flash-Next speed
 
-One RTX 5090, BF16 KV, CUDA Graphs, fork commit `7fbabfbc`
-([benchmark conditions](#benchmark-conditions)):
+Measured 2026-10-02 on one RTX 5090, CUDA 13.3, BF16 KV, CUDA Graphs
+([benchmark conditions](#benchmark-conditions)). Fork commit `fc305acd`, which overlaps the expert
+fetches with the cache-resident experts' compute, ran interleaved with the commit before it
+(`31fcfd74`), alternating run for run.
 
-| Test | tok/s |
-|---|---:|
-| Prefill, 4,096-token prompt | 3,411 |
-| Prefill, 16,384-token prompt | 3,350 |
-| Prefill, 512-token prompt | 431 |
-| Decode after a 2,048-token prompt | 77.1 |
-| Decode, `tg128` | 125.2 |
-| Decode, `tg128`, adaptive MTP | 130.2 (52% accepted) |
-| Decode, `tg128`, MTP K=3 | 126.9 (45% accepted) |
+Single request, `ninfer_bench -pg 2048,128` (a 2,048-token prompt, then 128 decoded tokens):
 
-`tg128` decodes from a one-token seed, so its speed depends on how many distinct experts the
-generated text routes to; decode after a 2,048-token prompt is the steadier figure. With FP8 KV,
-prefill is unchanged and decode after a 2,048-token prompt rises to 79.7 tok/s.
+| Test | `31fcfd74` | `fc305acd` | Change |
+|---|---:|---:|---:|
+| Prefill, 2,048-token prompt | 2,225 | 2,226 | 0% |
+| Decode, no speculation (3 runs each) | 79.1 | **84.2** | +6.5% |
+| Decode, MTP K=3 (2 runs each, 97% accepted) | 129.5 | **141.9** | +9.6% |
 
-Serving 512-token essays, aggregate decode tok/s (mean of two runs):
+The benchmark corpus repeats itself, so after its 2,048-token prompt MTP drafts are accepted almost
+every time; that flatters MTP. Chat traffic accepts far fewer drafts, as the serving table shows.
+Adaptive MTP (`--spec mtp` alone) chooses its draft length from timing and acceptance, and the
+same binary can settle on different lengths from run to run: one master run took 66 verify rounds
+(126.5 tok/s) and every other run 36. At 36 rounds it measured 143.1 tok/s on `31fcfd74` and
+150.8–156.9 on `fc305acd`.
 
-| `ninfer-serve` | C=1 | C=2 | C=4 | C=8 |
-|---|---:|---:|---:|---:|
-| No speculation | **103.6** | **146.7** | **167.8** | **182.7** |
-| `--spec mtp` | 82.4 | 143.6 | 140.3 | 172.4 |
+Serving 512-token essays with `ninfer-serve`, aggregate decode tok/s over C concurrent requests
+(mean of two runs):
 
-Throughput levels off from C=4, where the requests in flight route to more distinct experts and
-the cache misses more often.
+| Mode | Commit | C=1 | C=2 | C=4 | C=8 |
+|---|---|---:|---:|---:|---:|
+| No speculation | `31fcfd74` | 95.7 | 134.4 | 156.9 | 157.0 |
+| | `fc305acd` | **98.5** | **141.6** | **180.6** | **185.3** |
+| | change | +2.9% | +5.3% | +15.1% | +18.0% |
+| `--spec mtp` | `31fcfd74` | 87.0 | 127.4 | 150.1 | 156.2 |
+| | `fc305acd` | 82.2 | 136.8 | 165.0 | 182.1 |
+| | change | −5.6%, inconclusive | +7.4% | +10.0% | +16.5% |
+
+The gain grows with concurrency because more requests in flight route to more distinct experts,
+so more fetches overlap. The single-request MTP point is unresolved: master's two runs were 100.0
+and 74.1 tok/s and `fc305acd`'s 77.5 and 86.9, a spread larger than the difference. Throughput
+still levels off from C=4, where the expert cache misses most.
+
+Not re-measured at `fc305acd`: at `7fbabfbc`, prefill reached 3,411 tok/s for a 4,096-token prompt,
+3,350 for 16,384 and 431 for 512, and FP8 KV decoded 3% faster than BF16 KV after a 2,048-token
+prompt.
+
+**Try it yourself.** Build with `cmake --preset dev` (it includes the benchmarks), download the
+artifact ([Download and serve](#download-and-serve)), then:
+
+```bash
+W=models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer
+
+# Single request: prefill and decode, with and without MTP (the first table)
+./build/bench/ninfer_bench --weights $W -pg 2048,128
+./build/bench/ninfer_bench --weights $W -pg 2048,128 --spec mtp --draft-tokens 3 --fixed-draft
+
+# Peak aggregate throughput: 1 and 8 concurrent 512-token requests, plain and adaptive MTP.
+# The tool starts and stops ninfer-serve itself and writes its reports to --output.
+python3 -m tools.bench.run_serve_concurrency --serve build/apps/ninfer-serve \
+  --artifact flash=$W --mode mtp0 --mode mtp_adaptive --sampling greedy \
+  --suite decode-saturation --concurrency 1 --concurrency 8 --decode-tokens 512 \
+  --max-context 4096 --kv-capacity auto --kv-dtype bf16 --output profiles/bench/flash_try
+```
+
+Each run loads the model first (about 40 s from NVMe). The serving tool's prompts are not the
+essays above, so expect figures in the same range rather than the same numbers. Your PCIe link and
+host memory matter as much as the GPU, because every expert miss crosses PCIe.
+
+**Serve it for real, at full context.** The model's whole 262,144-token window, with up to eight
+requests decoding at once:
+
+```bash
+./build/apps/ninfer-serve models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer \
+  --model-id qwen3.8-flash-next --host 127.0.0.1 --port 8080 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype fp8 --max-concurrency 8
+```
+
+For the highest throughput on short requests, use `--max-context 4096 --kv-capacity auto` instead
+(BF16 KV, as in the serving table). Once the log prints `listening on`, send a request:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next", "max_tokens": 512,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": "Write a short essay about the history of the printing press."}]
+}'
+```
+
+Run verbatim with the full-context command, this first request returned a 456-token essay with
+179 ms to the first token at 85.8 tok/s. The first requests after startup run slower than the
+table below while the expert cache fills.
+
+Measured at `fc305acd` with the same 512-token essays as the serving table (one run each), plus one
+241,003-token prompt (79 of this repository's documentation files concatenated, with a question
+about the first one):
+
+| `ninfer-serve` settings | KV pool | C=1 | C=8 | 241k-token prompt |
+|---|---|---:|---:|---|
+| `--max-context 4096 --kv-capacity auto` (BF16 KV) | auto | 98.5 | 185.3 | does not fit |
+| `--max-context 262144 --kv-capacity 262144 --kv-dtype fp8` | 262,144 tokens | 96.7 | 162.7 | answered correctly; 3 min 59 s to the first token |
+| `--max-context 262144 --kv-capacity auto --kv-dtype fp8` | 330,880 tokens | 96.3 | 132.3 | answered correctly; 4 min 6 s |
+
+C=1 and C=8 are aggregate decode tok/s. The KV pool is shared by every request in flight, so one
+request can use the whole window, or several can split it. Leave `--kv-capacity` explicit at full
+context: `auto` reserves more KV than one full-length request needs, and that memory comes out of
+the expert cache, so C=8 decoded 19% slower and unevenly (its slowest request ran at 16.5 tok/s
+against a mean of 31.9). Prefill slows as the prompt grows: about 1,000 tok/s averaged over the
+241k-token prompt, against about 2,200 at 2,048 tokens.
 
 **How it got here.** When Flash-Next support first landed (`e68225b7`), it decoded about 19.5 tok/s
 for a single request and prefilled about 350 tok/s. The main steps since then:
@@ -460,7 +546,10 @@ for a single request and prefilled about 350 tok/s. The main steps since then:
 - single-column projection splits as views instead of device copies, removing about 218 graph copy
   nodes per decode token (+2.5% at C=1);
 - pinned weights and Host KV on prefaulted 2 MiB pages, so the GPU's TLB covers the expert stream
-  (+16% prefill, +11% serving at C=1, +32% at C=8).
+  (+16% prefill, +11% serving at C=1, +32% at C=8);
+- cache-route expert fetches on the pager's own stream, with the cache-resident experts' GEMVs
+  running while the misses arrive (+6.5% decode after a 2,048-token prompt, +3% serving at C=1,
+  +18% at C=8).
 
 The comparison engine used during development, FreeToken with `--moe-backend offload`, measured
 about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same machine (4k context).
@@ -504,8 +593,9 @@ everything else about these artifacts are in their
 ## Performance
 
 These numbers were measured on this fork: one RTX 5090, CUDA 13.3. The 27B and 35B rows are from
-fork commits `19f38b77` and `f8106aa9` (same Engine; only benchmark sizing changed); the Flash-Next
-rows are from `7fbabfbc`, built with CUDA 13.4.
+fork commits `19f38b77` and `f8106aa9` (same Engine; only benchmark sizing changed). The Flash-Next
+serving rows are from `fc305acd`, built with CUDA 13.3; its single-request row is from `7fbabfbc`,
+built with CUDA 13.4.
 
 ### Serving throughput
 
@@ -521,8 +611,8 @@ essay (mean of two runs). Bold marks the faster mode at each concurrency.
 | Qwen3.6-35B-A3B `groupwise-int` | plain | 386.6 | 619.8 | **972.3** | **1,324.4** |
 | | `--spec mtp` | **491.9** | **663.5** | 850.9 | 1,001.0 |
 | | `--spec dflash --draft-tokens 7` | 355.4 | 452.1 | 507.7 | 898.9 |
-| Qwen3.8-Flash-Next `nvfp4` | plain | **103.6** | **146.7** | **167.8** | **182.7** |
-| | `--spec mtp` | 82.4 | 143.6 | 140.3 | 172.4 |
+| Qwen3.8-Flash-Next `nvfp4` | plain | **98.5** | **141.6** | **180.6** | **185.3** |
+| | `--spec mtp` | 82.2 | 136.8 | 165.0 | 182.1 |
 
 On this prose load, 35B-A3B speculation loses from C=4 up. On the long-reasoning load in
 [Versus stock NInfer](#versus-stock-ninfer) it wins instead: MTP K=3 beats plain at C=4 and DFlash7
@@ -574,7 +664,9 @@ NVMe drive.
   512-token essays on eight fixed topics.
 - **Not yet measured.** The Qwen3.6-27B artifacts.
 - **Raw reports** are kept locally under `profiles/bench/readme_20260925/`, and the Flash-Next ones
-  under `profiles/bench/readme_20260926b/` (`run.sh` reproduces them).
+  under `profiles/bench/readme_20260926b/` (`run.sh` reproduces them). The Flash-Next comparison
+  of `fc305acd` against `31fcfd74` is under `profiles/bench/flash_overlap_20261002/` (`ab.sh` and
+  `ab_serve.sh` reproduce it).
 
 Upstream's published results use its own methodology and artifacts; they are in the
 [performance index](docs/performance.md).

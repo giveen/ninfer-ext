@@ -207,8 +207,15 @@ std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots)
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream) {
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending) {
     constexpr const char* op = "moe_experts";
+    if (pending != nullptr) {
+        require(pending->misses != nullptr && pending->fetched != nullptr, op,
+                "pending fetch needs a miss list and an event");
+        require_dense(*pending->misses, DType::I32, op, "misses");
+        require(pending->misses->numel() >= 2 * expert_ids.numel() + 1, op,
+                "misses must hold 2*(10*T)+1 words");
+    }
     require_dense(x, DType::BF16, op, "x");
     const std::int32_t columns = x.ne[1];
     require(x.ne[0] == kOffloadMoeHidden, op, "x must be [2560,T]");
@@ -259,6 +266,10 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         c.job_count     = reinterpret_cast<std::int32_t*>(base + layout.job_count);
         c.act           = reinterpret_cast<__nv_bfloat16*>(base + layout.act);
         c.partial       = reinterpret_cast<float*>(base + layout.partial);
+        if (pending != nullptr) {
+            c.misses  = static_cast<const std::int32_t*>(pending->misses->data);
+            c.fetched = pending->fetched;
+        }
         detail::moe_experts_chunk_launch(c, stream);
     }
 }
