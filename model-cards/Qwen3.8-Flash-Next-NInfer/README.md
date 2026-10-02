@@ -49,15 +49,16 @@ MTP speculative decoding (`--spec mtp`).
 | Metric | Value |
 |---|---|
 | Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | **3.518** |
-| Prefill (1,457-token prompt) | **922 tok/s** |
-| Prefill, long context (262,144-token budget, fp8 KV, single request) | **3,498 / 2,908 / 2,218** tok/s at 64k / 128k / 256k tokens |
+| Prefill, 262,144-token budget, fp8 KV, single request | **1,090 / 3,666 / 3,498 / 2,908 / 2,218** tok/s at 1.5k / 8k / 64k / 128k / 256k tokens |
 | Decode (greedy, MTP K=3) | **81 tok/s** |
 | Peak host RSS (`--ngram-residency stream`) | **~65 GiB** |
 | Artifact size | **119 GB**, 4 sharded files |
 
-Long-context prefill improved 1.48x at 64k, 1.87x at 128k and 2.53x at 256k over the previous
-engine: the QSA block selection now pools each block's index keys once per select call instead of
-once per query column (bit-identical). Measured with the NIAH prompts on the development machine.
+Prefill is fastest at medium prompts: a short prompt is dominated by the fixed per-chunk expert
+streaming, and a long one by the QSA selection. Long-context prefill improved 1.48x at 64k, 1.87x at
+128k and 2.53x at 256k over the previous engine, because the QSA block selection now pools each
+block's index keys once per select call instead of once per query column (bit-identical). Measured
+with the NIAH prompts on the development machine.
 
 ## Requirements
 
