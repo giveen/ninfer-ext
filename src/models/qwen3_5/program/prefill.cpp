@@ -1032,8 +1032,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
+        // P1 lend: a wide idle step borrows the expert cache's top slots as its arena. A step whose
+        // remaining prompt already fits the ordinary chunk uses the narrow arena instead, so short
+        // requests never disturb the cache; wide steps only run with no decode waiting, so the range
+        // is reclaimed once per wide episode and becomes cache again when the step ends.
+        const std::uint32_t remaining_prompt = staged.prompt_tokens - staged.cursor;
+        const bool wide_step = pace == runtime::PrefillPace::Idle && !staged.vision &&
+                               prefill_width > prefill_chunk && remaining_prompt > prefill_chunk &&
+                               wide_workspace.has_value();
+        WorkspaceArena& step_work = wide_step ? *wide_workspace : work;
+        if (wide_step && qwen4_experts.has_value()) { qwen4_experts->lend(device.stream); }
+        struct LendReturn {
+            ProgramImpl* self;
+            bool active;
+            ~LendReturn() {
+                if (active && self->qwen4_experts.has_value()) { self->qwen4_experts->return_lend(); }
+            }
+        } lend_return{this, wide_step};
         execution::PrefillContext schedule_state{
-            {device, parameters, work, state_images->linear(),
+            {device, parameters, step_work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
              proposal_head, qwen4_execution()},
             text_kv_view(sequence),
@@ -1081,9 +1098,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.cursor < staged.prompt_tokens) {
             // Vision prompts keep the ordinary chunk: their media payload lifetime follows it.
-            const std::uint32_t width = pace == runtime::PrefillPace::Idle && !staged.vision
-                                            ? prefill_width
-                                            : prefill_chunk;
+            const std::uint32_t width = wide_step ? prefill_width : prefill_chunk;
             const std::uint32_t nominal = std::min(width, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);

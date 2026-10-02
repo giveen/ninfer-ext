@@ -2639,6 +2639,46 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const auto lease = [](const std::unique_ptr<LogicalKVPageStore>& store) noexcept {
         return store == nullptr ? 0U : store->physical_pool().reserved_pages();
     };
+    // Routed-expert cache counters live in Device memory.  This snapshot is taken on the maintenance
+    // boundary, so a short Device read and one stream wait are acceptable; a failed read leaves the
+    // fields at zero rather than failing the snapshot (this method is noexcept).
+    struct ExpertUsage {
+        std::uint64_t hits     = 0;
+        std::uint64_t misses   = 0;
+        std::uint32_t resident = 0;
+        std::uint32_t layer_min = 0;
+        std::uint32_t layer_max = 0;
+    } expert_usage;
+    if (qwen4_experts.has_value()) {
+        const ops::ExpertCacheState& cache = qwen4_experts->cache();
+        if (cache.statistics != nullptr && cache.owner != nullptr && cache.slots > 0) {
+            unsigned long long counters[2] = {0, 0};
+            std::vector<std::int32_t> owners(static_cast<std::size_t>(cache.slots), -1);
+            if (cudaMemcpyAsync(counters, cache.statistics, sizeof(counters), cudaMemcpyDeviceToHost,
+                                device.stream) == cudaSuccess &&
+                cudaMemcpyAsync(owners.data(), cache.owner,
+                                owners.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                device.stream) == cudaSuccess &&
+                cudaStreamSynchronize(device.stream) == cudaSuccess) {
+                expert_usage.hits   = counters[0];
+                expert_usage.misses = counters[1];
+                std::vector<std::uint32_t> per_layer(static_cast<std::size_t>(cache.layers), 0);
+                for (const std::int32_t owner : owners) {
+                    if (owner < 0) { continue; }
+                    ++expert_usage.resident;
+                    const std::int32_t layer = owner / ops::kOffloadMoeExperts;
+                    if (layer >= 0 && layer < cache.layers) {
+                        ++per_layer[static_cast<std::size_t>(layer)];
+                    }
+                }
+                if (!per_layer.empty()) {
+                    const auto [lo, hi] = std::minmax_element(per_layer.begin(), per_layer.end());
+                    expert_usage.layer_min = *lo;
+                    expert_usage.layer_max = *hi;
+                }
+            }
+        }
+    }
     return qwen3_5::PhysicalUsageSnapshot{
         .resource_revision           = resource_revision_,
         .device_state_slots          = usage.device.state_slots,
@@ -2648,6 +2688,11 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         .device_main_kv_lease_pages  = lease(text_kv_pages),
         .device_backend_kv_lease_pages = lease(backend_kv_pages),
         .host_kv_bytes               = usage.host.kv_bytes,
+        .expert_cache_hits           = expert_usage.hits,
+        .expert_cache_misses         = expert_usage.misses,
+        .expert_cache_resident_slots = expert_usage.resident,
+        .expert_cache_layer_min      = expert_usage.layer_min,
+        .expert_cache_layer_max      = expert_usage.layer_max,
     };
 }
 

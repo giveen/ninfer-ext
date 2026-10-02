@@ -241,7 +241,9 @@ struct EngineOptions {
     std::optional<std::uint32_t> prefill_chunk;
     // Width a prefill step takes when no decode work is waiting, a multiple of prefill_chunk.
     // Empty selects prefill_chunk when prefill_chunk is set, else the model's default: the widest
-    // of 4096, 2048 and 1024 whose workspace fits beside the requested KV capacity.
+    // candidate whose runtime reservation fits beside the requested KV capacity. Candidates are
+    // 4096/2048/1024, or the powers of two up to 16384 (bounded by max_context) for Qwen4Exp, whose
+    // wide arena is borrowed from the expert cache and returned between wide steps.
     std::optional<std::uint32_t> idle_prefill_chunk;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // KV streaming: each request keeps a bounded Device window of Main/MTP KV pages; older full
@@ -1099,6 +1101,14 @@ struct RuntimeStats {
     std::uint64_t pressure_maximal_fallback_selections = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
+    // Routed-expert device cache of host-resident experts (Qwen4Exp).  Cumulative resolve counters,
+    // the occupied slot count, and the smallest/largest per-layer occupancy, so a decode change can
+    // be attributed to cache size, miss traffic, or layer skew rather than guessed at.
+    std::uint64_t expert_cache_hits           = 0;
+    std::uint64_t expert_cache_misses         = 0;
+    std::uint32_t expert_cache_resident_slots = 0;
+    std::uint32_t expert_cache_layer_min      = 0;
+    std::uint32_t expert_cache_layer_max      = 0;
     double actual_context_transfer_seconds             = 0.0;
 };
 

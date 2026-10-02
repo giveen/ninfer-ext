@@ -44,6 +44,14 @@ struct PhysicalUsageSnapshot {
     std::uint32_t device_main_kv_lease_pages    = 0;
     std::uint32_t device_backend_kv_lease_pages = 0;
     std::size_t host_kv_bytes                   = 0;
+    // Routed-expert device cache of host-resident experts (Qwen4Exp).  `hits`/`misses` are the
+    // cumulative resolve counters; the layer min/max expose whether residency is spread across the
+    // layers or piled into the first ones (the failure mode per-layer admission exists to fix).
+    std::uint64_t expert_cache_hits           = 0;
+    std::uint64_t expert_cache_misses         = 0;
+    std::uint32_t expert_cache_resident_slots = 0;
+    std::uint32_t expert_cache_layer_min      = 0;
+    std::uint32_t expert_cache_layer_max      = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;

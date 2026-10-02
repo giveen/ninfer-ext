@@ -925,7 +925,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk while decode work is waiting, and the scheduler's service unit; alone it fixes the width | `4096` for Qwen4Exp, else `1024` |
-| `--idle-prefill-chunk N` | text-prefill chunk when no decode work is waiting, a multiple of `--prefill-chunk` | `--prefill-chunk` when that is set, else the widest of `4096`, `2048`, `1024` that fits beside the KV capacity |
+| `--idle-prefill-chunk N` | text-prefill chunk when no decode work is waiting, a multiple of `--prefill-chunk` | `--prefill-chunk` when that is set, else the widest candidate whose reservation fits beside the KV capacity: powers of two up to `16384` for Qwen4Exp, `4096`/`2048`/`1024` otherwise. A Qwen4Exp wide step borrows the expert cache's top slots as its arena and returns them afterwards, so it costs no decode residency |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1112,16 +1112,20 @@ batch without an empty row.
 A prefill unit beside waiting decode work is one `--prefill-chunk` wide, so a decode round waits
 behind at most one such chunk. With nothing to decode, the unit takes `--idle-prefill-chunk`, whose
 wider GEMMs prefill faster. Its workspace grows with the width (about 610 MiB at 4096 on 27B), so
-when neither width is given startup halves the idle width from 4096 until it fits beside the
-requested KV capacity; the `prefill |` startup line and `server_start.engine.idle_prefill_chunk`
-report the width in use. On an RTX 5090 (int8 KV, prefix reuse on) the defaults (1024 and
-4096) bring a lone 24k-token prompt's first token 7 % sooner on Qwen3.8-27B NVFP4 and 11 % on
-Qwen3.6-35B-A3B than a fixed 1024 chunk; groupwise-int 27B is compute-bound and gains nothing.
-A decode round interrupted by a long prompt stalls as long as with the fixed 1024 chunk, about
-150-165 ms (27B NVFP4) or 65-100 ms (35B), rather than the ~520 ms or ~210 ms a fixed 4096 chunk
-costs. Prefill arithmetic is not identical across chunk
-widths, so the greedy continuation of one prompt can differ between a lone request and one that
-prefills beside decode.
+when neither width is given startup widens the idle step and falls back until it fits beside the
+requested KV capacity. For a model whose routed experts stay in Host memory (Qwen4Exp) the
+candidates are the powers of two from the 4096 chunk up to 16384, because every chunk streams each
+host-resident expert layer once. A wide step's arena is borrowed from the expert cache's top slots
+and returned when the wide prefill ends, so the decode cache is the same size as at the ordinary
+chunk. The `prefill |` startup line and
+`server_start.engine.idle_prefill_chunk` report the width in use. On an RTX 5090 (int8 KV, prefix
+reuse on) the defaults (1024 and 4096) bring a lone 24k-token prompt's first token 7 % sooner on
+Qwen3.8-27B NVFP4 and 11 % on Qwen3.6-35B-A3B than a fixed 1024 chunk; groupwise-int 27B is
+compute-bound and gains nothing. A decode round interrupted by a long prompt stalls as long as with
+the fixed 1024 chunk, about 150-165 ms (27B NVFP4) or 65-100 ms (35B), rather than the ~520 ms or
+~210 ms a fixed 4096 chunk costs. Prefill arithmetic is not identical across chunk widths, so the
+greedy continuation of one prompt can differ between a lone request and one that prefills beside
+decode.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

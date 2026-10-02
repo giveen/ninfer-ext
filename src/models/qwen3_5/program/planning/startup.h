@@ -32,11 +32,18 @@ inline constexpr std::int32_t kQwen4StagedBankSlots = 2 * ops::kOffloadMoeExpert
 // width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
 // chunk lifts prefill 2-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
 // decode round waiting behind one chunk stalls ~3.4x longer. Every Qwen4Exp chunk of at least
-// kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps one wide
-// chunk that divides that traffic.
+// kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps a wide chunk
+// that divides that traffic.
 inline constexpr std::uint32_t kDefaultPrefillChunk     = 1024;
 inline constexpr std::uint32_t kDefaultIdlePrefillChunk = 4096;
 inline constexpr std::uint32_t kQwen4PrefillChunk       = 4096;
+// Host-resident routed experts keep that chunk beside decode but let the idle step widen with the
+// prompt: a 30,627-token prompt read at 4096 streams each expert layer eight times and at 16384
+// twice, measured on the RTX 5090 at 2,095 vs 3,146 tok/s. The wide step's arena is borrowed from the
+// expert cache's top slots and returned between wide steps, so widening costs almost no decode
+// residency. 16384 rather than 32768: the wider step adds only 1-5 % prefill but widens the lend
+// enough to cost the cache ~3 % (K7 C8 decode -7 %). --max-context caps it as well.
+inline constexpr std::uint32_t kQwen4MaxIdlePrefillChunk = 16384;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -63,6 +70,14 @@ struct Qwen4PersistentLayout {
     std::optional<TensorLayout> ple_input;  // BF16 [ple_width, (draft_window + 1) * max_concurrency]
     std::int32_t slots        = 0;
     std::int32_t cache_layers = 0;
+    // P1 lend: when the idle prefill width exceeds the ordinary chunk, the top `slots - base_slots`
+    // cache slots double as the wide prefill workspace. They are cache during decode and a borrowed
+    // arena during a wide idle step. `wide_offset`/`wide_bytes` locate that arena in the pool;
+    // `bank_slot` is the first staged-bank slot (past the cache and the lend region).
+    std::int32_t base_slots  = 0; // cache slots while a wide prefill borrows the lend region
+    std::int32_t bank_slot   = 0;
+    std::size_t  wide_offset = 0;
+    std::size_t  wide_bytes  = 0;
 };
 
 struct PersistentLayout {
@@ -107,6 +122,12 @@ struct WorkspacePlan {
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
+    // P1 lend: `capacity` sizes the widest arena (a wide idle prefill); `permanent_capacity` is the
+    // arena the Program always owns (decode rounds and the ordinary narrow prefill). For Qwen4Exp
+    // the difference is carried by the cached lend slots rather than a second allocation.
+    std::size_t permanent_capacity = 0;
+    std::size_t lend_bytes         = 0;
+    std::int32_t lend_slots        = 0;
 };
 
 struct SequencePlanningInputs {

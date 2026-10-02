@@ -18,8 +18,8 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
                        const Tensor& cache_positions, const Tensor* valid_columns,
                        const Tensor& table_rows, const Tensor& query_norm, const Tensor& key_norm,
                        const QsaIndexPlane& index, const QsaGeometry& geometry,
-                       std::int32_t max_blocks, float* scores, Tensor& selected, Tensor& counts,
-                       cudaStream_t stream);
+                       std::int32_t max_blocks, float* scores, float* pooled, Tensor& selected,
+                       Tensor& counts, cudaStream_t stream);
 
 struct QsaAttentionSplit {
     std::int32_t splits;     // CTAs per (column, KV head)

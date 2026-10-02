@@ -218,6 +218,9 @@ struct SelectArgs {
     const __nv_bfloat16* query_norm;
     const __nv_bfloat16* key_norm;
     float* scores; // [max_blocks] per CTA
+    // Pooled, normalized and RoPE'd block keys [lanes, max_blocks, index_dim], or null to pool per
+    // column (the decode/multi-lane path). Filled once per select call by qsa_pool_keys_kernel.
+    const float* pooled;
     std::int32_t max_blocks;
     std::int32_t* selected;
     std::int32_t* counts;
@@ -268,6 +271,75 @@ __device__ __forceinline__ SelectColumn select_column(const SelectArgs& a) {
     return c;
 }
 
+// Pool, normalize and RoPE one block's key into `key[per]` (this lane's features). Shared by the
+// per-column score path and the once-per-call pooled-key precompute so both agree bit for bit.
+__device__ __forceinline__ void qsa_block_key(const SelectArgs& a, const KernelGeometry& g,
+                                              const std::int32_t* table, std::int32_t b, int lane_id,
+                                              float* key) {
+    const int di             = g.index_dim;
+    const int per            = di / 32;
+    const std::int32_t ratio = g.ratio;
+    for (int r = 0; r < per; ++r) { key[r] = 0.0F; }
+    std::int32_t kpos[3] = {0, 0, 0};
+    for (int t = 0; t < ratio; ++t) {
+        const std::int32_t token = b * ratio + t;
+        // The page resolves on the Device or Host arm; in-page offsets are the same on both.
+        const __nv_bfloat16* record =
+            paged_kv_read_page(a.records, a.host_records, paged_kv_physical_page(table, token),
+                               record_offset(1, 0)) +
+            record_offset(0, token & kPagedKVPageMask);
+        for (int r = 0; r < per; ++r) { key[r] += __bfloat162float(record[lane_id * per + r]); }
+        if (t == 0) {
+            for (int axis = 0; axis < 3; ++axis) { kpos[axis] = read_position(record, axis); }
+        }
+    }
+    float sum = 0.0F;
+    for (int r = 0; r < per; ++r) {
+        // Upstream rounds the pooled mean to the activation dtype before normalizing.
+        key[r] = __bfloat162float(__float2bfloat16_rn(key[r] / static_cast<float>(ratio)));
+        sum += key[r] * key[r];
+    }
+    const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(di) + g.rms_norm_eps);
+    for (int r = 0; r < per; ++r) {
+        key[r] *= inv * (1.0F + __bfloat162float(a.key_norm[lane_id * per + r]));
+    }
+    // RoPE pairs (i, i + rotary/2) inside the first rotary features.
+    const int half  = g.rotary_dim / 2;
+    const int shift = half / per; // lanes between pair members
+    for (int r = 0; r < per; ++r) {
+        const int d       = lane_id * per + r;
+        const float other = __shfl_xor_sync(0xffffffffu, key[r], shift);
+        if (d < g.rotary_dim) {
+            const int pair = d < half ? d : d - half;
+            const float t  = rope_angle(g, pair, kpos);
+            const float c = cosf(t), s = sinf(t);
+            key[r] = d < half ? key[r] * c - other * s : key[r] * c + other * s;
+        }
+    }
+}
+
+// Pooled block keys of one lane's cache: [lane, block, index_dim], filled once per select call.
+// One warp per block; blocks not fully visible to the lane's last column are left untouched.
+__global__ void __launch_bounds__(256) qsa_pool_keys_kernel(SelectArgs a, float* pooled) {
+    const KernelGeometry& g = a.geometry;
+    const int lane          = blockIdx.y;
+    const int warp          = static_cast<int>(threadIdx.x) >> 5;
+    const int lane_id       = static_cast<int>(threadIdx.x) & 31;
+    const int b             = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) >> 5) + warp;
+    if (b >= a.max_blocks) { return; }
+    const int w_last = lane_valid(a.valid, lane, a.width) - 1;
+    if (w_last < 0) { return; }
+    const std::int32_t visible = a.cache[w_last + a.width * lane] + 1;
+    if (static_cast<std::int32_t>(b) * g.ratio + g.ratio > visible) { return; }
+    const std::int32_t* table =
+        a.tables + static_cast<std::int64_t>(a.table_rows[lane]) * a.table_stride;
+    float key[8];
+    qsa_block_key(a, g, table, b, lane_id, key);
+    const int per = g.index_dim / 32;
+    float* out    = pooled + (static_cast<std::int64_t>(lane) * a.max_blocks + b) * g.index_dim;
+    for (int r = 0; r < per; ++r) { out[lane_id * per + r] = key[r]; }
+}
+
 // Block scores of the columns that must choose among their blocks. CTA (x, y) scores blocks
 // [y * split_blocks, (y + 1) * split_blocks) of pass column x into its scores row.
 __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32_t split_blocks) {
@@ -283,7 +355,6 @@ __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32
     const std::int32_t first = static_cast<int>(blockIdx.y) * split_blocks;
     const std::int32_t last  = min(col.blocks, first + split_blocks);
     if (col.blocks <= g.block_topk() || first >= last) { return; }
-    const std::int32_t ratio = g.ratio;
 
     // Query heads: offset RMSNorm then RoPE at the query position.
     const std::int64_t tokens = static_cast<std::int64_t>(a.width) * a.lanes;
@@ -326,42 +397,13 @@ __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32
     const int per     = di / 32;
     for (int b = first + warp; b < last; b += blockDim.x / 32) {
         float key[8];
-        for (int r = 0; r < per; ++r) { key[r] = 0.0F; }
-        std::int32_t kpos[3] = {0, 0, 0};
-        for (int t = 0; t < ratio; ++t) {
-            const std::int32_t token = b * ratio + t;
-            // The page resolves on the Device or Host arm; in-page offsets are the same on both.
-            const __nv_bfloat16* record =
-                paged_kv_read_page(a.records, a.host_records,
-                                   paged_kv_physical_page(table, token), record_offset(1, 0)) +
-                record_offset(0, token & kPagedKVPageMask);
-            for (int r = 0; r < per; ++r) { key[r] += __bfloat162float(record[lane_id * per + r]); }
-            if (t == 0) {
-                for (int axis = 0; axis < 3; ++axis) { kpos[axis] = read_position(record, axis); }
-            }
-        }
-        float sum = 0.0F;
-        for (int r = 0; r < per; ++r) {
-            // Upstream rounds the pooled mean to the activation dtype before normalizing.
-            key[r] = __bfloat162float(__float2bfloat16_rn(key[r] / static_cast<float>(ratio)));
-            sum += key[r] * key[r];
-        }
-        const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(di) + g.rms_norm_eps);
-        for (int r = 0; r < per; ++r) {
-            key[r] *= inv * (1.0F + __bfloat162float(a.key_norm[lane_id * per + r]));
-        }
-        // RoPE pairs (i, i + rotary/2) inside the first rotary features.
-        const int half  = g.rotary_dim / 2;
-        const int shift = half / per; // lanes between pair members
-        for (int r = 0; r < per; ++r) {
-            const int d       = lane_id * per + r;
-            const float other = __shfl_xor_sync(0xffffffffu, key[r], shift);
-            if (d < g.rotary_dim) {
-                const int pair = d < half ? d : d - half;
-                const float t  = rope_angle(g, pair, kpos);
-                const float c = cosf(t), s = sinf(t);
-                key[r] = d < half ? key[r] * c - other * s : key[r] * c + other * s;
-            }
+        if (a.pooled != nullptr) {
+            // The pooled block key was computed once for this call; read this lane's features.
+            const float* pk =
+                a.pooled + (static_cast<std::int64_t>(lane) * a.max_blocks + b) * di;
+            for (int r = 0; r < per; ++r) { key[r] = pk[lane_id * per + r]; }
+        } else {
+            qsa_block_key(a, g, table, b, lane_id, key);
         }
         float score = 0.0F;
         for (int h = 0; h < g.index_heads; ++h) {
@@ -1083,8 +1125,8 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
                        const Tensor& cache_positions, const Tensor* valid_columns,
                        const Tensor& table_rows, const Tensor& query_norm, const Tensor& key_norm,
                        const QsaIndexPlane& index, const QsaGeometry& geometry,
-                       std::int32_t max_blocks, float* scores, Tensor& selected, Tensor& counts,
-                       cudaStream_t stream) {
+                       std::int32_t max_blocks, float* scores, float* pooled, Tensor& selected,
+                       Tensor& counts, cudaStream_t stream) {
     const std::int32_t width   = cache_positions.ne[0];
     const std::int32_t lanes   = cache_positions.ne[1];
     const std::int32_t columns = width * lanes;
@@ -1102,6 +1144,7 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
     args.query_norm         = static_cast<const __nv_bfloat16*>(query_norm.data);
     args.key_norm           = static_cast<const __nv_bfloat16*>(key_norm.data);
     args.scores             = scores;
+    args.pooled             = pooled;
     args.max_blocks         = max_blocks;
     args.selected           = static_cast<std::int32_t*>(selected.data);
     args.counts             = static_cast<std::int32_t*>(counts.data);
@@ -1109,6 +1152,14 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
     args.lanes              = lanes;
     args.max_selected       = selected.ne[0];
     args.geometry           = kernel_geometry(geometry);
+    if (pooled != nullptr) {
+        // Pool each block's key once for the whole call instead of once per query column.
+        constexpr int kPoolWarps = 8;
+        const dim3 grid(static_cast<unsigned int>((max_blocks + kPoolWarps - 1) / kPoolWarps),
+                        static_cast<unsigned int>(lanes));
+        qsa_pool_keys_kernel<<<grid, kPoolWarps * 32, 0, stream>>>(args, pooled);
+        CUDA_CHECK(cudaGetLastError());
+    }
     const std::int32_t pass = qsa_select_pass_columns(columns);
     for (std::int32_t begin = 0; begin < columns; begin += pass) {
         args.column_begin       = begin;

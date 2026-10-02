@@ -803,6 +803,23 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    const std::uint64_t expert_hit_delta =
+        monotonic_delta(previous.expert_cache_hits, current.expert_cache_hits);
+    const std::uint64_t expert_miss_delta =
+        monotonic_delta(previous.expert_cache_misses, current.expert_cache_misses);
+    const std::uint64_t expert_total_delta = expert_hit_delta + expert_miss_delta;
+    record["expert_cache"] =
+        Json{{"hits", current.expert_cache_hits},
+             {"misses", current.expert_cache_misses},
+             {"interval_hits", expert_hit_delta},
+             {"interval_misses", expert_miss_delta},
+             {"interval_hit_rate",
+              expert_total_delta == 0 ? 0.0
+                                      : static_cast<double>(expert_hit_delta) /
+                                            static_cast<double>(expert_total_delta)},
+             {"resident_slots", current.expert_cache_resident_slots},
+             {"layer_min_resident", current.expert_cache_layer_min},
+             {"layer_max_resident", current.expert_cache_layer_max}};
     return record.dump();
 }
 

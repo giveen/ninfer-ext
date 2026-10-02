@@ -182,8 +182,10 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    // A default idle prefill width shrinks until its workspace fits beside the requested KV; the
-    // narrowest candidate is the ordinary chunk, whose failure reports the real shortfall.
+    // A default idle prefill width shrinks until its runtime reservation fits beside the requested
+    // KV. The narrowest candidate is the ordinary chunk, whose failure reports the real shortfall.
+    // Qwen4Exp pays for a wider step by lending it cache slots, not by giving up decode residency,
+    // so no separate cache floor is needed.
     EngineOptions planned = options;
     const std::vector<std::uint32_t> idle_widths =
         models::qwen3_5::idle_prefill_chunk_candidates(instance->parameters, options);
@@ -194,12 +196,13 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
         if (!idle_widths.empty()) { planned.idle_prefill_chunk = idle_widths[i]; }
         planner.emplace(
             models::qwen3_5::make_sequence_planner(instance->parameters, device, planned));
+        const bool narrowest = idle_widths.empty() || i + 1 >= idle_widths.size();
         try {
             resolution =
                 resolve_kv_capacity(planned.kv_capacity, planner->capacity_curve(), free_bytes);
             break;
         } catch (const std::invalid_argument&) {
-            if (i + 1 >= idle_widths.size()) { throw; }
+            if (narrowest) { throw; }
         }
     }
     auto sequence = std::move(*planner).finalize(resolution.main_page_groups);
