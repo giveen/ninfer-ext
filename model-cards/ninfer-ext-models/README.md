@@ -168,9 +168,14 @@ One RTX 5090 (32 GB, sm_120a), CUDA 13.3, `--expert-cache auto`, fp8 KV, `--spec
 |---|---|
 | Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | 3.518 |
 | Prefill (1,457-token prompt) | 922 tok/s |
+| Prefill, long context (262,144-token budget, fp8 KV, single request) | 3,498 / 2,908 / 2,218 tok/s at 64k / 128k / 256k tokens |
 | Decode (greedy, MTP K=3) | 81 tok/s |
 | Peak host RSS (`--ngram-residency stream`) | ~65 GiB |
 | Artifact size | 119 GB, 4 sharded files |
+
+Long-context prefill improved 1.48x at 64k, 1.87x at 128k and 2.53x at 256k over the previous
+engine: the QSA block selection now pools each block's index keys once per select call instead of
+once per query column (bit-identical).
 
 ### Requirements
 
