@@ -17,7 +17,7 @@ namespace ninfer::ops {
 // execution dispatches registered vocab profiles to a smaller block so the much
 // larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
-inline constexpr int kArgmaxItemsPerThread = 1;
+inline constexpr int kArgmaxItemsPerThread = 16;
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
                                               std::int32_t best_index) {
@@ -102,14 +102,52 @@ __launch_bounds__(kArgmaxBlock) __global__
 
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
+
+    constexpr int kVecRows = 8;
+    constexpr int kVecGroups = kArgmaxItemsPerThread / kVecRows;
+
+    const bool vectorized = (physical_rows % kVecRows) == 0;
+    if (vectorized) {
 #pragma unroll
-    for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
-        const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
-        if (v < valid_rows) {
-            const float value = __bfloat162float(logits[base + v]);
-            if (argmax_better(value, v, best_value, best_index)) {
+        for (int g = 0; g < kVecGroups; ++g) {
+            const std::int32_t v =
+                tile_start + (static_cast<std::int32_t>(threadIdx.x) + g * blockDim.x) * kVecRows;
+            if (v + kVecRows <= valid_rows) {
+                const uint4 packed =
+                    __ldg(reinterpret_cast<const uint4*>(logits + base + v));
+                const __nv_bfloat16* halves = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+                for (int k = 0; k < kVecRows; ++k) {
+                    const std::int32_t row = v + k;
+                    const float value       = __bfloat162float(halves[k]);
+                    if (argmax_better(value, row, best_value, best_index)) {
+                        best_value = value;
+                        best_index = row;
+                    }
+                }
+            }
+        }
+        // <8-row remainder of the final tile: covered by the first threads only.
+        const std::int32_t tail = valid_rows - ((valid_rows / kVecRows) * kVecRows);
+        if (tail > 0 && static_cast<std::int32_t>(threadIdx.x) < tail) {
+            const std::int32_t row =
+                valid_rows - tail + static_cast<std::int32_t>(threadIdx.x);
+            const float value = __bfloat162float(logits[base + row]);
+            if (argmax_better(value, row, best_value, best_index)) {
                 best_value = value;
-                best_index = v;
+                best_index = row;
+            }
+        }
+    } else {
+#pragma unroll
+        for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
+            const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
+            if (v < valid_rows) {
+                const float value = __bfloat162float(logits[base + v]);
+                if (argmax_better(value, v, best_value, best_index)) {
+                    best_value = value;
+                    best_index = v;
+                }
             }
         }
     }
