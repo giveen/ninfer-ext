@@ -34,7 +34,7 @@ def make_payload(messages, max_tokens):
             "model": "qwen3.8-flash-next",
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0,
+            "temperature": float(os.environ.get("BENCH_TEMP", "0")),
             "stream": False,
         }
     ).encode()
@@ -73,12 +73,17 @@ class Server:
         for p in (self.jsonl, self.log):
             if os.path.exists(p):
                 os.remove(p)
+        sample_flags = (
+            ["--temperature", "0.6", "--top-p", "0.95", "--top-k", "20"]
+            if os.environ.get("BENCH_SAMPLED")
+            else ["--greedy"]
+        )
         cmd = [
             SERVE, ART, "--model-id", "qwen3.8-flash-next",
             "--host", HOST, "--port", str(PORT),
             "--max-concurrency", "8", "--max-context", "262144", "--kv-capacity", "262144",
             "--kv-dtype", kv, "--expert-cache", "auto", "--ngram-residency", "stream",
-            "--no-prefix-reuse", "--greedy", "--no-thinking",
+            "--no-prefix-reuse", *sample_flags, "--no-thinking",
             "--log-stats-interval-ms", str(stats_ms),
             "--request-log-jsonl", self.jsonl,
         ]
