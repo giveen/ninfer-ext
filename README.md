@@ -370,7 +370,9 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
   a double-buffered staging bank, copying experts already in the cache device-to-device instead.
   Staged experts run on a W4A4 tensor-core route. Between long chunks the staging banks serve as
-  1024 more cache slots. The prefill chunk defaults to 4,096 tokens for this model.
+  1024 more cache slots. The prefill chunk beside decode defaults to 4,096 tokens; with no decode
+  waiting the idle step widens up to 32,768 as memory allows, stopping before it takes more than a
+  quarter of the automatic expert cache, so a long prompt streams each layer fewer times.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,

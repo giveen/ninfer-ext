@@ -56,6 +56,17 @@ const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const no
     return impl_ != nullptr ? impl_->curve : empty;
 }
 
+std::uint32_t SequencePlanner::expert_cache_slots() const noexcept {
+    return impl_ != nullptr ? impl_->inputs.expert_cache_slots : 0;
+}
+
+bool SequencePlanner::retains_expert_cache_floor(std::uint32_t baseline_slots) const noexcept {
+    if (baseline_slots == 0) { return true; }
+    const std::uint64_t slots = impl_ != nullptr ? impl_->inputs.expert_cache_slots : 0;
+    return slots * 100 >=
+           static_cast<std::uint64_t>(detail::kQwen4IdleCacheFloorPct) * baseline_slots;
+}
+
 SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
     return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));

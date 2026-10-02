@@ -1217,6 +1217,11 @@ public:
         out.device_main_kv_lease_pages       = usage.device_main_kv_lease_pages;
         out.device_backend_kv_lease_pages    = usage.device_backend_kv_lease_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
+        out.expert_cache_hits                = usage.expert_cache_hits;
+        out.expert_cache_misses              = usage.expert_cache_misses;
+        out.expert_cache_resident_slots      = usage.expert_cache_resident_slots;
+        out.expert_cache_layer_min           = usage.expert_cache_layer_min;
+        out.expert_cache_layer_max           = usage.expert_cache_layer_max;
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
             if (active_[lane].occupied) {

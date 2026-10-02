@@ -1414,9 +1414,21 @@ void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private
 
 std::vector<std::uint32_t> idle_prefill_chunk_candidates_impl(const execution::Parameters& parameters,
                                                               const EngineOptions& options) {
-    if (options.prefill_chunk || options.idle_prefill_chunk ||
-        parameters.model.config().text.qwen4()) {
-        return {};
+    if (options.prefill_chunk || options.idle_prefill_chunk) { return {}; }
+    // Host-resident routed experts (Qwen4Exp): a wider idle step lets fewer chunk boundaries pay
+    // the whole-expert-layer streaming cost. Offer the powers of two between the ordinary chunk and
+    // kQwen4MaxIdlePrefillChunk that fit the context; startup takes the widest the runtime
+    // reservation and the expert-cache floor both accept.
+    if (parameters.model.config().text.qwen4()) {
+        const std::uint32_t chunk   = kQwen4PrefillChunk;
+        const std::uint32_t widest  = std::min(kQwen4MaxIdlePrefillChunk,
+                                               options.max_context / chunk * chunk);
+        std::vector<std::uint32_t> out;
+        for (std::uint32_t width = chunk; width != 0 && width <= widest; width *= 2U) {
+            out.push_back(width);
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
     }
     // Halving keeps every candidate a multiple of the chunk; the chunk itself is the last resort.
     std::vector<std::uint32_t> out;

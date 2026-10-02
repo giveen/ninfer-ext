@@ -32,11 +32,18 @@ inline constexpr std::int32_t kQwen4StagedBankSlots = 2 * ops::kOffloadMoeExpert
 // width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
 // chunk lifts prefill 2-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
 // decode round waiting behind one chunk stalls ~3.4x longer. Every Qwen4Exp chunk of at least
-// kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps one wide
-// chunk that divides that traffic.
+// kQwen4StagedColumns streams each host-resident expert layer once, so Qwen4Exp keeps a wide chunk
+// that divides that traffic.
 inline constexpr std::uint32_t kDefaultPrefillChunk     = 1024;
 inline constexpr std::uint32_t kDefaultIdlePrefillChunk = 4096;
 inline constexpr std::uint32_t kQwen4PrefillChunk       = 4096;
+// Host-resident routed experts keep that chunk beside decode but let the idle step widen with the
+// prompt: a 30,627-token prompt read at 4096 streams each expert layer eight times and at 32768
+// once, measured on the RTX 5090 at 2,095 vs 3,459 tok/s. The extra workspace comes out of the
+// automatic expert cache, so startup stops widening before the cache falls below
+// kQwen4IdleCacheFloorPct of its chunk-width size; --max-context caps it as well.
+inline constexpr std::uint32_t kQwen4MaxIdlePrefillChunk = 32768;
+inline constexpr std::uint32_t kQwen4IdleCacheFloorPct    = 75;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
