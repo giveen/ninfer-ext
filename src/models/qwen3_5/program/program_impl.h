@@ -680,6 +680,9 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // Qwen4Exp: the wide idle prefill arena, borrowed from the expert cache's top slots. Empty when
+    // the idle width does not exceed the ordinary chunk.
+    std::optional<DeviceArena> wide_workspace;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;

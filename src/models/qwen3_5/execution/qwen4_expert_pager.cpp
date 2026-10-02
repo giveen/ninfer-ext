@@ -8,14 +8,19 @@
 namespace ninfer::models::qwen3_5::execution {
 
 Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache,
-                                   std::int32_t staged_columns)
-    : cache_(cache), staged_columns_(staged_columns) {
-    // Every slot the banks do not overlay must still hold one call's assignments.
-    if (cache_.slots < kBankSlots + ops::kOffloadMoeTopK) {
-        throw std::logic_error("expert cache is too small to overlay the staged banks");
+                                   std::int32_t staged_columns, std::int32_t bank_slot,
+                                   std::int32_t base_slots)
+    : cache_(cache), staged_columns_(staged_columns), bank_slot_(bank_slot),
+      base_slots_(base_slots), decode_slots_(cache.slots) {
+    // Every route still needs room for one call's assignments, and the banks must sit past the cache
+    // (and, when the idle prefill is wider than the chunk, past its lent top range).
+    if (cache_.slots < ops::kOffloadMoeTopK || base_slots_ < ops::kOffloadMoeTopK) {
+        throw std::logic_error("expert cache is too small for one resolve");
+    }
+    if (base_slots_ > bank_slot_ || bank_slot_ + kBankSlots != cache_.slots) {
+        throw std::logic_error("staged banks must be the top of the expert cache slots");
     }
     static_assert(kStagedBankBytes % 256 == 0, "staged banks must stay 256-byte aligned");
-    bank_slot_ = cache_.slots - kBankSlots;
     banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * ops::kExpertSlotBytes;
     banks_[1]  = banks_[0] + kStagedBankBytes;
     CUDA_CHECK(cudaMallocHost(&resident_, static_cast<std::size_t>(cache_.layers) *
@@ -139,12 +144,14 @@ ops::ExpertWeights Qwen4ExpertPager::acquire_staged(std::int32_t layer,
                                                     bool forward_start, cudaStream_t stream) {
     const int b = layer & 1;
     if (forward_start) {
-        // Cache-route calls since the last staged forward may have placed experts in the bank
-        // slots (and still read or write them earlier on `stream`). Evict them after that work,
-        // and hold every fill of this forward behind the eviction.
-        ops::expert_cache_reclaim(cache_, bank_slot_, stream);
-        CUDA_CHECK(cudaEventRecord(reclaimed_, stream));
-        CUDA_CHECK(cudaStreamWaitEvent(stream_, reclaimed_));
+        // The banks double as cache slots between staged forwards, so reclaim whatever the cache
+        // placed in them. A wide idle step has already shrunk the cache below the banks and
+        // reclaimed the lend range itself, so skip it there.
+        if (bank_slot_ < cache_.slots) {
+            ops::expert_cache_reclaim(cache_, bank_slot_, stream);
+            CUDA_CHECK(cudaEventRecord(reclaimed_, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(stream_, reclaimed_));
+        }
         layer_[0] = layer_[1] = -1;
     }
     // A forward's first staged call fills its own layer; later layers were prefetched.
@@ -157,6 +164,16 @@ ops::ExpertWeights Qwen4ExpertPager::acquire_staged(std::int32_t layer,
 
 void Qwen4ExpertPager::release_staged(std::int32_t layer, cudaStream_t stream) {
     CUDA_CHECK(cudaEventRecord(released_[layer & 1], stream));
+}
+
+// P1 lend: the wide idle prefill borrows the top cache slots' bytes as its arena. Invalidate them so
+// a later resolve cannot trust a slot whose bytes the arena overwrote, then shrink the cache to the
+// base count. `expert_cache_reclaim` reads `cache_.slots` at launch, so it covers the full lend range
+// before the shrink.
+void Qwen4ExpertPager::lend(cudaStream_t stream) {
+    if (cache_.slots == base_slots_) { return; }
+    ops::expert_cache_reclaim(cache_, base_slots_, stream);
+    cache_.slots = base_slots_;
 }
 
 std::int32_t Qwen4ExpertPager::max_resolve_columns() const noexcept {

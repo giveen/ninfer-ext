@@ -23,11 +23,11 @@ namespace ninfer::models::qwen3_5::execution {
  *   Experts the cache holds are copied device-to-device instead of from the Host. Staged calls do
  *   not change the cache.
  *
- * The banks overlay the last `kBankSlots` slots of the cache pool (plus the pool's divisor tail).
- * Cache-route calls use those slots like any other; the first staged call of each forward reclaims
- * them (evicts what the cache placed there) before any fill writes a bank. No cache-route call runs
- * inside a staged forward, so the banks stay intact until the forward ends. The reclaim is part of
- * the stream work, so a captured staged forward replays it too.
+ * The banks sit past the cache pool's slots (plus the pool's divisor tail), so a cache-route call
+ * never touches them and the staged route never has to reclaim cache residency first. When the idle
+ * prefill width exceeds the ordinary chunk, the top `base_slots_..decode_slots_` cache slots are a
+ * lend region: `lend` reclaims them and the Program uses their bytes as the wide prefill arena;
+ * `return_lend` makes them cache again.
  *
  * The two routes differ numerically (the staged route may quantize activations), so the route
  * choice is fixed by `stages`. Within a route, placement never changes a result.
@@ -41,15 +41,21 @@ public:
     static constexpr std::size_t kStagedBankBytes = ops::kExpertStagedLayerBytes;
     static constexpr std::int32_t kBankSlots      = 2 * ops::kOffloadMoeExperts;
 
-    // `cache.pool` holds `cache.slots` slots followed by two layers' weight divisors; the last
-    // kBankSlots slots double as the banks.
-    Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::int32_t staged_columns);
+    // `cache.pool` holds the decode cache slots (cache plus the lent range), then two layers' weight
+    // divisors; the banks begin at `bank_slot`. `base_slots` is the cache size while the wide idle
+    // prefill borrows the lend range, `cache.slots` the decode-time size.
+    Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::int32_t staged_columns,
+                     std::int32_t bank_slot, std::int32_t base_slots);
     ~Qwen4ExpertPager();
 
     Qwen4ExpertPager(const Qwen4ExpertPager&)            = delete;
     Qwen4ExpertPager& operator=(const Qwen4ExpertPager&) = delete;
 
     [[nodiscard]] const ops::ExpertCacheState& cache() const noexcept { return cache_; }
+
+    // P1 lend: reclaim the lend range for the wide prefill arena, then make the cache again.
+    void lend(cudaStream_t stream);
+    void return_lend() noexcept { cache_.slots = decode_slots_; }
 
     // True when a call of `columns` columns takes the staged route.
     [[nodiscard]] bool stages(std::int32_t columns) const noexcept {
@@ -103,7 +109,9 @@ private:
     // forward. A fill waits for `released_[b]` of the bank's previous reader and records
     // `ready_[b]`; the forward's first fill also waits for `reclaimed_`.
     std::byte* banks_[2]     = {};
-    std::int32_t bank_slot_  = 0; // first slot the banks overlay
+    std::int32_t bank_slot_  = 0; // first slot the banks overlay (past the cache and lend slots)
+    std::int32_t base_slots_   = 0; // cache slots while the lend range is borrowed
+    std::int32_t decode_slots_ = 0; // cache slots during decode (cache plus lend)
     cudaStream_t stream_     = nullptr;
     cudaEvent_t ready_[2]    = {};
     cudaEvent_t released_[2] = {};

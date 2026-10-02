@@ -295,10 +295,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (config.qwen4()) {
         Qwen4PersistentLayout q;
         q.cache_layers = dimension(config.num_hidden_layers + (plan.features.mtp() ? 1U : 0U));
-        // The planned cache slots plus the staged banks' slots, which the cache uses between staged
-        // forwards.
-        q.slots = checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots) + kQwen4StagedBankSlots,
-                              "expert cache slot count");
+        // The cache pool holds the decode-time cache (the planned slots plus the lent idle-prefill
+        // slots) followed by the staged banks. A wide idle step reclaims the lent top range and uses
+        // it as the wide prefill arena; the banks live past both, so their offset never moves.
+        const std::int32_t lend_slots = plan.workspace.lend_slots;
+        q.base_slots = checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots),
+                                   "expert cache base slot count");
+        // The lend region sits just below the staged banks, and the banks keep doubling as cache
+        // slots between staged forwards, exactly as before. So the decode-time cache is
+        // base + lend + banks, the wide-time cache is just base, and the banks never move.
+        q.bank_slot  = checked_i32(static_cast<std::uint64_t>(q.base_slots) + lend_slots,
+                                   "expert cache bank slot");
+        q.slots      = checked_i32(static_cast<std::uint64_t>(q.bank_slot) + kQwen4StagedBankSlots,
+                                   "expert cache slot count");
         q.slot_of      = add_tensor(builder, DType::I32, {q.cache_layers * ops::kOffloadMoeExperts},
                                     "expert cache slot table");
         q.owner        = add_tensor(builder, DType::I32, {q.slots}, "expert cache owners");
@@ -312,6 +321,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                      ops::kExpertSlotBytes, "expert cache pool bytes"),
                                          2 * ops::kExpertDivisorBytes, "expert cache pool bytes"),
                              kArenaAlign, "expert cache pool");
+        q.wide_offset = static_cast<std::size_t>(q.base_slots) *
+                        static_cast<std::size_t>(ops::kExpertSlotBytes);
+        q.wide_bytes = static_cast<std::size_t>(lend_slots) *
+                       static_cast<std::size_t>(ops::kExpertSlotBytes);
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -332,16 +345,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
-WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
+WorkspacePlan qwen4_workspace_plan_for(const SequencePlanImpl& plan, std::uint32_t width,
+                                       std::int32_t slots) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
     const auto& qwen4      = *parameters.qwen4;
-    const auto chunk       = static_cast<std::int32_t>(std::min(plan.prefill_width, plan.capacity));
+    const auto chunk       = static_cast<std::int32_t>(std::min(width, plan.capacity));
     const auto verify      = static_cast<std::int32_t>(plan.draft_window + 1U);
-    // Cache-route calls address every pool slot, the staged banks' slots included.
-    const std::int32_t slots = checked_i32(
-        static_cast<std::uint64_t>(plan.expert_cache_slots) + kQwen4StagedBankSlots,
-        "expert cache slot count");
     const std::int32_t hidden = dimension(config.hidden_size);
     const std::int32_t wide   = dimension(config.residual_width());
     const auto public_tokens  = dimension(parameters.model.resources().public_token_count);
@@ -518,6 +528,48 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
             *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
+    return out;
+}
+
+// Qwen4Exp: the idle prefill may be wider than the ordinary chunk. The Program always owns the
+// narrow arena (decode rounds plus the chunk-width prefill); the extra wide arena is lent from the
+// expert cache's top slots and is cache again between wide steps. `lend_slots` spans the whole wide
+// arena because the permanent arena is a separate allocation.
+WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
+    const std::uint32_t narrow_width = std::max<std::uint32_t>(plan.prefill_chunk, 1U);
+    const std::uint32_t wide_width   = std::max(plan.prefill_width, narrow_width);
+    const auto slots_for = [&](std::int32_t lend_slots) {
+        return checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots) + lend_slots +
+                               kQwen4StagedBankSlots,
+                           "expert cache slot count");
+    };
+    std::int32_t slots = slots_for(0);
+    WorkspacePlan narrow = qwen4_workspace_plan_for(plan, narrow_width, slots);
+    WorkspacePlan wide   = qwen4_workspace_plan_for(plan, wide_width, slots);
+    std::int32_t lend_slots = 0;
+    const auto recompute    = [&] {
+        const std::size_t lend_bytes = wide.capacity > narrow.capacity ? wide.capacity : 0;
+        lend_slots = lend_bytes == 0
+                         ? 0
+                         : checked_i32(
+                               (lend_bytes + static_cast<std::size_t>(ops::kExpertSlotBytes) - 1) /
+                                   static_cast<std::size_t>(ops::kExpertSlotBytes),
+                               "expert cache lend slots");
+    };
+    recompute();
+    // The slot-dependent workspace term is a few bytes per slot, so one refinement of the fixed
+    // point (lend -> slots -> workspace -> lend) is enough.
+    if (slots_for(lend_slots) != slots) {
+        slots  = slots_for(lend_slots);
+        narrow = qwen4_workspace_plan_for(plan, narrow_width, slots);
+        wide   = qwen4_workspace_plan_for(plan, wide_width, slots);
+        recompute();
+    }
+    WorkspacePlan out      = wide;
+    out.permanent_capacity = narrow.capacity;
+    out.lend_slots         = lend_slots;
+    out.lend_bytes         = static_cast<std::size_t>(lend_slots) *
+                             static_cast<std::size_t>(ops::kExpertSlotBytes);
     return out;
 }
 
@@ -981,6 +1033,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
+    out.permanent_capacity = out.capacity;
     return out;
 }
 
@@ -1263,6 +1316,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         inputs.speculative_backend == SpeculativeBackend::Mtp && !inputs.causal_scoring &&
         inputs.max_concurrency > 1 &&
         mtp_plain_batches(inputs.adaptive_draft, inputs.parameters->model.config().text.qwen4());
+    // The workspace plan must precede the persistent layout: for Qwen4Exp it reports how many cache
+    // slots the wide idle prefill arena borrows, and the pool is sized around that.
+    impl->workspace = build_workspace_plan(*impl);
     impl->persistent = persistent_layout(*impl);
     if (impl->context_cache.host_cache_budget_bytes) {
         // The budget is resolved on the finished layout, before anything consumes the plan's
@@ -1279,7 +1335,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                   impl->persistent.state_images.host.image_bytes,
                                   impl->persistent.host_kv_text_page_stride);
     }
-    impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
@@ -1344,7 +1399,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
 
     impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+        checked_add(impl->persistent.bytes, impl->workspace.permanent_capacity,
+                    "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }

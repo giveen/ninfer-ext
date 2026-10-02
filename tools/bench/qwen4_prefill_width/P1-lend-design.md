@@ -1,7 +1,13 @@
 # P1 design: borrow the idle prefill workspace from the expert cache
 
-Status: design, not implemented. Goal: make the wide idle prefill step stop shrinking the automatic
-routed-expert cache, so decode returns to the 4096 baseline while prefill keeps its gain.
+Status: **implemented**. Goal met: at the 256k budget the wide idle step (16384) now leaves decode at
+0.99-1.00 of the 4096 baseline across K3/K7 and C=1-8 (K7 C8 0.98), cache -1.5 % instead of -12 %,
+prefill unchanged (8k 3600, 64k 2353, 256k 867 tok/s). The lend region is the whole wide arena; the
+permanent narrow arena stays a separate owning allocation. Wide steps are gated on the remaining
+prompt exceeding the ordinary chunk, so short requests never disturb the cache. The cache floor was
+removed: the lend makes the decode cache independent of the idle width, so the floor's premise is
+gone; 16384 is capped rather than 32768 because the wider lend still costs ~3 % cache (K7 C8 -7 %)
+for only 1-5 % more prefill.
 
 ## Measured motivation
 

@@ -925,7 +925,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk while decode work is waiting, and the scheduler's service unit; alone it fixes the width | `4096` for Qwen4Exp, else `1024` |
-| `--idle-prefill-chunk N` | text-prefill chunk when no decode work is waiting, a multiple of `--prefill-chunk` | `--prefill-chunk` when that is set, else the widest candidate whose reservation fits beside the KV capacity and, for Qwen4Exp, leaves the automatic expert cache at or above 75 % of its chunk-width size: powers of two up to `32768` for Qwen4Exp, `4096`/`2048`/`1024` otherwise |
+| `--idle-prefill-chunk N` | text-prefill chunk when no decode work is waiting, a multiple of `--prefill-chunk` | `--prefill-chunk` when that is set, else the widest candidate whose reservation fits beside the KV capacity: powers of two up to `16384` for Qwen4Exp, `4096`/`2048`/`1024` otherwise. A Qwen4Exp wide step borrows the expert cache's top slots as its arena and returns them afterwards, so it costs no decode residency |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1114,9 +1114,10 @@ behind at most one such chunk. With nothing to decode, the unit takes `--idle-pr
 wider GEMMs prefill faster. Its workspace grows with the width (about 610 MiB at 4096 on 27B), so
 when neither width is given startup widens the idle step and falls back until it fits beside the
 requested KV capacity. For a model whose routed experts stay in Host memory (Qwen4Exp) the
-candidates are the powers of two from the 4096 chunk up to 32768, because every chunk streams each
-host-resident expert layer once; there startup also stops before that extra workspace drops the
-automatic expert cache below 75 % of its chunk-width size. The `prefill |` startup line and
+candidates are the powers of two from the 4096 chunk up to 16384, because every chunk streams each
+host-resident expert layer once. A wide step's arena is borrowed from the expert cache's top slots
+and returned when the wide prefill ends, so the decode cache is the same size as at the ordinary
+chunk. The `prefill |` startup line and
 `server_start.engine.idle_prefill_chunk` report the width in use. On an RTX 5090 (int8 KV, prefix
 reuse on) the defaults (1024 and 4096) bring a lone 24k-token prompt's first token 7 % sooner on
 Qwen3.8-27B NVFP4 and 11 % on Qwen3.6-35B-A3B than a fixed 1024 chunk; groupwise-int 27B is

@@ -192,11 +192,6 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
-    // Qwen4Exp: device slots of the automatic routed-expert cache this candidate would get.
-    [[nodiscard]] std::uint32_t expert_cache_slots() const noexcept;
-    // Qwen4Exp: whether this candidate keeps at least the startup floor of the automatic expert
-    // cache, `baseline_slots` being the cache at the ordinary chunk width (0 disables the check).
-    [[nodiscard]] bool retains_expert_cache_floor(std::uint32_t baseline_slots) const noexcept;
     [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
 
 public:

@@ -53,8 +53,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
-      work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
+      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.permanent_capacity),
+      work(DeviceSpan{workspace_storage.base(), plan.workspace.permanent_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(plan.causal_scoring ? std::nullopt
@@ -300,7 +300,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
         static_assert(execution::Qwen4ExpertPager::kBankSlots == kQwen4StagedBankSlots,
                       "the planned pool tail must be exactly the pager's bank slots");
-        qwen4_experts.emplace(cache, kQwen4StagedColumns);
+        qwen4_experts.emplace(cache, kQwen4StagedColumns, layout.bank_slot, layout.base_slots);
+        if (layout.wide_bytes != 0) {
+            auto* pool_base = static_cast<std::byte*>(layout.pool.bind(backing).data);
+            wide_workspace.emplace(DeviceSpan{pool_base + layout.wide_offset, layout.wide_bytes});
+        }
         runtime.experts = &*qwen4_experts;
         const auto& config = parameters.model.config().text;
         if (config.ple) {

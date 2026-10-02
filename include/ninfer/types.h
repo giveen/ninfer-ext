@@ -241,10 +241,9 @@ struct EngineOptions {
     std::optional<std::uint32_t> prefill_chunk;
     // Width a prefill step takes when no decode work is waiting, a multiple of prefill_chunk.
     // Empty selects prefill_chunk when prefill_chunk is set, else the model's default: the widest
-    // candidate whose runtime reservation fits beside the requested KV capacity and, for a
-    // host-resident-expert model, leaves the automatic expert cache at or above 75 % of its
-    // chunk-width size. Candidates are 4096/2048/1024, or the powers of two up to 32768 (bounded
-    // by max_context) for Qwen4Exp.
+    // candidate whose runtime reservation fits beside the requested KV capacity. Candidates are
+    // 4096/2048/1024, or the powers of two up to 16384 (bounded by max_context) for Qwen4Exp, whose
+    // wide arena is borrowed from the expert cache and returned between wide steps.
     std::optional<std::uint32_t> idle_prefill_chunk;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // KV streaming: each request keeps a bounded Device window of Main/MTP KV pages; older full
