@@ -1,0 +1,1 @@
+{"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "Count from 1 to 300, one integer per line, nothing else."}], "max_tokens": 256, "temperature": 0, "stream": false}
