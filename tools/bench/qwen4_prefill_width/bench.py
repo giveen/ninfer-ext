@@ -81,8 +81,10 @@ class Server:
         cmd = [
             SERVE, ART, "--model-id", "qwen3.8-flash-next",
             "--host", HOST, "--port", str(PORT),
-            "--max-concurrency", "8", "--max-context", "262144", "--kv-capacity", "262144",
-            "--kv-dtype", kv, "--expert-cache", "auto", "--ngram-residency", "stream",
+            "--max-concurrency", os.environ.get("BENCH_MAXC", "8"), "--max-context", "262144",
+            "--kv-capacity", "262144",
+            "--kv-dtype", kv, "--expert-cache", "auto", "--ngram-residency",
+            os.environ.get("BENCH_NGRAM", "stream"),
             "--no-prefix-reuse", *sample_flags, "--no-thinking",
             "--log-stats-interval-ms", str(stats_ms),
             "--request-log-jsonl", self.jsonl,
