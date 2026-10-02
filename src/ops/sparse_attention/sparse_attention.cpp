@@ -76,14 +76,19 @@ void qsa_append(const Tensor& k, const Tensor& v, const Tensor& index_keys,
 }
 
 std::size_t qsa_select_workspace_bytes(const QsaGeometry& geometry, std::uint32_t max_visible_keys,
-                                       std::int32_t columns) {
-    if (geometry.ratio <= 0 || columns <= 0) {
+                                       std::int32_t columns, std::int32_t lanes) {
+    if (geometry.ratio <= 0 || columns <= 0 || lanes <= 0) {
         throw std::invalid_argument("qsa_select_workspace_bytes: invalid geometry");
     }
     const std::size_t blocks = max_visible_keys / static_cast<std::uint32_t>(geometry.ratio) + 1;
-    return blocks * sizeof(float) *
-               static_cast<std::size_t>(detail::qsa_select_pass_columns(columns)) +
-           256;
+    std::size_t bytes        = blocks * sizeof(float) *
+                                   static_cast<std::size_t>(detail::qsa_select_pass_columns(columns)) +
+                               256;
+    if (lanes == 1) {
+        // Pooled block keys [1, blocks, index_dim], computed once per call.
+        bytes += blocks * sizeof(float) * static_cast<std::size_t>(geometry.index_dim);
+    }
+    return bytes;
 }
 
 void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
@@ -118,12 +123,24 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
     }
     const std::int32_t max_blocks = static_cast<std::int32_t>(
         max_visible_keys / static_cast<std::uint32_t>(geometry.ratio) + 1);
+    const std::int32_t lanes = static_cast<std::int32_t>(cache_positions.ne[1]);
     auto scope   = workspace.scope();
-    auto scratch = workspace.alloc_bytes(
-        qsa_select_workspace_bytes(geometry, max_visible_keys, static_cast<std::int32_t>(columns)));
+    auto scratch = workspace.alloc_bytes(qsa_select_workspace_bytes(
+        geometry, max_visible_keys, static_cast<std::int32_t>(columns), lanes));
+    float* scores = static_cast<float*>(scratch.data);
+    float* pooled = nullptr;
+    if (lanes == 1) {
+        // The pooled block keys follow the per-column score rows in the same allocation.
+        const std::size_t scores_bytes =
+            static_cast<std::size_t>(max_blocks) *
+            static_cast<std::size_t>(
+                detail::qsa_select_pass_columns(static_cast<std::int32_t>(columns))) *
+            sizeof(float);
+        pooled = reinterpret_cast<float*>(static_cast<std::byte*>(scratch.data) + scores_bytes);
+    }
     detail::qsa_select_launch(index_query, query_rope_positions, cache_positions, valid_columns,
                               table_rows, query_norm, key_norm, index, geometry, max_blocks,
-                              static_cast<float*>(scratch.data), selected, counts, stream);
+                              scores, pooled, selected, counts, stream);
 }
 
 std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns) {

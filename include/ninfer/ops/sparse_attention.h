@@ -72,7 +72,8 @@ void qsa_append(const Tensor& k, const Tensor& v, const Tensor& index_keys,
 
 [[nodiscard]] std::size_t qsa_select_workspace_bytes(const QsaGeometry& geometry,
                                                      std::uint32_t max_visible_keys,
-                                                     std::int32_t columns);
+                                                     std::int32_t columns,
+                                                     std::int32_t lanes = 1);
 
 /**
  * Select the visible cache indices of every query column.
