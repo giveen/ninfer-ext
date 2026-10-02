@@ -222,7 +222,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, logger),
-      generation_token_trace_jsonl_(options_.generation_token_trace_jsonl, std::move(logger)) {
+      generation_token_trace_jsonl_(options_.generation_token_trace_jsonl, std::move(logger)),
+      metrics_(options_.max_context) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -271,12 +272,14 @@ void HttpServer::record_request_start(const RequestLogContext& context) {
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
+    metrics_.observe_rejection(context.error.status);
 }
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
+    metrics_.observe_done(outcome);
 }
 
 void HttpServer::record_generation_token_trace(const RequestLogContext& context,
@@ -292,6 +295,7 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
+    metrics_.observe_failure(failure.classification);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
@@ -369,7 +373,9 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // Health and Prometheus scrapes carry no credentials, as in vLLM.
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/metrics" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -448,6 +454,9 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_metrics(req, res);
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -500,6 +509,15 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
                     "application/json");
 }
 
+void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        res.status = 503;
+        return;
+    }
+    res.set_content(metrics_.render(service_->runtime_stats()),
+                    std::string(ServeMetrics::kContentType));
+}
+
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
     if (id != public_model_id_) {
@@ -525,6 +543,7 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_name);
     model_metadata_                = service.model_metadata();
+    metrics_.attach(public_model_id_, service.memory_summary(), service.runtime_stats());
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,

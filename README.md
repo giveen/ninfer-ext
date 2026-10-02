@@ -105,7 +105,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The server speaks OpenAI Chat Completions and Responses, and Anthropic Messages, including
 streaming and tools. `--model-id` changes the model name it reports; `--host 0.0.0.0` exposes it
-beyond localhost, and `--api-key` requires a key.
+beyond localhost, and `--api-key` requires a key. `GET /metrics` serves Prometheus metrics named
+after vLLM's ([Metrics](docs/serving.md#metrics)).
 
 For a one-shot answer without a server:
 
@@ -773,6 +774,8 @@ describes the planner.
 - Offline perplexity scoring (`ninfer-perplexity`).
 - OpenAI Responses and Chat Completions, and Anthropic Messages, including streaming, tools, token
   counting and usage.
+- Prometheus `/metrics` with vLLM-style names: request, token, latency, KV and speculative
+  decoding metrics.
 
 **Limits:**
 

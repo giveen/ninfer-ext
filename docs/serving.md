@@ -70,6 +70,7 @@ selected for this process.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Engine readiness |
+| `GET /metrics` | Prometheus metrics; see [Metrics](#metrics) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -96,6 +97,66 @@ a dead or unacknowledging peer is normally cancelled within about 20 seconds, in
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
 connection when the downstream client disappears.
+
+## Metrics
+
+`GET /metrics` returns Prometheus text exposition format 0.0.4
+(`text/plain; version=0.0.4; charset=utf-8`). It is always enabled and, like `/health`,
+unauthenticated. Names follow vLLM's with the `ninfer:` prefix in place of `vllm:`;
+`n_decode_total`, `n_busy_slots_per_decode` and the `spec_decode_*` counters follow llama.cpp's
+names. There is no `engine` label. Every sample carries the
+`model_name` label (the `--model-id` alias). Histograms use vLLM's default buckets; the
+token-count histograms use its 1-2-5 series capped at `--max-context`.
+
+A scrape reads the Engine's published counters and never waits for GPU work, so it answers
+immediately while requests are running.
+
+Gauges, read at scrape time:
+
+| Metric | Meaning |
+|---|---|
+| `ninfer:num_requests_running` | requests occupying an Engine lane (prefill or decode) |
+| `ninfer:num_requests_waiting` | requests submitted to the Engine and waiting for a lane |
+| `ninfer:kv_cache_usage_perc` | Device Main KV pages occupied (written, reserved for growth, or retained by the context cache) over the pool; 0 to 1. Unlike vLLM, which counts evictable prefix-cache blocks as free, retained context-cache pages count as used, so an idle server with a warm cache reports above 0; admission pressure can still evict them |
+| `ninfer:kv_cache_capacity_tokens` | Device Main KV pool capacity in tokens |
+| `ninfer:n_busy_slots_per_decode` | mean requests per decode batch since startup |
+
+Counters that advance while a request runs (Engine counters, startup warmup excluded):
+
+| Metric | Meaning |
+|---|---|
+| `ninfer:prompt_tokens_total` | prompt tokens: computed by prefill plus reused from the prefix cache |
+| `ninfer:prompt_tokens_cached_total`, `ninfer:prefix_cache_hits_total` | prompt tokens reused from the prefix cache |
+| `ninfer:prefix_cache_queries_total` | same as `prompt_tokens_total` |
+| `ninfer:generation_tokens_total` | tokens committed by decode rounds, plus the first token of each completed request |
+| `ninfer:n_decode_total` | decode batch executions |
+
+Counters and histograms observed once, when a request finishes:
+
+| Metric | Meaning |
+|---|---|
+| `ninfer:request_success_total{finished_reason}` | completed requests: `stop` (stop token, stop string or tool call), `length` (output limit or context capacity), `abort` (Engine cancellation) |
+| `ninfer:request_failure_total{reason}` | failed or rejected requests: `client_input`, `client_disconnected`, `overload`, `timeout`, `unavailable`, `upstream`, `internal` |
+| `ninfer:time_to_first_token_seconds` | start of prompt preparation (templating, tokenization) to first output token |
+| `ninfer:e2e_request_latency_seconds` | start of prompt preparation to completion |
+| `ninfer:request_queue_time_seconds` | wait for an Engine lane |
+| `ninfer:request_prefill_time_seconds` | admission to first output token |
+| `ninfer:request_decode_time_seconds` | first to last output token |
+| `ninfer:request_time_per_output_token_seconds` | decode time per output token after the first; requests with at least two tokens |
+| `ninfer:request_prompt_tokens`, `ninfer:request_generation_tokens` | per-request token counts |
+| `ninfer:spec_decode_num_drafts_total` | speculative verification rounds (model drafts and prompt lookup) |
+| `ninfer:spec_decode_num_draft_tokens_total`, `ninfer:spec_decode_num_accepted_tokens_total` | proposed and accepted draft tokens |
+| `ninfer:spec_decode_num_accepted_tokens_per_pos_total{position}` | accepted model-draft tokens by draft position |
+
+A client that disconnects mid-request counts as `request_failure_total{reason="client_disconnected"}`,
+not as `abort`. Requests refused while their body is parsed (malformed JSON, invalid fields, an
+unknown model) are not counted; refusals after parsing, such as `429` overload, are. Time
+histograms and per-request token histograms omit failed requests; `generation_tokens_total`
+includes the decode tokens they produced, but not their first token.
+
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep -v '^#'
+```
 
 ## Models
 
@@ -836,7 +897,8 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. `GET /health`, `GET /metrics` and CORS preflight requests remain
+unauthenticated.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
