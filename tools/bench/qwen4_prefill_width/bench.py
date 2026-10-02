@@ -64,8 +64,10 @@ def wait_ready(proc, log_path, seconds=900):
 
 
 class Server:
-    def __init__(self, idle, spec, tag, stats_ms=0):
+    def __init__(self, idle, spec, tag, stats_ms=0, kv=None):
         self.tag = tag
+        if kv is None:
+            kv = os.environ.get("BENCH_KV", "fp8")
         self.jsonl = f"{AB}/bench-{tag}.jsonl"
         self.log = f"{AB}/bench-{tag}.log"
         for p in (self.jsonl, self.log):
@@ -75,7 +77,7 @@ class Server:
             SERVE, ART, "--model-id", "qwen3.8-flash-next",
             "--host", HOST, "--port", str(PORT),
             "--max-concurrency", "8", "--max-context", "262144", "--kv-capacity", "262144",
-            "--kv-dtype", "fp8", "--expert-cache", "auto", "--ngram-residency", "stream",
+            "--kv-dtype", kv, "--expert-cache", "auto", "--ngram-residency", "stream",
             "--no-prefix-reuse", "--greedy", "--no-thinking",
             "--log-stats-interval-ms", str(stats_ms),
             "--request-log-jsonl", self.jsonl,
@@ -284,7 +286,14 @@ def main():
         for spec in specs:
             tag = f"{idle}-{spec}"
             print(f"=== server {tag} ===", flush=True)
-            server = Server(idle, spec, tag)
+            server = Server(idle, spec, tag, kv=os.environ.get("BENCH_KV", "fp8"))
+            e = server.start
+            print(
+                f"  kv={e.get('kv_cache')} idle={e.get('idle_prefill_chunk')} "
+                f"slots={e.get('expert_cache_slots')} "
+                f"cacheGiB={(e.get('expert_cache_bytes', 0) / 2**30):.2f}",
+                flush=True,
+            )
             meta.append(
                 {
                     "tag": tag,
