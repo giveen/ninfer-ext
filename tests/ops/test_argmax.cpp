@@ -142,6 +142,9 @@ int main() {
     failures += run_case(131072, 131072, 1);
     failures += run_case(131072, 131072, 15);
     failures += run_case(131072, 131072, 120);
+    // Physical row counts that are not a multiple of 8 take the scalar fallback route.
+    failures += run_case(248319, 248077, 8);
+    failures += run_case(131071, 131071, 15);
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }
