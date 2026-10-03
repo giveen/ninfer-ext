@@ -73,6 +73,11 @@ void test_options() {
            "optional values were not parsed");
     expect(parse({"ninfer-quantize", "m.ninfer", "--list"}).list_only,
            "--list did not select the listing mode");
+    const app::QuantizeOptions experts =
+        parse({"ninfer-quantize", "m.ninfer", "--out", "o", "--hessians", "h", "--experts-only",
+               "--only", "text/layers/0/", "--calibrate-only"});
+    expect(experts.experts_only && experts.calibrate_only && experts.only == "text/layers/0/",
+           "--experts-only, --only and --calibrate-only were not parsed");
     expect(parse({"ninfer-quantize", "--help"}).help, "--help did not select help");
     expect_throws<std::invalid_argument>(
         [] { (void)parse({"ninfer-quantize", "m.ninfer", "--hessians", "h"}); },

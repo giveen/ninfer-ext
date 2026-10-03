@@ -207,7 +207,8 @@ std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots)
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending) {
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending,
+                 const MoeActivationTap* tap) {
     constexpr const char* op = "moe_experts";
     if (pending != nullptr) {
         require(pending->misses != nullptr && pending->fetched != nullptr, op,
@@ -271,6 +272,12 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
             c.fetched = pending->fetched;
         }
         detail::moe_experts_chunk_launch(c, stream);
+        if (tap != nullptr && *tap) {
+            Tensor act(c.act, DType::BF16, {kOffloadMoeIntermediate, count * kOffloadMoeTopK});
+            Tensor ids(const_cast<std::int32_t*>(c.expert_ids), DType::I32,
+                       {kOffloadMoeTopK, count});
+            (*tap)(act, ids, stream);
+        }
     }
 }
 

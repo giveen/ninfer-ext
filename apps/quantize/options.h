@@ -32,6 +32,9 @@ struct QuantizeOptions {
     bool hq                     = false;
     std::uint64_t seed          = 0;
     bool list_only              = false;
+    bool calibrate_only         = false;
+    bool experts_only           = false; // quantize routed experts only (dense stays as converted)
+    std::string only;                // quantize only parents whose name contains this text
     std::int64_t limit          = 0; // 0 selects every eligible parameter
     OutScaleMode out_scales     = OutScaleMode::Auto;
     bool help                   = false;

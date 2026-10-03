@@ -276,6 +276,9 @@ private:
     void qwen4_ple(const PleParameters& p, const Tensor& embedding, Phase phase, Tensor& wide);
     void qwen4_moe(const OffloadMoeParameters& p, const Tensor& x, std::int32_t cache_layer,
                    Tensor& y);
+    // Offline calibration: route every token through every expert on scratch outputs so each
+    // expert's down projection observes the whole calibration set.
+    void qwen4_capture_all_experts(const Tensor& x, const ops::ExpertWeights& staged, int layer);
     void qwen4_block(const Qwen4BlockParameters& p, Tensor& wide, Phase phase,
                      const Qwen4Sequence& sequence, const PagedKVCache& cache,
                      std::uint32_t kv_layer, int gdn_index, std::int32_t cache_layer,

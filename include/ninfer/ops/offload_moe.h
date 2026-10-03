@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace ninfer::ops {
 
@@ -168,10 +169,20 @@ struct MoeExpertsPending {
     cudaEvent_t fetched;
 };
 
+/**
+ * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
+ * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
+ * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
+ * Serving never passes a tap.
+ */
+using MoeActivationTap =
+    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
+
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr);
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr,
+                 const MoeActivationTap* tap = nullptr);
 
 [[nodiscard]] std::size_t moe_experts_a4_workspace_bytes(std::int32_t tokens);
 
