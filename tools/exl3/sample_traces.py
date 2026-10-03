@@ -451,11 +451,13 @@ def read_generated_token_trace(path: Path) -> list[dict[str, Any]]:
             raise RuntimeError(f"token trace line {line_number} is not an object")
         if (
             record.get("schema") != "ninfer_generated_token_trace"
-            or record.get("schema_version") != 1
+            or record.get("schema_version") != 2
             or not isinstance(record.get("request_id"), int)
             or not isinstance(record.get("prompt_tokens"), int)
             or not isinstance(record.get("completion_tokens"), int)
             or not isinstance(record.get("generated_token_ids"), list)
+            or not isinstance(record.get("prompt_token_ids"), list)
+            or len(record["prompt_token_ids"]) != record["prompt_tokens"]
         ):
             raise RuntimeError(f"token trace line {line_number} has an invalid schema")
         token_ids = record["generated_token_ids"]
