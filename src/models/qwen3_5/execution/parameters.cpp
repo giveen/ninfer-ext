@@ -444,13 +444,20 @@ public:
 
     PleParameters ple(const PleWeights& w) const {
         const auto& table = model_.weight(w.table);
-        if (table.mapped.empty() || table.mapped_geometry.format != QType::FP8_E4M3FN_ROW_BF16) {
-            throw std::invalid_argument("PLE table must be a file-mapped row-scaled FP8 matrix");
+        const auto& geometry = table.mapped_geometry;
+        if (table.mapped.empty() || (geometry.format != QType::FP8_E4M3FN_ROW_BF16 &&
+                                     geometry.format != QType::Q4_G32_FP16_ROWS)) {
+            throw std::invalid_argument(
+                "PLE table must be a file-mapped row-scaled FP8 or row-grouped 4-bit matrix");
         }
         PleParameters out;
-        out.table =
-            PleTable{table.mapped, table.view.shape[0], dimension(table.view.shape[1]),
-                     table.mapped_geometry.code_bytes_per_row, table.mapped_geometry.scale_offset};
+        out.table = PleTable{table.mapped,
+                             table.view.shape[0],
+                             dimension(table.view.shape[1]),
+                             geometry.code_bytes_per_row,
+                             geometry.scale_offset,
+                             geometry.scale_bytes_per_row,
+                             geometry.format};
         out.key_value =
             ops::prepare_linear_weight(std::array{model_.input(w.key), model_.input(w.value)});
         out.key_norm    = tensor(w.key_norm);

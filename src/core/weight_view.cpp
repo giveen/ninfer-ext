@@ -142,6 +142,18 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = 2;
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::RowGroup) {
+        // Signed 4-bit codes in groups of 32 with one binary16 scale each; rows carry no padding, so
+        // a row is addressable by its index alone (K/2 code bytes, K/32 scale words).
+        if (format != QType::Q4_G32_FP16_ROWS) {
+            throw std::invalid_argument("RowGroup requires the row-grouped 4-bit format");
+        }
+        if (k % 32 != 0) { throw std::invalid_argument("RowGroup requires K%32=0"); }
+        out.group_size          = 32;
+        out.code_bytes_per_row  = k / 2;
+        out.scale_bytes_per_row = k / 32 * 2;
+        out.code_bytes          = mul(n, out.code_bytes_per_row);
+        out.scale_offset        = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::BlockScaleK16M128x4) {
         if (format != QType::NVFP4 || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");

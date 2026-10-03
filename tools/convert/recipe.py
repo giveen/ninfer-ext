@@ -15,6 +15,7 @@ from tools.artifact.formats import (
     DirectFormat,
     Exl3Format,
     Fp8RowFormat,
+    RowGroupFormat,
     Nvfp4Format,
     get_format,
 )
@@ -31,6 +32,7 @@ from .methods import (
     import_encoded,
     nvfp4_absmax,
     nvfp4_mse,
+    q4_rows_maxabs,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -71,6 +73,8 @@ def default_layout(format: str) -> str:
         return "contiguous_le_v1"
     if isinstance(kind, Fp8RowFormat):
         return "row_scale_v1"
+    if isinstance(kind, RowGroupFormat):
+        return "row_group_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
     if isinstance(kind, Exl3Format):
@@ -492,6 +496,7 @@ class Recipe:
             import_encoded,
             nvfp4_absmax,
             nvfp4_mse,
+            q4_rows_maxabs,
         )
         for names in self.model.packing_groups:
             if any(

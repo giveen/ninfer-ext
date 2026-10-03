@@ -32,6 +32,21 @@ float e4m3fn(std::uint8_t code) {
     return sign != 0 ? -magnitude : magnitude;
 }
 
+// Exact binary16 to binary32 (the scales are finite and nonnegative, but subnormals are handled).
+float half_to_float(std::uint16_t word) {
+    const std::uint32_t sign     = (static_cast<std::uint32_t>(word) & 0x8000U) << 16;
+    const std::uint32_t exponent = (word >> 10) & 0x1FU;
+    const std::uint32_t fraction = word & 0x3FFU;
+    if (exponent == 0) {
+        const float magnitude = std::ldexp(static_cast<float>(fraction), -24);
+        return sign != 0 ? -magnitude : magnitude;
+    }
+    if (exponent == 0x1F) {
+        return std::bit_cast<float>(sign | 0x7F800000U | (fraction << 13));
+    }
+    return std::bit_cast<float>(sign | ((exponent + 112U) << 23) | (fraction << 13));
+}
+
 float bf16_to_float(std::uint16_t word) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16);
 }
@@ -54,8 +69,17 @@ PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream
         static_cast<std::uint64_t>(row_width_) * config.heads() != width_) {
         throw std::invalid_argument("PLE gather configuration is inconsistent");
     }
+    const bool grouped = table.format == QType::Q4_G32_FP16_ROWS;
+    if (!grouped && table.format != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("PLE table format is not a decodable n-gram table");
+    }
+    // FP8 rows carry one byte per value and one BF16 multiplier; 4-bit rows two values per byte and a
+    // binary16 scale per group of 32.
+    const std::uint64_t expected_bytes = grouped ? row_width_ / 2U : row_width_;
+    const std::uint64_t expected_scale = grouped ? row_width_ / 32U * 2U : 2U;
     if (table.rows != config.table_rows || table.width != static_cast<std::int32_t>(row_width_) ||
-        table.row_bytes < row_width_ || table.segments.empty()) {
+        table.row_bytes != expected_bytes || table.scale_row_bytes != expected_scale ||
+        (grouped && row_width_ % 32U != 0) || table.segments.empty()) {
         throw std::invalid_argument("PLE table does not match its configuration");
     }
     for (std::uint32_t head = 0; head < config.heads(); ++head) {
@@ -124,6 +148,24 @@ void PleGather::column_rows(std::span<const std::int32_t> tokens, std::size_t po
 
 void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
                            std::uint16_t* out) const {
+    if (table_.format == QType::Q4_G32_FP16_ROWS) {
+        // Element 2i is the low nibble of byte i and 2i+1 the high nibble; a stored nibble is the
+        // signed code plus 8, and each group of 32 shares one binary16 scale.
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(codes);
+        for (std::uint32_t group = 0; group < row_width_ / 32U; ++group) {
+            std::uint16_t scale_word;
+            std::memcpy(&scale_word, scale_bytes + group * 2U, 2);
+            const float scale = half_to_float(scale_word);
+            for (std::uint32_t i = 0; i < 32U; i += 2U) {
+                const std::uint8_t packed = bytes[group * 16U + i / 2U];
+                const float low           = static_cast<float>((packed & 0xF) - 8) * scale;
+                const float high          = static_cast<float>((packed >> 4) - 8) * scale;
+                out[group * 32U + i]      = float_to_bf16(low);
+                out[group * 32U + i + 1U] = float_to_bf16(high);
+            }
+        }
+        return;
+    }
     std::uint16_t scale_word;
     std::memcpy(&scale_word, scale_bytes, 2);
     const float scale = bf16_to_float(scale_word);
@@ -146,8 +188,10 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
     if (reader_) {
         std::vector<PleRowReader::Range> ranges(2 * rows.size());
         for (std::size_t r = 0; r < rows.size(); ++r) {
-            ranges[2 * r]     = {rows[r] * table_.row_bytes, row_width_};
-            ranges[2 * r + 1] = {table_.scale_plane + rows[r] * 2U, 2U};
+            ranges[2 * r] = {rows[r] * table_.row_bytes,
+                             static_cast<std::uint32_t>(table_.row_bytes)};
+            ranges[2 * r + 1] = {table_.scale_plane + rows[r] * table_.scale_row_bytes,
+                                 static_cast<std::uint32_t>(table_.scale_row_bytes)};
         }
         reader_->read(ranges);
     }
@@ -155,10 +199,12 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         for (std::size_t i = begin; i < end; ++i) {
             for (std::uint32_t head = 0; head < heads; ++head) {
                 const std::size_t r = i * heads + head;
-                const std::byte* codes =
-                    reader_ ? reader_->data(2 * r) : locate(rows[r] * table_.row_bytes, row_width_);
-                const std::byte* scale = reader_ ? reader_->data(2 * r + 1)
-                                                 : locate(table_.scale_plane + rows[r] * 2U, 2);
+                const std::byte* codes = reader_ ? reader_->data(2 * r)
+                                                 : locate(rows[r] * table_.row_bytes, table_.row_bytes);
+                const std::byte* scale =
+                    reader_ ? reader_->data(2 * r + 1)
+                            : locate(table_.scale_plane + rows[r] * table_.scale_row_bytes,
+                                     table_.scale_row_bytes);
                 decode_row(codes, scale,
                            out.data() + i * width_ + static_cast<std::size_t>(head) * row_width_);
             }

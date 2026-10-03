@@ -21,6 +21,7 @@ from .formats import (
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
+    RowGroupFormat,
     get_format,
 )
 
@@ -80,6 +81,20 @@ class RowScaleGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class RowGroupGeometry:
+    n: int
+    k: int
+    group_size: int
+    groups_per_row: int
+    code_row_bytes: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_row_bytes: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class Exl3Geometry:
     n: int
     k: int
@@ -112,6 +127,7 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+ROW_GROUP_V1 = Layout("row_group_v1", 256, frozenset(("q4_g32_fp16_rows",)))
 TRELLIS_T16_V1 = Layout("trellis_t16_v1", 256, frozenset(("exl3_mul1",)))
 
 LAYOUTS = MappingProxyType(
@@ -122,6 +138,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            ROW_GROUP_V1,
             TRELLIS_T16_V1,
         )
     }
@@ -277,6 +294,37 @@ def row_scale_geometry(
     )
 
 
+def row_group_geometry(
+    format: str | RowGroupFormat, shape: Sequence[int]
+) -> RowGroupGeometry:
+    spec = _format(format)
+    if not isinstance(spec, RowGroupFormat):
+        raise ValueError("row_group_v1 requires a row-grouped format")
+    n, k = _shape(shape, rank=2)
+    if k % spec.group_size or k % 2:
+        raise ValueError(
+            f"row_group_v1 needs K to be a multiple of {spec.group_size}; got {k}"
+        )
+    groups = k // spec.group_size
+    code_row_bytes = k // 2
+    code_plane_bytes = n * code_row_bytes
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_row_bytes = groups * 2
+    scale_plane_bytes = n * scale_row_bytes
+    return RowGroupGeometry(
+        n=n,
+        k=k,
+        group_size=spec.group_size,
+        groups_per_row=groups,
+        code_row_bytes=code_row_bytes,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_row_bytes=scale_row_bytes,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def exl3_geometry(
     format: str | Exl3Format,
     shape: Sequence[int],
@@ -373,6 +421,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_GROUP_V1:
+        if not isinstance(numeric_spec, RowGroupFormat):
+            raise ValueError("row_group_v1 requires a row-grouped format")
+        return row_group_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is TRELLIS_T16_V1:
         if not isinstance(numeric_spec, Exl3Format):
             raise ValueError("trellis_t16_v1 requires exl3_mul1")

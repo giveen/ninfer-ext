@@ -63,7 +63,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Imported NVFP4 routed experts (MTP bank re-encoded from block FP8), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | None; `--model` is the ModelOpt NVFP4 checkpoint |
 | `qwen3_8_flash_next_bf16` | Every Text/MTP projection at full BF16 precision, experts in the NVFP4 recipe's per-layer banks, FP8 n-gram table (the EXL3 expert quantizer's input) | None |
-| `qwen3_8_flash_next_exl3` | EXL3 routed experts from `ninfer-quantize` (one bank per layer with an input-scale set per expert), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | `quantized` |
+| `qwen3_8_flash_next_exl3` | EXL3 routed experts from `ninfer-quantize` (one bank per layer with an input-scale set per expert), 4-bit (`q4_g32_fp16_rows`) n-gram table, Q6 projections, Q8 token embedding, Q6 output head | `quantized` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -206,11 +206,13 @@ The converter currently writes these formats:
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
+| `q4_g32_fp16_rows` | `q4_rows_maxabs` | Supply a custom method/source if needed |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 | `exl3_mul1` | Produced by `ninfer-quantize`, not by a recipe method | `import_encoded` |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
+`q4_rows_maxabs` stores signed 4-bit codes with one binary16 scale per group of 32 in unpadded rows.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
 

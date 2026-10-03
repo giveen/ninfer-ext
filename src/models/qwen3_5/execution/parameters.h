@@ -157,13 +157,16 @@ struct OffloadMoeParameters {
     ops::ExpertWeights bank; // host-pinned NVFP4 routed banks
 };
 
-// Host-mapped row-scaled FP8 n-gram table of one PLE layer.
+// Host-mapped n-gram table of one PLE layer: row-scaled FP8 (one BF16 multiplier per row) or 4-bit
+// group codes (one binary16 scale per group of 32).
 struct PleTable {
     std::vector<artifact::MappedObjectSegment> segments;
-    std::uint64_t rows        = 0;
-    std::int32_t width        = 0;
-    std::uint64_t row_bytes   = 0; // code bytes per stored row
-    std::uint64_t scale_plane = 0; // object offset of the BF16 row multipliers
+    std::uint64_t rows            = 0;
+    std::int32_t width            = 0;
+    std::uint64_t row_bytes       = 0; // code bytes per stored row
+    std::uint64_t scale_plane     = 0; // object offset of the scale plane
+    std::uint64_t scale_row_bytes = 0; // scale bytes per stored row
+    QType format                  = QType::FP8_E4M3FN_ROW_BF16;
 };
 
 struct PleParameters {

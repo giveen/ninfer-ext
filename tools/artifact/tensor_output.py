@@ -11,6 +11,7 @@ import torch
 from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
+from .codecs.row_group import encode_row_group
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
@@ -18,11 +19,13 @@ from .formats import (
     Fp8RowFormat,
     Nvfp4Format,
     QuantFormat,
+    RowGroupFormat,
     get_format,
 )
 from .layouts import (
     block_scale_geometry,
     exl3_geometry,
+    row_group_geometry,
     row_scale_geometry,
     row_split_geometry,
 )
@@ -66,6 +69,9 @@ class TensorOutput:
             )
         elif isinstance(self.format, Fp8RowFormat):
             g = row_scale_geometry(self.format, obj.shape)
+            gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, RowGroupFormat):
+            g = row_group_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
@@ -122,6 +128,15 @@ class TensorOutput:
             self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
             self.write_bytes(
                 g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
+            )
+        elif isinstance(self.format, RowGroupFormat):
+            g = row_group_geometry(self.format, obj.shape)
+            local = row_group_geometry(self.format, (rows, k))
+            block = memoryview(encode_row_group(codes, scales, self.format, (rows, k)))
+            self.write_bytes(row_begin * g.code_row_bytes, block[: local.code_plane_bytes])
+            self.write_bytes(
+                g.scale_plane_offset + row_begin * g.scale_row_bytes,
+                block[local.scale_plane_offset :],
             )
         elif isinstance(self.format, Nvfp4Format):
             if row_begin % 128 or rows % 128 or weight_divisor is None:

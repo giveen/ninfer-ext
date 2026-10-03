@@ -29,6 +29,17 @@ class QuantFormat:
 
 
 @dataclass(frozen=True, slots=True)
+class RowGroupFormat:
+    """Signed grouped codes with one binary16 multiplier per group, rows packed without padding."""
+
+    name: str
+    bits: int
+    group_size: int
+    qmin: int
+    qmax: int
+
+
+@dataclass(frozen=True, slots=True)
 class Nvfp4Format:
     """E2M1 weights with one E4M3FN scale word per K-axis group."""
 
@@ -51,7 +62,12 @@ class Exl3Format:
 
 
 NumericFormat: TypeAlias = (
-    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Exl3Format
+    DirectFormat
+    | QuantFormat
+    | RowGroupFormat
+    | Nvfp4Format
+    | Fp8RowFormat
+    | Exl3Format
 )
 
 
@@ -63,6 +79,7 @@ Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
+Q4_G32_FP16_ROWS = RowGroupFormat("q4_g32_fp16_rows", 4, 32, -8, 7)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 EXL3_MUL1 = Exl3Format("exl3_mul1")
@@ -72,6 +89,7 @@ DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT3
 QUANT_FORMATS = MappingProxyType(
     {item.name: item for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)}
 )
+ROW_GROUP_FORMATS = MappingProxyType({Q4_G32_FP16_ROWS.name: Q4_G32_FP16_ROWS})
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
 EXL3_FORMATS = MappingProxyType({EXL3_MUL1.name: EXL3_MUL1})
@@ -79,6 +97,7 @@ NUMERIC_FORMATS = MappingProxyType(
     {
         **DIRECT_FORMATS,
         **QUANT_FORMATS,
+        **ROW_GROUP_FORMATS,
         **NVFP4_FORMATS,
         **FP8_ROW_FORMATS,
         **EXL3_FORMATS,
@@ -162,17 +181,20 @@ __all__ = [
     "Q5_G64_FP16",
     "Q6_G64_FP16",
     "Q8_G32_FP16",
+    "Q4_G32_FP16_ROWS",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
     "EXL3_MUL1",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
+    "ROW_GROUP_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
     "EXL3_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
+    "RowGroupFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
     "Exl3Format",

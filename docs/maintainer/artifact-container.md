@@ -321,6 +321,7 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | q8_g32_fp16 | Codes `[-127,127]`，G32，FP16 multiplier |
 | nvfp4 | E2M1 codes、G16 E4M3FN block scale、FP32 weight divisor |
 | fp8_e4m3fn_row_bf16 | E4M3FN codes，每行一个 BF16 multiplier |
+| q4_g32_fp16_rows | Signed 4-bit codes，行内 G32，FP16 multiplier，行无 K padding |
 
 量化名字末尾的 FP16/BF16 表示 scale 类型。激活计算许可在 uses 中表达。
 Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-formats.md)解释。
@@ -337,6 +338,7 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 | row_split_k128_v1 | q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |
+| row_group_v1 | q4_g32_fp16_rows，正 rank-2 `[N,K]`，`K%32=0` | 256 |
 | raw_bytes_v1 | Resource，非空字节串 | 1 |
 
 Byte packing、planes、内部 padding、swizzle 和 encoded-size 公式由

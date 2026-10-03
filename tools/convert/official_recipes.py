@@ -7,6 +7,7 @@ from .methods import (
     fp8_row_maxabs,
     grouped_absmax,
     import_encoded,
+    q4_rows_maxabs,
     nvfp4_absmax,
 )
 from .sources.compressed_tensors import compressed_matrix_source
@@ -18,6 +19,7 @@ Q5 = "q5_g64_fp16"
 Q6 = "q6_g64_fp16"
 Q8 = "q8_g32_fp16"
 FP8 = "fp8_e4m3fn_row_bf16"
+Q4ROWS = "q4_g32_fp16_rows"
 
 
 def _assign(recipe, name, format, *, source=None):
@@ -425,9 +427,10 @@ def qwen3_8_flash_next_exl3(model, recipe, sources):
     output scales; each layer's gate/up and down banks keep the NVFP4 recipe's expert-major order,
     and because the matrices were quantized apart each bank object stores one input-scale set per
     expert. An expert missing from the store is an error: leaving it at another precision would
-    make the bank unexecutable. The n-gram table keeps its FP8 codes when the source stores them
-    and is row-quantized otherwise. Dense projections become Q8 (the output head Q6); routers,
-    shared-expert gates, norms and small vectors stay direct.
+    make the bank unexecutable. The n-gram table is quantized to 4-bit group codes (row_group_v1,
+    group of 32 with a binary16 scale, about 4.5 bits per value); its noise cost was measured at KL
+    0.016 against the FP8 table. Dense projections become Q6 (the output head Q6, the token
+    embedding Q8); routers, shared-expert gates, norms and small vectors stay direct.
     """
     if model.config.get("model_type") != "qwen4_exp_text":
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
@@ -440,10 +443,7 @@ def qwen3_8_flash_next_exl3(model, recipe, sources):
             continue
         encoded = parameter.source.read_encoded is not None
         if name.endswith("/ple/table"):
-            if encoded:
-                recipe.assign(name, format=FP8, method=import_encoded, source=parameter.source)
-            else:
-                recipe.assign(name, format=FP8, method=fp8_row_maxabs)
+            recipe.assign(name, format=Q4ROWS, method=q4_rows_maxabs)
             continue
         if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
             "text/token_embedding",
@@ -460,7 +460,7 @@ def qwen3_8_flash_next_exl3(model, recipe, sources):
                 source=exl3_matrix_source(store, name, parameter.shape),
             )
             continue
-        _assign(recipe, name, Q8)
+        _assign(recipe, name, Q6)
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
