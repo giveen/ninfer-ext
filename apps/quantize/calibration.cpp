@@ -118,8 +118,16 @@ public:
         } else if (slot.k != k) {
             throw std::runtime_error("calibration site changed its input width");
         }
-        ninfer::quantize::exl3::accumulate_hessian_kt(
-            static_cast<const __nv_bfloat16*>(input.data), tokens, k, slot.data, stream);
+        // ne[0] = k is the fastest axis of an ordinary activation ([token][k] in memory); only a
+        // transposed view (tokens fastest) takes the K x tokens reduction.
+        const auto* data = static_cast<const __nv_bfloat16*>(input.data);
+        if (input.nb[0] == 2 && input.nb[1] == 2 * k) {
+            ninfer::quantize::exl3::accumulate_hessian(data, tokens, k, slot.data, stream);
+        } else if (input.nb[1] == 2 && input.nb[0] == 2 * tokens) {
+            ninfer::quantize::exl3::accumulate_hessian_kt(data, tokens, k, slot.data, stream);
+        } else {
+            throw std::runtime_error("calibration activation is neither [token][k] nor [k][token]");
+        }
     }
 
     // Copy every observed Hessian to host and write one file per name that shares it.
