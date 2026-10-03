@@ -3,6 +3,7 @@
 // buffer and are decoded in registers; activations stay BF16 (A16). Every assignment (k,t) owns
 // its own intermediate and partial output, and the merge sums k in order, so cache placement and
 // job order never change a result.
+#include "ops/offload_moe/jobs.cuh"
 #include "ops/offload_moe/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -24,7 +25,7 @@ constexpr int H                         = kOffloadMoeHidden;
 constexpr int E                         = kOffloadMoeExperts;
 constexpr int K                         = kOffloadMoeTopK;
 constexpr int I                         = kOffloadMoeIntermediate;
-constexpr int kJobTokens                = 64;
+
 
 __device__ __constant__ float kE2m1[16] = {0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
                                            -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
@@ -517,66 +518,6 @@ __global__ void __launch_bounds__(kJobThreads)
 
 constexpr int kTile = 64;
 
-struct JobView {
-    int begin;
-    int count;
-    int slot;
-    int expert;
-};
-
-// Selects which jobs a projection pass runs: all of them, or only the slots that are (not) listed
-// in a resolve miss list.
-struct JobFilter {
-    const std::int32_t* misses; // [count, (slot, expert)...]; null runs every job
-    bool missed;                // run the listed slots (true) or the others (false)
-
-    __device__ __forceinline__ bool admits(int slot) const {
-        if (misses == nullptr) { return true; }
-        const int count = misses[0];
-        bool listed     = false;
-        for (int j = 0; j < count && !listed; ++j) { listed = misses[1 + 2 * j] == slot; }
-        return listed == missed;
-    }
-};
-
-// First assignment and slot of this CTA's job; count 0 when the CTA has no job or `filter` skips
-// it.
-__device__ __forceinline__ JobView job_head(const std::int32_t* jobs, const std::int32_t* job_count,
-                                            const std::int32_t* sorted_slot, JobFilter filter) {
-    JobView view{-1, 0, -1, -1};
-    const int job = static_cast<int>(blockIdx.x);
-    if (job >= *job_count) { return view; }
-    view.begin = jobs[job];
-    view.slot  = sorted_slot[view.begin];
-    if (!filter.admits(view.slot)) { return view; }
-    view.count = 1;
-    return view;
-}
-
-// Token count and expert of a job whose head is known.
-__device__ __forceinline__ void job_tail(JobView& view, const std::int32_t* sorted_slot,
-                                         const std::int32_t* sorted_assign,
-                                         const std::int32_t* expert_ids, int assignments) {
-    int count = 0;
-    while (count < kJobTokens && view.begin + count < assignments &&
-           sorted_slot[view.begin + count] == view.slot) {
-        ++count;
-    }
-    view.count  = count;
-    view.expert = expert_ids[sorted_assign[view.begin]];
-}
-
-__device__ __forceinline__ JobView load_job(const std::int32_t* jobs, const std::int32_t* job_count,
-                                            const std::int32_t* sorted_slot,
-                                            const std::int32_t* sorted_assign,
-                                            const std::int32_t* expert_ids, int assignments,
-                                            JobFilter filter) {
-    JobView view = job_head(jobs, job_count, sorted_slot, filter);
-    if (view.count == 0) { return view; }
-    job_tail(view, sorted_slot, sorted_assign, expert_ids, assignments);
-    return view;
-}
-
 __global__ void __launch_bounds__(256) moe_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ expert_ids,
     const std::int32_t* __restrict__ sorted_assign, const std::int32_t* __restrict__ sorted_slot,
@@ -985,6 +926,10 @@ namespace {
 
 // Gate/up then down for the jobs `filter` admits.
 void moe_project(const MoeChunk& chunk, JobFilter filter, cudaStream_t stream) {
+    if (chunk.source.layout.format == ExpertFormat::Exl3) {
+        moe_project_exl3(chunk, filter.misses, filter.missed, stream);
+        return;
+    }
     const int assignments = chunk.columns * K;
     if (assignments <= kGemvAssignments) {
         moe_gate_up_gemv_kernel<<<dim3(assignments, I / (kGemvWarps * kGateUpPairsPerWarp)),
@@ -1016,6 +961,12 @@ void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream) {
                                                    chunk.counts, chunk.sorted_assign,
                                                    chunk.sorted_slot, chunk.jobs, chunk.job_count);
     CUDA_CHECK(cudaGetLastError());
+    if (chunk.source.layout.format == ExpertFormat::Exl3) {
+        // Slice-completion counters start at zero; the last slice of each block resets its own.
+        CUDA_CHECK(cudaMemsetAsync(chunk.counters, 0,
+                                   static_cast<std::size_t>(assignments) * (I / 128) * sizeof(std::int32_t),
+                                   stream));
+    }
     if (chunk.misses == nullptr) {
         moe_project(chunk, JobFilter{nullptr, false}, stream);
     } else {

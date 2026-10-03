@@ -14,6 +14,12 @@ namespace {
 
 // Token columns per internal pass; bounds the per-assignment intermediate and partial buffers.
 constexpr std::int32_t kChunkColumns = 1024;
+// EXL3 keeps four FP32 K-slice partials of gate and up per assignment, so its pass is narrower.
+constexpr std::int32_t kExl3ChunkColumns = 32;
+
+std::int32_t chunk_columns(const ExpertLayout& layout) {
+    return layout.format == ExpertFormat::Exl3 ? kExl3ChunkColumns : kChunkColumns;
+}
 
 void require(bool condition, const char* op, const std::string& message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -34,10 +40,11 @@ void require_routed(const Tensor& t, DType dtype, std::int32_t columns, const ch
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
 
 struct ChunkLayout {
-    std::size_t counts, sorted_assign, sorted_slot, jobs, job_count, act, partial, total;
+    std::size_t counts, sorted_assign, sorted_slot, jobs, job_count, act, partial, gu_partial,
+        counters, total;
 };
 
-ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
+ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots, bool exl3) {
     const std::size_t assignments = static_cast<std::size_t>(columns) * kOffloadMoeTopK;
     ChunkLayout out{};
     std::size_t cursor = 0;
@@ -53,6 +60,9 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
     out.job_count     = take(4);
     out.act           = take(assignments * kOffloadMoeIntermediate * 2);
     out.partial       = take(assignments * kOffloadMoeHidden * 4);
+    // EXL3: four K-slice partials of gate and up per assignment, and the slice counters.
+    out.gu_partial = take(exl3 ? assignments * 4 * 2 * kOffloadMoeIntermediate * 4 : 0);
+    out.counters   = take(exl3 ? assignments * (kOffloadMoeIntermediate / 128) * 4 : 0);
     out.total         = cursor;
     return out;
 }
@@ -201,9 +211,13 @@ std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept {
     return slots <= 4096 ? std::numeric_limits<std::int32_t>::max() : 1024 / kOffloadMoeTopK;
 }
 
-std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots) {
+std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots,
+                                       const ExpertLayout& layout) {
     if (tokens <= 0) { throw std::invalid_argument("moe_experts_workspace_bytes: T <= 0"); }
-    return chunk_layout(std::min(tokens, kChunkColumns), slots).total + 256;
+    return chunk_layout(std::min(tokens, chunk_columns(layout)), slots,
+                        layout.format == ExpertFormat::Exl3)
+               .total +
+           256;
 }
 
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
@@ -229,24 +243,32 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
-    require(weights_source.layout.format == ExpertFormat::Nvfp4, op,
-            "EXL3 expert execution is not implemented yet");
-    require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
-                weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
-            op, "expert divisors are required");
-    require(weights_source.layout.format == ExpertFormat::Nvfp4, op,
-            "this route executes NVFP4 expert banks");
-    for (const int p : {0, 1, 2, 3}) {
-        // Code planes are read in 16-byte vectors, scale planes in adjacent pairs.
-        const std::int64_t alignment = p % 2 == 0 ? 16 : 2;
-        require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % alignment == 0 &&
-                    weights_source.stride[p] % alignment == 0,
-                op, "expert code planes must be 16-byte aligned and scale planes 2-byte aligned");
+    const bool exl3 = weights_source.layout.format == ExpertFormat::Exl3;
+    if (exl3) {
+        require(weights_source.layout.planes == 6, op, "an EXL3 bank has six planes");
+        require(tap == nullptr || !*tap, op, "EXL3 experts expose no activation tap");
+        for (std::int32_t p = 0; p < 6; ++p) {
+            require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % 16 == 0 &&
+                        weights_source.stride[p] % 16 == 0,
+                    op, "EXL3 expert planes must be 16-byte aligned");
+        }
+    } else {
+        require(weights_source.gate_up_divisors != nullptr &&
+                    weights_source.down_divisors != nullptr &&
+                    weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
+                op, "expert divisors are required");
+        for (const int p : {0, 1, 2, 3}) {
+            // Code planes are read in 16-byte vectors, scale planes in adjacent pairs.
+            const std::int64_t alignment = p % 2 == 0 ? 16 : 2;
+            require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % alignment == 0 &&
+                        weights_source.stride[p] % alignment == 0,
+                    op, "expert code planes must be 16-byte aligned and scale planes 2-byte aligned");
+        }
     }
     require(columns <= moe_experts_max_columns(slots), op,
             "large token chunks require a staged bank indexed by expert id");
-    const std::int32_t chunk = std::min(columns, kChunkColumns);
-    const ChunkLayout layout = chunk_layout(chunk, slots);
+    const std::int32_t chunk = std::min(columns, chunk_columns(weights_source.layout));
+    const ChunkLayout layout = chunk_layout(chunk, slots, exl3);
     auto scope               = workspace.scope();
     auto* base               = static_cast<std::byte*>(workspace.alloc_bytes(layout.total).data);
     for (std::int32_t begin = 0; begin < columns; begin += chunk) {
@@ -273,6 +295,8 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         c.job_count     = reinterpret_cast<std::int32_t*>(base + layout.job_count);
         c.act           = reinterpret_cast<__nv_bfloat16*>(base + layout.act);
         c.partial       = reinterpret_cast<float*>(base + layout.partial);
+        c.gu_partial    = exl3 ? reinterpret_cast<float*>(base + layout.gu_partial) : nullptr;
+        c.counters      = exl3 ? reinterpret_cast<std::int32_t*>(base + layout.counters) : nullptr;
         if (pending != nullptr) {
             c.misses  = static_cast<const std::int32_t*>(pending->misses->data);
             c.fetched = pending->fetched;

@@ -610,7 +610,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     GuardedDeviceBuffer staged(static_cast<std::size_t>(H) * tokens * 2);
     Tensor ty_staged(staged.data(), DType::BF16, {H, tokens});
     {
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, E));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, E, ops::nvfp4_expert_layout()));
         ops::moe_experts(tx, tids, tids, tw, tsg, tshared, bank.weights, E, workspace, ty_staged,
                          nullptr);
         cuda_synchronize();
@@ -626,7 +626,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     GuardedDeviceBuffer cached(static_cast<std::size_t>(H) * tokens * 2);
     Tensor ty_cached(cached.data(), DType::BF16, {H, tokens});
     {
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
         ops::moe_experts(tx, tids, tslots, tw, tsg, tshared,
                          ops::expert_cache_weights(cache.state, bank.weights), slots, workspace,
                          ty_cached, nullptr);
@@ -665,7 +665,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
         CUDA_CHECK(cudaStreamCreateWithFlags(&fetch, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&resolved, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&fetched, cudaEventDisableTiming));
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
         ops::expert_cache_resolve(tids, 0, pending_cache.state, tpending_slots, tpending_misses,
                                   main);
         CUDA_CHECK(cudaEventRecord(resolved, main));

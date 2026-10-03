@@ -29,6 +29,7 @@ set(ninfer_op_tests
   hyper_connection
   ple
   offload_moe
+  offload_moe_exl3
   sparse_attention)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test

@@ -418,9 +418,9 @@ WorkspacePlan qwen4_workspace_plan_for(const SequencePlanImpl& plan, std::uint32
         linear(layout, p.moe.shared_gate_up, tokens);
         linear(layout, p.moe.shared_down, tokens);
         std::size_t experts = ops::moe_experts_workspace_bytes(
-            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts));
+            tokens, std::max<std::int32_t>(slots, ops::kOffloadMoeExperts), p.moe.bank.layout);
         // Calls wide enough to stage the layer may take the A4 route instead.
-        if (tokens >= kQwen4StagedColumns) {
+        if (tokens >= kQwen4StagedColumns && p.moe.bank.layout.format == ops::ExpertFormat::Nvfp4) {
             experts = std::max(experts, ops::moe_experts_a4_workspace_bytes(tokens));
         }
         scratch(layout, experts);

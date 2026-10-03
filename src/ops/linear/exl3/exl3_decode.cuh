@@ -108,4 +108,58 @@ __device__ __forceinline__ void exl3_windows_half(const std::uint32_t* tile, int
 }
 
 
+// One lane's view of a 16x16 trellis tile at any rate: the eight codebook values d[r] of states
+// 8*lane + r, which are the m16n8k16 B-fragment elements (d[0..3] feed the first n8 half, d[4..7]
+// the second). The per-lane window offsets of the even rates are resolved once at construction.
+struct Exl3TileDecoder {
+    int half_bits;
+    int bits;
+    int words;
+    bool fast; // even rate: eight windows from two 64-bit funnel reads
+    int wlo0 = 0, wn0 = 0, sft0 = 0, wlo1 = 0, wn1 = 0, sft1 = 0;
+
+    __device__ __forceinline__ Exl3TileDecoder(int half_bits_in, int lane)
+        : half_bits(half_bits_in), bits(half_bits_in >> 1), words(4 * half_bits_in),
+          fast((half_bits_in & 1) == 0) {
+        if (fast && bits != 4) {
+            const int total = words * 32;
+            const int s0    = ((8 * lane + 1) * bits - 16 + total) % total;
+            const int s1    = ((8 * lane + 5) * bits - 16 + total) % total;
+            wlo0            = s0 >> 5;
+            sft0            = s0 & 31;
+            wn0             = (wlo0 + 1 == words) ? 0 : wlo0 + 1;
+            wlo1            = s1 >> 5;
+            sft1            = s1 & 31;
+            wn1             = (wlo1 + 1 == words) ? 0 : wlo1 + 1;
+        }
+    }
+
+    // `tile` is the tile's 16*half_bits bytes, 4-byte aligned.
+    __device__ __forceinline__ void decode(const std::uint8_t* tile, int lane, float d[8]) const {
+        const auto* tile32 = reinterpret_cast<const std::uint32_t*>(tile);
+        if (half_bits == 8) {
+            exl3_windows_4bit(tile32, lane, d);
+        } else if (fast) {
+            const unsigned long long w0 =
+                (static_cast<unsigned long long>(tile32[wn0]) << 32) | tile32[wlo0];
+            const unsigned long long w1 =
+                (static_cast<unsigned long long>(tile32[wn1]) << 32) | tile32[wlo1];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[i] = mul1_value(static_cast<std::uint16_t>((w0 >> (sft0 + bits * i)) & 0xFFFFU));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[4 + i] =
+                    mul1_value(static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
+            }
+        } else if (exl3_half_fast(half_bits)) {
+            exl3_windows_half(tile32, lane, half_bits, d);
+        } else {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { d[r] = mul1_value(tile_state(tile, half_bits, 8 * lane + r)); }
+        }
+    }
+};
+
 } // namespace ninfer::ops::detail

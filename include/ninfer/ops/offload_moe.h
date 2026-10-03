@@ -219,7 +219,9 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
 [[nodiscard]] ExpertWeights expert_cache_weights(const ExpertCacheState& cache,
                                                  const ExpertWeights& bank);
 
-[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots);
+/** Workspace of moe_experts for `tokens` columns over `slots` slots of experts in `layout`. */
+[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots,
+                                                      const ExpertLayout& layout);
 
 /**
  * Most columns one moe_experts call over a pool of `slots` slots accepts: job building sorts a
