@@ -5,6 +5,10 @@
 namespace ninfer::ops::detail::q6_instances {
 
 using SimtR8T4 = Q6A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
+// Four rows a block with two warps on each: the low-rank hyper-connection stems (N = 320|324,
+// K = 10240) are too short for a warp per row to fill the GPU.
+using SimtR4T4W2G16 = Q6A16SimtSchedule<4, 4, 2, 16, 2, Cache::ca, 1>;
+using SimtR4T8W2G16 = Q6A16SimtSchedule<4, 8, 2, 16, 2, Cache::ca, 1>;
 
 using GemvR4W2G16      = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
 using SlicedR16T8W4S2  = Q6A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;

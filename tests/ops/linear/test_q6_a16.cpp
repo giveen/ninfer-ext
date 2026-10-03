@@ -60,6 +60,20 @@ int q6_a16_conformance() {
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {1152, 1536, 197U, Comparison::Sampled, false, kVisionLarge});
+
+    // Qwen4Exp (Flash-Next) dense projections: single-token decode, MTP verify widths, and prefill.
+    constexpr std::array kFlash{
+        a16(1),  a16(2),  a16(3),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),   a16(9),
+        a16(16), a16(17), a16(33), a16(64), a16(97), a16(129), a16(2048), graph(1), graph(3), graph(8),
+    };
+    constexpr std::array<std::array<std::int32_t, 2>, 12> kFlashShapes{{
+        {324, 10240}, {320, 10240}, {96, 2560},   {640, 2560},   {1280, 2560},  {2560, 640},
+        {2560, 2560}, {2560, 4608}, {2560, 6144}, {13312, 2560}, {16384, 2560}, {12800, 2560},
+    }};
+    for (const auto& [n, k] : kFlashShapes) {
+        failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                              {n, k, 211U, Comparison::Sampled, false, kFlash});
+    }
     return failures;
 }
 } // namespace
