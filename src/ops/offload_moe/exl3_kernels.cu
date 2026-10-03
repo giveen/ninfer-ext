@@ -17,6 +17,7 @@
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/linear/exl3/exl3_decode.cuh"
+#include "ops/offload_moe/exl3_common.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -41,47 +42,9 @@ constexpr int kSliceKTiles = kSliceK / 16;
 constexpr int kDownKTiles  = I / 16;
 constexpr int kRows    = 8;            // job rows per pass: the A rows 8..15 of m16 stay zero
 constexpr int kAStride = kSliceK + 8;  // padded halves per smem row: conflict-free fragment loads
-constexpr float kInvSqrt128 = 0.08838834764831845F;
+constexpr float kInvSqrt128 = kExl3InvSqrt128;
 
 static_assert(kSliceK == I && kAStride == I + 8, "gate/up slice and down input share one row stride");
-
-// In-register unnormalized 128-point Hadamard: lane holds elements 4*lane..4*lane+3.
-__device__ __forceinline__ void fwht128(float v[4], int lane) {
-    const float a = v[0], b = v[1], c = v[2], d = v[3];
-    const float ab = a + b, amb = a - b, cd = c + d, cmd = c - d;
-    v[0] = ab + cd;
-    v[1] = amb + cmd;
-    v[2] = ab - cd;
-    v[3] = amb - cmd;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float other = __shfl_xor_sync(0xFFFFFFFFU, v[j], m);
-            v[j]              = (lane & m) ? (other - v[j]) : (v[j] + other);
-        }
-    }
-}
-
-__device__ __forceinline__ std::uint32_t pack_half2(float lo, float hi) {
-    const __half2 value = __floats2half2_rn(lo, hi);
-    std::uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-__device__ __forceinline__ std::uint32_t load_half2(const __half* pair) {
-    return *reinterpret_cast<const std::uint32_t*>(pair);
-}
-
-__device__ __forceinline__ void mma_f16(float d[4], const std::uint32_t a[4],
-                                        const std::uint32_t b[2]) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
 
 // A fragment (rows 0..7 only) of k-tile `kt` from a row-major smem tile with stride kAStride halves;
 // rows 8..15 of the m16 operand are zero, so their registers are too.
@@ -345,6 +308,10 @@ __global__ void __launch_bounds__(kThreads, 3)
 
 void moe_project_exl3(const MoeChunk& chunk, const std::int32_t* misses, bool missed,
                       cudaStream_t stream) {
+    if (chunk.columns > kExl3DecodeColumns) {
+        moe_project_exl3_prefill(chunk, misses, missed, stream);
+        return;
+    }
     const int assignments = chunk.columns * K;
     const JobFilter filter{misses, missed};
     const ExpertLayout& layout = chunk.source.layout;

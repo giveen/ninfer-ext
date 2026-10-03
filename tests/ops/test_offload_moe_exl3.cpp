@@ -390,7 +390,13 @@ int exl3_case(int gate_up_half_bits, int down_half_bits, int tokens, bool concen
         const DeviceBank device = upload(bank, identity);
         by_expert = run(device, ids, ids, x, weights, shared_gate, shared, tokens);
         repeat    = run(device, ids, ids, x, weights, shared_gate, shared, tokens);
-        by_cache  = run_cached(device, ids, x, weights, shared_gate, shared, tokens, &misses);
+        // The cache route needs a slot per assignment, which large calls do not get (staged banks).
+        if (tokens * K <= 4096) {
+            by_cache = run_cached(device, ids, x, weights, shared_gate, shared, tokens, &misses);
+        } else {
+            by_cache = by_expert;
+            misses   = 1;
+        }
     }
     {
         // The same experts stored at other slots must give the same bits.
@@ -430,6 +436,11 @@ int main() {
     // Shipped 4.0 bpw: one column, a speculative verify width, a mid batch, and a call wider than
     // one internal pass (32 columns) whose tail pass is a single column.
     for (const int tokens : {1, 2, 8, 33}) { failures += exl3_case(8, 8, tokens, false, false, 0xE31U + tokens); }
+    // Wide prefill passes: many experts with several rows each, rows on shared experts that fill a
+    // 64-row job and leave a tail job, and a call crossing the 512-column pass.
+    failures += exl3_case(8, 8, 200, false, false, 0x200U);
+    failures += exl3_case(8, 8, 70, true, false, 0x70U);
+    failures += exl3_case(8, 8, 520, false, false, 0x520U);
     // Every row on the same experts: each job spans two row groups of 16.
     failures += exl3_case(8, 8, 32, true, false, 0xC0DEU);
     // Other rates: half-bit with the fast window (9, 7, 5), even with a 3-bit step (6), 5-bit

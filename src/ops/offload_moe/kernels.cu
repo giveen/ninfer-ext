@@ -961,7 +961,8 @@ void moe_project(const MoeChunk& chunk, JobFilter filter, cudaStream_t stream) {
 void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream) {
     const int assignments = chunk.columns * K;
     // EXL3 slice-completion counters (one per assignment and 128-column block) start at zero.
-    const bool exl3 = chunk.source.layout.format == ExpertFormat::Exl3;
+    const bool exl3 = chunk.source.layout.format == ExpertFormat::Exl3 &&
+                      chunk.columns <= kExl3DecodeColumns;
     moe_jobs_kernel<<<1, kJobThreads, 0, stream>>>(
         chunk.slot_ids, assignments, chunk.slots, chunk.counts, chunk.sorted_assign,
         chunk.sorted_slot, chunk.jobs, chunk.job_count, exl3 ? chunk.counters : nullptr,

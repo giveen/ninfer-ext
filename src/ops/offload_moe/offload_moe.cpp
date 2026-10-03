@@ -14,8 +14,8 @@ namespace {
 
 // Token columns per internal pass; bounds the per-assignment intermediate and partial buffers.
 constexpr std::int32_t kChunkColumns = 1024;
-// EXL3 keeps four FP32 K-slice partials of gate and up per assignment, so its pass is narrower.
-constexpr std::int32_t kExl3ChunkColumns = 32;
+// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment).
+constexpr std::int32_t kExl3ChunkColumns = 512;
 
 std::int32_t chunk_columns(const ExpertLayout& layout) {
     return layout.format == ExpertFormat::Exl3 ? kExl3ChunkColumns : kChunkColumns;
@@ -41,7 +41,7 @@ constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 25
 
 struct ChunkLayout {
     std::size_t counts, sorted_assign, sorted_slot, jobs, job_count, act, partial, gu_partial,
-        counters, total;
+        counters, xr, total;
 };
 
 ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots, bool exl3) {
@@ -60,9 +60,16 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots, bool exl3) {
     out.job_count     = take(4);
     out.act           = take(assignments * kOffloadMoeIntermediate * 2);
     out.partial       = take(assignments * kOffloadMoeHidden * 4);
-    // EXL3: four K-slice partials of gate and up per assignment, and the slice counters.
-    out.gu_partial = take(exl3 ? assignments * 4 * 2 * kOffloadMoeIntermediate * 4 : 0);
-    out.counters   = take(exl3 ? assignments * (kOffloadMoeIntermediate / 128) * 4 : 0);
+    // EXL3 decode (a pass of at most kExl3DecodeColumns): four K-slice partials of gate and up per
+    // assignment and the slice counters. Wider passes use the prefill route and its rotated inputs.
+    const std::size_t decode =
+        static_cast<std::size_t>(std::min(columns, detail::kExl3DecodeColumns)) *
+        kOffloadMoeTopK;
+    out.gu_partial = take(exl3 ? decode * 4 * 2 * kOffloadMoeIntermediate * 4 : 0);
+    out.counters   = take(exl3 ? decode * (kOffloadMoeIntermediate / 128) * 4 : 0);
+    out.xr = take(exl3 && columns > detail::kExl3DecodeColumns
+                      ? assignments * 2 * kOffloadMoeHidden * 2
+                      : 0);
     out.total         = cursor;
     return out;
 }
@@ -297,6 +304,7 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         c.partial       = reinterpret_cast<float*>(base + layout.partial);
         c.gu_partial    = exl3 ? reinterpret_cast<float*>(base + layout.gu_partial) : nullptr;
         c.counters      = exl3 ? reinterpret_cast<std::int32_t*>(base + layout.counters) : nullptr;
+        c.xr            = exl3 ? base + layout.xr : nullptr;
         if (pending != nullptr) {
             c.misses  = static_cast<const std::int32_t*>(pending->misses->data);
             c.fetched = pending->fetched;
