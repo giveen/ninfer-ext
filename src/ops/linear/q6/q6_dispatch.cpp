@@ -18,18 +18,18 @@ constexpr std::array kShapes{
     ShapeEntry{248320, 2560, select_q6_n248320_k2560},
     // Qwen4Exp dense projections (same list as the Q8 table).
     ShapeEntry{13312, 2560, select_q6_qwen4_exp},
-    ShapeEntry{640, 2560, select_q6_qwen4_exp},
+    ShapeEntry{640, 2560, select_q6_qwen4_exp_small},
     ShapeEntry{2560, 6144, select_q6_qwen4_exp},
     ShapeEntry{16384, 2560, select_q6_qwen4_exp},
-    ShapeEntry{1280, 2560, select_q6_qwen4_exp},
-    ShapeEntry{2560, 640, select_q6_qwen4_exp},
+    ShapeEntry{1280, 2560, select_q6_qwen4_exp_small},
+    ShapeEntry{2560, 640, select_q6_qwen4_exp_small},
     ShapeEntry{324, 10240, select_q6_qwen4_exp_wide_k},
     ShapeEntry{320, 10240, select_q6_qwen4_exp_wide_k},
     ShapeEntry{10240, 320, select_q6_qwen4_exp},
     ShapeEntry{12800, 2560, select_q6_qwen4_exp},
     ShapeEntry{2560, 2560, select_q6_qwen4_exp},
     ShapeEntry{2560, 4608, select_q6_qwen4_exp},
-    ShapeEntry{96, 2560, select_q6_qwen4_exp},
+    ShapeEntry{96, 2560, select_q6_qwen4_exp_small},
 };
 } // namespace
 

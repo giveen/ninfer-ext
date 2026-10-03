@@ -11,5 +11,6 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Q6Launch select_q6_n248320_k2560(std::int32_t tokens);
 [[nodiscard]] Q6Launch select_q6_qwen4_exp(std::int32_t tokens);
 [[nodiscard]] Q6Launch select_q6_qwen4_exp_wide_k(std::int32_t tokens);
+[[nodiscard]] Q6Launch select_q6_qwen4_exp_small(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail
