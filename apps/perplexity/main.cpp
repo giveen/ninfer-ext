@@ -1,6 +1,7 @@
 #include "corpus.h"
 #include "evaluation.h"
 #include "reference.h"
+#include "models/qwen3_5/frontend/digest.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -45,6 +46,8 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> reference;
+    std::optional<std::filesystem::path> write_reference;
+    std::uint32_t sample_stride = 1;
     std::optional<std::filesystem::path> output;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -60,6 +63,7 @@ std::string usage_text() {
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--reference <kl-reference>]\n"
+           "       [--write-reference <file> [--sample-stride N]]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -123,6 +127,10 @@ Options parse_options(int argc, char** argv) {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--reference") {
             out.reference = std::filesystem::path(value("--reference"));
+        } else if (option == "--write-reference") {
+            out.write_reference = std::filesystem::path(value("--write-reference"));
+        } else if (option == "--sample-stride") {
+            out.sample_stride = parse_integer<std::uint32_t>(value("--sample-stride"), "sample stride");
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -133,6 +141,10 @@ Options parse_options(int argc, char** argv) {
         usage_error("exactly one of --corpus and --text is required");
     }
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
+    if (out.write_reference && (!out.text || out.reference)) {
+        usage_error("--write-reference scores one --text and cannot be combined with --reference");
+    }
+    if (out.sample_stride == 0) { usage_error("--sample-stride must be positive"); }
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
@@ -282,6 +294,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ScoreAggregate overall;
     std::map<std::string, ScoreAggregate> domains;
     KlAggregate overall_kl;
+    std::vector<std::uint32_t> written_positions;
+    std::vector<std::uint16_t> written_logits;
+    std::uint32_t written_vocab = 0;
     std::map<std::string, KlAggregate> domains_kl;
     json stream_reports             = json::array();
     std::uint64_t completed_windows = 0;
@@ -311,7 +326,25 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             std::vector<float> logprobs;
             KlAggregate window_kl;
             const ninfer::LogitsSink logits_sink =
-                options.reference
+                options.write_reference
+                    ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
+                          // Keep every sample_stride-th scored target: a full row is vocab * 2 B.
+                          for (std::uint32_t column = 0; column < view.columns; ++column) {
+                              const std::uint32_t local = view.first_target + column;
+                              const std::uint32_t target =
+                                  static_cast<std::uint32_t>(window.target_begin) +
+                                  (local - window.first_target);
+                              if (target % options.sample_stride != 0) { continue; }
+                              written_positions.push_back(target);
+                              const std::uint16_t* row =
+                                  view.values.data() +
+                                  static_cast<std::size_t>(column) * view.vocab_size;
+                              written_logits.insert(written_logits.end(), row,
+                                                    row + view.vocab_size);
+                              written_vocab = view.vocab_size;
+                          }
+                      })
+                : options.reference
                     ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
                           if (view.vocab_size != reference.vocab_size()) {
                               throw std::runtime_error(
@@ -409,6 +442,17 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     const double scoring_seconds = seconds_since(scoring_started);
     progress->clear();
+    if (options.write_reference) {
+        if (written_positions.empty()) { throw std::runtime_error("no scored position was kept"); }
+        using ninfer::models::qwen3_5::frontend::sha256;
+        using ninfer::models::qwen3_5::frontend::sha256_hex;
+        ninfer::perplexity::write_reference(
+            *options.write_reference, written_vocab, options.context, options.stride,
+            sha256_hex(sha256(std::string_view(streams.front().source.text))), written_positions,
+            written_logits);
+        logger->info("wrote kl reference {} | {} rows | vocab {}",
+                     options.write_reference->string(), written_positions.size(), written_vocab);
+    }
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",
                  ninfer::product::format_pretty_count(overall.scored_tokens), completed_windows,
                  overall.ppl(), ninfer::product::format_pretty_duration(scoring_seconds),
