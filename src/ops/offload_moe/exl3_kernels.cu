@@ -39,7 +39,7 @@ constexpr int kDownBlocks = H / 128;   // ... and of the hidden output
 constexpr int kSliceK  = H / kKSplit;  // 640 input features per gate/up CTA
 constexpr int kSliceKTiles = kSliceK / 16;
 constexpr int kDownKTiles  = I / 16;
-constexpr int kRows    = 16;           // m16 rows per pass over a job
+constexpr int kRows    = 8;            // job rows per pass: the A rows 8..15 of m16 stay zero
 constexpr int kAStride = kSliceK + 8;  // padded halves per smem row: conflict-free fragment loads
 constexpr float kInvSqrt128 = 0.08838834764831845F;
 
@@ -83,38 +83,78 @@ __device__ __forceinline__ void mma_f16(float d[4], const std::uint32_t a[4],
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// A fragment of k-tile `kt` from a row-major smem tile with stride kAStride halves.
+// A fragment (rows 0..7 only) of k-tile `kt` from a row-major smem tile with stride kAStride halves;
+// rows 8..15 of the m16 operand are zero, so their registers are too.
 __device__ __forceinline__ void load_a(const __half* tile, int row, int col, int kt,
                                        std::uint32_t a[4]) {
     const __half* p = tile + row * kAStride + kt * 16 + col;
     a[0]            = load_half2(p);
-    a[1]            = load_half2(p + 8 * kAStride);
+    a[1]            = 0U;
     a[2]            = load_half2(p + 8);
-    a[3]            = load_half2(p + 8 * kAStride + 8);
+    a[3]            = 0U;
 }
 
-// One 16-row, 16-column tile over `ktiles` k-tiles: c[j] is the n8 half j of the m16n8 result.
-__device__ __forceinline__ void tile_gemm(const __half* a_tile, const std::uint8_t* trellis,
-                                          int ktiles, int tile_bytes, const Exl3TileDecoder& dec,
-                                          int lane, float c[2][4]) {
+// Tile loads in flight per warp before any is decoded.
+constexpr int kBatch = 8;
+
+// Both operands of `kMats` stacked matrices over `ktiles` k-tiles (a multiple of kBatch): c[m][j] is
+// the n8 half j of matrix m's 16-column tile. kHB == 8 is the 4.0 bpw rate; kHB == 0 takes any
+// other rate and prefetches only the even ones, whose tile words can be loaded ahead of the decode.
+template <int kHB, int kMats>
+__device__ __forceinline__ void tile_gemm(const __half* const (&a_tile)[kMats],
+                                          const std::uint8_t* const (&trellis)[kMats], int ktiles,
+                                          int tile_bytes, const Exl3TileDecoder& dec, int lane,
+                                          float (&c)[kMats][2][4]) {
     const int row = lane >> 2;
     const int col = (lane & 3) * 2;
-    for (int kt = 0; kt < ktiles; ++kt) {
-        float d[8];
-        dec.decode(trellis + static_cast<std::size_t>(kt) * tile_bytes, lane, d);
-        const std::uint32_t b0[2] = {pack_half2(d[0], d[1]), pack_half2(d[2], d[3])};
-        const std::uint32_t b1[2] = {pack_half2(d[4], d[5]), pack_half2(d[6], d[7])};
-        std::uint32_t a[4];
-        load_a(a_tile, row, col, kt, a);
-        mma_f16(c[0], a, b0);
-        mma_f16(c[1], a, b1);
+    if (kHB == 8 || dec.fast) {
+        for (int kb = 0; kb < ktiles; kb += kBatch) {
+            Exl3TileWords words[kMats][kBatch];
+#pragma unroll
+            for (int m = 0; m < kMats; ++m) {
+#pragma unroll
+                for (int i = 0; i < kBatch; ++i) {
+                    words[m][i] = dec.load_words<kHB>(
+                        trellis[m] + static_cast<std::size_t>(kb + i) * tile_bytes, lane);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kBatch; ++i) {
+#pragma unroll
+                for (int m = 0; m < kMats; ++m) {
+                    float d[8];
+                    dec.decode_words<kHB>(words[m][i], d);
+                    const std::uint32_t b0[2] = {pack_half2(d[0], d[1]), pack_half2(d[2], d[3])};
+                    const std::uint32_t b1[2] = {pack_half2(d[4], d[5]), pack_half2(d[6], d[7])};
+                    std::uint32_t a[4];
+                    load_a(a_tile[m], row, col, kb + i, a);
+                    mma_f16(c[m][0], a, b0);
+                    mma_f16(c[m][1], a, b1);
+                }
+            }
+        }
+    } else {
+        for (int kt = 0; kt < ktiles; ++kt) {
+#pragma unroll
+            for (int m = 0; m < kMats; ++m) {
+                float d[8];
+                dec.decode(trellis[m] + static_cast<std::size_t>(kt) * tile_bytes, lane, d);
+                const std::uint32_t b0[2] = {pack_half2(d[0], d[1]), pack_half2(d[2], d[3])};
+                const std::uint32_t b1[2] = {pack_half2(d[4], d[5]), pack_half2(d[6], d[7])};
+                std::uint32_t a[4];
+                load_a(a_tile[m], row, col, kt, a);
+                mma_f16(c[m][0], a, b0);
+                mma_f16(c[m][1], a, b1);
+            }
+        }
     }
 }
 
 // Gate/up. CTA (job, 128-column block, K slice): rotate the job's rows into smem, run both GEMMs
 // over the slice and store the FP32 partials. The last of the four slices of a block applies the
 // output Hadamard and scale, the SwiGLU, and the down input's scale and Hadamard.
-__global__ void __launch_bounds__(kThreads)
+template <int kHB>
+__global__ void __launch_bounds__(kThreads, 2)
     exl3_gate_up_kernel(const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ ids,
                         const std::int32_t* __restrict__ sorted_assign,
                         const std::int32_t* __restrict__ sorted_slot,
@@ -164,27 +204,23 @@ __global__ void __launch_bounds__(kThreads)
             }
         }
         __syncthreads();
-        float cg[2][4] = {}, cu[2][4] = {};
+        float c[2][2][4] = {};
         const std::int64_t gate_tile = static_cast<std::int64_t>(nb * 8 + warp);
         const std::int64_t up_tile   = static_cast<std::int64_t>(I / 16 + nb * 8 + warp);
-        tile_gemm(as[0], trellis + (gate_tile * kTilesK + ks * kSliceKTiles) * tile_bytes,
-                  kSliceKTiles, tile_bytes, dec, lane, cg);
-        tile_gemm(as[1], trellis + (up_tile * kTilesK + ks * kSliceKTiles) * tile_bytes,
-                  kSliceKTiles, tile_bytes, dec, lane, cu);
-        for (int proj = 0; proj < 2; ++proj) {
-            const auto& c = proj == 0 ? cg : cu;
+        const __half* const a_tiles[2] = {as[0], as[1]};
+        const std::uint8_t* const tiles[2] = {
+            trellis + (gate_tile * kTilesK + ks * kSliceKTiles) * tile_bytes,
+            trellis + (up_tile * kTilesK + ks * kSliceKTiles) * tile_bytes};
+        tile_gemm<kHB, 2>(a_tiles, tiles, kSliceKTiles, tile_bytes, dec, lane, c);
+        if (row < rows) {
+            for (int proj = 0; proj < 2; ++proj) {
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int n = nb * 128 + warp * 16 + j * 8 + col;
-#pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int r = row + 8 * half;
-                    if (r < rows) {
-                        float* out = partial + ((static_cast<std::int64_t>(ks) * assignments +
-                                                 job.begin + g0 + r) * 2 + proj) * I + n;
-                        out[0] = c[j][2 * half];
-                        out[1] = c[j][2 * half + 1];
-                    }
+                for (int j = 0; j < 2; ++j) {
+                    const int n = nb * 128 + warp * 16 + j * 8 + col;
+                    float* out  = partial + ((static_cast<std::int64_t>(ks) * assignments +
+                                              job.begin + g0 + row) * 2 + proj) * I + n;
+                    out[0] = c[proj][j][0];
+                    out[1] = c[proj][j][1];
                 }
             }
         }
@@ -238,7 +274,8 @@ __global__ void __launch_bounds__(kThreads)
 
 // Down. CTA (job, 128-column block of the hidden output): the whole K = 640 contraction, then the
 // output Hadamard and scale, written as the assignment's partial row for the merge.
-__global__ void __launch_bounds__(kThreads)
+template <int kHB>
+__global__ void __launch_bounds__(kThreads, 3)
     exl3_down_kernel(const __half* __restrict__ act, const std::int32_t* __restrict__ ids,
                      const std::int32_t* __restrict__ sorted_assign,
                      const std::int32_t* __restrict__ sorted_slot,
@@ -271,16 +308,18 @@ __global__ void __launch_bounds__(kThreads)
             *reinterpret_cast<std::uint32_t*>(&as[r * kAStride + 2 * k2]) = pair;
         }
         __syncthreads();
-        float c[2][4] = {};
+        float c[1][2][4] = {};
         const std::int64_t tile = static_cast<std::int64_t>(nb * 8 + warp);
-        tile_gemm(as, trellis + tile * kDownKTiles * tile_bytes, kDownKTiles, tile_bytes, dec, lane, c);
+        const __half* const a_tiles[1]     = {as};
+        const std::uint8_t* const tiles[1] = {trellis + tile * kDownKTiles * tile_bytes};
+        tile_gemm<kHB, 1>(a_tiles, tiles, kDownKTiles, tile_bytes, dec, lane, c);
+        if (row < kRows) {
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int n = warp * 16 + j * 8 + col;
-            res[row][n]         = c[j][0];
-            res[row][n + 1]     = c[j][1];
-            res[row + 8][n]     = c[j][2];
-            res[row + 8][n + 1] = c[j][3];
+            for (int j = 0; j < 2; ++j) {
+                const int n = warp * 16 + j * 8 + col;
+                res[row][n]     = c[0][j][0];
+                res[row][n + 1] = c[0][j][1];
+            }
         }
         __syncthreads();
         for (int pos = warp; pos < rows; pos += kThreads / 32) {
@@ -307,12 +346,15 @@ void moe_project_exl3(const MoeChunk& chunk, const std::int32_t* misses, bool mi
                       cudaStream_t stream) {
     const int assignments = chunk.columns * K;
     const JobFilter filter{misses, missed};
-    exl3_gate_up_kernel<<<dim3(assignments, kBlocks, kKSplit), kThreads, 0, stream>>>(
+    const ExpertLayout& layout = chunk.source.layout;
+    const auto gate_up = layout.gate_up_half_bits == 8 ? exl3_gate_up_kernel<8> : exl3_gate_up_kernel<0>;
+    gate_up<<<dim3(assignments, kBlocks, kKSplit), kThreads, 0, stream>>>(
         chunk.x, chunk.expert_ids, chunk.sorted_assign, chunk.sorted_slot, chunk.jobs,
         chunk.job_count, assignments, filter, chunk.source, chunk.gu_partial,
         reinterpret_cast<__half*>(chunk.act), chunk.counters);
     CUDA_CHECK(cudaGetLastError());
-    exl3_down_kernel<<<dim3(assignments, kDownBlocks), kThreads, 0, stream>>>(
+    const auto down = layout.down_half_bits == 8 ? exl3_down_kernel<8> : exl3_down_kernel<0>;
+    down<<<dim3(assignments, kDownBlocks), kThreads, 0, stream>>>(
         reinterpret_cast<const __half*>(chunk.act), chunk.expert_ids, chunk.sorted_assign,
         chunk.sorted_slot, chunk.jobs, chunk.job_count, assignments, filter, chunk.source,
         chunk.partial);

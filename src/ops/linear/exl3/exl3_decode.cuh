@@ -111,6 +111,11 @@ __device__ __forceinline__ void exl3_windows_half(const std::uint32_t* tile, int
 // One lane's view of a 16x16 trellis tile at any rate: the eight codebook values d[r] of states
 // 8*lane + r, which are the m16n8k16 B-fragment elements (d[0..3] feed the first n8 half, d[4..7]
 // the second). The per-lane window offsets of the even rates are resolved once at construction.
+// Raw tile words held in registers between the load and the decode.
+struct Exl3TileWords {
+    std::uint32_t w[4];
+};
+
 struct Exl3TileDecoder {
     int half_bits;
     int bits;
@@ -158,6 +163,53 @@ struct Exl3TileDecoder {
         } else {
 #pragma unroll
             for (int r = 0; r < 8; ++r) { d[r] = mul1_value(tile_state(tile, half_bits, 8 * lane + r)); }
+        }
+    }
+
+    // The words one lane reads of a tile at a prefetchable rate: the 4-bit rate (kHB == 8) reads its
+    // own word and its circular predecessor; other even rates read the four words of their two
+    // 64-bit funnel windows. Loading them ahead of the decode lets many tiles' loads overlap.
+    template <int kHB>
+    __device__ __forceinline__ Exl3TileWords load_words(const std::uint8_t* tile, int lane) const {
+        const auto* tile32 = reinterpret_cast<const std::uint32_t*>(tile);
+        Exl3TileWords r{};
+        if constexpr (kHB == 8) {
+            r.w[0] = tile32[lane];
+            r.w[1] = tile32[(lane + 31) & 31];
+        } else {
+            r.w[0] = tile32[wlo0];
+            r.w[1] = tile32[wn0];
+            r.w[2] = tile32[wlo1];
+            r.w[3] = tile32[wn1];
+        }
+        return r;
+    }
+
+    template <int kHB>
+    __device__ __forceinline__ void decode_words(const Exl3TileWords& r, float d[8]) const {
+        if constexpr (kHB == 8) {
+            const std::uint32_t b = r.w[0];
+            const std::uint32_t s = __funnelshift_r(r.w[1], b, 20);
+            d[0] = mul1_value(static_cast<std::uint16_t>(s & 0xFFFFU));
+            d[1] = mul1_value(static_cast<std::uint16_t>((s >> 4) & 0xFFFFU));
+            d[2] = mul1_value(static_cast<std::uint16_t>((s >> 8) & 0xFFFFU));
+            d[3] = mul1_value(static_cast<std::uint16_t>(b & 0xFFFFU));
+            d[4] = mul1_value(static_cast<std::uint16_t>((b >> 4) & 0xFFFFU));
+            d[5] = mul1_value(static_cast<std::uint16_t>((b >> 8) & 0xFFFFU));
+            d[6] = mul1_value(static_cast<std::uint16_t>((b >> 12) & 0xFFFFU));
+            d[7] = mul1_value(static_cast<std::uint16_t>((b >> 16) & 0xFFFFU));
+        } else {
+            const unsigned long long w0 = (static_cast<unsigned long long>(r.w[1]) << 32) | r.w[0];
+            const unsigned long long w1 = (static_cast<unsigned long long>(r.w[3]) << 32) | r.w[2];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[i] = mul1_value(static_cast<std::uint16_t>((w0 >> (sft0 + bits * i)) & 0xFFFFU));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                d[4 + i] =
+                    mul1_value(static_cast<std::uint16_t>((w1 >> (sft1 + bits * i)) & 0xFFFFU));
+            }
         }
     }
 };
