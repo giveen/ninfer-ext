@@ -7,10 +7,13 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache,
+Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertLayout& layout,
+                                   const ops::ExpertCacheState& cache,
                                    std::int32_t staged_columns, std::int32_t bank_slot,
                                    std::int32_t base_slots)
-    : cache_(cache), staged_columns_(staged_columns), bank_slot_(bank_slot),
+    : layout_(layout),
+      staged_bank_bytes_(static_cast<std::size_t>(layout.staged_layer_bytes(ops::kOffloadMoeExperts))),
+      cache_(cache), staged_columns_(staged_columns), bank_slot_(bank_slot),
       base_slots_(base_slots), decode_slots_(cache.slots) {
     // Every route still needs room for one call's assignments, and the banks must sit past the cache
     // (and, when the idle prefill is wider than the chunk, past its lent top range).
@@ -20,9 +23,11 @@ Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertCacheState& cache,
     if (base_slots_ > bank_slot_ || bank_slot_ + kBankSlots != cache_.slots) {
         throw std::logic_error("staged banks must be the top of the expert cache slots");
     }
-    static_assert(kStagedBankBytes % 256 == 0, "staged banks must stay 256-byte aligned");
-    banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * ops::kExpertSlotBytes;
-    banks_[1]  = banks_[0] + kStagedBankBytes;
+    if (staged_bank_bytes_ % 256 != 0) {
+        throw std::logic_error("staged banks must stay 256-byte aligned");
+    }
+    banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * layout_.slot_bytes;
+    banks_[1]  = banks_[0] + staged_bank_bytes_;
     CUDA_CHECK(cudaMallocHost(&resident_, static_cast<std::size_t>(cache_.layers) *
                                               ops::kOffloadMoeExperts * sizeof(std::int32_t)));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
@@ -49,12 +54,13 @@ Qwen4ExpertPager::~Qwen4ExpertPager() {
     if (resident_ != nullptr) { (void)cudaFreeHost(resident_); }
 }
 
-// Staged-bank addressing of `source`: its four planes back to back, then its weight divisors.
+// Staged-bank addressing of `source`: its planes back to back, then the layout tail (NVFP4: its
+// weight divisors).
 ops::ExpertWeights Qwen4ExpertPager::staged_weights(int bank,
                                                     const ops::ExpertWeights& source) const {
     ops::ExpertWeights staged = source;
     std::byte* cursor         = banks_[bank];
-    for (int plane = 0; plane < 4; ++plane) {
+    for (int plane = 0; plane < layout_.planes; ++plane) {
         staged.base[plane] = cursor;
         cursor += static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts;
     }
@@ -97,7 +103,7 @@ void Qwen4ExpertPager::fill(std::int32_t layer, const ops::ExpertWeights& source
     if (resident != nullptr) {
         ops::expert_cache_stage(cache_, layer, resident_, source, staged, stream_);
     }
-    for (int plane = 0; plane < 4; ++plane) {
+    for (int plane = 0; plane < layout_.planes; ++plane) {
         const auto stride = static_cast<std::size_t>(source.stride[plane]);
         auto* target      = const_cast<std::byte*>(staged.base[plane]);
         for (int first = 0; first < ops::kOffloadMoeExperts;) {

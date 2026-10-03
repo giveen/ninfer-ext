@@ -32,19 +32,77 @@ inline constexpr std::int64_t kExpertDownScaleBytes =
 inline constexpr std::int64_t kExpertSlotBytes =
     kExpertGateUpCodeBytes + kExpertGateUpScaleBytes + kExpertDownCodeBytes + kExpertDownScaleBytes;
 
+/** Weight divisors of one NVFP4 layer: gate and up of every expert, then down of every expert. */
+inline constexpr std::int64_t kExpertDivisorBytes =
+    std::int64_t(3) * kOffloadMoeExperts * sizeof(float);
+
+/** Most planes one expert stores (NVFP4: 4, EXL3: 6). */
+inline constexpr std::int32_t kMaxExpertPlanes = 6;
+
+enum class ExpertFormat : std::uint8_t {
+    Nvfp4, // block-scaled NVFP4 codes and scales, divisors in the staged layer's tail
+};
+
+/**
+ * How one expert is laid out in a bank, a cache slot and a staged layer. A slot holds an expert's
+ * planes back to back in plane order; a staged layer holds every expert's slot-ordered planes in
+ * the bank layout (plane p of expert e at `base[p] + e * stride[p]`), then `tail_bytes` of
+ * per-layer data. The pager, cache and planner size everything from this table, so the Op's
+ * geometry is stated once, by the bound bank.
+ */
+struct ExpertLayout {
+    ExpertFormat format                          = ExpertFormat::Nvfp4;
+    std::int32_t planes                          = 0;
+    std::int64_t plane_bytes[kMaxExpertPlanes]   = {}; // per expert
+    std::int64_t slot_bytes                      = 0;  // sum of plane_bytes
+    std::int64_t tail_bytes                      = 0;  // per staged layer, after the planes
+
+    [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
+
+    /** Offset of plane `p` inside a cache slot. */
+    [[nodiscard]] constexpr std::int64_t plane_offset(std::int32_t p) const {
+        std::int64_t offset = 0;
+        for (std::int32_t i = 0; i < p; ++i) { offset += plane_bytes[i]; }
+        return offset;
+    }
+    /** One staged layer of `experts` experts. */
+    [[nodiscard]] constexpr std::int64_t staged_layer_bytes(std::int32_t experts) const {
+        return std::int64_t(experts) * slot_bytes + tail_bytes;
+    }
+};
+
+/** The NVFP4 routed-expert layout: gate/up codes, gate/up scales, down codes, down scales. */
+[[nodiscard]] constexpr ExpertLayout nvfp4_expert_layout() {
+    ExpertLayout layout;
+    layout.format         = ExpertFormat::Nvfp4;
+    layout.planes         = 4;
+    layout.plane_bytes[0] = kExpertGateUpCodeBytes;
+    layout.plane_bytes[1] = kExpertGateUpScaleBytes;
+    layout.plane_bytes[2] = kExpertDownCodeBytes;
+    layout.plane_bytes[3] = kExpertDownScaleBytes;
+    layout.slot_bytes     = kExpertSlotBytes;
+    layout.tail_bytes     = kExpertDivisorBytes;
+    return layout;
+}
+
+/** One staged NVFP4 layer: every expert's planes in the bank layout, then the layer's divisors. */
+inline constexpr std::int64_t kExpertStagedLayerBytes =
+    nvfp4_expert_layout().staged_layer_bytes(kOffloadMoeExperts);
+
 /**
  * Addressing of routed expert weights. Expert (or slot) index i of plane p begins at
- * `base[p] + i * stride[p]`; planes are gate/up codes, gate/up scales, down codes, down scales.
- * A stored bank uses the plane layout (stride = per-expert plane bytes), a slot pool uses one
- * stride of kExpertSlotBytes with plane offsets inside the slot. Every expert's gate rows precede
- * its up rows. Weight divisors are read from the stored banks by expert id: gate/up bank row r
- * uses `gate_up_divisors[r / gate_up_divisor_rows]` and down bank row r uses
+ * `base[p] + i * stride[p]`; for NVFP4 the planes are gate/up codes, gate/up scales, down codes,
+ * down scales. A stored bank uses the plane layout (stride = per-expert plane bytes), a slot pool
+ * uses one stride of `layout.slot_bytes` with plane offsets inside the slot. Every expert's gate
+ * rows precede its up rows. NVFP4 weight divisors are read from the stored banks by expert id:
+ * gate/up bank row r uses `gate_up_divisors[r / gate_up_divisor_rows]` and down bank row r uses
  * `down_divisors[r / down_divisor_rows]`. The activation divisors are the layer's NVFP4 input
  * divisors of gate/up and down, positive when the checkpoint permits A4 inputs and zero otherwise.
  */
 struct ExpertWeights {
-    const std::byte* base[4]          = {};
-    std::int64_t stride[4]            = {};
+    ExpertLayout layout               = nvfp4_expert_layout();
+    const std::byte* base[kMaxExpertPlanes] = {};
+    std::int64_t stride[kMaxExpertPlanes]   = {};
     const float* gate_up_divisors     = nullptr;
     std::int32_t gate_up_divisor_rows = 0;
     const float* down_divisors        = nullptr;
@@ -52,14 +110,6 @@ struct ExpertWeights {
     float gate_up_input_divisor       = 0.0F;
     float down_input_divisor          = 0.0F;
 };
-
-/** Weight divisors of one layer: gate and up of every expert, then down of every expert. */
-inline constexpr std::int64_t kExpertDivisorBytes =
-    std::int64_t(3) * kOffloadMoeExperts * sizeof(float);
-
-/** One staged layer: every expert's planes in the bank layout, then the layer's divisors. */
-inline constexpr std::int64_t kExpertStagedLayerBytes =
-    std::int64_t(kOffloadMoeExperts) * kExpertSlotBytes + kExpertDivisorBytes;
 
 /** Device-resident mutable state of the expert cache; owned by one Program. */
 struct ExpertCacheState {

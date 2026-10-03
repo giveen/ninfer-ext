@@ -315,16 +315,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         q.counters     = add_tensor(builder, DType::I64, {3}, "expert cache counters");
         // Two staged banks (so the next layer's copy overlaps this layer's compute) overlay the last
         // kQwen4StagedBankSlots slots; each bank also stores its layer's divisors past its experts.
-        static_assert(2 * ops::kExpertStagedLayerBytes ==
-                      kQwen4StagedBankSlots * ops::kExpertSlotBytes + 2 * ops::kExpertDivisorBytes);
+        const ops::ExpertLayout& expert_layout = parameters.qwen4->experts;
+        static_assert(kQwen4StagedBankSlots == 2 * ops::kOffloadMoeExperts,
+                      "two staged banks overlay two layers of expert slots");
         q.pool = builder.add(checked_add(checked_mul(static_cast<std::size_t>(q.slots),
-                                                     ops::kExpertSlotBytes, "expert cache pool bytes"),
-                                         2 * ops::kExpertDivisorBytes, "expert cache pool bytes"),
+                                                     static_cast<std::size_t>(expert_layout.slot_bytes),
+                                                     "expert cache pool bytes"),
+                                         2 * static_cast<std::size_t>(expert_layout.tail_bytes),
+                                         "expert cache pool bytes"),
                              kArenaAlign, "expert cache pool");
         q.wide_offset = static_cast<std::size_t>(q.base_slots) *
-                        static_cast<std::size_t>(ops::kExpertSlotBytes);
+                        static_cast<std::size_t>(expert_layout.slot_bytes);
         q.wide_bytes = static_cast<std::size_t>(lend_slots) *
-                       static_cast<std::size_t>(ops::kExpertSlotBytes);
+                       static_cast<std::size_t>(expert_layout.slot_bytes);
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -536,6 +539,7 @@ WorkspacePlan qwen4_workspace_plan_for(const SequencePlanImpl& plan, std::uint32
 // expert cache's top slots and is cache again between wide steps. `lend_slots` spans the whole wide
 // arena because the permanent arena is a separate allocation.
 WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
+    const auto slot_bytes = static_cast<std::size_t>(plan.parameters->qwen4->experts.slot_bytes);
     const std::uint32_t narrow_width = std::max<std::uint32_t>(plan.prefill_chunk, 1U);
     const std::uint32_t wide_width   = std::max(plan.prefill_width, narrow_width);
     const auto slots_for = [&](std::int32_t lend_slots) {
@@ -552,8 +556,8 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         lend_slots = lend_bytes == 0
                          ? 0
                          : checked_i32(
-                               (lend_bytes + static_cast<std::size_t>(ops::kExpertSlotBytes) - 1) /
-                                   static_cast<std::size_t>(ops::kExpertSlotBytes),
+                               (lend_bytes + slot_bytes - 1) /
+                                   slot_bytes,
                                "expert cache lend slots");
     };
     recompute();
@@ -568,8 +572,7 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out      = wide;
     out.permanent_capacity = narrow.capacity;
     out.lend_slots         = lend_slots;
-    out.lend_bytes         = static_cast<std::size_t>(lend_slots) *
-                             static_cast<std::size_t>(ops::kExpertSlotBytes);
+    out.lend_bytes         = static_cast<std::size_t>(lend_slots) * slot_bytes;
     return out;
 }
 
@@ -1192,7 +1195,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("Qwen4Exp proposals use the full output head");
         }
         if (options.expert_cache.mode == ExpertCacheMode::Explicit &&
-            options.expert_cache.explicit_bytes < ops::kExpertSlotBytes) {
+            static_cast<std::int64_t>(options.expert_cache.explicit_bytes) <
+                parameters.qwen4->experts.slot_bytes) {
             throw std::invalid_argument("expert cache must hold at least one expert");
         }
     }
@@ -1241,6 +1245,7 @@ std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
                                          const EngineOptions& options,
                                          std::uint32_t floor_pages) {
     const auto& config = inputs.parameters->model.config().text;
+    const auto slot_bytes = static_cast<std::uint64_t>(inputs.parameters->qwen4->experts.slot_bytes);
     const std::uint64_t total =
         static_cast<std::uint64_t>(config.num_hidden_layers + (inputs.features.mtp() ? 1U : 0U)) *
         ops::kOffloadMoeExperts;
@@ -1248,11 +1253,11 @@ std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
                                   (inputs.draft_window + 1U) * inputs.max_concurrency;
     std::uint64_t slots = 0;
     if (options.expert_cache.mode == ExpertCacheMode::Explicit) {
-        slots = options.expert_cache.explicit_bytes / ops::kExpertSlotBytes;
+        slots = options.expert_cache.explicit_bytes / slot_bytes;
         if (slots < minimum) {
             throw std::invalid_argument("expert cache must hold " + std::to_string(minimum) +
                                         " experts (" +
-                                        std::to_string(minimum * ops::kExpertSlotBytes) +
+                                        std::to_string(minimum * slot_bytes) +
                                         " bytes) for one verify round");
         }
     } else {
@@ -1270,7 +1275,7 @@ std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
                 "the KV floor and minimum expert cache require " + std::to_string(floor + headroom) +
                 " bytes, but only " + std::to_string(free_bytes) + " bytes are free after weights");
         }
-        slots = minimum + (free_bytes - floor - headroom) / ops::kExpertSlotBytes;
+        slots = minimum + (free_bytes - floor - headroom) / slot_bytes;
     }
     return static_cast<std::uint32_t>(std::min(slots, total));
 }

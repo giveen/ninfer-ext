@@ -180,6 +180,7 @@ struct Qwen4BlockParameters {
 };
 
 struct Qwen4Parameters {
+    ops::ExpertLayout experts; // the one layout every layer's routed-expert bank uses
     HyperConnectionParameters head;
     std::vector<Qwen4BlockParameters> layers;
 };

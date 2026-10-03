@@ -359,26 +359,26 @@ constexpr int kFetchCtas   = 64;
 __global__ void __launch_bounds__(256)
     expert_cache_fetch_kernel(ExpertWeights bank, const std::int32_t* __restrict__ misses,
                               std::int32_t max_misses, std::byte* pool) {
-    constexpr std::int64_t kVectors[4] = {kExpertGateUpCodeBytes / 16, kExpertGateUpScaleBytes / 16,
-                                          kExpertDownCodeBytes / 16, kExpertDownScaleBytes / 16};
-    constexpr std::int64_t kPerExpert = kExpertSlotBytes / 16;
-    const std::int64_t total  = static_cast<std::int64_t>(min(misses[0], max_misses)) * kPerExpert;
+    // The layout's planes are 16-byte multiples; the slot is its planes back to back.
+    const ExpertLayout& layout        = bank.layout;
+    const std::int64_t per_expert     = layout.slot_bytes / 16;
+    const std::int64_t total  = static_cast<std::int64_t>(min(misses[0], max_misses)) * per_expert;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t w = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          w < total; w += stride) {
-        const std::int64_t j = w / kPerExpert;
-        std::int64_t v       = w - j * kPerExpert;
+        const std::int64_t j = w / per_expert;
+        std::int64_t v       = w - j * per_expert;
         std::int64_t offset  = 0;
         int p                = 0;
-        while (v >= kVectors[p]) {
-            v -= kVectors[p];
-            offset += kVectors[p];
+        while (v >= layout.plane_bytes[p] / 16) {
+            v -= layout.plane_bytes[p] / 16;
+            offset += layout.plane_bytes[p] / 16;
             ++p;
         }
         const std::int64_t slot   = misses[1 + 2 * j];
         const std::int64_t expert = misses[2 + 2 * j];
         const auto* src = reinterpret_cast<const uint4*>(bank.base[p] + expert * bank.stride[p]);
-        auto* dst       = reinterpret_cast<uint4*>(pool + slot * kExpertSlotBytes) + offset;
+        auto* dst       = reinterpret_cast<uint4*>(pool + slot * layout.slot_bytes) + offset;
         dst[v]          = src[v];
     }
 }
@@ -403,22 +403,21 @@ __global__ void __launch_bounds__(256)
     const int expert = static_cast<int>(blockIdx.x);
     const std::int64_t entry = static_cast<std::int64_t>(layer) * E + expert;
     if (resident[entry] < 0) { return; }
-    const std::int32_t slot     = cache.slot_of[entry];
-    const std::int64_t sizes[4] = {kExpertGateUpCodeBytes, kExpertGateUpScaleBytes,
-                                   kExpertDownCodeBytes, kExpertDownScaleBytes};
-    std::int64_t plane_offset   = 0;
-    for (int p = 0; p < 4; ++p) {
-        const std::byte* from = slot >= 0 ? cache.pool + slot * kExpertSlotBytes + plane_offset
+    const std::int32_t slot    = cache.slot_of[entry];
+    const ExpertLayout& layout = bank.layout;
+    std::int64_t plane_offset  = 0;
+    for (int p = 0; p < layout.planes; ++p) {
+        const std::byte* from = slot >= 0 ? cache.pool + slot * layout.slot_bytes + plane_offset
                                           : bank.base[p] + expert * bank.stride[p];
         const auto* src          = reinterpret_cast<const uint4*>(from);
         auto* dst                = reinterpret_cast<uint4*>(
             const_cast<std::byte*>(staged.base[p]) + expert * staged.stride[p]);
-        const std::int64_t vectors = sizes[p] / 16;
+        const std::int64_t vectors = layout.plane_bytes[p] / 16;
         const std::int64_t per     = (vectors + kFetchChunks - 1) / kFetchChunks;
         const std::int64_t begin   = static_cast<std::int64_t>(blockIdx.y) * per;
         const std::int64_t end     = min(vectors, begin + per);
         for (std::int64_t v = begin + threadIdx.x; v < end; v += blockDim.x) { dst[v] = src[v]; }
-        plane_offset += sizes[p];
+        plane_offset += layout.plane_bytes[p];
     }
 }
 

@@ -300,7 +300,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
         static_assert(execution::Qwen4ExpertPager::kBankSlots == kQwen4StagedBankSlots,
                       "the planned pool tail must be exactly the pager's bank slots");
-        qwen4_experts.emplace(cache, kQwen4StagedColumns, layout.bank_slot, layout.base_slots);
+        qwen4_experts.emplace(parameters.qwen4->experts, cache, kQwen4StagedColumns,
+                              layout.bank_slot, layout.base_slots);
         if (layout.wide_bytes != 0) {
             auto* pool_base = static_cast<std::byte*>(layout.pool.bind(backing).data);
             wide_workspace.emplace(DeviceSpan{pool_base + layout.wide_offset, layout.wide_bytes});
@@ -618,7 +619,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     if (qwen4_runtime) {
         const std::int32_t slots = qwen4_experts->cache().slots;
         out.expert_cache_slots   = static_cast<std::uint32_t>(slots);
-        out.expert_cache_bytes   = static_cast<std::size_t>(slots) * ops::kExpertSlotBytes;
+        out.expert_cache_bytes   = static_cast<std::size_t>(slots) *
+                                 static_cast<std::size_t>(parameters.qwen4->experts.slot_bytes);
         if (ple_gather) {
             out.ngram_residency =
                 ple_gather->streamed() ? NgramResidency::Stream : NgramResidency::Mapped;

@@ -351,6 +351,7 @@ public:
             }
         }
         ops::ExpertWeights bank;
+        bank.layout    = ops::nvfp4_expert_layout();
         bank.base[0]   = gate_up->data;
         bank.base[1]   = gate_up->data + gate_up->geometry.scale_offset;
         bank.base[2]   = down->data;
@@ -475,6 +476,14 @@ Parameters::Parameters(const Model& source) : model(source) {
                 return prepare.qwen4_block(w.qwen4->layers[i]);
             }));
         }
+        // The pager, cache and planner size everything from one layout, so every bank must use it.
+        q.experts = q.layers.front().moe.bank.layout;
+        for (std::size_t i = 0; i < q.layers.size(); ++i) {
+            if (q.layers[i].moe.bank.layout != q.experts) {
+                throw std::invalid_argument("text/layers/" + std::to_string(i) +
+                                            ": routed experts use a different bank layout");
+            }
+        }
         qwen4 = std::move(q);
         if (w.qwen4_mtp) {
             qwen4_mtp = with_context("mtp", [&] {
@@ -484,6 +493,9 @@ Parameters::Parameters(const Model& source) : model(source) {
                     prepare.linear(m.embedding_projection), prepare.linear(m.hidden_projection),
                     prepare.hyper_connection(m.head),       prepare.qwen4_block(m.layer)};
             });
+            if (qwen4_mtp->layer.moe.bank.layout != qwen4->experts) {
+                throw std::invalid_argument("mtp: routed experts use a different bank layout");
+            }
         }
         if (w.vision) {
             vision = with_context("vision", [&] { return prepare.vision(*w.vision); });

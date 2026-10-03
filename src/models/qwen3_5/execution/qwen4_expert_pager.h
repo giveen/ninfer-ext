@@ -38,13 +38,13 @@ namespace ninfer::models::qwen3_5::execution {
  */
 class Qwen4ExpertPager {
 public:
-    static constexpr std::size_t kStagedBankBytes = ops::kExpertStagedLayerBytes;
     static constexpr std::int32_t kBankSlots      = 2 * ops::kOffloadMoeExperts;
 
     // `cache.pool` holds the decode cache slots (cache plus the lent range), then two layers' weight
     // divisors; the banks begin at `bank_slot`. `base_slots` is the cache size while the wide idle
     // prefill borrows the lend range, `cache.slots` the decode-time size.
-    Qwen4ExpertPager(const ops::ExpertCacheState& cache, std::int32_t staged_columns,
+    Qwen4ExpertPager(const ops::ExpertLayout& layout, const ops::ExpertCacheState& cache,
+                     std::int32_t staged_columns,
                      std::int32_t bank_slot, std::int32_t base_slots);
     ~Qwen4ExpertPager();
 
@@ -102,6 +102,8 @@ private:
     [[nodiscard]] ops::ExpertWeights staged_weights(int bank,
                                                     const ops::ExpertWeights& source) const;
 
+    ops::ExpertLayout layout_;
+    std::size_t staged_bank_bytes_ = 0; // one staged layer: its experts, then the layout tail
     ops::ExpertCacheState cache_;
     std::int32_t staged_columns_ = 0;
 
