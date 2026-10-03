@@ -92,9 +92,29 @@ def hadamard128() -> torch.Tensor:
 def decode(
     trellis: torch.Tensor, su: torch.Tensor, sv: torch.Tensor, bitrate_half_bits: int
 ) -> torch.Tensor:
-    """FP64 matrix [N, K] represented by tiles [N/16, K/16, tile_bytes] and scales su[K], sv[N]."""
+    """FP64 matrix [N, K] represented by tiles [N/16, K/16, tile_bytes] and scales su[K], sv[N].
+
+    A stacked object passes su[S, K]: its S matrices of N / S rows each use their own row of su,
+    and the rows of sv are the concatenation of theirs.
+    """
     tiles_n, tiles_k = trellis.shape[:2]
     n, k = tiles_n * TILE, tiles_k * TILE
+    if su.ndim == 2:
+        sets = su.shape[0]
+        if sets < 1 or n % sets or (n // sets) % 128 or su.shape[1] != k or sv.shape != (n,):
+            raise ValueError("EXL3 stacked decode needs su[S, K], sv[N] and whole 128-row sets")
+        rows = n // sets // TILE
+        return torch.cat(
+            [
+                decode(
+                    trellis[s * rows : (s + 1) * rows],
+                    su[s],
+                    sv[s * rows * TILE : (s + 1) * rows * TILE],
+                    bitrate_half_bits,
+                )
+                for s in range(sets)
+            ]
+        )
     if su.shape != (k,) or sv.shape != (n,) or n % 128 or k % 128:
         raise ValueError("EXL3 decode needs su[K], sv[N] and 128-aligned dimensions")
     z_tiles = mul1(unpack_states(trellis, bitrate_half_bits)).double()  # [tn, tk, 256]

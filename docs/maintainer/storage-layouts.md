@@ -443,17 +443,23 @@ The payload has three planes, in this order:
 ```text
 trellis plane
 zero padding to a 256-byte boundary
-FP32 input-channel scales suh[K]
+FP32 input-channel scales suh[S][K]
 zero padding to a 256-byte boundary
 FP32 output-channel scales svh[N]
 ```
+
+`S` is the tensor object's `divisors` member (1 when absent). `S > 1` stacks `S` independently
+quantized `[N / S, K]` matrices in one object, as a bank of routed experts does: the trellis plane
+is the tile rows of the matrices back to back, `svh` is the concatenation of their output scales,
+and matrix `s` (rows `s * N / S` through `(s + 1) * N / S - 1`) uses `suh[s]`. `N / S` must be a
+positive multiple of 128, so no Hadamard block spans two matrices. `S = 1` is the plain matrix.
 
 Each scale word is stored as its exact little-endian binary32 bits. Plane offsets and object size are:
 
 ```text
 trellis_offset       = 0
 suh_offset           = align_up(trellis_bytes, 256)
-suh_bytes            = 4 * K
+suh_bytes            = 4 * K * S
 svh_offset           = align_up(suh_offset + suh_bytes, 256)
 svh_bytes            = 4 * N
 payload_bytes        = svh_offset + svh_bytes

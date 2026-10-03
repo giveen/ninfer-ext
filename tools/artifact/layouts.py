@@ -93,6 +93,7 @@ class Exl3Geometry:
     output_scale_offset: int
     output_scale_bytes: int
     payload_bytes: int
+    scale_sets: int = 1
 
 
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
@@ -280,7 +281,13 @@ def exl3_geometry(
     format: str | Exl3Format,
     shape: Sequence[int],
     bitrate_half_bits: int | None,
+    scale_sets: int = 1,
 ) -> Exl3Geometry:
+    """Geometry of `scale_sets` stacked [N / scale_sets, K] matrices, each with its own suh[K].
+
+    The trellis plane and svh[N] are those of the whole [N, K] object; only suh repeats, once per
+    stacked matrix, so one set covers N / scale_sets consecutive rows. One set is the plain matrix.
+    """
     spec = _format(format)
     if not isinstance(spec, Exl3Format):
         raise ValueError("trellis_t16_v1 requires exl3_mul1")
@@ -293,13 +300,20 @@ def exl3_geometry(
     n, k = _shape(shape, rank=2)
     if n % 128 or k % 128:
         raise ValueError("trellis_t16_v1 requires both matrix dimensions divisible by 128")
+    if isinstance(scale_sets, bool) or not isinstance(scale_sets, int) or scale_sets < 1:
+        raise ValueError("EXL3 scale set count must be a positive integer")
+    # Each stacked matrix is transformed on its own: a 128-row Hadamard block may not span two.
+    if n % scale_sets or (n // scale_sets) % 128:
+        raise ValueError(
+            "each EXL3 scale set must cover a whole number of 128-row blocks of the object"
+        )
 
     tiles_n = n // 16
     tiles_k = k // 16
     tile_bytes = 16 * bitrate_half_bits
     trellis_bytes = tiles_n * tiles_k * tile_bytes
     input_scale_offset = align_up(trellis_bytes, PLANE_ALIGNMENT)
-    input_scale_bytes = k * 4
+    input_scale_bytes = k * 4 * scale_sets
     output_scale_offset = align_up(
         input_scale_offset + input_scale_bytes, PLANE_ALIGNMENT
     )
@@ -317,6 +331,7 @@ def exl3_geometry(
         output_scale_offset=output_scale_offset,
         output_scale_bytes=output_scale_bytes,
         payload_bytes=output_scale_offset + output_scale_bytes,
+        scale_sets=scale_sets,
     )
 
 
@@ -329,7 +344,7 @@ def encoded_size(
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
-    if divisors != 1 and layout_spec is not BLOCK_SCALE_K16_M128X4_V1:
+    if divisors != 1 and layout_spec not in (BLOCK_SCALE_K16_M128X4_V1, TRELLIS_T16_V1):
         raise ValueError(
             f"layout {layout_spec.name!r} stores one divisor, not {divisors}"
         )
@@ -361,5 +376,5 @@ def encoded_size(
     if layout_spec is TRELLIS_T16_V1:
         if not isinstance(numeric_spec, Exl3Format):
             raise ValueError("trellis_t16_v1 requires exl3_mul1")
-        return exl3_geometry(numeric_spec, shape, bitrate_half_bits).payload_bytes
+        return exl3_geometry(numeric_spec, shape, bitrate_half_bits, divisors).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

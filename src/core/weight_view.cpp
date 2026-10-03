@@ -79,8 +79,9 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                std::span<const std::uint64_t> shape, std::uint64_t divisors,
                                std::uint64_t bitrate_half_bits) {
-    if (divisors == 0 || (divisors != 1 && format != QType::NVFP4)) {
-        throw std::invalid_argument("only an NVFP4 plane carries more than one divisor");
+    if (divisors == 0 || (divisors != 1 && format != QType::NVFP4 && format != QType::EXL3_MUL1)) {
+        throw std::invalid_argument(
+            "only an NVFP4 or EXL3 plane carries more than one divisor or scale set");
     }
     if (bitrate_half_bits != 0 && format != QType::EXL3_MUL1) {
         throw std::invalid_argument("only EXL3 tensors carry bitrate_half_bits");
@@ -160,6 +161,12 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if (n % 128 || k % 128) {
             throw std::invalid_argument("EXL3 TrellisT16 requires N%128=0 and K%128=0");
         }
+        // `divisors` stacked matrices of n / divisors rows each own one suh[k]; a 128-row Hadamard
+        // block may not span two of them. One set is the plain matrix.
+        if (n % divisors || (n / divisors) % 128) {
+            throw std::invalid_argument(
+                "each EXL3 scale set must cover a whole number of 128-row blocks");
+        }
         out.bitrate_half_bits = bitrate_half_bits;
         out.tiles_n           = n / 16;
         out.tiles_k           = k / 16;
@@ -167,7 +174,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.trellis_bytes = mul(mul(out.tiles_n, out.tiles_k), out.tile_bytes);
         out.code_bytes = out.trellis_bytes;
         out.input_scale_offset = aligned(out.trellis_bytes, 256);
-        out.input_scale_bytes = mul(k, 4);
+        out.input_scale_bytes = mul(mul(k, 4), divisors);
         out.output_scale_offset = aligned(add(out.input_scale_offset, out.input_scale_bytes), 256);
         out.output_scale_bytes = mul(n, 4);
         out.scale_offset = out.output_scale_offset;
@@ -309,6 +316,11 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         // complete parent, so a row slice is not a valid operand.
         if (g.format != QType::EXL3_MUL1 || !is_complete_weight(view)) {
             throw std::invalid_argument("EXL3 native Weight requires the complete parent");
+        }
+        // A dense Linear reads one suh; a bank of separately scaled matrices is consumed by the
+        // grouped expert Op, which addresses each matrix's scale set itself.
+        if (g.divisor_count != 1) {
+            throw std::invalid_argument("EXL3 native Weight cannot be a stacked bank");
         }
         out.qdata            = region.parent->data;
         out.input_scales     = region.parent->data + g.input_scale_offset;

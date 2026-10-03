@@ -324,6 +324,11 @@ scaled by `1/sqrt(128)`. `Z` is the exact integer matrix decoded from the trelli
 into `svh`, so reconstruction uses `Z` directly and does not round the codebook values to FP16.
 The format defines these stored scale words, not the quantization procedure that selects them.
 
+A tensor object may stack `S` independently quantized `[N/S, K]` matrices (its `divisors` member).
+Each owns one `suh[K]`, and `svh` holds their output scales back to back; the matrix of row `n` is
+`floor(n / (N / S))`. `N / S` must be a multiple of 128 so that a transform block never spans two
+matrices. This is how a bank of routed experts is stored; a dense Linear consumes only `S = 1`.
+
 For a 16-bit state `s`, the exact integer code is:
 
 ```text

@@ -40,7 +40,7 @@ class TensorOutput:
         self.format = get_format(obj.format)
         self._padding_initialized = False
         self._divisors: list[bytes | None] = [None] * obj.divisors
-        self._input_scales: bytes | None = None
+        self._input_scales: list[bytes | None] = [None] * obj.divisors
 
     def write_bytes(self, offset: int, data: bytes | memoryview) -> None:
         self.writer.write_region(self.object.id, offset, data)
@@ -71,7 +71,7 @@ class TensorOutput:
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Exl3Format):
-            g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits)
+            g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits, obj.divisors)
             gaps = (
                 (g.trellis_bytes, g.input_scale_offset),
                 (g.input_scale_offset + g.input_scale_bytes, g.output_scale_offset),
@@ -159,7 +159,7 @@ class TensorOutput:
         input_scales: torch.Tensor | None,
     ) -> None:
         obj = self.object
-        g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits)
+        g = exl3_geometry(self.format, obj.shape, obj.bitrate_half_bits, obj.divisors)
         rows = tiles.shape[0] * 16
         if (
             tiles.dtype != torch.uint8
@@ -181,13 +181,18 @@ class TensorOutput:
             if not bool(torch.isfinite(values).all()):
                 raise ValueError(f"{obj.id}: EXL3 {label} scales must be finite")
         self._padding()
+        # Each stacked matrix owns one suh[K]; a block of rows belongs to exactly one of them.
+        rows_per_set = g.n // g.scale_sets
+        scale_set = row_begin // rows_per_set
+        if row_begin + rows > (scale_set + 1) * rows_per_set:
+            raise ValueError(f"{obj.id}: EXL3 row block straddles two scale sets")
         su = input_scales.contiguous().cpu().numpy().tobytes()
-        if self._input_scales is None:
-            self.write_bytes(g.input_scale_offset, su)
-            self._input_scales = su
-        elif self._input_scales != su:
+        if self._input_scales[scale_set] is None:
+            self.write_bytes(g.input_scale_offset + scale_set * g.k * 4, su)
+            self._input_scales[scale_set] = su
+        elif self._input_scales[scale_set] != su:
             raise ValueError(
-                f"{obj.id}: EXL3 sources of one parent must share their input scales"
+                f"{obj.id}: EXL3 sources of one scale set must share their input scales"
             )
         tile_row_bytes = g.tiles_k * g.tile_bytes
         self.write_bytes(

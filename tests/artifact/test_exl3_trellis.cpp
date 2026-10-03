@@ -147,6 +147,39 @@ void test_trellis_geometry() {
     expect_throws<std::invalid_argument>(
         [&] { (void)ninfer::weight_row_planes(view.parts.front()); },
         "the generic row-plane view must not misinterpret EXL3 scales");
+    // Stacked matrices: the trellis plane and svh[N] are the whole object's, suh repeats per set.
+    const std::array<std::uint64_t, 2> stacked_shape{1024, 256};
+    const auto single = weight_geometry(QType::EXL3_MUL1, QuantLayout::TrellisT16,
+                                        stacked_shape, 1, 8);
+    const auto stacked = weight_geometry(QType::EXL3_MUL1, QuantLayout::TrellisT16,
+                                         stacked_shape, 4, 8);
+    expect(stacked.divisor_count == 4 && stacked.trellis_bytes == single.trellis_bytes &&
+               stacked.input_scale_offset == single.input_scale_offset &&
+               stacked.input_scale_bytes == 4 * single.input_scale_bytes &&
+               stacked.output_scale_bytes == single.output_scale_bytes &&
+               stacked.output_scale_offset % 256 == 0 &&
+               stacked.bytes == stacked.output_scale_offset + stacked.output_scale_bytes,
+           "stacked EXL3 matrices must repeat only the input scales");
+    expect_throws<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::EXL3_MUL1, QuantLayout::TrellisT16,
+                                    stacked_shape, 3, 8); },
+        "a scale set count that does not divide the rows must be rejected");
+    expect_throws<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::EXL3_MUL1, QuantLayout::TrellisT16,
+                                    stacked_shape, 16, 8); },
+        "a scale set smaller than a 128-row Hadamard block must be rejected");
+    expect_throws<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::Q4_G64_FP16, QuantLayout::RowSplit,
+                                    stacked_shape, 2); },
+        "only NVFP4 and EXL3 may carry several divisors or scale sets");
+    {
+        std::vector<std::byte> bank(stacked.bytes);
+        ninfer::WeightParent bank_parent{stacked, bank.data()};
+        ninfer::WeightView bank_view{{1024, 256}, {{&bank_parent, 0, stacked.elements}}};
+        expect_throws<std::invalid_argument>(
+            [&] { (void)ninfer::native_weight(bank_view); },
+            "a stacked EXL3 bank must not be handed to a dense Linear as one matrix");
+    }
     const std::array<std::uint64_t, 2> overflow_shape{
         std::numeric_limits<std::uint64_t>::max(), 128};
     expect_throws<std::overflow_error>(

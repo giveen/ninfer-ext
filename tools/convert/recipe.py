@@ -8,6 +8,8 @@ from fnmatch import fnmatchcase
 from math import prod
 from typing import Sequence
 
+import torch
+
 from tools.artifact.layouts import encoded_size
 from tools.artifact.formats import (
     DirectFormat,
@@ -313,6 +315,43 @@ class Recipe:
                 "grouped inputs need compatible rows or an explicit parent shape"
             )
 
+        def exl3_scale_sets(sources, selection) -> int:
+            """How many input-scale sets an imported EXL3 parent stores.
+
+            Row ranges of one quantised matrix share its suh, so such a parent keeps one set.
+            Matrices quantised apart (the routed experts) each own theirs, and the stored plane
+            addresses them by an equal share of its rows: every source must be a complete matrix of
+            the same height whose rows are whole 128-row blocks, otherwise the parent is refused
+            here rather than part way through writing it.
+            """
+            if selection.method is not import_encoded:
+                return 1
+            scales = []
+            for source in sources:
+                if source.read_encoded is None:
+                    return 1
+                rows = source.read_encoded(0, 16)
+                if rows.input_scales is None:
+                    return 1
+                scales.append(rows.input_scales)
+            # Compare by value in one pass; pairwise tensor comparison of a 1,024-expert bank is
+            # quadratic.
+            distinct = {scale.contiguous().numpy().tobytes() for scale in scales}
+            if len(distinct) == 1:
+                return 1
+            if any(len(source.shape) != 2 for source in sources) or (
+                len({source.shape[0] for source in sources}) != 1
+            ):
+                raise ValueError(
+                    "EXL3 sources with different input scales must be complete matrices "
+                    "with equal row counts"
+                )
+            if len(distinct) != len(scales):
+                raise ValueError(
+                    "EXL3 sources of one parent must all share an input scale or all differ"
+                )
+            return len(sources)
+
         def parent_divisors(sources, selection) -> int:
             """How many NVFP4 divisors this parent stores: one per source, or one for all.
 
@@ -322,6 +361,8 @@ class Recipe:
             divided equally is refused here, where its shape is chosen, rather than part way through
             writing it.
             """
+            if selection.format == "exl3_mul1" and len(sources) > 1:
+                return exl3_scale_sets(sources, selection)
             if selection.format != "nvfp4" or len(sources) < 2:
                 return 1
             # Only imported encoded sources carry a per-source weight divisor. A parent built by a

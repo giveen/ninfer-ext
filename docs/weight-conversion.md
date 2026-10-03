@@ -62,6 +62,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_flash_next_nvfp4` | Imported NVFP4 routed experts (MTP bank re-encoded from block FP8), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | None; `--model` is the ModelOpt NVFP4 checkpoint |
+| `qwen3_8_flash_next_bf16` | Every Text/MTP projection at full BF16 precision, experts in the NVFP4 recipe's per-layer banks, FP8 n-gram table (the EXL3 expert quantizer's input) | None |
+| `qwen3_8_flash_next_exl3` | EXL3 routed experts from `ninfer-quantize` (one bank per layer with an input-scale set per expert), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | `quantized` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
