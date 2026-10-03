@@ -314,6 +314,44 @@ public:
         return out;
     }
 
+    // EXL3 banks: gate/up is 2E stacked matrices (gate_e, up_e adjacent) and down is E, each with
+    // its own `suh` set, so every plane of expert e is contiguous at a fixed per-expert stride.
+    static ops::ExpertWeights exl3_expert_bank(const WeightParent& gate_up,
+                                               const WeightParent& down) {
+        const auto& gg = gate_up.geometry;
+        const auto& dg = down.geometry;
+        if (gg.layout != QuantLayout::TrellisT16 || dg.layout != QuantLayout::TrellisT16 ||
+            dg.format != QType::EXL3_MUL1) {
+            throw std::invalid_argument("offloaded EXL3 experts must be TrellisT16 mul1 banks");
+        }
+        if (gg.divisor_count != 2ULL * ops::kOffloadMoeExperts ||
+            dg.divisor_count != ops::kOffloadMoeExperts) {
+            throw std::invalid_argument(
+                "EXL3 expert banks need one scale set per expert matrix (2E gate/up, E down)");
+        }
+        ops::ExpertWeights bank;
+        bank.layout = ops::exl3_expert_layout(static_cast<std::int32_t>(gg.bitrate_half_bits),
+                                              static_cast<std::int32_t>(dg.bitrate_half_bits));
+        const std::byte* const bases[6] = {
+            gate_up.data, gate_up.data + gg.input_scale_offset, gate_up.data + gg.output_scale_offset,
+            down.data,    down.data + dg.input_scale_offset,    down.data + dg.output_scale_offset};
+        for (std::int32_t p = 0; p < 6; ++p) {
+            bank.base[p]   = bases[p];
+            bank.stride[p] = bank.layout.plane_bytes[p];
+        }
+        // The planes must hold exactly E experts at those strides.
+        const std::uint64_t e = ops::kOffloadMoeExperts;
+        if (gg.trellis_bytes != e * bank.layout.plane_bytes[0] ||
+            gg.input_scale_bytes != e * bank.layout.plane_bytes[1] ||
+            gg.output_scale_bytes != e * bank.layout.plane_bytes[2] ||
+            dg.trellis_bytes != e * bank.layout.plane_bytes[3] ||
+            dg.input_scale_bytes != e * bank.layout.plane_bytes[4] ||
+            dg.output_scale_bytes != e * bank.layout.plane_bytes[5]) {
+            throw std::invalid_argument("EXL3 expert bank planes do not match the expert geometry");
+        }
+        return bank;
+    }
+
     ops::ExpertWeights expert_bank(const MoeWeights& moe) const {
         const auto& config = model_.config().text;
         const auto& geo    = std::get<MoeConfig>(config.ffn);
@@ -344,6 +382,7 @@ public:
                 throw std::invalid_argument("routed experts are not stored expert-major");
             }
         }
+        if (gate_up->geometry.format == QType::EXL3_MUL1) { return exl3_expert_bank(*gate_up, *down); }
         for (const auto* parent : {gate_up, down}) {
             if (parent->geometry.format != QType::NVFP4 ||
                 parent->geometry.layout != QuantLayout::BlockScaleK16M128x4) {

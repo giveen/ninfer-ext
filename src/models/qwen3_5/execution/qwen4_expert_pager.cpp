@@ -64,6 +64,7 @@ ops::ExpertWeights Qwen4ExpertPager::staged_weights(int bank,
         staged.base[plane] = cursor;
         cursor += static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts;
     }
+    if (layout_.format != ops::ExpertFormat::Nvfp4) { return staged; }
     auto* divisors          = reinterpret_cast<float*>(cursor);
     staged.gate_up_divisors = divisors;
     staged.down_divisors    = divisors + 2 * ops::kOffloadMoeExperts;
@@ -120,25 +121,27 @@ void Qwen4ExpertPager::fill(std::int32_t layer, const ops::ExpertWeights& source
             first = last;
         }
     }
-    // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
-    // one per bank (the MTP layer's banks).
-    const auto divisors = [](std::int64_t rows, std::int32_t divisor_rows, std::int64_t room) {
-        if (divisor_rows <= 0 || rows % divisor_rows != 0 || rows / divisor_rows > room) {
-            throw std::logic_error("Qwen4Exp staged bank cannot hold the layer's weight divisors");
-        }
-        return static_cast<std::size_t>(rows / divisor_rows) * sizeof(float);
-    };
-    constexpr std::int64_t kGateUpRows =
-        std::int64_t(ops::kOffloadMoeExperts) * 2 * ops::kOffloadMoeIntermediate;
-    constexpr std::int64_t kDownRows = std::int64_t(ops::kOffloadMoeExperts) * ops::kOffloadMoeHidden;
-    CUDA_CHECK(cudaMemcpyAsync(
-        const_cast<float*>(staged.gate_up_divisors), source.gate_up_divisors,
-        divisors(kGateUpRows, source.gate_up_divisor_rows, 2 * ops::kOffloadMoeExperts),
-        cudaMemcpyDefault, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.down_divisors), source.down_divisors,
-                               divisors(kDownRows, source.down_divisor_rows,
-                                        ops::kOffloadMoeExperts),
-                               cudaMemcpyDefault, stream_));
+    if (layout_.format == ops::ExpertFormat::Nvfp4) {
+        // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
+        // one per bank (the MTP layer's banks).
+        const auto divisors = [](std::int64_t rows, std::int32_t divisor_rows, std::int64_t room) {
+            if (divisor_rows <= 0 || rows % divisor_rows != 0 || rows / divisor_rows > room) {
+                throw std::logic_error("Qwen4Exp staged bank cannot hold the layer's weight divisors");
+            }
+            return static_cast<std::size_t>(rows / divisor_rows) * sizeof(float);
+        };
+        constexpr std::int64_t kGateUpRows =
+            std::int64_t(ops::kOffloadMoeExperts) * 2 * ops::kOffloadMoeIntermediate;
+        constexpr std::int64_t kDownRows = std::int64_t(ops::kOffloadMoeExperts) * ops::kOffloadMoeHidden;
+        CUDA_CHECK(cudaMemcpyAsync(
+            const_cast<float*>(staged.gate_up_divisors), source.gate_up_divisors,
+            divisors(kGateUpRows, source.gate_up_divisor_rows, 2 * ops::kOffloadMoeExperts),
+            cudaMemcpyDefault, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.down_divisors), source.down_divisors,
+                                   divisors(kDownRows, source.down_divisor_rows,
+                                            ops::kOffloadMoeExperts),
+                                   cudaMemcpyDefault, stream_));
+    }
     CUDA_CHECK(cudaEventRecord(ready_[b], stream_));
     layer_[b] = layer;
 }

@@ -41,6 +41,7 @@ inline constexpr std::int32_t kMaxExpertPlanes = 6;
 
 enum class ExpertFormat : std::uint8_t {
     Nvfp4, // block-scaled NVFP4 codes and scales, divisors in the staged layer's tail
+    Exl3,  // EXL3 mul1 trellis, with per-expert scale sets
 };
 
 /**
@@ -56,6 +57,8 @@ struct ExpertLayout {
     std::int64_t plane_bytes[kMaxExpertPlanes]   = {}; // per expert
     std::int64_t slot_bytes                      = 0;  // sum of plane_bytes
     std::int64_t tail_bytes                      = 0;  // per staged layer, after the planes
+    std::int32_t gate_up_half_bits               = 0;  // EXL3 trellis rates; 0 for NVFP4
+    std::int32_t down_half_bits                  = 0;
 
     [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
 
@@ -82,6 +85,33 @@ struct ExpertLayout {
     layout.plane_bytes[3] = kExpertDownScaleBytes;
     layout.slot_bytes     = kExpertSlotBytes;
     layout.tail_bytes     = kExpertDivisorBytes;
+    return layout;
+}
+
+/**
+ * The EXL3 mul1 routed-expert layout at the given trellis rates (half-bits per weight, 8 = 4.0
+ * bpw). Planes: gate/up trellis, gate/up `suh`, gate/up `svh`, down trellis, down `suh`, down
+ * `svh`. An expert's gate and up matrices are two adjacent scale sets of the gate/up bank, so each
+ * plane is contiguous per expert. Scale planes are FP32 and do not depend on the rate.
+ */
+[[nodiscard]] constexpr ExpertLayout exl3_expert_layout(std::int32_t gate_up_half_bits,
+                                                        std::int32_t down_half_bits) {
+    ExpertLayout layout;
+    layout.format           = ExpertFormat::Exl3;
+    layout.planes           = 6;
+    layout.gate_up_half_bits = gate_up_half_bits;
+    layout.down_half_bits    = down_half_bits;
+    const std::int64_t gate_up_tiles =
+        std::int64_t(2) * kOffloadMoeIntermediate / 16 * (kOffloadMoeHidden / 16);
+    const std::int64_t down_tiles =
+        std::int64_t(kOffloadMoeHidden) / 16 * (kOffloadMoeIntermediate / 16);
+    layout.plane_bytes[0] = gate_up_tiles * 16 * gate_up_half_bits;
+    layout.plane_bytes[1] = std::int64_t(2) * kOffloadMoeHidden * 4;
+    layout.plane_bytes[2] = std::int64_t(2) * kOffloadMoeIntermediate * 4;
+    layout.plane_bytes[3] = down_tiles * 16 * down_half_bits;
+    layout.plane_bytes[4] = std::int64_t(kOffloadMoeIntermediate) * 4;
+    layout.plane_bytes[5] = std::int64_t(kOffloadMoeHidden) * 4;
+    for (std::int32_t p = 0; p < layout.planes; ++p) { layout.slot_bytes += layout.plane_bytes[p]; }
     return layout;
 }
 

@@ -229,6 +229,8 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
+    require(weights_source.layout.format == ExpertFormat::Nvfp4, op,
+            "EXL3 expert execution is not implemented yet");
     require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
                 weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
             op, "expert divisors are required");

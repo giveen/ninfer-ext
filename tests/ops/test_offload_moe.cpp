@@ -845,6 +845,15 @@ std::vector<std::int32_t> column_range(std::int32_t first, std::int32_t count) {
 
 } // namespace
 
+// The EXL3 expert layout is pinned to the stored bank geometry: at 4.0 bpw (8 half-bits) an expert
+// is 1,638,400 + 20,480 + 5,120 + 819,200 + 2,560 + 10,240 bytes, and the tail is empty.
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).slot_bytes == 2'496'000);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_bytes[0] == 1'638'400);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_bytes[3] == 819'200);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).tail_bytes == 0);
+static_assert(ninfer::ops::exl3_expert_layout(10, 9).plane_bytes[0] == 2'048'000);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_offset(3) == 1'664'000);
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
