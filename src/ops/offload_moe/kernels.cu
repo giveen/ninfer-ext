@@ -432,11 +432,14 @@ __global__ void __launch_bounds__(kJobThreads)
                     std::int32_t slots, std::int32_t* __restrict__ counts,
                     std::int32_t* __restrict__ sorted_assign,
                     std::int32_t* __restrict__ sorted_slot, std::int32_t* __restrict__ jobs,
-                    std::int32_t* __restrict__ job_count) {
+                    std::int32_t* __restrict__ job_count, std::int32_t* __restrict__ zero,
+                    std::int32_t zero_words) {
     __shared__ unsigned long long keys[kJobThreads];
     __shared__ int scratch[kJobThreads];
     __shared__ int base_s;
     const int tid = static_cast<int>(threadIdx.x);
+    // A caller's per-block completion counters start at zero; the kernels after this one use them.
+    for (int i = tid; i < zero_words; i += blockDim.x) { zero[i] = 0; }
     if (assignments <= kJobThreads) {
         // Bitonic sort of (slot, assignment) keys in shared memory.
         keys[tid] = tid < assignments ? (static_cast<unsigned long long>(slot_ids[tid]) << 32) |
@@ -957,16 +960,13 @@ void moe_project(const MoeChunk& chunk, JobFilter filter, cudaStream_t stream) {
 
 void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream) {
     const int assignments = chunk.columns * K;
-    moe_jobs_kernel<<<1, kJobThreads, 0, stream>>>(chunk.slot_ids, assignments, chunk.slots,
-                                                   chunk.counts, chunk.sorted_assign,
-                                                   chunk.sorted_slot, chunk.jobs, chunk.job_count);
+    // EXL3 slice-completion counters (one per assignment and 128-column block) start at zero.
+    const bool exl3 = chunk.source.layout.format == ExpertFormat::Exl3;
+    moe_jobs_kernel<<<1, kJobThreads, 0, stream>>>(
+        chunk.slot_ids, assignments, chunk.slots, chunk.counts, chunk.sorted_assign,
+        chunk.sorted_slot, chunk.jobs, chunk.job_count, exl3 ? chunk.counters : nullptr,
+        exl3 ? assignments * (I / 128) : 0);
     CUDA_CHECK(cudaGetLastError());
-    if (chunk.source.layout.format == ExpertFormat::Exl3) {
-        // Slice-completion counters start at zero; the last slice of each block resets its own.
-        CUDA_CHECK(cudaMemsetAsync(chunk.counters, 0,
-                                   static_cast<std::size_t>(assignments) * (I / 128) * sizeof(std::int32_t),
-                                   stream));
-    }
     if (chunk.misses == nullptr) {
         moe_project(chunk, JobFilter{nullptr, false}, stream);
     } else {

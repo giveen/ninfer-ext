@@ -99,7 +99,8 @@ constexpr int kBatch = 8;
 
 // Both operands of `kMats` stacked matrices over `ktiles` k-tiles (a multiple of kBatch): c[m][j] is
 // the n8 half j of matrix m's 16-column tile. kHB == 8 is the 4.0 bpw rate; kHB == 0 takes any
-// other rate and prefetches only the even ones, whose tile words can be loaded ahead of the decode.
+// other rate; every rate but the widest half-rates has tile words fixed by (lane, rate), which are
+// loaded ahead of the decode.
 template <int kHB, int kMats>
 __device__ __forceinline__ void tile_gemm(const __half* const (&a_tile)[kMats],
                                           const std::uint8_t* const (&trellis)[kMats], int ktiles,
@@ -107,7 +108,7 @@ __device__ __forceinline__ void tile_gemm(const __half* const (&a_tile)[kMats],
                                           float (&c)[kMats][2][4]) {
     const int row = lane >> 2;
     const int col = (lane & 3) * 2;
-    if (kHB == 8 || dec.fast) {
+    if (kHB == 8 || dec.prefetchable) {
         for (int kb = 0; kb < ktiles; kb += kBatch) {
             Exl3TileWords words[kMats][kBatch];
 #pragma unroll
