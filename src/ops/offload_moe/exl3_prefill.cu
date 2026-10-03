@@ -21,6 +21,7 @@
 #include "ops/offload_moe/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "ops/common/math.cuh"
 #include "ops/linear/exl3/exl3_decode.cuh"
 
 #include <cuda_bf16.h>
@@ -80,9 +81,11 @@ __global__ void __launch_bounds__(kThreads)
         const int token = sorted_assign[job.begin + first + r] / K;
         const __nv_bfloat16* xrow = x + static_cast<std::int64_t>(token) * H + blk * 128;
         const float* sp           = suh + proj * H + blk * 128;
-        float v[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) { v[j] = __bfloat162float(xrow[lane * 4 + j]) * sp[lane * 4 + j]; }
+        const uint2 raw = *reinterpret_cast<const uint2*>(xrow + lane * 4);
+        const float4 sv = *reinterpret_cast<const float4*>(sp + lane * 4);
+        const float2 x01 = bf16x2_bits_to_float2(raw.x);
+        const float2 x23 = bf16x2_bits_to_float2(raw.y);
+        float v[4]       = {x01.x * sv.x, x01.y * sv.y, x23.x * sv.z, x23.y * sv.w};
         fwht128(v, lane);
         __half* dst = xr + (static_cast<std::int64_t>(job.begin + first + r) * 2 + proj) * H +
                       blk * 128 + lane * 4;
