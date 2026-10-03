@@ -424,6 +424,50 @@ int exl3_case(int gate_up_half_bits, int down_half_bits, int tokens, bool concen
     return failures;
 }
 
+// A call wider than one internal pass (2048 columns) must give every column the bits it gets in a
+// call of its own: rows reduce in a fixed order, so neither the pass boundary nor the job grouping
+// may change a result. Compared against two separate calls, with no oracle (the oracle is per-case
+// above and too slow at this width).
+int split_case(std::uint64_t seed) {
+    constexpr int kFirst = 2048, kTail = 52, kTokens = kFirst + kTail;
+    const HostBank bank = make_bank(8, 8, seed);
+    std::mt19937 rng(static_cast<std::uint32_t>(seed));
+    std::vector<int> ids(static_cast<std::size_t>(K) * kTokens), pool(E);
+    std::vector<float> weights(ids.size());
+    for (int e = 0; e < E; ++e) { pool[e] = e; }
+    for (int t = 0; t < kTokens; ++t) {
+        std::shuffle(pool.begin(), pool.end(), rng);
+        for (int k = 0; k < K; ++k) {
+            ids[static_cast<std::size_t>(t) * K + k]     = pool[k];
+            weights[static_cast<std::size_t>(t) * K + k] = 0.1F;
+        }
+    }
+    std::vector<float> x(static_cast<std::size_t>(H) * kTokens), shared(x.size()), shared_gate(kTokens);
+    fill_uniform(x, static_cast<std::uint32_t>(seed) + 1, -2.0F, 2.0F);
+    fill_uniform(shared, static_cast<std::uint32_t>(seed) + 2, -1.0F, 1.0F);
+    fill_uniform(shared_gate, static_cast<std::uint32_t>(seed) + 3, 0.0F, 1.0F);
+    round_to_bf16(x);
+    round_to_bf16(shared);
+    std::vector<int> identity(E);
+    for (int e = 0; e < E; ++e) { identity[e] = e; }
+    const DeviceBank device = upload(bank, identity);
+    const auto whole = run(device, ids, ids, x, weights, shared_gate, shared, kTokens);
+
+    const auto head_of = [&](const auto& v, std::size_t per) {
+        return std::decay_t<decltype(v)>(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(per * kFirst));
+    };
+    const auto tail_of = [&](const auto& v, std::size_t per) {
+        return std::decay_t<decltype(v)>(v.begin() + static_cast<std::ptrdiff_t>(per * kFirst), v.end());
+    };
+    const auto head = run(device, head_of(ids, K), head_of(ids, K), head_of(x, H), head_of(weights, K),
+                          head_of(shared_gate, 1), head_of(shared, H), kFirst);
+    const auto tail = run(device, tail_of(ids, K), tail_of(ids, K), tail_of(x, H), tail_of(weights, K),
+                          tail_of(shared_gate, 1), tail_of(shared, H), kTail);
+    std::vector<std::uint16_t> joined(head);
+    joined.insert(joined.end(), tail.begin(), tail.end());
+    return verify_exact("exl3 moe_experts 2100 columns equals 2048 + 52 bits", whole, joined);
+}
+
 } // namespace
 
 int main() {
@@ -448,6 +492,7 @@ int main() {
     failures += exl3_case(9, 7, 4, false, false, 0x971U);
     failures += exl3_case(6, 10, 3, false, false, 0x610U);
     failures += exl3_case(11, 5, 2, false, false, 0xB05U);
+    failures += split_case(0x2100U);
     if (failures == 0) { std::cout << "OK offload_moe_exl3 correctness\n"; }
     return failures == 0 ? 0 : 1;
 }

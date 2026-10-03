@@ -14,8 +14,9 @@ namespace {
 
 // Token columns per internal pass; bounds the per-assignment intermediate and partial buffers.
 constexpr std::int32_t kChunkColumns = 1024;
-// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment).
-constexpr std::int32_t kExl3ChunkColumns = 512;
+// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment). Per-token cost
+// stops falling at about 2048 columns, where an expert has ~40 rows per row tile.
+constexpr std::int32_t kExl3ChunkColumns = 2048;
 
 std::int32_t chunk_columns(const ExpertLayout& layout) {
     return layout.format == ExpertFormat::Exl3 ? kExl3ChunkColumns : kChunkColumns;
