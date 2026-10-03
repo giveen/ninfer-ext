@@ -38,7 +38,7 @@ constexpr int I = kOffloadMoeIntermediate;
 constexpr int K = kOffloadMoeTopK;
 
 constexpr int kThreads    = 256; // 8 warps, one 16-wide output tile of each matrix per warp
-constexpr int kMt         = 4;   // m16 row tiles per job
+constexpr int kGroups    = kJobTokens / 8; // n8 token groups per job
 constexpr int kBatch      = 8;   // tile loads in flight per warp before any is decoded
 constexpr int kSliceK     = 128; // contraction columns staged in shared memory at a time (one Hadamard block)
 constexpr int kSliceTiles = kSliceK / 16;
@@ -50,7 +50,7 @@ constexpr int kGuStride   = kSliceK + 8; // padded halves per smem row: conflict
 constexpr int kHalfRows   = kJobTokens / 2; // rows per epilogue pass
 constexpr int kRes        = 129; // FP32 epilogue row stride
 
-static_assert(kJobTokens == 16 * kMt);
+static_assert(kJobTokens % 16 == 0);
 static_assert(H % kSliceK == 0 && I % kSliceK == 0 && kSliceTiles == kBatch);
 
 // The RTX 5090 offers 100 KB of shared memory per SM, so the staged A tiles stay small enough for two
@@ -96,33 +96,30 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
-// Contraction of `kMats` matrices over `ktiles` k-tiles against the job's A tiles in shared memory:
-// c[m][mt][j] is the n8 half j of row tile mt of matrix m's 16-column tile. A fragments of row tiles
-// past the job's rows are skipped (the count is CTA-uniform).
-template <int kHB, int kMats>
-__device__ __forceinline__ void tile_gemm_rows(const __half* const (&a_base)[kMats], int a_stride,
-                                               const std::uint8_t* const (&trellis)[kMats],
-                                               int ktiles, int tile_bytes,
-                                               const Exl3TileDecoder& dec, int lane, int count,
-                                               float (&c)[kMats][kMt][2][4]) {
-    const int row = lane >> 2;
-    const int col = (lane & 3) * 2;
+// Contraction of `kMats` matrices over `ktiles` k-tiles against the job's tokens in shared memory.
+// The decoded weights are the m16 operand (16 output columns by 16 k) and the tokens the n8 operand,
+// so rows are padded to 8, not 16: c[m][g] is the 16 output columns of matrix m's tile by the 8
+// tokens of group g. `kG` is the number of token groups the job occupies and is a template
+// parameter: a runtime test around each MMA is compiled to predication, and a predicated-off HMMA
+// still occupies the tensor pipe.
+template <int kHB, int kMats, int kG>
+__device__ __forceinline__ void tile_gemm_groups(const __half* const (&a_base)[kMats], int a_stride,
+                                                 const std::uint8_t* const (&trellis)[kMats],
+                                                 int ktiles, int tile_bytes,
+                                                 const Exl3TileDecoder& dec, int lane,
+                                                 float (&c)[kMats][kGroups][4]) {
+    const int token = lane >> 2;
+    const int col   = (lane & 3) * 2;
     auto apply = [&](int m, const float (&d)[8], int kt) {
-        const std::uint32_t b0[2] = {pack_half2(d[0], d[1]), pack_half2(d[2], d[3])};
-        const std::uint32_t b1[2] = {pack_half2(d[4], d[5]), pack_half2(d[6], d[7])};
-        const __half* p           = a_base[m] + row * a_stride + kt * 16 + col;
+        // The decoder's B-fragment registers are also the A fragment of the transposed product.
+        const std::uint32_t a[4] = {pack_half2(d[0], d[1]), pack_half2(d[4], d[5]),
+                                    pack_half2(d[2], d[3]), pack_half2(d[6], d[7])};
+        const __half* p          = a_base[m] + token * a_stride + kt * 16 + col;
 #pragma unroll
-        for (int mt = 0; mt < kMt; ++mt) {
-            if (mt * 16 < count) {
-                const __half* q = p + mt * 16 * a_stride;
-                std::uint32_t a[4];
-                a[0] = load_half2(q);
-                a[1] = load_half2(q + 8 * a_stride);
-                a[2] = load_half2(q + 8);
-                a[3] = load_half2(q + 8 * a_stride + 8);
-                mma_f16(c[m][mt][0], a, b0);
-                mma_f16(c[m][mt][1], a, b1);
-            }
+        for (int g = 0; g < kG; ++g) {
+            const __half* q          = p + g * 8 * a_stride;
+            const std::uint32_t b[2] = {load_half2(q), load_half2(q + 8)};
+            mma_f16(c[m][g], a, b);
         }
     };
     if (kHB == 8 || dec.prefetchable) {
@@ -158,27 +155,48 @@ __device__ __forceinline__ void tile_gemm_rows(const __half* const (&a_base)[kMa
     }
 }
 
-// Spill the accumulators of matrix m to res[row][n] (row stride kRes) for the Hadamard epilogues.
+template <int kHB, int kMats>
+__device__ __forceinline__ void tile_gemm_rows(const __half* const (&a_base)[kMats], int a_stride,
+                                               const std::uint8_t* const (&trellis)[kMats],
+                                               int ktiles, int tile_bytes,
+                                               const Exl3TileDecoder& dec, int lane, int count,
+                                               float (&c)[kMats][kGroups][4]) {
+    switch ((count + 7) / 8) {
+#define NINFER_EXL3_GROUPS(G)                                                                    \
+    case G:                                                                                      \
+        tile_gemm_groups<kHB, kMats, G>(a_base, a_stride, trellis, ktiles, tile_bytes, dec, lane, c); \
+        break;
+        NINFER_EXL3_GROUPS(1)
+        NINFER_EXL3_GROUPS(2)
+        NINFER_EXL3_GROUPS(3)
+        NINFER_EXL3_GROUPS(4)
+        NINFER_EXL3_GROUPS(5)
+        NINFER_EXL3_GROUPS(6)
+        NINFER_EXL3_GROUPS(7)
+#undef NINFER_EXL3_GROUPS
+    default:
+        tile_gemm_groups<kHB, kMats, kGroups>(a_base, a_stride, trellis, ktiles, tile_bytes, dec, lane, c);
+        break;
+    }
+}
+
+// Spill the accumulators of the token groups of one half of the job to res[token][n] (row stride
+// kRes) for the Hadamard epilogues. Groups the job does not occupy hold zeros.
 template <int kMats>
 __device__ __forceinline__ void store_accumulators(float* res, int half, int warp, int lane,
-                                                   const float (&c)[kMats][kMt][2][4]) {
-    const int row = lane >> 2;
-    const int col = (lane & 3) * 2;
+                                                   const float (&c)[kMats][kGroups][4]) {
+    const int g = lane >> 2;
+    const int t = (lane & 3) * 2;
 #pragma unroll
     for (int m = 0; m < kMats; ++m) {
 #pragma unroll
-        for (int h = 0; h < kMt / 2; ++h) {
-            const int mt = half * (kMt / 2) + h;
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int n = warp * 16 + j * 8 + col;
-                float* lo   = res + (m * kHalfRows + h * 16 + row) * kRes + n;
-                float* hi   = lo + 8 * kRes;
-                lo[0]       = c[m][mt][j][0];
-                lo[1]       = c[m][mt][j][1];
-                hi[0]       = c[m][mt][j][2];
-                hi[1]       = c[m][mt][j][3];
-            }
+        for (int h = 0; h < kGroups / 2; ++h) {
+            const int group = half * (kGroups / 2) + h;
+            float* base     = res + (m * kHalfRows + h * 8 + t) * kRes + warp * 16 + g;
+            base[0]         = c[m][group][0]; // token t, column g
+            base[kRes]      = c[m][group][1]; // token t + 1, column g
+            base[8]         = c[m][group][2]; // token t, column g + 8
+            base[kRes + 8]  = c[m][group][3]; // token t + 1, column g + 8
         }
     }
 }
@@ -206,7 +224,7 @@ __global__ void __launch_bounds__(kThreads, 2) exl3_gate_up_prefill_kernel(
     const std::uint8_t* const tiles[2] = {trellis + gate_tile * kTilesK * tile_bytes,
                                           trellis + up_tile * kTilesK * tile_bytes};
     const __half* const a_base[2] = {as, as + kJobTokens * kGuStride};
-    float c[2][kMt][2][4] = {};
+    float c[2][kGroups][4] = {};
 
     for (int slice = 0; slice < H / kSliceK; ++slice) {
         __syncthreads();
@@ -284,7 +302,7 @@ __global__ void __launch_bounds__(kThreads, 2) exl3_down_prefill_kernel(
     const int tile_bytes = 16 * half_bits;
     const Exl3TileDecoder dec(half_bits, lane);
 
-    float c[1][kMt][2][4] = {};
+    float c[1][kGroups][4] = {};
     const std::int64_t tile = static_cast<std::int64_t>(nb * 8 + warp);
     const __half* const a_base[1]      = {as};
     const std::uint8_t* const tiles[1] = {trellis + tile * kDownTiles * tile_bytes};
