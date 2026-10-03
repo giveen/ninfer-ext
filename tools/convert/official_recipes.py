@@ -429,7 +429,7 @@ def qwen3_8_flash_next_exl3(model, recipe, sources):
     expert. An expert missing from the store is an error: leaving it at another precision would
     make the bank unexecutable. The n-gram table is quantized to 4-bit group codes (row_group_v1,
     group of 32 with a binary16 scale, about 4.5 bits per value); its noise cost was measured at KL
-    0.016 against the FP8 table. Dense projections become Q6 (the output head Q6, the token
+    0.016 against the FP8 table. Dense projections become Q6 (Q8 where K is not a multiple of 128; the output head Q6, the token
     embedding Q8); routers, shared-expert gates, norms and small vectors stay direct.
     """
     if model.config.get("model_type") != "qwen4_exp_text":
@@ -460,7 +460,8 @@ def qwen3_8_flash_next_exl3(model, recipe, sources):
                 source=exl3_matrix_source(store, name, parameter.shape),
             )
             continue
-        _assign(recipe, name, Q6)
+        # The Q6 kernels need K aligned to 128; the low-rank hyper-connection stems (K=320) stay Q8.
+        _assign(recipe, name, Q6 if parameter.shape[-1] % 128 == 0 else Q8)
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
