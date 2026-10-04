@@ -610,7 +610,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     GuardedDeviceBuffer staged(static_cast<std::size_t>(H) * tokens * 2);
     Tensor ty_staged(staged.data(), DType::BF16, {H, tokens});
     {
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, E));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, E, ops::nvfp4_expert_layout()));
         ops::moe_experts(tx, tids, tids, tw, tsg, tshared, bank.weights, E, workspace, ty_staged,
                          nullptr);
         cuda_synchronize();
@@ -626,7 +626,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
     GuardedDeviceBuffer cached(static_cast<std::size_t>(H) * tokens * 2);
     Tensor ty_cached(cached.data(), DType::BF16, {H, tokens});
     {
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
         ops::moe_experts(tx, tids, tslots, tw, tsg, tshared,
                          ops::expert_cache_weights(cache.state, bank.weights), slots, workspace,
                          ty_cached, nullptr);
@@ -665,7 +665,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
         CUDA_CHECK(cudaStreamCreateWithFlags(&fetch, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&resolved, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&fetched, cudaEventDisableTiming));
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots));
+        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
         ops::expert_cache_resolve(tids, 0, pending_cache.state, tpending_slots, tpending_misses,
                                   main);
         CUDA_CHECK(cudaEventRecord(resolved, main));
@@ -844,6 +844,15 @@ std::vector<std::int32_t> column_range(std::int32_t first, std::int32_t count) {
 }
 
 } // namespace
+
+// The EXL3 expert layout is pinned to the stored bank geometry: at 4.0 bpw (8 half-bits) an expert
+// is 1,638,400 + 20,480 + 5,120 + 819,200 + 2,560 + 10,240 bytes, and the tail is empty.
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).slot_bytes == 2'496'000);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_bytes[0] == 1'638'400);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_bytes[3] == 819'200);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).tail_bytes == 0);
+static_assert(ninfer::ops::exl3_expert_layout(10, 9).plane_bytes[0] == 2'048'000);
+static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_offset(3) == 1'664'000);
 
 int main() {
     if (cuda_unavailable()) {

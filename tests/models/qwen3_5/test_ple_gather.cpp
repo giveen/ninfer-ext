@@ -1,8 +1,11 @@
 // The n-gram (PLE) gather must produce the same BF16 embedding whether rows are faulted through
-// the mapping or streamed with direct I/O. The synthetic table spans two volume files at unaligned
-// offsets, so rows straddle 4 KiB pages and the second segment starts mid-page.
+// the mapping or streamed with direct I/O, for both table formats (row-scaled FP8 and 4-bit group
+// codes). The synthetic table spans two volume files at unaligned offsets, so rows straddle 4 KiB
+// pages and the second segment starts mid-page. Mapped decode is checked against an independent
+// reconstruction of the stored words.
 #include "models/qwen3_5/execution/ple_gather.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -16,9 +19,8 @@ using namespace ninfer::models::qwen3_5;
 
 namespace {
 
-constexpr std::uint32_t kRows     = 5000;
-constexpr std::uint32_t kRowWidth = 16;
-constexpr std::uint32_t kEos      = 7;
+constexpr std::uint32_t kRows = 5000;
+constexpr std::uint32_t kEos  = 7;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -37,15 +39,36 @@ void write_file(const std::filesystem::path& path, std::uint64_t leading, const 
     out.write(tail.data(), static_cast<std::streamsize>(tail.size()));
 }
 
-} // namespace
+std::uint16_t to_bf16(float value) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    return static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16);
+}
 
-int main() {
-    // Two 2-gram heads and two 3-gram heads of 16 columns: a 64-wide embedding.
+float from_half(std::uint16_t word) {
+    const float magnitude =
+        ((word >> 10) & 0x1F) == 0
+            ? std::ldexp(static_cast<float>(word & 0x3FF), -24)
+            : std::ldexp(1.0F + static_cast<float>(word & 0x3FF) / 1024.0F,
+                         static_cast<int>((word >> 10) & 0x1F) - 15);
+    return (word & 0x8000) ? -magnitude : magnitude;
+}
+
+float e4m3(std::uint8_t c) {
+    const int e = (c >> 3) & 15, m = c & 7;
+    const float v = e == 0 ? std::ldexp(m / 8.0F, -6) : std::ldexp(1.0F + m / 8.0F, e - 7);
+    return (c & 0x80) ? -v : v;
+}
+
+// One scenario: FP8 rows of 16 values or 4-bit rows of 32 values (one group).
+int run(bool grouped) {
+    const std::uint32_t row_width = grouped ? 32 : 16;
+    // Two 2-gram heads and two 3-gram heads: a 4-head embedding.
     PleConfig config;
     config.layer           = 1;
     config.ngram_size      = 3;
     config.heads_per_ngram = 2;
-    config.embed_dim       = 4 * kRowWidth;
+    config.embed_dim       = 4 * row_width;
     config.conv_kernel     = 4;
     config.eos_token_id    = kEos;
     config.table_rows      = kRows;
@@ -57,34 +80,40 @@ int main() {
         offset += modulus;
     }
 
-    // Object: FP8 codes [rows, 16], then BF16 row multipliers at a 256-byte aligned plane.
-    const std::uint64_t scale_plane = (kRows * kRowWidth + 255) / 256 * 256;
-    std::vector<std::byte> object(scale_plane + kRows * 2);
-    std::mt19937 rng(1234);
-    for (std::uint64_t i = 0; i < kRows * kRowWidth; ++i) {
-        // Finite E4M3FN codes only (exclude the 0x7F / 0xFF NaN words).
+    // Object: codes [rows, code_bytes] then the scale plane at a 256-byte aligned offset. FP8 stores
+    // one BF16 row multiplier per row; the 4-bit table one binary16 scale per row here (one group).
+    const std::uint64_t code_bytes  = grouped ? row_width / 2 : row_width;
+    const std::uint64_t scale_bytes = 2;
+    const std::uint64_t scale_plane = (kRows * code_bytes + 255) / 256 * 256;
+    std::vector<std::byte> object(scale_plane + kRows * scale_bytes);
+    std::mt19937 rng(grouped ? 4321 : 1234);
+    for (std::uint64_t i = 0; i < kRows * code_bytes; ++i) {
         std::uint8_t code = static_cast<std::uint8_t>(rng());
-        if ((code & 0x7F) == 0x7F) { code ^= 1; }
+        // FP8 must be finite E4M3FN (exclude the 0x7F / 0xFF NaN words); nibbles take any value.
+        if (!grouped && (code & 0x7F) == 0x7F) { code ^= 1; }
         object[i] = std::byte{code};
     }
     for (std::uint32_t r = 0; r < kRows; ++r) {
-        const std::uint16_t scale = static_cast<std::uint16_t>(0x3C00 + (rng() % 0x0300));
-        std::memcpy(object.data() + scale_plane + r * 2, &scale, 2);
+        const std::uint16_t scale = grouped ? static_cast<std::uint16_t>(0x2000 + (rng() % 0x1800))
+                                            : static_cast<std::uint16_t>(0x3C00 + (rng() % 0x0300));
+        std::memcpy(object.data() + scale_plane + r * scale_bytes, &scale, 2);
     }
 
     // Split mid-table at a row boundary; place both pieces at unaligned file offsets.
-    const std::uint64_t split = 1777 * kRowWidth;
-    const auto dir            = std::filesystem::current_path() / "ple_gather_test_volumes";
+    const std::uint64_t split = 1777 * code_bytes;
+    const auto dir = std::filesystem::current_path() / (grouped ? "ple_gather_q4_volumes" : "ple_gather_test_volumes");
     std::filesystem::create_directories(dir);
     write_file(dir / "a.bin", 1234, object.data(), split);
     write_file(dir / "b.bin", 777, object.data() + split, object.size() - split);
 
     execution::PleTable table;
-    table.rows        = kRows;
-    table.width       = kRowWidth;
-    table.row_bytes   = kRowWidth;
-    table.scale_plane = scale_plane;
-    table.segments    = {
+    table.rows            = kRows;
+    table.width           = static_cast<std::int32_t>(row_width);
+    table.row_bytes       = code_bytes;
+    table.scale_plane     = scale_plane;
+    table.scale_row_bytes = scale_bytes;
+    table.format          = grouped ? QType::Q4_G32_FP16_ROWS : QType::FP8_E4M3FN_ROW_BF16;
+    table.segments        = {
         {0, split, object.data(), dir / "a.bin", 1234},
         {split, object.size() - split, object.data() + split, dir / "b.bin", 777},
     };
@@ -106,32 +135,30 @@ int main() {
             streamed.gather(tokens, first, count, b);
             failures += check(a == b, "streamed n-gram rows differ from mapped rows");
         }
-        // Mapped decode is independently the E4M3 row times its BF16 multiplier.
+        // Mapped decode is independently the stored words times their scale.
         std::vector<std::uint16_t> column(config.embed_dim);
         mapped.gather(tokens, 20, 1, column);
         std::vector<std::uint64_t> rows(config.heads());
         const std::int64_t context[3] = {tokens[20], tokens[19], tokens[18]};
         mapped.rows(context, rows);
-        const auto e4m3 = [](std::uint8_t c) {
-            const int e = (c >> 3) & 15, m = c & 7;
-            const float v = e == 0 ? std::ldexp(m / 8.0F, -6) : std::ldexp(1.0F + m / 8.0F, e - 7);
-            return (c & 0x80) ? -v : v;
-        };
         for (std::uint32_t h = 0; h < config.heads(); ++h) {
             std::uint16_t scale_bits;
-            std::memcpy(&scale_bits, object.data() + scale_plane + rows[h] * 2, 2);
+            std::memcpy(&scale_bits, object.data() + scale_plane + rows[h] * scale_bytes, 2);
             float scale;
-            const std::uint32_t scale_word = static_cast<std::uint32_t>(scale_bits) << 16;
-            std::memcpy(&scale, &scale_word, 4);
-            for (std::uint32_t i = 0; i < kRowWidth; ++i) {
+            if (grouped) {
+                scale = from_half(scale_bits);
+            } else {
+                const std::uint32_t scale_word = static_cast<std::uint32_t>(scale_bits) << 16;
+                std::memcpy(&scale, &scale_word, 4);
+            }
+            const auto* codes = reinterpret_cast<const std::uint8_t*>(object.data() + rows[h] * code_bytes);
+            for (std::uint32_t i = 0; i < row_width; ++i) {
                 const float value =
-                    e4m3(static_cast<std::uint8_t>(object[rows[h] * kRowWidth + i])) * scale;
-                std::uint32_t bits;
-                std::memcpy(&bits, &value, 4);
-                const auto bf16 =
-                    static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16);
-                if (column[h * kRowWidth + i] != bf16) {
-                    std::cerr << "n-gram row decode mismatch at head " << h << '\n';
+                    grouped ? static_cast<float>(((i & 1) ? codes[i / 2] >> 4 : codes[i / 2] & 0xF) - 8) * scale
+                            : e4m3(codes[i]) * scale;
+                if (column[h * row_width + i] != to_bf16(value)) {
+                    std::cerr << (grouped ? "4-bit" : "FP8") << " n-gram row decode mismatch at head " << h
+                              << '\n';
                     ++failures;
                     break;
                 }
@@ -141,9 +168,21 @@ int main() {
         // O_DIRECT is unsupported on some filesystems (tmpfs); that is an environment limit.
         std::cerr << "SKIP: " << error.what() << '\n';
         std::filesystem::remove_all(dir);
-        return 77;
+        return -1;
     }
     std::filesystem::remove_all(dir);
+    return failures;
+}
+
+} // namespace
+
+int main() {
+    int failures = 0;
+    for (const bool grouped : {false, true}) {
+        const int result = run(grouped);
+        if (result < 0) { return 77; }
+        failures += result;
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " PLE gather mapped/stream equivalence\n";
     return failures == 0 ? 0 : 1;
 }

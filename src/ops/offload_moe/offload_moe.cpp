@@ -14,6 +14,13 @@ namespace {
 
 // Token columns per internal pass; bounds the per-assignment intermediate and partial buffers.
 constexpr std::int32_t kChunkColumns = 1024;
+// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment). Per-token cost
+// stops falling at about 2048 columns, where an expert has ~40 rows per row tile.
+constexpr std::int32_t kExl3ChunkColumns = 2048;
+
+std::int32_t chunk_columns(const ExpertLayout& layout) {
+    return layout.format == ExpertFormat::Exl3 ? kExl3ChunkColumns : kChunkColumns;
+}
 
 void require(bool condition, const char* op, const std::string& message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -34,10 +41,11 @@ void require_routed(const Tensor& t, DType dtype, std::int32_t columns, const ch
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
 
 struct ChunkLayout {
-    std::size_t counts, sorted_assign, sorted_slot, jobs, job_count, act, partial, total;
+    std::size_t counts, sorted_assign, sorted_slot, jobs, job_count, act, partial, gu_partial,
+        counters, xr, total;
 };
 
-ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
+ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots, bool exl3) {
     const std::size_t assignments = static_cast<std::size_t>(columns) * kOffloadMoeTopK;
     ChunkLayout out{};
     std::size_t cursor = 0;
@@ -53,6 +61,16 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots) {
     out.job_count     = take(4);
     out.act           = take(assignments * kOffloadMoeIntermediate * 2);
     out.partial       = take(assignments * kOffloadMoeHidden * 4);
+    // EXL3 decode (a pass of at most kExl3DecodeColumns): four K-slice partials of gate and up per
+    // assignment and the slice counters. Wider passes use the prefill route and its rotated inputs.
+    const std::size_t decode =
+        static_cast<std::size_t>(std::min(columns, detail::kExl3DecodeColumns)) *
+        kOffloadMoeTopK;
+    out.gu_partial = take(exl3 ? decode * 4 * 2 * kOffloadMoeIntermediate * 4 : 0);
+    out.counters   = take(exl3 ? decode * (kOffloadMoeIntermediate / 128) * 4 : 0);
+    out.xr = take(exl3 && columns > detail::kExl3DecodeColumns
+                      ? assignments * 2 * kOffloadMoeHidden * 2
+                      : 0);
     out.total         = cursor;
     return out;
 }
@@ -150,7 +168,9 @@ void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::in
     constexpr const char* op = "expert_cache_fetch";
     require_dense(misses, DType::I32, op, "misses");
     require(max_misses > 0 && misses.numel() >= 2 * max_misses + 1, op, "invalid miss capacity");
-    for (const auto* base : bank.base) { require(base != nullptr, op, "bank planes are required"); }
+    for (std::int32_t p = 0; p < bank.layout.planes; ++p) {
+        require(bank.base[p] != nullptr, op, "bank planes are required");
+    }
     require(cache.pool != nullptr, op, "cache pool is required");
     detail::expert_cache_fetch_launch(bank, misses, max_misses, cache, stream);
 }
@@ -162,13 +182,16 @@ void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
     require(cache.slot_of != nullptr && cache.pool != nullptr && resident != nullptr, op,
             "cache state and residency snapshot are required");
     require(layer >= 0 && layer < cache.layers, op, "layer is outside the cache");
-    const std::int64_t sizes[4] = {kExpertGateUpCodeBytes, kExpertGateUpScaleBytes,
-                                   kExpertDownCodeBytes, kExpertDownScaleBytes};
-    for (int p = 0; p < 4; ++p) {
+    const ExpertLayout& layout = bank.layout;
+    require(layout.format == staged.layout.format && layout.planes == staged.layout.planes &&
+                layout.slot_bytes == staged.layout.slot_bytes,
+            op, "bank and staged bank must share one expert layout");
+    for (std::int32_t p = 0; p < layout.planes; ++p) {
         require(bank.base[p] != nullptr && staged.base[p] != nullptr, op,
                 "bank and staged planes are required");
-        require(bank.stride[p] >= sizes[p] && staged.stride[p] >= sizes[p] &&
-                    bank.stride[p] % 16 == 0 && staged.stride[p] % 16 == 0,
+        require(bank.stride[p] >= layout.plane_bytes[p] &&
+                    staged.stride[p] >= layout.plane_bytes[p] && bank.stride[p] % 16 == 0 &&
+                    staged.stride[p] % 16 == 0,
                 op, "plane strides must hold one 16-byte-aligned expert");
     }
     detail::expert_cache_stage_launch(cache, layer, resident, bank, staged, stream);
@@ -184,13 +207,10 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
 }
 
 ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
-    ExpertWeights out             = bank;
-    const std::int64_t offsets[4] = {
-        0, kExpertGateUpCodeBytes, kExpertGateUpCodeBytes + kExpertGateUpScaleBytes,
-        kExpertGateUpCodeBytes + kExpertGateUpScaleBytes + kExpertDownCodeBytes};
-    for (int p = 0; p < 4; ++p) {
-        out.base[p]   = cache.pool + offsets[p];
-        out.stride[p] = kExpertSlotBytes;
+    ExpertWeights out = bank;
+    for (std::int32_t p = 0; p < bank.layout.planes; ++p) {
+        out.base[p]   = cache.pool + bank.layout.plane_offset(p);
+        out.stride[p] = bank.layout.slot_bytes;
     }
     return out;
 }
@@ -199,15 +219,20 @@ std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept {
     return slots <= 4096 ? std::numeric_limits<std::int32_t>::max() : 1024 / kOffloadMoeTopK;
 }
 
-std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots) {
+std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots,
+                                       const ExpertLayout& layout) {
     if (tokens <= 0) { throw std::invalid_argument("moe_experts_workspace_bytes: T <= 0"); }
-    return chunk_layout(std::min(tokens, kChunkColumns), slots).total + 256;
+    return chunk_layout(std::min(tokens, chunk_columns(layout)), slots,
+                        layout.format == ExpertFormat::Exl3)
+               .total +
+           256;
 }
 
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending) {
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending,
+                 const MoeActivationTap* tap) {
     constexpr const char* op = "moe_experts";
     if (pending != nullptr) {
         require(pending->misses != nullptr && pending->fetched != nullptr, op,
@@ -226,20 +251,32 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
-    require(weights_source.gate_up_divisors != nullptr && weights_source.down_divisors != nullptr &&
-                weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
-            op, "expert divisors are required");
-    for (const int p : {0, 1, 2, 3}) {
-        // Code planes are read in 16-byte vectors, scale planes in adjacent pairs.
-        const std::int64_t alignment = p % 2 == 0 ? 16 : 2;
-        require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % alignment == 0 &&
-                    weights_source.stride[p] % alignment == 0,
-                op, "expert code planes must be 16-byte aligned and scale planes 2-byte aligned");
+    const bool exl3 = weights_source.layout.format == ExpertFormat::Exl3;
+    if (exl3) {
+        require(weights_source.layout.planes == 6, op, "an EXL3 bank has six planes");
+        require(tap == nullptr || !*tap, op, "EXL3 experts expose no activation tap");
+        for (std::int32_t p = 0; p < 6; ++p) {
+            require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % 16 == 0 &&
+                        weights_source.stride[p] % 16 == 0,
+                    op, "EXL3 expert planes must be 16-byte aligned");
+        }
+    } else {
+        require(weights_source.gate_up_divisors != nullptr &&
+                    weights_source.down_divisors != nullptr &&
+                    weights_source.gate_up_divisor_rows > 0 && weights_source.down_divisor_rows > 0,
+                op, "expert divisors are required");
+        for (const int p : {0, 1, 2, 3}) {
+            // Code planes are read in 16-byte vectors, scale planes in adjacent pairs.
+            const std::int64_t alignment = p % 2 == 0 ? 16 : 2;
+            require(reinterpret_cast<std::uintptr_t>(weights_source.base[p]) % alignment == 0 &&
+                        weights_source.stride[p] % alignment == 0,
+                    op, "expert code planes must be 16-byte aligned and scale planes 2-byte aligned");
+        }
     }
     require(columns <= moe_experts_max_columns(slots), op,
             "large token chunks require a staged bank indexed by expert id");
-    const std::int32_t chunk = std::min(columns, kChunkColumns);
-    const ChunkLayout layout = chunk_layout(chunk, slots);
+    const std::int32_t chunk = std::min(columns, chunk_columns(weights_source.layout));
+    const ChunkLayout layout = chunk_layout(chunk, slots, exl3);
     auto scope               = workspace.scope();
     auto* base               = static_cast<std::byte*>(workspace.alloc_bytes(layout.total).data);
     for (std::int32_t begin = 0; begin < columns; begin += chunk) {
@@ -266,11 +303,20 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         c.job_count     = reinterpret_cast<std::int32_t*>(base + layout.job_count);
         c.act           = reinterpret_cast<__nv_bfloat16*>(base + layout.act);
         c.partial       = reinterpret_cast<float*>(base + layout.partial);
+        c.gu_partial    = exl3 ? reinterpret_cast<float*>(base + layout.gu_partial) : nullptr;
+        c.counters      = exl3 ? reinterpret_cast<std::int32_t*>(base + layout.counters) : nullptr;
+        c.xr            = exl3 ? base + layout.xr : nullptr;
         if (pending != nullptr) {
             c.misses  = static_cast<const std::int32_t*>(pending->misses->data);
             c.fetched = pending->fetched;
         }
         detail::moe_experts_chunk_launch(c, stream);
+        if (tap != nullptr && *tap) {
+            Tensor act(c.act, DType::BF16, {kOffloadMoeIntermediate, count * kOffloadMoeTopK});
+            Tensor ids(const_cast<std::int32_t*>(c.expert_ids), DType::I32,
+                       {kOffloadMoeTopK, count});
+            (*tap)(act, ids, stream);
+        }
     }
 }
 
@@ -293,6 +339,7 @@ void moe_experts_a4(const Tensor& x, const Tensor& expert_ids, const Tensor& wei
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");
+    require(staged.layout.format == ExpertFormat::Nvfp4, op, "A4 executes NVFP4 expert banks");
     require(staged.stride[0] == kExpertGateUpCodeBytes &&
                 staged.stride[1] == kExpertGateUpScaleBytes &&
                 staged.stride[2] == kExpertDownCodeBytes &&

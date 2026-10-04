@@ -1,6 +1,7 @@
 #include "calibration.h"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 
 #include "hessian_io.h"
@@ -28,7 +29,10 @@ namespace ninfer::quantize::app {
 namespace {
 
 using Site = ninfer::models::qwen3_5::execution::CalibrationSite;
-using Key  = std::pair<int, int>; // (site, layer)
+using Key  = std::array<int, 3>; // (site, layer, expert or -1)
+Key make_key(Site site, int layer, int expert = -1) {
+    return Key{static_cast<int>(site), layer, expert};
+}
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -36,18 +40,35 @@ void check(cudaError_t status, const char* operation) {
     }
 }
 
+// A routed expert tail "moe/experts/<E>/<gate|up|down>": gate and up share the layer's MoeInput;
+// each expert's down has its own MoeActivation Hessian.
+std::optional<Key> expert_key(const std::string& tail, int layer) {
+    const std::string prefix = "moe/experts/";
+    if (!tail.starts_with(prefix)) { return std::nullopt; }
+    const std::size_t slash = tail.find('/', prefix.size());
+    if (slash == std::string::npos) { return std::nullopt; }
+    int expert = 0;
+    try {
+        expert = std::stoi(tail.substr(prefix.size(), slash - prefix.size()));
+    } catch (const std::exception&) { return std::nullopt; }
+    const std::string role = tail.substr(slash + 1);
+    if (role == "gate" || role == "up") { return make_key(Site::MoeInput, layer); }
+    if (role == "down") { return make_key(Site::MoeActivation, layer, expert); }
+    return std::nullopt;
+}
+
 // Which projection input a logical parameter consumes. Site and Text layer fully determine the
 // activation, so every member of a shared-input group maps to the same Hessian.
 std::optional<Key> site_for(const std::string& name) {
     const auto layer_prefix = std::string("text/layers/");
     if (name == "text/output_head") {
-        return std::make_pair(static_cast<int>(Site::OutputHead), -1);
+        return make_key(Site::OutputHead, -1);
     }
     // The MTP layer's activations: one layer (sentinel -1), the trunk's final hidden state plus the
     // next-token embedding at the stem, then its own attention and MLP. Its MLP reuses the Mlp sites
     // because ffn() observes them with the same -1 sentinel.
     if (name == "mtp/input_projection") {
-        return std::make_pair(static_cast<int>(Site::MtpStem), -1);
+        return make_key(Site::MtpStem, -1);
     }
     const auto mtp_prefix = std::string("mtp/layers/");
     if (name.starts_with(mtp_prefix)) {
@@ -55,7 +76,7 @@ std::optional<Key> site_for(const std::string& name) {
         if (slash == std::string::npos) { return std::nullopt; }
         const std::string tail = name.substr(slash + 1);
         const auto mtp_key     = [](Site site) {
-            return std::make_pair(static_cast<int>(site), -1);
+            return make_key(site, -1);
         };
         if (tail == "attention/query" || tail == "attention/key" || tail == "attention/gate" ||
             tail == "attention/value") {
@@ -64,7 +85,7 @@ std::optional<Key> site_for(const std::string& name) {
         if (tail == "attention/output") { return mtp_key(Site::MtpAttentionOutput); }
         if (tail == "mlp/gate" || tail == "mlp/up") { return mtp_key(Site::MlpInput); }
         if (tail == "mlp/down") { return mtp_key(Site::MlpActivation); }
-        return std::nullopt;
+        return expert_key(tail, -1);
     }
     if (!name.starts_with(layer_prefix)) { return std::nullopt; }
     const std::size_t slash = name.find('/', layer_prefix.size());
@@ -74,7 +95,7 @@ std::optional<Key> site_for(const std::string& name) {
         layer = std::stoi(name.substr(layer_prefix.size(), slash - layer_prefix.size()));
     } catch (const std::exception&) { return std::nullopt; }
     const std::string tail = name.substr(slash + 1);
-    const auto key = [&](Site site) { return std::make_pair(static_cast<int>(site), layer); };
+    const auto key = [&](Site site) { return make_key(site, layer); };
     if (tail == "attention/query" || tail == "attention/key" || tail == "attention/gate" ||
         tail == "attention/value") {
         return key(Site::AttentionInput);
@@ -87,7 +108,7 @@ std::optional<Key> site_for(const std::string& name) {
     if (tail == "gdn/output") { return key(Site::GdnOutput); }
     if (tail == "mlp/gate" || tail == "mlp/up") { return key(Site::MlpInput); }
     if (tail == "mlp/down") { return key(Site::MlpActivation); }
-    return std::nullopt;
+    return expert_key(tail, layer);
 }
 
 // Device Hessian for the sites of one layer group. Groups are separate passes over the same rows:
@@ -102,7 +123,40 @@ public:
     HessianGroup& operator=(const HessianGroup&) = delete;
 
     void observe(Site site, int layer, const ninfer::Tensor& input, cudaStream_t stream) {
-        const Key key{static_cast<int>(site), layer};
+        accumulate(make_key(site, layer), input, stream);
+    }
+
+    // Whether this group holds any expert Hessian of the layer (-1 is the MTP block).
+    [[nodiscard]] bool wants_experts(int layer) const {
+        for (const auto& entry : names_) {
+            if (entry.first[0] == static_cast<int>(Site::MoeActivation) && entry.first[1] == layer) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // One routed expert's down input; rows may be a strided slice, so gather to contiguous first.
+    void observe_expert(int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
+        const Key key = make_key(Site::MoeActivation, layer, expert);
+        if (!names_.contains(key)) { return; }
+        const std::size_t row_bytes = static_cast<std::size_t>(rows.ne[0]) * 2;
+        const std::size_t need      = row_bytes * static_cast<std::size_t>(rows.ne[1]);
+        if (need > gather_bytes_) {
+            if (gather_ != nullptr) { check(cudaFree(gather_), "cudaFree(gather)"); }
+            check(cudaMalloc(&gather_, need), "cudaMalloc(gather)");
+            gather_bytes_ = need;
+        }
+        check(cudaMemcpy2DAsync(gather_, row_bytes, rows.data, static_cast<std::size_t>(rows.nb[1]),
+                                row_bytes, static_cast<std::size_t>(rows.ne[1]),
+                                cudaMemcpyDeviceToDevice, stream),
+              "cudaMemcpy2DAsync(expert gather)");
+        ninfer::Tensor dense(gather_, ninfer::DType::BF16, {rows.ne[0], rows.ne[1]});
+        accumulate(key, dense, stream);
+    }
+
+private:
+    void accumulate(const Key& key, const ninfer::Tensor& input, cudaStream_t stream) {
         if (!names_.contains(key)) { return; }
         if (input.dtype != ninfer::DType::BF16 || input.ne[2] != 1 || input.ne[3] != 1) { return; }
         const std::int64_t k = input.ne[0];
@@ -118,10 +172,19 @@ public:
         } else if (slot.k != k) {
             throw std::runtime_error("calibration site changed its input width");
         }
-        ninfer::quantize::exl3::accumulate_hessian_kt(
-            static_cast<const __nv_bfloat16*>(input.data), tokens, k, slot.data, stream);
+        // ne[0] = k is the fastest axis of an ordinary activation ([token][k] in memory); only a
+        // transposed view (tokens fastest) takes the K x tokens reduction.
+        const auto* data = static_cast<const __nv_bfloat16*>(input.data);
+        if (input.nb[0] == 2 && input.nb[1] == 2 * k) {
+            ninfer::quantize::exl3::accumulate_hessian(data, tokens, k, slot.data, stream);
+        } else if (input.nb[1] == 2 && input.nb[0] == 2 * tokens) {
+            ninfer::quantize::exl3::accumulate_hessian_kt(data, tokens, k, slot.data, stream);
+        } else {
+            throw std::runtime_error("calibration activation is neither [token][k] nor [k][token]");
+        }
     }
 
+public:
     // Copy every observed Hessian to host and write one file per name that shares it.
     std::uint64_t flush() {
         check(cudaDeviceSynchronize(), "Hessian calibration synchronize");
@@ -153,7 +216,12 @@ private:
             if (slot.data != nullptr) { (void)cudaFree(slot.data); }
         }
         slots_.clear();
+        if (gather_ != nullptr) { (void)cudaFree(gather_); }
+        gather_       = nullptr;
+        gather_bytes_ = 0;
     }
+    void* gather_             = nullptr;
+    std::size_t gather_bytes_ = 0;
     std::filesystem::path hessians_;
     std::map<Key, std::vector<std::string>> names_;
     std::map<Key, Slot> slots_;
@@ -194,14 +262,22 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         for (const LinearParameter& parameter : enumerate_linear_parameters(reader)) {
             const auto key = site_for(parameter.name);
             if (!key) { continue; }
-            names[*key].push_back(parameter.name);
+            if ((*key)[0] == static_cast<int>(Site::MoeInput)) {
+                // Every expert gate/up of a layer shares one input Hessian: write it once, not
+                // once per expert (1024 identical 26 MB files per layer otherwise).
+                const std::string shared =
+                    parameter.name.substr(0, parameter.name.find("/moe/experts/")) + "/moe/input";
+                if (names[*key].empty()) { names[*key].push_back(shared); }
+            } else {
+                names[*key].push_back(parameter.name);
+            }
             site_bytes[*key] =
                 std::max(site_bytes[*key],
                          static_cast<std::uint64_t>(parameter.k) * parameter.k * sizeof(float));
         }
     }
     std::map<int, std::uint64_t> layer_bytes;
-    for (const auto& [key, bytes] : site_bytes) { layer_bytes[key.second] += bytes; }
+    for (const auto& [key, bytes] : site_bytes) { layer_bytes[key[1]] += bytes; }
     if (names.empty()) {
         throw std::runtime_error("weights artifact has no calibratable Text projections");
     }
@@ -234,6 +310,9 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
     engine_options.purpose       = ninfer::EnginePurpose::CausalScoring;
     engine_options.device        = device;
     engine_options.max_context   = trace.row_tokens;
+    // A host-resident-expert model otherwise gives all free device memory to its expert cache, which
+    // would leave nothing for the Hessians; other architectures ignore the policy.
+    engine_options.expert_cache = ninfer::ExpertCachePolicy::explicit_cache(8ULL << 30);
     // The MTP layer only runs when its backend is selected, so its activations would otherwise go
     // unobserved and its Hessians unwritten. Scoring still returns the trunk's logits; the MTP
     // prefill is extra work, done only for an artifact that carries an MTP component.
@@ -256,7 +335,7 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         std::map<Key, std::vector<std::string>> group_names;
         for (const int layer : groups[group_index]) {
             for (const auto& [key, value] : names) {
-                if (key.second == layer) { group_names.emplace(key, value); }
+                if (key[1] == layer) { group_names.emplace(key, value); }
             }
         }
         HessianGroup accumulator(hessians, std::move(group_names));
@@ -264,6 +343,15 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                                    cudaStream_t stream) {
             accumulator.observe(site, layer, input, stream);
         });
+        // Per-expert down inputs come from the all-experts passes; only the scoring (trunk) pass
+        // installs this, since the staged BF16-activation route is what exposes the intermediates.
+        ninfer::models::qwen3_5::execution::expert_activation_observer() =
+            [&](int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
+                accumulator.observe_expert(layer, expert, rows, stream);
+            };
+        ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
+            return accumulator.wants_experts(layer);
+        };
         for (std::uint32_t row = 0; row < rows; ++row) {
             const std::int32_t length = trace.lengths[row];
             if (length < 2) { continue; }
@@ -276,6 +364,8 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
             if (group_index == 0) { result.tokens += static_cast<std::uint64_t>(length); }
         }
         result.hessians += accumulator.flush();
+        ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
+        ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
         std::fprintf(stderr, "calibration group %zu/%zu done (%llu Hessians so far)\n",
                      group_index + 1, groups.size(),
                      static_cast<unsigned long long>(result.hessians));
@@ -299,6 +389,7 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
             gen_options.purpose        = ninfer::EnginePurpose::Generation;
             gen_options.device         = device;
             gen_options.max_context    = trace.row_tokens;
+            gen_options.expert_cache   = ninfer::ExpertCachePolicy::explicit_cache(8ULL << 30);
             gen_options.use_cuda_graph = false;
             gen_options.speculative.backend      = SpeculativeBackend::Mtp;
             gen_options.speculative.draft_tokens = 1;

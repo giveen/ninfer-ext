@@ -113,8 +113,8 @@ PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& pr
     const auto p    = prefix + "ple/";
     const auto wide = config.residual_width();
     PleWeights out;
-    out.table    = b.parameter(p + "table", {ple.table_rows, ple.row_width()}, {},
-                               QType::FP8_E4M3FN_ROW_BF16, artifact::Residency::HostFile);
+    out.table    = b.parameter(p + "table", {ple.table_rows, ple.row_width()}, {}, std::nullopt,
+                               artifact::Residency::HostFile);
     out.key      = b.parameter(p + "key", {wide, ple.embed_dim}, {p + "embedding"});
     out.value    = b.parameter(p + "value", {config.hidden_size, ple.embed_dim}, {p + "embedding"});
     out.key_norm = b.direct(p + "key_norm", {wide});

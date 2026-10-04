@@ -28,9 +28,16 @@ struct MoeChunk {
     std::int32_t* job_count;
     __nv_bfloat16* act;
     float* partial;
+    float* gu_partial;          // EXL3: [4][columns*K][2][I] gate/up K-slice partials
+    std::int32_t* counters;     // EXL3: [columns*K][I/128] slice-completion counters (zero)
+    void* xr;                   // EXL3 prefill: [assignments][2][H] FP16 rotated inputs
     const std::int32_t* misses; // resolve miss list still being fetched, or null
     cudaEvent_t fetched;        // completes the fetch of `misses`
 };
+
+// EXL3 passes of at most this many columns use the decode kernels (K-split, 8-row tiles); wider
+// ones use the grouped prefill kernels.
+inline constexpr std::int32_t kExl3DecodeColumns = 32;
 
 // One A4 job is one 64-column tile of one expert's grouped assignments.
 inline constexpr std::int32_t kA4JobColumns = 64;
@@ -84,5 +91,11 @@ void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
                                std::int32_t max_misses, const ExpertCacheState& cache,
                                cudaStream_t stream);
 void moe_experts_chunk_launch(const MoeChunk& chunk, cudaStream_t stream);
+
+// EXL3 gate/up then down for the jobs a resolve miss list admits (`misses` null: all jobs).
+void moe_project_exl3(const MoeChunk& chunk, const std::int32_t* misses, bool missed,
+                      cudaStream_t stream);
+void moe_project_exl3_prefill(const MoeChunk& chunk, const std::int32_t* misses, bool missed,
+                              cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

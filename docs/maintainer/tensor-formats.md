@@ -39,6 +39,12 @@ The row-scaled floating-point weight format is:
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
+The row-grouped signed-integer weight format is:
+
+| Canonical name | Code | Group | Scale |
+|---|---|---|---|
+| `q4_g32_fp16_rows` | signed 4-bit, `[-8,7]`, stored as `code + 8` | 32 consecutive elements of a row | binary16 |
+
 The transform-coded integer weight format is:
 
 | Canonical name | Codebook | Per-tensor rate | Scale vectors |
@@ -308,6 +314,22 @@ A recipe either preserves already selected code and scale words exactly or names
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
 
+### 3.4.1 `q4_g32_fp16_rows`
+
+`q4_g32_fp16_rows` is a rank-two weight matrix `[N,K]` with positive dimensions and `K % 32 == 0`.
+Every logical weight owns one signed 4-bit code `c` in `[-8,7]`, and every group of 32 consecutive
+elements of a row owns one binary16 multiplier. Valid scales are nonnegative and finite; a positive-zero
+scale requires all 32 codes of its group to be zero. The exact represented weight is:
+
+```text
+w_hat[n,k] = binary32(c[n,k] * binary16_to_binary32(s[n, floor(k / 32)]))
+```
+
+The format does not define how a floating-point source is assigned scales or codes. The converter
+method `q4_rows_maxabs` uses scale `max|x| / 7` rounded to binary16 and codes `round(x / scale)`
+clamped to `[-7,7]`. Unlike `q4_g64_fp16` the format has no K padding; it exists for wide row tables
+(the Qwen4Exp n-gram table, `K = 160`) that `row_split_k128_v1` would pad by more than half.
+
 ### 3.5 `exl3_mul1`
 
 `exl3_mul1` stores a transform-coded integer matrix. Its logical tensor shape is `[N,K]` (output
@@ -323,6 +345,11 @@ scaled by `1/sqrt(128)`. `Z` is the exact integer matrix decoded from the trelli
 `svh[N]` are exact little-endian FP32 scale/sign words; the converter folds the mul1 constant `κ`
 into `svh`, so reconstruction uses `Z` directly and does not round the codebook values to FP16.
 The format defines these stored scale words, not the quantization procedure that selects them.
+
+A tensor object may stack `S` independently quantized `[N/S, K]` matrices (its `divisors` member).
+Each owns one `suh[K]`, and `svh` holds their output scales back to back; the matrix of row `n` is
+`floor(n / (N / S))`. `N / S` must be a multiple of 128 so that a transform block never spans two
+matrices. This is how a bank of routed experts is stored; a dense Linear consumes only `S = 1`.
 
 For a 16-bit state `s`, the exact integer code is:
 
@@ -598,6 +625,8 @@ A conforming producer must:
   legal signed codes, including never emitting Q8 `-128`;
 - for `nvfp4`, emit only valid E2M1 code words, nonnegative finite E4M3FN scale words, and one
   finite positive FP32 weight divisor per stacked source matrix under Section 3.3;
+- for `q4_g32_fp16_rows`, emit only codes in `[-8,7]` and one nonnegative finite binary16 scale per
+  group, with all-zero codes in a zero-scale group under Section 3.4.1;
 - for `fp8_e4m3fn_row_bf16`, emit only finite E4M3FN code words and valid BF16 row multipliers,
   with signed-zero codes as the only legal codes in a positive-zero-scale row under Section 3.4;
 - for `exl3_mul1`, emit an allowed `bitrate_half_bits`, exactly 256 circular states per tile, and
@@ -628,6 +657,8 @@ The `.ninfer` container and each registered storage layout must:
   implementation;
 - for `nvfp4`, reconstruct every E2M1 code word, natural E4M3FN scale word, and the FP32 divisor
   of the row's own source matrix under Section 3.3;
+- for `q4_g32_fp16_rows`, reconstruct every signed code and its group's binary16 scale under
+  Section 3.4.1;
 - for `fp8_e4m3fn_row_bf16`, reconstruct every E4M3FN code word and its owning BF16 row multiplier
   under Section 3.4;
 - for `exl3_mul1`, reconstruct every trellis state and exact FP32 input/output scale word under

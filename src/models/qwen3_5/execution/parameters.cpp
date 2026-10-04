@@ -314,6 +314,44 @@ public:
         return out;
     }
 
+    // EXL3 banks: gate/up is 2E stacked matrices (gate_e, up_e adjacent) and down is E, each with
+    // its own `suh` set, so every plane of expert e is contiguous at a fixed per-expert stride.
+    static ops::ExpertWeights exl3_expert_bank(const WeightParent& gate_up,
+                                               const WeightParent& down) {
+        const auto& gg = gate_up.geometry;
+        const auto& dg = down.geometry;
+        if (gg.layout != QuantLayout::TrellisT16 || dg.layout != QuantLayout::TrellisT16 ||
+            dg.format != QType::EXL3_MUL1) {
+            throw std::invalid_argument("offloaded EXL3 experts must be TrellisT16 mul1 banks");
+        }
+        if (gg.divisor_count != 2ULL * ops::kOffloadMoeExperts ||
+            dg.divisor_count != ops::kOffloadMoeExperts) {
+            throw std::invalid_argument(
+                "EXL3 expert banks need one scale set per expert matrix (2E gate/up, E down)");
+        }
+        ops::ExpertWeights bank;
+        bank.layout = ops::exl3_expert_layout(static_cast<std::int32_t>(gg.bitrate_half_bits),
+                                              static_cast<std::int32_t>(dg.bitrate_half_bits));
+        const std::byte* const bases[6] = {
+            gate_up.data, gate_up.data + gg.input_scale_offset, gate_up.data + gg.output_scale_offset,
+            down.data,    down.data + dg.input_scale_offset,    down.data + dg.output_scale_offset};
+        for (std::int32_t p = 0; p < 6; ++p) {
+            bank.base[p]   = bases[p];
+            bank.stride[p] = bank.layout.plane_bytes[p];
+        }
+        // The planes must hold exactly E experts at those strides.
+        const std::uint64_t e = ops::kOffloadMoeExperts;
+        if (gg.trellis_bytes != e * bank.layout.plane_bytes[0] ||
+            gg.input_scale_bytes != e * bank.layout.plane_bytes[1] ||
+            gg.output_scale_bytes != e * bank.layout.plane_bytes[2] ||
+            dg.trellis_bytes != e * bank.layout.plane_bytes[3] ||
+            dg.input_scale_bytes != e * bank.layout.plane_bytes[4] ||
+            dg.output_scale_bytes != e * bank.layout.plane_bytes[5]) {
+            throw std::invalid_argument("EXL3 expert bank planes do not match the expert geometry");
+        }
+        return bank;
+    }
+
     ops::ExpertWeights expert_bank(const MoeWeights& moe) const {
         const auto& config = model_.config().text;
         const auto& geo    = std::get<MoeConfig>(config.ffn);
@@ -344,6 +382,7 @@ public:
                 throw std::invalid_argument("routed experts are not stored expert-major");
             }
         }
+        if (gate_up->geometry.format == QType::EXL3_MUL1) { return exl3_expert_bank(*gate_up, *down); }
         for (const auto* parent : {gate_up, down}) {
             if (parent->geometry.format != QType::NVFP4 ||
                 parent->geometry.layout != QuantLayout::BlockScaleK16M128x4) {
@@ -351,6 +390,7 @@ public:
             }
         }
         ops::ExpertWeights bank;
+        bank.layout    = ops::nvfp4_expert_layout();
         bank.base[0]   = gate_up->data;
         bank.base[1]   = gate_up->data + gate_up->geometry.scale_offset;
         bank.base[2]   = down->data;
@@ -404,13 +444,20 @@ public:
 
     PleParameters ple(const PleWeights& w) const {
         const auto& table = model_.weight(w.table);
-        if (table.mapped.empty() || table.mapped_geometry.format != QType::FP8_E4M3FN_ROW_BF16) {
-            throw std::invalid_argument("PLE table must be a file-mapped row-scaled FP8 matrix");
+        const auto& geometry = table.mapped_geometry;
+        if (table.mapped.empty() || (geometry.format != QType::FP8_E4M3FN_ROW_BF16 &&
+                                     geometry.format != QType::Q4_G32_FP16_ROWS)) {
+            throw std::invalid_argument(
+                "PLE table must be a file-mapped row-scaled FP8 or row-grouped 4-bit matrix");
         }
         PleParameters out;
-        out.table =
-            PleTable{table.mapped, table.view.shape[0], dimension(table.view.shape[1]),
-                     table.mapped_geometry.code_bytes_per_row, table.mapped_geometry.scale_offset};
+        out.table = PleTable{table.mapped,
+                             table.view.shape[0],
+                             dimension(table.view.shape[1]),
+                             geometry.code_bytes_per_row,
+                             geometry.scale_offset,
+                             geometry.scale_bytes_per_row,
+                             geometry.format};
         out.key_value =
             ops::prepare_linear_weight(std::array{model_.input(w.key), model_.input(w.value)});
         out.key_norm    = tensor(w.key_norm);
@@ -475,6 +522,14 @@ Parameters::Parameters(const Model& source) : model(source) {
                 return prepare.qwen4_block(w.qwen4->layers[i]);
             }));
         }
+        // The pager, cache and planner size everything from one layout, so every bank must use it.
+        q.experts = q.layers.front().moe.bank.layout;
+        for (std::size_t i = 0; i < q.layers.size(); ++i) {
+            if (q.layers[i].moe.bank.layout != q.experts) {
+                throw std::invalid_argument("text/layers/" + std::to_string(i) +
+                                            ": routed experts use a different bank layout");
+            }
+        }
         qwen4 = std::move(q);
         if (w.qwen4_mtp) {
             qwen4_mtp = with_context("mtp", [&] {
@@ -484,6 +539,9 @@ Parameters::Parameters(const Model& source) : model(source) {
                     prepare.linear(m.embedding_projection), prepare.linear(m.hidden_projection),
                     prepare.hyper_connection(m.head),       prepare.qwen4_block(m.layer)};
             });
+            if (qwen4_mtp->layer.moe.bank.layout != qwen4->experts) {
+                throw std::invalid_argument("mtp: routed experts use a different bank layout");
+            }
         }
         if (w.vision) {
             vision = with_context("vision", [&] { return prepare.vision(*w.vision); });

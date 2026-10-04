@@ -12,6 +12,7 @@ from tools.convert.official_recipes import (
     qwen3_8_27b_bf16,
     qwen3_8_27b_exl3,
     qwen3_8_27b_q6,
+    qwen3_8_flash_next_exl3,
     qwen3_8_flash_next_nvfp4,
 )
 from tools.convert.recipe import Recipe
@@ -102,6 +103,7 @@ def _method(model: Model, function, name: str):
 def test_flash_next_recipes_are_registered() -> None:
     # Exercising it needs a full Qwen4Exp sparse-MoE model, so this pins the wiring.
     assert RECIPES["qwen3_8_flash_next_nvfp4"] is qwen3_8_flash_next_nvfp4
+    assert RECIPES["qwen3_8_flash_next_exl3"] is qwen3_8_flash_next_exl3
 
 
 def test_flash_next_nvfp4_quantizes_a_full_precision_source() -> None:

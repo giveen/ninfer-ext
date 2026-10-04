@@ -97,3 +97,43 @@ def test_tensor_output_places_trellis_and_scale_planes() -> None:
         output.write_codes(0, tiles[:8], sv[:128], input_scales=su + 1)
     with pytest.raises(ValueError, match="16-row tiles"):
         output.write_codes(8, tiles[:1], sv[:16], input_scales=su)
+
+
+def test_stacked_object_places_one_input_scale_set_per_matrix_and_decodes_each() -> None:
+    sets, rows, k, half_bits = 3, 128, 128, 4
+    n = sets * rows
+    g = exl3_geometry("exl3_mul1", (n, k), half_bits, sets)
+    obj = TensorObject("bank", (n, k), "exl3_mul1", "trellis_t16_v1", 0, g.payload_bytes, sets, half_bits)
+    writer = _MemoryWriter(obj)
+    output = TensorOutput(writer, "bank")
+    generator = torch.Generator().manual_seed(11)
+    tiles = torch.randint(0, 256, (n // 16, k // 16, 16 * half_bits), dtype=torch.uint8, generator=generator)
+    su = torch.rand(sets, k, generator=generator) + 0.5
+    sv = torch.rand(n, generator=generator) + 0.5
+    # Matrices arrive in any order, each in two row blocks of its own set.
+    for s in (2, 0, 1):
+        for begin in (rows // 2, 0):
+            lo = s * rows + begin
+            output.write_codes(lo, tiles[lo // 16 : (lo + rows // 2) // 16], sv[lo : lo + rows // 2], input_scales=su[s])
+    data = bytes(writer.data)
+    assert data[: g.trellis_bytes] == tiles.numpy().tobytes()
+    assert data[g.input_scale_offset : g.input_scale_offset + g.input_scale_bytes] == su.numpy().tobytes()
+    assert data[g.output_scale_offset :] == sv.numpy().tobytes()
+    assert all(writer.written)
+    # Each set's scales are its own; a block under another set's scales is refused.
+    with pytest.raises(ValueError, match="share their input scales"):
+        output.write_codes(0, tiles[:8], sv[:rows], input_scales=su[1])
+    # A block straddling the boundary between two stacked matrices has no single owner.
+    with pytest.raises(ValueError, match="straddles two scale sets"):
+        output.write_codes(rows - 16, tiles[(rows - 16) // 16 : (rows + 16) // 16], sv[rows - 16 : rows + 16], input_scales=su[0])
+    # The logical matrix is the stack of the separately decoded ones.
+    stacked = exl3.decode(tiles, su, sv, half_bits)
+    separate = torch.cat(
+        [
+            exl3.decode(tiles[s * rows // 16 : (s + 1) * rows // 16], su[s], sv[s * rows : (s + 1) * rows], half_bits)
+            for s in range(sets)
+        ]
+    )
+    assert stacked.shape == (n, k) and torch.equal(stacked, separate)
+    with pytest.raises(ValueError, match="stacked decode"):
+        exl3.decode(tiles, su[:2], sv, half_bits)

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace ninfer::perplexity {
 namespace {
@@ -73,6 +74,48 @@ const std::uint16_t* Reference::row(std::uint32_t target) const noexcept {
     const auto found = index_.find(target);
     if (found == index_.end()) { return nullptr; }
     return logits_.data() + found->second * static_cast<std::size_t>(vocab_size_);
+}
+
+namespace {
+
+void put_u32(std::array<unsigned char, Reference::kHeaderBytes>& header, std::size_t at,
+             std::uint32_t value) {
+    for (int i = 0; i < 4; ++i) {
+        header[at + static_cast<std::size_t>(i)] = static_cast<unsigned char>(value >> (8 * i));
+    }
+}
+
+} // namespace
+
+void write_reference(const std::filesystem::path& path, std::uint32_t vocab_size,
+                     std::uint32_t context, std::uint32_t stride, std::string_view text_digest,
+                     std::span<const std::uint32_t> positions,
+                     std::span<const std::uint16_t> logits) {
+    if (vocab_size == 0 || positions.empty() ||
+        logits.size() != positions.size() * static_cast<std::size_t>(vocab_size)) {
+        throw std::invalid_argument("reference rows do not match the position table");
+    }
+    if (text_digest.size() != Reference::kDigestBytes) {
+        throw std::invalid_argument("reference text digest must be 64 hex characters");
+    }
+    std::array<unsigned char, Reference::kHeaderBytes> header{};
+    std::memcpy(header.data(), kMagic, Reference::kMagicBytes);
+    put_u32(header, 8, Reference::kVersion);
+    put_u32(header, 12, vocab_size);
+    put_u32(header, 16, static_cast<std::uint32_t>(positions.size()));
+    put_u32(header, 20, context);
+    put_u32(header, 24, stride);
+    std::memcpy(header.data() + 32, text_digest.data(), Reference::kDigestBytes);
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) { throw std::runtime_error(reject(path, "cannot create")); }
+    file.write(reinterpret_cast<const char*>(header.data()),
+               static_cast<std::streamsize>(header.size()));
+    file.write(reinterpret_cast<const char*>(positions.data()),
+               static_cast<std::streamsize>(positions.size_bytes()));
+    file.write(reinterpret_cast<const char*>(logits.data()),
+               static_cast<std::streamsize>(logits.size_bytes()));
+    if (!file) { throw std::runtime_error(reject(path, "write failed")); }
 }
 
 } // namespace ninfer::perplexity

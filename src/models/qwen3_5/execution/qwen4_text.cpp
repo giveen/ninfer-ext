@@ -424,6 +424,17 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
 
     auto scope = work_.scope();
     auto roots = workspace::qwen4_moe(work_, config_, T, experts.cache().slots);
+    const int calibration_layer =
+        static_cast<std::size_t>(cache_layer) >= qwen4_->layers.size() ? -1 : cache_layer;
+    observe_projection(CalibrationSite::MoeInput, calibration_layer, x, s);
+    const bool capture_experts =
+        static_cast<bool>(expert_activation_observer()) &&
+        (!expert_activation_wanted() || expert_activation_wanted()(calibration_layer));
+    if (capture_experts && !(experts.stages(T) && p.bank.gate_up_input_divisor <= 0.0F)) {
+        throw std::logic_error(
+            "expert calibration needs the staged BF16-activation route (NVFP4 from a "
+            "full-precision source, whole-layer staging)");
+    }
     ops::moe_route(x, p.router, work_, roots.ids, roots.weights, roots.shared_gate, s);
     project(x, p.shared_gate_up, roots.shared_gate_up, work_, s);
     const std::int32_t width = roots.shared_gate_up.ne[0] / 2;
@@ -451,6 +462,7 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
             ops::moe_experts(x, roots.ids, roots.ids, roots.weights, roots.shared_gate,
                              roots.shared, staged, ops::kOffloadMoeExperts, work_, y, s);
         }
+        if (capture_experts) { qwen4_capture_all_experts(x, staged, calibration_layer); }
         experts.release_staged(cache_layer, s);
         return;
     }
@@ -480,6 +492,64 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
             roots.shared_gate.slice(0, begin, count), roots.shared.slice(1, begin, count), slots,
             slot_count, work_, y_slice, s, &pending);
     }
+}
+
+void TextContext::qwen4_capture_all_experts(const Tensor& x, const ops::ExpertWeights& staged,
+                                            int layer) {
+    cudaStream_t s         = ctx_.stream;
+    const std::int32_t T   = x.ne[1];
+    constexpr std::int32_t K = ops::kOffloadMoeTopK, E = ops::kOffloadMoeExperts,
+                           H = ops::kOffloadMoeHidden, I = ops::kOffloadMoeIntermediate;
+    const std::size_t routed = static_cast<std::size_t>(K) * T;
+    const std::size_t wide   = static_cast<std::size_t>(H) * T;
+    void *ids_d = nullptr, *weights_d = nullptr, *gate_d = nullptr, *shared_d = nullptr,
+         *y_d = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&ids_d, routed * sizeof(std::int32_t), s));
+    CUDA_CHECK(cudaMallocAsync(&weights_d, routed * sizeof(float), s));
+    CUDA_CHECK(cudaMallocAsync(&gate_d, static_cast<std::size_t>(T) * sizeof(float), s));
+    CUDA_CHECK(cudaMallocAsync(&shared_d, wide * 2, s));
+    CUDA_CHECK(cudaMallocAsync(&y_d, wide * 2, s));
+    // Unit weights and a zero shared gate keep the scratch output finite; it is never consumed.
+    const std::vector<float> ones(routed, 1.0F);
+    CUDA_CHECK(cudaMemcpyAsync(weights_d, ones.data(), routed * sizeof(float),
+                               cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemsetAsync(gate_d, 0, static_cast<std::size_t>(T) * sizeof(float), s));
+    CUDA_CHECK(cudaMemsetAsync(shared_d, 0, wide * 2, s));
+    Tensor ids(ids_d, DType::I32, {K, T}), weights(weights_d, DType::FP32, {K, T});
+    Tensor gate(gate_d, DType::FP32, {T}), shared(shared_d, DType::BF16, {H, T});
+    Tensor y(y_d, DType::BF16, {H, T});
+
+    std::vector<std::int32_t> host(routed);
+    for (std::int32_t first = 0; first < E; first += K) {
+        // Pass `first/K` sends every token to experts first..first+valid-1; the last pass repeats
+        // its final expert to fill the fixed top-10 and ignores those duplicates when observing.
+        const std::int32_t valid = std::min(K, E - first);
+        for (std::int32_t t = 0; t < T; ++t) {
+            for (std::int32_t i = 0; i < K; ++i) {
+                host[static_cast<std::size_t>(t) * K + i] = first + std::min(i, valid - 1);
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(ids_d, host.data(), routed * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaStreamSynchronize(s)); // `host` is reused by the next pass
+        const ops::MoeActivationTap tap = [&](const Tensor& act, const Tensor&, cudaStream_t st) {
+            // The chunk's act is assignment-major: expert slot i of every column is every K-th row.
+            // moe_experts chunks columns, so a view covers this chunk's columns only.
+            const std::int32_t columns = act.ne[1] / K;
+            for (std::int32_t i = 0; i < valid; ++i) {
+                Tensor rows(static_cast<std::byte*>(act.data) + static_cast<std::size_t>(i) * I * 2,
+                            DType::BF16, {I, columns});
+                rows.nb[1] = static_cast<std::int64_t>(K) * I * 2;
+                expert_activation_observer()(layer, first + i, rows, st);
+            }
+        };
+        ops::moe_experts(x, ids, ids, weights, gate, shared, staged, E, work_, y, s, nullptr, &tap);
+    }
+    CUDA_CHECK(cudaFreeAsync(ids_d, s));
+    CUDA_CHECK(cudaFreeAsync(weights_d, s));
+    CUDA_CHECK(cudaFreeAsync(gate_d, s));
+    CUDA_CHECK(cudaFreeAsync(shared_d, s));
+    CUDA_CHECK(cudaFreeAsync(y_d, s));
 }
 
 void TextContext::qwen4_block(const Qwen4BlockParameters& p, Tensor& wide, Phase ph,

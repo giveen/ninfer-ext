@@ -62,7 +62,7 @@ struct Qwen4PersistentLayout {
     TensorLayout owner;    // I32 [slots]
     TensorLayout stamp;    // I64 [slots]
     TensorLayout counters; // I64 [3]: clock, hits, misses
-    // slots * kExpertSlotBytes, plus the divisor tails of two staged layers. The last
+    // slots * the expert layout's slot bytes, plus the tails of two staged layers. The last
     // kQwen4StagedBankSlots slots double as the two staged layer banks: staged forwards reclaim
     // them, cache-route calls use them as ordinary slots in between.
     LayoutRegion pool;

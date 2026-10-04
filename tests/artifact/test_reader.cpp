@@ -94,6 +94,19 @@ void geometry_and_views() {
     rejects<std::invalid_argument>([&] { (void)native_weight(fp8_rows); },
                                    "complete-parent ABI accepted an FP8 submatrix");
 
+    // Row-grouped 4-bit table rows carry no padding: K/2 code bytes and K/32 binary16 scales per row.
+    const auto q4_rows = weight_geometry(QType::Q4_G32_FP16_ROWS, QuantLayout::RowGroup,
+                                         std::array<std::uint64_t, 2>{2, 160});
+    require(q4_rows.code_bytes_per_row == 80 && q4_rows.scale_bytes_per_row == 10 &&
+                q4_rows.scale_offset == 256 && q4_rows.bytes == 276,
+            "row-grouped 4-bit geometry changed");
+    rejects<std::invalid_argument>(
+        [&] {
+            (void)weight_geometry(QType::Q4_G32_FP16_ROWS, QuantLayout::RowGroup,
+                                  std::array<std::uint64_t, 2>{2, 48});
+        },
+        "row-grouped geometry accepted K not divisible by 32");
+
     std::vector<std::byte> nvfp4(4612);
     WeightParent nv_parent{weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
                                            std::array<std::uint64_t, 2>{128, 64}),

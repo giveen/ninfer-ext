@@ -7,6 +7,7 @@ from .methods import (
     fp8_row_maxabs,
     grouped_absmax,
     import_encoded,
+    q4_rows_maxabs,
     nvfp4_absmax,
 )
 from .sources.compressed_tensors import compressed_matrix_source
@@ -18,6 +19,7 @@ Q5 = "q5_g64_fp16"
 Q6 = "q6_g64_fp16"
 Q8 = "q8_g32_fp16"
 FP8 = "fp8_e4m3fn_row_bf16"
+Q4ROWS = "q4_g32_fp16_rows"
 
 
 def _assign(recipe, name, format, *, source=None):
@@ -417,6 +419,77 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
             recipe.group(names)
 
 
+def qwen3_8_flash_next_exl3(model, recipe, sources):
+    """Qwen3.8-Flash-Next with EXL3 routed experts produced by `ninfer-quantize`.
+
+    `--source quantized=PATH` is the quantizer's expert store (a directory with a safetensors
+    index). Every routed expert gate, up and down is its own EXL3 matrix with its own input and
+    output scales; each layer's gate/up and down banks keep the NVFP4 recipe's expert-major order,
+    and because the matrices were quantized apart each bank object stores one input-scale set per
+    expert. An expert missing from the store is an error: leaving it at another precision would
+    make the bank unexecutable. The n-gram table is quantized to 4-bit group codes (row_group_v1,
+    group of 32 with a binary16 scale, about 4.5 bits per value); its noise cost was measured at KL
+    0.016 against the FP8 table. Dense projections become Q6 (Q8 where K is not a multiple of 128; the output head Q6, the token
+    embedding Q8); routers, shared-expert gates, norms and small vectors stay direct.
+    """
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    store = sources["quantized"]
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    _assign(recipe, "text/output_head", Q6)
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
+            continue
+        encoded = parameter.source.read_encoded is not None
+        if name.endswith("/ple/table"):
+            recipe.assign(name, format=Q4ROWS, method=q4_rows_maxabs)
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
+            "text/token_embedding",
+            "text/output_head",
+        ):
+            continue
+        if "/moe/experts/" in name:
+            if not store.has(name + ".trellis"):
+                raise ValueError(f"{name}: no EXL3 matrix in the quantizer store")
+            recipe.assign(
+                name,
+                format="exl3_mul1",
+                method=import_encoded,
+                source=exl3_matrix_source(store, name, parameter.shape),
+            )
+            continue
+        # The Q6 kernels need K aligned to 128; the low-rank hyper-connection stems (K=320) stay Q8.
+        _assign(recipe, name, Q6 if parameter.shape[-1] % 128 == 0 else Q8)
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
+def qwen3_8_flash_next_bf16(model, recipe, sources):
+    """Qwen3.8-Flash-Next at full BF16 precision: the native EXL3 quantizer's input artifact.
+
+    Every Text/MTP projection, routed experts included, is stored as BF16 and the experts keep the
+    NVFP4 recipe's per-layer gate/up and down parents, so an expert is a row range of its bank.
+    The n-gram table keeps its row-scaled FP8 form; the quantizer does not read it.
+    """
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
+            continue
+        if name.endswith("/ple/table"):
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs)
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")):
+            continue
+        _assign(recipe, name, "bf16")
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -428,4 +501,6 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_6_35b_a3b_nvfp4": qwen3_6_35b_a3b_nvfp4,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_bf16": qwen3_8_flash_next_bf16,
+    "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
 }

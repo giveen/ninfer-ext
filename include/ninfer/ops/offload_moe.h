@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace ninfer::ops {
 
@@ -31,19 +32,107 @@ inline constexpr std::int64_t kExpertDownScaleBytes =
 inline constexpr std::int64_t kExpertSlotBytes =
     kExpertGateUpCodeBytes + kExpertGateUpScaleBytes + kExpertDownCodeBytes + kExpertDownScaleBytes;
 
+/** Weight divisors of one NVFP4 layer: gate and up of every expert, then down of every expert. */
+inline constexpr std::int64_t kExpertDivisorBytes =
+    std::int64_t(3) * kOffloadMoeExperts * sizeof(float);
+
+/** Most planes one expert stores (NVFP4: 4, EXL3: 6). */
+inline constexpr std::int32_t kMaxExpertPlanes = 6;
+
+enum class ExpertFormat : std::uint8_t {
+    Nvfp4, // block-scaled NVFP4 codes and scales, divisors in the staged layer's tail
+    Exl3,  // EXL3 mul1 trellis, with per-expert scale sets
+};
+
+/**
+ * How one expert is laid out in a bank, a cache slot and a staged layer. A slot holds an expert's
+ * planes back to back in plane order; a staged layer holds every expert's slot-ordered planes in
+ * the bank layout (plane p of expert e at `base[p] + e * stride[p]`), then `tail_bytes` of
+ * per-layer data. The pager, cache and planner size everything from this table, so the Op's
+ * geometry is stated once, by the bound bank.
+ */
+struct ExpertLayout {
+    ExpertFormat format                          = ExpertFormat::Nvfp4;
+    std::int32_t planes                          = 0;
+    std::int64_t plane_bytes[kMaxExpertPlanes]   = {}; // per expert
+    std::int64_t slot_bytes                      = 0;  // sum of plane_bytes
+    std::int64_t tail_bytes                      = 0;  // per staged layer, after the planes
+    std::int32_t gate_up_half_bits               = 0;  // EXL3 trellis rates; 0 for NVFP4
+    std::int32_t down_half_bits                  = 0;
+
+    [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
+
+    /** Offset of plane `p` inside a cache slot. */
+    [[nodiscard]] constexpr std::int64_t plane_offset(std::int32_t p) const {
+        std::int64_t offset = 0;
+        for (std::int32_t i = 0; i < p; ++i) { offset += plane_bytes[i]; }
+        return offset;
+    }
+    /** One staged layer of `experts` experts. */
+    [[nodiscard]] constexpr std::int64_t staged_layer_bytes(std::int32_t experts) const {
+        return std::int64_t(experts) * slot_bytes + tail_bytes;
+    }
+};
+
+/** The NVFP4 routed-expert layout: gate/up codes, gate/up scales, down codes, down scales. */
+[[nodiscard]] constexpr ExpertLayout nvfp4_expert_layout() {
+    ExpertLayout layout;
+    layout.format         = ExpertFormat::Nvfp4;
+    layout.planes         = 4;
+    layout.plane_bytes[0] = kExpertGateUpCodeBytes;
+    layout.plane_bytes[1] = kExpertGateUpScaleBytes;
+    layout.plane_bytes[2] = kExpertDownCodeBytes;
+    layout.plane_bytes[3] = kExpertDownScaleBytes;
+    layout.slot_bytes     = kExpertSlotBytes;
+    layout.tail_bytes     = kExpertDivisorBytes;
+    return layout;
+}
+
+/**
+ * The EXL3 mul1 routed-expert layout at the given trellis rates (half-bits per weight, 8 = 4.0
+ * bpw). Planes: gate/up trellis, gate/up `suh`, gate/up `svh`, down trellis, down `suh`, down
+ * `svh`. An expert's gate and up matrices are two adjacent scale sets of the gate/up bank, so each
+ * plane is contiguous per expert. Scale planes are FP32 and do not depend on the rate.
+ */
+[[nodiscard]] constexpr ExpertLayout exl3_expert_layout(std::int32_t gate_up_half_bits,
+                                                        std::int32_t down_half_bits) {
+    ExpertLayout layout;
+    layout.format           = ExpertFormat::Exl3;
+    layout.planes           = 6;
+    layout.gate_up_half_bits = gate_up_half_bits;
+    layout.down_half_bits    = down_half_bits;
+    const std::int64_t gate_up_tiles =
+        std::int64_t(2) * kOffloadMoeIntermediate / 16 * (kOffloadMoeHidden / 16);
+    const std::int64_t down_tiles =
+        std::int64_t(kOffloadMoeHidden) / 16 * (kOffloadMoeIntermediate / 16);
+    layout.plane_bytes[0] = gate_up_tiles * 16 * gate_up_half_bits;
+    layout.plane_bytes[1] = std::int64_t(2) * kOffloadMoeHidden * 4;
+    layout.plane_bytes[2] = std::int64_t(2) * kOffloadMoeIntermediate * 4;
+    layout.plane_bytes[3] = down_tiles * 16 * down_half_bits;
+    layout.plane_bytes[4] = std::int64_t(kOffloadMoeIntermediate) * 4;
+    layout.plane_bytes[5] = std::int64_t(kOffloadMoeHidden) * 4;
+    for (std::int32_t p = 0; p < layout.planes; ++p) { layout.slot_bytes += layout.plane_bytes[p]; }
+    return layout;
+}
+
+/** One staged NVFP4 layer: every expert's planes in the bank layout, then the layer's divisors. */
+inline constexpr std::int64_t kExpertStagedLayerBytes =
+    nvfp4_expert_layout().staged_layer_bytes(kOffloadMoeExperts);
+
 /**
  * Addressing of routed expert weights. Expert (or slot) index i of plane p begins at
- * `base[p] + i * stride[p]`; planes are gate/up codes, gate/up scales, down codes, down scales.
- * A stored bank uses the plane layout (stride = per-expert plane bytes), a slot pool uses one
- * stride of kExpertSlotBytes with plane offsets inside the slot. Every expert's gate rows precede
- * its up rows. Weight divisors are read from the stored banks by expert id: gate/up bank row r
- * uses `gate_up_divisors[r / gate_up_divisor_rows]` and down bank row r uses
+ * `base[p] + i * stride[p]`; for NVFP4 the planes are gate/up codes, gate/up scales, down codes,
+ * down scales. A stored bank uses the plane layout (stride = per-expert plane bytes), a slot pool
+ * uses one stride of `layout.slot_bytes` with plane offsets inside the slot. Every expert's gate
+ * rows precede its up rows. NVFP4 weight divisors are read from the stored banks by expert id:
+ * gate/up bank row r uses `gate_up_divisors[r / gate_up_divisor_rows]` and down bank row r uses
  * `down_divisors[r / down_divisor_rows]`. The activation divisors are the layer's NVFP4 input
  * divisors of gate/up and down, positive when the checkpoint permits A4 inputs and zero otherwise.
  */
 struct ExpertWeights {
-    const std::byte* base[4]          = {};
-    std::int64_t stride[4]            = {};
+    ExpertLayout layout               = nvfp4_expert_layout();
+    const std::byte* base[kMaxExpertPlanes] = {};
+    std::int64_t stride[kMaxExpertPlanes]   = {};
     const float* gate_up_divisors     = nullptr;
     std::int32_t gate_up_divisor_rows = 0;
     const float* down_divisors        = nullptr;
@@ -51,14 +140,6 @@ struct ExpertWeights {
     float gate_up_input_divisor       = 0.0F;
     float down_input_divisor          = 0.0F;
 };
-
-/** Weight divisors of one layer: gate and up of every expert, then down of every expert. */
-inline constexpr std::int64_t kExpertDivisorBytes =
-    std::int64_t(3) * kOffloadMoeExperts * sizeof(float);
-
-/** One staged layer: every expert's planes in the bank layout, then the layer's divisors. */
-inline constexpr std::int64_t kExpertStagedLayerBytes =
-    std::int64_t(kOffloadMoeExperts) * kExpertSlotBytes + kExpertDivisorBytes;
 
 /** Device-resident mutable state of the expert cache; owned by one Program. */
 struct ExpertCacheState {
@@ -138,7 +219,9 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
 [[nodiscard]] ExpertWeights expert_cache_weights(const ExpertCacheState& cache,
                                                  const ExpertWeights& bank);
 
-[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots);
+/** Workspace of moe_experts for `tokens` columns over `slots` slots of experts in `layout`. */
+[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t tokens, std::int32_t slots,
+                                                      const ExpertLayout& layout);
 
 /**
  * Most columns one moe_experts call over a pool of `slots` slots accepts: job building sorts a
@@ -168,10 +251,20 @@ struct MoeExpertsPending {
     cudaEvent_t fetched;
 };
 
+/**
+ * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
+ * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
+ * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
+ * Serving never passes a tap.
+ */
+using MoeActivationTap =
+    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
+
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
-                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr);
+                 Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr,
+                 const MoeActivationTap* tap = nullptr);
 
 [[nodiscard]] std::size_t moe_experts_a4_workspace_bytes(std::int32_t tokens);
 

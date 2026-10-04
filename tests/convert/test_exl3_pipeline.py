@@ -194,3 +194,75 @@ def test_grouped_parent_store_reassembles_one_shared_matrix(tmp_path) -> None:
         exl3.decode(stored_trellis, stored_su, stored_sv, half_bits),
         exl3.decode(trellis, su, sv, half_bits),
     )
+
+
+def test_flash_next_experts_become_banks_with_one_scale_set_per_expert(tmp_path) -> None:
+    """Separately quantised experts keep their own input scales inside one bank object."""
+
+    from tools.convert.official_recipes import qwen3_8_flash_next_exl3
+
+    experts, rows, k, half_bits = 3, 128, 128, 3
+    generator = torch.Generator().manual_seed(21)
+    tensors, expected = {}, {}
+    names = []
+    for expert in range(experts):
+        for role in ("gate", "up", "down"):
+            name = f"text/layers/0/moe/experts/{expert}/{role}"
+            trellis = torch.randint(
+                0, 256, (rows // 16, k // 16, 16 * half_bits), dtype=torch.uint8, generator=generator
+            )
+            su = (torch.rand(k, generator=generator) + 0.5).float()
+            sv = (torch.rand(rows, generator=generator) + 0.5).float()
+            tensors |= {name + ".trellis": trellis, name + ".su": su, name + ".sv": sv}
+            expected[name] = exl3.decode(trellis, su, sv, half_bits)
+            names.append(name)
+    directory = tmp_path / "store"
+    directory.mkdir()
+    save_file(tensors, str(directory / "exl3.safetensors"))
+
+    model = Model({"text": {"config": {"model_type": "qwen4_exp_text"}}})
+
+    def add(name, shape, inputs):
+        model.add(Parameter(name, shape, array_source(torch.ones(shape, dtype=torch.bfloat16), name), inputs=inputs))
+
+    add("text/token_embedding", (128, 128), ())
+    add("text/output_head", (128, 128), ())
+    for name in names:
+        add(name, (rows, k), ("x",))
+    model.packing_groups.append(
+        tuple(n for n in names if not n.endswith("/down"))  # gate0, up0, gate1, up1, ...
+    )
+    model.packing_groups.append(tuple(n for n in names if n.endswith("/down")))
+
+    recipe = Recipe(model)
+    with SafetensorsSource(directory / "exl3.safetensors") as store:
+        qwen3_8_flash_next_exl3(model, recipe, {"quantized": store})
+    output = tmp_path / "bank.ninfer"
+    convert(model, recipe, output, device="cpu")
+
+    with Artifact(output) as artifact:
+        banks = [o for o in artifact.objects if getattr(o, "format", None) == "exl3_mul1"]
+        assert sorted((o.shape, o.divisors) for o in banks) == [
+            ((experts * rows, k), experts),
+            ((2 * experts * rows, k), 2 * experts),
+        ]
+        for bank in banks:
+            sets = bank.divisors
+            g = exl3_geometry("exl3_mul1", bank.shape, half_bits, sets)
+            payload = artifact.read_object(bank.id)
+            assert len(payload) == g.payload_bytes
+            trellis = torch.frombuffer(bytearray(payload[: g.trellis_bytes]), dtype=torch.uint8).reshape(
+                bank.shape[0] // 16, k // 16, 16 * half_bits
+            )
+            su = torch.frombuffer(
+                bytearray(payload[g.input_scale_offset : g.input_scale_offset + g.input_scale_bytes]),
+                dtype=torch.float32,
+            ).reshape(sets, k)
+            sv = torch.frombuffer(
+                bytearray(payload[g.output_scale_offset : g.output_scale_offset + g.output_scale_bytes]),
+                dtype=torch.float32,
+            )
+            decoded = exl3.decode(trellis, su, sv, half_bits)
+            members = [n for n in names if (n.endswith("/down")) == (bank.divisors == experts)]
+            for index, name in enumerate(members):
+                assert torch.equal(decoded[index * rows : (index + 1) * rows], expected[name]), name

@@ -27,6 +27,7 @@ from tools.artifact.tensor_output import TensorOutput
 from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix
 from .quantization.nvfp4 import divisor_for, quantize_rows as quantize_nvfp4_rows
+from .quantization.row_group import quantize_rows as quantize_row_groups
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -268,6 +269,30 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+# Rows per pass of q4_rows_maxabs: the n-gram table has hundreds of millions of rows, so the
+# per-recipe chunk (sized for projections) would make millions of tiny passes.
+_ROW_GROUP_CHUNK_ROWS = 1 << 20
+
+
+def q4_rows_maxabs(request: PrepareRequest) -> PreparedMethod:
+    """Quantize rows to signed 4-bit group codes with binary16 group scales (row_group_v1)."""
+    if request.target.format != "q4_g32_fp16_rows" or len(request.target.shape) != 2:
+        raise ValueError("q4_rows_maxabs requires the row-grouped 4-bit matrix format")
+    _preflight(request)
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, _ROW_GROUP_CHUNK_ROWS):
+            end = min(n, begin + _ROW_GROUP_CHUNK_ROWS)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError("q4_rows_maxabs source must provide floating-point values")
+            encoded = quantize_row_groups(values, request.target.format, device=request.device)
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
 def _nvfp4_weight(request: PrepareRequest, scale_search: str) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError(f"nvfp4_{scale_search} requires an NVFP4 matrix target")
@@ -420,6 +445,7 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
+    "q4_rows_maxabs": q4_rows_maxabs,
     "import_encoded": import_encoded,
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse": nvfp4_mse,

@@ -7,7 +7,7 @@ ranges come from [`artifact-container.md`](artifact-container.md).
 
 ## 1. Registered identities
 
-The storage registry contains exactly these six identities:
+The storage registry contains exactly these seven identities:
 
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
@@ -15,6 +15,7 @@ The storage registry contains exactly these six identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `row_group_v1` | tensor layout | `q4_g32_fp16_rows` | rank 2 `[N,K]`, `K % 32 == 0` | 256 bytes |
 | `trellis_t16_v1` | tensor layout | `exl3_mul1` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 128 == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -327,6 +328,29 @@ encoded by concatenating the selected code rows, recomputing the scale-plane ali
 row count, and appending the selected scale words in the same row order. It does not decode or
 requantize either plane.
 
+## 5.1 `row_group_v1`
+
+`row_group_v1` stores only rank-two `q4_g32_fp16_rows` matrices `[N,K]` with positive dimensions and
+`K % 32 == 0`. Rows are packed without the K padding `row_split_k128_v1` requires, so a row is
+addressable by its index alone. Let:
+
+```text
+code_row_bytes     = K / 2
+code_plane_bytes   = N * code_row_bytes
+scale_plane_offset = align_up(code_plane_bytes, 256)
+scale_row_bytes    = (K / 32) * 2
+scale_plane_bytes  = N * scale_row_bytes
+payload_bytes      = scale_plane_offset + scale_plane_bytes
+```
+
+Row `n` begins at code-plane offset `n * code_row_bytes`. Within a row, element `2i` is the low
+nibble of byte `i` and element `2i+1` the high nibble. Each stored nibble is the signed code plus 8.
+Zero bytes fill the interval from `code_plane_bytes` to `scale_plane_offset`. The scale plane holds,
+for row `n` and group `g` (elements `32g .. 32g+31`), one little-endian binary16 word at
+`scale_plane_offset + n * scale_row_bytes + 2 * g`. Code and scale validity and reconstruction are
+defined by `q4_g32_fp16_rows` in [`tensor-formats.md`](tensor-formats.md). A row view is its
+`code_row_bytes` consecutive code bytes and its `scale_row_bytes` consecutive scale bytes.
+
 ## 6. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is
@@ -443,17 +467,23 @@ The payload has three planes, in this order:
 ```text
 trellis plane
 zero padding to a 256-byte boundary
-FP32 input-channel scales suh[K]
+FP32 input-channel scales suh[S][K]
 zero padding to a 256-byte boundary
 FP32 output-channel scales svh[N]
 ```
+
+`S` is the tensor object's `divisors` member (1 when absent). `S > 1` stacks `S` independently
+quantized `[N / S, K]` matrices in one object, as a bank of routed experts does: the trellis plane
+is the tile rows of the matrices back to back, `svh` is the concatenation of their output scales,
+and matrix `s` (rows `s * N / S` through `(s + 1) * N / S - 1`) uses `suh[s]`. `N / S` must be a
+positive multiple of 128, so no Hadamard block spans two matrices. `S = 1` is the plain matrix.
 
 Each scale word is stored as its exact little-endian binary32 bits. Plane offsets and object size are:
 
 ```text
 trellis_offset       = 0
 suh_offset           = align_up(trellis_bytes, 256)
-suh_bytes            = 4 * K
+suh_bytes            = 4 * K * S
 svh_offset           = align_up(suh_offset + suh_bytes, 256)
 svh_bytes            = 4 * N
 payload_bytes        = svh_offset + svh_bytes

@@ -30,6 +30,10 @@ enum class CalibrationSite : int {
     MtpStem,            // input to mtp/input_projection (the packed hidden + embedding)
     MtpAttentionInput,  // input to the MTP attention q/k/gate/v parent
     MtpAttentionOutput, // input to the MTP attention output projection
+    // Qwen4Exp routed experts. One MoE block input feeds every expert's gate and up; each expert's
+    // down has its own intermediate, delivered per expert through ExpertActivationObserver.
+    MoeInput,      // input to every routed expert gate/up of the layer
+    MoeActivation, // one expert's down input; the app keys it by expert via the expert observer
     Count,
 };
 
@@ -39,6 +43,23 @@ using CalibrationObserver =
 
 inline CalibrationObserver& calibration_observer() {
     static CalibrationObserver observer;
+    return observer;
+}
+
+// One routed expert's SwiGLU intermediate for every calibration token: a [I, tokens] BF16 view
+// whose column stride may exceed I (a slice of the grouped op's assignment-major buffer).
+using ExpertActivationObserver =
+    std::function<void(int layer, int expert, const Tensor& rows, cudaStream_t stream)>;
+
+// Layers whose experts the observer wants; the all-experts capture costs 52 expert passes, so a
+// layer nobody asked for must not run it. Unset means every layer.
+inline std::function<bool(int layer)>& expert_activation_wanted() {
+    static std::function<bool(int layer)> wanted;
+    return wanted;
+}
+
+inline ExpertActivationObserver& expert_activation_observer() {
+    static ExpertActivationObserver observer;
     return observer;
 }
 

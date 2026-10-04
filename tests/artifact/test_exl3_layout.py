@@ -76,5 +76,26 @@ def test_exl3_rejects_unsupported_layout_shape_and_metadata() -> None:
         encoded_size("trellis_t16_v1", "exl3_mul1", (128, 129), bitrate_half_bits=8)
     with pytest.raises(ValueError, match="bitrate_half_bits is only valid"):
         encoded_size("contiguous_le_v1", "bf16", (128, 128), bitrate_half_bits=8)
-    with pytest.raises(ValueError, match="stores one divisor"):
+    with pytest.raises(ValueError, match="whole number of 128-row blocks"):
         encoded_size("trellis_t16_v1", "exl3_mul1", (128, 128), 2, 8)
+    with pytest.raises(ValueError, match="whole number of 128-row blocks"):
+        encoded_size("trellis_t16_v1", "exl3_mul1", (384, 128), 2, 8)
+    with pytest.raises(ValueError, match="stores one divisor"):
+        encoded_size("row_split_k128_v1", "q4_g64_fp16", (128, 128), 2)
+
+
+def test_exl3_scale_sets_repeat_only_the_input_scales() -> None:
+    """A stacked object holds one suh[K] per matrix; the trellis plane and svh[N] are the whole object's."""
+
+    single = exl3_geometry("exl3_mul1", (1024, 256), 8)
+    stacked = exl3_geometry("exl3_mul1", (1024, 256), 8, 4)
+    assert single.scale_sets == 1 and stacked.scale_sets == 4
+    assert stacked.trellis_bytes == single.trellis_bytes
+    assert stacked.input_scale_offset == single.input_scale_offset
+    assert stacked.input_scale_bytes == 4 * single.input_scale_bytes
+    assert stacked.output_scale_bytes == single.output_scale_bytes == 1024 * 4
+    assert stacked.output_scale_offset % 256 == 0
+    assert stacked.payload_bytes == stacked.output_scale_offset + 1024 * 4
+    assert encoded_size("trellis_t16_v1", "exl3_mul1", (1024, 256), 4, 8) == stacked.payload_bytes
+    # One set is the plain matrix, byte for byte.
+    assert encoded_size("trellis_t16_v1", "exl3_mul1", (1024, 256), 1, 8) == single.payload_bytes

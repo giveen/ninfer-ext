@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -46,5 +47,12 @@ private:
     std::vector<std::uint16_t> logits_;
     std::unordered_map<std::uint32_t, std::size_t> index_;
 };
+
+// Write a reference in the layout Reference::load reads. `logits` holds `positions.size()` rows of
+// `vocab_size` BF16 values, row i being the distribution that predicts global target positions[i].
+void write_reference(const std::filesystem::path& path, std::uint32_t vocab_size,
+                     std::uint32_t context, std::uint32_t stride, std::string_view text_digest,
+                     std::span<const std::uint32_t> positions,
+                     std::span<const std::uint16_t> logits);
 
 } // namespace ninfer::perplexity
