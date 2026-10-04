@@ -11,10 +11,11 @@ The fork adds four things on top of upstream's engine:
   artifacts, DFlash2 serving is 13–48% faster at 1–4 concurrent requests, and MTP 8–32% faster.
 - **Serving work for long-running agents.** Context-cache salvage and anchoring, one Host-tier
   budget, OOM recovery, and protocol additions.
-- **EXL3 quantization for Qwen3.8-27B.** A trellis-coded format at 4.0 and 3.5 bpw with its own
-  C++/CUDA quantizer and kernels ([EXL3 quantization](#exl3-quantization)). The artifacts it
-  produces are the smallest of this fork's Qwen3.8-27B builds and the best on both perplexity and KL
-  divergence; nothing upstream can produce or run them.
+- **EXL3 quantization for Qwen3.8-27B and Qwen3.8-Flash-Next.** A trellis-coded format at 4.0 and
+  3.5 bpw with its own C++/CUDA quantizer and kernels ([EXL3 quantization](#exl3-quantization)). The
+  27B artifacts are the smallest of this fork's Qwen3.8-27B builds and the best on both perplexity
+  and KL divergence; the Flash-Next ones are about 20–26% smaller than its NVFP4 artifact.
+  Nothing upstream can produce or run them.
 
 It is **not** faster than stock everywhere. Qwen3.8-27B `nvfp4` and Qwen3.6-35B-A3B tie with stock,
 and stock is ahead in two cases. [Versus stock NInfer](#versus-stock-ninfer) has both sides.
@@ -74,13 +75,15 @@ Upstream's official v3 artifacts work unchanged:
 | Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [neroued/Qwen3.6-27B-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [neroued/Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 | Qwen3.8-Flash-Next | `nvfp4` | `qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer` (+ 3 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next) |
+| Qwen3.8-Flash-Next | `exl3` 4.0 bpw | `qwen3.8-flash-next-exl3-4bpw/qwen3_8_flash_next_exl3_4bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-4bpw) |
+| Qwen3.8-Flash-Next | `exl3` 3.5 bpw | `qwen3.8-flash-next-exl3-3p5bpw/qwen3_8_flash_next_exl3_3p5bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-3p5bpw) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
 hf download jabbatheduck/ninfer-ext-models qwen3_8_27b_exl3_4bpw.ninfer --local-dir models
 ```
 
-The two `exl3` rows and Qwen3.8-Flash-Next are this fork's own artifacts, published on Hugging
+The `exl3` rows and the Qwen3.8-Flash-Next rows are this fork's own artifacts, published on Hugging
 Face; they download and run unchanged ([EXL3 quantization](#exl3-quantization),
 [Qwen3.8-Flash-Next](#download-and-serve)). Qwen3.8-27B with DFlash2 weights has to be converted
 yourself ([instructions](#converting-a-dflash2-artifact)). Converted artifacts embed this fork's chat template
@@ -363,7 +366,8 @@ does not implement the architecture.
 
 ninfer-ext runs it through the same Engine, CLI and HTTP server as every other model:
 
-- **Experts on the Host.** Routed experts stay NVFP4 in pinned Host memory. Each MoE layer resolves
+- **Experts on the Host.** Routed experts stay NVFP4 (or [EXL3](#flash-next-exl3)) in pinned Host
+  memory. Each MoE layer resolves
   its top-10 experts against an LRU device expert cache inside the decode CUDA Graph and copies
   misses over PCIe. `--expert-cache` sizes that cache; `auto` gives it the device memory left after
   the KV floor.
@@ -427,6 +431,48 @@ Serve two concurrent 64k-token requests at full speed:
 
 Long contexts work too (for example `--max-context 229376 --kv-capacity 458752`), at the cost of
 expert-cache room and so of decode speed.
+
+### Flash-Next EXL3
+
+The routed experts can also be stored as EXL3 (`exl3_mul1`) at a flat 4.0 or 3.5 bpw, quantized by
+`ninfer-quantize --experts-only` from the BF16 weights with per-expert Hessians (the NVFP4 artifact is
+the calibration model). Dense projections are Q6 (Q8 where K is not a multiple of 128) and the n-gram
+table is 4-bit row-grouped. These artifacts hold Text and MTP, **no Vision**. Prefill runs a grouped
+tensor-core route over 64-row jobs, and decode a K-split MMA route; both read the experts through the
+same device expert cache. Measured on the development machine (RTX 5090, i9-285K, MTP K=3, fp8 KV,
+`--expert-cache auto`):
+
+| | NVFP4 | EXL3 4.0 bpw | EXL3 3.5 bpw |
+|---|---|---|---|
+| Artifact size | 119 GB | 95.82 GB | 88.11 GB |
+| Perplexity, 261k-token mixed text | not run on this text | 3.525 | 3.535 |
+| KL divergence vs the NVFP4 artifact | 0 (reference) | 0.0585 | 0.0629 |
+| Decode, 7 mixed chat requests, E-cores | not measured | 172.7 tok/s | 186.7 tok/s |
+| Expert-cache hit rate on that traffic | not measured | 90.2% | 92.0% |
+| Prefill, 8k-token prompt | about 6,250 tok/s (mapped) | about 6,050 tok/s | not measured pinned |
+
+- KL is against the NVFP4 artifact, not BF16; there is no BF16 baseline.
+- **Pin the server to the efficiency cores of a hybrid CPU** (`taskset -c 8-23` on the i9-285K). The
+  same runs on the P-cores were about 30% slower (121.7 and 133.0 tok/s).
+- **Agentic and coding quality is not measured.** A SlopCodeBench pass (mini-swe, greedy, no thinking)
+  was inconclusive and had no NVFP4 baseline; the 3.5 bpw run was stopped after a greedy repetition
+  loop. Use the model's default sampling for agents, not `--greedy`.
+- Long agent contexts prefill slowly (about 250 tok/s at 47k tokens, 44% prompt reuse); not
+  investigated.
+- Next-layer expert prefetch (the next router applied to this layer's input, fetching its predicted
+  misses early) cost 4–8% decode here and is not in the tree.
+
+```bash
+hf download jabbatheduck/ninfer-ext-models --include "qwen3.8-flash-next-exl3-3p5bpw/*" --local-dir models
+taskset -c 8-23 ./build/apps/ninfer-serve \
+  models/qwen3.8-flash-next-exl3-3p5bpw/qwen3_8_flash_next_exl3_3p5bpw.ninfer \
+  --model-id flash-next-3p5 --max-context 65536 --kv-capacity auto --kv-dtype fp8 \
+  --spec mtp --draft-tokens 3
+```
+
+`--kv-capacity auto` returns the KV headroom its `--max-context` cannot use to the expert cache.
+Rebuild the artifacts with `tools/convert` and the `qwen3_8_flash_next_exl3` recipe (see the folder
+READMEs on Hugging Face).
 
 ### Flash-Next speed
 
@@ -586,7 +632,8 @@ tiles, with the input and output Hadamard rotations folded into the kernels. It 
 checkpoint format and imports nothing from it — `ninfer-quantize` produces the weights from
 full-precision source tensors, and the loader and kernels live in this repository.
 
-Two artifacts are published for Qwen3.8-27B, both Text + MTP + Vision:
+Two artifacts are published for Qwen3.8-27B, both Text + MTP + Vision (the Qwen3.8-Flash-Next
+artifacts, which quantize the routed experts only, are described [above](#flash-next-exl3)):
 
 | Artifact | Size | PPL | KL(BF16 ‖ P) |
 |---|---|---:|---:|
