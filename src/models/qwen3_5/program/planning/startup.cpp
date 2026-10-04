@@ -1240,10 +1240,12 @@ bool resolve_ngram_stream(const execution::Parameters& parameters, NgramResidenc
 
 // Qwen4Exp: device slots of the routed-expert cache. The KV floor is planned first; the automatic
 // cache takes the rest of free device memory less headroom, clamped to [one verify round, every
-// expert].
+// expert]. An automatic KV capacity grows into its own headroom afterwards, up to what max_context
+// needs (`maximum_pages`); the part of that headroom the KV cannot use stays with the cache, which
+// is the same memory an explicit --kv-capacity leaves it.
 std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
                                          const EngineOptions& options,
-                                         std::uint32_t floor_pages) {
+                                         std::uint32_t floor_pages, std::uint32_t maximum_pages) {
     const auto& config = inputs.parameters->model.config().text;
     const auto slot_bytes = static_cast<std::uint64_t>(inputs.parameters->qwen4->experts.slot_bytes);
     const std::uint64_t total =
@@ -1262,14 +1264,21 @@ std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
         }
     } else {
         inputs.expert_cache_slots = static_cast<std::uint32_t>(minimum);
-        const std::size_t floor   = build_sequence_candidate(inputs, floor_pages)
-                                      ->device_reservation_bytes;
+        std::size_t floor = build_sequence_candidate(inputs, floor_pages)->device_reservation_bytes;
+        if (options.kv_capacity.mode == KvCapacityMode::Automatic && maximum_pages > floor_pages &&
+            options.kv_capacity.automatic_headroom_bytes != 0) {
+            const std::size_t stride =
+                build_sequence_candidate(inputs, floor_pages + 1U)->device_reservation_bytes - floor;
+            if (stride > 0) {
+                const std::uint64_t affordable = options.kv_capacity.automatic_headroom_bytes / stride;
+                const std::uint32_t grown      = floor_pages + static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                                   affordable, maximum_pages - floor_pages));
+                floor = build_sequence_candidate(inputs, grown)->device_reservation_bytes;
+            }
+        }
         std::size_t free_bytes = 0, total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-        const std::size_t headroom =
-            kDefaultKvCapacityHeadroomBytes + (options.kv_capacity.mode == KvCapacityMode::Automatic
-                                                   ? options.kv_capacity.automatic_headroom_bytes
-                                                   : 0U);
+        const std::size_t headroom = kDefaultKvCapacityHeadroomBytes;
         if (free_bytes < floor + headroom) {
             throw std::invalid_argument(
                 "the KV floor and minimum expert cache require " + std::to_string(floor + headroom) +
@@ -1550,7 +1559,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
             options.kv_capacity.mode == KvCapacityMode::Explicit
                 ? std::max(minimum_pages, page_count(options.kv_capacity.explicit_tokens))
                 : minimum_pages;
-        inputs.expert_cache_slots = resolve_expert_cache_slots(inputs, options, floor_pages);
+        inputs.expert_cache_slots =
+            resolve_expert_cache_slots(inputs, options, floor_pages, maximum_pages);
         inputs.ngram_stream       = resolve_ngram_stream(parameters, options.ngram_residency);
     }
 
