@@ -370,7 +370,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const execution::PrefillChunkResult result = execution::prefill_text_chunk(
-                    schedule_state, sequence.ledger, count, std::nullopt, false);
+                    schedule_state, sequence.ledger, count, std::nullopt, false,
+                    sequence.rope_delta);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
