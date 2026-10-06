@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -140,6 +141,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const Weight weight = host_weight.device_weight(device_weight.data());
 
     int failures = 0;
+    std::map<std::int32_t, std::vector<std::uint16_t>> a4_results;
     for (const Invocation invocation : invocations) {
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
@@ -184,6 +186,14 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
         std::vector<std::uint16_t> actual_bits(output_words);
         output.copy_to_host(actual_bits.data(), output.bytes());
+        // Tile-occupancy invariance: a column's residual must not depend on how many tokens share
+        // its launch, so the same column at a width and at that width plus a one-token tail must be
+        // bit-identical. Compared after the sweep.
+        if (a4 && (invocation.tokens == 16 || invocation.tokens == 17 ||
+                   invocation.tokens == 128 || invocation.tokens == 129 ||
+                   invocation.tokens == 1024 || invocation.tokens == 1025)) {
+            a4_results.emplace(invocation.tokens, actual_bits);
+        }
         const std::vector<std::int32_t> tokens = sampled_indices(invocation.tokens);
         std::vector<double> actual;
         std::vector<double> expected;
@@ -217,6 +227,26 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                                       activation.size() * sizeof(std::uint16_t)),
         "NVFP4 linear_add activation");
     failures += verify_preserved(device_weight, host_weight.payload, "NVFP4 linear_add weight");
+    // A one-token tail must not change the arithmetic of the columns before it.
+    for (const auto [full, tail] :
+         {std::pair<std::int32_t, std::int32_t>{16, 17}, {128, 129}, {1024, 1025}}) {
+        const auto base      = a4_results.find(full);
+        const auto with_tail = a4_results.find(tail);
+        if (base == a4_results.end() || with_tail == a4_results.end()) { continue; }
+        std::size_t mismatched = 0;
+        for (const std::int32_t row : rows) {
+            for (std::int32_t token = 0; token < full; ++token) {
+                const std::size_t index = static_cast<std::size_t>(token) * n + row;
+                if (base->second[index] != with_tail->second[index]) { ++mismatched; }
+            }
+        }
+        if (mismatched != 0) {
+            std::cerr << "NVFP4 linear_add [" << n << ',' << k << "] T=" << full << " vs T=" << tail
+                      << ": A4 residual changed with tile occupancy (" << mismatched
+                      << " columns)\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
