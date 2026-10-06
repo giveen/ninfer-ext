@@ -175,12 +175,34 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_stream_real_test --output-on-failure
 ```
 
+The speculative residue sweep walks prompt lengths that straddle prefill chunks, KV page groups and
+CUDA-graph buckets, and for each length runs the same request with capture on and off, on both a
+fresh prompt and a request that resumes from a committed prefix checkpoint. Capture is semantically
+transparent, so the two graph modes must commit identical tokens; a mismatch is the class of defect
+where a cached request under capture runs the wrong graph and returns corrupted or truncated output
+at only some residues. (The hit and fresh routes are deliberately not compared to each other: a
+restored prefix comes from decode kernels and a fresh prompt from prefill kernels, and the
+repository does not define bit parity across arbitrary floating-point routes. The row's `route=`
+field reports that divergence for information only.) The draft width is startup-fixed, so sweep it
+with `--draft-k` and `--backend`. MTP's adaptive policy is excluded here: it chooses its per-round
+draft length from host timing, which capture changes, so it is not a shape-residue invariant:
+
+```bash
+NINFER_ARTIFACT_RESIDUE=$PWD/models/qwen3_8_27b_dflash2.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_5_spec_residue_real_test --output-on-failure
+
+./build/tests/ninfer_qwen3_5_spec_residue_real_test \
+  --artifact models/qwen3_8_27b.ninfer --backend mtp --draft-k 5
+./build/tests/ninfer_qwen3_5_spec_residue_real_test \
+  --artifact models/qwen3_8_27b.ninfer --backend dflash2 --draft-k 15
+```
+
 Without an artifact, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks
 use behavior and state accounting rather than another numerical path's generated tokens as a golden.
 
-The eight artifact-dependent tests carry the `real` label and each reads its artifact from its own
+The ten artifact-dependent tests carry the `real` label and each reads its artifact from its own
 `NINFER_ARTIFACT_*` CMake cache variable, so one run serves mutually incompatible artifacts and any
 test whose artifact is unset skips cleanly:
 
