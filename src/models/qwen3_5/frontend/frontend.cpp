@@ -410,6 +410,7 @@ PreparedContextCache prepare_context_cache(
     std::span<const std::optional<std::uint32_t>> message_boundaries,
     std::span<const PromptCacheMarker> rendered_markers,
     std::span<const std::optional<std::uint32_t>> cache_boundaries,
+    std::span<const std::uint32_t> execution_frontiers,
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
     std::uint32_t max_long_anchors, std::uint32_t long_anchor_min_spacing) {
@@ -496,7 +497,13 @@ PreparedContextCache prepare_context_cache(
     out.opportunities.reserve(7U);
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
-        if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
+        // A capture may only occur where the prefill schedule already has an execution boundary.
+        // An advisory hint that would introduce its own split would make cold and cached
+        // arithmetic differ, so it is declined rather than allowed to change the schedule.
+        if (frontier == 0 || !exact_vision_frontier(frontier, vision_items) ||
+            !std::binary_search(execution_frontiers.begin(), execution_frontiers.end(), frontier)) {
+            return;
+        }
         const auto duplicate = std::ranges::find_if(out.opportunities, [&](const auto& existing) {
             return existing.kind == kind && existing.frontier == frontier;
         });
@@ -771,7 +778,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
-    if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
+    // The tool-preamble boundary is a structurally stable history position, so it always resolves
+    // for the canonical execution schedule; whether it is captured stays gated on the automatic
+    // shared-prefix hint.
+    if (!options.tool_jsons.empty()) {
         engine_tool_marker_index = rendered_markers.size();
         rendered_markers.push_back(PromptCacheMarker{
             .kind             = PromptCacheMarkerKind::SharedStablePrefix,
@@ -855,10 +865,44 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
-    result.context_cache     = prepare_context_cache(
+    const std::uint32_t full_prompt_frontier = checked_token_count(result.token_ids.size());
+    {
+        // Canonical execution frontiers: the prefill decomposition depends only on the represented
+        // history plus client-declared explicit write boundaries, never on advisory cache hints or
+        // capture admission. Structurally stable history positions (the end of the leading
+        // instruction run and the end of the tool preamble) join the schedule so their captures
+        // remain available without a hint ever introducing a split of its own.
+        auto& frontiers = result.identity.rewrite_execution_frontiers;
+        // Message boundaries are a history-dependent execution decomposition; the long-anchor grid
+        // captures at them, so they are canonical and the cache decides only whether to capture.
+        for (const std::optional<std::uint32_t> boundary : message_boundaries) {
+            if (boundary && *boundary != 0) { frontiers.push_back(*boundary); }
+        }
+        if (leading_boundary && *leading_boundary < message_boundaries.size() &&
+            message_boundaries[*leading_boundary]) {
+            frontiers.push_back(*message_boundaries[*leading_boundary]);
+        }
+        if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size() &&
+            cache_boundaries[*engine_tool_marker_index]) {
+            frontiers.push_back(*cache_boundaries[*engine_tool_marker_index]);
+        }
+        const std::size_t marker_count =
+            std::min(rendered_markers.size(), cache_boundaries.size());
+        for (std::size_t index = 0; index < marker_count; ++index) {
+            if (cache_boundaries[index] &&
+                has_shared_candidate_evidence(rendered_markers[index].evidence,
+                                              SharedCandidateEvidence::ExplicitBoundary)) {
+                frontiers.push_back(*cache_boundaries[index]);
+            }
+        }
+        frontiers.push_back(full_prompt_frontier);
+        std::sort(frontiers.begin(), frontiers.end());
+        frontiers.erase(std::unique(frontiers.begin(), frontiers.end()), frontiers.end());
+    }
+    result.context_cache = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
-        cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
-        checked_token_count(result.token_ids.size()),
+        cache_boundaries, result.identity.rewrite_execution_frontiers, result.vision_items,
+        engine_tool_marker_index, leading_boundary, full_prompt_frontier,
         impl_->max_long_anchors_per_continuation.load(std::memory_order_relaxed),
         impl_->long_anchor_min_spacing_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();

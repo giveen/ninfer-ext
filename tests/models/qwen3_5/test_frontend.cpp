@@ -1239,6 +1239,13 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     });
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
+    for (const auto& opportunity : prepared_data.context_cache.opportunities) {
+        failures += check(
+            std::binary_search(prepared_data.identity.rewrite_execution_frontiers.begin(),
+                               prepared_data.identity.rewrite_execution_frontiers.end(),
+                               opportunity.frontier),
+            "prepared capture opportunity can change the arithmetic schedule");
+    }
     failures += check(prepared_data.has_media() && prepared_data.vision_items.size() == 1,
                       "image frontend did not retain one Vision item");
     if (!prepared_data.vision_items.empty()) {
