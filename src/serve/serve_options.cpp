@@ -2,14 +2,18 @@
 #include "product/offload_options.h"
 #include "product/speculative_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -68,7 +72,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--profile FILE] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--expert-cache auto|MiB] "
            "[--ngram-residency auto|mapped|stream] "
            "[--max-concurrency N] "
@@ -104,6 +108,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --generation-token-trace-jsonl appends prompt and generated token IDs to a "
            "separate JSONL file\n"
+           "       --profile loads base options from a ninfer_serve_profile JSON file written by "
+           "ninfer-optimizer; every other command-line flag overrides the profile\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -136,6 +142,56 @@ std::string serve_usage_text(const char* argv0) {
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
+namespace {
+
+// Read a `ninfer-serve --profile` document and return the CLI arguments it sets. The profile
+// stores a flag -> value object; booleans are valueless flags (true) or absent (false).
+std::vector<std::string> load_serve_profile(const std::string& path) {
+    std::ifstream stream(path);
+    if (!stream) { throw std::invalid_argument("cannot read --profile file: " + path); }
+    nlohmann::json document;
+    try {
+        stream >> document;
+    } catch (const nlohmann::json::exception& error) {
+        throw std::invalid_argument("--profile is not valid JSON: " + std::string(error.what()));
+    }
+    if (document.value("artifact_type", std::string()) != "ninfer_serve_profile") {
+        throw std::invalid_argument("--profile is not a ninfer_serve_profile: " + path);
+    }
+    if (document.value("schema_version", 0) != 1) {
+        throw std::invalid_argument("--profile has an unsupported schema_version: " + path);
+    }
+    const auto options = document.find("options");
+    if (options == document.end() || !options->is_object()) {
+        throw std::invalid_argument("--profile has no options object: " + path);
+    }
+    std::vector<std::string> args;
+    for (const auto& [key, value] : options->items()) {
+        if (key.empty() || key.rfind("--", 0) == 0) {
+            throw std::invalid_argument(
+                "--profile option names omit the leading dashes, got: " + key);
+        }
+        if (value.is_boolean()) {
+            if (value.get<bool>()) { args.push_back("--" + key); }
+        } else if (value.is_string()) {
+            args.push_back("--" + key);
+            args.push_back(value.get<std::string>());
+        } else if (value.is_number_integer()) {
+            args.push_back("--" + key);
+            args.push_back(std::to_string(value.get<std::int64_t>()));
+        } else if (value.is_number_unsigned()) {
+            args.push_back("--" + key);
+            args.push_back(std::to_string(value.get<std::uint64_t>()));
+        } else {
+            throw std::invalid_argument(
+                "--profile option " + key + " has an unsupported value type");
+        }
+    }
+    return args;
+}
+
+} // namespace
+
 ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
@@ -149,23 +205,48 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
         redact_next = options.startup_argv.back() == "--api-key";
     }
-    bool default_max_tokens_explicit = false;
-    bool kv_capacity_explicit        = false;
-    bool context_capacity_explicit   = false;
-    bool host_state_slots_explicit   = false;
-    bool host_kv_mib_explicit        = false;
-    bool host_cache_budget_explicit  = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
     options.artifact_path = argv[1];
+
+    // A `--profile` supplies the base options; every other command-line flag is applied after it,
+    // so the command line always wins over the profile, whatever the argument order.
+    std::vector<std::string> profile_args;
+    std::vector<std::string> cli_args;
     for (int i = 2; i < argc; ++i) {
-        const std::string arg    = argv[i];
+        const std::string arg                   = argv[i] == nullptr ? "" : argv[i];
+        constexpr std::string_view kProfileFlag = "--profile=";
+        if (arg == "--profile") {
+            if (++i >= argc) { throw std::invalid_argument("--profile needs a value"); }
+            profile_args = load_serve_profile(argv[i]);
+        } else if (arg.rfind(kProfileFlag, 0) == 0) {
+            profile_args = load_serve_profile(arg.substr(kProfileFlag.size()));
+        } else {
+            cli_args.push_back(arg);
+        }
+    }
+    std::vector<std::string> args;
+    args.emplace_back(argv[0] == nullptr ? "" : argv[0]);
+    args.push_back(options.artifact_path);
+    args.insert(args.end(), profile_args.begin(), profile_args.end());
+    args.insert(args.end(), cli_args.begin(), cli_args.end());
+
+    bool default_max_tokens_explicit = false;
+    bool kv_capacity_explicit        = false;
+    bool context_capacity_explicit   = false;
+    bool host_state_slots_explicit   = false;
+    bool host_kv_mib_explicit        = false;
+    bool host_cache_budget_explicit  = false;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+        const std::string& arg   = args[i];
         const auto require_value = [&](const char* flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= args.size()) {
+                throw std::invalid_argument(std::string(flag) + " needs a value");
+            }
+            return args[i].c_str();
         };
         if (arg == "--host") {
             options.host = require_value("--host");

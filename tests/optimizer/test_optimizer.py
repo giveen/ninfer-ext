@@ -192,3 +192,34 @@ def test_html_report_is_self_contained():
     assert "<svg" in html and "Pareto" in html and "Confirmation" in html
     assert "http://" not in html and "https://" not in html  # no external assets
     assert "ninfer &lt;artifact&gt;" in html
+
+
+def test_profile_round_trips_serve_options():
+    from tools.optimizer.profile import build_profile
+
+    result = build_result(
+        use_case("chat"), [_row(8192, 90.0)], [], _hardware(), _model(),
+        [Factor("kv_dtype", ("fp8", "nvfp4"))], reps=1,
+    )
+    document = build_profile(result, "fastest")
+    assert document["artifact_type"] == "ninfer_serve_profile"
+    assert document["schema_version"] == 1
+    assert document["options"]["max-context"] == 8192
+    assert document["options"]["kv-dtype"] == "fp8"
+    assert document["options"]["max-concurrency"] == 1
+    assert all(not key.startswith("--") for key in document["options"])
+
+
+def test_profile_encodes_speculative_flags():
+    from tools.optimizer.profile import serve_options
+
+    row = Measurement(
+        Setting({"spec": "mtp:5+head", "ctx": "4096"}), STATUS_OK, 1000.0, 100.0, 100.0, 1.0
+    )
+    assert serve_options(row, use_case("chat")) == {
+        "spec": "mtp",
+        "draft-tokens": 5,
+        "lm-head-draft": True,
+        "max-context": 4096,
+        "max-concurrency": 1,
+    }

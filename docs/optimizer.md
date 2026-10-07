@@ -86,6 +86,22 @@ Each run is recorded as it finishes (crash-safe CSV under `--output-dir`), then 
 `--html report.html` writes a **self-contained** report — inline CSS and an SVG Pareto chart, no
 external assets — with the picks, confirmation, main effects and every measured row.
 
+## Saving a profile
+
+`--save-profile PATH` writes the chosen pick (default `balanced`; `--save-pick
+fastest|balanced|max_context`) as a `ninfer_serve_profile` document. Serve with it, and override any
+option on the command line — the command line always wins, whatever the argument order:
+
+```bash
+python3 -m tools.optimizer models/qwen3_8_27b.ninfer --use-case agents --run \
+  --save-profile profiles/agents.json --save-pick balanced
+ninfer-serve models/qwen3_8_27b.ninfer --profile profiles/agents.json --vision
+```
+
+The profile stores the serve flags the sweep measured (`kv-dtype`, `max-context`, `spec`,
+`draft-tokens`, `lm-head-draft`, `prefill-chunk`, `max-concurrency`, …), plus the model, use case,
+objective and fingerprint for reference. It is plain JSON, so it can be edited.
+
 ## Time to first token
 
 The server driver streams every request and records the time from send to the first content token,

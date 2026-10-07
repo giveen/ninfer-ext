@@ -493,6 +493,62 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    // --profile loads base options; every command-line flag overrides it.
+    const auto profile_path =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-serve-profile-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    {
+        std::ofstream profile(profile_path);
+        profile << R"({"artifact_type":"ninfer_serve_profile","schema_version":1,)"
+                   R"("options":{"kv-dtype":"nvfp4","max-context":4096,"prefill-chunk":1024,)"
+                   R"("spec":"mtp","draft-tokens":5,"lm-head-draft":true,"max-concurrency":2}})";
+    }
+    const ServeOptions profiled =
+        parse({"ninfer-serve", "model.ninfer", "--profile", profile_path.string()});
+    failures += check(profiled.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16 &&
+                          profiled.max_context == 4096 && profiled.prefill_chunk == 1024U &&
+                          profiled.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          profiled.speculative.draft_tokens == 5 &&
+                          profiled.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                          profiled.max_concurrency == 2,
+                      "--profile did not apply its options");
+    const ServeOptions overridden =
+        parse({"ninfer-serve", "model.ninfer", "--profile", profile_path.string(), "--max-context",
+               "8192", "--kv-dtype", "fp8"});
+    failures += check(overridden.max_context == 8192 &&
+                          overridden.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256 &&
+                          overridden.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                      "command-line flags did not override --profile");
+    const ServeOptions overridden_first =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "8192", "--profile",
+               profile_path.string()});
+    failures += check(overridden_first.max_context == 8192,
+                      "a flag before --profile was overridden by the profile");
+    const ServeOptions equals_form =
+        parse({"ninfer-serve", "model.ninfer", "--profile=" + profile_path.string()});
+    failures += check(equals_form.max_context == 4096, "--profile=PATH did not load");
+    failures += check(serve_usage_text("ninfer-serve").contains("--profile"),
+                      "serve help omits --profile");
+    bool bad_profile_rejected = false;
+    {
+        const auto bad_path =
+            std::filesystem::temp_directory_path() /
+            ("ninfer-serve-bad-profile-" +
+             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+        std::ofstream bad(bad_path);
+        bad << R"({"artifact_type":"something_else","schema_version":1,"options":{}})";
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--profile", bad_path.string()});
+        } catch (const std::invalid_argument&) { bad_profile_rejected = true; }
+        std::error_code cleanup;
+        std::filesystem::remove(bad_path, cleanup);
+    }
+    failures += check(bad_profile_rejected, "a non-profile file was accepted as --profile");
+    std::error_code profile_cleanup;
+    std::filesystem::remove(profile_path, profile_cleanup);
+    failures += check(!profile_cleanup, "profile test file cleanup failed");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -35,6 +35,7 @@ from .design import (
 from .detect import detect_hardware, detect_model
 from .driver import DEFAULT_BENCH, DEFAULT_SERVE, Measurement, ThermalController, driver_for
 from .html import render_html
+from .profile import build_profile, write_profile
 from .factors import Factor, FactorOptions, Setting, build_factors
 from .report import (
     TOOL_VERSION,
@@ -165,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ctx-size", type=int, default=None, help="pin the context depth")
     parser.add_argument("--output-dir", type=Path, default=Path("profiles/optimizer"))
     parser.add_argument("--html", type=Path, default=None, help="write a self-contained HTML report")
+    parser.add_argument("--save-profile", type=Path, default=None,
+                        help="write the chosen pick as a ninfer-serve --profile document")
+    parser.add_argument("--save-pick", default="balanced",
+                        choices=["fastest", "balanced", "max_context"],
+                        help="which pick to save (default balanced)")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
     parser.add_argument("--serve", type=Path, default=DEFAULT_SERVE)
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
@@ -292,6 +298,13 @@ def main(argv: list[str] | None = None) -> int:
         args.html.parent.mkdir(parents=True, exist_ok=True)
         args.html.write_text(render_html(result), encoding="utf-8")
         print(f"HTML report written to {args.html}")
+    if args.save_profile is not None:
+        try:
+            document = build_profile(result, args.save_pick)
+        except ValueError as error:
+            parser.error(str(error))
+        write_profile(args.save_profile, document)
+        print(f"profile written to {args.save_profile} (pick {args.save_pick})")
     if args.json:
         print(to_json(result))
     return 0
