@@ -181,7 +181,10 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
     }
 
     if constexpr (RowPolicy::kContiguous) {
-        static_assert((Schedule::kBlockN % 64) == 0);
+        // The persistent 128-row scale tile is addressed in 32-row quartiles, so a 32-row block
+        // stages and reads exactly one quartile at slot 0. 32 is the narrowest block this path
+        // serves; the NVFP4 down projection uses it to fill the device at verify widths.
+        static_assert((Schedule::kBlockN % 32) == 0);
         constexpr int kScaleRowTiles     = Schedule::kBlockN >= 128 ? Schedule::kBlockN / 128 : 1;
         constexpr int kQuartilesPerTile  = Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
         constexpr int kScaleBytesPerTask = kQuartilesPerTile * 4;
