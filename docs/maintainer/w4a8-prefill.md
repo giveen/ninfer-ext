@@ -15,10 +15,15 @@ is fully characterized.
 | **W4A8 (`--policy a8`)** | **208.7** | **192.4** | **187.1** |
 | ratio | 1.03x | 1.09x | 1.07x |
 
-The standalone prototype of the same kernel reaches ~242 TFLOP/s, so ~15-25% is lost inside the
-engine. Profiling shows the in-engine kernel is L2-throughput bound (~93%) at a lower SM clock
-(2.41 vs 2.67 GHz) and ~25% more elapsed cycles; the cause is not yet isolated. This is the open
-work before the route is worth enabling by default.
+### The prototype's ~242 is a boost artifact, not a lost 20%
+
+A standalone prototype of the same kernel reaches ~242 TFLOP/s, but under a sustained load it is
+running at ~3.0 GHz / 140 W while the engine benchmark saturates the board at 475 W. Both engine
+routes hit that 475 W limit, and int8 draws more power per cycle, so W4A8 sustains ~2.0 GHz against
+A16's ~2.42 GHz. The int8 tensor-rate advantage is therefore largely spent on the power/clock
+penalty: the win is real but power-limited (1.03-1.09x), not kernel-limited. Closing the remaining
+gap means reducing W4A8's energy per output (fewer non-MMA instructions, since ALU is +30% and LSU
++19% against the prototype), not more tensor throughput.
 
 ## Enabling it (no reconversion)
 
