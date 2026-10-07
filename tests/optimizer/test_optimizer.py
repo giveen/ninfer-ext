@@ -71,7 +71,7 @@ def test_kv_floor_and_factor_building():
     names = {f.name for f in factors}
     assert {"kv_dtype", "ctx", "spec", "prefill_chunk"} <= names
     spec = next(f for f in factors if f.name == "spec").levels
-    assert "none" in spec and "mtp+head" in spec and "dflash2+head" in spec
+    assert "none" in spec and "mtp+head" in spec and "dflash2:7+head" in spec
 
 
 def test_setting_renders_flags():

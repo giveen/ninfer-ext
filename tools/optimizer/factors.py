@@ -138,10 +138,13 @@ def _spec_levels(model: ModelInfo, options: FactorOptions) -> tuple[str, ...]:
         ("dflash", model.has_dflash),
         ("dflash2", model.has_dflash2),
     ):
-        if present:
-            levels.append(backend)
-            if model.has_proposal_head:
-                levels.append(f"{backend}+head")
+        if not present:
+            continue
+        # DFlash/DFlash2 require an explicit draft window; MTP adapts on its own.
+        spec = f"{backend}:7" if backend in ("dflash", "dflash2") else backend
+        levels.append(spec)
+        if model.has_proposal_head:
+            levels.append(f"{spec}+head")
     return tuple(levels)
 
 
