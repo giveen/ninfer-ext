@@ -201,6 +201,33 @@ int main(int argc, char** argv) {
                             reused_image.reused_prompt_tokens != 0 &&
                             reused_image.timings.vision_seconds == 0.0,
                         "Vision DFlash2 capture/restore recomputed retained media");
+
+                // A text-only suffix appended after a reused media prefix must carry the sequence's
+                // RoPE offset; a freshly constructed TextContext must not fall back to zero. The
+                // reused and fresh continuations share one schedule, so their greedy output must
+                // agree.
+                ninfer::PromptInput follow = media_prompt(kind);
+                ninfer::ChatMessage assistant;
+                assistant.role              = ninfer::ChatRole::Assistant;
+                assistant.reasoning_content = image.reasoning;
+                assistant.parts.push_back(
+                    {.kind = ninfer::MessagePartKind::Text, .text = image.content, .media = {}});
+                ninfer::ChatMessage user;
+                user.role = ninfer::ChatRole::User;
+                user.parts.push_back({.kind  = ninfer::MessagePartKind::Text,
+                                      .text  = "Now answer with a single word.",
+                                      .media = {}});
+                follow.messages.push_back(std::move(assistant));
+                follow.messages.push_back(std::move(user));
+
+                const auto appended = engine.generate(engine.prepare(follow), request(8, true));
+                const auto fresh    = engine.generate(engine.prepare(follow), request(8, false));
+                valid(appended, 8);
+                valid(fresh, 8);
+                require(appended.reused_prompt_tokens != 0 &&
+                            fresh.reused_prompt_tokens == 0 &&
+                            appended.generated_token_ids == fresh.generated_token_ids,
+                        "text suffix after a reused media prefix changed the result");
             }
         }
         const auto stats = engine.runtime_stats();

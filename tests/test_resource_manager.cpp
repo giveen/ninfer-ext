@@ -536,6 +536,11 @@ struct FakePhysicalUsage {
     std::uint32_t device_main_kv_lease_pages    = 0;
     std::uint32_t device_backend_kv_lease_pages = 0;
     std::size_t host_kv_bytes                   = 0;
+    std::uint64_t expert_cache_hits             = 0;
+    std::uint64_t expert_cache_misses           = 0;
+    std::uint32_t expert_cache_resident_slots   = 0;
+    std::uint32_t expert_cache_layer_min        = 0;
+    std::uint32_t expert_cache_layer_max        = 0;
 };
 
 class FakeProgram;

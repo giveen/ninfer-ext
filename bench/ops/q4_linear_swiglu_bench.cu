@@ -30,11 +30,12 @@ constexpr std::size_t kFlushBytes  = 256ULL << 20;
 
 struct Options {
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 24, 32, 48};
-    int warmup   = 5;
-    int repeat   = 30;
-    bool profile = false;
-    bool graph   = false;
+    int warmup            = 5;
+    int repeat            = 30;
+    bool profile          = false;
+    bool graph            = false;
     std::string csv_out;
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
 struct Result {
@@ -89,6 +90,15 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--execution must be eager or graph");
             }
             options.graph = mode == "graph";
+        } else if (argument == "--policy") {
+            const std::string_view mode = next("--policy value");
+            if (mode == "a16") {
+                options.policy = ops::LinearPolicy::A16Only;
+            } else if (mode == "a8") {
+                options.policy = ops::LinearPolicy::AllowA8;
+            } else {
+                throw std::invalid_argument("--policy must be a16 or a8");
+            }
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
         } else if (argument == "--profile") {
@@ -98,6 +108,7 @@ Options parse_options(int argc, char** argv) {
                 "Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--execution eager|graph]\n"
                 "          [--csv-out PATH] [--profile]\n"
                 "  --execution graph captures ONE complete public ops::linear_swiglu call per\n"
+                "  --policy a16|a8 selects the activation-compute policy (default a16)\n"
                 "  graph; the reported graph_nodes is the captured count, not an assumption.\n"
                 "  --profile runs a single eager or single graph launch for external profilers.\n",
                 argv[0]);
@@ -157,13 +168,13 @@ int main(int argc, char** argv) {
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::Q4_G64_FP16, kGateUpRows, kHidden, min_t, max_t);
+            QType::Q4_G64_FP16, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, workspace, launch_stream);
+            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, launch_stream);
         };
 
         if (options.profile) {
@@ -209,7 +220,7 @@ int main(int argc, char** argv) {
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const std::size_t workspace_exact = ops::linear_swiglu_workspace_capacity_bytes(
-                QType::Q4_G64_FP16, kGateUpRows, kHidden, tokens, tokens);
+                QType::Q4_G64_FP16, kGateUpRows, kHidden, options.policy, tokens, tokens);
             std::printf("T=%-4d median=%9.3f us min=%9.3f p95=%9.3f %7.1f GB/s %7.2f TFLOP/s "
                         "workspace_sweep=%zu workspace_exact=%zu nodes=%zu\n",
                         tokens, timing.median_us, timing.min_us, timing.p95_us, bytes / seconds / 1.0e9,

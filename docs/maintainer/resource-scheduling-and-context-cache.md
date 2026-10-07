@@ -327,6 +327,16 @@ Session key、marker、hash 和 prefix index 只缩小 candidate 集合，不证
 
 `rewrite_execution_frontiers` 也是 exact identity 的一部分。它记录 replay/root prefill 必须分段的 exact
 token frontiers，使重建路径采用与原生成路径一致的 execution decomposition；不能为了采用 endpoint 而忽略。
+
+Canonical execution frontiers depend only on the represented history plus client-declared explicit
+write boundaries: the template/output reconstruction boundaries, the structurally stable history
+positions (the end of the leading instruction run, the end of the tool preamble, and each message
+boundary), every explicit client write boundary, and the full prompt frontier. They are part of
+exact identity and drive execution, cost planning and shortlist digests together. Automatic and
+implicit cache hints are advisory: a capture opportunity is emitted only where a canonical frontier
+already exists, so an implicit hint never adds a prefill split or changes cold arithmetic. A
+capture is declined rather than allowed to move the schedule, so disabling retention or declining a
+candidate leaves the prefill decomposition unchanged.
 当 NInfer 自己生成的 accepted output 形成可由历史 renderer 精确重建的边界时，所有权链固定为：
 
 ```text

@@ -720,8 +720,10 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
         }
         rope_delta_ = multimodal->rope_delta;
         history     = multimodal->token_ids;
-    } else if (text_kv_base_ == 0) {
-        rope_delta_ = 0;
+    } else {
+        // A reused media prefix can leave only text to prefill; a freshly constructed TextContext
+        // must take the sequence's RoPE offset instead of defaulting to zero.
+        rope_delta_ = text_prefill != nullptr ? text_prefill->rope_delta : 0;
     }
     if (text_prefill == nullptr && multimodal == nullptr && base != 0) {
         throw std::invalid_argument("Qwen4Exp continued prefill requires its full prompt");

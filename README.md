@@ -90,6 +90,18 @@ yourself ([instructions](#converting-a-dflash2-artifact)). Converted artifacts e
 ([conversion guide](docs/weight-conversion.md)). An existing v2 download can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
 
+Qwen3.8-27B `groupwise-int` has a Q4 W4A8 prefill route. The upstream artifact stores `A16Only` on
+the MLP gate/up uses, so enable it on an existing download without reconverting (a fresh conversion
+already declares `AllowA8`):
+
+```bash
+python3 -m tools.artifact.set_activation_policy models/qwen3_8_27b.ninfer models/qwen3_8_27b_a8.ninfer \
+  --parameter '*/mlp/gate' --parameter '*/mlp/up' --policy AllowA8
+```
+
+The route measures ~1.6-1.7x the A16 gate/up op and ~1.16x on a 1410-token prefill
+([design note](docs/maintainer/w4a8-prefill.md)).
+
 ### 4. Serve and send a request
 
 ```bash
