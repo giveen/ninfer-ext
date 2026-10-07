@@ -254,7 +254,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
-    if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
+    if (io.mtp_decode.has_value() !=
+        (speculative_backend == SpeculativeBackend::Mtp ||
+         speculative_backend == SpeculativeBackend::Eagle3)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() !=

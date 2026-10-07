@@ -15,6 +15,7 @@ enum class Category : std::uint32_t {
     Decode,
     Mtp,
     DFlash,
+    Eagle3,
     Attention,
     Gdn,
     PostMixer,
@@ -45,6 +46,9 @@ enum class Name : std::size_t {
     DecodeDFlashRound,
     DecodeDFlashSubmit,
     DecodeDFlashWait,
+    DecodeEagle3Round,
+    DecodeEagle3Submit,
+    DecodeEagle3Wait,
     DecodeOrdinarySubmit,
     DecodeOrdinaryWait,
     PrefillMtpChunk,
@@ -89,6 +93,8 @@ enum class Name : std::size_t {
     DFlashAttention,
     DFlashMlp,
     DecodeDFlashTarget,
+    DecodeEagle3Target,
+    DecodeEagle3Draft,
     Count,
 };
 
@@ -104,6 +110,8 @@ enum class Name : std::size_t {
         return 0xffb279a2u;
     case Category::DFlash:
         return 0xffaf7aa1u;
+    case Category::Eagle3:
+        return 0xffc99bd6u;
     case Category::Attention:
         return 0xff76b7b2u;
     case Category::Gdn:
@@ -132,6 +140,7 @@ enum class Name : std::size_t {
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::Decode), "decode");
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::Mtp), "mtp");
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::DFlash), "dflash");
+        nvtxDomainNameCategoryA(out, std::to_underlying(Category::Eagle3), "eagle3");
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::Attention), "attention");
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::Gdn), "gdn");
         nvtxDomainNameCategoryA(out, std::to_underlying(Category::PostMixer), "post-mixer");
@@ -166,6 +175,9 @@ enum class Name : std::size_t {
         "decode.dflash_round",
         "decode.dflash.submit",
         "decode.dflash.wait",
+        "decode.eagle3_round",
+        "decode.eagle3.submit",
+        "decode.eagle3.wait",
         "decode.ordinary.submit",
         "decode.ordinary.wait",
         "prefill.mtp_chunk",
@@ -210,6 +222,8 @@ enum class Name : std::size_t {
         "dflash.attention",
         "dflash.mlp",
         "decode.dflash.target",
+        "decode.eagle3.target",
+        "decode.eagle3.draft",
     });
     static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {

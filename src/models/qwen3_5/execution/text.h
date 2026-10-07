@@ -207,8 +207,7 @@ public:
     void eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g,
                                      const Tensor& cache_positions, const Tensor& rope_positions,
                                      const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                     Tensor& logits);
+                                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
     // EAGLE3 draft proposal: the draft-vocabulary head, then the draft-to-target token-id map.
     void eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void set_eagle3_head(const LinearParameters* head, const std::int32_t* d2t,

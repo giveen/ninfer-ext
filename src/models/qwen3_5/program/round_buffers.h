@@ -29,6 +29,8 @@ struct RoundStateSpec {
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
+    // EAGLE3 fused target-feature width (three target hidden states); 0 for other backends.
+    std::int32_t eagle3_fused    = 0;
     bool causal_scoring          = false;
     // A speculative program that also runs ordinary rounds for batches.
     bool plain_batches = false;
@@ -70,6 +72,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
+    // EAGLE3: the feature-sink row-to-slot map (identity for the compact round frame).
+    std::array<std::int32_t, kMaximumConcurrency> feature_lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -153,6 +157,8 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
+    // EAGLE3 only: the three concatenated target layers captured by the verify feature sink.
+    std::optional<TensorRegion> eagle3_features;
 };
 
 struct DFlashDecodeStateLayout {
@@ -279,6 +285,10 @@ struct MtpDecodeState {
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
+    // EAGLE3 only: the fused encoder input captured by the target verify feature sink.
+    Tensor features;
+    // EAGLE3 only: the feature-sink row-to-slot map.
+    Tensor feature_lanes;
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,

@@ -45,15 +45,15 @@ void TextContext::eagle3_encode_batch(const Tensor& features, Tensor& g) {
 // EAGLE3 decoder step. At draft position P the pair is (t_{P+1}, g_P): the token embedding and the
 // fused target feature, each normalized, concatenated into the 2h-wide attention input. The layer
 // has no attention gate and no fused input projection, unlike the MTP layer it is hosted beside.
-// `ids` is [width, batch]; `g`/`hidden` are [h, width, batch]; `logits` is [draft_vocab, width,
-// batch]; `cache_positions`/`rope_positions` are [width, batch].
+// `ids` is [width, batch]; `g`/`hidden` are [h, width, batch]; `cache_positions`/`rope_positions`
+// are [width, batch]. The draft head is applied separately, only at the selected column.
 void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g,
                                               const Tensor& cache_positions,
                                               const Tensor& rope_positions,
                                               const Tensor& valid_columns,
                                               const Tensor& kv_table_rows,
                                               ops::CausalAttentionExecutionEnvelope envelope,
-                                              Tensor& hidden, Tensor& logits) {
+                                              Tensor& hidden) {
     if (batch_eagle3_kv_ == nullptr) { throw std::runtime_error("EAGLE3 forward is not enabled"); }
     const auto& config = parameters_.model.config();
     const auto& draft  = *parameters_.draft;
@@ -74,9 +74,7 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
         valid_columns.ne[0] != batch || kv_table_rows.ne[0] != batch ||
         g.dtype != DType::BF16 || g.ne[0] != h || g.ne[1] != width || g.ne[2] != batch ||
         hidden.dtype != DType::BF16 || hidden.ne[0] != h || hidden.ne[1] != width ||
-        hidden.ne[2] != batch || logits.dtype != DType::BF16 ||
-        logits.ne[0] != static_cast<std::int32_t>(eagle.draft_vocab_size) ||
-        logits.ne[1] != width || logits.ne[2] != batch) {
+        hidden.ne[2] != batch) {
         throw std::invalid_argument("EAGLE3 decode batch shapes are invalid");
     }
     const std::int32_t columns = width * batch;
@@ -127,11 +125,6 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
 
     // The pre-norm hidden becomes the next draft step's g.
     CUDA_CHECK(cudaMemcpyAsync(hidden.data, y.data, y.bytes(), cudaMemcpyDeviceToDevice, s));
-    Tensor normed = work_.alloc(DType::BF16, {h, columns});
-    ops::rmsnorm(y, draft.final_norm, config_.rms_norm_eps, true, normed, s);
-    Tensor logits_flat =
-        logits.view({static_cast<std::int32_t>(eagle.draft_vocab_size), columns});
-    project(normed, draft.output_head, logits_flat, work_, s);
 }
 
 // EAGLE3 draft proposal: the draft-vocabulary head over the pre-norm hidden, then the stored
@@ -142,12 +135,15 @@ void TextContext::eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Ten
     }
     const std::int32_t batch = hidden.ne[1];
     if (hidden.dtype != DType::BF16 || batch <= 0 || logits.dtype != DType::BF16 ||
-        logits.ne[0] != eagle3_draft_vocab_ || logits.ne[1] != batch || draft_tokens.dtype != DType::I32 ||
-        draft_tokens.ne[0] != batch) {
+        logits.ne[0] != eagle3_draft_vocab_ || logits.ne[1] != batch ||
+        draft_tokens.dtype != DType::I32 || draft_tokens.ne[0] != batch) {
         throw std::invalid_argument("EAGLE3 proposal batch shapes are invalid");
     }
+    const auto& draft = *parameters_.draft;
     Tensor lg = logits.view({eagle3_draft_vocab_, batch});
-    project(hidden, *eagle3_head_, lg, work_, ctx_.stream);
+    Tensor normed = work_.alloc(DType::BF16, {hidden.ne[0], batch});
+    ops::rmsnorm(hidden, draft.final_norm, config_.rms_norm_eps, true, normed, ctx_.stream);
+    project(normed, *eagle3_head_, lg, work_, ctx_.stream);
     ops::argmax(lg, draft_tokens, eagle3_draft_vocab_, ctx_.stream);
     ops::proposal_remap_token_ids(draft_tokens, eagle3_d2t_, eagle3_draft_vocab_, ctx_.stream);
 }

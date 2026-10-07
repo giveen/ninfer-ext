@@ -91,6 +91,22 @@ struct MtpBatchContext {
     qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
+// EAGLE3 reuses the MTP round's host bridge, frame and envelopes; only the draft KV cache and the
+// draft forward differ.
+struct Eagle3BatchContext {
+    ExecutionCore execution;
+    const qwen3_5::PagedKVCache& text_cache;
+    const qwen3_5::PagedKVCache& eagle3_cache;
+    qwen3_5::MtpDecodeState& frame;
+    const qwen3_5::MtpDecodeIngress& host_ingress;
+    qwen3_5::MtpDecodeEgress& host_egress;
+    Tensor& continuation_hidden_store;
+    // Streamed round: the prepared staging of its Host text KV (eager only), or null.
+    qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
+};
+
 struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_5::PagedKVCache& text_cache;
@@ -198,6 +214,12 @@ void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, s
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
                       bool lookup_only);
+
+// Executes one exact-B EAGLE3 verification/alignment/draft transaction. It reuses the MTP round's
+// host bridge and frame, but verifies with a feature sink that captures the three target layers,
+// then drafts with the EAGLE3 encoder and its one autoregressive decoder layer.
+void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                         MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

@@ -1306,6 +1306,10 @@ private:
                      std::span<const runtime::RoundBudget> budgets,
                      runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_eagle3_batch(std::span<const std::uint32_t> lanes,
+                        std::span<const runtime::RoundBudget> budgets,
+                        runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);

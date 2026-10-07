@@ -134,7 +134,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     const auto i32            = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    if (layout.spec.backend == SpeculativeBackend::Mtp) {
+    if (layout.spec.backend == SpeculativeBackend::Mtp ||
+        layout.spec.backend == SpeculativeBackend::Eagle3) {
         layout.mtp.emplace();
         const auto ar_steps =
             checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
@@ -183,6 +184,14 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        if (layout.spec.backend == SpeculativeBackend::Eagle3) {
+            if (layout.spec.eagle3_fused <= 0) {
+                throw std::invalid_argument("EAGLE3 round state requires its fused feature width");
+            }
+            decode.eagle3_features =
+                add_tensor(builder, DType::BF16,
+                           {layout.spec.eagle3_fused, columns, batch}, "EAGLE3 decode features");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         DFlashPrefillStateLayout& prefill = layout.dflash_prefill.emplace();
@@ -291,6 +300,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     state_destination_slots =
         ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
+    feature_lanes =
+        ingress_tensor(offsetof(MtpDecodeIngress, feature_lanes), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
 
@@ -331,6 +342,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_positions               = window_view(layout.ar_positions, {batch, steps});
     ar_rope_positions          = window_view(layout.ar_rope_positions, {batch, steps});
     ar_valid_columns           = window_view(layout.ar_valid_columns, {batch, steps});
+    if (layout.eagle3_features) {
+        features = window_view(*layout.eagle3_features,
+                               {layout.eagle3_features->shape[0], width, batch});
+    }
 }
 
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

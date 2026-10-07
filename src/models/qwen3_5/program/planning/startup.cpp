@@ -282,6 +282,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
+                                         .eagle3_fused   = parameters.model.config().draft &&
+                                                             parameters.model.config().draft->eagle3
+                                                               ? static_cast<std::int32_t>(
+                                                                     parameters.model.config()
+                                                                         .draft->eagle3->fused_input_size())
+                                                               : 0,
                                          .causal_scoring = plan.causal_scoring,
                                          .plain_batches  = plan.plain_mtp_batches,
                                          .lookup_only    = plan.lookup_only});
