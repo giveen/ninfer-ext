@@ -132,3 +132,55 @@ def test_exl3_source_preserves_tiles_and_decodes_independently(tmp_path):
         assert torch.allclose(source.values().reshape(n, k), expected, rtol=0, atol=0)
         explicit = matrix_source(store, "proj.weight", (n, k), "exl3_mul1")
         assert explicit.bitrate_half_bits() == half_bits
+
+
+def test_modelopt_nvfp4_source_is_detected(tmp_path):
+    # ModelOpt writes NVFP4 as `weight`/`weight_scale`/`weight_scale_2` instead of the
+    # compressed-tensors `weight_packed`/`weight_global_scale` spelling.
+    codes = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]], dtype=torch.uint8
+    )
+    save_file(
+        {
+            "proj.weight": codes,
+            "proj.weight_scale": torch.tensor([[0x38]], dtype=torch.uint8).view(
+                torch.float8_e4m3fn
+            ),
+            "proj.weight_scale_2": torch.tensor(2.0, dtype=torch.float32),
+            "proj.input_scale": torch.tensor(1.5, dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        source = matrix_source(store, "proj.weight", (1, 16))
+        words = source.read_encoded(0, 1)
+        assert torch.equal(words.codes, codes)
+        assert words.weight_divisor == struct.pack("<f", 0.5)  # 1 / weight_scale_2
+        assert torch.equal(
+            source.values().reshape(1, 16),
+            torch.tensor(
+                [[0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                  0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0]]
+            ),
+        )
+        assert source.input_divisor() == struct.pack("<f", 1.0 / 1.5)
+
+
+def test_modelopt_per_tensor_fp8_source_is_detected(tmp_path):
+    # ModelOpt per-tensor FP8 carries one scalar F32 scale, which has no exact encoded form.
+    weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]]).to(torch.float8_e4m3fn)
+    save_file(
+        {
+            "proj.weight": weight,
+            "proj.weight_scale": torch.tensor(0.25, dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        source = matrix_source(store, "proj.weight", (2, 2))
+        assert torch.equal(
+            source.values().reshape(2, 2),
+            torch.tensor([[0.25, -0.5], [0.125, 1.0]]),
+        )
+        with pytest.raises(ValueError, match="does not provide encoded"):
+            source.read_encoded(0, 1)

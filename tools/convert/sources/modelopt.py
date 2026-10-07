@@ -125,6 +125,34 @@ def fp8_block_source(
     return LogicalSource(shape, f"{store.path}:{prefix} (block fp8)", read)
 
 
+def fp8_tensor_source(
+    store: SafetensorsSource, prefix: str, shape: tuple[int, int]
+) -> LogicalSource:
+    """ModelOpt per-tensor FP8: one E4M3FN ``weight`` times a scalar F32 ``weight_scale``.
+
+    Exposed as logical values only: a scalar multiplier has no exact v3 encoded counterpart,
+    so a caller that needs a packed format re-quantises the values.
+    """
+    n, k = shape
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.float32)
+        first, last = begin // k, (end + k - 1) // k
+        _signature(store, prefix + ".weight", (n, k), "F8_E4M3")
+        scale = _scalar_f32(store, prefix + ".weight_scale")
+        values = (
+            store.read_flat(prefix + ".weight", first * k, last * k)
+            .view(torch.float8_e4m3fn)
+            .float()
+            .reshape(last - first, k)
+            * scale
+        )
+        return values.reshape(-1)[begin - first * k : end - first * k]
+
+    return LogicalSource(shape, f"{store.path}:{prefix} (modelopt fp8)", read)
+
+
 def fp8_tensor_rows_source(
     store: SafetensorsSource,
     shards: list[str],

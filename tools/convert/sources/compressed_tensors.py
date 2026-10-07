@@ -15,6 +15,7 @@ from tools.artifact.codecs.fp8_row import validate_fp8_row_words
 from tools.artifact.formats import valid_positive_fp32_word
 from .exl3 import exl3_matrix_source, has_exl3
 from .logical import EncodedRows, LogicalSource
+from .modelopt import fp8_tensor_source, nvfp4_source
 from .safetensors import SafetensorsSource, tensor_source
 
 
@@ -152,10 +153,25 @@ def matrix_source(
                 actual = "exl3_mul1"
             if actual is None and store.has(prefix + ".weight_packed"):
                 actual = "nvfp4"
+            if actual is None and store.has(prefix + ".weight_scale_2"):
+                actual = "modelopt_nvfp4"
             if actual is None and store.describe(name).dtype == "F8_E4M3":
-                actual = "fp8_e4m3fn_row_bf16"
+                scale = (
+                    store.describe(prefix + ".weight_scale")
+                    if store.has(prefix + ".weight_scale")
+                    else None
+                )
+                actual = (
+                    "modelopt_fp8"
+                    if scale is not None and scale.dtype == "F32" and prod(scale.shape) == 1
+                    else "fp8_e4m3fn_row_bf16"
+                )
             if actual == "exl3_mul1":
                 resolved = exl3_matrix_source(store, prefix, shape)
+            elif actual == "modelopt_nvfp4":
+                resolved = nvfp4_source(store, prefix, shape)
+            elif actual == "modelopt_fp8":
+                resolved = fp8_tensor_source(store, prefix, shape)
             elif actual is None:
                 resolved = tensor_source(store, name, shape)
             else:

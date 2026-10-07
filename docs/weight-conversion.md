@@ -69,6 +69,13 @@ These names select conversion choices. Runtime execution is selected from the ar
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
 
+`qwen3_6_35b_a3b_nvfp4` accepts either expert layout: the compressed-tensors spelling
+(`weight_packed`/`weight_global_scale`) or the NVIDIA ModelOpt spelling
+(`weight`/`weight_scale`/`weight_scale_2`/`input_scale`). The same checkpoint directory can be
+passed as both `--model` and the `quantized` source, in which case the NVFP4 experts, the per-tensor
+FP8 projections and the packed vocabulary head are all read from it. The NVFP4 sparse-MoE route
+requires `AllowA4` on every expert input, so the imported input divisors are part of the model.
+
 `qwen3_8_flash_next_nvfp4` converts Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) directly from
 [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4). Each
 layer's routed experts are stored expert-major so that one expert is a few contiguous spans, and
