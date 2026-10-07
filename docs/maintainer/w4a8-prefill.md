@@ -1,7 +1,8 @@
 # W4A8 prefill for groupwise-int (active work)
 
-Status: **active**. M1 (feasibility) complete; M2 (production int8 route) not started. This records
-the measured evidence and the plan so the numbers are not re-derived. Remove or fold into
+Status: **active**. M1 (feasibility) complete. A groupwise Q4-A8 SwiGLU prototype is correct but
+does **not yet beat** the bf16 route (see below); M2 (production int8 route) is not started. This
+records the measured evidence and the plan so the numbers are not re-derived. Remove or fold into
 [op development](op-development.md) / [engine architecture](engine-architecture.md) when the route
 lands.
 
@@ -16,11 +17,19 @@ scheduling headroom left in the Q4/Q5 A16 kernels:
 | cuBLAS bf16 (same shape) | 237.7 | 256.5 |
 | **int8 (cuBLAS, same shape)** | **830.3** | **909.0** |
 | hand-written wmma int8 prototype | 217.5 | 241.9 |
-| **hand-written raw `mma.s8` prototype (correct)** | **397.5** | **420.9** |
+| hand-written raw `mma.s8` prototype (correct) | **397.5** | **420.9** |
+| groupwise Q4-A8 SwiGLU prototype (correct) | 145.7 | 142.2 |
 
 int8 is ~3.5-4× bf16 in hardware, but `wmma::mma_sync` (m16n16k16) does not reach it. A raw
 `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` kernel with `cp.async` staging reaches ~2× the
-bf16 route (~0.5x cuBLAS), and correctness is verified against a CPU oracle (all-ones -> K).
+bf16 route (~0.5x cuBLAS), verified against a CPU oracle.
+
+However the **groupwise Q4-A8 SwiGLU prototype lags the bf16 route** (146 vs 205): the 64-K group
+tile, three staging streams (activation + gate + up), dual accumulators, and per-group scaling cost
+more than the int8 MMA saves. The plain int8 GEMM reaching 397 shows the ~2× is achievable in
+principle, but the groupwise SwiGLU needs the production structure (interleaved gate/up rows in one
+accumulator, larger K tiles with an inner per-group scale) plus a deeper pipeline. That is the M2
+work, and it is not guaranteed.
 
 ## Design
 
@@ -33,7 +42,8 @@ route adds:
 - **Activations**: per-token absmax int8 quantization in-kernel with a per-token scale.
 - **Groupwise scale (the crux)**: unlike FP8's per-row weight scale, Q4 scales vary per K-group-64.
   Accumulate a group into a temp int fragment, then `total += (w_group_scale x a_token_scale) *
-  group_acc`. ~1.5-3% extra FMA, negligible vs the 2x MMA.
+  group_acc`. The prototype shows the naive form is expensive (it forces a 64-K tile and dual
+  accumulators), so the production kernel must amortize it over a larger K tile.
 - **Epilogue**: existing SwiGLU epilogue after dequant.
 
 ## Milestones
