@@ -16,6 +16,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Sample disjoint EXL3 traces through `ninfer-serve` | [`exl3/sample_traces.py`](exl3/sample_traces.py) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Optimize a model's configuration for a use case | [`optimizer/`](optimizer/); [guide](../docs/optimizer.md) |
 | Swap an artifact's trailing chat-template resource without reconverting | [`artifact/replace_resource.py`](artifact/replace_resource.py); [usage](#artifact-workflow) |
 | Enable a route on an already-downloaded artifact (`activation_policy` metadata only) | [`artifact/set_activation_policy.py`](artifact/set_activation_policy.py); [usage](#artifact-workflow) |
 | Attach a donor's DFlash2 component to a v3 artifact without requantizing | [`artifact/attach_dflash2.py`](artifact/attach_dflash2.py); [guide](../docs/weight-conversion.md#attach-an-existing-dflash2-component) |
