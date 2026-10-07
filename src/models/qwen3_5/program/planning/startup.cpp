@@ -275,6 +275,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 "DFlash pending target features");
         }
     }
+    if (plan.speculative_backend == SpeculativeBackend::Eagle3) {
+        const auto* draft =
+            parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
+        if (draft == nullptr || !draft->eagle3) {
+            throw std::logic_error("EAGLE3 prefill requires the EAGLE3 draft config");
+        }
+        Eagle3PrefillLayout& eagle3 = out.eagle3.emplace();
+        eagle3.features =
+            add_tensor(builder, DType::BF16,
+                       {static_cast<std::int32_t>(draft->eagle3->fused_input_size()),
+                        effective_prefill_chunk},
+                       "EAGLE3 prefill target features");
+        eagle3.positions = add_tensor(builder, DType::I32, {effective_prefill_chunk},
+                                      "EAGLE3 prefill target positions");
+    }
 
     out.round = qwen3_5::begin_round_state_layout(
         builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.residual_width()),

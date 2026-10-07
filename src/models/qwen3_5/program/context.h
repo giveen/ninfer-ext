@@ -26,6 +26,7 @@ namespace ninfer::models::qwen3_5::execution {
 
 using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
+using detail::Eagle3PrefillState;
 using qwen3_5::PromptModality;
 
 struct ExecutionCore {
@@ -48,6 +49,9 @@ struct PrefillContext {
     const qwen3_5::PagedKVCache& text_cache;
     const qwen3_5::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
+    Eagle3PrefillState* eagle3;
+    qwen3_5::PagedKVCacheView eagle3_kv;
+    const qwen3_5::PagedKVCache* eagle3_cache;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;

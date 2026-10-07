@@ -364,7 +364,9 @@ def draft_eagle3_config(raw: dict, target: dict) -> dict:
     layers = target["num_hidden_layers"]
     if layers < 4:
         raise ValueError("eagle3 target has too few layers")
-    result["target_layer_ids"] = [1, layers // 2, layers - 4]
+    # SpecForge fuses layers [1, num_layers//2 - 1, num_layers - 4] (see
+    # `set_aux_hidden_states_layers` in specforge/modeling/target/eagle3_target_model.py).
+    result["target_layer_ids"] = [1, layers // 2 - 1, layers - 4]
     result["target_hidden_size"] = _positive(
         raw.get("target_hidden_size", target["hidden_size"]), "eagle3.target_hidden_size"
     )
@@ -1017,8 +1019,15 @@ class _Builder:
             (config["draft_vocab_size"], h),
             inputs=("eagle3/final_hidden",),
         )
-        # The draft-to-target token-id map is an integer table, not a quantized weight.
-        d2t = store.read_flat("d2t").to(torch.int32)
+        # The head stores d2t as an offset from the draft index; store the absolute target id so the
+        # runtime remap is a plain table lookup (matching llama.cpp's GGUF converter).
+        d2t = store.read_flat("d2t").to(torch.int64)
+        d2t = d2t + torch.arange(d2t.numel(), dtype=torch.int64)
+        if int(d2t.min()) < 0 or int(d2t.max()) >= int(target["vocab_size"]):
+            raise ValueError("eagle3 d2t target ids fall outside the target vocabulary")
+        if int(torch.unique(d2t).numel()) != int(d2t.numel()):
+            raise ValueError("eagle3 d2t contains duplicate target ids")
+        d2t = d2t.to(torch.int32)
         self.model.add(
             Parameter(
                 "eagle3/d2t",

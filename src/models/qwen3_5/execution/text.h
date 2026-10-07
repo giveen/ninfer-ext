@@ -128,6 +128,17 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // EAGLE3 prefill: the sequence's draft KV execution view, read while the draft layer appends.
+    void set_eagle3_prefill_kv(qwen3_5::PagedKVCacheView kv) noexcept { eagle3_kv_ = kv; }
+
+    // EAGLE3 prefill: the persistent feature buffer the target capture writes and the draft reads.
+    void set_eagle3_prefill_features(const Tensor* features) noexcept {
+        eagle3_prefill_features_ = features;
+    }
+
+    // EAGLE3 prefill: the draft KV execution-table row the draft attention addresses.
+    void set_eagle3_kv_table_row(std::int32_t row) noexcept { eagle3_kv_table_row_ = row; }
+
     void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
 
     // Width of the continuation hidden this context reads and writes (the wide HC residual for
@@ -219,6 +230,10 @@ public:
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
+    }
+
+    [[nodiscard]] bool eagle3_enabled() const noexcept {
+        return eagle3_kv_.valid() || batch_eagle3_kv_ != nullptr;
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
@@ -324,6 +339,8 @@ private:
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
     qwen3_5::PagedKVCacheView eagle3_kv_;
+    const Tensor* eagle3_prefill_features_ = nullptr;
+    std::int32_t eagle3_kv_table_row_       = 0;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
     qwen3_5::KVHostStaging* mtp_kv_staging_  = nullptr;

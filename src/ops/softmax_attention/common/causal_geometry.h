@@ -12,4 +12,6 @@ struct CausalGeometry : AttentionHeadMapping<QueryHeads, KVHeads> {
 
 using CausalD256H24Kv4 = CausalGeometry<256, 24, 4>;
 using CausalD256H16Kv2 = CausalGeometry<256, 16, 2>;
+// EAGLE3 draft: multi-head attention (one query head per KV head).
+using CausalD256H16Kv16 = CausalGeometry<256, 16, 16>;
 } // namespace ninfer::ops::detail

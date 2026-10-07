@@ -52,6 +52,14 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 2560, select_q8_qwen4_exp},
     ShapeEntry{2560, 4608, select_q8_qwen4_exp},
     ShapeEntry{96, 2560, select_q8_qwen4_exp},
+    // EAGLE3 draft: attention q/k/v (4096,4096), MLP gate/up (16384,2048), feature projection
+    // (2048,6144), MLP down (2048,16384) and the draft head (32000,2048).
+    ShapeEntry{4096, 4096, select_q8_generic},
+    ShapeEntry{16384, 2048, select_q8_generic},
+    ShapeEntry{2048, 6144, select_q8_generic},
+    // The converter pads the draft head's 32000 rows to 32768.
+    ShapeEntry{32768, 2048, select_q8_generic},
+    ShapeEntry{32000, 2048, select_q8_generic},
 };
 } // namespace
 
@@ -60,7 +68,8 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q8 linear: unsupported shape");
+    throw std::invalid_argument("q8 linear: unsupported shape N=" + std::to_string(n) +
+                                " K=" + std::to_string(k) + " T=" + std::to_string(t));
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

@@ -134,19 +134,21 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     const auto i32            = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    if (layout.spec.backend == SpeculativeBackend::Mtp ||
-        layout.spec.backend == SpeculativeBackend::Eagle3) {
+    if (layout.spec.backend == SpeculativeBackend::Mtp) {
         layout.mtp.emplace();
-        const auto ar_steps =
-            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
-                        "RoundState MTP AR steps exceed int32");
         layout.mtp->position         = i32(1, "MTP prefill autoregressive position");
         layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
                                                   "MTP prefill autoregressive hidden");
         layout.mtp->draft_tokens     = i32(drafts, "MTP prefill draft tokens");
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
         layout.mtp->target_positions = i32(columns, "MTP prefill target positions");
-
+    }
+    // EAGLE3 reuses the MTP decode frame (its round is MTP-shaped) without the MTP prefill state.
+    if (layout.spec.backend == SpeculativeBackend::Mtp ||
+        layout.spec.backend == SpeculativeBackend::Eagle3) {
+        const auto ar_steps =
+            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
+                        "RoundState MTP AR steps exceed int32");
         layout.mtp_decode.emplace();
         MtpDecodeStateLayout& decode = *layout.mtp_decode;
         decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, "MTP decode ingress");

@@ -273,7 +273,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     const std::uint32_t main_window_tokens = std::max(leased_output_tokens, draft_window + 1U);
     base->text_kv_page_entitlement       = kv_pages_for_tokens(std::min(
         capacity, base->summary.prompt_tokens + main_window_tokens - 1U));
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
         const std::uint32_t backend_window_tokens =
             std::max(leased_output_tokens,
                      draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts));
@@ -724,8 +725,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     }
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     plan->summary.prefix_reuse_path      = plan->reuse;
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
         if (plan->reuse == ReusePath::Root) {
+            plan->prepare_mtp = true;
+        } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+            // EAGLE3 keeps the reused prefix's draft KV and rebuilds only the suffix's.
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::PrivateEndpoint) {
             plan->prepare_mtp = true;

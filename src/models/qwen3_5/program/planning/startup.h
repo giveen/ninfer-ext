@@ -56,6 +56,13 @@ struct DFlashPersistentLayout {
     }
 };
 
+// EAGLE3 prefill: the three concatenated target layers captured over one prefill chunk and their
+// positions, consumed in the same chunk to build the draft KV.
+struct Eagle3PrefillLayout {
+    TensorLayout features;
+    TensorLayout positions;
+};
+
 // Qwen4Exp Program resources: the routed-expert cache, the prefill layer bank and PLE buffers.
 struct Qwen4PersistentLayout {
     TensorLayout slot_of;  // I32 [cache_layers * experts]
@@ -85,6 +92,7 @@ struct PersistentLayout {
     qwen3_5::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<Eagle3PrefillLayout> eagle3;
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;

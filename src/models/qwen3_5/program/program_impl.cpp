@@ -69,7 +69,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
-      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp
+      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp ||
+                       plan.speculative_backend == SpeculativeBackend::Eagle3
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::MtpDecodeIngress) +
                                                           sizeof(qwen3_5::MtpDecodeEgress))
                    : std::nullopt),
@@ -193,6 +194,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
+    }
+    if (plan.persistent.eagle3) { eagle3_prefill.emplace(backing, *plan.persistent.eagle3); }
+    if (eagle3_prefill.has_value() !=
+        (speculative_backend == SpeculativeBackend::Eagle3)) {
+        throw std::logic_error("EAGLE3 prefill state does not match the sequence plan");
     }
     if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
         backend_host_kv_page_stride =
@@ -521,6 +527,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 {},
                 decoder->text_kv,
                 nullptr,
+                nullptr,
+                nullptr,
+                {},
                 nullptr,
                 cursor,
                 nullptr,

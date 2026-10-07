@@ -32,7 +32,8 @@ constexpr std::int32_t kMaximumBatchSize    = 8;
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 16 && geometry.kv_heads == 16))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -281,7 +282,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     }
 
     if (cache_storage == KvCacheStorage::BFloat16)
-        return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+        return detail::bf16_kv_workspace_bytes(q_heads, geometry.kv_heads, batch_size, min_width,
+                                               max_width, envelope,
                                                execution.multiprocessor_count);
 
     if (cache_storage == KvCacheStorage::Fp8E4M3Row256)

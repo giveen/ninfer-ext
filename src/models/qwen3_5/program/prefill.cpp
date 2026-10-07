@@ -48,6 +48,21 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         });
 }
 
+DFlashFeatureSink make_eagle3_prefill_sink(PrefillContext& state) {
+    if (state.eagle3 == nullptr) {
+        throw std::logic_error("EAGLE3 prefill state is unavailable");
+    }
+    const auto& config = *state.execution.parameters.model.config().draft;
+    return DFlashFeatureSink{
+        .features  = &state.eagle3->features,
+        .positions = &state.eagle3->positions,
+        .layers    = std::span<const std::uint32_t>(config.target_layer_ids),
+        // The EAGLE3 draft runs inside the chunk that captures the features, so the sink has
+        // nothing to consume afterwards.
+        .consume_prefill = [](const Tensor&, const Tensor&, bool) {},
+    };
+}
+
 } // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -74,9 +89,13 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.eagle3_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_eagle3_prefill_kv(state.eagle3_kv);
+    card.set_eagle3_kv_table_row(state.dflash_kv_table_row);
+    if (state.eagle3 != nullptr) { card.set_eagle3_prefill_features(&state.eagle3->features); }
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -85,6 +104,11 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  rope_delta, sink);
+    }
+    if (state.eagle3 != nullptr) {
+        DFlashFeatureSink sink = make_eagle3_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   rope_delta, sink);
     }
@@ -100,9 +124,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.eagle3_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_eagle3_prefill_kv(state.eagle3_kv);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -110,6 +136,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_mtp_kv_staging(state.mtp_kv_staging);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
+                                  finalize_at_end, sink);
+    }
+    if (state.eagle3 != nullptr) {
+        DFlashFeatureSink sink = make_eagle3_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);
     }
@@ -667,7 +698,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
-            speculative_backend == SpeculativeBackend::Mtp
+            speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
@@ -1068,6 +1100,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
+            eagle3_prefill ? &*eagle3_prefill : nullptr,
+            eagle3_kv_view(sequence),
+            decoder->eagle3_cache(),
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),

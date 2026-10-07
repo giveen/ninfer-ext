@@ -9,15 +9,16 @@ namespace {
 constexpr int kGroupedPrefillMaxWidth = 256;
 } // namespace
 
-Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
+Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int kv_heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope,
                                           int multiprocessor_count) {
-    if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
-        batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+    if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || kv_heads < 1 ||
+        kv_heads > heads || heads % kv_heads != 0 || width < 1 || batch < 1 || batch > 8 ||
+        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("BF16 attention: invalid plan inputs");
-    const int kv_heads = heads == 24 ? 4 : 2, group = heads / kv_heads;
+    const int group = heads / kv_heads;
     const auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
     const int visible   = envelope.max_visible_keys;
     if (width > kGroupedPrefillMaxWidth) {
@@ -53,13 +54,14 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
     return {instance, partition, heads, width, batch, envelope};
 }
 
-std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
-                                    CausalAttentionExecutionEnvelope envelope,
+std::size_t bf16_kv_workspace_bytes(int heads, int kv_heads, int batch, int min_width,
+                                    int max_width, CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count) {
     std::size_t maximum = 0;
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
-            make_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+            make_bf16_kv_causal_plan(heads, kv_heads, width, batch, envelope,
+                                     multiprocessor_count);
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, plan.partition.capacity, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
