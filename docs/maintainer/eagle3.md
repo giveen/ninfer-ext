@@ -32,7 +32,7 @@ for Qwen3.5-35B-A3B.
 | Draft hidden / intermediate | 2048 / 16384 |
 | Q heads / KV heads / head dimension | 16 / 16 / 256 |
 | Attention input width (`2·H`) | 4096 |
-| Target layers fused | 3 (see Open questions) |
+| Target layers fused | 3: `1`, `num_layers//2`, `num_layers-4` → `[1, 20, 36]` for the 40-layer target |
 | Draft vocabulary | 32,000 (target 248,320) |
 | Norm epsilon / RoPE theta | `1e-6` / `1e7` |
 | `norm_before_residual` / `norm_before_fc` | false / false |
@@ -145,9 +145,11 @@ Phased, each phase independently verifiable:
 
 ## Open questions
 
-- **Target layers are undeclared** in the SpecForge `config.json` (no `eagle_aux_hidden_state_layer_ids`).
-  The reference derives `[2, n/2, n-3]`; if SpecForge trained on a different set the acceptance drops.
-  Phase 1 recovers the real IDs from `training_state.pt` rather than guessing.
+- **Target layers.** SpecForge does not store them in the exported `config.json`; it fuses layer
+  `1`, `num_layers//2` and `num_layers-4` (its `OnlineEagle3Model` docstring), which is `[1, 20, 36]`
+  for the 40-layer target. This differs from the llama.cpp reference's fallback `[2, n/2, n-3]`, so the
+  converter must record the SpecForge rule, not the fallback. The head is trained against those three
+  layers; a mismatch degrades acceptance.
 - **Target version.** The head targets Qwen3.5-35B-A3B; the shipped artifact is Qwen3.6-35B-A3B. Both
   are `qwen3_5_moe`, but the hidden states must be confirmed compatible before acceptance is trusted.
 - **Quantized target.** As with DFlash, the target's quantized hidden states condition the draft, so
