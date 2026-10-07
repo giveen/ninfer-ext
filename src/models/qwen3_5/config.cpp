@@ -418,9 +418,9 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 // reads are not exported; SpecForge fuses layer 1, num_layers/2 and num_layers-4.
 DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
     require_members(value,
-                    {"architectures", "intermediate_size", "num_attention_heads",
-                     "num_key_value_heads", "head_dim", "num_hidden_layers", "rms_norm_eps",
-                     "rope_theta", "draft_vocab_size"},
+                    {"architectures", "model_type", "hidden_size", "intermediate_size",
+                     "num_attention_heads", "num_key_value_heads", "head_dim", "num_hidden_layers",
+                     "rms_norm_eps", "rope_theta", "draft_vocab_size", "target_layer_ids"},
                     {"max_position_embeddings", "norm_before_residual", "norm_before_fc",
                      "target_hidden_size"},
                     "EAGLE3 draft config");
@@ -441,9 +441,17 @@ DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
     if (out.num_hidden_layers != 1U) {
         throw ArtifactError("EAGLE3 draft must have exactly one decoder layer");
     }
-    const std::uint32_t layers = target.num_hidden_layers;
-    if (layers < 4U) { throw ArtifactError("EAGLE3 target has too few layers"); }
-    out.target_layer_ids = {1U, layers / 2U, layers - 4U};
+    const auto& taps = value.at("target_layer_ids");
+    if (!taps.is_array() || taps.size() != 3U) {
+        throw ArtifactError("EAGLE3 needs exactly three target layers");
+    }
+    for (const auto& tap : taps) {
+        const auto index = integer(tap, "EAGLE3 target layer", false);
+        if (index >= target.num_hidden_layers) {
+            throw ArtifactError("EAGLE3 target layer is out of range");
+        }
+        out.target_layer_ids.push_back(index);
+    }
 
     Eagle3Config eagle;
     eagle.target_hidden_size = value.contains("target_hidden_size")

@@ -109,6 +109,7 @@ struct DynamicConvWeights {
 
 struct DraftBlockWeights {
     WeightId input_norm, post_attention_norm;
+    WeightId hidden_norm; // EAGLE3 fused-feature norm (attn_norm_2); unused by DFlash
     DraftAttentionWeights attention;
     DenseWeights mlp;
     std::optional<DynamicConvWeights> attention_conv, mlp_conv;
@@ -124,6 +125,7 @@ struct DraftWeights {
     std::optional<SelectorWeights> selector;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
+    WeightId d2t; // EAGLE3 draft-to-target token-id map; unused by DFlash
 };
 
 struct ProposalWeights {

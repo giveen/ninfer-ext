@@ -4,6 +4,7 @@ namespace ninfer::models::qwen3_5::loading {
 
 DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig& target,
                         const TextWeights& weights, const std::string& component) {
+    if (config.eagle3) { return bind_eagle3(b, config, target, weights, component); }
     const auto h = target.hidden_size;
     const auto q = config.attention.query_width();
     const auto k = config.attention.key_width();

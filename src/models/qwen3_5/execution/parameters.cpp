@@ -238,6 +238,9 @@ public:
     }
 
     DraftParameters draft(const DraftWeights& w) const {
+        if (model_.config().draft && model_.config().draft->eagle3) {
+            throw std::logic_error("EAGLE3 draft execution is not implemented yet");
+        }
         DraftParameters out;
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
