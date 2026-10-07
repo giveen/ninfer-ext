@@ -1,10 +1,34 @@
 # W4A8 prefill for groupwise-int (active work)
 
-Status: **active**. M1 (feasibility) is complete. A correct groupwise Q4-A8 SwiGLU prototype now
-**beats** the bf16 route on realistic data by ~1.2-1.4x; M2 (production int8 route) is not started.
-This records the measured evidence and the design so the numbers are not re-derived. Remove or fold
-into [op development](op-development.md) / [engine architecture](engine-architecture.md) when the
-route lands.
+Status: **active**. M1 (feasibility) and M2 (the production Q4 W4A8 `linear_swiglu` route) are
+implemented and oracle-tested. In the engine the route is a modest win over A16 (1.03-1.09x); a
+prototype of the same kernel reaches ~1.2x, so a gap remains. This records the measured evidence,
+the design, and the remaining gap so the numbers are not re-derived. Remove or fold into
+[op development](op-development.md) / [engine architecture](engine-architecture.md) when the route
+is fully characterized.
+
+## In-engine result (M2, `ninfer_q4_linear_swiglu_bench --policy a8`)
+
+| `[34816,5120] x [5120,T]` | T=2048 | T=4096 | T=8192 |
+|---|---:|---:|---:|
+| A16 (`--policy a16`) | 202.5 | 176.1 | 174.4 TFLOP/s |
+| **W4A8 (`--policy a8`)** | **208.7** | **192.4** | **187.1** |
+| ratio | 1.03x | 1.09x | 1.07x |
+
+The standalone prototype of the same kernel reaches ~242 TFLOP/s, so ~15-25% is lost inside the
+engine. Profiling shows the in-engine kernel is L2-throughput bound (~93%) at a lower SM clock
+(2.41 vs 2.67 GHz) and ~25% more elapsed cycles; the cause is not yet isolated. This is the open
+work before the route is worth enabling by default.
+
+## Enabling it (no reconversion)
+
+The W4A8 route consumes the **same** stored Q4 codes and fp16 group scales as A16, so the artifact
+payload is unchanged. Only the per-use `activation_policy` metadata differs. The groupwise artifact
+currently declares `A16Only` for every use (the `recipe.py` default, which `_dense_groupwise` never
+overrode), so the route is unreachable until the artifact declares `AllowA8` for the gate/up
+projections. `_dense_groupwise` now sets `activation_policy="AllowA8"` for the Q4 gate/up; because
+`"A16Only"` and `"AllowA8"` are both 7 bytes, an existing artifact can be enabled by rewriting that
+schema field in place - no re-quantization from tensors is required.
 
 ## Why
 

@@ -238,7 +238,9 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A4) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
-        (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
+        (q4 && profile.activation_compute != ActivationCompute::A16 &&
+         profile.activation_compute != ActivationCompute::A8) ||
+        (!nvfp4 && !fp8 && !q4 && profile.activation_compute != ActivationCompute::A16)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }

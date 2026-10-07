@@ -22,9 +22,15 @@ FP8 = "fp8_e4m3fn_row_bf16"
 Q4ROWS = "q4_g32_fp16_rows"
 
 
-def _assign(recipe, name, format, *, source=None):
+def _assign(recipe, name, format, *, source=None, activation_policy=None):
     method = grouped_absmax if format in (Q4, Q5, Q6, Q8) else cast_direct
-    recipe.assign(name, format=format, method=method, source=source)
+    recipe.assign(
+        name,
+        format=format,
+        method=method,
+        source=source,
+        activation_policy=activation_policy,
+    )
 
 
 def _optional(model, recipe):
@@ -78,8 +84,16 @@ def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4):
             recipe.separate(name)
             continue
         if name.endswith(("/mlp/gate", "/mlp/up")):
-            format = gate_up
-        elif name.endswith(
+            # The fused gate/up projection has a Q4 W4A8 route, so the prefill-heavy
+            # activation is allowed to run int8; the other projections keep A16.
+            _assign(
+                recipe,
+                name,
+                gate_up,
+                activation_policy="AllowA8" if gate_up == Q4 else None,
+            )
+            continue
+        if name.endswith(
             (
                 "/attention/query",
                 "/attention/key",
