@@ -201,12 +201,22 @@ public:
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 
     // EAGLE3 draft: fuse the three captured target layers into the draft-width feature g.
-    void eagle3_encode(const Tensor& features, Tensor& g);
+    void eagle3_encode_batch(const Tensor& features, Tensor& g);
     // EAGLE3 decoder step: the pair (token embedding, g) through the one decoder layer produces the
     // draft pre-norm hidden (the next step's g) and the draft-vocabulary logits.
-    void eagle3_forward_ar_step(const Tensor& token, const Tensor& g, const Tensor& position,
-                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                Tensor& logits);
+    void eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g,
+                                     const Tensor& cache_positions, const Tensor& rope_positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                                     Tensor& logits);
+    // EAGLE3 draft proposal: the draft-vocabulary head, then the draft-to-target token-id map.
+    void eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    void set_eagle3_head(const LinearParameters* head, const std::int32_t* d2t,
+                         int draft_vocab) noexcept {
+        eagle3_head_        = head;
+        eagle3_d2t_         = d2t;
+        eagle3_draft_vocab_ = draft_vocab;
+    }
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
@@ -321,6 +331,9 @@ private:
     qwen3_5::QsaIndexMirrors qsa_index_mirrors_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
     const qwen3_5::PagedKVCache* batch_eagle3_kv_ = nullptr;
+    const LinearParameters* eagle3_head_    = nullptr;
+    const std::int32_t* eagle3_d2t_         = nullptr;
+    int eagle3_draft_vocab_                 = 0;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
