@@ -140,7 +140,8 @@ def _spec_levels(model: ModelInfo, options: FactorOptions) -> tuple[str, ...]:
     ):
         if present:
             levels.append(backend)
-            levels.append(f"{backend}+head")
+            if model.has_proposal_head:
+                levels.append(f"{backend}+head")
     return tuple(levels)
 
 

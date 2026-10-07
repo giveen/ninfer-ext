@@ -109,6 +109,7 @@ class ModelInfo:
     has_vision: bool
     weight_bytes: int
     native_context: int = 32768
+    has_proposal_head: bool = False
     components: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -124,6 +125,7 @@ def detect_model(path: str | Path) -> ModelInfo:
             raise ValueError(f"{path}: artifact has no text component")
         config = directory.components["text"]["config"]
         weight_bytes = sum(obj.bytes for obj in directory.objects)
+        has_proposal_head = "proposal/head" in directory.bindings
     layer_types = config.get("layer_types", [])
     num_layers = config.get("num_hidden_layers") or len(layer_types)
     is_moe = "num_experts" in config
@@ -141,5 +143,6 @@ def detect_model(path: str | Path) -> ModelInfo:
         has_vision="vision" in components,
         weight_bytes=weight_bytes,
         native_context=int(config.get("max_position_embeddings", 32768) or 32768),
+        has_proposal_head=has_proposal_head,
         components=components,
     )

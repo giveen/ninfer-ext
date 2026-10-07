@@ -143,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--use-case", default="chat", choices=sorted(USE_CASES))
     parser.add_argument("--objective", default=None, choices=["tg", "pp", "eff", "ttft"],
                         help="override the runbook's objective")
+    parser.add_argument("--concurrency", type=int, default=None,
+                        help="override the runbook's concurrency (server-driven use cases)")
     parser.add_argument("--list-use-cases", action="store_true")
     parser.add_argument("--run", action="store_true", help="execute the sweep (uses the GPU)")
     parser.add_argument("--screen", nargs="?", type=int, const=3, default=None,
@@ -164,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--factor", action="append", default=[], metavar="NAME=LEVELS",
                         help="override a factor's levels, repeatable")
     parser.add_argument("--ctx-size", type=int, default=None, help="pin the context depth")
+    parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                        help="pin an option in every configuration, repeatable "
+                             "(e.g. --set kv_capacity=524288 --set expert_cache=auto)")
     parser.add_argument("--output-dir", type=Path, default=Path("profiles/optimizer"))
     parser.add_argument("--html", type=Path, default=None, help="write a self-contained HTML report")
     parser.add_argument("--save-profile", type=Path, default=None,
@@ -188,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
     case = use_case(args.use_case)
     if args.objective is not None:
         case = replace(case, objective=args.objective)
+    if args.concurrency is not None:
+        case = replace(case, concurrency=args.concurrency)
     hardware = detect_hardware()
     try:
         model = detect_model(args.artifact)
@@ -195,21 +202,28 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"cannot read artifact: {error}")
 
     overrides = _parse_factor_overrides(args.factor)
-    options = FactorOptions(
-        min_kv=args.min_kv,
-        extra={k: v for k, v in overrides.items()},
-    )
-    factors = build_factors(case, model, hardware, options)
-    # Apply explicit overrides to factors the runbook already defines.
+    factors = build_factors(case, model, hardware, FactorOptions(min_kv=args.min_kv))
+    # Explicit --factor overrides replace a runbook factor's levels, or add a new factor.
+    known = {f.name for f in factors}
     factors = [Factor(f.name, overrides.get(f.name, f.levels), f.help) for f in factors]
-    for name in overrides:
-        if name not in {f.name for f in factors}:
-            factors.append(Factor(name, overrides[name]))
+    for name, levels in overrides.items():
+        if name not in known:
+            factors.append(Factor(name, levels))
 
     pinned: dict[str, str] = {}
+    for item in args.set:
+        name, _, value = item.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name or not value:
+            parser.error(f"--set must be NAME=VALUE, got {item!r}")
+        try:
+            Setting({name: value}).render_serve()  # validates the option name
+        except ValueError as error:
+            parser.error(str(error))
+        pinned[name] = value
     if args.ctx_size is not None:
-        factors = [f for f in factors if f.name != "ctx"]
         pinned["ctx"] = str(args.ctx_size)
+    factors = [f for f in factors if f.name not in pinned]
 
     if not factors:
         parser.error("no factors to sweep; the runbook and overrides left nothing to vary")

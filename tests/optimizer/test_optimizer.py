@@ -39,6 +39,7 @@ def _model(**overrides) -> ModelInfo:
         has_vision=False,
         weight_bytes=1 << 30,
         native_context=32768,
+        has_proposal_head=True,
         components=("text", "mtp", "dflash2"),
     )
     base.update(overrides)
