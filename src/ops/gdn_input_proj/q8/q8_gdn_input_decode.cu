@@ -75,7 +75,7 @@ void q8_gdn_input_decode_conv_snapshot_launch(
                            snapshot_base_slot, query, key, value),
         static_cast<__nv_bfloat16*>(z.data),
     };
-    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
+    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 4, 2048>>(
         q8_linear_operands(x, weight), ignored_output, epilogue, stream);
     CUDA_CHECK(cudaGetLastError());
 }
