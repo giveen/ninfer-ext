@@ -1,39 +1,59 @@
 # W4A8 prefill for groupwise-int (active work)
 
 Status: **active**. M1 (feasibility) and M2 (the production Q4 W4A8 `linear_swiglu` route) are
-implemented and oracle-tested. In the engine the route is a modest win over A16 (1.03-1.09x); a
-prototype of the same kernel reaches ~1.2x, so a gap remains. This records the measured evidence,
-the design, and the remaining gap so the numbers are not re-derived. Remove or fold into
-[op development](op-development.md) / [engine architecture](engine-architecture.md) when the route
-is fully characterized.
+complete: the route is implemented, FP64-oracle-tested, enabled on the `qwen3_8_27b` artifact, and
+measured end-to-end. It runs ~1.6-1.7x the A16 route at the op and ~1.16x on a 1410-token prefill.
+M3 (Q5/Q6 and `linear`/`linear_add`) and the remaining M4 work are open. This records the measured
+evidence, the design, and the open work. Remove or fold into [op development](op-development.md) /
+[engine architecture](engine-architecture.md) when the route is fully characterized.
 
-## In-engine result (M2, `ninfer_q4_linear_swiglu_bench --policy a8`)
+## Result
 
-| `[34816,5120] x [5120,T]` | T=2048 | T=4096 | T=8192 |
+### Op (`ninfer_q4_linear_swiglu_bench`), `[34816,5120] x [5120,T]`
+
+Realistic data, 256 MB L2 flush (`flush_bytes=268435456`), three interleaved A16/A8 passes (median):
+
+| policy | T=2048 | T=4096 | T=8192 |
 |---|---:|---:|---:|
-| A16 (`--policy a16`) | 202.5 | 176.1 | 174.4 TFLOP/s |
-| **W4A8 (`--policy a8`)** | **208.7** | **192.4** | **187.1** |
-| ratio | 1.03x | 1.09x | 1.07x |
+| A16 (`--policy a16`) | 203.1 | 179.9 | 175.2 TFLOP/s |
+| **W4A8 (`--policy a8`)** | **324.7** | **310.7** | **288.6** |
+| ratio | 1.60x | 1.73x | 1.65x |
 
-### The prototype's ~242 is a boost artifact, not a lost 20%
+### End-to-end prefill
 
-A standalone prototype of the same kernel reaches ~242 TFLOP/s, but under a sustained load it is
-running at ~3.0 GHz / 140 W while the engine benchmark saturates the board at 475 W. Both engine
-routes hit that 475 W limit, and int8 draws more power per cycle, so W4A8 sustains ~2.0 GHz against
-A16's ~2.42 GHz. The int8 tensor-rate advantage is therefore largely spent on the power/clock
-penalty: the win is real but power-limited (1.03-1.09x), not kernel-limited. Closing the remaining
-gap means reducing W4A8's energy per output (fewer non-MMA instructions, since ALU is +30% and LSU
-+19% against the prototype), not more tensor throughput.
+1410-token prompt, `--max-new 1 --greedy`; two interleaved passes each:
+
+| artifact policy | prefill | speed |
+|---|---:|---:|
+| A16 (785 uses `A16Only`) | 457 ms | 3.09k tok/s |
+| **A8 (130 gate/up uses `AllowA8`)** | **392 ms** | **3.60k tok/s** |
+
+End-to-end is 1.16x, not the op's 1.6-1.7x: prefill also runs attention and the other projections,
+which stay A16.
+
+## Energy per output was the remaining lever
+
+The route's first in-engine measurement was only 1.03-1.09x A16. Investigation showed the kernel was
+not tensor-throughput limited but **instruction-issue limited**: the per-group scale FMA, the
+`ldmatrix` address math, and above all the int4->int8 expansion were ~4x the MMA instruction count.
+The expansion decoded each 32-bit weight word with four scalar sign-extends; replacing it with two
+`__byte_perm` gathers plus a SWAR sign-extend (`q4a8_sext4`/`q4a8_expand4`, forcing the high bit of
+every byte before the subtract so no borrow crosses a byte) roughly halved the non-MMA ALU work and
+lifted the op from ~1.05x to the 1.6-1.7x above.
+
+The earlier note that W4A8 is "power-limited at 475 W" was incomplete: the scalar expansion was
+also drawing ALU power and blocking issue, so removing it improved both the clock and the issue
+rate. The int8 tensor advantage is now mostly realized, not spent on the clock penalty.
 
 ## Enabling it (no reconversion)
 
 The W4A8 route consumes the **same** stored Q4 codes and fp16 group scales as A16, so the artifact
 payload is unchanged. Only the per-use `activation_policy` metadata differs. The groupwise artifact
-currently declares `A16Only` for every use (the `recipe.py` default, which `_dense_groupwise` never
-overrode), so the route is unreachable until the artifact declares `AllowA8` for the gate/up
-projections. `_dense_groupwise` now sets `activation_policy="AllowA8"` for the Q4 gate/up; because
-`"A16Only"` and `"AllowA8"` are both 7 bytes, an existing artifact can be enabled by rewriting that
-schema field in place - no re-quantization from tensors is required.
+originally declared `A16Only` for every use (the `recipe.py` default, which `_dense_groupwise` never
+overrode), so the route was unreachable. `_dense_groupwise` now sets `activation_policy="AllowA8"`
+for the Q4 gate/up; because `"A16Only"` and `"AllowA8"` are both 7 bytes, the existing artifact was
+enabled by rewriting that schema field in place (130 gate/up uses to `AllowA8`, the other 655 uses
+left `A16Only`) - no re-quantization from tensors was required.
 
 ## Why
 
@@ -51,8 +71,9 @@ scheduling headroom left in the Q4/Q5 A16 kernels. int8 is ~3.5-4x bf16 in hardw
 
 `wmma::mma_sync` (m16n16k16) cannot reach the int8 rate; a raw
 `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` kernel with `cp.async` staging reaches ~2x bf16
-(~0.5x cuBLAS). The fused **groupwise** SwiGLU reaches ~1.2-1.4x bf16: the groupwise structure and
-the SwiGLU's dual gate/up stream keep a ~1.6x gap against the plain int8 GEMM.
+(~0.5x cuBLAS). The fused **groupwise** SwiGLU prototype reached ~1.2-1.4x bf16. The production
+route now exceeds that prototype (324.7/310.7 at T=2048/4096), so the prototype-vs-engine gap is
+closed.
 
 ### Measurement caveat (important)
 
@@ -62,7 +83,9 @@ use random inputs and a 256 MB L2 flush per iteration, matching
 `ninfer_q4_linear_swiglu_bench` (`flush_bytes=268435456`). Do not benchmark this route on uniform
 data.
 
-## What actually moved the prototype (145 -> 247)
+## What actually moved it
+
+Prototype, 145 -> 247 TFLOP/s:
 
 1. **Weight residency is the first-order effect.** Pre-expanding Q4 to int8 doubles the weight to
    178 MB, which does not fit the ~96 MB L2, so the weight streams from DRAM (DRAM 58%). Keeping the
@@ -77,9 +100,15 @@ data.
 5. Larger K tiles (STAGES=3), more warps per CTA, and a smaller row tile (BN=32) all *hurt*
    (redundant A `ldmatrix`, less reuse).
 
-The remaining limiter is instruction issue (tensor pipe ~29%): the per-group scale FMA, the
-`ldmatrix` address math, and the int4 expansion together are ~4x the MMA instruction count. Closing
-that is the M2 kernel work.
+Engine route, 208 -> 325 TFLOP/s (T=2048):
+
+6. **Cheap int4 decode.** Two `__byte_perm` gathers plus a SWAR sign-extend replace the four scalar
+   sign-extends per word (see "Energy per output" above).
+7. **Packed expansion stores.** The engine stage writes two `uint4` per stream, matching the
+   prototype's LSU fix; a byte-store version left LSU at 47%.
+8. **Register cap for occupancy.** `__launch_bounds__(512, 2)` admits 2 blocks/SM.
+9. **Token-major grid.** `grid.x` is the token block, `grid.y` the row block, so the active weight
+   slice stays L2-resident.
 
 ## Design
 
@@ -87,23 +116,25 @@ Reuse the FP8 A8 route as the template: the `fp8_mma_compute_stage` ldmatrix fra
 k32 8-bit operands applies unchanged to int8.
 
 - **Weights**: keep Q4 group-64 packed (int4, 89 MB); sign-extend the 4-bit codes to int8 `[-8,7]`
-  in the shared stage (packed `uint4` stores). MMA = `mma_s8` (`src/ops/common/mma.cuh`).
+  in the shared stage with `__byte_perm` + SWAR sign-extend and packed `uint4` stores. MMA =
+  `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`.
 - **Activations**: per-token absmax int8 quantization with a per-token scale.
 - **Groupwise scale**: Q4 scales vary per K-group-64, so accumulate a group into an int fragment and
   `total += (w_group_scale x a_token_scale) * group_acc`. Folding after each k32 is valid by
   linearity and shortens the accumulator live range.
-- **Tile**: 128 tokens x 64 gate rows (+64 up rows), 512 threads, `maxrregcount` ~64; token block as
-  the fast grid axis.
+- **Tile**: 128 tokens x 64 gate rows (+64 up rows), 512 threads, `__launch_bounds__(512, 2)`; token
+  block as the fast grid axis.
 - **Epilogue**: `silu(gate) * up`.
 
 ## Milestones
 
-- **M2**: production raw-`mma_s8` Q4 route for `linear_swiglu [34816,5120]` over ninfer's rowsplit Q4
-  layout; register as an A8 plan under `LinearPolicy::AllowA8`; wire the activation quant and
-  workspace; benchmark against the bf16 route on realistic data with the L2 flush.
+- **M2** (done): production raw-`mma.s8` Q4 route for `linear_swiglu [34816,5120]` over ninfer's
+  rowsplit Q4 layout; registered as an A8 plan under `LinearPolicy::AllowA8`; activation quant and
+  workspace wired; FP64-oracle qualified; artifact enabled; benchmarked against A16 on realistic
+  data with the L2 flush and end-to-end.
 - **M3**: extend to Q5/Q6 and `linear`/`linear_add`.
-- **M4**: FP64-oracle A8 qualification (per [op-development.md](op-development.md)) and end-to-end
-  prefill measurement.
+- **M4**: complete the remaining end-to-end characterization (longer prompts, other prefill chunks)
+  under [op-development.md](op-development.md).
 
 ## Alternative
 
