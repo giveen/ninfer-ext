@@ -26,9 +26,13 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     bool enable_mtp                         = false;
+    // EAGLE3 keeps its own one-layer draft KV, whose head count differs from the target's.
+    bool enable_eagle3                      = false;
+    std::int32_t eagle3_kv_heads            = 0;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    std::uint32_t eagle3_physical_page_groups = 0;
     // Qwen Sparse Attention: every attention layer also pages one indexer-key record per token.
     bool qsa_index = false;
     // KV streaming: the physical pools may be smaller than one full-capacity sequence, since
@@ -274,6 +278,7 @@ struct QsaIndexMirrors {
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
+    std::optional<PagedKVCacheLayout> eagle3_kv;
     std::optional<KVHostStagingLayout> text_kv_staging;
     // Prefill staging of the MTP layer's own cache (Qwen4Exp runs that layer over every chunk). It
     // shares the text staging buffer: the MTP layer runs after the last text layer on one stream.
@@ -290,6 +295,7 @@ struct DecoderStateLayout {
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
+    std::optional<PagedKVCache> eagle3_kv;
     std::optional<KVHostStaging> text_kv_staging;
     std::optional<KVHostStaging> mtp_kv_staging;
     std::optional<QsaIndexMirror> text_qsa_mirror;
@@ -299,6 +305,8 @@ struct DecoderState {
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;
+    [[nodiscard]] PagedKVCache* eagle3_cache() noexcept;
+    [[nodiscard]] const PagedKVCache* eagle3_cache() const noexcept;
 };
 
 } // namespace ninfer::models::qwen3_5

@@ -125,9 +125,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                   ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
+    const std::uint64_t eagle3_extra_pages =
+        plan.features.eagle3()
+            ? static_cast<std::uint64_t>(plan.max_concurrency) *
+                  ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
+                   static_cast<std::uint32_t>(kPagedKVPageSize))
+            : 0ULL;
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    const std::uint32_t eagle3_physical_pages = static_cast<std::uint32_t>(
+        checked_i32(static_cast<std::uint64_t>(physical_pages) + eagle3_extra_pages,
+                    "EAGLE3 Paged KV physical pages exceed int32"));
+    const std::int32_t eagle3_heads =
+        parameters.model.config().draft && parameters.model.config().draft->eagle3
+            ? dimension(parameters.model.config().draft->attention.num_key_value_heads)
+            : 0;
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
@@ -139,9 +152,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
+                     .enable_eagle3             = plan.features.eagle3(),
+                     .eagle3_kv_heads           = eagle3_heads,
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .eagle3_physical_page_groups = eagle3_physical_pages,
                      .qsa_index                 = config.sparse_attention.has_value(),
                      .kv_stream                 = plan.kv_stream,
                      // Every request's Device window is at least the startup minimum, so at most
