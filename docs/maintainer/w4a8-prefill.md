@@ -53,7 +53,9 @@ originally declared `A16Only` for every use (the `recipe.py` default, which `_de
 overrode), so the route was unreachable. `_dense_groupwise` now sets `activation_policy="AllowA8"`
 for the Q4 gate/up; because `"A16Only"` and `"AllowA8"` are both 7 bytes, the existing artifact was
 enabled by rewriting that schema field in place (130 gate/up uses to `AllowA8`, the other 655 uses
-left `A16Only`) - no re-quantization from tensors was required.
+left `A16Only`) - no re-quantization from tensors was required. For an already-downloaded artifact,
+[`set_activation_policy`](../../tools/artifact/set_activation_policy.py) performs that rewrite and
+writes a new file with a new `artifact_id`.
 
 ## Why
 

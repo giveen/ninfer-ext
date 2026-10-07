@@ -8,6 +8,7 @@ from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
+    qwen3_6_27b,
     qwen3_8_27b,
     qwen3_8_27b_bf16,
     qwen3_8_27b_exl3,
@@ -203,6 +204,22 @@ def test_registered_recipe_gives_the_mlp_pair_q4() -> None:
     assert _single(formats, f"{LAYER}/mlp/down") == Q5
     assert _single(formats, "text/token_embedding") == Q8
     assert _single(formats, "text/output_head") == Q8
+
+
+def test_groupwise_recipes_allow_a8_on_the_mlp_pair_only() -> None:
+    """The Q4 gate/up pair has a W4A8 prefill route; every other use stays A16Only."""
+    for recipe_function in (qwen3_6_27b, qwen3_8_27b):
+        model = _dense_model()
+        recipe = Recipe(model)
+        recipe_function(model, recipe, {})
+        assert recipe.policies[(f"{LAYER}/mlp/gate", "input")] == "AllowA8"
+        assert recipe.policies[(f"{LAYER}/mlp/up", "input")] == "AllowA8"
+        for name in (
+            f"{LAYER}/mlp/down",
+            f"{LAYER}/attention/query",
+            f"{LAYER}/attention/output",
+        ):
+            assert recipe.policies[(name, "input")] == "A16Only"
 
 
 def test_q6_recipe_moves_only_the_mlp_pair() -> None:

@@ -59,7 +59,7 @@ other references own narrower contracts:
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
-| [W4A8 prefill](maintainer/w4a8-prefill.md) | active work: measured evidence and plan for an int8 Q4 prefill route |
+| [W4A8 prefill](maintainer/w4a8-prefill.md) | active work: the landed int8 Q4 prefill route, its enablement and measured evidence |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |

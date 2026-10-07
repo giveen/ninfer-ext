@@ -233,6 +233,19 @@ shares one activation across several projections must respect the intersection o
 permissions. `recipe.use(parameter, input_name, ...)` can set one mathematical input independently;
 the names are available in `parameter.inputs`.
 
+The Qwen3.6-27B and Qwen3.8-27B groupwise-int recipes (`qwen3_6_27b`, `qwen3_8_27b`) declare
+`AllowA8` for the Q4 MLP gate/up projections, because the fused gate/up projection has a Q4 W4A8
+prefill route; the other projections stay `A16Only`. A fresh conversion therefore emits the
+permission. An artifact converted before this change, or the published upstream artifact, keeps
+`A16Only` and can be enabled without reconverting or re-downloading, since its Q4 codes and scales
+are the same as A16: [`set_activation_policy`](../tools/artifact/set_activation_policy.py) rewrites
+only the per-Use metadata.
+
+```bash
+python3 -m tools.artifact.set_activation_policy in.ninfer out.ninfer \
+  --parameter '*/mlp/gate' --parameter '*/mlp/up' --policy AllowA8
+```
+
 An NVFP4 A4 input requires a positive finite activation divisor. `import_encoded` obtains it from
 the selected source, or a recipe supplies it through
 `recipe.use(..., auxiliaries={"activation_input_divisor": value})`. Shared weights retain separate
