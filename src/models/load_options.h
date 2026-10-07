@@ -26,6 +26,10 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
+    [[nodiscard]] bool eagle3() const noexcept {
+        return speculative == SpeculativeBackend::Eagle3;
+    }
+
     [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
@@ -43,6 +47,8 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::Eagle3:
+            return "eagle3";
         }
         return {};
     }

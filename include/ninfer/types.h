@@ -118,6 +118,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    Eagle3,
 };
 
 // Prompt-lookup (suffix) draft source, shared with the MTP backend. It proposes tokens that

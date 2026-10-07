@@ -12,6 +12,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "eagle3") { return SpeculativeBackend::Eagle3; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -25,6 +26,8 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::Eagle3:
+        return "eagle3";
     }
     return "unknown";
 }
@@ -63,7 +66,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             options.fixed_draft) {
             throw std::invalid_argument(
                 "--draft-tokens, --lm-head-draft and --fixed-draft require --spec "
-                "mtp|dflash|dflash2");
+                "mtp|dflash|dflash2|eagle3");
         }
         return;
     case SpeculativeBackend::Mtp: {
@@ -92,6 +95,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        }
+        if (options.fixed_draft) {
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+        }
+        return;
+    case SpeculativeBackend::Eagle3:
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw std::invalid_argument("--spec eagle3 requires --draft-tokens in [1,15]");
         }
         if (options.fixed_draft) {
             throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
