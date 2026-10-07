@@ -103,6 +103,15 @@ Per sequence, drafting walks `K` steps:
 The anchor feature `g_P` is produced while the target performs its own forward, so the encoder output
 at the last verified position is carried as the seed.
 
+EAGLE-3 adopts EAGLE-2's **context-aware dynamic draft tree**: the tree is grown from the draft
+model's own confidence instead of being fixed in advance. The first implementation uses a top-k
+chain/tree (as in the llama.cpp reference); the dynamic tree is a later refinement.
+
+Reference: [EAGLE-3](https://arxiv.org/abs/2503.01840) §3.1 (inference pipeline) and §2.2 (the
+EAGLE-2 tree). Two points the paper leaves loose are settled by the released weights: the fused
+feature is `concat(l, m, h) -> FC -> g` (the encoder), and the decoder's `concat(embedding, g)` goes
+**straight to q/k/v** with no input projection — the checkpoint's q/k/v input is `2n`, not `n`.
+
 ## Artifact and converter
 
 The SpecForge checkpoint stores, besides `config.json`:
