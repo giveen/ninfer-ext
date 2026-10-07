@@ -18,18 +18,18 @@ scheduling headroom left in the Q4/Q5 A16 kernels:
 | **int8 (cuBLAS, same shape)** | **830.3** | **909.0** |
 | hand-written wmma int8 prototype | 217.5 | 241.9 |
 | hand-written raw `mma.s8` prototype (correct) | **397.5** | **420.9** |
-| groupwise Q4-A8 SwiGLU prototype (correct) | 145.7 | 142.2 |
+| groupwise Q4-A8 SwiGLU prototype (correct, best of several) | 178.1 | 176.3 |
 
 int8 is ~3.5-4× bf16 in hardware, but `wmma::mma_sync` (m16n16k16) does not reach it. A raw
 `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` kernel with `cp.async` staging reaches ~2× the
 bf16 route (~0.5x cuBLAS), verified against a CPU oracle.
 
-However the **groupwise Q4-A8 SwiGLU prototype lags the bf16 route** (146 vs 205): the 64-K group
-tile, three staging streams (activation + gate + up), dual accumulators, and per-group scaling cost
-more than the int8 MMA saves. The plain int8 GEMM reaching 397 shows the ~2× is achievable in
-principle, but the groupwise SwiGLU needs the production structure (interleaved gate/up rows in one
-accumulator, larger K tiles with an inner per-group scale) plus a deeper pipeline. That is the M2
-work, and it is not guaranteed.
+However the **groupwise Q4-A8 SwiGLU prototype still lags the bf16 route** (178 vs 205): staging
+the per-group weight scales in shared lifted it from 146 to 178, but the gate/up dual weight
+stream, dual group accumulators and per-group scaling retain a ~2.2x efficiency gap against the
+plain int8 GEMM (398). Reaching (~2x) needs more kernel work than was completed: a single fused
+gate/up row stream, larger K tiles with an inner per-group scale, and deeper pipelining. M2 is not
+guaranteed.
 
 ## Design
 
