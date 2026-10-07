@@ -413,6 +413,49 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     return out;
 }
 
+// EAGLE3 draft config: the SpecForge `LlamaForCausalLMEagle3` layout (`model_type=llama`, one
+// decoder layer, top-level `rope_theta`, a reduced `draft_vocab_size`). The three target layers it
+// reads are not exported; SpecForge fuses layer 1, num_layers/2 and num_layers-4.
+DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
+    require_members(value,
+                    {"architectures", "intermediate_size", "num_attention_heads",
+                     "num_key_value_heads", "head_dim", "num_hidden_layers", "rms_norm_eps",
+                     "rope_theta", "draft_vocab_size"},
+                    {"max_position_embeddings", "norm_before_residual", "norm_before_fc",
+                     "target_hidden_size"},
+                    "EAGLE3 draft config");
+    const auto arch = architecture(value);
+    if (arch != "LlamaForCausalLMEagle3" && arch != "Eagle3DraftModel" &&
+        arch != "Eagle3LlamaForCausalLM") {
+        throw ArtifactError("EAGLE3 draft architecture mismatch");
+    }
+    DraftConfig out;
+    out.attention         = attention(value);
+    out.intermediate_size = dimension(value, "intermediate_size");
+    out.num_hidden_layers = dimension(value, "num_hidden_layers");
+    out.max_position_embeddings = value.contains("max_position_embeddings")
+                                      ? dimension(value, "max_position_embeddings")
+                                      : 0U;
+    out.rms_norm_eps = positive_float(value, "rms_norm_eps");
+    out.rope_theta   = positive_float(value, "rope_theta");
+    if (out.num_hidden_layers != 1U) {
+        throw ArtifactError("EAGLE3 draft must have exactly one decoder layer");
+    }
+    const std::uint32_t layers = target.num_hidden_layers;
+    if (layers < 4U) { throw ArtifactError("EAGLE3 target has too few layers"); }
+    out.target_layer_ids = {1U, layers / 2U, layers - 4U};
+
+    Eagle3Config eagle;
+    eagle.target_hidden_size = value.contains("target_hidden_size")
+                                   ? dimension(value, "target_hidden_size")
+                                   : target.hidden_size;
+    eagle.draft_vocab_size     = dimension(value, "draft_vocab_size");
+    eagle.norm_before_residual = value.value("norm_before_residual", false);
+    eagle.norm_before_fc       = value.value("norm_before_fc", false);
+    out.eagle3                 = eagle;
+    return out;
+}
+
 } // namespace
 
 std::uint64_t GdnConfig::conv_channels() const {
@@ -464,9 +507,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             }
         }
         if (options.speculative == SpeculativeBackend::DFlash ||
-            options.speculative == SpeculativeBackend::DFlash2) {
-            out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+            options.speculative == SpeculativeBackend::DFlash2 ||
+            options.speculative == SpeculativeBackend::Eagle3) {
+            const auto& config = companion(directory, options.speculative_component()).config;
+            out.draft = options.speculative == SpeculativeBackend::Eagle3
+                            ? draft_eagle3(config, out.text)
+                            : draft(config, out.text,
+                                    options.speculative == SpeculativeBackend::DFlash2);
         }
         return out;
     } catch (const std::exception& error) {
