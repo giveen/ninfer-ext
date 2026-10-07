@@ -139,8 +139,11 @@ Phased, each phase independently verifiable:
 4. **Decoder execution.** One-layer transformer with the `2n`-wide attention input, the chained `g`,
    the draft head and the `d2t` scatter; qualify per-step logits and the pre-norm hidden against the
    oracle.
-5. **Drafting and verification.** Autoregressive top-k tree drafting and batched target verification,
-   wired into the speculative loop beside MTP/DFlash.
+5. **Drafting and verification.** Autoregressive top-k tree drafting and batched target verification.
+   The round is **MTP-shaped** (one token per step, its own KV), not the masked DFlash round, so the
+   MTP decode round is the right host: the draft forward swaps in the encoder + EAGLE3 decoder while
+   the draft/verify/KV/commit plumbing is shared. This is why the load reaches the DFlash dispatch
+   (`decode_dflash_batch` requires the DFlash backend) and stops: EAGLE3 must not enter that round.
 6. **Measure.** Acceptance, tokens/forward and end-to-end decode against MTP.
 
 ## Open questions
