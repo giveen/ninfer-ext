@@ -93,13 +93,25 @@ rate is recorded with a status (`OOM`, `SIGNAL`, `TIMEOUT`, `ERROR`, `PARSE_FAIL
 excluded from the fits and the picks — never silently averaged in as zero. High context at a slow
 KV format is *expected* to OOM; that failure maps the memory cliff.
 
+## Thermal state and confirmation
+
+- **`--thermal-mode warm`** preheats each configuration with its own workload until the temperature
+  stops rising, then measures there — the sustained rate an already-hot deployment sees.
+  **`idle`** settles back toward the idle baseline between runs (the burst rate a bursty workload
+  sees). **`off`** (default) measures whatever the previous run left behind. `--thermal-cap` bounds
+  the wait and every row records its temperature.
+- Execution order is **randomized** (`--seed` reproduces it) so thermal drift does not align with a
+  factor level.
+- **`--confirm`** (implied by `--full`) re-measures the additive model's predicted-optimal
+  configuration and reports predicted vs actual. A small gap means the additive model held; a large
+  gap means interactions or drift dominate, so trust the Pareto pick.
+
 ## Limitations (current)
 
-- The server driver measures aggregate tokens/s from concurrent OpenAI chat requests; it is
-  approximate (token counts come from the server's `usage`) and does not yet reproduce the frozen
-  TTFT corpus.
-- `--confirm` (re-measure the predicted-optimal config), thermal-state settling, and HTML reports
-  are not implemented yet; use `--reps` to average noise.
+- The server driver draws its prompt from the frozen TTFT corpus shape nearest the runbook (falling
+  back to a synthetic prompt), sends concurrent OpenAI chat requests, and reads tokens/s from the
+  server's `usage`; it is approximate and does not reproduce the full TTFT campaign.
+- HTML reports are not implemented.
 - Factor level generation uses the artifact config only; a `--factor` override is the escape hatch
   for anything the runbook gets wrong.
 

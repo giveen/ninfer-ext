@@ -141,3 +141,31 @@ def test_report_round_trips_to_json():
     payload = json.loads(to_json(result))
     assert payload["picks"]["fastest"]["objective"] == 90.0
     assert payload["fingerprint"]["hardware"]["gpu"].startswith("NVIDIA")
+
+
+def test_thermal_controller_validates_and_off_is_noop():
+    from tools.optimizer.driver import ThermalController
+
+    controller = ThermalController("off")
+    calls: list[int] = []
+    controller.settle(lambda: calls.append(1))
+    assert calls == []
+    with pytest.raises(ValueError):
+        ThermalController("turbo")
+
+
+def test_corpus_messages_are_available_or_synthetic():
+    from tools.optimizer.driver import _corpus_messages_for
+
+    messages = _corpus_messages_for(use_case("chat"))
+    assert messages and all("role" in m and "content" in m for m in messages)
+
+
+def test_confirmation_is_reported():
+    result = build_result(
+        use_case("chat"), [_row(8192, 90.0)], [], _hardware(), _model(), [], reps=1,
+        confirmation=(100.0, _row(8192, 92.0)),
+    )
+    assert "Confirmation run" in format_result(result)
+    payload = json.loads(to_json(result))
+    assert payload["confirmation"]["predicted"] == 100.0

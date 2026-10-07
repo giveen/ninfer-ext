@@ -252,3 +252,18 @@ def main_effects(design: OrthogonalDesign, scores: dict[tuple[int, ...], float])
         )
         out.append(MainEffect(factor.name, means, unique))
     return sorted(out, key=lambda e: e.range, reverse=True)
+
+
+def predicted_optimal(effects: list[MainEffect]) -> dict[str, str]:
+    """The setting the additive model predicts wins: each factor at its best main-effect level."""
+    return {effect.name: effect.best_level() for effect in effects}
+
+
+def additive_prediction(effects: list[MainEffect], grand_mean: float) -> float:
+    """Grand mean plus every factor's best-level deviation from it."""
+    if not effects:
+        return grand_mean
+    return grand_mean + sum(
+        effect.means[max(range(len(effect.means)), key=lambda i: effect.means[i])] - grand_mean
+        for effect in effects
+    )

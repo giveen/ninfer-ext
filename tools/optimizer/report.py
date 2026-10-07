@@ -151,6 +151,7 @@ class OptimizerResult:
     max_context: Measurement | None
     frontier: list[Measurement]
     fingerprint: dict
+    confirmation: tuple[float, Measurement] | None = None
 
 
 def build_result(
@@ -161,6 +162,7 @@ def build_result(
     model: ModelInfo,
     factors: list[Factor],
     reps: int,
+    confirmation: tuple[float, Measurement] | None = None,
 ) -> OptimizerResult:
     return OptimizerResult(
         use_case=use_case,
@@ -171,6 +173,7 @@ def build_result(
         max_context=pick_max_context(rows),
         frontier=pareto(rows),
         fingerprint=fingerprint(hardware, model, use_case, factors, reps),
+        confirmation=confirmation,
     )
 
 
@@ -221,6 +224,21 @@ def format_result(result: OptimizerResult) -> str:
             f"best={effect.best_level()}"
         )
     lines.append("")
+    if result.confirmation is not None:
+        predicted, row = result.confirmation
+        lines.append("### Confirmation run (predicted-optimal config)")
+        lines.append(f"  predicted {use_case.objective}={predicted:.2f}")
+        lines.append(f"  measured  {use_case.objective}={row.objective:.2f}  (status={row.status})")
+        if predicted > 0:
+            error = abs(row.objective - predicted) / predicted * 100.0
+            verdict = (
+                "small gap: the additive model held"
+                if error <= 5.0
+                else "large gap: interactions or drift — trust the Pareto pick"
+            )
+            lines.append(f"  prediction error: {error:.1f}% -> {verdict}")
+        lines.append(f"  {row.setting.label()}")
+        lines.append("")
     lines.append("Trust the Pareto frontier for the recommendation; use main effects to rank knobs.")
     return "\n".join(lines)
 
@@ -245,6 +263,11 @@ def to_json(result: OptimizerResult) -> str:
             {"name": e.name, "levels": list(e.levels), "means": list(e.means), "range": e.range}
             for e in result.effects
         ],
+        "confirmation": (
+            {"predicted": result.confirmation[0], "measured": _row_json(result.confirmation[1])}
+            if result.confirmation is not None
+            else None
+        ),
         "rows": [_row_json(r) for r in result.rows],
     }
     return json.dumps(payload, indent=2)

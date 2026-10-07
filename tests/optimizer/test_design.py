@@ -6,6 +6,7 @@ import random
 import pytest
 
 from tools.optimizer.design import (
+    additive_prediction,
     design_prime,
     elementary_effects,
     factor_column,
@@ -15,6 +16,7 @@ from tools.optimizer.design import (
     morris_trajectories,
     orthogonal_array,
     orthogonal_design,
+    predicted_optimal,
     select_levels,
     significant_factors,
 )
@@ -89,3 +91,18 @@ def test_main_effects_find_the_best_level():
     assert x.best_level() == "hi"
     assert x.range == pytest.approx(5.0)
     assert effects[0].name == "x"
+
+
+def test_predicted_optimal_and_additive_prediction():
+    factors = [Factor("x", ("lo", "hi")), Factor("y", ("lo", "hi"))]
+    design = orthogonal_design(factors)
+    scores = {
+        run: (5.0 if design.columns[0][run[0]] == "hi" else 0.0)
+        + (2.0 if design.columns[1][run[1]] == "hi" else 0.0)
+        for run in design.runs
+    }
+    effects = main_effects(design, scores)
+    assert predicted_optimal(effects) == {"x": "hi", "y": "hi"}
+    grand = sum(scores.values()) / len(scores)
+    # The additive model recovers the true optimum for a purely additive objective.
+    assert additive_prediction(effects, grand) == pytest.approx(7.0)

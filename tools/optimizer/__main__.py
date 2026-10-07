@@ -23,14 +23,16 @@ import time
 from tools.artifact.reader import ArtifactError
 
 from .design import (
+    additive_prediction,
     elementary_effects,
     main_effects,
     morris_trajectories,
     orthogonal_design,
+    predicted_optimal,
     significant_factors,
 )
 from .detect import detect_hardware, detect_model
-from .driver import DEFAULT_BENCH, DEFAULT_SERVE, Measurement, driver_for
+from .driver import DEFAULT_BENCH, DEFAULT_SERVE, Measurement, ThermalController, driver_for
 from .factors import Factor, FactorOptions, Setting, build_factors
 from .report import (
     TOOL_VERSION,
@@ -146,6 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--full", action="store_true", help="five repetitions per config")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900.0, help="per-run seconds")
+    parser.add_argument("--thermal-mode", default="off", choices=["off", "warm", "idle"],
+                        help="GPU thermal state before each measurement (default off)")
+    parser.add_argument("--thermal-cap", type=float, default=180.0,
+                        help="maximum seconds to settle the GPU")
+    parser.add_argument("--confirm", action="store_true",
+                        help="re-measure the predicted-optimal config (implied by --full)")
     parser.add_argument("--min-kv", default="any",
                         choices=["any", "k8v4", "nvfp4", "fp8", "int8", "bf16"])
     parser.add_argument("--factor", action="append", default=[], metavar="NAME=LEVELS",
@@ -207,7 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         sample = Setting({**sample.values, **pinned})
     driver = driver_for(args.artifact, case, bench=args.bench, serve=args.serve,
                         warmup=args.warmup, timeout=args.timeout,
-                        run_dir=args.output_dir)
+                        run_dir=args.output_dir,
+                        thermal=ThermalController(args.thermal_mode, cap_seconds=args.thermal_cap))
     sample_command = (
         driver.command(sample, case, 0)  # server: a free port is chosen at run time
         if case.driver == "server"
@@ -232,18 +241,37 @@ def main(argv: list[str] | None = None) -> int:
         design = orthogonal_design(survivors, args.levels)
 
     csv_path = args.output_dir / f"results_{case.name}.csv"
-    for index, setting in enumerate(design.settings(), 1):
+    items: list[tuple[tuple[int, ...], Setting]] = []
+    for run, setting in zip(design.runs, design.settings()):
         if pinned:
             setting = Setting({**setting.values, **pinned})
+        items.append((run, setting))
+    rng.shuffle(items)  # randomized order fights thermal drift across the sweep
+    measured: list[tuple[tuple[int, ...], Measurement]] = []
+    for index, (run, setting) in enumerate(items, 1):
         row = driver.measure(setting, case, reps)
+        measured.append((run, row))
         rows.append(row)
         log(f"[{index}/{design.run_count}] {setting.label()} -> {row.status} "
             f"objective={row.objective:.2f} ({row.seconds:.0f}s)")
         _write_csv(csv_path, rows)
 
-    scores = {run: row.objective for run, row in zip(design.runs, rows)}
+    scores = {run: row.objective for run, row in measured}
     effects = main_effects(design, scores)
-    result = build_result(case, rows, effects, hardware, model, survivors, reps)
+    grand_mean = sum(scores.values()) / len(scores) if scores else 0.0
+
+    confirmation = None
+    if args.confirm or args.full:
+        predicted_values = predicted_optimal(effects)
+        predicted_setting = Setting({**predicted_values, **pinned})
+        predicted_score = additive_prediction(effects, grand_mean)
+        log(f"confirmation: measuring predicted-optimal {predicted_setting.label()}")
+        row = driver.measure(predicted_setting, case, reps)
+        rows.append(row)
+        _write_csv(csv_path, rows)
+        confirmation = (predicted_score, row)
+
+    result = build_result(case, rows, effects, hardware, model, survivors, reps, confirmation)
     elapsed = time.monotonic() - started
 
     print()

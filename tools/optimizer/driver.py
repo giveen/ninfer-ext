@@ -58,10 +58,82 @@ class Measurement:
     seconds: float
     detail: str = ""
     command: tuple[str, ...] = ()
+    temp_c: float = 0.0
 
     @property
     def ok(self) -> bool:
         return self.status == STATUS_OK
+
+
+def gpu_temperature_c() -> float | None:
+    """GPU temperature in Celsius, or None when no sensor is readable."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+@dataclass
+class ThermalController:
+    """Put the GPU in a defined thermal state before each measurement.
+
+    ``warm`` preheats a configuration with its own workload until the temperature stops rising, then
+    measures there — the sustained rate a deployment gets from an already-hot card. ``idle`` settles
+    back toward the idle baseline between runs — the burst rate a bursty workload sees. ``off``
+    measures whatever state the previous run left behind, which is the confound the other two exist
+    to remove.
+    """
+
+    mode: str = "off"
+    cap_seconds: float = 180.0
+    poll_seconds: float = 2.0
+    idle_target_c: float = 45.0
+    stable_delta_c: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("off", "warm", "idle"):
+            raise ValueError(f"unknown thermal mode {self.mode!r}")
+
+    def settle(self, preheat: Callable[[], None]) -> None:
+        if self.mode == "off":
+            return
+        if gpu_temperature_c() is None:
+            return
+        if self.mode == "warm":
+            preheat()
+            self._wait_until_stable()
+        else:
+            self._wait_until_idle()
+
+    def _wait_until_stable(self) -> None:
+        deadline = time.monotonic() + self.cap_seconds
+        previous = gpu_temperature_c()
+        while time.monotonic() < deadline and previous is not None:
+            time.sleep(self.poll_seconds)
+            current = gpu_temperature_c()
+            if current is None or abs(current - previous) <= self.stable_delta_c:
+                return
+            previous = current
+
+    def _wait_until_idle(self) -> None:
+        deadline = time.monotonic() + self.cap_seconds
+        while time.monotonic() < deadline:
+            current = gpu_temperature_c()
+            if current is None or current <= self.idle_target_c:
+                return
+            time.sleep(self.poll_seconds)
 
 
 def _classify_failure(returncode: int, stderr: str, timed_out: bool) -> tuple[str, str]:
@@ -86,12 +158,14 @@ class BenchDriver:
         warmup: int = 1,
         timeout: float = 600.0,
         run_dir: Path | None = None,
+        thermal: ThermalController | None = None,
     ) -> None:
         self.artifact = Path(artifact)
         self.bench = Path(bench)
         self.warmup = warmup
         self.timeout = timeout
         self.run_dir = Path(run_dir) if run_dir else Path(tempfile.mkdtemp(prefix="ninfer-opt-"))
+        self.thermal = thermal or ThermalController()
 
     def command(self, setting: Setting, use_case: UseCase, reps: int) -> list[str]:
         return [
@@ -109,10 +183,19 @@ class BenchDriver:
             "json",
         ]
 
+    def _preheat(self, setting: Setting, use_case: UseCase) -> None:
+        """One throwaway pass so a `warm` settle measures the configuration already hot."""
+        argv = self.command(setting, use_case, 1)
+        try:
+            subprocess.run(argv, capture_output=True, text=True, timeout=self.timeout, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def measure(self, setting: Setting, use_case: UseCase, reps: int) -> Measurement:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         report_path = self.run_dir / f"report_{abs(hash(setting.label())) % (1 << 32):08x}.json"
         argv = [*self.command(setting, use_case, reps), "--output-file", str(report_path)]
+        self.thermal.settle(lambda: self._preheat(setting, use_case))
         started = time.monotonic()
         timed_out = False
         try:
@@ -123,14 +206,15 @@ class BenchDriver:
         except subprocess.TimeoutExpired:
             timed_out, returncode, stderr = True, -1, ""
         seconds = time.monotonic() - started
+        temp = gpu_temperature_c() or 0.0
         if timed_out or returncode != 0:
             status, detail = _classify_failure(returncode, stderr, timed_out)
-            return Measurement(setting, status, 0.0, 0.0, 0.0, seconds, detail, tuple(argv))
+            return Measurement(setting, status, 0.0, 0.0, 0.0, seconds, detail, tuple(argv), temp)
         try:
             pp, tg = _parse_bench_report(report_path, use_case)
         except (OSError, ValueError, KeyError) as error:
             return Measurement(
-                setting, STATUS_PARSE_FAIL, 0.0, 0.0, 0.0, seconds, str(error), tuple(argv)
+                setting, STATUS_PARSE_FAIL, 0.0, 0.0, 0.0, seconds, str(error), tuple(argv), temp
             )
         status, detail = _plausibility(pp, tg)
         objective = use_case.effective_tokens_per_second(pp, tg) if use_case.objective == "eff" else (
@@ -138,7 +222,7 @@ class BenchDriver:
         )
         if status != STATUS_OK:
             objective = 0.0
-        return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv))
+        return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv), temp)
 
 
 def _parse_bench_report(path: Path, use_case: UseCase) -> tuple[float, float]:
@@ -174,12 +258,20 @@ class ServerDriver:
         warmup: int = 1,
         timeout: float = 900.0,
         run_dir: Path | None = None,
+        thermal: ThermalController | None = None,
     ) -> None:
         self.artifact = Path(artifact)
         self.serve = Path(serve)
         self.warmup = warmup
         self.timeout = timeout
         self.run_dir = Path(run_dir) if run_dir else Path(tempfile.mkdtemp(prefix="ninfer-opt-serve-"))
+        self.thermal = thermal or ThermalController()
+        self._messages: list[dict] | None = None
+
+    def messages(self, use_case: UseCase) -> list[dict]:
+        if self._messages is None:
+            self._messages = _corpus_messages_for(use_case)
+        return self._messages
 
     def _free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -204,6 +296,7 @@ class ServerDriver:
     def measure(self, setting: Setting, use_case: UseCase, reps: int) -> Measurement:
         port = self._free_port()
         argv = self.command(setting, use_case, port)
+        messages = self.messages(use_case)
         started = time.monotonic()
         process = subprocess.Popen(
             argv,
@@ -217,14 +310,14 @@ class ServerDriver:
                 stdout, stderr = process.communicate(timeout=5)
                 status, detail = _classify_failure(process.returncode or 0, stderr or stdout, False)
                 return Measurement(setting, status, 0.0, 0.0, 0.0, time.monotonic() - started,
-                                   detail, tuple(argv))
-            _serve_once(port, use_case)  # warmup / graph prime
-            for _ in range(max(0, self.warmup - 1)):
-                _serve_once(port, use_case)
-            samples = [_serve_once(port, use_case) for _ in range(max(1, reps))]
+                                   detail, tuple(argv), gpu_temperature_c() or 0.0)
+            for _ in range(max(1, self.warmup)):
+                _serve_once(port, use_case, messages)
+            self.thermal.settle(lambda: _serve_once(port, use_case, messages))
+            samples = [_serve_once(port, use_case, messages) for _ in range(max(1, reps))]
         except (OSError, ValueError) as error:
             return Measurement(setting, STATUS_ERROR, 0.0, 0.0, 0.0, time.monotonic() - started,
-                               str(error), tuple(argv))
+                               str(error), tuple(argv), gpu_temperature_c() or 0.0)
         finally:
             _terminate(process)
         seconds = time.monotonic() - started
@@ -238,7 +331,8 @@ class ServerDriver:
         )
         if status != STATUS_OK:
             objective = 0.0
-        return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv))
+        return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv),
+                           gpu_temperature_c() or 0.0)
 
 
 def _wait_ready(port: int, process: subprocess.Popen, timeout: float) -> bool:
@@ -259,13 +353,31 @@ def _wait_ready(port: int, process: subprocess.Popen, timeout: float) -> bool:
     return False
 
 
-def _serve_once(port: int, use_case: UseCase) -> tuple[float, float]:
+def _corpus_messages_for(use_case: UseCase) -> list[dict]:
+    """The frozen TTFT corpus shape nearest the runbook's prompt, or a synthetic fallback."""
+    try:
+        from tools.bench.ttft.corpus import Corpus, CorpusError
+
+        corpus = Corpus()
+        shapes = corpus.manifest["shapes"]
+        best = min(
+            shapes.items(),
+            key=lambda item: abs(int(item[1]["prompt_tokens"]) - use_case.n_prompt),
+        )
+        return corpus.shape_messages(best[0])
+    except (ImportError, CorpusError, OSError, ValueError, KeyError):
+        prompt = (
+            "The quick brown fox jumps over the lazy dog. " * (use_case.n_prompt // 9 + 1)
+        ).strip()
+        return [{"role": "user", "content": prompt}]
+
+
+def _serve_once(port: int, use_case: UseCase, messages: list[dict]) -> tuple[float, float]:
     """Send ``concurrency`` simultaneous requests; return aggregate (pp t/s, tg t/s)."""
-    prompt = ("The quick brown fox jumps over the lazy dog. " * (use_case.n_prompt // 9 + 1)).strip()
     body = json.dumps(
         {
             "model": "local",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max(1, use_case.n_gen),
             "temperature": 0.0,
             "stream": False,
