@@ -917,6 +917,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
+| `--profile FILE` | load base options from a `ninfer_serve_profile` JSON file (written by `ninfer-optimizer`); every other command-line flag overrides it | unset |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only); `auto` takes the memory left after the KV floor | `auto` |
