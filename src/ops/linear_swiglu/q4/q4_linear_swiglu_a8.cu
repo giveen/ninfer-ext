@@ -65,14 +65,17 @@ constexpr int kMR      = (kBN / kNR) / 8;
 __device__ __forceinline__ int q4a8_swz(int row, int logical_byte) {
     return (((logical_byte >> 4) ^ (row & (kSeg - 1))) * 16) + (logical_byte & 15);
 }
-__device__ __forceinline__ int q4a8_s4(int x) {
-    return static_cast<int>(static_cast<std::int8_t>(x << 4)) >> 4;
+// Per-byte sign extension of four packed nibbles (0..15 -> -8..7).  SWAR: the high bit of every
+// byte is forced before the subtract so no borrow crosses a byte, then cleared back.
+__device__ __forceinline__ unsigned q4a8_sext4(unsigned nibbles) {
+    return (((nibbles ^ 0x08080808u) | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
 }
-__device__ __forceinline__ unsigned q4a8_pack4(std::uint8_t b0, std::uint8_t b1) {
-    return static_cast<unsigned>(static_cast<std::uint8_t>(q4a8_s4(b0 & 0xF))) |
-           (static_cast<unsigned>(static_cast<std::uint8_t>(q4a8_s4(b0 >> 4))) << 8) |
-           (static_cast<unsigned>(static_cast<std::uint8_t>(q4a8_s4(b1 & 0xF))) << 16) |
-           (static_cast<unsigned>(static_cast<std::uint8_t>(q4a8_s4(b1 >> 4))) << 24);
+// Four packed int4 bytes -> eight sign-extended int8 in document order.
+__device__ __forceinline__ void q4a8_expand4(unsigned word, unsigned& even, unsigned& odd) {
+    const unsigned low_nibbles  = word & 0x0F0F0F0Fu;
+    const unsigned high_nibbles = (word >> 4) & 0x0F0F0F0Fu;
+    even = q4a8_sext4(__byte_perm(low_nibbles, high_nibbles, 0x5140));
+    odd  = q4a8_sext4(__byte_perm(low_nibbles, high_nibbles, 0x7362));
 }
 
 __global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_a8_kernel(
@@ -123,9 +126,11 @@ __global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_a8_kernel(
             const std::uint8_t* bu = reinterpret_cast<const std::uint8_t*>(&vu);
             unsigned wg[8], wu[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                wg[j] = q4a8_pack4(bg[2 * j], bg[2 * j + 1]);
-                wu[j] = q4a8_pack4(bu[2 * j], bu[2 * j + 1]);
+            for (int j = 0; j < 4; ++j) {
+                q4a8_expand4(*reinterpret_cast<const unsigned*>(bg + 4 * j), wg[2 * j],
+                             wg[2 * j + 1]);
+                q4a8_expand4(*reinterpret_cast<const unsigned*>(bu + 4 * j), wu[2 * j],
+                             wu[2 * j + 1]);
             }
             *reinterpret_cast<uint4*>(&Bgs[s][r * kG + p0]) = make_uint4(wg[0], wg[1], wg[2], wg[3]);
             *reinterpret_cast<uint4*>(&Bgs[s][r * kG + p1]) = make_uint4(wg[4], wg[5], wg[6], wg[7]);
