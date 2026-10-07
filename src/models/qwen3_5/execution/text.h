@@ -198,6 +198,14 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+
+    // EAGLE3 draft: fuse the three captured target layers into the draft-width feature g.
+    void eagle3_encode(const Tensor& features, Tensor& g);
+    // EAGLE3 decoder step: the pair (token embedding, g) through the one decoder layer produces the
+    // draft pre-norm hidden (the next step's g) and the draft-vocabulary logits.
+    void eagle3_forward_ar_step(const Tensor& token, const Tensor& g, const Tensor& position,
+                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                                Tensor& logits);
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
@@ -305,11 +313,13 @@ private:
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
+    qwen3_5::PagedKVCacheView eagle3_kv_;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
     qwen3_5::KVHostStaging* mtp_kv_staging_  = nullptr;
     qwen3_5::QsaIndexMirrors qsa_index_mirrors_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
+    const qwen3_5::PagedKVCache* batch_eagle3_kv_ = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
