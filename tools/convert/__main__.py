@@ -150,7 +150,7 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         companions = {
-            key: sources[key] for key in ("dflash", "dflash2") if key in components
+            key: sources[key] for key in ("dflash", "dflash2", "eagle3") if key in components
         }
         if is_qwen4_exp(base.config):
             if companions:

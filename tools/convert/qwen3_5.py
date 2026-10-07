@@ -11,9 +11,11 @@ from pathlib import Path
 import struct
 from typing import Mapping
 
+import torch
+
 from .model import Model, Parameter
 from .resources import load_resources
-from .sources.logical import LogicalSource, select_rows, transpose_source
+from .sources.logical import LogicalSource, array_source, select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
 
@@ -320,6 +322,53 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     return result
 
 
+def draft_eagle3_config(raw: dict, target: dict) -> dict:
+    """Normalize the SpecForge `LlamaForCausalLMEagle3` head into the `eagle3` component config.
+
+    The head is one autoregressive decoder layer conditioned on three concatenated target hidden
+    states. SpecForge does not export which layers those are; its `OnlineEagle3Model` fuses layer 1,
+    `num_layers // 2` and `num_layers - 4`, so the parser derives them from the target.
+    """
+    architecture = "LlamaForCausalLMEagle3"
+    _fixed(raw, "architectures", [architecture], "eagle3")
+    _fixed(raw, "model_type", "llama", "eagle3")
+    _fixed(raw, "hidden_act", "silu", "eagle3")
+    _fixed(raw, "num_hidden_layers", 1, "eagle3")
+    _fixed(raw, "tie_word_embeddings", False, "eagle3")
+    result = {
+        "architectures": [architecture],
+        "model_type": "llama",
+        "hidden_size": target["hidden_size"],
+        "num_hidden_layers": 1,
+    }
+    for key in ("intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim"):
+        result[key] = _positive(raw.get(key), "eagle3." + key)
+    if (
+        result["num_attention_heads"] % result["num_key_value_heads"]
+        or result["head_dim"] % 2
+    ):
+        raise ValueError("eagle3: invalid attention geometry")
+    result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "eagle3.rms_norm_eps")
+    result["rope_theta"] = _f32(
+        raw.get("rope_theta", 10_000_000), "eagle3.rope_theta"
+    )
+    result["draft_vocab_size"] = _positive(
+        raw.get("draft_vocab_size"), "eagle3.draft_vocab_size"
+    )
+    if result["draft_vocab_size"] > target["vocab_size"]:
+        raise ValueError("eagle3 draft vocabulary exceeds the target vocabulary")
+    layers = target["num_hidden_layers"]
+    if layers < 4:
+        raise ValueError("eagle3 target has too few layers")
+    result["target_layer_ids"] = [1, layers // 2, layers - 4]
+    result["target_hidden_size"] = _positive(
+        raw.get("target_hidden_size", target["hidden_size"]), "eagle3.target_hidden_size"
+    )
+    result["norm_before_residual"] = bool(raw.get("norm_before_residual", False))
+    result["norm_before_fc"] = bool(raw.get("norm_before_fc", False))
+    return result
+
+
 def _has_model_config(source: SafetensorsSource) -> bool:
     return bool(
         source.config.keys()
@@ -395,6 +444,17 @@ class _Builder:
                 fields.add("spatial_merge_size")
             if "position_embedding" in name:
                 fields.add("num_position_embeddings")
+        elif component == "eagle3":
+            actual = draft_eagle3_config(selected.config, target)
+            expected = self.model.components[component]["config"]
+            fields = set()
+            if "/attention/" in name:
+                fields.update(("num_attention_heads", "num_key_value_heads", "head_dim"))
+            if "/mlp/" in name:
+                fields.add("intermediate_size")
+            if name.endswith("/feature_projection"):
+                fields.update(("target_layer_ids", "target_hidden_size"))
+            _check_source_fields(name, actual, expected, fields)
         else:
             actual = draft_config(selected.config, target, component)
             expected = self.model.components[component]["config"]
@@ -421,7 +481,7 @@ class _Builder:
             index = int(name.split("/layers/", 1)[1].split("/", 1)[0])
             if component == "vision":
                 compatible = index < actual["depth"]
-            elif component == "mtp":
+            elif component in ("mtp", "eagle3"):
                 compatible = index == 0
             else:
                 compatible = index < len(actual["layer_types"]) and (
@@ -903,6 +963,68 @@ class _Builder:
                     (target["vocab_size"], rank),
                 )
 
+    def draft_eagle3(self, store, config, target):
+        h, d = config["hidden_size"], config["head_dim"]
+        q = config["num_attention_heads"] * d
+        kv = config["num_key_value_heads"] * d
+        fused = config["target_hidden_size"] * 3
+        # Encoder: fuse the three target hidden states into one draft-width feature.
+        self.add(
+            "eagle3/feature_projection",
+            store,
+            "fc.weight",
+            (h, fused),
+            inputs=("eagle3/target_features",),
+        )
+        self.add("eagle3/final_norm", store, "norm.weight", (h,))
+        p, sp = "eagle3/layers/0/", "midlayer."
+        self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))
+        self.add(p + "hidden_norm", store, sp + "hidden_norm.weight", (h,))
+        # Decoder attention reads the concatenated (token embedding, fused feature) pair, so its
+        # input width is 2h.
+        for role, field, rows in (
+            ("query", "q_proj", q),
+            ("key", "k_proj", kv),
+            ("value", "v_proj", kv),
+        ):
+            self.add(
+                p + "attention/" + role,
+                store,
+                sp + "self_attn." + field + ".weight",
+                (rows, 2 * h),
+                inputs=(p + "attention_input",),
+            )
+        self.group(*(p + "attention/" + r for r in ("query", "key", "value")))
+        self.add(
+            p + "attention/output",
+            store,
+            sp + "self_attn.o_proj.weight",
+            (h, q),
+            inputs=(p + "attention_output",),
+        )
+        self.add(
+            p + "post_attention_norm", store, sp + "post_attention_layernorm.weight", (h,)
+        )
+        self.dense(p, sp, store, h, config["intermediate_size"], draft=True)
+        self.add(
+            "eagle3/output_head",
+            store,
+            "lm_head.weight",
+            (config["draft_vocab_size"], h),
+            inputs=("eagle3/final_hidden",),
+        )
+        # The draft-to-target token-id map is an integer table, not a quantized weight.
+        d2t = store.read_flat("d2t").to(torch.int32)
+        self.model.add(
+            Parameter(
+                "eagle3/d2t",
+                (config["draft_vocab_size"],),
+                array_source(d2t, "eagle3.d2t"),
+                direct_format="int32",
+                residency="eagle3",
+            )
+        )
+
 
 def build_model(
     base: SafetensorsSource,
@@ -918,6 +1040,7 @@ def build_model(
         "mtp",
         "dflash",
         "dflash2",
+        "eagle3",
     }:
         raise ValueError("select text and supported optional components")
     companions = {} if companions is None else companions
@@ -939,6 +1062,13 @@ def build_model(
                 "config": draft_config(companions[backend].config, config, backend),
                 "target": "text",
             }
+    if "eagle3" in selected:
+        if "eagle3" not in companions:
+            raise ValueError("selected eagle3 requires its source")
+        records["eagle3"] = {
+            "config": draft_eagle3_config(companions["eagle3"].config, config),
+            "target": "text",
+        }
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
@@ -998,4 +1128,6 @@ def build_model(
             builder.draft(
                 companions[backend], records[backend]["config"], config, backend
             )
+    if "eagle3" in selected:
+        builder.draft_eagle3(companions["eagle3"], records["eagle3"]["config"], config)
     return model
