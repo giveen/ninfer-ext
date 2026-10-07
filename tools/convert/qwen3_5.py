@@ -355,6 +355,10 @@ def draft_eagle3_config(raw: dict, target: dict) -> dict:
     result["draft_vocab_size"] = _positive(
         raw.get("draft_vocab_size"), "eagle3.draft_vocab_size"
     )
+    result["max_position_embeddings"] = _positive(
+        raw.get("max_position_embeddings", target["max_position_embeddings"]),
+        "eagle3.max_position_embeddings",
+    )
     if result["draft_vocab_size"] > target["vocab_size"]:
         raise ValueError("eagle3 draft vocabulary exceeds the target vocabulary")
     layers = target["num_hidden_layers"]
