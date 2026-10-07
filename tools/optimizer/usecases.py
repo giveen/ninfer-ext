@@ -11,13 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 DRIVERS = ("bench", "server")
-OBJECTIVES = ("tg", "pp", "eff")
+OBJECTIVES = ("tg", "pp", "eff", "ttft")
 
 # objective -> human label
 OBJECTIVE_LABELS = {
     "tg": "decode tokens/s",
     "pp": "prefill tokens/s",
     "eff": "effective tokens/s (prefill+decode as the request experiences them)",
+    "ttft": "time to first token (reported; scored as 1000/ms so higher is better)",
 }
 
 
@@ -48,6 +49,18 @@ class UseCase:
             return 0.0
         seconds = self.n_prompt / pp_tps + (self.n_gen / tg_tps if self.n_gen else 0.0)
         return (self.n_prompt + self.n_gen) / seconds if seconds > 0 else 0.0
+
+    def score(self, pp_tps: float, tg_tps: float, ttft_ms: float = 0.0) -> float:
+        """A single 'higher is better' number for the objective. TTFT is scored as 1000/ms."""
+        if self.objective == "tg":
+            return tg_tps
+        if self.objective == "pp":
+            return pp_tps
+        if self.objective == "eff":
+            return self.effective_tokens_per_second(pp_tps, tg_tps)
+        if self.objective == "ttft":
+            return 1000.0 / ttft_ms if ttft_ms > 0 else 0.0
+        raise ValueError(f"unknown objective {self.objective!r}")
 
 
 USE_CASES: dict[str, UseCase] = {

@@ -19,6 +19,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -59,6 +60,7 @@ class Measurement:
     detail: str = ""
     command: tuple[str, ...] = ()
     temp_c: float = 0.0
+    ttft_ms: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -140,7 +142,7 @@ def _classify_failure(returncode: int, stderr: str, timed_out: bool) -> tuple[st
     if timed_out:
         return STATUS_TIMEOUT, "timeout"
     text = stderr.lower()
-    if "out of memory" in text or "cuda_error_out_of_memory" in text or "oom" in text:
+    if "out of memory" in text or "outofmemory" in text or re.search(r"\boom\b", text):
         return STATUS_OOM, "out of memory"
     if returncode < 0:
         return STATUS_SIGNAL, f"killed by signal {-returncode}"
@@ -217,9 +219,7 @@ class BenchDriver:
                 setting, STATUS_PARSE_FAIL, 0.0, 0.0, 0.0, seconds, str(error), tuple(argv), temp
             )
         status, detail = _plausibility(pp, tg)
-        objective = use_case.effective_tokens_per_second(pp, tg) if use_case.objective == "eff" else (
-            tg if use_case.objective == "tg" else pp
-        )
+        objective = use_case.score(pp, tg)
         if status != STATUS_OK:
             objective = 0.0
         return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv), temp)
@@ -306,15 +306,17 @@ class ServerDriver:
             start_new_session=True,
         )
         try:
-            if not _wait_ready(port, process, self.timeout):
+            model_id = _wait_ready(port, process, self.timeout)
+            if model_id is None:
                 stdout, stderr = process.communicate(timeout=5)
                 status, detail = _classify_failure(process.returncode or 0, stderr or stdout, False)
                 return Measurement(setting, status, 0.0, 0.0, 0.0, time.monotonic() - started,
                                    detail, tuple(argv), gpu_temperature_c() or 0.0)
             for _ in range(max(1, self.warmup)):
-                _serve_once(port, use_case, messages)
-            self.thermal.settle(lambda: _serve_once(port, use_case, messages))
-            samples = [_serve_once(port, use_case, messages) for _ in range(max(1, reps))]
+                _serve_once(port, use_case, messages, model_id)
+            self.thermal.settle(lambda: _serve_once(port, use_case, messages, model_id))
+            samples = [_serve_once(port, use_case, messages, model_id)
+                       for _ in range(max(1, reps))]
         except (OSError, ValueError) as error:
             return Measurement(setting, STATUS_ERROR, 0.0, 0.0, 0.0, time.monotonic() - started,
                                str(error), tuple(argv), gpu_temperature_c() or 0.0)
@@ -323,34 +325,41 @@ class ServerDriver:
         seconds = time.monotonic() - started
         prompts = sorted(s[0] for s in samples)
         decodes = sorted(s[1] for s in samples)
+        ttfts = sorted(s[2] for s in samples if s[2] > 0)
         pp = prompts[len(prompts) // 2]
         tg = decodes[len(decodes) // 2]
+        ttft = ttfts[len(ttfts) // 2] if ttfts else 0.0
         status, detail = _plausibility(pp, tg)
-        objective = use_case.effective_tokens_per_second(pp, tg) if use_case.objective == "eff" else (
-            tg if use_case.objective == "tg" else pp
-        )
+        objective = use_case.score(pp, tg, ttft)
         if status != STATUS_OK:
             objective = 0.0
         return Measurement(setting, status, pp, tg, objective, seconds, detail, tuple(argv),
-                           gpu_temperature_c() or 0.0)
+                           gpu_temperature_c() or 0.0, ttft)
 
 
-def _wait_ready(port: int, process: subprocess.Popen, timeout: float) -> bool:
+def _wait_ready(port: int, process: subprocess.Popen, timeout: float) -> str | None:
+    """Wait for the server, returning its advertised model id, or None on failure."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            return False
+            return None
         try:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             connection.request("GET", "/v1/models")
             response = connection.getresponse()
-            response.read()
+            body = response.read()
             connection.close()
             if response.status == 200:
-                return True
+                try:
+                    items = json.loads(body).get("data") or []
+                    if items and isinstance(items[0], dict) and items[0].get("id"):
+                        return str(items[0]["id"])
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+                return "local"
         except OSError:
             time.sleep(0.5)
-    return False
+    return None
 
 
 def _corpus_messages_for(use_case: UseCase) -> list[dict]:
@@ -372,36 +381,73 @@ def _corpus_messages_for(use_case: UseCase) -> list[dict]:
         return [{"role": "user", "content": prompt}]
 
 
-def _serve_once(port: int, use_case: UseCase, messages: list[dict]) -> tuple[float, float]:
-    """Send ``concurrency`` simultaneous requests; return aggregate (pp t/s, tg t/s)."""
+@dataclass(frozen=True)
+class ServeSample:
+    prompt_tokens: int
+    decode_tokens: int
+    wall_seconds: float
+    ttft_ms: float
+
+
+def _serve_once(
+    port: int, use_case: UseCase, messages: list[dict], model_id: str
+) -> tuple[float, float, float]:
+    """Release ``concurrency`` simultaneous streamed requests; return (pp t/s, tg t/s, median TTFT ms)."""
     body = json.dumps(
         {
-            "model": "local",
+            "model": model_id,
             "messages": messages,
             "max_tokens": max(1, use_case.n_gen),
             "temperature": 0.0,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
     ).encode("utf-8")
-    results: list[tuple[int, int, float]] = []
+    samples: list[ServeSample] = []
     lock = threading.Lock()
+    barrier = threading.Barrier(use_case.concurrency)
 
     def one() -> None:
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
-        start = time.monotonic()
         try:
+            barrier.wait()  # release every request together, so TTFT reflects queuing
+            start = time.monotonic()
             connection.request(
                 "POST", "/v1/chat/completions", body=body,
                 headers={"Content-Type": "application/json"},
             )
             response = connection.getresponse()
-            payload = json.loads(response.read().decode("utf-8"))
+            first: float | None = None
+            usage: dict = {}
+            deltas = 0
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("usage"):
+                    usage = payload["usage"]
+                for choice in payload.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("content") or delta.get("reasoning_content"):
+                        if first is None:
+                            first = time.monotonic()
+                        deltas += 1
             elapsed = time.monotonic() - start
-            usage = payload.get("usage", {})
             with lock:
-                results.append(
-                    (int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
-                     elapsed)
+                samples.append(
+                    ServeSample(
+                        prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                        decode_tokens=int(usage.get("completion_tokens", deltas)),
+                        wall_seconds=elapsed,
+                        ttft_ms=(first - start) * 1000.0 if first is not None else 0.0,
+                    )
                 )
         finally:
             connection.close()
@@ -411,13 +457,18 @@ def _serve_once(port: int, use_case: UseCase, messages: list[dict]) -> tuple[flo
         thread.start()
     for thread in threads:
         thread.join()
-    if not results:
+    if not samples:
         raise ValueError("no server responses")
-    prompt_tokens = sum(r[0] for r in results)
-    decode_tokens = sum(r[1] for r in results)
-    wall = max(r[2] for r in results)
-    return (prompt_tokens / wall if wall > 0 else 0.0,
-            decode_tokens / wall if wall > 0 else 0.0)
+    prompt_tokens = sum(s.prompt_tokens for s in samples)
+    decode_tokens = sum(s.decode_tokens for s in samples)
+    wall = max(s.wall_seconds for s in samples)
+    ttfts = sorted(s.ttft_ms for s in samples if s.ttft_ms > 0)
+    ttft = ttfts[len(ttfts) // 2] if ttfts else 0.0
+    return (
+        prompt_tokens / wall if wall > 0 else 0.0,
+        decode_tokens / wall if wall > 0 else 0.0,
+        ttft,
+    )
 
 
 def _terminate(process: subprocess.Popen) -> None:

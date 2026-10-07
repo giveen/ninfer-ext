@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 import json
 from pathlib import Path
 import random
@@ -33,6 +34,7 @@ from .design import (
 )
 from .detect import detect_hardware, detect_model
 from .driver import DEFAULT_BENCH, DEFAULT_SERVE, Measurement, ThermalController, driver_for
+from .html import render_html
 from .factors import Factor, FactorOptions, Setting, build_factors
 from .report import (
     TOOL_VERSION,
@@ -138,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("artifact", nargs="?", type=Path, help="a .ninfer artifact")
     parser.add_argument("--use-case", default="chat", choices=sorted(USE_CASES))
+    parser.add_argument("--objective", default=None, choices=["tg", "pp", "eff", "ttft"],
+                        help="override the runbook's objective")
     parser.add_argument("--list-use-cases", action="store_true")
     parser.add_argument("--run", action="store_true", help="execute the sweep (uses the GPU)")
     parser.add_argument("--screen", nargs="?", type=int, const=3, default=None,
@@ -160,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="override a factor's levels, repeatable")
     parser.add_argument("--ctx-size", type=int, default=None, help="pin the context depth")
     parser.add_argument("--output-dir", type=Path, default=Path("profiles/optimizer"))
+    parser.add_argument("--html", type=Path, default=None, help="write a self-contained HTML report")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
     parser.add_argument("--serve", type=Path, default=DEFAULT_SERVE)
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
@@ -175,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("an artifact path is required")
 
     case = use_case(args.use_case)
+    if args.objective is not None:
+        case = replace(case, objective=args.objective)
     hardware = detect_hardware()
     try:
         model = detect_model(args.artifact)
@@ -281,6 +288,10 @@ def main(argv: list[str] | None = None) -> int:
     (args.output_dir / f"fingerprint_{case.name}.json").write_text(
         json.dumps(result.fingerprint, indent=2), encoding="utf-8"
     )
+    if args.html is not None:
+        args.html.parent.mkdir(parents=True, exist_ok=True)
+        args.html.write_text(render_html(result), encoding="utf-8")
+        print(f"HTML report written to {args.html}")
     if args.json:
         print(to_json(result))
     return 0

@@ -169,3 +169,26 @@ def test_confirmation_is_reported():
     assert "Confirmation run" in format_result(result)
     payload = json.loads(to_json(result))
     assert payload["confirmation"]["predicted"] == 100.0
+
+
+def test_ttft_objective_scores_as_a_rate():
+    from dataclasses import replace
+
+    ttft_case = replace(use_case("agents"), objective="ttft")
+    assert ttft_case.score(pp_tps=1000.0, tg_tps=100.0, ttft_ms=100.0) == pytest.approx(10.0)
+    assert ttft_case.score(pp_tps=1000.0, tg_tps=100.0, ttft_ms=0.0) == 0.0
+
+
+def test_html_report_is_self_contained():
+    from tools.optimizer.html import render_html
+
+    result = build_result(
+        use_case("chat"), [_row(8192, 90.0), _row(32768, 60.0)], [], _hardware(), _model(),
+        [Factor("kv_dtype", ("fp8", "nvfp4"))], reps=3,
+        confirmation=(92.0, _row(8192, 90.0)),
+    )
+    html = render_html(result)
+    assert html.startswith("<!doctype html>")
+    assert "<svg" in html and "Pareto" in html and "Confirmation" in html
+    assert "http://" not in html and "https://" not in html  # no external assets
+    assert "ninfer &lt;artifact&gt;" in html

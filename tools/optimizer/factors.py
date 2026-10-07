@@ -66,7 +66,7 @@ def _render(name: str, value: str, *, driver: str) -> list[str]:
     if name == "kv_dtype":
         return ["--kv-dtype", value]
     if name == "ctx":
-        return ["--max-ctx", value]
+        return ["--max-context" if driver == "server" else "--max-ctx", value]
     if name == "prefill_chunk":
         return ["--prefill-chunk", value]
     if name == "spec":

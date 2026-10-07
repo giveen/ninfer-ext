@@ -83,6 +83,16 @@ Each run is recorded as it finishes (crash-safe CSV under `--output-dir`), then 
 - the **main-effects table**, ranked by range, so you can see which knobs matter;
 - a **fingerprint** (machine, model, factors, run settings) written beside the CSV for sharing.
 
+`--html report.html` writes a **self-contained** report — inline CSS and an SVG Pareto chart, no
+external assets — with the picks, confirmation, main effects and every measured row.
+
+## Time to first token
+
+The server driver streams every request and records the time from send to the first content token,
+so TTFT is reported for every server-driven run and shown in the picks, the Pareto table and the
+HTML report. `--objective ttft` scores a run by TTFT (reported as `1000/ms` so higher is better);
+the default objectives stay throughput.
+
 The recommendation is read from measured configurations, not the additive model: main effects can
 misattribute an interaction to a main effect.
 
@@ -109,9 +119,8 @@ KV format is *expected* to OOM; that failure maps the memory cliff.
 ## Limitations (current)
 
 - The server driver draws its prompt from the frozen TTFT corpus shape nearest the runbook (falling
-  back to a synthetic prompt), sends concurrent OpenAI chat requests, and reads tokens/s from the
-  server's `usage`; it is approximate and does not reproduce the full TTFT campaign.
-- HTML reports are not implemented.
+  back to a synthetic prompt), streams concurrent OpenAI chat requests, and reads tokens/s and TTFT
+  from the live server; it is not the audited TTFT campaign and does not reproduce its case graphs.
 - Factor level generation uses the artifact config only; a `--factor` override is the escape hatch
   for anything the runbook gets wrong.
 

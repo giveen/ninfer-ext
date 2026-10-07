@@ -193,7 +193,9 @@ def format_result(result: OptimizerResult) -> str:
             lines.append("")
             return
         lines.append(
-            f"  {use_case.objective}={row.objective:.2f}  (pp={row.pp_tps:.1f} tg={row.tg_tps:.1f})"
+            f"  {use_case.objective}={row.objective:.2f}  (pp={row.pp_tps:.1f} tg={row.tg_tps:.1f}"
+            + (f" ttft={row.ttft_ms:.0f}ms" if row.ttft_ms > 0 else "")
+            + ")"
         )
         lines.append(f"  {row.setting.label()}")
         lines.append("  suggested command:")
@@ -208,9 +210,10 @@ def format_result(result: OptimizerResult) -> str:
     if not result.frontier:
         lines.append("  (none)")
     for row in result.frontier:
+        ttft = f"  ttft={row.ttft_ms:7.0f}ms" if row.ttft_ms > 0 else ""
         lines.append(
             f"  ctx={_ctx(row.setting.values):>7}  {use_case.objective}={row.objective:8.2f}  "
-            f"tg={row.tg_tps:7.1f}  {row.setting.label()}"
+            f"tg={row.tg_tps:7.1f}{ttft}  {row.setting.label()}"
         )
     lines.append("")
 
