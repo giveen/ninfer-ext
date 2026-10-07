@@ -206,6 +206,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--profile FILE` | load base options from a `ninfer_serve_profile` JSON file (written by `ninfer-optimizer`); options the CLI does not share are ignored and every other command-line flag overrides the profile | unset |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only) | `auto` |

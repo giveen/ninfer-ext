@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/offload_options.h"
+#include "product/serve_profile.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -7,7 +8,9 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::cli {
 namespace {
@@ -78,12 +81,44 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
 
+// Flags a `ninfer_serve_profile` may carry that the one-shot CLI also understands. Serve-only
+// options (concurrency, prefix caching, host tiers) are dropped when a profile is loaded here.
+constexpr std::string_view kCliProfileFlags[] = {
+    "prompt",           "messages",         "chat-template",      "max-new",
+    "max-context",      "kv-capacity",      "expert-cache",       "ngram-residency",
+    "prefill-chunk",    "device",           "kv-dtype",           "spec",
+    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "lookup-drafts",
+    "lookup-min-match", "raw-output",       "print-token-ids",    "no-thinking",
+    "thinking-budget",  "reasoning-effort", "vision",             "no-cuda-graph",
+    "stop-token-id",    "stop",             "reasoning-stop",     "temperature",
+    "top-p",            "top-k",            "min-p",              "presence-penalty",
+    "frequency-penalty", "seed",            "greedy",             "log-level",
+};
+
+std::vector<std::string> load_cli_profile(const std::string& path) {
+    std::vector<std::string> args;
+    for (const product::ProfileOption& option : product::read_serve_profile(path)) {
+        bool supported = false;
+        for (std::string_view flag : kCliProfileFlags) {
+            if (option.flag == flag) {
+                supported = true;
+                break;
+            }
+        }
+        if (!supported) { continue; }
+        args.push_back("--" + option.flag);
+        if (option.has_value) { args.push_back(option.value); }
+    }
+    return args;
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--profile FILE]\n"
            "       [--device N] [--expert-cache auto|MiB] [--ngram-residency auto|mapped|stream]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
@@ -130,11 +165,35 @@ Options parse_options(int argc, char** argv) {
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
 
+    // A `--profile` supplies base options; every other command-line flag is applied after it, so
+    // the command line always wins over the profile, whatever the argument order.
+    std::vector<std::string> profile_args;
+    std::vector<std::string> cli_args;
     for (int i = 2; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
+        const std::string arg                   = argv[i] == nullptr ? "" : argv[i];
+        constexpr std::string_view kProfileFlag = "--profile=";
+        if (arg == "--profile") {
+            if (++i >= argc) { throw std::invalid_argument("--profile needs a value"); }
+            profile_args = load_cli_profile(argv[i]);
+        } else if (arg.rfind(kProfileFlag, 0) == 0) {
+            profile_args = load_cli_profile(arg.substr(kProfileFlag.size()));
+        } else {
+            cli_args.push_back(arg);
+        }
+    }
+    std::vector<std::string> args;
+    args.emplace_back(argv[0] == nullptr ? "" : argv[0]);
+    args.push_back(options.artifact_path);
+    args.insert(args.end(), profile_args.begin(), profile_args.end());
+    args.insert(args.end(), cli_args.begin(), cli_args.end());
+
+    for (std::size_t i = 2; i < args.size(); ++i) {
+        const std::string_view arg(args[i]);
         const auto value = [&](std::string_view flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= args.size()) {
+                throw std::invalid_argument(std::string(flag) + " needs a value");
+            }
+            return args[i].c_str();
         };
 
         if (arg == "--prompt") {

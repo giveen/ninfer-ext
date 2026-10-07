@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/offload_options.h"
+#include "product/serve_profile.h"
 #include "product/speculative_options.h"
 
 #include <nlohmann/json.hpp>
@@ -144,48 +145,11 @@ std::string serve_usage_text(const char* argv0) {
 
 namespace {
 
-// Read a `ninfer-serve --profile` document and return the CLI arguments it sets. The profile
-// stores a flag -> value object; booleans are valueless flags (true) or absent (false).
 std::vector<std::string> load_serve_profile(const std::string& path) {
-    std::ifstream stream(path);
-    if (!stream) { throw std::invalid_argument("cannot read --profile file: " + path); }
-    nlohmann::json document;
-    try {
-        stream >> document;
-    } catch (const nlohmann::json::exception& error) {
-        throw std::invalid_argument("--profile is not valid JSON: " + std::string(error.what()));
-    }
-    if (document.value("artifact_type", std::string()) != "ninfer_serve_profile") {
-        throw std::invalid_argument("--profile is not a ninfer_serve_profile: " + path);
-    }
-    if (document.value("schema_version", 0) != 1) {
-        throw std::invalid_argument("--profile has an unsupported schema_version: " + path);
-    }
-    const auto options = document.find("options");
-    if (options == document.end() || !options->is_object()) {
-        throw std::invalid_argument("--profile has no options object: " + path);
-    }
     std::vector<std::string> args;
-    for (const auto& [key, value] : options->items()) {
-        if (key.empty() || key.rfind("--", 0) == 0) {
-            throw std::invalid_argument(
-                "--profile option names omit the leading dashes, got: " + key);
-        }
-        if (value.is_boolean()) {
-            if (value.get<bool>()) { args.push_back("--" + key); }
-        } else if (value.is_string()) {
-            args.push_back("--" + key);
-            args.push_back(value.get<std::string>());
-        } else if (value.is_number_integer()) {
-            args.push_back("--" + key);
-            args.push_back(std::to_string(value.get<std::int64_t>()));
-        } else if (value.is_number_unsigned()) {
-            args.push_back("--" + key);
-            args.push_back(std::to_string(value.get<std::uint64_t>()));
-        } else {
-            throw std::invalid_argument(
-                "--profile option " + key + " has an unsupported value type");
-        }
+    for (const product::ProfileOption& option : product::read_serve_profile(path)) {
+        args.push_back("--" + option.flag);
+        if (option.has_value) { args.push_back(option.value); }
     }
     return args;
 }

@@ -1,5 +1,8 @@
 #include "options.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -204,5 +207,40 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    // --profile loads base options; the command line overrides; serve-only options are dropped.
+    const auto profile_path =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-cli-profile-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    {
+        std::ofstream profile(profile_path);
+        profile << R"({"artifact_type":"ninfer_serve_profile","schema_version":1,)"
+                   R"("options":{"kv-dtype":"nvfp4","max-context":4096,"prefill-chunk":1024,)"
+                   R"("spec":"mtp","draft-tokens":5,"lm-head-draft":true,"vision":true,)"
+                   R"("max-concurrency":4}})";
+    }
+    const ninfer::cli::Options profiled =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--profile", profile_path.string()});
+    failures += check(profiled.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16 &&
+                          profiled.max_context == 4096 && profiled.prefill_chunk == 1024U &&
+                          profiled.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          profiled.speculative.draft_tokens == 5 &&
+                          profiled.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                          profiled.enable_vision,
+                      "--profile did not apply the CLI-compatible options");
+    const ninfer::cli::Options overridden =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--profile", profile_path.string(),
+               "--max-context", "8192"});
+    failures += check(overridden.max_context == 8192 &&
+                          overridden.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                      "command-line flags did not override --profile");
+    const ninfer::cli::Options equals_form = parse({"ninfer-cli", "model.ninfer", "--prompt", "hi",
+                                                    "--profile=" + profile_path.string()});
+    failures += check(equals_form.max_context == 4096, "--profile=PATH did not load");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--profile"),
+                      "CLI help omits --profile");
+    std::error_code profile_cleanup;
+    std::filesystem::remove(profile_path, profile_cleanup);
+    failures += check(!profile_cleanup, "CLI profile test file cleanup failed");
     return failures == 0 ? 0 : 1;
 }

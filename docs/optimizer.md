@@ -102,6 +102,10 @@ The profile stores the serve flags the sweep measured (`kv-dtype`, `max-context`
 `draft-tokens`, `lm-head-draft`, `prefill-chunk`, `max-concurrency`, …), plus the model, use case,
 objective and fingerprint for reference. It is plain JSON, so it can be edited.
 
+Both products read it: `ninfer-serve` and the one-shot `ninfer` CLI. The CLI ignores the
+serve-only options (concurrency, prefix-cache and host tiers) and keeps the rest, so the same
+profile drives a single generation or a server.
+
 ## Time to first token
 
 The server driver streams every request and records the time from send to the first content token,
