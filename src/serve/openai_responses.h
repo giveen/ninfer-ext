@@ -4,6 +4,7 @@
 // HTTP transport live in separate translation units; only wire-independent GenerationRequest is
 // passed to GenerationService.
 
+#include "serve/openai_common.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request.h"
 #include "serve/request_json.h"
@@ -36,6 +37,10 @@ struct OpenAIResponsesPromptRequest {
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
     std::optional<std::string> reasoning_summary;
+    // Applied after prompt resolution assembles generation.messages (the
+    // policy needs the resolved system/developer turns to place the
+    // leading-instruction candidate).
+    std::optional<OpenAIPromptCachePolicy> cache_policy;
 };
 
 struct OpenAIResponsesCreateRequest {
@@ -75,7 +80,9 @@ struct BuiltOpenAIResponse {
 };
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const RequestJson& body,
-                                                                   const RequestLimits& limits);
+                                                                   const RequestLimits& limits,
+                                                                   bool auto_system_shared_prefix =
+                                                                       true);
 
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const RequestJson& body, const RequestLimits& limits);

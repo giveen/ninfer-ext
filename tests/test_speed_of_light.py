@@ -13,6 +13,7 @@ from tools.artifact.writer import ArtifactWriter
 from tools.bench.speed_of_light import (
     _model_work,
     _projection_geometry,
+    compare,
     estimate,
 )
 
@@ -158,7 +159,9 @@ class SpeedOfLightTests(unittest.TestCase):
             for role in ("gate", "up", "down")
         }
         artifact = fake_artifact(config, expensive)
-        _, _, selected_bytes = _model_work(artifact)
+        body_flops, head_flops, selected_bytes = _model_work(artifact)
+        assert body_flops == 240
+        assert head_flops == 64
         assert selected_bytes == 304
         assert selected_bytes == _model_work(fake_artifact(config))[2]
 
@@ -178,6 +181,115 @@ class SpeedOfLightTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "--spec none"):  # noqa: PT027
             estimate(report, artifact, 1, None)
+
+
+def _sol_phase(
+    tokens: int,
+    seconds: float,
+    compute_floor: float,
+    weight_floor: float | None = None,
+    kv_floor: float | None = None,
+) -> dict:
+    entry = {
+        "tokens": tokens,
+        "measured_seconds": seconds,
+        "compute_floor_seconds": compute_floor,
+        "compute_roof_fraction": compute_floor / seconds,
+    }
+    if weight_floor is not None:
+        entry["weight_traffic_seconds"] = weight_floor
+        entry["weight_roof_fraction"] = weight_floor / seconds
+    if kv_floor is not None:
+        entry["kv_traffic_seconds"] = kv_floor
+        entry["kv_roof_fraction"] = kv_floor / seconds
+    return entry
+
+
+def _sol_result(
+    artifact_id: str,
+    phases: dict,
+    peak_tflops: float = 1676.0,
+    hbm_gbps: float | None = 1792.0,
+) -> dict:
+    return {
+        "model": "qwen3.8-27b",
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "artifact_id": artifact_id,
+        "peak_tflops": peak_tflops,
+        "hbm_gbps": hbm_gbps,
+        "tests": [{"label": "pp2048+tg128", "phases": phases}],
+    }
+
+
+class SpeedOfLightCompareTests(unittest.TestCase):
+    def test_change_closes_fraction_of_roof_gap(self):
+        before = _sol_result(
+            "a" * 32,
+            {
+                "decode": _sol_phase(
+                    128, 1.765, 0.094, weight_floor=1.364, kv_floor=0.042
+                )
+            },
+        )
+        after = _sol_result(
+            "b" * 32,
+            {
+                "decode": _sol_phase(
+                    128, 1.610, 0.094, weight_floor=1.364, kv_floor=0.042
+                )
+            },
+        )
+        row = compare(before, after)["rows"][0]
+        assert abs(row["measured_change_fraction"] + 0.155 / 1.765) < 1e-9
+        weight = row["weight"]
+        assert abs(weight["fraction_before"] - 1.364 / 1.765) < 1e-9
+        assert abs(weight["fraction_after"] - 1.364 / 1.610) < 1e-9
+        assert abs(weight["gap_closed_fraction"] - (0.401 - 0.246) / 0.401) < 1e-9
+
+    def test_ceiling_change_is_rejected(self):
+        before = _sol_result("a" * 32, {"decode": _sol_phase(128, 1.0, 0.1)})
+        after = _sol_result(
+            "b" * 32,
+            {"decode": _sol_phase(128, 0.9, 0.1)},
+            peak_tflops=1800.0,
+        )
+        with self.assertRaisesRegex(ValueError, "ceilings"):  # noqa: PT027
+            compare(before, after)
+
+    def test_model_change_is_rejected(self):
+        before = _sol_result("a" * 32, {"decode": _sol_phase(128, 1.0, 0.1)})
+        after = _sol_result("b" * 32, {"decode": _sol_phase(128, 0.9, 0.1)})
+        after["model"] = "other-model"
+        with self.assertRaisesRegex(ValueError, "models"):  # noqa: PT027
+            compare(before, after)
+
+    def test_token_count_change_is_rejected(self):
+        before = _sol_result("a" * 32, {"decode": _sol_phase(128, 1.0, 0.1)})
+        after = _sol_result("b" * 32, {"decode": _sol_phase(256, 0.9, 0.1)})
+        with self.assertRaisesRegex(ValueError, "token counts"):  # noqa: PT027
+            compare(before, after)
+
+    def test_baseline_at_or_above_roof_reports_no_gap_closure(self):
+        before = _sol_result("a" * 32, {"decode": _sol_phase(128, 0.5, 0.8)})
+        after = _sol_result("b" * 32, {"decode": _sol_phase(128, 0.45, 0.8)})
+        row = compare(before, after)["rows"][0]
+        assert row["compute"]["gap_closed_fraction"] is None
+
+    def test_unmatched_phase_is_listed_not_compared(self):
+        before = _sol_result(
+            "a" * 32,
+            {
+                "prefill": _sol_phase(2048, 0.241, 0.0595),
+                "decode": _sol_phase(128, 1.765, 0.094, weight_floor=1.364),
+            },
+        )
+        after = _sol_result(
+            "b" * 32,
+            {"decode": _sol_phase(128, 1.610, 0.094, weight_floor=1.364)},
+        )
+        comparison = compare(before, after)
+        assert comparison["unmatched"] == ["pp2048+tg128 prefill"]
+        assert [row["phase"] for row in comparison["rows"]] == ["decode"]
 
 
 if __name__ == "__main__":

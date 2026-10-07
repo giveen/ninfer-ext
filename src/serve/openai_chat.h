@@ -30,8 +30,8 @@ struct OpenAIChatRequest {
     bool return_progress   = false;
 };
 
-OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
-                                                const RequestLimits& limits);
+OpenAIChatRequest parse_chat_completion_request(const RequestJson& body, const RequestLimits& limits,
+                                                bool auto_system_shared_prefix = true);
 
 struct OpenAIChatResponseIdentity {
     std::string id;

@@ -9,16 +9,44 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <exception>
 #include <print>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <utility>
 
 namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
+std::atomic<ninfer::product::LoggingRuntime*> g_logging{nullptr};
+
+// An exception that escapes a request boundary ends the process through
+// std::terminate, and the default handler's message is the only record of which
+// exception it was. That message is worth writing through the server's own log:
+// under a container this process is pid 1, the kernel discards the SIGABRT that
+// abort() raises against itself, glibc falls through to its abort instruction,
+// and all the kernel reports is a bare protection fault inside libc.
+[[noreturn]] void log_terminate() {
+    std::string detail = "terminate called with no active exception";
+    if (std::current_exception() != nullptr) {
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& error) {
+            detail = std::string("terminate called after throwing ") + typeid(error).name() + ": " +
+                     error.what();
+        } catch (...) { detail = "terminate called after throwing a non-std exception"; }
+    }
+    if (ninfer::product::LoggingRuntime* logging = g_logging.load(); logging != nullptr) {
+        logging->logger()->critical("{}", detail);
+        logging->flush();
+    } else {
+        std::println(stderr, "ninfer-serve: {}", detail);
+    }
+    std::abort();
+}
 
 void handle_signal(int) {
     ninfer::serve::HttpServer* server = g_server.load();
@@ -28,6 +56,7 @@ void handle_signal(int) {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::set_terminate(log_terminate);
     ninfer::serve::ServeOptions options;
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
@@ -49,6 +78,7 @@ int main(int argc, char** argv) {
          .level        = options.log_level,
          .presentation = ninfer::product::LogPresentation::Service});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
+    g_logging.store(&logging);
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);
     bool serving = false;

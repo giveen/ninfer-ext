@@ -18,6 +18,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Swap an artifact's trailing chat-template resource without reconverting | [`artifact/replace_resource.py`](artifact/replace_resource.py); [usage](#artifact-workflow) |
 | Enable a route on an already-downloaded artifact (`activation_policy` metadata only) | [`artifact/set_activation_policy.py`](artifact/set_activation_policy.py); [usage](#artifact-workflow) |
+| Attach a donor's DFlash2 component to a v3 artifact without requantizing | [`artifact/attach_dflash2.py`](artifact/attach_dflash2.py); [guide](../docs/weight-conversion.md#attach-an-existing-dflash2-component) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |

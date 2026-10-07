@@ -86,7 +86,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--fixed-draft] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--kv-stream] "
+           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--no-auto-system-shared-prefix] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--tolerant-tool-calls] "
            "[--cors] "
@@ -339,6 +339,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--no-auto-system-shared-prefix") {
+            options.auto_system_shared_prefix = false;
         } else if (arg == "--kv-stream") {
             options.kv_stream = true;
         } else if (arg == "--lm-head-draft") {

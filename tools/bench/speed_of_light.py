@@ -245,6 +245,130 @@ def estimate(
     }
 
 
+_ROOF_KEYS = {
+    "compute": ("compute_floor_seconds", "compute_roof_fraction"),
+    "weight": ("weight_traffic_seconds", "weight_roof_fraction"),
+    "kv": ("kv_traffic_seconds", "kv_roof_fraction"),
+}
+
+
+def compare(baseline: dict, current: dict) -> dict:
+    """Report how much of the distance to each roof a change closed."""
+    if baseline["model"] != current["model"]:
+        raise ValueError("baseline and current runs use different models")
+    if (
+        baseline["peak_tflops"] != current["peak_tflops"]
+        or baseline["hbm_gbps"] != current["hbm_gbps"]
+    ):
+        raise ValueError(
+            "baseline and current runs used different ceilings; the roof "
+            "fractions are not comparable"
+        )
+    baseline_phases = {
+        (row["label"], phase): entry
+        for row in baseline["tests"]
+        for phase, entry in row["phases"].items()
+    }
+    current_phases = {
+        (row["label"], phase): entry
+        for row in current["tests"]
+        for phase, entry in row["phases"].items()
+    }
+    unmatched = sorted(set(baseline_phases) ^ set(current_phases))
+    rows = []
+    for current_row in current["tests"]:
+        for phase, after in current_row["phases"].items():
+            label = current_row["label"]
+            before = baseline_phases.get((label, phase))
+            if before is None:
+                continue
+            if before["tokens"] != after["tokens"]:
+                raise ValueError(
+                    f"{label} {phase} token counts differ between the runs; "
+                    "not comparable"
+                )
+            measured_before = before["measured_seconds"]
+            measured_after = after["measured_seconds"]
+            row = {
+                "label": label,
+                "phase": phase,
+                "tokens": before["tokens"],
+                "measured_seconds_before": measured_before,
+                "measured_seconds_after": measured_after,
+                "measured_change_fraction": (
+                    measured_after - measured_before
+                )
+                / measured_before,
+            }
+            for roof, (floor_key, fraction_key) in _ROOF_KEYS.items():
+                if fraction_key not in before or fraction_key not in after:
+                    continue
+                gap_before = measured_before - before[floor_key]
+                gap_after = measured_after - after[floor_key]
+                row[roof] = {
+                    "fraction_before": before[fraction_key],
+                    "fraction_after": after[fraction_key],
+                    "gap_before_seconds": gap_before,
+                    "gap_after_seconds": gap_after,
+                    "gap_closed_fraction": (
+                        None
+                        if gap_before <= 0
+                        else (gap_before - gap_after) / gap_before
+                    ),
+                }
+            rows.append(row)
+    return {
+        "model": current["model"],
+        "gpu": current["gpu"],
+        "peak_tflops": current["peak_tflops"],
+        "hbm_gbps": current["hbm_gbps"],
+        "baseline_artifact_id": baseline.get("artifact_id"),
+        "artifact_id": current.get("artifact_id"),
+        "rows": rows,
+        "unmatched": [f"{label} {phase}" for label, phase in unmatched],
+    }
+
+
+def _format_comparison(comparison: dict) -> str:
+    hbm = comparison["hbm_gbps"]
+    hbm_text = f"{hbm:g} GB/s" if hbm is not None else "n/a"
+    lines = [
+        f"{comparison['model']} on {comparison['gpu']} "
+        f"(ceilings {comparison['peak_tflops']:g} TFLOP/s, {hbm_text})",
+        (
+            "roof change vs baseline "
+            f"({comparison['baseline_artifact_id'] or 'unknown'} -> "
+            f"{comparison['artifact_id'] or 'unknown'})"
+        ),
+    ]
+    for row in comparison["rows"]:
+        lines.append(
+            f"{row['label']} {row['phase']}: "
+            f"{row['measured_seconds_before']:.3f}s -> "
+            f"{row['measured_seconds_after']:.3f}s "
+            f"({100 * row['measured_change_fraction']:+.1f}%)"
+        )
+        for roof in _ROOF_KEYS:
+            if roof not in row:
+                continue
+            value = row[roof]
+            if value["gap_closed_fraction"] is None:
+                closed = "n/a (baseline was at or above the roof)"
+            else:
+                closed = (
+                    f"{100 * value['gap_closed_fraction']:+.1f}% of the "
+                    f"{100 * (1 - value['fraction_before']):.1f}% gap "
+                    "to the roof closed"
+                )
+            lines.append(
+                f"  {roof} roof: {100 * value['fraction_before']:.1f}% -> "
+                f"{100 * value['fraction_after']:.1f}% ({closed})"
+            )
+    for name in comparison["unmatched"]:
+        lines.append(f"not present in both runs: {name}")
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -273,6 +397,13 @@ def main() -> int:
     parser.add_argument(
         "--json", action="store_true", help="emit machine-readable results"
     )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="previous --json output from before the change; report the roof "
+        "fraction change and how much of the roof gap the change closed",
+    )
     args = parser.parse_args()
     try:
         with args.report.open(encoding="utf-8") as source:
@@ -281,10 +412,16 @@ def main() -> int:
             result = estimate(
                 report, artifact, args.peak_tflops, args.hbm_gbps
             )
+        if args.baseline is not None:
+            with args.baseline.open(encoding="utf-8") as source:
+                baseline = json.load(source)
+            result["comparison"] = compare(baseline, result)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     if args.json:
         print(json.dumps(result, indent=2))
+    elif "comparison" in result:
+        print(_format_comparison(result["comparison"]))
     else:
         print(f"{result['model']} on {result['gpu']}")
         print(

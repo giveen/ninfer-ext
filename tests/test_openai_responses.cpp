@@ -1189,6 +1189,28 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_responses_leading_instruction_shared_prefix() {
+    int failures = 0;
+    const Json body =
+        Json{{"model", "qwen"}, {"instructions", "you are an agent"}, {"input", "go"}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    // The policy needs the resolved instruction turn, so parsing only stores it.
+    failures += check(request.prompt.cache_policy.has_value(),
+                      "Responses parsing dropped the prompt cache policy");
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_frontier", true);
+    failures += check(!resolved.generation.messages.empty() &&
+                          resolved.generation.messages.front().role ==
+                              ninfer::ChatRole::Developer &&
+                          resolved.generation.messages.front().cache_boundary_after.has_value() &&
+                          resolved.generation.messages.front().cache_boundary_after->evidence ==
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                      "Responses resolution did not publish the frontier shared-prefix candidate");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1207,6 +1229,7 @@ int main() {
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
+    failures += test_responses_leading_instruction_shared_prefix();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

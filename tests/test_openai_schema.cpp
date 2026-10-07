@@ -841,6 +841,29 @@ int test_common_objects() {
     return failures;
 }
 
+int test_leading_instruction_shared_prefix() {
+    int failures     = 0;
+    Json body        = base_request();
+    body["messages"] = Json::array({
+        Json{{"role", "system"}, {"content", "you are an agent"}},
+        Json{{"role", "developer"}, {"content", "tools available"}},
+        Json{{"role", "user"}, {"content", "go"}},
+    });
+    const GenerationRequest request = parse(body).generation;
+    failures += check(request.messages[1].cache_boundary_after.has_value() &&
+                          request.messages[1].cache_boundary_after->evidence ==
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                      "leading system/developer frontier did not publish a shared-prefix candidate");
+    failures += check(!request.messages[0].cache_boundary_after.has_value(),
+                      "a non-final leading instruction turn was marked");
+
+    const GenerationRequest disabled =
+        parse_chat_completion_request(body, limits(), false).generation;
+    failures += check(!disabled.messages[1].cache_boundary_after.has_value(),
+                      "--no-auto-system-shared-prefix left the frontier candidate in place");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -850,6 +873,7 @@ int main() {
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();
+    failures += test_leading_instruction_shared_prefix();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
