@@ -237,11 +237,12 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv,
+                         const qwen3_5::PagedKVCache* batch_eagle3_kv)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
-      batch_mtp_kv_(batch_mtp_kv) {
+      batch_mtp_kv_(batch_mtp_kv), batch_eagle3_kv_(batch_eagle3_kv) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");

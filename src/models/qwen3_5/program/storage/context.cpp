@@ -1369,12 +1369,14 @@ void ProgramImpl::release_active_shared_references(SequenceState& sequence) noex
 
 qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Eagle3) { return decoder->eagle3_cache(); }
     if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 const qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Eagle3) { return decoder->eagle3_cache(); }
     if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
@@ -2001,6 +2003,16 @@ qwen3_5::PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& sequence
         throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
     return decoder->mtp_cache()->execution_view(
+        backend_kv_addresses->execution_row(*sequence.kv->backend));
+}
+
+qwen3_5::PagedKVCacheView ProgramImpl::eagle3_kv_view(const SequenceState& sequence) const {
+    if (speculative_backend != SpeculativeBackend::Eagle3) { return {}; }
+    if (decoder->eagle3_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
+        !backend_kv_addresses->active(*sequence.kv->backend)) {
+        throw std::logic_error("sequence has no active EAGLE3 KV execution mapping");
+    }
+    return decoder->eagle3_cache()->execution_view(
         backend_kv_addresses->execution_row(*sequence.kv->backend));
 }
 

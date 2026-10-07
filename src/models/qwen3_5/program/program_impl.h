@@ -1387,6 +1387,7 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_5::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_5::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_5::PagedKVCacheView eagle3_kv_view(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
