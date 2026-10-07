@@ -807,7 +807,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.prefix_identity.size() != pending.base_S ||
             sequence.prefix_digests.size() != pending.base_S ||
             sequence.text_kv_valid != pending.base_E ||
-            (speculative_backend == SpeculativeBackend::Mtp &&
+            ((speculative_backend == SpeculativeBackend::Mtp ||
+              speculative_backend == SpeculativeBackend::Eagle3) &&
              sequence.mtp_kv_valid != pending.base_E) ||
             (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier != pending.base_E)) {
@@ -835,9 +836,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     try {
         timing.resume_submit();
         // An MTP round recorded at its own width, so it folds through that width's records.
-        const ops::GdnReplayFoldPlan& fold = speculative_backend == SpeculativeBackend::Mtp
-                                                 ? *mtp_rungs[mtp_round_rung].fold
-                                                 : *replay_fold;
+        const ops::GdnReplayFoldPlan& fold =
+            speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3
+                ? *mtp_rungs[mtp_round_rung].fold
+                : *replay_fold;
         fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                      device.stream);
         fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()));
@@ -866,7 +869,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             Tensor hidden;
             Tensor selected;
             Tensor destinations;
-            if (speculative_backend == SpeculativeBackend::Mtp && !mtp_rungs.empty()) {
+            if ((speculative_backend == SpeculativeBackend::Mtp ||
+                 speculative_backend == SpeculativeBackend::Eagle3) &&
+                !mtp_rungs.empty()) {
                 qwen3_5::MtpDecodeState& frame = mtp_rungs[mtp_round_rung].frame;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
@@ -926,9 +931,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
     // Egress rows are strided by the round's own width: the MTP draft length varies per round.
-    const std::uint32_t width = speculative_backend == SpeculativeBackend::Mtp
-                                    ? mtp_rungs[mtp_round_rung].k + 1U
-                                    : draft_window + 1U;
+    const std::uint32_t width =
+        speculative_backend == SpeculativeBackend::Mtp ||
+                speculative_backend == SpeculativeBackend::Eagle3
+            ? mtp_rungs[mtp_round_rung].k + 1U
+            : draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
@@ -944,7 +951,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             const std::uint32_t committed  = accepted_tokens[row];
             settle_state_fork(sequence);
             const TokenId* token_base =
-                speculative_backend == SpeculativeBackend::Mtp
+                speculative_backend == SpeculativeBackend::Mtp ||
+                        speculative_backend == SpeculativeBackend::Eagle3
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
@@ -957,7 +965,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
 
-            if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (speculative_backend == SpeculativeBackend::Mtp ||
+                speculative_backend == SpeculativeBackend::Eagle3) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
