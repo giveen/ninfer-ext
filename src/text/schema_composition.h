@@ -13,5 +13,6 @@ struct NormalizedSchema {
 
 // Reduce a source validated by prepare_json_schema before vocabulary compilation.
 // References remain a graph; dialect and keyword validation belong to the caller.
-NormalizedSchema normalize_schema_composition(const nlohmann::ordered_json& source);
+NormalizedSchema normalize_schema_composition(const nlohmann::ordered_json& source,
+                                              bool draft7 = false);
 } // namespace ninfer::text

@@ -8,7 +8,13 @@
 #include <string>
 #include <string_view>
 
+namespace ninfer::text {
+struct ParsedJsonNumbers;
+}
+
 namespace ninfer::serve {
+// Rejects a request whose schema declares a number the JSON number representation cannot preserve.
+void validate_schema_number_input(const text::ParsedJsonNumbers& parsed);
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {});
 
