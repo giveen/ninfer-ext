@@ -7,7 +7,12 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
-from tools.convert.qwen3_5 import build_model, draft_config, text_config
+from tools.convert.qwen3_5 import (
+    build_model,
+    draft_config,
+    draft_eagle3_config,
+    text_config,
+)
 from tools.convert.sources.safetensors import SafetensorsSource
 
 
@@ -283,6 +288,95 @@ def test_draft_query_context_and_dynamic_weights_keep_their_uses(
             other.config["dflash_config"]["target_layer_ids"] = [0, 1]
             with pytest.raises(ValueError, match="target_layer_ids differs"):
                 model.source(f"{backend}/feature_projection", other)
+
+
+def test_eagle3_config_derives_specforge_target_layers():
+    target = {
+        "hidden_size": 16,
+        "vocab_size": 32,
+        "num_hidden_layers": 40,
+        "max_position_embeddings": 128,
+    }
+    raw = {
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "model_type": "llama",
+        "hidden_act": "silu",
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+        "hidden_size": 16,
+        "intermediate_size": 24,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "draft_vocab_size": 8,
+        "max_position_embeddings": 128,
+    }
+    result = draft_eagle3_config(raw, target)
+    # SpecForge fuses [1, num_layers // 2 - 1, num_layers - 4], not [1, num_layers // 2, ...].
+    assert result["target_layer_ids"] == [1, 19, 36]
+    assert draft_eagle3_config(raw, {**target, "num_hidden_layers": 28})[
+        "target_layer_ids"
+    ] == [1, 13, 24]
+    assert result["target_hidden_size"] == 16
+    assert result["draft_vocab_size"] == 8
+    assert result["norm_before_residual"] is False
+    assert result["norm_before_fc"] is False
+    with pytest.raises(ValueError, match="too few layers"):
+        draft_eagle3_config(raw, {**target, "num_hidden_layers": 3})
+    with pytest.raises(ValueError, match="exceeds the target vocabulary"):
+        draft_eagle3_config({**raw, "draft_vocab_size": 64}, target)
+    with pytest.raises(ValueError, match="invalid attention geometry"):
+        draft_eagle3_config({**raw, "num_key_value_heads": 3}, target)
+
+
+def test_eagle3_draft_materializes_absolute_d2t_target_ids(tmp_path):
+    target = _config()
+    target["text_config"]["num_hidden_layers"] = 4
+    target["text_config"]["layer_types"] = ["full_attention"] * 4
+    draft = {
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "model_type": "llama",
+        "hidden_act": "silu",
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+        "hidden_size": 16,
+        "intermediate_size": 24,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "draft_vocab_size": 8,
+        "max_position_embeddings": 128,
+    }
+    # The head stores d2t as an offset from the draft index; a swap keeps the ids unique.
+    offsets = torch.tensor([0, 0, 1, -1, 0, 0, 0, 0], dtype=torch.int64)
+    tensors = {
+        "fc.weight": torch.arange(16 * 48).float().reshape(16, 48),
+        "norm.weight": torch.ones(16),
+        "lm_head.weight": torch.arange(8 * 16).float().reshape(8, 16),
+        "d2t": offsets,
+        "t2d": torch.ones(32, dtype=torch.bool),
+        "midlayer.input_layernorm.weight": torch.ones(16),
+        "midlayer.hidden_norm.weight": torch.ones(16),
+        "midlayer.post_attention_layernorm.weight": torch.ones(16),
+        "midlayer.self_attn.q_proj.weight": torch.arange(16 * 32).float().reshape(16, 32),
+        "midlayer.self_attn.k_proj.weight": torch.arange(16 * 32).float().reshape(16, 32),
+        "midlayer.self_attn.v_proj.weight": torch.arange(16 * 32).float().reshape(16, 32),
+        "midlayer.self_attn.o_proj.weight": torch.arange(16 * 16).float().reshape(16, 16),
+        "midlayer.mlp.gate_proj.weight": torch.arange(24 * 16).float().reshape(24, 16),
+        "midlayer.mlp.up_proj.weight": torch.arange(24 * 16).float().reshape(24, 16),
+        "midlayer.mlp.down_proj.weight": torch.arange(16 * 24).float().reshape(16, 24),
+    }
+    with (
+        _checkpoint(tmp_path / "text", target, {"unused": torch.ones(1)}) as base,
+        _checkpoint(tmp_path / "eagle3", draft, tensors) as companion,
+    ):
+        model = build_model(
+            base, components=("text", "eagle3"), companions={"eagle3": companion}
+        )
+        stored = _values(model, "eagle3/d2t").reshape(-1).to(torch.int64)
+        # The artifact stores absolute target ids: i + offset[i].
+        assert torch.equal(stored, offsets + torch.arange(offsets.numel()))
+        assert model.components["eagle3"]["config"]["target_layer_ids"] == [1, 1, 0]
 
 
 def test_config_normalization_keeps_dimensions_and_checks_fixed_mathematics():

@@ -326,8 +326,9 @@ def draft_eagle3_config(raw: dict, target: dict) -> dict:
     """Normalize the SpecForge `LlamaForCausalLMEagle3` head into the `eagle3` component config.
 
     The head is one autoregressive decoder layer conditioned on three concatenated target hidden
-    states. SpecForge does not export which layers those are; its `OnlineEagle3Model` fuses layer 1,
-    `num_layers // 2` and `num_layers - 4`, so the parser derives them from the target.
+    states. SpecForge does not export which layers those are; its `set_aux_hidden_states_layers`
+    fuses layer 1, `num_layers // 2 - 1` and `num_layers - 4`, so the parser derives them from the
+    target.
     """
     architecture = "LlamaForCausalLMEagle3"
     _fixed(raw, "architectures", [architecture], "eagle3")

@@ -89,7 +89,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
         }
         if (options.fixed_draft) {
-            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp|eagle3");
         }
         return;
     case SpeculativeBackend::DFlash2:
@@ -97,7 +97,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
         }
         if (options.fixed_draft) {
-            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp|eagle3");
         }
         return;
     case SpeculativeBackend::Eagle3:
