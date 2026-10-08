@@ -203,6 +203,14 @@ Reclaim(S,A\cup B)\ne Reclaim(S,A)+Reclaim(S,B)
 Move、Fork、partial-tail COW 和 source placement 也由完整 post-state 决定。一个 source 在初始状态中
 存在多个引用，并不意味着最终一定 Fork；反之，保留任一 checkpoint 所需的引用后也不能把它当作 Move。
 
+已被 admission 选中、但尚未 bind 的 source 同样计入 PostState：在它被绑定或被放弃之前，victim 回收不得
+触碰该 source 的 pages。这一保证由 checkpoint retention 承担，而不是由 admission 期的 pin 承担 ——
+`set_checkpoint_requirement` 把该 source 的 checkpoint frontier 转成每页 protected coverage，退役与重写
+都不能在覆盖率下限之下截断它；pressure 规划再用 checkpoint references 与 source references 判断哪个
+owner 可以退役。pin 只在 `prepare_prefix_fork` 建立物化转移时取得，用于转移期间的独占。若 source 在等待
+期间确实失去稳定性或 frontier，`prepare_prefix_fork` 以稳定性与可用性检查拒绝该事务，而不是读取已被回收的
+pages；`ninfer_qwen3_5_context_store_test` 固定了保留、释放与退役并存的这组语义。
+
 ### 3.4 有序阶段峰值
 
 一个物理 plan 是稳定状态之间的有序阶段：

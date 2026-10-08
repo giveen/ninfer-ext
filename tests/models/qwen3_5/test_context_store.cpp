@@ -479,6 +479,62 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
+    // A selected source that a pending admission has not bound yet is protected by its own
+    // checkpoint requirement, not by an admission-scoped pin: while the requirement stands the
+    // owner cannot truncate the prefix away, and a retirement candidate elsewhere is free to
+    // release. Clearing the requirement is what releases the coverage, which is the control that
+    // the guard above is the requirement and not an incidental reference count.
+    const auto pending_source = addresses.create_active(3, 0);
+    expect(pending_source.has_value(), "pending-admission source allocation");
+    addresses.ensure_mapped_to_tokens(*pending_source, 65, device.stream);
+    addresses.commit_frontier(*pending_source, 65);
+    addresses.set_checkpoint_requirement(*pending_source, 65);
+    const auto pending_full = addresses.logical_page(*pending_source, 0);
+    const auto pending_tail = addresses.logical_page(*pending_source, 1);
+    expect(pages.protected_columns(pending_full) ==
+                   static_cast<std::uint32_t>(ninfer::kPagedKVPageSize) &&
+               pages.protected_columns(pending_tail) == 1 &&
+               !pages.can_destructive_truncate(pending_full, 0) &&
+               pages.can_destructive_truncate(pending_full,
+                                              static_cast<std::uint32_t>(ninfer::kPagedKVPageSize)),
+           "a retained source resists a destructive truncate below its checkpoint frontier");
+    addresses.set_checkpoint_requirement(*pending_source, 0);
+    expect(pages.protected_columns(pending_full) == 0 && pages.protected_columns(pending_tail) == 0 &&
+               pages.can_destructive_truncate(pending_full, 0),
+           "clearing the checkpoint requirement releases the retained coverage");
+    addresses.set_checkpoint_requirement(*pending_source, 65);
+    addresses.deactivate(*pending_source);
+
+    const auto retirement_candidate = addresses.create_active(3, 0);
+    expect(retirement_candidate.has_value(), "retirement-candidate address allocation");
+    addresses.ensure_mapped_to_tokens(*retirement_candidate, 65, device.stream);
+    addresses.commit_frontier(*retirement_candidate, 65);
+    addresses.set_checkpoint_requirement(*retirement_candidate, 65);
+    addresses.deactivate(*retirement_candidate);
+    addresses.set_checkpoint_requirement(*retirement_candidate, 0);
+    expect(addresses.can_destructive_truncate_inactive(*retirement_candidate, 0) &&
+               addresses.release(*retirement_candidate),
+           "an unretained retirement candidate releases in full");
+    expect(pages.protected_columns(pending_full) ==
+                   static_cast<std::uint32_t>(ninfer::kPagedKVPageSize) &&
+               pages.address_references(pending_full) == 1,
+           "retiring another point left the pending source retained and referenced");
+
+    const auto pending_branch = addresses.create_inactive();
+    expect(pending_branch.has_value(), "pending-admission branch allocation");
+    auto pending_fork = addresses.prepare_prefix_fork(*pending_source, *pending_branch, 65, 3, 1);
+    physical_pages.copy_page(addresses.prefix_fork_tail_source(pending_fork),
+                             addresses.prefix_fork_tail_destination(pending_fork),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(pending_fork), device.stream);
+    expect(pages.address_references(pending_full) == 2 && pages.occupied() != 0,
+           "the pending admission still binds its retained source after a retirement");
+    addresses.deactivate(*pending_branch);
+    expect(addresses.release(*pending_branch) && addresses.release(*pending_source) &&
+               pages.occupied() == 0 && physical_pages.allocated_pages() == 0,
+           "the retained-source fixture releases without leaked pages");
+
     const auto mixed_source = addresses.create_active(4, 0);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
     addresses.ensure_mapped_to_tokens(*mixed_source, 65, device.stream);
