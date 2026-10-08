@@ -8,9 +8,9 @@ The fork adds four things on top of upstream's engine:
 - **Qwen3.8-Flash-Next on one 32 GB GPU.** A ~180B-parameter MoE model whose routed experts live in
   pinned Host memory behind a device expert cache. Stock NInfer cannot load it.
 - **Constrained decoding** on the generated content: JSON object and JSON Schema through the
-  standard `response_format`/`text.format` fields on all three HTTP protocols, GBNF through
-  `structured_outputs.grammar`, and `--json-object`/`--json-schema-file`/`--grammar-file` on the
-  CLI. The vocabulary-wide legal set is compiled once per model and applied per round on the device,
+  standard `response_format`/`text.format` fields on all three HTTP protocols, GBNF, choice and
+  regex through the `structured_outputs` object, and
+  `--json-object`/`--json-schema-file`/`--grammar-file`/`--regex`/`--choice` on the CLI. The vocabulary-wide legal set is compiled once per model and applied per round on the device,
   per verify position, so speculative drafting keeps working; the supported schema subset and the
   current limits are in [constrained decoding](docs/maintainer/constrained-decoding.md).
 - **Faster speculative decoding on Qwen3.8-27B `groupwise-int`.** Against stock on the same
