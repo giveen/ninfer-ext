@@ -103,6 +103,41 @@ int origins_and_requests() {
     failures += check(clipped.regions.size() == 1 && clipped.regions[0].source_offset == 1 &&
                           clipped.regions[0].end == 6,
                       "Unicode slice lost byte origin mapping");
+    // Trimming collapses source ranges. The removed ranges survive as boundary mappings at the
+    // retained edges, so a cache marker inside trimmed content can still resolve; a fully trimmed
+    // value contributes no bytes but keeps its mapping, and losing the source (JSON encoding)
+    // drops the mapping instead of inventing one.
+    const auto trimmed =
+        JinjaTemplate("before{{ text|trim }}after", "trim-boundary")
+            .render({{"text", " policy\n"}}, options);
+    failures += check(trimmed.text == "beforepolicyafter" &&
+                          trimmed.boundary_mappings.size() == 2 &&
+                          trimmed.boundary_mappings[0].tag == 7 &&
+                          trimmed.boundary_mappings[0].source_begin == 0 &&
+                          trimmed.boundary_mappings[0].source_end == 1 &&
+                          trimmed.boundary_mappings[0].offset == 6 &&
+                          trimmed.boundary_mappings[1].tag == 7 &&
+                          trimmed.boundary_mappings[1].source_begin == 7 &&
+                          trimmed.boundary_mappings[1].source_end == 8 &&
+                          trimmed.boundary_mappings[1].offset == 12,
+                      "trim did not map removed source boundaries to the surviving edges");
+
+    const auto blank = JinjaTemplate("before{{ text|trim }}after", "trim-blank")
+                           .render({{"text", " \t"}}, options);
+    failures += check(blank.text == "beforeafter" && blank.boundary_mappings.size() == 1 &&
+                          blank.boundary_mappings[0].tag == 7 &&
+                          blank.boundary_mappings[0].source_begin == 0 &&
+                          blank.boundary_mappings[0].source_end == 2 &&
+                          blank.boundary_mappings[0].offset == 6,
+                      "fully trimmed input lost its boundary or produced bytes");
+
+    const auto encoded =
+        JinjaTemplate("{{ text|trim|tojson }}", "trim-json").render({{"text", " policy\n"}}, options);
+    failures += check(encoded.text == "\"policy\"" && encoded.boundary_mappings.empty() &&
+                          encoded.regions.size() == 1 && encoded.regions[0].tag == 7 &&
+                          !encoded.regions[0].source_offset,
+                      "JSON encoding of trimmed input retained an exact source boundary");
+
     std::vector<std::future<bool>> workers;
     for (int worker = 0; worker < 8; ++worker) {
         workers.push_back(std::async(std::launch::async, [&] {
