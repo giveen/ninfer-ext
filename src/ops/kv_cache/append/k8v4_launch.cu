@@ -47,6 +47,10 @@ void dispatch_k8v4(const Tensor& k, const Tensor& v, const Tensor& positions, Ca
         launch_k8v4_for<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
     }
+    if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+        launch_k8v4_for<KVCacheAppendD256Kv16>(k, v, positions, cache, metadata, stream);
+        return;
+    }
     launch_k8v4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
 }
 
@@ -86,6 +90,8 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
                 append.template operator()<KVCacheAppendD256Kv4>();
+            } else if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+                append.template operator()<KVCacheAppendD256Kv16>();
             } else {
                 append.template operator()<KVCacheAppendD256Kv2>();
             }

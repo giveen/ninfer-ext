@@ -766,6 +766,213 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 }
 
 runtime::BatchedGeneratedRound
+ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
+                                 std::span<const runtime::RoundBudget> budgets,
+                                 runtime::ExecutionTiming* failed_timing) {
+    nvtx::ScopedRange round_range(nvtx::Name::DecodeEagle3Round, nvtx::Category::Eagle3,
+                                  static_cast<std::uint64_t>(lanes.size()));
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    if (speculative_backend != SpeculativeBackend::Eagle3 || !io.mtp_decode ||
+        decoder->eagle3_cache() == nullptr) {
+        throw std::logic_error("EAGLE3 batch execution requires the EAGLE3 backend");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+        throw std::invalid_argument("EAGLE3 batch membership is invalid");
+    }
+
+    std::uint32_t maximum_frontier = 0;
+    std::array<const MtpAcceptanceEstimate*, kMaximumConcurrency> acceptance{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("EAGLE3 batch contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = active_sequence(lane);
+        acceptance[row]               = &sequence.mtp_acceptance;
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
+            text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
+            backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
+            sequence.execution_frontier >= capacity ||
+            sequence.mtp_kv_valid != sequence.execution_frontier ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier ||
+            sequence.prefix_digests.size() != sequence.ledger_frontier ||
+            sequence.mtp_draft_count > draft_window) {
+            throw std::logic_error("EAGLE3 batch row is not decode-ready");
+        }
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+    }
+
+    mtp_round_rung = mtp_policy.select(
+        mtp_round_rung,
+        std::span<const MtpAcceptanceEstimate* const>(acceptance.data(), lanes.size()));
+    MtpRung& rung             = mtp_rungs[mtp_round_rung];
+    const std::uint32_t k     = rung.k;
+    const std::uint32_t width = k + 1;
+
+    const auto started = Clock::now();
+    try {
+        std::optional<nvtx::ScopedRange> submit_range;
+        submit_range.emplace(nvtx::Name::DecodeEagle3Submit, nvtx::Category::Eagle3,
+                             static_cast<std::uint64_t>(lanes.size()));
+        execution::MtpCausalAttentionEnvelopes envelopes =
+            mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
+        DecodeGraphExecutable* executable = nullptr;
+        if (use_cuda_graph) {
+            DecodeGraphProfile& profile = select_graph_profile(
+                rung.graphs, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                "EAGLE3 batch");
+            executable = &install_graph_profile(rung.graphs, profile, "EAGLE3 batch");
+            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, k, capacity);
+        }
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence           = active_sequence(lanes[row]);
+            const RequestControl& request     = requests[lanes[row]];
+            const std::uint32_t frontier      = sequence.execution_frontier;
+            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                    ? budgets[row].generated_tokens_remaining - 1
+                                                    : 0;
+            const std::uint32_t structural_cap =
+                std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
+            const std::uint32_t extent = std::min(sequence.mtp_draft_count, structural_cap);
+
+            mtp_host_ingress->anchors[row]              = sequence.ledger.back();
+            mtp_host_ingress->base_frontiers[row] =
+                checked_i32(frontier, "EAGLE3 batch frontier");
+            mtp_host_ingress->remaining_budgets[row] =
+                checked_i32(budgets[row].generated_tokens_remaining, "EAGLE3 batch budget");
+            mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
+            mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
+            for (std::uint32_t j = 0; j < k; ++j) {
+                mtp_host_ingress->current_drafts[row * k + j] =
+                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+            }
+            for (std::uint32_t j = 0; j < width; ++j) {
+                const std::uint32_t position = frontier + std::min(j, extent);
+                mtp_host_ingress->target_rope_positions[row * width + j] =
+                    checked_i32(position, "EAGLE3 batch RoPE position") + sequence.rope_delta;
+            }
+            mtp_host_ingress->text_kv_table_rows[row] =
+                text_kv_addresses->bound_row(sequence.kv->text);
+            mtp_host_ingress->mtp_kv_table_rows[row] =
+                backend_kv_addresses->bound_row(*sequence.kv->backend);
+            const StateImageSelectors selectors            = state_selectors(sequence);
+            mtp_host_ingress->state_source_slots[row]      = selectors.source;
+            mtp_host_ingress->state_destination_slots[row] = selectors.destination;
+            mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
+            // The EAGLE3 frame is compact per round, so the feature sink scatters rows to
+            // themselves.
+            mtp_host_ingress->feature_lanes[row] = static_cast<std::int32_t>(row);
+            mtp_host_ingress->sampling[row]      = request.sampling_host;
+            ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
+                                      std::min(capacity, frontier + extent + k));
+        }
+        qwen3_5::KVHostStaging* staging        = stage_text_kv(lanes);
+        const qwen3_5::QsaIndexMirrors mirrors = mirror_qsa_index(lanes, true);
+
+        if (staging != nullptr || mirrors.active()) {
+            executable = nullptr;
+            envelopes  = mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
+        }
+
+        execution::Eagle3BatchContext schedule_state{
+            {device, parameters, work, state_images->linear(), &rung.records, io, prefill_hidden,
+             prefill_width, proposal_head, qwen4_execution()},
+            decoder->text_kv,
+            *decoder->eagle3_cache(),
+            rung.frame,
+            *mtp_host_ingress,
+            *mtp_host_egress,
+            state_images->continuation_hidden_store(),
+            staging,
+            mirrors};
+
+        mark_workspace_usage(workspace_plan.mtp_round);
+        execution::eagle3_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,
+                                       envelopes, executable);
+        submit_range.reset();
+        timing.begin_wait();
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeEagle3Wait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        }
+        timing.end_wait();
+
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        if (lanes.size() == 1) { mtp_policy.observe_round(mtp_round_rung, seconds); }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence       = active_sequence(lanes[row]);
+            RequestControl& request       = requests[lanes[row]];
+            const std::uint32_t base_E    = sequence.execution_frontier;
+            const std::uint32_t base_S    = sequence.ledger_frontier;
+            const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
+            const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
+            const std::int32_t next_i     = mtp_host_egress->next_extents[row];
+            if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
+                accepted_i + 1 != count_i || next_i < 0 || next_i > static_cast<std::int32_t>(k) ||
+                static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
+                static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
+                    capacity) {
+                throw std::runtime_error("EAGLE3 batch returned invalid row metadata");
+            }
+            const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
+                                                          row * width,
+                                                      static_cast<std::size_t>(count_i));
+            validate_licensed_tokens(row_tokens);
+            const std::uint32_t pcur =
+                static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+            if (pcur == 0) {
+                request.speculative_stats.fallback_steps += 1;
+            } else {
+                auto& stats = request.speculative_stats;
+                stats.rounds += 1;
+                stats.rounds_by_draft_length[k - 1U] += 1;
+                stats.drafted_tokens += pcur;
+                stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+                for (std::int32_t i = 0; i < accepted_i; ++i) {
+                    stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
+                }
+            }
+            request.pending = PendingCandidate{
+                .kind          = PendingKind::Speculative,
+                .base_E        = base_E,
+                .base_S        = base_S,
+                .prompt_tokens = 0,
+                .produced      = static_cast<std::uint32_t>(count_i),
+            };
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+        return runtime::BatchedGeneratedRound{
+            .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
+                                                   lanes.size() * width),
+            .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
+                                                        lanes.size()),
+            .row_stride = width,
+            .timing     = timing.finish(),
+        };
+    } catch (...) {
+        timing.begin_wait();
+        try {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeEagle3Wait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        } catch (...) {}
+        timing.end_wait();
+        clear_execution_failure_lanes(lanes);
+        throw;
+    }
+}
+
+runtime::BatchedGeneratedRound
 ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  std::span<const runtime::RoundBudget> budgets,
                                  runtime::ExecutionTiming* failed_timing) {
@@ -971,6 +1178,9 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
             return decode_ordinary_batch(lanes, budgets, failed_timing);
         }
         return decode_mtp_batch(lanes, budgets, failed_timing);
+    }
+    if (speculative_backend == SpeculativeBackend::Eagle3) {
+        return decode_eagle3_batch(lanes, budgets, failed_timing);
     }
     return decode_dflash_batch(lanes, budgets, failed_timing);
 }

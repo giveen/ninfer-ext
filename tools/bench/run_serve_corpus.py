@@ -31,9 +31,12 @@ SPECULATIVE_MODES = {
     "mtp_adaptive": ("mtp", 7),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
+    "eagle3_3": ("eagle3", 3),
+    "eagle3_5": ("eagle3", 5),
+    "eagle3_adaptive": ("eagle3", 7),
 }
-# MTP modes whose draft length the server chooses per round, up to the mode's draft tokens.
-ADAPTIVE_MODES = frozenset({"mtp_adaptive"})
+# Speculative modes whose draft length the server chooses per round, up to the mode's draft tokens.
+ADAPTIVE_MODES = frozenset({"mtp_adaptive", "eagle3_adaptive"})
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
 KV_CACHE_NAMES = {
@@ -527,7 +530,10 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
         "speculative_draft_window": spec.draft_tokens,
-        "proposal_head": "optimized" if spec.draft_tokens else "full",
+        # EAGLE3 carries its own draft head, so the optimized proposal head is never loaded.
+        "proposal_head": "full"
+        if spec.speculative_backend == "eagle3" or not spec.draft_tokens
+        else "optimized",
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
@@ -778,11 +784,12 @@ def serve_has_adaptive_mtp(serve: Path) -> bool:
     return "--fixed-draft" in completed.stdout + completed.stderr
 
 
-def mtp_draft_flags(serve: Path, mode_name: str) -> list[str]:
-    """Draft-policy flags for an MTP mode on this server build.
+def draft_policy_flags(serve: Path, mode_name: str) -> list[str]:
+    """Draft-policy flags for a speculative mode with an adaptive draft length on this build.
 
-    Fixed modes pin their draft length. A build without adaptive MTP always drafts exactly
-    --draft-tokens, so it needs no flag; an adaptive mode cannot run on it.
+    Fixed modes pin their draft length. A build without adaptive drafts always drafts exactly
+    --draft-tokens, so it needs no flag; an adaptive mode cannot run on it. MTP and EAGLE3 share
+    this policy; the masked-draft backends draft a fixed block.
     """
     adaptive_server = serve_has_adaptive_mtp(serve)
     if mode_name in ADAPTIVE_MODES:
@@ -831,11 +838,16 @@ def server_command(
                 spec.speculative_backend,
                 "--draft-tokens",
                 str(spec.draft_tokens),
-                "--lm-head-draft",
             ]
         )
-        if spec.speculative_backend == "mtp":
-            command.extend(mtp_draft_flags(serve, spec.speculative_mode))
+        if spec.speculative_backend == "eagle3":
+            # EAGLE3 carries its own draft head (never the optimized proposal head) and adapts its
+            # draft length like MTP.
+            command.extend(draft_policy_flags(serve, spec.speculative_mode))
+        else:
+            command.append("--lm-head-draft")
+            if spec.speculative_backend == "mtp":
+                command.extend(draft_policy_flags(serve, spec.speculative_mode))
     if spec.sampling_mode == "greedy":
         command.append("--greedy")
     else:

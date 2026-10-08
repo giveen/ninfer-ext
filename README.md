@@ -370,6 +370,35 @@ python3 -m tools.convert --model /path/to/Qwen3.8-27B --recipe qwen3_8_27b \
   --proposal --name qwen3.8-27b --out models/qwen3_8_27b_dflash2.ninfer
 ```
 
+### Converting an EAGLE3 artifact
+
+No published artifact carries EAGLE3 either. Convert one from a Qwen3.6-35B-A3B checkpoint and a
+SpecForge `LlamaForCausalLMEagle3` head:
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.6-35B-A3B-NVFP4 \
+  --recipe qwen3_6_35b_a3b_nvfp4 \
+  --source quantized=/path/to/Qwen3.6-35B-A3B-NVFP4 \
+  --source eagle3=/path/to/Qwen3.6-35B-A3B-Eagle3-Specforge \
+  --components text,vision,mtp,eagle3 \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --proposal --name qwen3.6-35b-a3b-eagle3 \
+  --out models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer
+```
+
+The head used here is the SpecForge EAGLE3 draft for Qwen3.5-35B-A3B
+(`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`). The converter normalizes its `midlayer.*` weights,
+derives the three target layers it fuses, stores the draft-to-target token map, and inherits the
+target's token embedding and tokenizer. Heads in the `speculators`/vLLM layout (nested
+`transformer_layer_config`, `layers.0.*` weights, a declared `eagle_aux_hidden_state_layer_ids` and a
+partial rotary factor) convert the same way; note that a published head is not automatically better
+for your traffic — the EAGLE3 reference measures the choices it knows. Serve it with `--spec eagle3 --draft-tokens N`. Keep
+`--proposal`: EAGLE3 does not need the optimized proposal head (it drafts through its own 32k head
+and rejects `--lm-head-draft`), but without it the file cannot run the documented
+`--spec mtp --lm-head-draft` configuration at all, so EAGLE3 could only be compared against — or
+fall back to — the slower full-head MTP. See [EAGLE3](docs/maintainer/eagle3.md) for the draft
+graph, the target conditioning, the draft-KV cost and the measured comparison against MTP.
+
 ## Qwen3.8-Flash-Next
 
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) has about 180B parameters: about 121B are 512 routed
@@ -848,8 +877,9 @@ describes the planner.
 - Text with thinking and non-thinking modes.
 - Image, multi-image, video and mixed multimodal input (`--vision`).
 - Chunked prefill, and CUDA Graph decode of one to eight concurrent requests.
-- Speculative decoding: MTP on every model, DFlash (draft windows 1–15) on Qwen3.6-35B-A3B, and
-  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights. A host prompt-lookup (suffix)
+- Speculative decoding: MTP on every model, DFlash (draft windows 1–15) on Qwen3.6-35B-A3B,
+  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights, and EAGLE3 (draft windows
+  1–15) on artifacts that carry an EAGLE3 draft head. A host prompt-lookup (suffix)
   draft source rides any MTP model, with a measured cost gate (`--lookup-drafts`).
 - BF16, INT8, FP8, NVFP4 and K8V4 KV storage.
 - Private and shared exact-prefix reuse, with Device and Host retention.

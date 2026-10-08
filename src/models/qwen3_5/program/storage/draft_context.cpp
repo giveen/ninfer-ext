@@ -27,4 +27,7 @@ void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t source_slot,
     local.copy_slot_from(local, source_slot, destination_slot, stream);
 }
 
+Eagle3PrefillState::Eagle3PrefillState(DeviceSpan backing, const Eagle3PrefillLayout& layout)
+    : features(layout.features.bind(backing)), positions(layout.positions.bind(backing)) {}
+
 } // namespace ninfer::models::qwen3_5::detail

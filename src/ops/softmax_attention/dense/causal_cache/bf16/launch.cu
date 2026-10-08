@@ -59,6 +59,8 @@ void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvC
     };
     if (p.query_heads == 24)
         invoke.template operator()<CausalD256H24Kv4>();
+    else if (cache.kv_heads == 16)
+        invoke.template operator()<CausalD256H16Kv16>();
     else
         invoke.template operator()<CausalD256H16Kv2>();
 }
@@ -76,6 +78,8 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
     const auto partial = storage.view();
     if (p.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan, partial, stream);
+    else if (cache.num_kv_heads == 16)
+        grouped_instance<CausalD256H16Kv16>(p, view, input, plan, partial, stream);
     else
         grouped_instance<CausalD256H16Kv2>(p, view, input, plan, partial, stream);
 }
@@ -87,7 +91,8 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
-    const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+    const auto plan           = make_bf16_kv_causal_plan(q.ne[1], cache.num_kv_heads, q.ne[2],
+                                                         q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (!plan.grouped()) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
@@ -108,7 +113,8 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan =
-        make_bf16_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+        make_bf16_kv_causal_plan(q.ne[1], cache.num_kv_heads, q.ne[2], 1, envelope,
+                                 execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),

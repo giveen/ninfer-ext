@@ -50,7 +50,7 @@ def _optional(model, recipe):
             else:
                 format = Q5
             _assign(recipe, name, format)
-        elif name.startswith(("mtp/", "dflash/", "dflash2/")):
+        elif name.startswith(("mtp/", "dflash/", "dflash2/", "eagle3/")):
             if name.endswith(
                 (
                     "/moe/router",

@@ -51,6 +51,12 @@ artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-to
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
 `--vision`.
 
+Artifacts carrying EAGLE3 draft weights serve `--spec eagle3 --draft-tokens N` (1..15). The draft
+keeps its own draft head, so `--lm-head-draft` is rejected, and it adapts its draft length like MTP
+unless `--fixed-draft` pins it. `--draft-tree N` selects the static draft-tree root width, whose
+only implemented value is `1`; a wider tree is rejected when the server starts. See
+[EAGLE3](maintainer/eagle3.md).
+
 When `--model-id` is omitted, the server advertises and accepts the artifact's `metadata.name`,
 falling back to its architecture name when no name is stored. An explicit `--model-id` is a public
 HTTP alias override and does not select or alter model execution.
@@ -58,7 +64,7 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
+frozen by `--spec mtp|dflash|dflash2|eagle3` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
@@ -940,9 +946,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
-| `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--spec mtp\|dflash\|dflash2\|eagle3` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2/EAGLE3 `1..15` | MTP `7`; otherwise unset |
+| `--fixed-draft` | MTP/EAGLE3: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--draft-tree N` | EAGLE3 static draft-tree root width; only `1` (a chain) is implemented | `1` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
 | `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |

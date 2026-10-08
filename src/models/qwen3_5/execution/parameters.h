@@ -102,7 +102,9 @@ struct DynamicConvParameters {
 
 struct DraftBlockParameters {
     Tensor input_norm, post_attention_norm;
+    Tensor hidden_norm; // EAGLE3 fused-feature norm; unused by DFlash
     LinearParameters query_key_value, context_key, context_value;
+    LinearParameters query, key, value; // EAGLE3 plain q/k/v (2h input); unused by DFlash
     Tensor query_norm, key_norm;
     LinearParameters output;
     DenseParameters mlp;
@@ -120,6 +122,7 @@ struct DraftParameters {
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
     LinearParameters output_head;
+    Tensor d2t; // EAGLE3 draft-to-target token-id map; unused by DFlash
 };
 
 struct ProposalParameters {

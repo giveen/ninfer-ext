@@ -185,6 +185,23 @@ int main() {
     } catch (const std::invalid_argument&) { fixed_without_mtp_rejected = true; }
     failures += check(fixed_without_mtp_rejected, "--fixed-draft was accepted for DFlash");
 
+    const ServeOptions eagle3 =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "eagle3", "--draft-tokens", "3"});
+    failures += check(eagle3.speculative.backend == ninfer::SpeculativeBackend::Eagle3 &&
+                          eagle3.speculative.draft_tokens == 3 &&
+                          eagle3.speculative.proposal_head == ninfer::ProposalHead::Full &&
+                          eagle3.speculative.tree_width == 1,
+                      "EAGLE3 did not select a draft chain without the proposal head");
+    const ServeOptions eagle3_fixed = parse({"ninfer-serve", "model.ninfer", "--spec", "eagle3",
+                                             "--draft-tokens", "3", "--fixed-draft"});
+    failures += check(eagle3_fixed.speculative.fixed_draft, "--fixed-draft was not preserved");
+    bool wide_tree_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "eagle3", "--draft-tokens", "3",
+                     "--draft-tree", "2"});
+    } catch (const std::invalid_argument&) { wide_tree_rejected = true; }
+    failures += check(wide_tree_rejected, "the server accepted an EAGLE3 draft tree wider than 1");
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

@@ -335,11 +335,16 @@ def server_command(
                 point.speculative_backend,
                 "--draft-tokens",
                 str(point.draft_tokens),
-                "--lm-head-draft",
             ]
         )
-        if point.speculative_backend == "mtp":
-            command.extend(corpus.mtp_draft_flags(serve, point.speculative_mode))
+        if point.speculative_backend == "eagle3":
+            # EAGLE3 carries its own draft head (never the optimized proposal head) and adapts its
+            # draft length like MTP.
+            command.extend(corpus.draft_policy_flags(serve, point.speculative_mode))
+        else:
+            command.append("--lm-head-draft")
+            if point.speculative_backend == "mtp":
+                command.extend(corpus.draft_policy_flags(serve, point.speculative_mode))
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -382,7 +387,10 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": "optimized" if point.draft_tokens else "full",
+        # EAGLE3 carries its own draft head, so the optimized proposal head is never loaded.
+        "proposal_head": "full"
+        if point.speculative_backend == "eagle3" or not point.draft_tokens
+        else "optimized",
     }
     if args.prefill_chunk is None:
         # The server resolved its own default; its value is recorded, not prescribed.

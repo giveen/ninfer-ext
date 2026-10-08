@@ -118,6 +118,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    Eagle3,
 };
 
 // Prompt-lookup (suffix) draft source, shared with the MTP backend. It proposes tokens that
@@ -138,6 +139,9 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     bool fixed_draft           = false;
+    // Static draft-tree root width for EAGLE3 (1 is a chain; wider trees are planned but not
+    // implemented yet, so validation currently pins this to 1).
+    std::uint32_t tree_width = 1;
     // Lookup drafts substitute for the MTP drafts inside the same round; only meaningful with MTP.
     LookupDraftMode lookup_drafts = LookupDraftMode::Off;
     // Shortest match whose proposal may be used (3..32).

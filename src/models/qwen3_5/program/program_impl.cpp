@@ -44,7 +44,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), prefill_width(plan.prefill_width),
-      draft_window(plan.draft_window),
+      draft_window(plan.draft_window), tree_width(plan.tree_width),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
       lookup_drafts(plan.lookup_drafts), lookup_min_match(plan.lookup_min_match),
@@ -69,7 +69,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
-      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp
+      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp ||
+                       plan.speculative_backend == SpeculativeBackend::Eagle3
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::MtpDecodeIngress) +
                                                           sizeof(qwen3_5::MtpDecodeEgress))
                    : std::nullopt),
@@ -194,6 +195,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
+    if (plan.persistent.eagle3) { eagle3_prefill.emplace(backing, *plan.persistent.eagle3); }
+    if (eagle3_prefill.has_value() !=
+        (speculative_backend == SpeculativeBackend::Eagle3)) {
+        throw std::logic_error("EAGLE3 prefill state does not match the sequence plan");
+    }
     if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
         backend_host_kv_page_stride =
             plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
@@ -254,7 +260,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
-    if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
+    if (io.mtp_decode.has_value() !=
+        (speculative_backend == SpeculativeBackend::Mtp ||
+         speculative_backend == SpeculativeBackend::Eagle3)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() !=
@@ -519,6 +527,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 {},
                 decoder->text_kv,
                 nullptr,
+                nullptr,
+                nullptr,
+                {},
                 nullptr,
                 cursor,
                 nullptr,

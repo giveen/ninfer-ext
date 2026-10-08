@@ -237,7 +237,38 @@ public:
         return {tensor(w.base_kernel), linear(w.kernel_projection)};
     }
 
+    // EAGLE3 draft: no masked context, a 2h-wide attention input, its own head and the d2t map.
+    DraftParameters draft_eagle3(const DraftWeights& w) const {
+        DraftParameters out;
+        out.feature_projection = linear(w.feature_projection);
+        out.final_norm         = tensor(w.final_norm);
+        out.output_head        = linear(w.output_head_use);
+        out.d2t                = tensor(w.d2t);
+        out.layers.reserve(w.layers.size());
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(with_context(
+                std::string(model_.options().speculative_component()) + "/layers/" +
+                    std::to_string(i),
+                [&] {
+                    const auto& layer = w.layers[i];
+                    const auto& a     = layer.attention;
+                    DraftBlockParameters result;
+                    result.input_norm          = tensor(layer.input_norm);
+                    result.hidden_norm         = tensor(layer.hidden_norm);
+                    result.post_attention_norm = tensor(layer.post_attention_norm);
+                    result.query               = linear(a.query);
+                    result.key                 = linear(a.key);
+                    result.value               = linear(a.value);
+                    result.output = linear(a.output);
+                    result.mlp    = dense(layer.mlp);
+                    return result;
+                }));
+        }
+        return out;
+    }
+
     DraftParameters draft(const DraftWeights& w) const {
+        if (model_.config().draft && model_.config().draft->eagle3) { return draft_eagle3(w); }
         DraftParameters out;
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);

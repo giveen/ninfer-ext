@@ -180,6 +180,10 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
         launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
     }
+    if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+        launch_full<KVCacheAppendD256Kv16>(k, v, positions, cache, metadata, stream);
+        return;
+    }
     launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
 }
 
@@ -221,6 +225,8 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
                 append.template operator()<KVCacheAppendD256Kv4>();
+            } else if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+                append.template operator()<KVCacheAppendD256Kv16>();
             } else {
                 append.template operator()<KVCacheAppendD256Kv2>();
             }
@@ -242,6 +248,8 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
                 append.template operator()<KVCacheAppendD256Kv4>();
+            } else if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+                append.template operator()<KVCacheAppendD256Kv16>();
             } else {
                 append.template operator()<KVCacheAppendD256Kv2>();
             }
@@ -250,6 +258,10 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
         }
         if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
             launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
+            return;
+        }
+        if (k.ne[1] == KVCacheAppendD256Kv16::KVHeads) {
+            launch_full<KVCacheAppendD256Kv16>(k, v, positions, cache, metadata, stream);
             return;
         }
         launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);

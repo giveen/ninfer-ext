@@ -31,6 +31,9 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
     }
+    if (spec.proposal_rows < 0) {
+        throw std::invalid_argument("RoundState proposal_rows must not be negative");
+    }
     if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
@@ -136,16 +139,19 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     };
     if (layout.spec.backend == SpeculativeBackend::Mtp) {
         layout.mtp.emplace();
-        const auto ar_steps =
-            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
-                        "RoundState MTP AR steps exceed int32");
         layout.mtp->position         = i32(1, "MTP prefill autoregressive position");
         layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
                                                   "MTP prefill autoregressive hidden");
         layout.mtp->draft_tokens     = i32(drafts, "MTP prefill draft tokens");
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
         layout.mtp->target_positions = i32(columns, "MTP prefill target positions");
-
+    }
+    // EAGLE3 reuses the MTP decode frame (its round is MTP-shaped) without the MTP prefill state.
+    if (layout.spec.backend == SpeculativeBackend::Mtp ||
+        layout.spec.backend == SpeculativeBackend::Eagle3) {
+        const auto ar_steps =
+            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
+                        "RoundState MTP AR steps exceed int32");
         layout.mtp_decode.emplace();
         MtpDecodeStateLayout& decode = *layout.mtp_decode;
         decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, "MTP decode ingress");
@@ -166,8 +172,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_continuation_hidden =
             add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
                        "MTP decode target continuation hidden");
-        decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
-                                            "MTP decode proposal logits");
+        // The proposal head's own output region: the target vocabulary by default, the draft
+        // vocabulary for EAGLE3 (its head is projected in place here, never into a wider buffer).
+        decode.proposal_logits = add_tensor(
+            builder, DType::BF16,
+            {layout.spec.proposal_rows > 0 ? layout.spec.proposal_rows : layout.spec.output_rows,
+             batch},
+            "MTP decode proposal logits");
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =
@@ -183,6 +194,14 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        if (layout.spec.backend == SpeculativeBackend::Eagle3) {
+            if (layout.spec.eagle3_fused <= 0) {
+                throw std::invalid_argument("EAGLE3 round state requires its fused feature width");
+            }
+            decode.eagle3_features =
+                add_tensor(builder, DType::BF16,
+                           {layout.spec.eagle3_fused, columns, batch}, "EAGLE3 decode features");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         DFlashPrefillStateLayout& prefill = layout.dflash_prefill.emplace();
@@ -291,6 +310,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     state_destination_slots =
         ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
+    feature_lanes =
+        ingress_tensor(offsetof(MtpDecodeIngress, feature_lanes), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
 
@@ -331,6 +352,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_positions               = window_view(layout.ar_positions, {batch, steps});
     ar_rope_positions          = window_view(layout.ar_rope_positions, {batch, steps});
     ar_valid_columns           = window_view(layout.ar_valid_columns, {batch, steps});
+    if (layout.eagle3_features) {
+        features = window_view(*layout.eagle3_features,
+                               {layout.eagle3_features->shape[0], width, batch});
+    }
 }
 
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

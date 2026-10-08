@@ -12,6 +12,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "eagle3") { return SpeculativeBackend::Eagle3; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -25,6 +26,8 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::Eagle3:
+        return "eagle3";
     }
     return "unknown";
 }
@@ -49,6 +52,9 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.tree_width != 1 && options.backend != SpeculativeBackend::Eagle3) {
+        throw std::invalid_argument("--draft-tree requires --spec eagle3");
+    }
     if (options.lookup_drafts != LookupDraftMode::Off) {
         if (options.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("--lookup-drafts requires --spec mtp");
@@ -63,7 +69,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             options.fixed_draft) {
             throw std::invalid_argument(
                 "--draft-tokens, --lm-head-draft and --fixed-draft require --spec "
-                "mtp|dflash|dflash2");
+                "mtp|dflash|dflash2|eagle3");
         }
         return;
     case SpeculativeBackend::Mtp: {
@@ -86,7 +92,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
         }
         if (options.fixed_draft) {
-            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp|eagle3");
         }
         return;
     case SpeculativeBackend::DFlash2:
@@ -94,7 +100,19 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
         }
         if (options.fixed_draft) {
-            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
+            throw std::invalid_argument("--fixed-draft applies only to --spec mtp|eagle3");
+        }
+        return;
+    case SpeculativeBackend::Eagle3:
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw std::invalid_argument("--spec eagle3 requires --draft-tokens in [1,15]");
+        }
+        if (options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("--spec eagle3 uses its own draft head, not --lm-head-draft");
+        }
+        if (options.tree_width != 1) {
+            throw std::invalid_argument(
+                "--draft-tree must be 1: wider draft trees are not implemented yet");
         }
         return;
     }

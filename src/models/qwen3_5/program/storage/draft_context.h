@@ -26,4 +26,12 @@ struct DFlashPersistentState {
                                  cudaStream_t stream);
 };
 
+// EAGLE3 prefill feature capture over one chunk.
+struct Eagle3PrefillState {
+    Tensor features;
+    Tensor positions;
+
+    Eagle3PrefillState(DeviceSpan backing, const Eagle3PrefillLayout& layout);
+};
+
 } // namespace ninfer::models::qwen3_5::detail

@@ -11,5 +11,6 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/ple_rows.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/draft.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/eagle3.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/visual_scatter.cpp"
 )

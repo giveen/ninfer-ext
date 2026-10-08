@@ -316,9 +316,9 @@ std::string usage_text(std::string_view program) {
         << " (default: model; 4096 for Qwen4Exp, else 1024 beside\n"
         << "                              decode and 4096 alone; an explicit value fixes both)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
-        << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
+        << "  --spec <mtp|dflash|dflash2|eagle3> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"
-        << "                              DFlash/DFlash2 1..15\n"
+        << "                              DFlash/DFlash2/Eagle3 1..15\n"
         << "  --fixed-draft               MTP: always draft exactly --draft-tokens\n"
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
@@ -376,6 +376,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (arg == "--draft-tree") {
+            options.speculative.tree_width = parse_u32(value("--draft-tree"), "draft-tree");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--fixed-draft") {
@@ -617,6 +619,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
+        << " tree_width=" << env.speculative.tree_width
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
         << " graph_prime="
@@ -735,6 +738,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
+        << "    \"tree_width\": " << env.speculative.tree_width << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -815,7 +819,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
            "context,prefill_chunk,"
            "speculative_"
-           "backend,draft_tokens,"
+           "backend,draft_tokens,tree_width,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
@@ -842,7 +846,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
             << csv_field(env.artifact_path) << ',' << env.max_context << ',' << env.prefill_chunk
             << ',' << product::speculative_backend_name(env.speculative.backend) << ','
-            << env.speculative.draft_tokens << ','
+            << env.speculative.draft_tokens << ',' << env.speculative.tree_width << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','

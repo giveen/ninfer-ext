@@ -58,6 +58,9 @@ private:
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const DraftConfig& config,
                                       const TextConfig& target, const TextWeights& weights,
                                       const std::string& component);
+[[nodiscard]] DraftWeights bind_eagle3(Bindings& bindings, const DraftConfig& config,
+                                       const TextConfig& target, const TextWeights& weights,
+                                       const std::string& component);
 void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target);
 [[nodiscard]] Qwen4TextWeights bind_qwen4_text(Bindings& bindings, const TextConfig& config);

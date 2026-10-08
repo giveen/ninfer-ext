@@ -260,7 +260,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
             sequence.prefix_digests.size() != sequence.ledger_frontier ||
             sequence.text_kv_valid != sequence.execution_frontier ||
-            (speculative_backend == SpeculativeBackend::Mtp &&
+            ((speculative_backend == SpeculativeBackend::Mtp ||
+              speculative_backend == SpeculativeBackend::Eagle3) &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
             (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier > sequence.execution_frontier) ||
@@ -354,6 +355,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     decoder->text_kv,
                     decoder->mtp_cache(),
                     dflash ? &*dflash : nullptr,
+                    eagle3_prefill ? &*eagle3_prefill : nullptr,
+                    eagle3_kv_view(sequence),
+                    decoder->eagle3_cache(),
                     cursor,
                     nullptr,
                     nullptr,
@@ -378,7 +382,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 }
                 cursor += result.processed_tokens;
                 sequence.text_kv_valid = cursor;
-                if (speculative_backend == SpeculativeBackend::Mtp) {
+                if (speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3) {
                     sequence.mtp_kv_valid = cursor;
                 } else if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = cursor;
@@ -729,7 +734,8 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
-        if (speculative_backend == SpeculativeBackend::Mtp) {
+        if (speculative_backend == SpeculativeBackend::Mtp ||
+            speculative_backend == SpeculativeBackend::Eagle3) {
             if (state.mtp_kv_valid + 1 < frontier) { return false; }
         } else if (speculative_backend == SpeculativeBackend::DFlash) {
             if (state.dflash_context_frontier < frontier) { return false; }

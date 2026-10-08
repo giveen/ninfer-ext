@@ -125,9 +125,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                   ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
+    const std::uint64_t eagle3_extra_pages =
+        plan.features.eagle3()
+            ? static_cast<std::uint64_t>(plan.max_concurrency) *
+                  ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
+                   static_cast<std::uint32_t>(kPagedKVPageSize))
+            : 0ULL;
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    const std::uint32_t eagle3_physical_pages = static_cast<std::uint32_t>(
+        checked_i32(static_cast<std::uint64_t>(physical_pages) + eagle3_extra_pages,
+                    "EAGLE3 Paged KV physical pages exceed int32"));
+    const std::int32_t eagle3_heads =
+        parameters.model.config().draft && parameters.model.config().draft->eagle3
+            ? dimension(parameters.model.config().draft->attention.num_key_value_heads)
+            : 0;
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
@@ -139,9 +152,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
+                     .enable_eagle3             = plan.features.eagle3(),
+                     .eagle3_kv_heads           = eagle3_heads,
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .eagle3_physical_page_groups = eagle3_physical_pages,
                      .qsa_index                 = config.sparse_attention.has_value(),
                      .kv_stream                 = plan.kv_stream,
                      // Every request's Device window is at least the startup minimum, so at most
@@ -259,13 +275,40 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 "DFlash pending target features");
         }
     }
+    if (plan.speculative_backend == SpeculativeBackend::Eagle3) {
+        const auto* draft =
+            parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
+        if (draft == nullptr || !draft->eagle3) {
+            throw std::logic_error("EAGLE3 prefill requires the EAGLE3 draft config");
+        }
+        Eagle3PrefillLayout& eagle3 = out.eagle3.emplace();
+        eagle3.features =
+            add_tensor(builder, DType::BF16,
+                       {static_cast<std::int32_t>(draft->eagle3->fused_input_size()),
+                        effective_prefill_chunk},
+                       "EAGLE3 prefill target features");
+        eagle3.positions = add_tensor(builder, DType::I32, {effective_prefill_chunk},
+                                      "EAGLE3 prefill target positions");
+    }
 
+    // The EAGLE3 draft head projects into the frame's proposal buffer directly, so that buffer is
+    // exactly the draft vocabulary wide; every other backend follows the target vocabulary.
+    const auto* const eagle3_config =
+        parameters.model.config().draft && parameters.model.config().draft->eagle3
+            ? &*parameters.model.config().draft->eagle3
+            : nullptr;
+    const std::int32_t proposal_rows =
+        eagle3_config != nullptr ? static_cast<std::int32_t>(eagle3_config->draft_vocab_size) : 0;
+    const std::int32_t eagle3_fused =
+        eagle3_config != nullptr ? static_cast<std::int32_t>(eagle3_config->fused_input_size()) : 0;
     out.round = qwen3_5::begin_round_state_layout(
         builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.residual_width()),
                                          .output_rows    = dimension(config.vocab_size),
+                                         .proposal_rows  = proposal_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
+                                         .eagle3_fused   = eagle3_fused,
                                          .causal_scoring = plan.causal_scoring,
                                          .plain_batches  = plan.plain_mtp_batches,
                                          .lookup_only    = plan.lookup_only});
@@ -762,6 +805,56 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     out.text_prefill = finish(text_prefill);
 
+    if (plan.features.eagle3()) {
+        // The EAGLE3 draft forward runs inside the text prefill chunk over the same arena: the
+        // encoder fuses the captured target layers and the one-layer decoder appends the chunk's
+        // draft KV. The draft attention needs its own scratch (draft geometry, BF16 pool); without
+        // it the round survives on leftover slack until a small chunk plan meets a long prompt.
+        const auto* draft_config =
+            parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
+        if (draft_config && draft_config->eagle3 && parameters.draft &&
+            !parameters.draft->layers.empty()) {
+            const auto& layer     = parameters.draft->layers.at(0);
+            const std::int32_t h  = dimension(config.hidden_size);
+            const std::int32_t qw = dimension(draft_config->attention.num_attention_heads) *
+                                    dimension(draft_config->attention.head_dim);
+            const std::int32_t kw = dimension(draft_config->attention.num_key_value_heads) *
+                                    dimension(draft_config->attention.head_dim);
+            WorkspaceLayoutBuilder eagle3_prefill;
+            {
+                auto scope = eagle3_prefill.scope();
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // g
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // draft_hidden
+                linear_scratch(eagle3_prefill, parameters.draft->feature_projection, chunk, chunk);
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // emb
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // e
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // u
+                matrix(eagle3_prefill, DType::BF16, 2 * h, chunk);  // x
+                matrix(eagle3_prefill, DType::BF16, qw, chunk);      // q
+                matrix(eagle3_prefill, DType::BF16, kw, chunk);      // k
+                matrix(eagle3_prefill, DType::BF16, kw, chunk);      // v
+                linear_scratch(eagle3_prefill, layer.query, chunk, chunk);
+                linear_scratch(eagle3_prefill, layer.key, chunk, chunk);
+                linear_scratch(eagle3_prefill, layer.value, chunk, chunk);
+                matrix(eagle3_prefill, DType::BF16, qw, chunk);     // a
+                scratch(eagle3_prefill,
+                        ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {dimension(draft_config->attention.head_dim),
+                             dimension(draft_config->attention.num_attention_heads),
+                             dimension(draft_config->attention.num_key_value_heads)},
+                            KvCacheStorage::BFloat16, text_envelope, 1, 1, chunk,
+                            device_execution));
+                matrix(eagle3_prefill, DType::BF16, h, chunk);      // y
+                linear_scratch(eagle3_prefill, layer.output, chunk, chunk);
+                matrix(eagle3_prefill, DType::BF16, h, chunk);       // m
+                // The draft forward runs its FFN through the split (unfused) path, like MTP.
+                scratch(eagle3_prefill,
+                        execution::ffn_workspace_bytes(layer.mlp, chunk, chunk, true));
+            }
+            out.text_prefill = std::max(out.text_prefill, finish(eagle3_prefill));
+        }
+    }
+
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
         matrix(causal_score, DType::BF16, dimension(config.vocab_size),
@@ -854,6 +947,76 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     batch, batch);
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), batch_accept});
+        }
+    }
+
+    if (plan.features.eagle3()) {
+        // The EAGLE3 round reuses the MTP host bridge, frame and envelopes; only the draft
+        // forward differs, so the target verify matches the MTP block above while the draft core
+        // uses the draft geometry against the always-BF16 draft pool. Like the prefill block,
+        // this funds the draft attention scratch the round allocates.
+        const auto* draft_config =
+            parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
+        if (draft_config && draft_config->eagle3 && parameters.draft &&
+            !parameters.draft->layers.empty()) {
+            const auto& layer     = parameters.draft->layers.at(0);
+            const std::int32_t h  = dimension(config.hidden_size);
+            const std::int32_t qw = dimension(draft_config->attention.num_attention_heads) *
+                                    dimension(draft_config->attention.head_dim);
+            const std::int32_t kw = dimension(draft_config->attention.num_key_value_heads) *
+                                    dimension(draft_config->attention.head_dim);
+            const auto eagle3_decode_core = [&](WorkspaceLayoutBuilder& layout,
+                                                std::int32_t width, std::int32_t batch) {
+                const std::int32_t tokens = batch * width;
+                auto core                 = layout.scope();
+                matrix(layout, DType::BF16, h, tokens);       // g
+                matrix(layout, DType::BF16, h, tokens);       // hidden
+                linear_scratch(layout, parameters.draft->feature_projection, tokens, tokens);
+                matrix(layout, DType::BF16, h, tokens);       // emb
+                matrix(layout, DType::BF16, h, tokens);       // e
+                matrix(layout, DType::BF16, h, tokens);       // u
+                matrix(layout, DType::BF16, 2 * h, tokens);  // x
+                matrix(layout, DType::BF16, qw, tokens);      // q
+                matrix(layout, DType::BF16, kw, tokens);      // k
+                matrix(layout, DType::BF16, kw, tokens);      // v
+                linear_scratch(layout, layer.query, tokens, tokens);
+                linear_scratch(layout, layer.key, tokens, tokens);
+                linear_scratch(layout, layer.value, tokens, tokens);
+                matrix(layout, DType::BF16, qw, tokens);     // a
+                scratch(layout,
+                        ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {dimension(draft_config->attention.head_dim),
+                             dimension(draft_config->attention.num_attention_heads),
+                             dimension(draft_config->attention.num_key_value_heads)},
+                            KvCacheStorage::BFloat16, text_envelope, batch, width, width,
+                            device_execution));
+                matrix(layout, DType::BF16, h, tokens);     // y
+                linear_scratch(layout, layer.output, tokens, tokens);
+                matrix(layout, DType::BF16, h, tokens);     // m
+                // The draft forward runs its FFN through the split (unfused) path, like MTP.
+                scratch(layout, execution::ffn_workspace_bytes(layer.mlp, tokens, tokens, true));
+            };
+            for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+                 ++batch) {
+                const std::int32_t aggregate = batch * verify;
+                WorkspaceLayoutBuilder target;
+                matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
+                target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
+                            GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
+                WorkspaceLayoutBuilder alignment;
+                eagle3_decode_core(alignment, verify, batch);
+                WorkspaceLayoutBuilder ar;
+                eagle3_decode_core(ar, 1, batch);
+                WorkspaceLayoutBuilder proposal;
+                matrix(proposal, DType::BF16, dimension(config.hidden_size), batch); // normed
+                linear_scratch(proposal, parameters.draft->output_head, batch, batch);
+                const std::size_t batch_accept =
+                    ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                        dimension(parameters.model.resources().public_token_count), drafts, drafts,
+                        batch, batch);
+                out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment),
+                                          finish(ar), finish(proposal), batch_accept});
+            }
         }
     }
 
@@ -1071,6 +1234,10 @@ PrefillWidths clamped_prefill_widths(const execution::Parameters& parameters,
 
 void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
                              const EngineOptions& options) {
+    if (options.speculative.tree_width != 1 &&
+        options.speculative.backend != SpeculativeBackend::Eagle3) {
+        throw std::invalid_argument("draft-tree widths above 1 require the EAGLE3 backend");
+    }
     if (!parameters.model.config().text.attention ||
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
@@ -1168,6 +1335,21 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
+        }
+        break;
+    case SpeculativeBackend::Eagle3:
+        if (!parameters.draft || !parameters.model.config().draft->eagle3) {
+            throw std::invalid_argument("selected EAGLE3 backend is not supported by this target");
+        }
+        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument("EAGLE3 draft window must be in [1,15]");
+        }
+        if (options.speculative.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("EAGLE3 uses its own draft head, not the proposal head");
+        }
+        if (options.speculative.tree_width != 1) {
+            throw std::invalid_argument(
+                "EAGLE3 draft-tree widths above 1 are not implemented yet");
         }
         break;
     }
@@ -1310,6 +1492,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->prefill_width       = inputs.prefill_width;
     impl->draft_window        = inputs.draft_window;
+    impl->tree_width          = inputs.tree_width;
     impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
     impl->lookup_drafts       = inputs.lookup_drafts;
@@ -1520,7 +1703,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk       = clamped_prefill_widths(parameters, options).chunk,
         .prefill_width       = clamped_prefill_widths(parameters, options).idle,
         .draft_window        = options.speculative.draft_tokens,
-        .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
+        .tree_width          = options.speculative.tree_width,
+        .adaptive_draft      = (options.speculative.backend == SpeculativeBackend::Mtp ||
+                                options.speculative.backend == SpeculativeBackend::Eagle3) &&
                           !options.speculative.fixed_draft,
         .speculative_backend = options.speculative.backend,
         .lookup_drafts       = options.speculative.lookup_drafts,

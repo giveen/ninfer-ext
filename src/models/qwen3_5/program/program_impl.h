@@ -650,6 +650,8 @@ public:
     const std::uint32_t prefill_width;
     // Largest draft length. MTP rounds may run shorter draft lengths from `mtp_rungs`.
     const std::uint32_t draft_window;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    const std::uint32_t tree_width;
     const bool adaptive_draft;
     // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
     const bool plain_mtp_batches;
@@ -698,6 +700,7 @@ public:
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<Eagle3PrefillState> eagle3_prefill;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -1306,6 +1309,10 @@ private:
                      std::span<const runtime::RoundBudget> budgets,
                      runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_eagle3_batch(std::span<const std::uint32_t> lanes,
+                        std::span<const runtime::RoundBudget> budgets,
+                        runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
@@ -1387,6 +1394,7 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_5::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_5::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_5::PagedKVCacheView eagle3_kv_view(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::models::qwen3_5::detail

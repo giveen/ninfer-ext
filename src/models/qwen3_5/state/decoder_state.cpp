@@ -106,6 +106,14 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                    spec.mtp_physical_page_groups, spec.qsa_index, spec.kv_stream);
     }
+    if (spec.enable_eagle3) {
+        // The draft is multi-head (one query head per KV head); only the BF16 causal producer
+        // registers that geometry, and the draft's single layer makes the wider KV cheap.
+        layout.eagle3_kv = plan_cache(builder, 1, spec.capacity, spec.eagle3_kv_heads,
+                                      spec.attention_head_dim, KvCacheStorage::BFloat16,
+                                      spec.kv_table_rows, spec.eagle3_physical_page_groups, false,
+                                      spec.kv_stream);
+    }
     if (spec.kv_staging_pages != 0) {
         if (!spec.kv_stream) {
             throw std::invalid_argument("prefill KV staging requires KV streaming");
@@ -245,12 +253,14 @@ ops::QsaIndexPlane PagedKVCache::index_plane(std::uint32_t layer) const {
 }
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
-    return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
+    return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0) +
+           (eagle3_kv ? eagle3_kv->payload_bytes() : 0);
 }
 
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
     : text_kv(backing, layout.text_kv) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
+    if (layout.eagle3_kv) { eagle3_kv.emplace(backing, *layout.eagle3_kv); }
     if (layout.text_kv_staging) {
         text_kv_staging.emplace(backing, *layout.text_kv_staging, text_kv);
     }
@@ -524,5 +534,11 @@ ops::QsaIndexPlane QsaIndexMirror::plane(const ops::QsaIndexPlane& plane,
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
 
 const PagedKVCache* DecoderState::mtp_cache() const noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
+
+PagedKVCache* DecoderState::eagle3_cache() noexcept { return eagle3_kv ? &*eagle3_kv : nullptr; }
+
+const PagedKVCache* DecoderState::eagle3_cache() const noexcept {
+    return eagle3_kv ? &*eagle3_kv : nullptr;
+}
 
 } // namespace ninfer::models::qwen3_5

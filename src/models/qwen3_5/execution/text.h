@@ -89,7 +89,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
+                const qwen3_5::PagedKVCache* batch_eagle3_kv = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -126,6 +127,17 @@ public:
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
+
+    // EAGLE3 prefill: the sequence's draft KV execution view, read while the draft layer appends.
+    void set_eagle3_prefill_kv(qwen3_5::PagedKVCacheView kv) noexcept { eagle3_kv_ = kv; }
+
+    // EAGLE3 prefill: the persistent feature buffer the target capture writes and the draft reads.
+    void set_eagle3_prefill_features(const Tensor* features) noexcept {
+        eagle3_prefill_features_ = features;
+    }
+
+    // EAGLE3 prefill: the draft KV execution-table row the draft attention addresses.
+    void set_eagle3_kv_table_row(std::int32_t row) noexcept { eagle3_kv_table_row_ = row; }
 
     void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
 
@@ -198,9 +210,33 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+
+    // EAGLE3 draft: fuse the three captured target layers into the draft-width feature g.
+    void eagle3_encode_batch(const Tensor& features, Tensor& g);
+    // EAGLE3 decoder step: the pair (token embedding, g) through the one decoder layer produces the
+    // draft pre-norm hidden (the next step's g) and the draft-vocabulary logits.
+    void eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g,
+                                     const Tensor& cache_positions, const Tensor& rope_positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
+    // EAGLE3 draft proposal: the draft-vocabulary head, then the draft-to-target token-id map.
+    void eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // EAGLE3 top-k first tokens for the static draft tree, in descending draft-score order.
+    void eagle3_propose_topk_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                   std::int32_t top);
+    void set_eagle3_head(const LinearParameters* head, const std::int32_t* d2t,
+                         int draft_vocab) noexcept {
+        eagle3_head_        = head;
+        eagle3_d2t_         = d2t;
+        eagle3_draft_vocab_ = draft_vocab;
+    }
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
+    }
+
+    [[nodiscard]] bool eagle3_enabled() const noexcept {
+        return eagle3_kv_.valid() || batch_eagle3_kv_ != nullptr;
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
@@ -305,11 +341,18 @@ private:
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
+    qwen3_5::PagedKVCacheView eagle3_kv_;
+    const Tensor* eagle3_prefill_features_ = nullptr;
+    std::int32_t eagle3_kv_table_row_       = 0;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     qwen3_5::KVHostStaging* text_kv_staging_ = nullptr;
     qwen3_5::KVHostStaging* mtp_kv_staging_  = nullptr;
     qwen3_5::QsaIndexMirrors qsa_index_mirrors_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
+    const qwen3_5::PagedKVCache* batch_eagle3_kv_ = nullptr;
+    const LinearParameters* eagle3_head_    = nullptr;
+    const std::int32_t* eagle3_d2t_         = nullptr;
+    int eagle3_draft_vocab_                 = 0;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;

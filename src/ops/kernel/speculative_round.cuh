@@ -708,4 +708,35 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+// Sets one row per column to negative infinity so a repeated argmax over the same logits yields
+// the next-best rows in order. logits is contiguous BF16 [rows, batch]; selected[b] names the
+// row masked in column b. Out-of-range selections are ignored.
+__global__ void mask_selected_logits_kernel(__nv_bfloat16* logits, const std::int32_t* selected,
+                                            std::int32_t rows, std::int32_t batch) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) { return; }
+    const int row = selected[b];
+    if (row < 0 || row >= rows) { return; }
+    __nv_bfloat16 neg_inf = __ushort_as_bfloat16(0xFC00U);
+    logits[static_cast<std::int64_t>(b) * rows + row] = neg_inf;
+}
+
+// Picks each sequence's winning draft chain: winners[s] is the lowest t in [0,T) maximizing
+// accepted[s*T+t]. accepted is contiguous I32 [batch*T]; winners is I32 [batch].
+__global__ void select_tree_winners_kernel(const std::int32_t* accepted, std::int32_t* winners,
+                                           std::int32_t tree_width, std::int32_t batch) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= batch) { return; }
+    std::int32_t best_t       = 0;
+    std::int32_t best_accept  = accepted[static_cast<std::int64_t>(s) * tree_width];
+    for (std::int32_t t = 1; t < tree_width; ++t) {
+        const std::int32_t value = accepted[static_cast<std::int64_t>(s) * tree_width + t];
+        if (value > best_accept) {
+            best_accept = value;
+            best_t      = t;
+        }
+    }
+    winners[s] = best_t;
+}
+
 } // namespace ninfer::ops

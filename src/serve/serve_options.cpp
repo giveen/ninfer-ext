@@ -88,8 +88,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--generation-token-trace-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--fixed-draft] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2|eagle3 --draft-tokens N] "
+           "[--fixed-draft] [--draft-tree N] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--no-auto-system-shared-prefix] [--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -361,6 +361,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--fixed-draft") {
             options.speculative.fixed_draft = true;
+        } else if (arg == "--draft-tree") {
+            options.speculative.tree_width = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-tree"), "draft-tree"));
         } else if (arg == "--lookup-drafts") {
             options.speculative.lookup_drafts =
                 product::parse_lookup_draft_mode(require_value("--lookup-drafts"));

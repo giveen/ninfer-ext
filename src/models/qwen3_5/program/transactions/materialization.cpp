@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 
+#include "core/nvtx.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -587,7 +589,8 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         target.addresses->set_checkpoint_requirement(target.address, target.frontier);
     }
     source.text_kv_valid = details.reuse_base;
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
     } else if (is_masked_draft_backend(speculative_backend)) {
         source.dflash_context_frontier = details.reuse_base;
@@ -2197,6 +2200,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
 ContextTransactionProgress
 ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    nvtx::ScopedRange transaction_range(nvtx::Name::ContextTransaction,
+                                       nvtx::Category::Control);
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {

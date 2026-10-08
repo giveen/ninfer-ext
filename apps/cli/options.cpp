@@ -87,12 +87,13 @@ constexpr std::string_view kCliProfileFlags[] = {
     "prompt",           "messages",         "chat-template",      "max-new",
     "max-context",      "kv-capacity",      "expert-cache",       "ngram-residency",
     "prefill-chunk",    "device",           "kv-dtype",           "spec",
-    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "lookup-drafts",
-    "lookup-min-match", "raw-output",       "print-token-ids",    "no-thinking",
-    "thinking-budget",  "reasoning-effort", "vision",             "no-cuda-graph",
-    "stop-token-id",    "stop",             "reasoning-stop",     "temperature",
-    "top-p",            "top-k",            "min-p",              "presence-penalty",
-    "frequency-penalty", "seed",            "greedy",             "log-level",
+    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "draft-tree",
+    "lookup-drafts",    "lookup-min-match", "raw-output",         "print-token-ids",
+    "no-thinking",      "thinking-budget",  "reasoning-effort",   "vision",
+    "no-cuda-graph",    "stop-token-id",    "stop",               "reasoning-stop",
+    "temperature",      "top-p",            "top-k",              "min-p",
+    "presence-penalty", "frequency-penalty", "seed",             "greedy",
+    "log-level",
 };
 
 std::vector<std::string> load_cli_profile(const std::string& path) {
@@ -120,10 +121,10 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--profile FILE]\n"
            "       [--device N] [--expert-cache auto|MiB] [--ngram-residency auto|mapped|stream]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
-           "N]\n"
-           "       [--lm-head-draft] [--fixed-draft] [--lookup-drafts off|auto|always]\n"
-           "       [--lookup-min-match N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec "
+           "mtp|dflash|dflash2|eagle3 --draft-tokens N]\n"
+           "       [--lm-head-draft] [--fixed-draft] [--draft-tree N]\n"
+           "       [--lookup-drafts off|auto|always] [--lookup-min-match N]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -138,7 +139,10 @@ std::string usage_text(const char* argv0) {
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--spec mtp adapts the draft length of a single request per round (up to 7 tokens, or\n"
-           "--draft-tokens N); --fixed-draft always drafts exactly N.\n"
+           "--draft-tokens N); --fixed-draft always drafts exactly N. --spec eagle3 uses the\n"
+           "           SpecForge EAGLE3 head and adapts its draft length the same way.\n"
+           "--draft-tree N selects the EAGLE3 static draft-tree root width (currently 1,\n"
+           "           a chain; wider trees are planned).\n"
            "--lookup-drafts adds prompt-lookup drafts to MTP: tokens that followed an earlier\n"
            "occurrence of the current suffix. auto uses them only where they are predicted to\n"
            "commit more than the MTP drafts; always uses every proposal (measurement).\n"
@@ -223,6 +227,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-tree") {
+            options.speculative.tree_width = parse_u32(value(arg), "draft-tree");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--fixed-draft") {

@@ -356,10 +356,11 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 15, "report schema v15");
+    failures += expect(report.at("schema_version") == 16, "report schema v16");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
-                           report.at("config").at("draft_tokens") == 5,
-                       "report identifies its backend and window");
+                           report.at("config").at("draft_tokens") == 5 &&
+                           report.at("config").at("tree_width") == 1,
+                       "report identifies its backend, window and tree");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures +=

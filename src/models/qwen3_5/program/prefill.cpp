@@ -48,6 +48,21 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         });
 }
 
+DFlashFeatureSink make_eagle3_prefill_sink(PrefillContext& state) {
+    if (state.eagle3 == nullptr) {
+        throw std::logic_error("EAGLE3 prefill state is unavailable");
+    }
+    const auto& config = *state.execution.parameters.model.config().draft;
+    return DFlashFeatureSink{
+        .features  = &state.eagle3->features,
+        .positions = &state.eagle3->positions,
+        .layers    = std::span<const std::uint32_t>(config.target_layer_ids),
+        // The EAGLE3 draft runs inside the chunk that captures the features, so the sink has
+        // nothing to consume afterwards.
+        .consume_prefill = [](const Tensor&, const Tensor&, bool) {},
+    };
+}
+
 } // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -74,9 +89,13 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.eagle3_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_eagle3_prefill_kv(state.eagle3_kv);
+    card.set_eagle3_kv_table_row(state.dflash_kv_table_row);
+    if (state.eagle3 != nullptr) { card.set_eagle3_prefill_features(&state.eagle3->features); }
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -85,6 +104,11 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  rope_delta, sink);
+    }
+    if (state.eagle3 != nullptr) {
+        DFlashFeatureSink sink = make_eagle3_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   rope_delta, sink);
     }
@@ -100,9 +124,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.eagle3_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_eagle3_prefill_kv(state.eagle3_kv);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -110,6 +136,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_mtp_kv_staging(state.mtp_kv_staging);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
+                                  finalize_at_end, sink);
+    }
+    if (state.eagle3 != nullptr) {
+        DFlashFeatureSink sink = make_eagle3_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);
     }
@@ -545,6 +576,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("retained prefix has incomplete MTP KV");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                // EAGLE3 keeps the full draft KV (no bridge lag); the suffix prefill overwrites
+                // from the append frontier and the next round recomputes its anchor seam.
+                const std::uint32_t source_backend = private_source != nullptr
+                                                         ? private_source->mtp_kv_valid
+                                                         : shared_source->backend_frontier;
+                if (!request_plan.prepare_mtp || source_backend < base) {
+                    throw std::logic_error("retained prefix has incomplete EAGLE3 KV");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend)) {
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->dflash_context_frontier
@@ -597,6 +638,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < base) {
+                    throw std::logic_error("resident EAGLE3 KV is shorter than the append frontier");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend) &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
@@ -643,6 +689,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < base) {
+                    throw std::logic_error(
+                        "rewrite-checkpoint EAGLE3 KV is shorter than the append frontier");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend)) {
                 if (!dflash || (backend_kv_cache() && !sequence.kv->backend) ||
                     sequence.dflash_context_frontier < base) {
@@ -667,7 +719,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
-            speculative_backend == SpeculativeBackend::Mtp
+            speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
@@ -807,7 +860,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.prefix_identity.size() != pending.base_S ||
             sequence.prefix_digests.size() != pending.base_S ||
             sequence.text_kv_valid != pending.base_E ||
-            (speculative_backend == SpeculativeBackend::Mtp &&
+            ((speculative_backend == SpeculativeBackend::Mtp ||
+              speculative_backend == SpeculativeBackend::Eagle3) &&
              sequence.mtp_kv_valid != pending.base_E) ||
             (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier != pending.base_E)) {
@@ -835,9 +889,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     try {
         timing.resume_submit();
         // An MTP round recorded at its own width, so it folds through that width's records.
-        const ops::GdnReplayFoldPlan& fold = speculative_backend == SpeculativeBackend::Mtp
-                                                 ? *mtp_rungs[mtp_round_rung].fold
-                                                 : *replay_fold;
+        const ops::GdnReplayFoldPlan& fold =
+            speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3
+                ? *mtp_rungs[mtp_round_rung].fold
+                : *replay_fold;
         fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                      device.stream);
         fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()));
@@ -866,7 +922,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             Tensor hidden;
             Tensor selected;
             Tensor destinations;
-            if (speculative_backend == SpeculativeBackend::Mtp && !mtp_rungs.empty()) {
+            if ((speculative_backend == SpeculativeBackend::Mtp ||
+                 speculative_backend == SpeculativeBackend::Eagle3) &&
+                !mtp_rungs.empty()) {
                 qwen3_5::MtpDecodeState& frame = mtp_rungs[mtp_round_rung].frame;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
@@ -926,9 +984,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
     // Egress rows are strided by the round's own width: the MTP draft length varies per round.
-    const std::uint32_t width = speculative_backend == SpeculativeBackend::Mtp
-                                    ? mtp_rungs[mtp_round_rung].k + 1U
-                                    : draft_window + 1U;
+    const std::uint32_t width =
+        speculative_backend == SpeculativeBackend::Mtp ||
+                speculative_backend == SpeculativeBackend::Eagle3
+            ? mtp_rungs[mtp_round_rung].k + 1U
+            : draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
@@ -944,7 +1004,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             const std::uint32_t committed  = accepted_tokens[row];
             settle_state_fork(sequence);
             const TokenId* token_base =
-                speculative_backend == SpeculativeBackend::Mtp
+                speculative_backend == SpeculativeBackend::Mtp ||
+                        speculative_backend == SpeculativeBackend::Eagle3
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
@@ -957,7 +1018,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
 
-            if (speculative_backend == SpeculativeBackend::Mtp) {
+            if (speculative_backend == SpeculativeBackend::Mtp ||
+                speculative_backend == SpeculativeBackend::Eagle3) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
@@ -1059,6 +1121,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
+            eagle3_prefill ? &*eagle3_prefill : nullptr,
+            eagle3_kv_view(sequence),
+            decoder->eagle3_cache(),
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
@@ -1251,19 +1316,29 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {
-                if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
-                    throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
+                if (speculative_backend == SpeculativeBackend::Eagle3) {
+                    // EAGLE3 resume keeps the full draft KV, so the exact hit needs no bridge
+                    // forward: the next round's alignment recomputes its anchor seam and cold-starts
+                    // drafting (initial_mtp_extent is always zero for EAGLE3).
+                    if (sequence.mtp_kv_valid != staged.prompt_tokens) {
+                        throw std::logic_error(
+                            "zero-suffix EAGLE3 reuse has incomplete draft KV");
+                    }
+                } else {
+                    if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
+                        throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
+                    }
+                    mark_workspace_usage(workspace_plan.mtp_prefill);
+                    const auto bridge_rope =
+                        prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
+                    execution::mtp_bridge_and_propose(
+                        schedule_state, io.token, sequence.tail_hidden,
+                        checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
+                        bridge_rope, staged.initial_mtp_extent != 0);
+                    sequence.mtp_kv_valid = staged.prompt_tokens;
+                    commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
+                    staged.mtp_bridge = MtpBridgeMode::None;
                 }
-                mark_workspace_usage(workspace_plan.mtp_prefill);
-                const auto bridge_rope =
-                    prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
-                execution::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
-                sequence.mtp_kv_valid = staged.prompt_tokens;
-                commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
-                staged.mtp_bridge = MtpBridgeMode::None;
             }
         }
 

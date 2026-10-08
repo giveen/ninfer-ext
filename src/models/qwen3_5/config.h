@@ -170,6 +170,21 @@ struct DFlash2Config {
     std::uint32_t selector_top_k   = 0;
 };
 
+// EAGLE3 draft: a one-layer autoregressive decoder conditioned on three concatenated target hidden
+// states. SpecForge does not store the target layers in the exported config; it fuses layer 1,
+// num_layers/2 - 1 and num_layers-4, which the parser derives from the target and records as
+// `target_layer_ids`.
+struct Eagle3Config {
+    std::uint32_t target_hidden_size = 0;
+    std::uint32_t draft_vocab_size   = 0;
+    bool norm_before_residual        = false;
+    bool norm_before_fc              = false;
+
+    [[nodiscard]] std::uint32_t fused_input_size() const noexcept {
+        return target_hidden_size * 3U;
+    }
+};
+
 struct DraftConfig {
     AttentionConfig attention;
     std::uint32_t intermediate_size       = 0;
@@ -177,11 +192,14 @@ struct DraftConfig {
     std::uint32_t max_position_embeddings = 0;
     float rms_norm_eps                    = 0;
     float rope_theta                      = 0;
+    // Rotary width of the draft's own attention, at most `attention.head_dim`.
+    std::uint32_t rotary_dim             = 0;
     std::vector<DraftAttentionKind> layer_types;
     std::optional<std::uint32_t> sliding_window;
     std::vector<std::uint32_t> target_layer_ids;
     std::uint32_t mask_token_id = 0;
     std::optional<DFlash2Config> dflash2;
+    std::optional<Eagle3Config> eagle3;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
         return static_cast<std::uint32_t>(

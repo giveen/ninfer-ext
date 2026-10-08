@@ -413,6 +413,72 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     return out;
 }
 
+// EAGLE3 draft config: one decoder layer, `model_type=llama`, a reduced `draft_vocab_size` and the
+// three target layers whose hidden states condition the draft. The converter records the layers from
+// the head's own declaration when it has one and otherwise from SpecForge's rule, so the config
+// always carries them.
+DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
+    require_members(value,
+                    {"architectures", "model_type", "hidden_size", "intermediate_size",
+                     "num_attention_heads", "num_key_value_heads", "head_dim", "num_hidden_layers",
+                     "rms_norm_eps", "rope_theta", "draft_vocab_size", "target_layer_ids"},
+                    {"max_position_embeddings", "norm_before_residual", "norm_before_fc",
+                     "target_hidden_size", "partial_rotary_factor"},
+                    "EAGLE3 draft config");
+    const auto arch = architecture(value);
+    if (arch != "LlamaForCausalLMEagle3" && arch != "Eagle3DraftModel" &&
+        arch != "Eagle3LlamaForCausalLM") {
+        throw ArtifactError("EAGLE3 draft architecture mismatch");
+    }
+    DraftConfig out;
+    out.attention         = attention(value);
+    // SpecForge rotates the whole head dimension; a `speculators` export may declare a partial
+    // factor. The draft only reads text positions, so an exported MRoPE section cannot change its
+    // rotation and is not represented here.
+    const std::uint32_t head_dim = out.attention.head_dim;
+    const double rotary_factor = value.contains("partial_rotary_factor")
+                                     ? positive_float(value, "partial_rotary_factor")
+                                     : 1.0;
+    if (rotary_factor > 1.0) {
+        throw ArtifactError("EAGLE3 partial_rotary_factor exceeds one");
+    }
+    out.rotary_dim = static_cast<std::uint32_t>(double(head_dim) * rotary_factor);
+    if (out.rotary_dim < 2U || out.rotary_dim % 2U != 0U || out.rotary_dim > head_dim) {
+        throw ArtifactError("EAGLE3 draft rotary dimension must be even and within the head");
+    }
+    out.intermediate_size = dimension(value, "intermediate_size");
+    out.num_hidden_layers = dimension(value, "num_hidden_layers");
+    out.max_position_embeddings = value.contains("max_position_embeddings")
+                                      ? dimension(value, "max_position_embeddings")
+                                      : 0U;
+    out.rms_norm_eps = positive_float(value, "rms_norm_eps");
+    out.rope_theta   = positive_float(value, "rope_theta");
+    if (out.num_hidden_layers != 1U) {
+        throw ArtifactError("EAGLE3 draft must have exactly one decoder layer");
+    }
+    const auto& taps = value.at("target_layer_ids");
+    if (!taps.is_array() || taps.size() != 3U) {
+        throw ArtifactError("EAGLE3 needs exactly three target layers");
+    }
+    for (const auto& tap : taps) {
+        const auto index = integer(tap, "EAGLE3 target layer", false);
+        if (index >= target.num_hidden_layers) {
+            throw ArtifactError("EAGLE3 target layer is out of range");
+        }
+        out.target_layer_ids.push_back(index);
+    }
+
+    Eagle3Config eagle;
+    eagle.target_hidden_size = value.contains("target_hidden_size")
+                                   ? dimension(value, "target_hidden_size")
+                                   : target.hidden_size;
+    eagle.draft_vocab_size     = dimension(value, "draft_vocab_size");
+    eagle.norm_before_residual = value.value("norm_before_residual", false);
+    eagle.norm_before_fc       = value.value("norm_before_fc", false);
+    out.eagle3                 = eagle;
+    return out;
+}
+
 } // namespace
 
 std::uint64_t GdnConfig::conv_channels() const {
@@ -464,9 +530,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             }
         }
         if (options.speculative == SpeculativeBackend::DFlash ||
-            options.speculative == SpeculativeBackend::DFlash2) {
-            out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+            options.speculative == SpeculativeBackend::DFlash2 ||
+            options.speculative == SpeculativeBackend::Eagle3) {
+            const auto& config = companion(directory, options.speculative_component()).config;
+            out.draft = options.speculative == SpeculativeBackend::Eagle3
+                            ? draft_eagle3(config, out.text)
+                            : draft(config, out.text,
+                                    options.speculative == SpeculativeBackend::DFlash2);
         }
         return out;
     } catch (const std::exception& error) {

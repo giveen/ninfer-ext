@@ -108,7 +108,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     points = build_points(
         artifacts,
         Namespace(
-            mode=["dflash7", "dflash2_7"],
+            mode=["dflash7", "dflash2_7", "eagle3_adaptive"],
             suite=["decode-saturation"],
             concurrency=[1],
             sampling="greedy",
@@ -118,8 +118,10 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     assert [(point.target, point.speculative_backend) for point in points] == [
         ("org/custom", "dflash"),
         ("org/custom", "dflash2"),
+        ("org/custom", "eagle3"),
         ("org%2Fcustom", "dflash"),
         ("org%2Fcustom", "dflash2"),
+        ("org%2Fcustom", "eagle3"),
     ]
     assert all(
         point.artifact == artifact and point.model_id == point.target
