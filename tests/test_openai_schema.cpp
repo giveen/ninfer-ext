@@ -146,7 +146,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -193,8 +192,45 @@ int test_constrained_decoding_extensions() {
     Json gbnf                     = base_request();
     gbnf["structured_outputs"]    = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
     const OpenAIChatRequest wired = parse(gbnf);
-    failures += check(wired.generation.grammar == "root ::= \"yes\" | \"no\"",
+    failures += check(wired.generation.constraint->kind == ninfer::OutputConstraintKind::Grammar &&
+                          wired.generation.constraint->source == "root ::= \"yes\" | \"no\"" &&
+                          options(wired.generation).constraint == wired.generation.constraint,
                       "structured_outputs.grammar reaches the generation request");
+
+    // The standard JSON output formats are the supported entry point for structured content.
+    Json object_mode              = base_request();
+    object_mode["response_format"] = Json{{"type", "json_object"}};
+    failures += check(options(parse(object_mode).generation).constraint->kind ==
+                          ninfer::OutputConstraintKind::JsonObject,
+                      "response_format json_object reaches the constraint");
+
+    Json schema = Json::object();
+    schema["type"]       = "object";
+    schema["properties"] = Json{{"city", Json{{"type", "string"}}}};
+    schema["required"]   = Json::array({"city"});
+
+    Json json_schema = Json::object();
+    json_schema["name"]   = "trip";
+    json_schema["strict"] = true;
+    json_schema["schema"] = schema;
+
+    Json schema_mode                = base_request();
+    schema_mode["response_format"]  = Json::object();
+    schema_mode["response_format"]["type"]        = "json_schema";
+    schema_mode["response_format"]["json_schema"] = json_schema;
+
+    const auto schema_constraint = options(parse(schema_mode).generation).constraint;
+    failures += check(schema_constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          schema_constraint->source.contains("\"city\""),
+                      "response_format json_schema carries its schema");
+    schema_mode["response_format"] = Json{{"type", "text"}, {"extra", 1}};
+    failures += check(api_error([&] { (void)parse(schema_mode); }).param == "response_format",
+                      "text format with options is refused");
+    schema_mode["response_format"] = Json{{"type", "json_schema"},
+                                          {"json_schema", Json{{"schema", Json::object()}}}};
+    failures += check(api_error([&] { (void)parse(schema_mode); }).param ==
+                          "response_format.json_schema.name",
+                      "json_schema without a name is refused at its field");
 
     // Every other alias promises constrained generation, so it is refused with a pointer instead of
     // being ignored or silently reinterpreted.
@@ -253,7 +289,7 @@ int test_constrained_decoding_extensions() {
     neutral["guided_choice"]      = nullptr;
     neutral["guided_grammar"]     = nullptr;
     failures += check(parse(neutral).generation.messages.size() == 1 &&
-                          !parse(neutral).generation.grammar,
+                          !parse(neutral).generation.constraint,
                       "neutral constrained-decoding extension values are accepted");
     return failures;
 }

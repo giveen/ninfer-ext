@@ -946,22 +946,15 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     out.generation.reasoning_effort = *effort;
 }
 
-void parse_text(const Json& body) {
+void parse_text(const Json& body, GenerationRequest& request) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
     static const std::unordered_set<std::string> allowed = {"format", "verbosity"};
     reject_nonnull_unknown_members(text, allowed, "text");
     if (text.contains("format") && !text.at("format").is_null()) {
-        const Json& format = text.at("format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("text.format must be a typed object", "text");
-        }
-        if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
-            bad_request("JSON text.format is not implemented; use structured_outputs.grammar "
-                        "for GBNF",
-                        "text", "structured_outputs_not_supported");
-        }
+        parse_json_output_format(text.at("format"), request, "text.format",
+                                 JsonFormatProtocol::Responses);
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
         if (!text.at("verbosity").is_string()) {
@@ -1049,7 +1042,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
                     "parallel_tool_calls", "parallel_tool_calls_not_supported");
     }
     parse_reasoning(body, out.prompt);
-    parse_text(body);
+    parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
@@ -1170,6 +1163,10 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     ParsedPromptFields parsed = parse_prompt_fields(body, limits);
     OpenAIResponsesCreateRequest out;
     out.prompt              = std::move(parsed.prompt);
+    if (body.contains("text") && body.at("text").is_object() && body.at("text").contains("format") &&
+        !body.at("text").at("format").is_null()) {
+        out.text_format = body.at("text").at("format");
+    }
     // The prompt policy is applied after resolution assembles
     // generation.messages (resolve_openai_responses_prompt), because at parse
     // time the leading instructions/input turns are not yet in messages.

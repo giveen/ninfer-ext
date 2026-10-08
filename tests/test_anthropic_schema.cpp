@@ -135,8 +135,14 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "a schema format without a schema is refused at its field");
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    const auto schema_constraint = parse(body).generation.constraint;
+    failures += check(schema_constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          parse(body).generation.constraint_param == "output_config.format.schema",
+                      "Anthropic JSON schema reaches the constraint");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",

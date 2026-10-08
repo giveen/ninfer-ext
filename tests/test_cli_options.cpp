@@ -35,6 +35,23 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
+              "JSON object CLI option lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file",
+                     "answer.json"})
+                      .json_schema_path == "answer.json",
+              "schema file CLI option lost");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                       "--json-object", "--grammar-file", "a.gbnf"});
+                      }),
+                      "conflicting CLI constraints accepted");
     const ninfer::cli::Options cached =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--expert-cache", "20480"});
     failures += check(cached.expert_cache.mode == ninfer::ExpertCacheMode::Explicit &&

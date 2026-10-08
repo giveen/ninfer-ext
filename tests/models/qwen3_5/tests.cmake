@@ -8,6 +8,7 @@ set(NINFER_ARTIFACT_SCORE   "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_score
 set(NINFER_ARTIFACT_VISION  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_vision_workspace_test")
 set(NINFER_ARTIFACT_DFLASH2 "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash2_real_test")
 set(NINFER_ARTIFACT_MOE     "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_moe_real_test")
+set(NINFER_ARTIFACT_GRAMMAR "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_grammar_real_test")
 set(NINFER_ARTIFACT_DFLASH  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_real_test")
 set(NINFER_ARTIFACT_DFLASH_PREFILL "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_prefill_real_test")
 set(NINFER_ARTIFACT_STREAM  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_stream_real_test")
@@ -108,6 +109,10 @@ set_tests_properties(ninfer_qwen3_5_ple_gather_test PROPERTIES SKIP_RETURN_CODE 
 ninfer_add_real_test(ninfer_qwen3_5_stream_real_test NINFER_ARTIFACT_STREAM
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stream_real.cpp"
   LIBRARIES ninfer_engine)
+
+ninfer_add_real_test(ninfer_qwen3_5_grammar_real_test NINFER_ARTIFACT_GRAMMAR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
 
 ninfer_add_real_test(ninfer_qwen3_5_spec_residue_real_test NINFER_ARTIFACT_RESIDUE
   ARGS --backend mtp --draft-k 7

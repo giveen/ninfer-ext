@@ -359,9 +359,31 @@ struct OutputOptions {
     std::uint32_t tool_name_max_length = 128;
 };
 
+enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema };
+
+// Constrains generated content; Chat reasoning retains the model's framing. Source is owning GBNF
+// or JSON Schema text. JsonObject has no source payload.
+struct OutputConstraint {
+    OutputConstraintKind kind = OutputConstraintKind::Grammar;
+    std::string source;
+
+    [[nodiscard]] static OutputConstraint grammar(std::string source) {
+        return {OutputConstraintKind::Grammar, std::move(source)};
+    }
+
+    [[nodiscard]] static OutputConstraint json_object() {
+        return {OutputConstraintKind::JsonObject, {}};
+    }
+
+    [[nodiscard]] static OutputConstraint json_schema(std::string source) {
+        return {OutputConstraintKind::JsonSchema, std::move(source)};
+    }
+
+    bool operator==(const OutputConstraint&) const = default;
+};
+
 struct RequestOptions {
-    // GBNF constrains generated content. Chat reasoning retains the model's framing.
-    std::optional<std::string> grammar;
+    std::optional<OutputConstraint> constraint;
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
@@ -602,6 +624,9 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     InvalidGrammar,
+    InvalidJsonSchema,
+    UnsupportedJsonSchema,
+    UnsatisfiableJsonSchema,
     ConstraintDeadEnd,
     ContextLengthExceeded,
     ThinkingBudgetCapacityInsufficient,
@@ -615,13 +640,17 @@ enum class RequestErrorKind : std::uint8_t {
 
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {})
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    // JSON Pointer of the offending schema location, empty for other kinds.
+    [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
+
 private:
     RequestErrorKind kind_;
+    std::string pointer_;
 };
 
 struct PromptSummary {

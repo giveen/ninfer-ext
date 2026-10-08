@@ -802,11 +802,17 @@ int test_explicit_rejections() {
                       "strict function schema is rejected explicitly");
 
     value         = base;
-    value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+    value["text"] = Json{{"format", Json{{"type", "json_object"}}}};
+    failures += check(parse_openai_responses_create_request(value, limits())
+                                  .prompt.generation.constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonObject,
+                      "text.format json_object reaches the constraint");
+    value["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                        {"name", "trip"},
+                                        {"schema", Json{{"type", "object"}}}}}};
+    failures += check(parse_openai_responses_create_request(value, limits())
+                              .prompt.generation.constraint_param == "text.format.schema",
+                      "Responses JSON schema names its own field");
 
     value               = base;
     value["background"] = true;

@@ -215,14 +215,16 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            if (options.grammar && !instance_.program->consumes_token_masks()) {
+            if (options.constraint && !instance_.program->consumes_token_masks()) {
                 throw RequestError(RequestErrorKind::InvalidGrammar,
                                    "grammar requires a backend whose rounds consume token masks; "
                                    "this one verifies drafts without them");
             }
             auto output = instance_.frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking, options.grammar);
-            // A cold grammar compilation happens here, so the deadline is rechecked before queueing.
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.constraint);
+            // A cold constraint compilation happens here, so the deadline is rechecked before
+            // queueing.
             if (Clock::now() >= pending_deadline) {
                 throw RequestError(RequestErrorKind::QueueTimeout,
                                    "inference request expired during grammar preparation");
