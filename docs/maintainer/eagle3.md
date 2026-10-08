@@ -190,44 +190,68 @@ Phased, each phase independently verifiable:
 
 ## Measured status
 
-Reference: NVIDIA GeForce RTX 5090, CUDA 13.3, `models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer`
-(Qwen3.6-35B-A3B target carrying the SpecForge head, BF16 KV, greedy sampling), 2026-10-08.
-
-One request, `ninfer_bench -pg '512,128;2048,128' -r 5 --warmup 1 --fixed-draft` (5 measured
-repetitions of the benchmark corpus; MTP runs the full target head because this artifact carries no
-optimized proposal head):
-
-| Mode | decode tok/s, pp512 | decode tok/s, pp2048 | accepted/drafted, pp512 | accepted/drafted, pp2048 |
-|---|---:|---:|---:|---:|
-| `--spec mtp --draft-tokens 3` | 470.5 | 757.9 | 49.0% | 100% |
-| `--spec eagle3 --draft-tokens 3` | 428.0 | 341.0 | 34.4% | 22.2% |
-| `--spec eagle3 --draft-tokens 7` (adaptive) | 472.0 | 371.3 | 45.5% | 27.6% |
+Reference: NVIDIA GeForce RTX 5090, CUDA 13.3, BF16 KV, greedy sampling, 2026-10-08.
 
 Serving, `tools/bench/run_serve_concurrency --suite decode-saturation --sampling greedy
 --decode-tokens 2048 --max-context 8192 --kv-capacity auto --kv-dtype bf16` (a 293-token reasoning
-prompt, 2,048 decoded tokens per request, complete full-batch intervals):
+prompt, 2,048 decoded tokens per request, complete full-batch intervals), all four modes on **one
+artifact** — `models/qwen3_6_35b_a3b_nvfp4_eagle3_proposal.ninfer`, the reference conversion with
+`--proposal` added so the documented MTP configuration runs on the same weights:
 
-| Mode | C=1 decode tok/s | C=8 decode tok/s | C=8 scaling |
+| Mode | C=1 decode tok/s | C=8 decode tok/s | accepted/drafted, C=1 |
 |---|---:|---:|---:|
-| no `--spec` | 376.0 | 1,272.0 | 3.38x |
-| `--spec eagle3 --draft-tokens 3 --fixed-draft` | 537.5 | 1,805.4 | 3.36x |
-| `--spec eagle3 --draft-tokens 7` (adaptive) | 537.0 | 1,728.7 | 3.22x |
+| no `--spec` | 381.5 | 1,282.2 | – |
+| `--spec mtp --draft-tokens 3 --fixed-draft --lm-head-draft` | **693.0** | **2,094.5** | 77.0% |
+| `--spec mtp --draft-tokens 7 --lm-head-draft` (adaptive) | 594.0 | 1,973.7 | 62.1% |
+| `--spec eagle3 --draft-tokens 3 --fixed-draft` | 536.0 | 1,798.5 | 55.1% |
 
 What the numbers say:
 
-- On real long-decode prompts EAGLE3 is worth selecting: its three-draft chain is 43% faster than
-  plain decode at one request and 42% faster at eight, with 52-61% accepted/drafted per request and
-  no loss of batch scaling.
-- On the flat benchmark corpus MTP is faster at one request (758 against 341 tok/s at pp2048)
-  because its acceptance is 100% there while EAGLE3's is 22%; the adaptive EAGLE3 policy matches the
-  three-draft MTP setting on the short prompt (472 against 470 tok/s) and trails on the long one.
-  The corpus repeats itself, so its MTP acceptance is not representative of prose.
-- No like-for-like MTP reference exists on this artifact: it was converted without `--proposal`, and
-  EAGLE3 rejects the optimized proposal head anyway. The published MTP settings therefore stay the
-  recommendation, with EAGLE3 the better mode only where its head is available.
+- EAGLE3 is 41% faster than plain decode at one request and 40% faster at eight — but it is **the
+  slowest speculative mode on this model**, 29% behind the three-draft MTP chain at C=1 and 16%
+  behind at C=8. The published MTP settings stay the recommendation, and EAGLE3 is not a drop-in
+  improvement over them today.
+- The deficit is **acceptance, not draft cost**. Both backends draft three tokens per round; MTP
+  accepts 2.3 of them and EAGLE3 1.7, and the throughput ratio (1.29x at C=1) matches the committed
+  tokens per round (3.31 against 2.66) almost exactly, so similar round costs convert different
+  acceptances into different throughput. On the same shapes an EAGLE3 round is not obviously the
+  cheaper one: its draft decoder is 2,048 wide with one layer, but its attention reads 16 KV heads
+  over the whole history per step against the target's 2.
+- Acceptance decays sharply with depth: one CLI decode reported `accepted by pos 7,3,0` over 11
+  rounds at K=3, i.e. roughly 64% for the first draft, 27% for the second and none for the third.
+  Chained depth buys little at this acceptance, and K=5 measured slower than K=3 both here and on
+  the flat corpus.
+- The artifact's configuration matters when reading the numbers: without `--proposal` the only MTP
+  available is the **full** target head, which is a floor for MTP, not its measured setting — that
+  is why the flat-corpus row below understates MTP. Convert an EAGLE3 artifact with `--proposal`
+  (the converter flag costs seconds) whenever it is to be compared against MTP.
+
+One request, `ninfer_bench -pg '512,128;2048,128' -r 5 --warmup 1 --fixed-draft` on the flat
+benchmark corpus (same comparison, before `--proposal`; its MTP column is the full-head
+configuration):
+
+| Mode | decode tok/s, pp512 | decode tok/s, pp2048 | accepted/drafted, pp512 | accepted/drafted, pp2048 |
+|---|---:|---:|---:|---:|
+| `--spec mtp --draft-tokens 3` (full head) | 470.5 | 757.9 | 49.0% | 100% |
+| `--spec eagle3 --draft-tokens 3` | 428.0 | 341.0 | 34.4% | 22.2% |
+| `--spec eagle3 --draft-tokens 7` (adaptive) | 472.0 | 371.3 | 45.5% | 27.6% |
+
+The corpus repeats itself, so its MTP acceptance is not representative of prose; it is included
+because the tap sweep ran at these settings.
+
 - The draft's KV cost is confirmed at the planner's capacity: the reported KV payload is 82.0 MiB
   with EAGLE3 against 51.0 MiB without it at the same token capacity, about 14 KiB per token beside
   the 16 KiB per token derived above before page rounding.
+- For reference, the published recommendations on the `groupwise-int` artifact of the same target
+  (`models/qwen3_6_35b_a3b.ninfer`, measured on the same fixture): plain 370.5/1,322.9,
+  `--spec mtp --draft-tokens 7 --lm-head-draft` 674.5/1,605.5, `--spec dflash --draft-tokens 7
+  --lm-head-draft` 567.5/1,755.9. Its plain-decode numbers sit within 2-4% of the NVFP4 artifact's,
+  which is the control for comparing modes across the two quantizations.
+
+Two consequences for the improvement plan: an EAGLE3 head that matched its target would be worth
+more than any round-level tuning (acceptance is the whole deficit), and the static draft tree is the
+cheapest route to more acceptance per verify width, because it spends that width on first-position
+candidates — the only position this head lands reliably.
 
 The top-k propose path is verified against the chain path rather than only by its ops oracles: with
 the round temporarily routed through `eagle3_propose_topk_batch(..., top = 1)`, the CLI commits
@@ -236,8 +260,10 @@ byte-identical tokens and the identical round, acceptance and draft counters.
 ## Open questions
 
 - **Target version.** The head targets Qwen3.5-35B-A3B; the shipped artifact is Qwen3.6-35B-A3B. Both
-  are `qwen3_5_moe`, but the hidden states were never confirmed compatible, and this is the likeliest
-  remaining cause of the low flat-corpus acceptance above.
+  are `qwen3_5_moe`, but the hidden states were never confirmed compatible. Acceptance is the whole
+  measured deficit against MTP (55% against 77% at the same draft width and round cost), so a head
+  matched to its target is the single largest lever left; isolating the pairing needs the same head
+  run against a Qwen3.5-35B-A3B target artifact, which is one conversion.
 - **Target-layer capture order.** The converter derives the three taps the SpecForge rule names
   (`1`, `num_layers//2 - 1`, `num_layers-4`) and the artifact records them, but the released
   checkpoint does not say whether training read a layer's output or the input of the layer after it.

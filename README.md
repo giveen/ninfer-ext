@@ -382,17 +382,19 @@ python3 -m tools.convert --model /path/to/Qwen3.6-35B-A3B-NVFP4 \
   --source eagle3=/path/to/Qwen3.6-35B-A3B-Eagle3-Specforge \
   --components text,vision,mtp,eagle3 \
   --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
-  --name qwen3.6-35b-a3b-eagle3 --out models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer
+  --proposal --name qwen3.6-35b-a3b-eagle3 \
+  --out models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer
 ```
 
 The head used here is the SpecForge EAGLE3 draft for Qwen3.5-35B-A3B
 (`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`). The converter normalizes its `midlayer.*` weights,
 derives the three target layers it fuses, stores the draft-to-target token map, and inherits the
-target's token embedding and tokenizer. Serve it with `--spec eagle3 --draft-tokens N`; add
-`--proposal` only when the same file must also serve MTP with the optimized proposal head, because
-EAGLE3 uses its own draft head and rejects `--lm-head-draft`. See
-[EAGLE3](docs/maintainer/eagle3.md) for the draft graph, the target conditioning and the draft-KV
-cost.
+target's token embedding and tokenizer. Serve it with `--spec eagle3 --draft-tokens N`. Keep
+`--proposal`: EAGLE3 does not need the optimized proposal head (it drafts through its own 32k head
+and rejects `--lm-head-draft`), but without it the file cannot run the documented
+`--spec mtp --lm-head-draft` configuration at all, so EAGLE3 could only be compared against — or
+fall back to — the slower full-head MTP. See [EAGLE3](docs/maintainer/eagle3.md) for the draft
+graph, the target conditioning, the draft-KV cost and the measured comparison against MTP.
 
 ## Qwen3.8-Flash-Next
 
