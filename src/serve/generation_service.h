@@ -85,8 +85,9 @@ enum class GenerationConsumerMode : std::uint8_t {
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
 // `constraint_param` names the wire field the request's constraint came from, so a schema error
 // points at the field the client actually sent rather than at a fixed location.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception,
-                                    std::string_view constraint_param);
+ApiError
+request_error_to_api_error(const ninfer::RequestError& exception,
+                           std::string_view constraint_param = "structured_outputs.grammar");
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
