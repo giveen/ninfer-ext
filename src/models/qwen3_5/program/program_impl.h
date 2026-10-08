@@ -650,6 +650,8 @@ public:
     const std::uint32_t prefill_width;
     // Largest draft length. MTP rounds may run shorter draft lengths from `mtp_rungs`.
     const std::uint32_t draft_window;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    const std::uint32_t tree_width;
     const bool adaptive_draft;
     // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
     const bool plain_mtp_batches;

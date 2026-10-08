@@ -52,6 +52,9 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.tree_width != 1 && options.backend != SpeculativeBackend::Eagle3) {
+        throw std::invalid_argument("--draft-tree requires --spec eagle3");
+    }
     if (options.lookup_drafts != LookupDraftMode::Off) {
         if (options.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("--lookup-drafts requires --spec mtp");
@@ -106,6 +109,10 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         if (options.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument("--spec eagle3 uses its own draft head, not --lm-head-draft");
+        }
+        if (options.tree_width != 1) {
+            throw std::invalid_argument(
+                "--draft-tree must be 1: wider draft trees are not implemented yet");
         }
         return;
     }

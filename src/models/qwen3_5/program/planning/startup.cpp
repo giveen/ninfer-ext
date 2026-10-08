@@ -1228,6 +1228,10 @@ PrefillWidths clamped_prefill_widths(const execution::Parameters& parameters,
 
 void validate_target_options(const execution::Parameters& parameters, DeviceContext& device,
                              const EngineOptions& options) {
+    if (options.speculative.tree_width != 1 &&
+        options.speculative.backend != SpeculativeBackend::Eagle3) {
+        throw std::invalid_argument("draft-tree widths above 1 require the EAGLE3 backend");
+    }
     if (!parameters.model.config().text.attention ||
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
@@ -1336,6 +1340,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument("EAGLE3 uses its own draft head, not the proposal head");
+        }
+        if (options.speculative.tree_width != 1) {
+            throw std::invalid_argument(
+                "EAGLE3 draft-tree widths above 1 are not implemented yet");
         }
         break;
     }
@@ -1478,6 +1486,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->prefill_width       = inputs.prefill_width;
     impl->draft_window        = inputs.draft_window;
+    impl->tree_width          = inputs.tree_width;
     impl->adaptive_draft      = inputs.adaptive_draft;
     impl->speculative_backend = inputs.speculative_backend;
     impl->lookup_drafts       = inputs.lookup_drafts;
@@ -1688,6 +1697,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk       = clamped_prefill_widths(parameters, options).chunk,
         .prefill_width       = clamped_prefill_widths(parameters, options).idle,
         .draft_window        = options.speculative.draft_tokens,
+        .tree_width          = options.speculative.tree_width,
         .adaptive_draft      = (options.speculative.backend == SpeculativeBackend::Mtp ||
                                 options.speculative.backend == SpeculativeBackend::Eagle3) &&
                           !options.speculative.fixed_draft,

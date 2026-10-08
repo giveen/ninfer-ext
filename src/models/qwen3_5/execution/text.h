@@ -221,6 +221,9 @@ public:
                                      ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
     // EAGLE3 draft proposal: the draft-vocabulary head, then the draft-to-target token-id map.
     void eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // EAGLE3 top-k first tokens for the static draft tree, in descending draft-score order.
+    void eagle3_propose_topk_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                   std::int32_t top);
     void set_eagle3_head(const LinearParameters* head, const std::int32_t* d2t,
                          int draft_vocab) noexcept {
         eagle3_head_        = head;

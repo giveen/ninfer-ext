@@ -107,6 +107,25 @@ EAGLE-3 adopts EAGLE-2's **context-aware dynamic draft tree**: the tree is grown
 model's own confidence instead of being fixed in advance. The first implementation uses a top-k
 chain/tree (as in the llama.cpp reference); the dynamic tree is a later refinement.
 
+## Static draft tree (status and design)
+
+The planned first tree is static and root-branched: Top-T first tokens from one seed hidden state
+(`eagle3_propose_topk_batch`: one head projection, repeated argmax with `mask_selected_logits`),
+each continued greedily, all chains verified together, winner committed. Landed enablers:
+`mask_selected_logits` / `select_tree_winners` (exact-oracle unit tests), the top-k propose path,
+and the `--draft-tree` option with plan/workspace/reporting plumbing (currently gated to 1).
+
+Round wiring is pending on one infra question, settled by measurement against the kernel: the
+causal attention **appends** KV at its cache positions (`bf16_kv_append_attention`), so verifying
+T chains that share absolute positions in one forward races on the shared slots, and a no-append
+forward would break intra-forward causality (later columns must read the chain's own earlier
+columns). Sequential verify-trim-reverify is correct but rereads the MoE weights T+1 times per
+round, which no accept-length gain can repay. The viable batched verify gives each chain its own
+text-KV row whose page table shares the physical history pages and appends to fresh pages
+(metadata-only fork, no data copy, one weight read); the winner's row is adopted at commit. That
+per-round row lifecycle is the remaining work; sequential chains need no draft-KV snapshot
+because each chain overwrites its own window before reading it.
+
 Reference: [EAGLE-3](https://arxiv.org/abs/2503.01840) §3.1 (inference pipeline) and §2.2 (the
 EAGLE-2 tree). Two points the paper leaves loose are settled by the released weights: the fused
 feature is `concat(l, m, h) -> FC -> g` (the encoder), and the decoder's `concat(embedding, g)` goes

@@ -252,4 +252,40 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
+void mask_selected_logits(Tensor& logits, const Tensor& selected, cudaStream_t stream) {
+    constexpr const char* op = "mask_selected_logits";
+    require_dtype(logits, DType::BF16, op, "logits");
+    require_dtype(selected, DType::I32, op, "selected");
+    if (logits.ne[0] <= 0 || logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument("mask_selected_logits: logits must be a non-empty matrix");
+    }
+    if (selected.ne[0] != logits.ne[1] || selected.ne[1] != 1 || selected.ne[2] != 1 ||
+        selected.ne[3] != 1) {
+        throw std::invalid_argument("mask_selected_logits: selected must match the batch width");
+    }
+    if (!logits.is_contiguous() || !selected.is_contiguous()) {
+        throw std::invalid_argument("mask_selected_logits: inputs must be contiguous");
+    }
+    detail::mask_selected_logits_launch(logits, selected, stream);
+}
+
+void select_tree_winners(const Tensor& accepted, Tensor& winners, std::int32_t tree_width,
+                         cudaStream_t stream) {
+    constexpr const char* op = "select_tree_winners";
+    require_dtype(accepted, DType::I32, op, "accepted");
+    require_dtype(winners, DType::I32, op, "winners");
+    if (tree_width <= 0 || winners.ne[0] <= 0 || winners.ne[1] != 1 || winners.ne[2] != 1 ||
+        winners.ne[3] != 1) {
+        throw std::invalid_argument("select_tree_winners: winners must be a non-empty vector");
+    }
+    if (accepted.ne[0] != winners.ne[0] * tree_width || accepted.ne[1] != 1 ||
+        accepted.ne[2] != 1 || accepted.ne[3] != 1) {
+        throw std::invalid_argument("select_tree_winners: accepted must hold batch*tree_width");
+    }
+    if (!accepted.is_contiguous() || !winners.is_contiguous()) {
+        throw std::invalid_argument("select_tree_winners: inputs must be contiguous");
+    }
+    detail::select_tree_winners_launch(accepted, winners, tree_width, stream);
+}
+
 } // namespace ninfer::ops

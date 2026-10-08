@@ -132,6 +132,25 @@ int main() {
                                        "--fixed-draft"});
                       }),
                       "--fixed-draft was accepted without a speculative backend");
+    const ninfer::cli::Options eagle3_chain =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "eagle3",
+               "--draft-tokens", "3"});
+    failures += check(eagle3_chain.speculative.backend == ninfer::SpeculativeBackend::Eagle3 &&
+                          eagle3_chain.speculative.tree_width == 1,
+                      "EAGLE3 did not default to a draft chain");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--draft-tree", "2"});
+                      }),
+                      "CLI accepted --draft-tree with MTP");
+    for (const auto w : {0U, 2U, 9U}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "eagle3", "--draft-tokens", "3", "--draft-tree",
+                                           std::to_string(w)});
+                          }),
+                          "CLI accepted an EAGLE3 draft-tree width other than 1");
+    }
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                        "dflash", "--draft-tokens", "7", "--fixed-draft"});

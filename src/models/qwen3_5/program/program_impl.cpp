@@ -44,7 +44,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), prefill_width(plan.prefill_width),
-      draft_window(plan.draft_window),
+      draft_window(plan.draft_window), tree_width(plan.tree_width),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
       lookup_drafts(plan.lookup_drafts), lookup_min_match(plan.lookup_min_match),

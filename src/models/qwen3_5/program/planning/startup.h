@@ -145,6 +145,8 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk             = 0; // service unit; the width beside decode work
     std::uint32_t prefill_width             = 0; // widest chunk, a multiple of prefill_chunk
     std::uint32_t draft_window              = 0;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    std::uint32_t tree_width                = 1;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;
@@ -178,6 +180,8 @@ struct SequencePlanImpl {
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t prefill_width             = 0;
     std::uint32_t draft_window              = 0;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    std::uint32_t tree_width                = 1;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;

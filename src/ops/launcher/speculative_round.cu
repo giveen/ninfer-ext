@@ -174,4 +174,25 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void mask_selected_logits_launch(Tensor& logits, const Tensor& selected, cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const int batch      = logits.ne[1];
+    const int grid       = std::max(1, div_up(batch, kBlock));
+    mask_selected_logits_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(logits.data), static_cast<const std::int32_t*>(selected.data),
+        logits.ne[0], batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void select_tree_winners_launch(const Tensor& accepted, Tensor& winners, std::int32_t tree_width,
+                                 cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const int batch      = winners.ne[0];
+    const int grid       = std::max(1, div_up(batch, kBlock));
+    select_tree_winners_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(accepted.data),
+        static_cast<std::int32_t*>(winners.data), tree_width, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

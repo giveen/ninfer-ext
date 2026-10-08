@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/argmax.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1178,6 +1180,112 @@ int remap_case(int token_count) {
     return failures;
 }
 
+int mask_logits_case(int rows, int batch, int rounds) {
+    // Exact oracle for draft-tree top-k: repeated argmax with masking must yield the rows sorted
+    // by descending value with lower-id tie-breaks, and masked elements must read back -inf.
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(rows) * batch);
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            const float value =
+                static_cast<float>((7 * r + 11 * b + (r % 5)) % 13) - static_cast<float>(r) / 64.0f;
+            logits[static_cast<std::size_t>(b) * rows + r] = f32_to_bf16(value);
+        }
+    }
+    std::vector<std::vector<std::int32_t>> expected(batch);
+    for (int b = 0; b < batch; ++b) {
+        std::vector<std::int32_t> order(rows);
+        std::iota(order.begin(), order.end(), 0);
+        const auto* column = logits.data() + static_cast<std::size_t>(b) * rows;
+        std::stable_sort(order.begin(), order.end(), [&](std::int32_t x, std::int32_t y) {
+            const float vx = bf16_to_f32(column[x]);
+            const float vy = bf16_to_f32(column[y]);
+            return vx != vy ? vx > vy : x < y;
+        });
+        expected[b].assign(order.begin(), order.begin() + rounds);
+    }
+
+    DeviceBuffer d_logits = to_device(logits);
+    GuardedDeviceBuffer d_selected(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_winner(batch * sizeof(std::int32_t));
+    Tensor logits_tensor(d_logits.p, DType::BF16, {rows, batch});
+    Tensor selected_tensor(d_selected.data(), DType::I32, {batch});
+    Tensor winner_tensor(d_winner.data(), DType::I32, {batch});
+    DeviceContext context;
+    int failures = 0;
+    const std::string label =
+        "mask logits R=" + std::to_string(rows) + " B=" + std::to_string(batch);
+    std::vector<std::int32_t> winners(static_cast<std::size_t>(rounds) * batch);
+    for (int round = 0; round < rounds; ++round) {
+        ops::argmax(logits_tensor, winner_tensor, rows, context.stream);
+        cuda_synchronize();
+        const std::vector<std::int32_t> got =
+            from_device<std::int32_t>(d_winner.data(), static_cast<std::size_t>(batch));
+        for (int b = 0; b < batch; ++b) {
+            winners[static_cast<std::size_t>(round) * batch + b] = got[static_cast<std::size_t>(b)];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(selected_tensor.data, winner_tensor.data,
+                                   selected_tensor.bytes(), cudaMemcpyDeviceToDevice,
+                                   context.stream));
+        ops::mask_selected_logits(logits_tensor, selected_tensor, context.stream);
+        cuda_synchronize();
+    }
+    std::vector<std::int32_t> want(winners.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int round = 0; round < rounds; ++round) {
+            want[static_cast<std::size_t>(round) * batch + b] = expected[b][round];
+        }
+    }
+    failures += verify_exact((label + " winners").c_str(), winners, want);
+    const std::vector<std::uint16_t> masked =
+        from_device<std::uint16_t>(d_logits.p, logits.size());
+    std::vector<std::uint16_t> want_masked = logits;
+    for (int b = 0; b < batch; ++b) {
+        for (int round = 0; round < rounds; ++round) {
+            want_masked[static_cast<std::size_t>(b) * rows + expected[b][round]] = 0xFC00U;
+        }
+    }
+    failures += verify_exact((label + " masked").c_str(), masked, want_masked);
+    failures += d_selected.verify_guards((label + " selected guards").c_str());
+    failures += d_winner.verify_guards((label + " winner guards").c_str());
+    return failures;
+}
+
+int tree_winners_case(int batch, int tree_width) {
+    // Exact oracle: lowest maximizing index per sequence-major group.
+    std::vector<std::int32_t> accepted(static_cast<std::size_t>(batch) * tree_width);
+    std::vector<std::int32_t> expected(batch);
+    for (int s = 0; s < batch; ++s) {
+        std::int32_t best_t = 0;
+        std::int32_t best    = -1;
+        for (int t = 0; t < tree_width; ++t) {
+            const std::int32_t value =
+                static_cast<std::int32_t>((3 * s + 5 * t + (t == 2 ? 4 : 0)) % 4);
+            accepted[static_cast<std::size_t>(s) * tree_width + t] = value;
+            if (value > best) {
+                best   = value;
+                best_t = t;
+            }
+        }
+        expected[s] = best_t;
+    }
+    DeviceBuffer d_accepted = to_device(accepted);
+    GuardedDeviceBuffer d_winners(batch * sizeof(std::int32_t));
+    Tensor accepted_tensor(d_accepted.p, DType::I32,
+                           {batch * tree_width});
+    Tensor winners_tensor(d_winners.data(), DType::I32, {batch});
+    DeviceContext context;
+    ops::select_tree_winners(accepted_tensor, winners_tensor, tree_width, context.stream);
+    cuda_synchronize();
+    const std::string label = "tree winners B=" + std::to_string(batch) + " T=" +
+                              std::to_string(tree_width);
+    int failures = verify_exact((label + " winners").c_str(),
+                                from_device<std::int32_t>(d_winners.data(), batch), expected);
+    failures += verify_exact((label + " accepted unchanged").c_str(),
+                             from_device<std::int32_t>(d_accepted.p, accepted.size()), accepted);
+    failures += d_winners.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 int transforms_conformance() {
     int failures = 0;
     for (int k = 1; k <= 15; ++k)
@@ -1190,6 +1298,9 @@ int transforms_conformance() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    for (const int batch : {1, 8}) failures += mask_logits_case(37, batch, 4);
+    failures += tree_winners_case(3, 2);
+    failures += tree_winners_case(8, 4);
     return failures;
 }
 

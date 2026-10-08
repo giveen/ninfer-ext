@@ -150,4 +150,34 @@ void TextContext::eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Ten
     ops::proposal_remap_token_ids(draft_tokens, eagle3_d2t_, eagle3_draft_vocab_, ctx_.stream);
 }
 
+// EAGLE3 top-k first tokens for the static draft tree: one head projection, then repeated
+// argmax with masking so the T winners come out in descending draft-score order (lower draft id
+// wins exact ties, matching argmax). `draft_tokens` is flat [top * batch]; the remap lifts all
+// winners to target ids at once.
+void TextContext::eagle3_propose_topk_batch(const Tensor& hidden, Tensor& logits,
+                                            Tensor& draft_tokens, std::int32_t top) {
+    if (eagle3_head_ == nullptr || eagle3_d2t_ == nullptr) {
+        throw std::runtime_error("EAGLE3 proposal head is not set");
+    }
+    const std::int32_t batch = hidden.ne[1];
+    const std::int32_t rows  = eagle3_head_->weight.n; // stored rows; the converter pads the head
+    if (top <= 0 || hidden.dtype != DType::BF16 || batch <= 0 || logits.dtype != DType::BF16 ||
+        logits.ne[0] < rows || logits.ne[1] != batch || draft_tokens.dtype != DType::I32 ||
+        draft_tokens.ne[0] != top * batch) {
+        throw std::invalid_argument("EAGLE3 top-k proposal batch shapes are invalid");
+    }
+    const auto& draft = *parameters_.draft;
+    Tensor lg         = logits.slice(0, 0, rows);
+    Tensor normed     = work_.alloc(DType::BF16, {hidden.ne[0], batch});
+    ops::rmsnorm(hidden, draft.final_norm, config_.rms_norm_eps, false, normed, ctx_.stream);
+    project(normed, *eagle3_head_, lg, work_, ctx_.stream);
+    Tensor real = lg.slice(0, 0, eagle3_draft_vocab_);
+    for (std::int32_t t = 0; t < top; ++t) {
+        Tensor winner = draft_tokens.slice(0, t * batch, batch);
+        ops::argmax(real, winner, eagle3_draft_vocab_, ctx_.stream);
+        ops::mask_selected_logits(real, winner, ctx_.stream);
+    }
+    ops::proposal_remap_token_ids(draft_tokens, eagle3_d2t_, eagle3_draft_vocab_, ctx_.stream);
+}
+
 } // namespace ninfer::models::qwen3_5::execution
