@@ -12,7 +12,7 @@ target_include_directories(ninfer_jinja PRIVATE ${PROJECT_SOURCE_DIR}/third_part
 target_link_libraries(ninfer_jinja PRIVATE ninfer_text ninfer::json)
 
 # Grammar compilation and per-request matchers; consumers link it explicitly.
-add_library(ninfer_grammar STATIC grammar.cpp json_schema.cpp)
+add_library(ninfer_grammar STATIC grammar.cpp json_schema.cpp schema_composition.cpp)
 ninfer_internal_includes(ninfer_grammar)
 target_include_directories(ninfer_grammar PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 target_include_directories(ninfer_grammar SYSTEM PRIVATE

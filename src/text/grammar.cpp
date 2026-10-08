@@ -8,10 +8,44 @@
 #include "regex_converter.h"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace ninfer::text {
 namespace {
+// Times a request-scoped subinterval only when the caller asked for constraint observations.
+class WorkTimer {
+public:
+    WorkTimer(bool enabled, double& seconds) : seconds_(enabled ? &seconds : nullptr) {
+        if (seconds_) started_ = std::chrono::steady_clock::now();
+    }
+
+    ~WorkTimer() {
+        if (seconds_) {
+            *seconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+        }
+    }
+
+    WorkTimer(const WorkTimer&)            = delete;
+    WorkTimer& operator=(const WorkTimer&) = delete;
+
+private:
+    double* seconds_;
+    std::chrono::steady_clock::time_point started_;
+};
+
+ConstraintCacheAccess cache_access(xgrammar::CompilationCacheAccess access) {
+    switch (access) {
+    case xgrammar::CompilationCacheAccess::kHit:
+        return ConstraintCacheAccess::Hit;
+    case xgrammar::CompilationCacheAccess::kBuilt:
+        return ConstraintCacheAccess::Built;
+    case xgrammar::CompilationCacheAccess::kWaited:
+        return ConstraintCacheAccess::Waited;
+    }
+    throw std::logic_error("invalid compilation cache observation");
+}
 
 void validate_utf8(std::string_view value) {
     for (std::size_t offset = 0; offset < value.size();) {
@@ -168,6 +202,7 @@ public:
     int vocabulary;
     std::size_t words;
     int tentative = 0;
+    ConstraintObservation observed;
 
     void fill(std::span<std::uint32_t> target) {
         if (matcher.IsTerminated()) {
@@ -193,13 +228,18 @@ GrammarCompiler::compile_model(std::string_view identity,
                                std::string_view close, std::string_view continuation) {
     const std::string key =
         "model:" + std::to_string(close.size()) + ":" + std::string(close) + std::string(identity);
-    auto compiled = impl_->compiler.CompileCachedGrammar(key, [&] {
-        auto grammar = build();
-        return close.empty() ? grammar
-                             : xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
-    });
+    xgrammar::CompilationCacheAccess access;
+    auto compiled = impl_->compiler.CompileCachedGrammar(
+        key,
+        [&] {
+            auto grammar = build();
+            return close.empty() ? grammar
+                                 : xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+        },
+        &access);
     auto session =
         std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
+    session->observed.cache = cache_access(access);
     if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation))) {
         throw RequestError(RequestErrorKind::InvalidToolConstraint,
                            "assistant continuation is not a prefix of the tool grammar");
@@ -226,6 +266,7 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
                           std::to_string(close.size()) + ":" + std::string(close) +
                           constraint.source;
         for (const auto& value : choices) key += std::to_string(value.size()) + ":" + value;
+        xgrammar::CompilationCacheAccess access;
         auto compiled = impl_->compiler.CompileCachedGrammar(key, [&] {
             auto grammar = [&]() -> xgrammar::Grammar {
                 if (constraint.kind == OutputConstraintKind::Grammar) {
@@ -240,29 +281,16 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
                         ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
                             xgrammar::NormalizeRegexPattern(constraint.source, true))));
                 } else {
-                    std::string source;
-                    if (constraint.kind == OutputConstraintKind::JsonObject) {
-                        if (!constraint.source.empty())
-                            throw RequestError(RequestErrorKind::InvalidJsonSchema,
-                                               "JSON object mode has no source payload");
-                        source = R"({"type":"object"})";
-                    } else if (constraint.kind == OutputConstraintKind::JsonSchema) {
-                        source = prepare_json_schema(constraint.source);
-                    } else {
-                        throw RequestError(RequestErrorKind::InvalidJsonSchema,
-                                           "unknown output constraint kind");
-                    }
-                    return xgrammar::Grammar::FromJSONSchema(
-                        source, false, std::nullopt, std::pair<std::string, std::string>{",", ":"},
-                        false, std::nullopt, false, false);
+                    return build_json_grammar(constraint);
                 }
             }();
             if (!close.empty())
                 grammar = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
             return grammar;
-        });
+        }, &access);
         auto session =
             std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
+        session->observed.cache = cache_access(access);
         if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation))) {
             throw std::invalid_argument("assistant continuation is not a prefix of the grammar");
         }
@@ -300,6 +328,7 @@ std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
         words.size() != (drafts.size() + 1) * impl_->words) {
         throw std::logic_error("invalid grammar lookahead transaction");
     }
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.mask_seconds);
     int advanced       = 0;
     bool reachable     = true;
     std::uint32_t dead = 0;
@@ -308,6 +337,7 @@ std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
             auto mask = words.subspan(position * impl_->words, impl_->words);
             if (reachable && !impl_->matcher.IsTerminated()) {
                 impl_->fill(mask);
+                ++impl_->observed.mask_positions;
                 if (std::all_of(mask.begin(), mask.end(), [](auto word) { return word == 0; })) {
                     dead |= 1u << position;
                     reachable = false;
@@ -336,16 +366,39 @@ std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
     return dead;
 }
 
-void GrammarSession::accept(std::int32_t token) {
-    if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token)) {
-        throw std::logic_error("selected token violates the request grammar");
+void GrammarSession::accept(std::int32_t token) { accept(std::span(&token, 1)); }
+
+void GrammarSession::accept(std::span<const std::int32_t> tokens) {
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
+    for (const auto token : tokens) {
+        if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token)) {
+            throw std::logic_error("selected token violates the request grammar");
+        }
+        ++impl_->tentative;
     }
-    ++impl_->tentative;
+}
+
+void GrammarSession::observe(bool timings, double prepare_seconds) noexcept {
+    impl_->observed.timings_collected = timings;
+    impl_->observed.prepare_seconds   = timings ? prepare_seconds : 0.0;
+}
+
+void GrammarSession::uploaded(std::size_t bytes) noexcept {
+    impl_->observed.mask_upload_bytes += bytes;
+}
+
+ConstraintObservation GrammarSession::observation() const {
+    if (impl_->tentative) { throw std::logic_error("cannot publish tentative grammar state"); }
+    auto result       = impl_->observed;
+    result.terminated = impl_->matcher.IsTerminated();
+    result.complete   = result.terminated || impl_->matcher.IsCompleted();
+    return result;
 }
 
 void GrammarSession::confirm() noexcept { impl_->tentative = 0; }
 
 void GrammarSession::discard() {
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
     if (impl_->tentative) { impl_->matcher.Rollback(impl_->tentative); }
     impl_->tentative = 0;
 }

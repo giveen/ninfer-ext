@@ -29,9 +29,15 @@ public:
     [[nodiscard]] std::uint32_t masks(std::span<const std::int32_t> drafts,
                                       std::span<std::uint32_t> words);
     void accept(std::int32_t token);
+    void accept(std::span<const std::int32_t> tokens);
     void confirm() noexcept;
     void discard();
     [[nodiscard]] std::size_t mask_words() const noexcept;
+    // Record what the constraint cost this request. Timings are subintervals of existing request
+    // timings, so callers report them, never add them.
+    void observe(bool timings, double prepare_seconds = 0.0) noexcept;
+    void uploaded(std::size_t bytes) noexcept;
+    [[nodiscard]] ConstraintObservation observation() const;
 
 private:
     class Impl;

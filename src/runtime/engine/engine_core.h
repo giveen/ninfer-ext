@@ -76,6 +76,10 @@ public:
                                         std::span<std::uint32_t> words) override {
             return outputs[row]->grammar_masks(drafts, words);
         }
+
+        void uploaded(std::size_t row, std::size_t bytes) noexcept override {
+            outputs[row]->constraint_uploaded(bytes);
+        }
     };
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
@@ -220,6 +224,8 @@ public:
                                    "grammar requires a backend whose rounds consume token masks; "
                                    "this one verifies drafts without them");
             }
+            const auto constraint_started =
+                observation.phase_timings ? Clock::now() : submitted;
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
                 options.constraint, options.tool_choice);
@@ -238,6 +244,9 @@ public:
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
             }
+            output.observe_constraint(
+                observation.phase_timings,
+                std::chrono::duration<double>(Clock::now() - constraint_started).count());
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
@@ -430,6 +439,7 @@ private:
         stats.program_submit_ns += timing.submit_host_ns;
         stats.program_post_ns += timing.post_host_ns;
         stats.device_wait_ns += timing.device_wait_ns;
+        stats.constraint_draft_wait_ns += timing.constraint_draft_wait_ns;
         add_class_host_time(timing.host_ns(), timing.device_wait_ns);
         for (std::size_t i = 0; i < exposed.size; ++i) {
             const ActiveExposure& exposure = exposed.entries[i];
@@ -920,6 +930,7 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
+        result.constraint              = request->output.constraint_observation();
         result.materialization         = request->materialization_diagnostics;
         if (request->first_token) {
             result.timings.first_token_seconds =

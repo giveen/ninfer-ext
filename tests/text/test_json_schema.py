@@ -6,12 +6,7 @@ from pathlib import Path
 import subprocess
 import unittest
 
-try:
-    import jsonschema  # declared in tests/text/requirements.txt
-except ImportError:
-    # Exit 77 so a missing test-only dependency is a visible skip, not a silent pass or a failure
-    # that looks like a product defect.
-    raise SystemExit(77)
+import jsonschema
 
 ROOT = Path(__file__).resolve().parents[2]
 PROBE = Path(os.environ.get("NINFER_SCHEMA_PROBE", ROOT / "build/tests/ninfer_json_schema_test"))
@@ -92,6 +87,138 @@ class SchemaContracts(unittest.TestCase):
         cases.append((tree, [None, {"value": 1, "next": None}, {"value": 1, "next": {"value": 2, "next": None}}, {"value": "bad", "next": None}]))
         self.run_cases(cases)
 
+    def test_supported_conjunctions(self):
+        cases = [
+            (
+                {
+                    "type": "string",
+                    "pattern": "^[A-Z]+$",
+                    "minLength": 2,
+                    "maxLength": 4,
+                },
+                ["", "A", "AB", "ABCD", "ABCDE", "Ab", "ＡＢ"],
+            ),
+            (
+                {
+                    "type": "string",
+                    "pattern": "你|😀|\\n",
+                    "minLength": 2,
+                    "maxLength": 3,
+                },
+                ["你", "你好", "😀a", "x\ny", "abcd", "你abc", "\n\n"],
+            ),
+            (
+                {"enum": ["A", "AB", "ABC", 7], "type": "string", "minLength": 2},
+                ["A", "AB", "ABC", 7],
+            ),
+            (
+                {
+                    "const": {"b": 2, "a": 1},
+                    "type": "object",
+                    "properties": {"a": {"minimum": 1}},
+                    "required": ["a"],
+                },
+                [{"b": 2, "a": 1}, {"b": 2, "a": 0}],
+            ),
+            (
+                {
+                    "type": "integer",
+                    "minimum": 2,
+                    "anyOf": [{"maximum": 4}, {"minimum": 7}],
+                },
+                [1, 2, 4, 5, 7],
+            ),
+            (
+                {
+                    "$defs": {"s": {"type": "string", "minLength": 2}},
+                    "$ref": "#/$defs/s",
+                    "maxLength": 3,
+                },
+                ["a", "ab", "abc", "abcd"],
+            ),
+            (
+                {
+                    "allOf": [
+                        {"type": "string", "pattern": "a"},
+                        {"pattern": "b", "maxLength": 3},
+                    ]
+                },
+                ["a", "ab", "ba", "bba", "bbbb"],
+            ),
+            (
+                {
+                    "allOf": [
+                        {"type": "array", "items": {"type": "integer"}, "minItems": 1},
+                        {"items": {"minimum": 2}, "maxItems": 2},
+                    ]
+                },
+                [[], [1], [2], [2, 3], [2, 3, 4], ["2"]],
+            ),
+            (
+                {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "properties": {"a": {"type": "string"}},
+                            "additionalProperties": False,
+                        },
+                        {"properties": {"b": {"type": "integer"}}},
+                    ]
+                },
+                [{}, {"a": "x"}, {"b": 1}, {"a": "x", "b": 1}],
+            ),
+            (
+                {
+                    "type": "object",
+                    "required": ["kind"],
+                    "oneOf": [
+                        {
+                            "properties": {"kind": {"const": "a"}},
+                            "additionalProperties": False,
+                        },
+                        {
+                            "properties": {"kind": {"const": "b"}},
+                            "additionalProperties": False,
+                        },
+                    ],
+                },
+                [{}, {"kind": "a"}, {"kind": "b"}, {"kind": "c"}],
+            ),
+            (
+                {
+                    "type": ["integer", "null"],
+                    "allOf": [{"minimum": 2}, {"maximum": 1}],
+                },
+                [None, 1, 2],
+            ),
+        ]
+        tree = {
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "integer"},
+                        "next": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/node"}]},
+                    },
+                    "required": ["value", "next"],
+                    "additionalProperties": False,
+                }
+            },
+            "$ref": "#/$defs/node",
+            "properties": {"value": {"minimum": 2}},
+        }
+        cases.append(
+            (
+                tree,
+                [
+                    {"value": 2, "next": None},
+                    {"value": 2, "next": {"value": 1, "next": None}},
+                    {"value": 1, "next": None},
+                ],
+            )
+        )
+        self.run_cases(cases)
+
     def test_additional_keys_cannot_override_declared_values(self):
         schema = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
         candidates = ['{"n":1,"n":"bad"}', '{"n":1,"\\u006e":"bad"}', '{"n":1,"x":"good"}']
@@ -103,17 +230,35 @@ class SchemaContracts(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["accepted"], [False, False, True])
 
     def test_rejections_and_diagnostics(self):
-        cases = [({"type": "string", "format": "email"}, "/format"),
-                 ({"type": "array", "uniqueItems": True}, "/uniqueItems"),
-                 ({"type": "string", "pattern": "x", "maxLength": 5}, "/pattern"),
-                 ({"type": "object", "properties": {"x": {"type": "number", "minimum": 1}}}, "/properties/x/minimum"),
-                 ({"$ref": "https://example.com/schema"}, "/$ref"),
-                 ({"type": "string", "pattern": r"[\q]"}, "/pattern"),
-                 ({"type": "string", "pattern": r"\xZZ"}, "/pattern"),
-                 ({"type": "integer", "exclusiveMinimum": 2**63-1}, "/exclusiveMinimum"),
-                 ({"const": {"large": 2**63+1}}, "/const/large"),
-                 ({"const": -(2**63)-1}, "/const"),
-                 ({"type": "string", "minLength": -1}, "/minLength")]
+        cases = [
+            ({"$schema": 7}, "/$schema"),
+            ({"allOf": [{"type": "number"}, {"minimum": 1}]}, "/allOf/1/minimum"),
+            (
+                {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "$defs": {"x": {"type": "string"}},
+                    "$ref": "#/$defs/x",
+                    "maxLength": 2,
+                },
+                "/maxLength",
+            ),
+            ({"type": "string", "format": "email"}, "/format"),
+            ({"type": "array", "uniqueItems": True}, "/uniqueItems"),
+            (
+                {
+                    "type": "object",
+                    "properties": {"x": {"type": "number", "minimum": 1}},
+                },
+                "/properties/x/minimum",
+            ),
+            ({"$ref": "https://example.com/schema"}, "/$ref"),
+            ({"type": "string", "pattern": r"[\q]"}, "/pattern"),
+            ({"type": "string", "pattern": r"\xZZ"}, "/pattern"),
+            ({"type": "integer", "exclusiveMinimum": 2**63 - 1}, "/exclusiveMinimum"),
+            ({"const": {"large": 2**63 + 1}}, "/const/large"),
+            ({"const": -(2**63) - 1}, "/const"),
+            ({"type": "string", "minLength": -1}, "/minLength"),
+        ]
         result = subprocess.run(
             [str(PROBE), "--probe"],
             input="".join(compact({"schema": s, "candidates": []}) + "\n" for s, _ in cases),
@@ -127,9 +272,23 @@ class SchemaContracts(unittest.TestCase):
                 self.assertEqual(data["pointer"], pointer)
 
     def test_empty_languages_fail_before_generation(self):
-        schemas = [False, {"const": "x", "type": "integer"}, {"$ref": "#"},
-                   {"type": "object", "properties": {"x": False}, "required": ["x"]},
-                   {"anyOf": [False, {"type": "integer", "minimum": 2, "maximum": 1}]}]
+        schemas = [
+            {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": {"a": {}},
+                        "additionalProperties": False,
+                    },
+                    {"required": ["b"]},
+                ]
+            },
+            False,
+            {"const": "x", "type": "integer"},
+            {"$ref": "#"},
+            {"type": "object", "properties": {"x": False}, "required": ["x"]},
+            {"anyOf": [False, {"type": "integer", "minimum": 2, "maximum": 1}]},
+        ]
         result = subprocess.run(
             [str(PROBE), "--probe"],
             input="".join(compact({"schema": s, "candidates": []}) + "\n" for s in schemas),

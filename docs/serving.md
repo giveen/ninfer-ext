@@ -254,7 +254,11 @@ function also forbids parallel calls, matching both protocols' semantics. `paral
 caps the call count at one, and `strict: true` on a function makes the generated arguments satisfy
 that function's declared JSON Schema. `tool_constraints: auto|basic` (default `basic`) decides whether
 a request with ordinary `auto` tools is also constrained structurally; declarations always reach the
-prompt either way. A call may follow ordinary content under `auto`; under `required` it starts the
+prompt either way. JSON output may be combined with active tools — the model answers in JSON or calls
+a tool, and the response states which branch the answer took — while GBNF, choice and regex describe
+one language and are refused with tools. When the client asks for phase timings, the constraint
+observation reports the compile-cache outcome, mask work and that branch, as subintervals of the
+timings already reported. A call may follow ordinary content under `auto`; under `required` it starts the
 answer. Custom tools, hosted tools and `strict:true` on a tool whose schema is outside the supported
 subset are still refused.
 

@@ -1022,6 +1022,21 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
     // become the output language.
     auto tool_contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
     if (constraint && tool_contract && tool_contract->tools.empty()) { tool_contract.reset(); }
+    // A JSON body language and a call language can share one output: the model answers in JSON or
+    // calls a tool. Other body languages describe a single language, so combining them is refused.
+    const bool combined = constraint && tool_contract && !tool_contract->tools.empty();
+    if (combined) {
+        if (constraint->kind != OutputConstraintKind::JsonObject &&
+            constraint->kind != OutputConstraintKind::JsonSchema) {
+            throw RequestError(text::constraint_error_kind(constraint->kind),
+                               "active tools can be combined with JSON output constraints");
+        }
+        if (!tool_contract->constrained) {
+            auto structured         = std::make_shared<fi::ToolCallOutputContract>(*tool_contract);
+            structured->constrained = true;
+            tool_contract           = std::move(structured);
+        }
+    }
     const bool tool_constraint  = tool_contract && tool_contract->constrained;
     const auto constraint_kind  = [&] {
         return tool_constraint ? RequestErrorKind::InvalidToolConstraint
@@ -1029,7 +1044,7 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
     };
     std::unique_ptr<text::GrammarSession> matcher;
     if (constraint || tool_constraint) {
-        if (impl_->defaults.token_ids.empty() || (constraint && tool_contract) ||
+        if (impl_->defaults.token_ids.empty() ||
             !caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
             !caller_stop.include_model_defaults || caller_stop.publish_stop_token || output.raw ||
             output.preserve_special_tokens) {
@@ -1053,7 +1068,7 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
                     }
                 }
                 matcher = fi::compile_tool_grammar(impl_->grammars(), *tool_contract, close,
-                                                  prompt.data_->continuation_content);
+                                                   prompt.data_->continuation_content, constraint);
             } else {
                 matcher = impl_->grammars().compile(*constraint, close,
                                                     prompt.data_->continuation_content);
@@ -1067,7 +1082,7 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, std::move(tool_contract),
-                         std::move(matcher), prompt.data_->continuation_content);
+                         std::move(matcher), prompt.data_->continuation_content, combined);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
