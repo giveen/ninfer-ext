@@ -13,6 +13,10 @@ The fork adds four things on top of upstream's engine:
   `--json-object`/`--json-schema-file`/`--grammar-file`/`--regex`/`--choice` on the CLI. The vocabulary-wide legal set is compiled once per model and applied per round on the device,
   per verify position, so speculative drafting keeps working; the supported schema subset and the
   current limits are in [constrained decoding](docs/maintainer/constrained-decoding.md).
+- **Constrained tool calls**: `tool_choice` `required`/named/`allowed_tools`, `parallel_tool_calls:
+  false`, and per-function `strict` schemas, so a published call is complete and its arguments
+  satisfy the declared schema. Declarations always reach the prompt; the selection constrains the
+  generated calls. See [constrained decoding](docs/maintainer/constrained-decoding.md).
 - **Faster speculative decoding on Qwen3.8-27B `groupwise-int`.** Against stock on the same
   artifacts, DFlash2 serving is 13–48% faster at 1–4 concurrent requests, and MTP 8–32% faster.
 - **Serving work for long-running agents.** Context-cache salvage and anchoring, one Host-tier

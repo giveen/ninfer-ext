@@ -247,6 +247,17 @@ audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
+Tool declarations and their selection are separate facts. `tools` declares what the model may call;
+`tool_choice` decides what this request accepts: `auto`, `none`, `required`, `{"type":"function",...}`
+for one named function, or `allowed_tools` with `mode: auto|required` and a `tools` list. Naming one
+function also forbids parallel calls, matching both protocols' semantics. `parallel_tool_calls: false`
+caps the call count at one, and `strict: true` on a function makes the generated arguments satisfy
+that function's declared JSON Schema. `tool_constraints: auto|basic` (default `basic`) decides whether
+a request with ordinary `auto` tools is also constrained structurally; declarations always reach the
+prompt either way. A call may follow ordinary content under `auto`; under `required` it starts the
+answer. Custom tools, hosted tools and `strict:true` on a tool whose schema is outside the supported
+subset are still refused.
+
 The other constrained-decoding aliases llama.cpp and vLLM used (`grammar`, `guided_json`,
 `guided_regex`, `guided_choice`, and `guided_grammar`) are refused with a pointer to the standard
 JSON output formats or `structured_outputs.grammar` instead of being treated as unknown hints.

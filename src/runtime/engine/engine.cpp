@@ -40,6 +40,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
     resolved.constraint                        = options.constraint;
+    resolved.tool_choice                       = std::move(options.tool_choice);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;

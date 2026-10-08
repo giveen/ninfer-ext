@@ -8,7 +8,8 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
-#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_contract.h"
+#include "models/qwen3_5/frontend/tool_grammar.h"
 #include "text/unicode.h"
 #include "text/grammar.h"
 #include <mutex>
@@ -823,7 +824,6 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
-    result.has_active_tools    = !options.tool_jsons.empty();
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -1013,36 +1013,61 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession
 Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                               const OutputOptions& output, const ThinkingControlOptions& thinking,
-                              const std::optional<OutputConstraint>& constraint) const {
+                              const std::optional<OutputConstraint>& constraint,
+                              const ToolChoice& tool_choice) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    // The declarations are per prompt; this request's selection and cardinality decide whether they
+    // become the output language.
+    auto tool_contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
+    if (constraint && tool_contract && tool_contract->tools.empty()) { tool_contract.reset(); }
+    const bool tool_constraint  = tool_contract && tool_contract->constrained;
+    const auto constraint_kind  = [&] {
+        return tool_constraint ? RequestErrorKind::InvalidToolConstraint
+                               : text::constraint_error_kind(constraint->kind);
+    };
     std::unique_ptr<text::GrammarSession> matcher;
-    if (constraint) {
-        if (impl_->defaults.token_ids.empty() || prompt.data_->has_active_tools ||
+    if (constraint || tool_constraint) {
+        if (impl_->defaults.token_ids.empty() || (constraint && tool_contract) ||
             !caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
             !caller_stop.include_model_defaults || caller_stop.publish_stop_token || output.raw ||
             output.preserve_special_tokens) {
-            throw RequestError(text::constraint_error_kind(constraint->kind),
-                               "output constraints require default EOS, text output and no "
-                               "active tools or custom stops");
+            throw RequestError(constraint_kind(),
+                               "constraints require default EOS, text output, no custom stops, and "
+                               "one output language");
         }
         try {
-            matcher = impl_->grammars().compile(*constraint,
-                                                prompt.data_->starts_in_reasoning
-                                                    ? fi::kCanonicalReasoningCloseSerialization
-                                                    : std::string_view{},
-                                                prompt.data_->continuation_content);
+            const auto close = prompt.data_->starts_in_reasoning
+                                   ? fi::kCanonicalReasoningCloseSerialization
+                                   : std::string_view{};
+            if (tool_constraint) {
+                for (const auto& tool : tool_contract->tools) {
+                    if (tool.name.size() > output.tool_name_max_length ||
+                        !std::all_of(tool.name.begin(), tool.name.end(), [](unsigned char c) {
+                            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                   (c >= '0' && c <= '9') || c == '_' || c == '-';
+                        })) {
+                        throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                                           "tool name is outside the output contract: " + tool.name);
+                    }
+                }
+                matcher = fi::compile_tool_grammar(impl_->grammars(), *tool_contract, close,
+                                                  prompt.data_->continuation_content);
+            } else {
+                matcher = impl_->grammars().compile(*constraint, close,
+                                                    prompt.data_->continuation_content);
+            }
         } catch (const RequestError&) {
             throw;
         } catch (const std::invalid_argument& error) {
-            throw RequestError(text::constraint_error_kind(constraint->kind), error.what());
+            throw RequestError(constraint_kind(), error.what());
         }
     }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, prompt.data_->tool_call_output,
-                         std::move(matcher));
+                         impl_->thinking_control_tokens, std::move(tool_contract),
+                         std::move(matcher), prompt.data_->continuation_content);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

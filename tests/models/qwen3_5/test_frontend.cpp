@@ -1804,7 +1804,7 @@ int test_structured_tool_output() {
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
-        "</parameter>\n<parameter=enabled>\n</parameter>\n<parameter=count>\nmany\n"
+        "</parameter>\n<parameter=enabled>\n\n</parameter>\n<parameter=count>\nmany\n"
         "</parameter>\n</function>\n</tool_call>";
     const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
@@ -1980,8 +1980,13 @@ int test_tool_marker_after_quoted_marker() {
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
     auto prompt = frontend.prepare(std::move(input));
-    auto session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    // This case feeds a model-shaped answer that only free generation can produce, so it uses the
+    // mode that enforces nothing the request did not ask for.
+    auto session = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+        /*thinking=*/{},
+        /*constraint=*/{},
+        ninfer::ToolChoice{.constraints = ninfer::ToolConstraintMode::Automatic});
 
     const std::string quoted =
         "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
