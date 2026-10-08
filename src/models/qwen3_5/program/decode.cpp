@@ -822,6 +822,14 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
+        DecodeGraphExecutable* executable = nullptr;
+        if (use_cuda_graph) {
+            DecodeGraphProfile& profile = select_graph_profile(
+                rung.graphs, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                "EAGLE3 batch");
+            executable = &install_graph_profile(rung.graphs, profile, "EAGLE3 batch");
+            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, k, capacity);
+        }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
@@ -868,6 +876,11 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
         qwen3_5::KVHostStaging* staging        = stage_text_kv(lanes);
         const qwen3_5::QsaIndexMirrors mirrors = mirror_qsa_index(lanes, true);
 
+        if (staging != nullptr || mirrors.active()) {
+            executable = nullptr;
+            envelopes  = mtp_causal_attention_envelopes(maximum_frontier, k, capacity);
+        }
+
         execution::Eagle3BatchContext schedule_state{
             {device, parameters, work, state_images->linear(), &rung.records, io, prefill_hidden,
              prefill_width, proposal_head, qwen4_execution()},
@@ -882,7 +895,7 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::eagle3_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), k,
-                                       envelopes, nullptr);
+                                       envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {

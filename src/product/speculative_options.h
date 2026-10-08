@@ -104,9 +104,6 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec eagle3 requires --draft-tokens in [1,15]");
         }
-        if (options.fixed_draft) {
-            throw std::invalid_argument("--fixed-draft applies only to --spec mtp");
-        }
         return;
     }
     throw std::invalid_argument("invalid speculative backend");

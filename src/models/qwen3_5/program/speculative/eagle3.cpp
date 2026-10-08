@@ -31,9 +31,9 @@ DFlashFeatureSink eagle3_feature_sink(Eagle3BatchContext& state, const Tensor& l
 // draft layers, the encoder fuses them into g, and the one-layer draft decoder autoregressively
 // proposes the next round's tokens from the accepted prefix. The round reuses the MTP host bridge,
 // frame and envelopes; only the draft cache and the draft forward differ.
-void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = [&state, batch_size, k, envelopes] {
+auto eagle3_decode_batch_body(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                              MtpCausalAttentionEnvelopes envelopes) {
+    return [&state, batch_size, k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kLookupDecodeMaximumDrafts) {
             throw std::logic_error("EAGLE3 decode batch state is incomplete");
@@ -175,6 +175,18 @@ void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std
                                    sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
     };
+}
+
+void capture_eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                                 MtpCausalAttentionEnvelopes envelopes,
+                                 DecodeGraphDefinition& definition) {
+    auto body = eagle3_decode_batch_body(state, batch_size, k, envelopes);
+    capture_graph(state, definition, body);
+}
+
+void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                         MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
+    auto body = eagle3_decode_batch_body(state, batch_size, k, envelopes);
     run_prepared(state, executable, body);
 }
 

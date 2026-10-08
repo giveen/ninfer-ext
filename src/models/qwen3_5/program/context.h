@@ -224,6 +224,9 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
 // then drafts with the EAGLE3 encoder and its one autoregressive decoder layer.
 void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable);
+void capture_eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size,
+                                 std::uint32_t k, MtpCausalAttentionEnvelopes envelopes,
+                                 DecodeGraphDefinition& definition);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

@@ -1557,7 +1557,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk       = clamped_prefill_widths(parameters, options).chunk,
         .prefill_width       = clamped_prefill_widths(parameters, options).idle,
         .draft_window        = options.speculative.draft_tokens,
-        .adaptive_draft      = options.speculative.backend == SpeculativeBackend::Mtp &&
+        .adaptive_draft      = (options.speculative.backend == SpeculativeBackend::Mtp ||
+                                options.speculative.backend == SpeculativeBackend::Eagle3) &&
                           !options.speculative.fixed_draft,
         .speculative_backend = options.speculative.backend,
         .lookup_drafts       = options.speculative.lookup_drafts,

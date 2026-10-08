@@ -415,22 +415,42 @@ void ProgramImpl::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::Eagle3 && !mtp_rungs.empty()) {
-        // The EAGLE3 kernels (its multi-head causal producer and the draft's q8 projections) live
-        // in their own CUDA module. One representative eager round loads it during startup rather
-        // than making the first prefill pay the module load.
-        MtpRung& rung               = mtp_rungs[mtp_round_rung];
-        const std::uint32_t k       = rung.k;
-        const auto planned_profiles = mtp_graph_profiles(capacity, k);
-        const GraphExecutionProfile code_warm = planned_profiles.front();
-        prepare_representative(code_warm.min, 1, k);
-        device.synchronize();
-        execution::Eagle3BatchContext eagle3_state{
-            execution_core(&rung.records), decoder->text_kv, *decoder->eagle3_cache(), rung.frame,
-            *mtp_host_ingress, *mtp_host_egress, state_images->continuation_hidden_store()};
-        execution::eagle3_decode_batch(
-            eagle3_state, 1, k, mtp_causal_attention_envelopes(code_warm.max, k, capacity),
-            nullptr);
-        device.synchronize();
+        // The EAGLE3 round is MTP-shaped, so it captures one graph family per rung and batch size
+        // exactly as MTP does. The code-warm round also loads the EAGLE3 kernels' CUDA module
+        // during startup instead of charging the module load to the first prefill.
+        for (MtpRung& rung : mtp_rungs) {
+            const std::uint32_t k       = rung.k;
+            const auto planned_profiles = mtp_graph_profiles(capacity, k);
+            validate_graph_profiles(planned_profiles, capacity - 1, "EAGLE3");
+            execution::Eagle3BatchContext eagle3_state{
+                execution_core(&rung.records), decoder->text_kv, *decoder->eagle3_cache(),
+                rung.frame, *mtp_host_ingress, *mtp_host_egress,
+                state_images->continuation_hidden_store()};
+            const GraphExecutionProfile code_warm = planned_profiles.front();
+            prepare_representative(code_warm.min, 1, k);
+            device.synchronize();
+            execution::eagle3_decode_batch(
+                eagle3_state, 1, k, mtp_causal_attention_envelopes(code_warm.max, k, capacity),
+                nullptr);
+            device.synchronize();
+
+            rung.graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    rung.graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = rung.graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    execution::capture_eagle3_decode_batch(
+                        eagle3_state, static_cast<std::int32_t>(batch_size), k,
+                        mtp_causal_attention_envelopes(planned.max, k, capacity),
+                        profile.definition);
+                }
+            }
+        }
     }
     if (is_masked_draft_backend(speculative_backend)) {
         const auto planned_profiles =
@@ -481,9 +501,11 @@ void ProgramImpl::prepare_graphs() {
         instantiate_graph_family(ordinary_graphs, "ordinary", device, false,
                                  prepare_representative);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
+        const char* const family = speculative_backend == SpeculativeBackend::Mtp ? "MTP" : "EAGLE3";
         for (MtpRung& rung : mtp_rungs) {
-            instantiate_graph_family(rung.graphs, "MTP", device, true,
+            instantiate_graph_family(rung.graphs, family, device, true,
                                      [&](std::uint32_t frontier, std::uint32_t batch_size) {
                                          prepare_representative(frontier, batch_size, rung.k);
                                      });
