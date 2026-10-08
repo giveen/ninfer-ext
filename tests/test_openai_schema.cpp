@@ -187,33 +187,73 @@ int test_standard_field_policy() {
 }
 
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
+    int failures = 0;
+
+    // GBNF is the supported constrained-output entry point: one nonempty grammar string.
+    Json gbnf                     = base_request();
+    gbnf["structured_outputs"]    = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
+    const OpenAIChatRequest wired = parse(gbnf);
+    failures += check(wired.generation.grammar == "root ::= \"yes\" | \"no\"",
+                      "structured_outputs.grammar reaches the generation request");
+
+    // Every other alias promises constrained generation, so it is refused with a pointer instead of
+    // being ignored or silently reinterpreted.
+    const std::vector<std::pair<const char*, Json>> aliases = {
         {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
         {"guided_json", Json{{"type", "object"}}},
         {"guided_regex", "[a-z]+"},
         {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
+        {"guided_grammar", ""},
     };
-    for (const auto& [field, value] : active) {
+    for (const auto& [field, value] : aliases) {
         Json body            = base_request();
         body[field]          = value;
         const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.contains(field),
-                  std::string(field) + " constrained decoding is explicitly rejected");
+        failures += check(error.param == field &&
+                              error.message.contains("structured_outputs.grammar"),
+                          std::string(field) + " alias is refused with a pointer");
     }
 
+    // A malformed object, and a grammar that cannot be combined with the request, are refused here
+    // rather than at generation time.
+    const std::vector<std::pair<const char*, Json>> malformed = {
+        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
+        {"structured_outputs", Json{{"grammar", ""}}},
+        {"structured_outputs", Json{{"grammar", 1}}},
+        {"structured_outputs", Json{{"grammar", "root ::= \"a\""}, {"json", Json::object()}}},
+    };
+    for (const auto& [field, value] : malformed) {
+        Json body            = base_request();
+        body[field]          = value;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures += check(error.param == "structured_outputs.grammar",
+                          "malformed structured_outputs is refused at its field");
+    }
+    Json with_tools    = base_request();
+    with_tools["tools"] = Json::array({Json{{"type", "function"},
+                                            {"function", Json{{"name", "weather"},
+                                                              {"parameters",
+                                                               Json{{"type", "object"}}}}}}});
+    with_tools["structured_outputs"] = Json{{"grammar", "root ::= \"a\""}};
+    failures += check(api_error([&] { (void)parse(with_tools); }).param ==
+                          "structured_outputs.grammar",
+                      "a grammar with active tools is refused before generation");
+    Json with_stop       = base_request();
+    with_stop["stop"]    = "END";
+    with_stop["structured_outputs"] = Json{{"grammar", "root ::= \"a\""}};
+    failures += check(api_error([&] { (void)parse(with_stop); }).param ==
+                          "structured_outputs.grammar",
+                      "a grammar with a custom stop is refused before generation");
+
+    // Null values stay neutral, so clients that always send the field remain harmless.
     Json neutral                  = base_request();
-    neutral["grammar"]            = "";
     neutral["structured_outputs"] = nullptr;
     neutral["guided_json"]        = nullptr;
     neutral["guided_regex"]       = nullptr;
     neutral["guided_choice"]      = nullptr;
     neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
+    failures += check(parse(neutral).generation.messages.size() == 1 &&
+                          !parse(neutral).generation.grammar,
                       "neutral constrained-decoding extension values are accepted");
     return failures;
 }

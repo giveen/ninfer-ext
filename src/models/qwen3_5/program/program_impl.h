@@ -558,9 +558,15 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
+    [[nodiscard]] bool consumes_token_masks() const noexcept {
+        return speculative_backend == SpeculativeBackend::None ||
+               speculative_backend == SpeculativeBackend::Mtp;
+    }
+
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::PrefillPace pace,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  runtime::TokenMaskProvider* masks);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -588,7 +594,8 @@ public:
         CapturePressureCandidate&& pressure, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing);
+                                      runtime::ExecutionTiming* failed_timing,
+                                      runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
@@ -705,6 +712,16 @@ public:
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    // Device masks the sampling rounds consume, plus the pinned staging the Engine's provider
+    // fills. Positions beyond a round's reach keep their dead-end bits for the commit boundary.
+    Tensor grammar_masks_device;
+    std::optional<PinnedHostBuffer> grammar_masks_host;
+    std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+    [[nodiscard]] ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider* provider,
+                                                      std::size_t row,
+                                                      std::span<const TokenId> drafts);
+    void require_unmasked_round(runtime::TokenMaskProvider* masks,
+                                std::span<const std::uint32_t> lanes) const;
     Tensor token_counts;
     std::optional<execution::Qwen4ExpertPager> qwen4_experts;
     std::optional<execution::Qwen4Runtime> qwen4_runtime;
@@ -1067,7 +1084,7 @@ private:
                         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
-               runtime::ExecutionTiming* failed_timing);
+               runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_prefill_raw(std::uint32_t lane, bool terminal, runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
@@ -1300,22 +1317,28 @@ private:
     [[nodiscard]] bool lookup_cost_known() const noexcept {
         return lookup_round_seconds_ > 0.0 && plain_round_seconds_ > 0.0;
     }
+    // The speculative batches accept the mask set for signature parity; a constrained request is
+    // rejected at preparation until their verify positions consume it, so they assert it is absent.
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,
-                          runtime::ExecutionTiming* failed_timing);
+                          runtime::ExecutionTiming* failed_timing,
+                          runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets,
-                     runtime::ExecutionTiming* failed_timing);
+                     runtime::ExecutionTiming* failed_timing,
+                     runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing);
+                        runtime::ExecutionTiming* failed_timing,
+                        runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing);
+                        runtime::ExecutionTiming* failed_timing,
+                        runtime::TokenMaskProvider* masks);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void resize_sequence_kv_device_entitlement(SequenceState& sequence, std::uint32_t text_pages,

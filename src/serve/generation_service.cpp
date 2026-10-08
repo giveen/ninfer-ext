@@ -43,6 +43,14 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidGrammar:
+    case ninfer::RequestErrorKind::ConstraintDeadEnd:
+        error.status = 400;
+        error.param  = "structured_outputs.grammar";
+        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidGrammar
+                           ? "invalid_grammar"
+                           : "constraint_dead_end";
+        break;
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";

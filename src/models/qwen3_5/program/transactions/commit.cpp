@@ -39,9 +39,16 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
             ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
     }
     pending_transaction_ = transaction;
-    return ContractAccess::make_pending(
+    auto pending         = ContractAccess::make_pending(
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
         round.tokens, round.row_counts, round.row_stride, round.timing);
+    // A row fails only when its round actually consumed a position the constraint left empty.
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto count = round.row_counts.empty() ? 1 : round.row_counts[row];
+        ContractAccess::constraint_failed(pending, row,
+                                          (grammar_dead_positions[row] & ((1u << count) - 1)) != 0);
+    }
+    return pending;
 }
 
 PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
@@ -163,7 +170,8 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
 
 PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
                                  std::span<const runtime::RoundBudget> budgets,
-                                 runtime::ExecutionTiming* failed_timing) {
+                                 runtime::ExecutionTiming* failed_timing,
+                                 runtime::TokenMaskProvider* masks) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
@@ -183,7 +191,8 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
+        runtime::BatchedGeneratedRound round =
+            decode_raw(lane_span, budgets, failed_timing, masks);
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {

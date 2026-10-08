@@ -38,6 +38,16 @@ failures remain direct command diagnostics:
   > answer.txt 2> run.log
 ```
 
+`--grammar-file FILE` constrains the generated content to a GBNF language. The grammar applies
+after the model's reasoning phase, so thinking still precedes the constrained answer, and the
+request is refused when it cannot be combined with the grammar (raw output, custom stops, or a
+backend whose verify rounds consume no token masks). A constrained request drafts no speculative
+tokens, so it decodes one token per round:
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b.ninfer --messages msgs.json   --grammar-file answer.gbnf --greedy --max-new 200
+```
+
 `--chat-template FILE` overrides the artifact's built-in template with a local Jinja file.
 Changes to the file take effect after restarting NInfer:
 

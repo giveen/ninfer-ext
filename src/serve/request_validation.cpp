@@ -8,6 +8,28 @@
 
 namespace ninfer::serve {
 
+void parse_structured_outputs(const RequestJson& body, GenerationRequest& request) {
+    for (const char* alias :
+         {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
+        if (body.contains(alias) && !body.at(alias).is_null()) {
+            bad_request("use structured_outputs.grammar for GBNF constrained decoding", alias);
+        }
+    }
+    if (!body.contains("structured_outputs") || body.at("structured_outputs").is_null()) { return; }
+    const auto& value = body.at("structured_outputs");
+    if (!value.is_object() || value.size() != 1 || !value.contains("grammar") ||
+        !value.at("grammar").is_string() ||
+        value.at("grammar").get_ref<const std::string&>().empty()) {
+        bad_request("structured_outputs requires one nonempty grammar string",
+                    "structured_outputs.grammar");
+    }
+    if (request.uses_tools() || !request.stop_strings.empty()) {
+        bad_request("grammar cannot be combined with active tools or custom stops",
+                    "structured_outputs.grammar");
+    }
+    request.grammar = value.at("grammar").get<std::string>();
+}
+
 [[noreturn]] void bad_request(std::string message, std::string param, std::string code) {
     ApiError error;
     error.status  = 400;

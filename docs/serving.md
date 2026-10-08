@@ -225,17 +225,23 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
-- Assistant `reasoning_content` and `reasoning` history aliases.
+- Assistant `reasoning_content` and `reasoning` history aliases;
+- GBNF constrained decoding through `structured_outputs: {"grammar": "<GBNF source>"}`, accepted on
+  Chat Completions, Responses and Messages. The grammar constrains the generated content after the
+  model's reasoning phase, and the request is refused when it asks for something the constraint
+  cannot combine with: active tools, custom stops, raw or special-preserving output, non-default EOS,
+  and a backend whose verify rounds consume no token masks (`dflash`, `dflash2`, `eagle3`). A
+  constrained row drafts no speculative tokens, so it decodes one token per round.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes JSON `response_format` and JSON `text.format` output (use GBNF instead), nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+The other constrained-decoding aliases llama.cpp and vLLM used (`grammar`, `guided_json`,
+`guided_regex`, `guided_choice`, and `guided_grammar`) are refused with a pointer to
+`structured_outputs.grammar` instead of being treated as unknown hints.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
