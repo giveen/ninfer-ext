@@ -57,12 +57,18 @@ How the row reacts depends on whether verification reaches it:
   output from that round;
 - a dead end beyond the row's licensed prefix is irrelevant, and the row proceeds normally.
 
-A constrained row **drafts nothing**: the round's single accepted token is sampled from mask
-position zero, because one mask per verify position inside the same round is not implemented for the
-draft-producing backends. `decode_ordinary_batch` and `decode_mtp_batch` bind the mask into their
-lane's sampling configuration; `decode_eagle3_batch` and `decode_dflash_batch` refuse a constrained
-row, and the request is refused at preparation for those backends, so the refusal is reported as an
-`InvalidGrammar` request error rather than as a round failure.
+MTP drafts are produced at the end of the previous round and live in `sequence.mtp_drafts` on the
+host, so a constrained MTP row drafts normally: `decode_mtp_batch` passes the very draft span it is
+about to verify to `fill_grammar_mask`, which fills the accepted state plus one mask per draft
+position, and the acceptance kernels read mask position `col` for column `col`. The ordinary batch
+(`decode_ordinary_batch`) fills position zero only, because it verifies a single token.
+
+The tree and block backends draft *inside* the round, so their positions cannot be masked before it
+runs. `decode_eagle3_batch` and `decode_dflash_batch` therefore refuse a constrained row, and the
+request is refused at preparation for those backends, so the refusal is reported as an
+`InvalidGrammar` request error rather than as a round failure. Masking them needs the draft handoff
+and the forward/finish phase split: the drafts are copied to pinned host memory after the forward
+phase, the provider fills the masks from them, and the verify phase consumes them.
 
 ### 2.2 Transaction boundary
 
@@ -128,7 +134,7 @@ Implemented and verified end-to-end on a real artifact:
 |---|---|
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
-| MTP round with drafts | constrained; the constrained row drafts nothing |
+| MTP round with drafts | constrained; the row drafts normally, one mask per verify position |
 | MTP round in lookup mode | constrained through the same lane configuration |
 | Reasoning → content framing | constrained from the exact boundary |
 | Cancellation, failed commit, rejected preview | matcher rolled back to the committed prefix |
@@ -140,7 +146,7 @@ Not implemented:
 |---|---|
 | JSON object, JSON Schema, choice and regex entry points | `response_format`/`text.format` JSON output is still refused, now pointing at GBNF |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused |
-| Masks on the draft-producing verify positions (draft trees) | `dflash`, `dflash2`, `eagle3` refuse constrained requests |
+| Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
 | Jump-forward decoding | not planned here; a mask-only contract is enough for correctness |
 | Grammar-aware sampling-side fast paths | a constrained round takes the general sampler path, which costs more than the unmasked greedy path for the same round |
 
@@ -160,6 +166,14 @@ Not implemented:
   zero-extent round records no per-position acceptance evidence, so a constrained row cannot bias
   the draft-length estimate.
 - End-to-end: a GBNF grammar over a JSON object shape, greedy, on `models/qwen3_8_27b.ninfer`,
-  through the CLI (MTP round, drafts enabled) and through `ninfer-serve` with `--spec mtp
-  --draft-tokens {0,1}`; the published content parses and matches the grammar in every case, while
-  the unconstrained control run emits a value the grammar forbids.
+  through the CLI (MTP round) and through `ninfer-serve` with `--spec mtp --draft-tokens {0,1,3}`;
+  the published content parses and matches the grammar in every case, while the unconstrained
+  control run emits a value the grammar forbids.
+- Cost, measured on the same fixture (greedy, `--spec mtp --draft-tokens 3`, 512 new tokens, two
+  runs each, CLI): unconstrained 148.6 and 139.3 tok/s against 141.2 and 140.3 tok/s with a
+  permissive grammar over the whole byte range. The difference is inside run-to-run spread, so the
+  mechanism costs no measurable throughput on this fixture, while the row keeps its drafting: 2.68-2.82
+  accepted tokens per round and `K2`/`K3` rounds, against the 1.0 token per round a row that drafts
+  nothing commits. Acceptance is marginally lower under a constraint (56.5% against 61.6% here)
+  because the legal set excludes the vocabulary's special tokens, so drafts made of them can no
+  longer be accepted.

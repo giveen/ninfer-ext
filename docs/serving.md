@@ -231,7 +231,8 @@ The endpoint supports:
   model's reasoning phase, and the request is refused when it asks for something the constraint
   cannot combine with: active tools, custom stops, raw or special-preserving output, non-default EOS,
   and a backend whose verify rounds consume no token masks (`dflash`, `dflash2`, `eagle3`). A
-  constrained row drafts no speculative tokens, so it decodes one token per round.
+  constrained `mtp` request keeps drafting: every verify position gets its own legal set, and a draft
+  the constraint forbids is simply not accepted.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON `response_format` and JSON `text.format` output (use GBNF instead), nonzero `logit_bias`, requested log probabilities,

@@ -587,13 +587,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             // anchor alone.
             const std::uint32_t structural_cap =
                 std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
-            // A constrained row runs without drafts until speculative verify positions consume one
-            // mask each: the round samples its single accepted token from mask position zero, and a
-            // draft chain would need a mask per position inside the same round.
-            const bool constrained = masks != nullptr && masks->constrained(row);
-            std::uint32_t extent   = (lookup_only || constrained)
-                                         ? 0U
-                                         : std::min(sequence.mtp_draft_count, structural_cap);
+            std::uint32_t extent =
+                lookup_only ? 0U : std::min(sequence.mtp_draft_count, structural_cap);
 
             if (sequence.lookup) {
                 sequence.lookup->sync(sequence.ledger);
@@ -647,17 +642,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
-            mtp_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
-            if (masks != nullptr && masks->constrained(row)) {
-                // The MTP verify samples through the lane's installed config, not the round
-                // ingress, so the mask is written there as well; the ordinary round reads the
-                // ingress copy. Both carry position zero because a constrained row drafts nothing.
-                ops::SamplingConfig lane_config = mtp_host_ingress->sampling[row];
-                Tensor config_lane =
-                    sampling_config.slice(1, static_cast<std::int32_t>(lanes[row]), 1);
-                CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &lane_config, sizeof(lane_config),
-                                           cudaMemcpyHostToDevice, device.stream));
-            }
+            mtp_host_ingress->sampling[row].mask = fill_grammar_mask(masks, row, drafts);
             if (qwen4_runtime) {
                 std::array<TokenId, kMaximumMtpDraftTokens + 1> round{};
                 round[0] = sequence.ledger.back();
