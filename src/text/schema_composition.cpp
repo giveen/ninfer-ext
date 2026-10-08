@@ -4,6 +4,7 @@
 
 #include "grammar_functor.h"
 #include "json_string_grammar.h"
+#include "json_number.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -29,6 +30,20 @@ bool annotation(const std::string& key) {
                                             "$comment", "deprecated",  "readOnly", "writeOnly",
                                             "$schema",  "$id",         "$defs",    "definitions"};
     return keys.contains(key);
+}
+
+xgrammar::NumberRange number_range(const Json& node) {
+    xgrammar::NumberRange range;
+    for (const char* key : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
+        if (!node.contains(key)) continue;
+        auto value = xgrammar::DecimalNumber::Parse(node[key].dump());
+        const std::string_view name(key);
+        if (name == "minimum" || name == "exclusiveMinimum")
+            range.Lower(std::move(value), name.starts_with("exclusive"));
+        else
+            range.Upper(std::move(value), name.starts_with("exclusive"));
+    }
+    return range;
 }
 
 unsigned types(const Json& schema) {
@@ -58,12 +73,8 @@ unsigned value_type(const Json& value) {
 
 bool equal_value(const Json& a, const Json& b) {
     if (a.is_number() && b.is_number()) {
-        if (a.is_number_integer() && b.is_number_integer()) return a == b;
-        if (a.is_number_float() && b.is_number_float()) return a == b;
-        const auto& integer = a.is_number_integer() ? a : b;
-        const double real   = (a.is_number_float() ? a : b).get<double>();
-        return real >= -0x1p63 && real < 0x1p63 && std::floor(real) == real &&
-               integer.get<std::int64_t>() == static_cast<std::int64_t>(real);
+        return xgrammar::DecimalNumber::Parse(a.dump()).Compare(
+                   xgrammar::DecimalNumber::Parse(b.dump())) == 0;
     }
     if (a.type() != b.type()) return false;
     if (a.is_array()) {
@@ -83,6 +94,8 @@ bool equal_value(const Json& a, const Json& b) {
 
 bool needs_composition(const Json& node) {
     if (!node.is_object()) return false;
+    for (const char* key : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"})
+        if (node.contains(key)) return true;
     for (const char* op : {"$ref", "const", "enum", "anyOf", "oneOf", "allOf"}) {
         if (!node.contains(op)) continue;
         if (std::string_view(op) == "allOf" && node[op].size() > 1) return true;
@@ -96,7 +109,7 @@ bool needs_composition(const Json& node) {
         if (node.contains(map))
             for (const auto& value : node[map])
                 if (needs_composition(value)) return true;
-    for (const char* array : {"anyOf", "oneOf", "allOf"})
+    for (const char* array : {"anyOf", "oneOf", "allOf", "prefixItems"})
         if (node.contains(array))
             for (const auto& value : node[array])
                 if (needs_composition(value)) return true;
@@ -112,7 +125,7 @@ struct Part {
 
 class Composition {
 public:
-    explicit Composition(const Json& source) : source_(source) {}
+    explicit Composition(const Json& source, bool draft7) : source_(source), draft7_(draft7) {}
 
     NormalizedSchema run() {
         auto root = join({{source_, ""}});
@@ -122,6 +135,22 @@ public:
     }
 
 private:
+    const char* prefix_key(const Json& schema) const {
+        if (draft7_)
+            return schema.contains("items") && schema["items"].is_array() ? "items" : nullptr;
+        return schema.contains("prefixItems") ? "prefixItems" : nullptr;
+    }
+
+    Part item_at(const Part& part, std::size_t position) const {
+        const auto* prefix = prefix_key(part.value);
+        if (prefix && position < part.value[prefix].size())
+            return {part.value[prefix][position],
+                    child(child(part.path, prefix), std::to_string(position))};
+        const char* tail = draft7_ && prefix ? "additionalItems" : "items";
+        return part.value.contains(tail) ? Part{part.value[tail], child(part.path, tail)}
+                                         : Part{true, part.path};
+    }
+
     [[noreturn]] void fail(const std::string& path, const std::string& message) const {
         throw RequestError(Kind::UnsupportedJsonSchema,
                            message + " at " + (path.empty() ? "/" : path), path);
@@ -215,16 +244,7 @@ private:
             }
         }
         if (value.is_number()) {
-            const long double number = value.get<long double>();
-            if (schema.contains("minimum") && number < schema["minimum"].get<long double>())
-                return false;
-            if (schema.contains("maximum") && number > schema["maximum"].get<long double>())
-                return false;
-            if (schema.contains("exclusiveMinimum") &&
-                number <= schema["exclusiveMinimum"].get<long double>())
-                return false;
-            if (schema.contains("exclusiveMaximum") &&
-                number >= schema["exclusiveMaximum"].get<long double>())
+            if (!number_range(schema).Contains(xgrammar::DecimalNumber::Parse(value.dump())))
                 return false;
         }
         if (value.is_array()) {
@@ -232,9 +252,8 @@ private:
                 return false;
             if (schema.contains("maxItems") && value.size() > schema["maxItems"].get<std::size_t>())
                 return false;
-            if (schema.contains("items"))
-                for (const auto& item : value)
-                    if (!matches(schema["items"], item, depth + 1)) return false;
+            for (std::size_t i = 0; i < value.size(); ++i)
+                if (!matches(item_at({schema, {}}, i).value, value[i], depth + 1)) return false;
         }
         if (value.is_object()) {
             if (schema.contains("required"))
@@ -398,9 +417,12 @@ private:
         const auto bound = [&](const char* name, bool lower) {
             for (const auto& part : parts)
                 if (part.value.contains(name)) {
-                    if (!result.contains(name) ||
-                        (lower ? part.value[name] > result[name] : part.value[name] < result[name]))
-                        result[name] = part.value[name];
+                    const int cmp =
+                        !result.contains(name)
+                            ? (lower ? 1 : -1)
+                            : xgrammar::DecimalNumber::Parse(part.value[name].dump())
+                                  .Compare(xgrammar::DecimalNumber::Parse(result[name].dump()));
+                    if (lower ? cmp > 0 : cmp < 0) result[name] = part.value[name];
                 }
         };
         if (kind == 2 || kind == 5) {
@@ -429,21 +451,49 @@ private:
         if (kind == 3 || kind == 4) {
             for (const auto* name : {"minimum", "exclusiveMinimum"}) bound(name, true);
             for (const auto* name : {"maximum", "exclusiveMaximum"}) bound(name, false);
-            for (const auto* lo : {"minimum", "exclusiveMinimum"})
-                for (const auto* hi : {"maximum", "exclusiveMaximum"})
-                    if (result.contains(lo) && result.contains(hi) &&
-                        (result[lo] > result[hi] || (result[lo] == result[hi] &&
-                                                     (std::string_view(lo) == "exclusiveMinimum" ||
-                                                      std::string_view(hi) == "exclusiveMaximum"))))
-                        return false;
+            const auto range = number_range(result);
+            if (range.Empty()) return false;
+            if (kind == 3 && (range.lower || range.upper)) {
+                const auto integers = range.Integers();
+                if (!integers) {
+                    // Distinguish an interval between integers from one beyond the int64 domain.
+                    const auto first = xgrammar::DecimalNumber::Parse("-9223372036854775808");
+                    const auto last  = xgrammar::DecimalNumber::Parse("9223372036854775807");
+                    if ((range.lower && range.lower->value.Compare(last) >= 0) ||
+                        (range.upper && range.upper->value.Compare(first) <= 0))
+                        fail(parts.front().path, "integer interval exceeds signed 64-bit range");
+                    return false;
+                }
+                result = {{"type", "integer"},
+                          {"minimum", integers->first},
+                          {"maximum", integers->second}};
+            }
         }
         if (kind == 5) {
-            std::vector<Part> items;
+            std::size_t prefix_size = 0;
             for (const auto& part : parts)
-                if (part.value.contains("items"))
-                    items.push_back({part.value["items"], child(part.path, "items")});
-            result["items"] = join(items);
-            if (is_false(result["items"]) && result.value("minItems", 0) > 0) return false;
+                if (const auto* key = prefix_key(part.value))
+                    prefix_size = std::max(prefix_size, part.value[key].size());
+            Json prefix = Json::array();
+            for (std::size_t i = 0; i <= prefix_size; ++i) {
+                std::vector<Part> conditions;
+                for (const auto& part : parts) conditions.push_back(item_at(part, i));
+                auto item = join(conditions);
+                if (is_false(item)) {
+                    // An impossible position caps the length; it need not occur at all.
+                    const auto cap = static_cast<std::int64_t>(i);
+                    if (result.value("minItems", std::int64_t{0}) > cap) return false;
+                    if (!result.contains("maxItems") || result["maxItems"] > cap)
+                        result["maxItems"] = cap;
+                    result["items"] = false;
+                    break;
+                }
+                if (i == prefix_size)
+                    result["items"] = std::move(item);
+                else
+                    prefix.push_back(std::move(item));
+            }
+            if (!prefix.empty()) result["prefixItems"] = std::move(prefix);
         }
         if (kind == 6) {
             Json properties = Json::object(), required = Json::array();
@@ -487,6 +537,7 @@ private:
     }
 
     const Json& source_;
+    bool draft7_;
     Json definitions_ = Json::object();
     std::unordered_map<std::string, std::string> memo_;
     std::map<std::string, xgrammar::FSMWithStartEnd> patterns_;
@@ -495,8 +546,8 @@ private:
 };
 } // namespace
 
-NormalizedSchema normalize_schema_composition(const Json& source) {
-    if (!needs_composition(source)) return {source, {}};
-    return Composition(source).run();
+NormalizedSchema normalize_schema_composition(const Json& source, bool draft7) {
+    if (!draft7 && !needs_composition(source)) return {source, {}};
+    return Composition(source, draft7).run();
 }
 } // namespace ninfer::text

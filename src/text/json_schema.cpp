@@ -1,7 +1,9 @@
 #include "text/json_schema.h"
 #include "text/schema_composition.h"
+#include "text/json_input.h"
 #include "ninfer/types.h"
 #include "json_string_grammar.h"
+#include "json_number.h"
 #include <xgrammar/xgrammar.h>
 
 #include <nlohmann/json.hpp>
@@ -84,6 +86,8 @@ public:
                                                                    "required",
                                                                    "additionalProperties",
                                                                    "items",
+                                                                   "prefixItems",
+                                                                   "additionalItems",
                                                                    "minItems",
                                                                    "maxItems",
                                                                    "minLength",
@@ -104,6 +108,12 @@ public:
                 fail(Kind::UnsupportedJsonSchema, child(path, key),
                      "unsupported schema keyword: " + key);
         }
+        if (node.contains("prefixItems") && draft7)
+            fail(Kind::UnsupportedJsonSchema, child(path, "prefixItems"),
+                 "draft-07 tuples use an items array");
+        if (node.contains("additionalItems") && !draft7)
+            fail(Kind::UnsupportedJsonSchema, child(path, "additionalItems"),
+                 "2020-12 tuples use prefixItems and items");
         if (node.contains("$schema")) {
             const auto& dialect = node["$schema"];
             if (!dialect.is_string())
@@ -252,28 +262,35 @@ public:
                 fail(Kind::UnsupportedJsonSchema, child(path, key),
                      "length bound exceeds the supported range");
         }
+        xgrammar::NumberRange number_range;
         for (const char* key : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
             if (!node.contains(key)) continue;
             const auto& value = node[key];
             if (!value.is_number())
                 fail(Kind::InvalidJsonSchema, child(path, key), "numeric bound must be a number");
-            if (!source_validation && types.contains("number"))
-                fail(Kind::UnsupportedJsonSchema, child(path, key),
-                     "numeric ranges currently require type integer");
-            if (types.contains("integer") &&
-                (!value.is_number_integer() ||
-                 (value.is_number_unsigned() &&
-                  value.get<std::uint64_t>() >
-                      std::uint64_t(std::numeric_limits<std::int64_t>::max()))))
+            if (value.is_number_unsigned() &&
+                value.get<std::uint64_t>() >
+                    std::uint64_t(std::numeric_limits<std::int64_t>::max()))
                 fail(Kind::UnsupportedJsonSchema, child(path, key),
                      "integer bounds must fit signed 64-bit integers");
+            if (!source_validation && types.contains("integer") && !value.is_number_integer())
+                fail(Kind::UnsupportedJsonSchema, child(path, key),
+                     "integer interval was not reduced to whole-number bounds");
             if (types.contains("integer") && ((std::string_view(key) == "exclusiveMinimum" &&
                                                value == std::numeric_limits<std::int64_t>::max()) ||
                                               (std::string_view(key) == "exclusiveMaximum" &&
                                                value == std::numeric_limits<std::int64_t>::min())))
                 fail(Kind::UnsupportedJsonSchema, child(path, key),
                      "exclusive bound requires integers beyond the supported range");
+            auto endpoint = xgrammar::DecimalNumber::Parse(value.dump());
+            const std::string_view name(key);
+            if (name == "minimum" || name == "exclusiveMinimum")
+                number_range.Lower(std::move(endpoint), name.starts_with("exclusive"));
+            else
+                number_range.Upper(std::move(endpoint), name.starts_with("exclusive"));
         }
+        if (!source_validation && types.contains("number") && !number_range.HasPublishableValue())
+            fail(Kind::UnsupportedJsonSchema, path, "numeric interval has no publishable value");
         if (node.contains("pattern")) {
             if (!node["pattern"].is_string())
                 fail(Kind::InvalidJsonSchema, child(path, "pattern"), "pattern must be a string");
@@ -306,8 +323,21 @@ public:
                          "required properties must be declared in properties");
             }
         }
-        for (const char* key : {"items", "additionalProperties"})
-            if (node.contains(key)) check(node[key], child(path, key));
+        for (const char* key :
+             {"items", "prefixItems", "additionalItems", "additionalProperties"}) {
+            if (!node.contains(key)) continue;
+            const bool tuple = std::string_view(key) == "prefixItems" ||
+                               (draft7 && std::string_view(key) == "items" && node[key].is_array());
+            if (tuple) {
+                if (!node[key].is_array() || node[key].empty())
+                    fail(Kind::InvalidJsonSchema, child(path, key),
+                         "tuple positions must be a nonempty array of schemas");
+                for (std::size_t i = 0; i < node[key].size(); ++i)
+                    check(node[key][i], child(child(path, key), std::to_string(i)));
+            } else {
+                check(node[key], child(path, key));
+            }
+        }
     }
 };
 } // namespace
@@ -315,7 +345,11 @@ public:
 std::string prepare_json_schema(std::string_view source) {
     Schema schema;
     try {
-        schema.root = Json::parse(source);
+        auto parsed = parse_json_numbers(source);
+        if (const auto pointer = inexact_schema_number(parsed))
+            fail(Kind::UnsupportedJsonSchema, *pointer,
+                 "numeric schema value cannot be preserved by the JSON number representation");
+        schema.root = std::move(parsed.value);
     } catch (const Json::exception& error) { fail(Kind::InvalidJsonSchema, {}, error.what()); }
     schema.source_validation = true;
     schema.draft7            = schema.root.is_object() && schema.root.contains("$schema") &&
@@ -333,7 +367,7 @@ std::string prepare_json_schema(std::string_view source) {
             fail(Kind::InvalidJsonSchema, path, "unresolved local reference");
         }
     }
-    auto normalized = normalize_schema_composition(schema.root);
+    auto normalized = normalize_schema_composition(schema.root, schema.draft7);
     Schema prepared;
     prepared.root = std::move(normalized.schema);
     try {

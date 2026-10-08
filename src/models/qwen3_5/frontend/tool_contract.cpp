@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include "text/json_schema.h"
+#include "text/json_input.h"
 
 #include <algorithm>
 #include <cmath>
@@ -217,8 +218,9 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
     result->enforce_declared_names  = true;
     for (std::size_t i = 0; i < tool_jsons.size(); ++i) {
         try {
-            const Json declaration = Json::parse(tool_jsons[i]);
-            const auto& function   = declaration.at("function");
+            const auto parsed       = text::parse_json_numbers(tool_jsons[i]);
+            const auto& declaration = parsed.value;
+            const auto& function    = declaration.at("function");
             Contract::Tool tool;
             tool.name = function.at("name").get<std::string>();
             if (tool.name.empty()) fail("tool names must be nonempty", "/" + std::to_string(i));
@@ -227,7 +229,20 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
             const auto existing = std::find_if(
                 result->tools.begin(), result->tools.end(),
                 [&](const Contract::Tool& candidate) { return candidate.name == tool.name; });
-            tool.strict       = function.value("strict", false);
+            tool.strict = function.value("strict", false);
+            if (tool.strict) {
+                // A strict schema must round-trip through the JSON number representation, or the
+                // published arguments could not have come from it.
+                if (const auto pointer =
+                        text::inexact_schema_number(parsed, "/function/parameters")) {
+                    throw RequestError(
+                        RequestErrorKind::UnsupportedJsonSchema,
+                        "numeric schema value cannot be preserved by the JSON number representation",
+                        "/" + std::to_string(i) + "/parameters" +
+                            pointer->substr(std::string_view("/function/parameters").size()),
+                        RequestErrorSource::Tools);
+                }
+            }
             const Json schema = function.value(
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();

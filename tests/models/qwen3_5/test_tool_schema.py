@@ -69,6 +69,13 @@ class ToolSchema(unittest.TestCase):
             "</parameter>",
         ]
         cases = [
+            (schema({"type": "number", "exclusiveMinimum": 0.1, "maximum": 0.2}),
+             [{"x": x} for x in [0.1, 0.10000000000000002, 0.15, 0.2, 0.21]]),
+            (schema({"type": "number", "minimum": 1e-8, "maximum": 2e-8}),
+             [{"x": x} for x in [0, 1e-8, 1.5e-8, 2e-8, 3e-8]]),
+            (schema({"type": "array", "prefixItems": [{"type": "string"},
+                        {"type": "number", "minimum": 0, "maximum": 1}], "minItems": 2, "items": False}),
+             [{"x": x} for x in [[], ["x"], ["x", 0.5], ["x", 2], ["x", 0.5, 0]]]),
             (
                 schema({"type": "integer", "enum": [1.0, 2.0]}),
                 [{"x": value} for value in [0, 1, 2, 3]],
@@ -227,7 +234,7 @@ class ToolSchema(unittest.TestCase):
                 }
             ),
             schema({"type": "string", "const": "x\n</parameter>y"}),
-            schema({"type": "number", "minimum": 1}),
+            schema({"type": "number", "multipleOf": 1}),
             {"type": "object", "additionalProperties": True},
         ]
         # At least one candidate asks the probe to compile the grammar.

@@ -192,7 +192,10 @@ int main(int argc, char** argv) {
              {{"description", {{"type", "string"}, {"enum", {"你好", "code"}}}},
               {"values",
                {{"type", "array"},
-                {"items", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}}},
+                {"prefixItems",
+                 {{{"type", "number"}, {"minimum", 1e-8}, {"maximum", 2e-8}},
+                  {{"type", "number"}, {"exclusiveMinimum", 0.1}, {"maximum", 0.2}}}},
+                {"items", false},
                 {"minItems", 2},
                 {"maxItems", 2}}}}},
             {"required", {"description", "values"}},
@@ -215,8 +218,11 @@ int main(int argc, char** argv) {
         record(schema, structured);
         const auto parsed = nlohmann::json::parse(structured.content);
         require(parsed.size() == 2 && parsed.contains("description") &&
-                    parsed["values"].size() == 2,
-                "schema fields missing");
+                    parsed["values"].size() == 2 && parsed["values"][0].get<double>() >= 1e-8 &&
+                    parsed["values"][0].get<double>() <= 2e-8 &&
+                    parsed["values"][1].get<double>() > 0.1 &&
+                    parsed["values"][1].get<double>() <= 0.2,
+                "schema fields missing or outside their declared bounds");
         auto json_thinking                      = json_request;
         json_thinking.execution.thinking.budget = 2;
         record(schema, engine.generate(engine.prepare(prompt(true)), json_thinking));

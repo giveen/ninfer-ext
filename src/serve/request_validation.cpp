@@ -1,4 +1,5 @@
 #include "serve/request_validation.h"
+#include "text/json_input.h"
 
 #include <algorithm>
 #include <cctype>
@@ -16,6 +17,43 @@ void set_constraint(GenerationRequest& request, OutputConstraint constraint, std
     request.constraint_param = std::move(param);
 }
 }  // namespace
+
+void validate_schema_number_input(const text::ParsedJsonNumbers& parsed) {
+    if (parsed.inexact_numbers.empty() || !parsed.value.is_object()) { return; }
+    const auto check = [&](const std::string& pointer, const std::string& param) {
+        if (const auto error = text::inexact_schema_number(parsed, pointer)) {
+            bad_request("numeric schema value cannot be preserved by the JSON number representation",
+                        param + error->substr(pointer.size()), "unsupported_json_schema");
+        }
+    };
+    const auto& body = parsed.value;
+    for (const auto& [path, param] :
+         {std::pair{"/response_format/json_schema/schema", "response_format.json_schema.schema"},
+          std::pair{"/text/format/schema", "text.format.schema"},
+          std::pair{"/output_config/format/schema", "output_config.format.schema"}}) {
+        check(path, param);
+    }
+    const auto tools = [&](auto&& self, const RequestJson& list, const std::string& path) -> void {
+        if (!list.is_array()) { return; }
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const auto& tool = list[i];
+            if (!tool.is_object()) { continue; }
+            const auto pointer = path + '/' + std::to_string(i);
+            if (tool.contains("type") && tool["type"] == "namespace" && tool.contains("tools")) {
+                self(self, tool["tools"], pointer + "/tools");
+                continue;
+            }
+            const bool nested      = tool.contains("function") && tool["function"].is_object();
+            const auto& definition = nested ? tool["function"] : tool;
+            if (!definition.contains("strict") || definition["strict"] != true) { continue; }
+            const std::string key =
+                definition.contains("input_schema") ? "input_schema" : "parameters";
+            const auto schema = pointer + (nested ? "/function/" : "/") + key;
+            check(schema, schema.substr(1));
+        }
+    };
+    if (body.contains("tools")) { tools(tools, body["tools"], "/tools"); }
+}
 
 void parse_json_output_format(const RequestJson& format, GenerationRequest& request,
                               const std::string& param, JsonFormatProtocol protocol) {
