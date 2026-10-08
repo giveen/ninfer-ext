@@ -52,10 +52,11 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 2560, select_q8_qwen4_exp},
     ShapeEntry{2560, 4608, select_q8_qwen4_exp},
     ShapeEntry{96, 2560, select_q8_qwen4_exp},
-    // EAGLE3 draft: attention q/k/v (4096,4096), the SwiGLU gate/up pair (32768,2048) beside its
-    // 16384-wide halves, the feature projection (2048,6144), the MLP down (2048,16384) and the
-    // draft head (32000,2048).
+    // EAGLE3 draft: attention q (4096,4096) with k/v (512,4096) for a two-KV-head head, the SwiGLU
+    // gate/up pair (32768,2048) beside its 16384-wide halves, the feature projection (2048,6144),
+    // the MLP down (2048,16384) and the draft head (32000,2048).
     ShapeEntry{4096, 4096, select_q8_generic},
+    ShapeEntry{512, 4096, select_q8_generic},
     ShapeEntry{32768, 2048, select_q8_generic},
     ShapeEntry{16384, 2048, select_q8_generic},
     ShapeEntry{2048, 6144, select_q8_generic},

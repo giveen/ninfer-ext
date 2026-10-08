@@ -389,7 +389,10 @@ python3 -m tools.convert --model /path/to/Qwen3.6-35B-A3B-NVFP4 \
 The head used here is the SpecForge EAGLE3 draft for Qwen3.5-35B-A3B
 (`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`). The converter normalizes its `midlayer.*` weights,
 derives the three target layers it fuses, stores the draft-to-target token map, and inherits the
-target's token embedding and tokenizer. Serve it with `--spec eagle3 --draft-tokens N`. Keep
+target's token embedding and tokenizer. Heads in the `speculators`/vLLM layout (nested
+`transformer_layer_config`, `layers.0.*` weights, a declared `eagle_aux_hidden_state_layer_ids` and a
+partial rotary factor) convert the same way; note that a published head is not automatically better
+for your traffic — the EAGLE3 reference measures the choices it knows. Serve it with `--spec eagle3 --draft-tokens N`. Keep
 `--proposal`: EAGLE3 does not need the optimized proposal head (it drafts through its own 32k head
 and rejects `--lm-head-draft`), but without it the file cannot run the documented
 `--spec mtp --lm-head-draft` configuration at all, so EAGLE3 could only be compared against — or

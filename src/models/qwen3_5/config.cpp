@@ -413,16 +413,17 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     return out;
 }
 
-// EAGLE3 draft config: the SpecForge `LlamaForCausalLMEagle3` layout (`model_type=llama`, one
-// decoder layer, top-level `rope_theta`, a reduced `draft_vocab_size`). The three target layers it
-// reads are not exported; SpecForge fuses layer 1, num_layers/2 and num_layers-4.
+// EAGLE3 draft config: one decoder layer, `model_type=llama`, a reduced `draft_vocab_size` and the
+// three target layers whose hidden states condition the draft. The converter records the layers from
+// the head's own declaration when it has one and otherwise from SpecForge's rule, so the config
+// always carries them.
 DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
     require_members(value,
                     {"architectures", "model_type", "hidden_size", "intermediate_size",
                      "num_attention_heads", "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "rms_norm_eps", "rope_theta", "draft_vocab_size", "target_layer_ids"},
                     {"max_position_embeddings", "norm_before_residual", "norm_before_fc",
-                     "target_hidden_size"},
+                     "target_hidden_size", "partial_rotary_factor"},
                     "EAGLE3 draft config");
     const auto arch = architecture(value);
     if (arch != "LlamaForCausalLMEagle3" && arch != "Eagle3DraftModel" &&
@@ -431,6 +432,20 @@ DraftConfig draft_eagle3(const Json& value, const TextConfig& target) {
     }
     DraftConfig out;
     out.attention         = attention(value);
+    // SpecForge rotates the whole head dimension; a `speculators` export may declare a partial
+    // factor. The draft only reads text positions, so an exported MRoPE section cannot change its
+    // rotation and is not represented here.
+    const std::uint32_t head_dim = out.attention.head_dim;
+    const double rotary_factor = value.contains("partial_rotary_factor")
+                                     ? positive_float(value, "partial_rotary_factor")
+                                     : 1.0;
+    if (rotary_factor > 1.0) {
+        throw ArtifactError("EAGLE3 partial_rotary_factor exceeds one");
+    }
+    out.rotary_dim = static_cast<std::uint32_t>(double(head_dim) * rotary_factor);
+    if (out.rotary_dim < 2U || out.rotary_dim % 2U != 0U || out.rotary_dim > head_dim) {
+        throw ArtifactError("EAGLE3 draft rotary dimension must be even and within the head");
+    }
     out.intermediate_size = dimension(value, "intermediate_size");
     out.num_hidden_layers = dimension(value, "num_hidden_layers");
     out.max_position_embeddings = value.contains("max_position_embeddings")

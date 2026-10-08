@@ -16,39 +16,55 @@ than autoregressive, are described by [DFlash and DFlash2](dflash.md).
 
 The draft config reports `model_type=llama` and identifies `LlamaForCausalLMEagle3` (SpecForge) or
 `Eagle3DraftModel` / `Eagle3LlamaForCausalLM`; the architecture field selects the parser, the model
-type is only required to be present. It supplies draft hidden/intermediate width, head
-counts, head dimension, one decoder layer, norm epsilon and RoPE theta, the three target layer IDs it
-reads, and the draft vocabulary size with its `d2t` map. The target's hidden width and token embedding
-are inherited, not stored.
+type is only required to be present. Two export layouts are accepted, and the converter normalizes
+both into the same stored config:
+
+- **SpecForge**: flat geometry, no declared aux layers, so the converter derives them from the target
+  the way `set_aux_hidden_states_layers` does, and the decoder layer is named `midlayer.`.
+- **`speculators` / vLLM**: geometry nested under `transformer_layer_config`, the decoder layer named
+  `layers.0.`, an `eagle_aux_hidden_state_layer_ids` declaration of the three layers the head was
+  trained against, `rope_parameters` (a partial rotary factor, and an MRoPE section that the draft's
+  text-only positions make irrelevant), and a second copy of the target embedding that the artifact
+  ignores. A declaration wins over the derived rule.
+
+It supplies draft hidden/intermediate width, head counts, head dimension, one decoder layer, norm
+epsilon, RoPE theta and the draft's rotary width, the three target layer IDs it reads, and the draft
+vocabulary size with its `d2t` map. The target's hidden width and token embedding are inherited, not
+stored. Published heads disagree on the aux layers ([1, 19, 36] from SpecForge's rule against a
+declared [2, 19, 37] in the Qwen3.6 caption head), which is why a declaration is preferred.
 
 The first target is the SpecForge head
 [jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge](https://huggingface.co/jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge)
-for Qwen3.5-35B-A3B.
+for Qwen3.5-35B-A3B; the second is the `speculators` head
+[PatchyTisa/Qwen3.6-35B-A3B-Caption-Eagle3DraftModel](https://huggingface.co/PatchyTisa/Qwen3.6-35B-A3B-Caption-Eagle3DraftModel)
+for this artifact's own target.
 
-| Quantity | Value |
-|---|---:|
-| Target hidden width `H` | 2048 |
-| Fused input width `3·H` | 6144 |
-| Draft layers | 1 |
-| Draft hidden / intermediate | 2048 / 16384 |
-| Q heads / KV heads / head dimension | 16 / 16 / 256 |
-| Attention input width (`2·H`) | 4096 |
-| Target layers fused | 3: `1`, `num_layers//2 - 1`, `num_layers-4` → `[1, 19, 36]` for the 40-layer target |
-| Draft vocabulary | 32,000 (target 248,320) |
-| Norm epsilon / RoPE theta | `1e-6` / `1e7` |
-| `norm_before_residual` / `norm_before_fc` | false / false |
-| Own token embedding | no (shares the target's) |
-| Draft KV per token, per lane | 16 KiB: 1 layer × 16 KV heads × 256 dim × K and V, BF16 |
+| Quantity | SpecForge head | Qwen3.6 caption head |
+|---|---:|---:|
+| Target hidden width `H` | 2048 | 2048 |
+| Fused input width `3·H` | 6144 | 6144 |
+| Draft layers | 1 | 1 |
+| Draft hidden / intermediate | 2048 / 16384 | 2048 / 16384 |
+| Q heads / KV heads / head dimension | 16 / 16 / 256 | 16 / **2** / 256 |
+| Draft rotary width | 256 (whole head) | 64 (`partial_rotary_factor` 0.25) |
+| Attention input width (`2·H`) | 4096 | 4096 |
+| Target layers fused | `1`, `num_layers//2 - 1`, `num_layers-4` | declared `2`, `19`, `37` |
+| Draft vocabulary | 32,000 (target 248,320) | 32,000 (target 248,320) |
+| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` |
+| `norm_before_residual` / `norm_before_fc` | false / false | **true** / false |
+| Own token embedding | no (shares the target's) | no (shares the target's) |
+| Draft KV per token, per lane | 16 KiB | 2 KiB |
 
 Draft width `K` is a runtime choice, not a weight dimension, exactly as for DFlash.
 
-The draft cache is a second paged pool beside the Text KV: one layer at 16 KV heads and head
-dimension 256, always BF16, planned at the Text capacity plus the draft window's page headroom and
-never quantized with `--kv-dtype`. That is 16 KiB per token per lane, against 20 KiB for this
-target's ten full-attention Text layers at BF16, so on a BF16-KV engine the draft pool adds about
-80% to the KV-resident bytes; with a quantized `--kv-dtype` the draft bytes do not shrink, so the
-share is larger still. It is the cost of a multi-head draft whose attention reads the whole
-history at absolute positions.
+The draft cache is a second paged pool beside the Text KV: one layer, always BF16, planned at the
+Text capacity plus the draft window's page headroom and never quantized with `--kv-dtype`. Its size
+is set by the draft's KV head count, so the two published geometries differ eightfold: the SpecForge
+head's 16 KV heads cost 16 KiB per token per lane against 20 KiB for this target's ten full-attention
+Text layers at BF16 — about 80% added to the KV-resident bytes, and a larger share once `--kv-dtype`
+quantizes the Text pool while the draft stays BF16 — while the caption head's 2 KV heads cost 2 KiB
+per token. A draft's attention reads the whole history at absolute positions, so the pool is
+capacity-sized either way; GQA on the draft is what keeps it affordable.
 
 ## Model mathematics
 
@@ -203,7 +219,13 @@ artifact** — `models/qwen3_6_35b_a3b_nvfp4_eagle3_proposal.ninfer`, the refere
 | no `--spec` | 381.5 | 1,282.2 | – |
 | `--spec mtp --draft-tokens 3 --fixed-draft --lm-head-draft` | **693.0** | **2,094.5** | 77.0% |
 | `--spec mtp --draft-tokens 7 --lm-head-draft` (adaptive) | 594.0 | 1,973.7 | 62.1% |
-| `--spec eagle3 --draft-tokens 3 --fixed-draft` | 536.0 | 1,798.5 | 55.1% |
+| `--spec eagle3 --draft-tokens 3 --fixed-draft` (SpecForge head) | 536.0 | 1,798.5 | 55.1% |
+| `--spec eagle3 --draft-tokens 3 --fixed-draft` (caption head, same target) | 391.2 | 1,164.6 | 26.6% |
+
+The caption head was also decoded against caption-style prose, where it still trails the SpecForge
+head (16.2% against 35.3% accepted/drafted, 40.0% against 63.9% first-position acceptance over a
+256-token greedy decode), and its draft pool is the cheap one: 176.1 MiB of KV payload against 289.0
+for the SpecForge head and 160.0 with no draft at all.
 
 What the numbers say:
 
@@ -258,10 +280,11 @@ because the tap sweep ran at these settings.
 
 Three consequences for the improvement plan. The deficit is depth, not the first token (76% against
 MTP's 77%), so branching where the curve is flat — the static draft tree — is worth more than extra
-chain depth, whose last positions land 26% and 16% of the time. A draft trained for this target, or
-one as strong as the model's own MTP layer, would raise the whole curve. And the chain should stop
-extending when the marginal position stops paying, which today's policy does not do: it adapts the
-draft length from round cost and aggregate acceptance only.
+chain depth, whose last positions land 26% and 16% of the time. A stronger draft would raise the
+whole curve, but "stronger" means training data and scale rather than a matched target version: the
+target-matched caption head measured *below* the mismatched SpecForge head, and below plain decode at
+C=8. And the chain should stop extending when the marginal position stops paying, which today's
+policy does not do: it adapts the draft length from round cost and aggregate acceptance only.
 
 The top-k propose path is verified against the chain path rather than only by its ops oracles: with
 the round temporarily routed through `eagle3_propose_topk_batch(..., top = 1)`, the CLI commits
@@ -269,11 +292,14 @@ byte-identical tokens and the identical round, acceptance and draft counters.
 
 ## Open questions
 
-- **Target version.** The head targets Qwen3.5-35B-A3B; the shipped artifact is Qwen3.6-35B-A3B. Both
-  are `qwen3_5_moe`, but the hidden states were never confirmed compatible. Acceptance is the whole
-  measured deficit against MTP (55% against 77% at the same draft width and round cost), so a head
-  matched to its target is the single largest lever left; isolating the pairing needs the same head
-  run against a Qwen3.5-35B-A3B target artifact, which is one conversion.
+- **Target version: tested, and not the dominant factor.** The SpecForge head targets Qwen3.5-35B-A3B
+  while the artifact served here is Qwen3.6-35B-A3B, so the mismatch looked like the main suspect.
+  The `speculators` caption head targets this artifact's own model, and it is markedly *worse* on our
+  traffic: 26.6% accepted/drafted at C=1 against 55.1%, 37.7% against 76.1% first-position
+  acceptance on the reasoning decode, and 1,164.6 tok/s at C=8 against 1,798.5 and against plain
+  decode's 1,282.2. On caption-style prose it also trails (16.2% against 35.3%). Whatever limits the
+  current head, a matched target version does not fix it; the training distribution and scale look
+  more decisive, which is a hypothesis this repository can only record, not settle.
 - **Target-layer capture order.** The converter derives the three taps the SpecForge rule names
   (`1`, `num_layers//2 - 1`, `num_layers-4`) and the artifact records them, but the released
   checkpoint does not say whether training read a layer's output or the input of the layer after it.

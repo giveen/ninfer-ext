@@ -323,19 +323,47 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
 
 
 def draft_eagle3_config(raw: dict, target: dict) -> dict:
-    """Normalize the SpecForge `LlamaForCausalLMEagle3` head into the `eagle3` component config.
+    """Normalize an EAGLE3 draft head into the `eagle3` component config.
 
     The head is one autoregressive decoder layer conditioned on three concatenated target hidden
-    states. SpecForge does not export which layers those are; its `set_aux_hidden_states_layers`
-    fuses layer 1, `num_layers // 2 - 1` and `num_layers - 4`, so the parser derives them from the
-    target.
+    states. Two exports appear in the wild and both are accepted:
+
+    - SpecForge (`LlamaForCausalLMEagle3`): flat geometry, no declared aux layers, so the parser
+      derives them from the target the way `set_aux_hidden_states_layers` does.
+    - `speculators` / vLLM (`Eagle3LlamaForCausalLM`, `Eagle3DraftModel`): geometry nested under
+      ``transformer_layer_config``, and ``eagle_aux_hidden_state_layer_ids`` declares the three
+      layers the head was trained against. A declaration wins over the derived rule; published
+      heads disagree with each other, so the rule is only a fallback.
     """
-    architecture = "LlamaForCausalLMEagle3"
-    _fixed(raw, "architectures", [architecture], "eagle3")
-    _fixed(raw, "model_type", "llama", "eagle3")
-    _fixed(raw, "hidden_act", "silu", "eagle3")
-    _fixed(raw, "num_hidden_layers", 1, "eagle3")
-    _fixed(raw, "tie_word_embeddings", False, "eagle3")
+    nested = raw.get("transformer_layer_config")
+    if nested is not None and not isinstance(nested, dict):
+        raise ValueError("eagle3: transformer_layer_config must be an object")
+    layer = nested if isinstance(nested, dict) else {}
+
+    def field(name):
+        if name in raw:
+            return raw[name]
+        return layer.get(name)
+
+    rope = layer.get("rope_parameters")
+    if rope is not None and not isinstance(rope, dict):
+        raise ValueError("eagle3: rope_parameters must be an object")
+    rope = rope if isinstance(rope, dict) else {}
+
+    architectures = raw.get("architectures")
+    if not isinstance(architectures, list) or len(architectures) != 1:
+        raise ValueError("eagle3: architectures must hold one entry")
+    architecture = architectures[0]
+    if architecture not in ("LlamaForCausalLMEagle3", "Eagle3DraftModel", "Eagle3LlamaForCausalLM"):
+        raise ValueError(f"eagle3: unsupported architecture {architecture!r}")
+    if field("model_type") != "llama":
+        raise ValueError("eagle3: the draft must be a Llama decoder")
+    if field("hidden_act") != "silu":
+        raise ValueError("eagle3: the draft activation must be silu")
+    if field("num_hidden_layers") != 1:
+        raise ValueError("eagle3: the draft must have exactly one decoder layer")
+    if field("tie_word_embeddings") is not False:
+        raise ValueError("eagle3: the draft head must not tie word embeddings")
     result = {
         "architectures": [architecture],
         "model_type": "llama",
@@ -343,33 +371,56 @@ def draft_eagle3_config(raw: dict, target: dict) -> dict:
         "num_hidden_layers": 1,
     }
     for key in ("intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim"):
-        result[key] = _positive(raw.get(key), "eagle3." + key)
+        result[key] = _positive(field(key), "eagle3." + key)
+    if field("hidden_size") is not None and result["hidden_size"] != _positive(
+        field("hidden_size"), "eagle3.hidden_size"
+    ):
+        raise ValueError("eagle3 draft hidden width differs from the target")
     if (
         result["num_attention_heads"] % result["num_key_value_heads"]
         or result["head_dim"] % 2
     ):
         raise ValueError("eagle3: invalid attention geometry")
-    result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "eagle3.rms_norm_eps")
+    result["rms_norm_eps"] = _f32(field("rms_norm_eps") or 1e-6, "eagle3.rms_norm_eps")
     result["rope_theta"] = _f32(
-        raw.get("rope_theta", 10_000_000), "eagle3.rope_theta"
+        field("rope_theta") or rope.get("rope_theta") or 10_000_000, "eagle3.rope_theta"
     )
+    # The draft only ever sees text positions, where MRoPE's three axes coincide, so a declared
+    # mrope_section changes nothing and is not stored; a partial rotary factor does change the
+    # rotation and is.
+    factor = _f32(rope.get("partial_rotary_factor", 1.0), "eagle3.partial_rotary_factor")
+    if not 0 < factor <= 1:
+        raise ValueError("eagle3: partial_rotary_factor must be in (0,1]")
+    result["partial_rotary_factor"] = factor
     result["draft_vocab_size"] = _positive(
         raw.get("draft_vocab_size"), "eagle3.draft_vocab_size"
     )
     result["max_position_embeddings"] = _positive(
-        raw.get("max_position_embeddings", target["max_position_embeddings"]),
+        field("max_position_embeddings") or target["max_position_embeddings"],
         "eagle3.max_position_embeddings",
     )
     if result["draft_vocab_size"] > target["vocab_size"]:
         raise ValueError("eagle3 draft vocabulary exceeds the target vocabulary")
     layers = target["num_hidden_layers"]
-    if layers < 4:
-        raise ValueError("eagle3 target has too few layers")
-    # SpecForge fuses layers [1, num_layers//2 - 1, num_layers - 4] (see
-    # `set_aux_hidden_states_layers` in specforge/modeling/target/eagle3_target_model.py).
-    result["target_layer_ids"] = [1, layers // 2 - 1, layers - 4]
+    declared = raw.get("eagle_aux_hidden_state_layer_ids") or raw.get("target_layer_ids")
+    if declared is None:
+        # SpecForge fuses layers [1, num_layers//2 - 1, num_layers - 4] (see
+        # `set_aux_hidden_states_layers` in specforge/modeling/target/eagle3_target_model.py).
+        if layers < 4:
+            raise ValueError("eagle3 target has too few layers")
+        declared = [1, layers // 2 - 1, layers - 4]
+    if not isinstance(declared, list) or len(declared) != 3:
+        raise ValueError("eagle3: the aux hidden-state layers must be three")
+    taps = []
+    for index in declared:
+        if type(index) is not int or index < 0:
+            raise ValueError("eagle3: aux hidden-state layers must be non-negative integers")
+        taps.append(index)
+    if any(index >= layers for index in taps):
+        raise ValueError("eagle3 aux hidden-state layer is outside the target")
+    result["target_layer_ids"] = taps
     result["target_hidden_size"] = _positive(
-        raw.get("target_hidden_size", target["hidden_size"]), "eagle3.target_hidden_size"
+        raw.get("target_hidden_size") or target["hidden_size"], "eagle3.target_hidden_size"
     )
     result["norm_before_residual"] = bool(raw.get("norm_before_residual", False))
     result["norm_before_fc"] = bool(raw.get("norm_before_fc", False))
@@ -460,7 +511,7 @@ class _Builder:
             if "/mlp/" in name:
                 fields.add("intermediate_size")
             if name.endswith("/feature_projection"):
-                fields.update(("target_layer_ids", "target_hidden_size"))
+                fields.update(("target_layer_ids", "target_hidden_size", "partial_rotary_factor"))
             _check_source_fields(name, actual, expected, fields)
         else:
             actual = draft_config(selected.config, target, component)
@@ -984,7 +1035,11 @@ class _Builder:
             inputs=("eagle3/target_features",),
         )
         self.add("eagle3/final_norm", store, "norm.weight", (h,))
-        p, sp = "eagle3/layers/0/", "midlayer."
+        # SpecForge names the decoder layer `midlayer.`; a `speculators` export names it `layers.0.`
+        # and additionally carries a copy of the target embedding, which the artifact inherits from
+        # the target instead of storing.
+        p = "eagle3/layers/0/"
+        sp = "layers.0." if store.has("layers.0.input_layernorm.weight") else "midlayer."
         self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))
         self.add(p + "hidden_norm", store, sp + "hidden_norm.weight", (h,))
         # Decoder attention reads the concatenated (token embedding, fused feature) pair, so its

@@ -80,8 +80,9 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
     const std::int32_t columns = width * batch;
     cudaStream_t s             = ctx_.stream;
     auto scratch               = work_.scope();
-    // The SpecForge draft is a plain Llama: full rotary over the head dimension.
-    const int rotary = head_dim;
+    // The draft rotates its declared rotary width: the SpecForge head rotates the whole head
+    // dimension, a `speculators` export may declare a partial factor.
+    const int rotary = static_cast<int>(config.draft->rotary_dim);
 
     Tensor g_flat = g.view({h, columns});
     Tensor emb    = work_.alloc(DType::BF16, {h, columns});

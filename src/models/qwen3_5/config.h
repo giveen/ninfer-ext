@@ -192,6 +192,8 @@ struct DraftConfig {
     std::uint32_t max_position_embeddings = 0;
     float rms_norm_eps                    = 0;
     float rope_theta                      = 0;
+    // Rotary width of the draft's own attention, at most `attention.head_dim`.
+    std::uint32_t rotary_dim             = 0;
     std::vector<DraftAttentionKind> layer_types;
     std::optional<std::uint32_t> sliding_window;
     std::vector<std::uint32_t> target_layer_ids;
