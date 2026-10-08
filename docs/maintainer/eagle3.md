@@ -211,8 +211,8 @@ Reference: NVIDIA GeForce RTX 5090, CUDA 13.3, BF16 KV, greedy sampling, 2026-10
 Serving, `tools/bench/run_serve_concurrency --suite decode-saturation --sampling greedy
 --decode-tokens 2048 --max-context 8192 --kv-capacity auto --kv-dtype bf16` (a 293-token reasoning
 prompt, 2,048 decoded tokens per request, complete full-batch intervals), all four modes on **one
-artifact** — `models/qwen3_6_35b_a3b_nvfp4_eagle3_proposal.ninfer`, the reference conversion with
-`--proposal` added so the documented MTP configuration runs on the same weights:
+artifact** — the reference conversion with `--proposal` added, so the documented MTP configuration
+runs on the same weights (the README recipe; the artifact itself is regenerated rather than kept):
 
 | Mode | C=1 decode tok/s | C=8 decode tok/s | accepted/drafted, C=1 |
 |---|---:|---:|---:|
