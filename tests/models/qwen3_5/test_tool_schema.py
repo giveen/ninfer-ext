@@ -69,12 +69,30 @@ class ToolSchema(unittest.TestCase):
             "</parameter>",
         ]
         cases = [
+            (
+                schema({"type": "integer", "enum": [1.0, 2.0]}),
+                [{"x": value} for value in [0, 1, 2, 3]],
+            ),
             (schema({"type": "string"}), [{"x": s} for s in strings]),
             (
                 schema({"type": "string", "minLength": 1, "maxLength": 2}),
                 [{"x": s} for s in strings],
             ),
             (schema({"type": "string", "pattern": "p"}), [{"x": s} for s in strings]),
+            (
+                schema(
+                    {
+                        "type": "string",
+                        "pattern": "你|😀",
+                        "minLength": 2,
+                        "maxLength": 3,
+                    }
+                ),
+                [
+                    {"x": s}
+                    for s in ["你", "你好", "😀ab", "你abc", "abc", "\n</parameter>"]
+                ],
+            ),
             (
                 schema({"type": "string", "pattern": "^a(b|c){1,2}$"}),
                 [{"x": s} for s in ["ab", "abc", "abbc", "zab"]],
@@ -199,8 +217,16 @@ class ToolSchema(unittest.TestCase):
     def test_prepare_rejections(self):
         specs = [
             schema({"type": ["string", "null"]}),
+            schema({"type": ["string", "integer"], "enum": ["1.0", 1.0]}),
+            schema(
+                {
+                    "anyOf": [
+                        {"type": "string", "const": "0"},
+                        {"type": "integer", "const": -0.0},
+                    ]
+                }
+            ),
             schema({"type": "string", "const": "x\n</parameter>y"}),
-            schema({"type": "string", "pattern": "x", "maxLength": 5}),
             schema({"type": "number", "minimum": 1}),
             {"type": "object", "additionalProperties": True},
         ]

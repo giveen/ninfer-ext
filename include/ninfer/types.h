@@ -664,12 +664,20 @@ enum class RequestErrorKind : std::uint8_t {
     Unavailable,
 };
 
+// Which request-level language a constraint failure came from, so a protocol can name the field the
+// client sent instead of guessing from the kind.
+enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
+
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {})
-        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
+                 RequestErrorSource source = RequestErrorSource::OutputConstraint)
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
+          source_(source) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+
+    [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
 
     // JSON Pointer of the offending schema location, empty for other kinds.
     [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
@@ -677,6 +685,7 @@ public:
 private:
     RequestErrorKind kind_;
     std::string pointer_;
+    RequestErrorSource source_;
 };
 
 struct PromptSummary {
@@ -830,8 +839,9 @@ struct GenerationEngineTiming {
     double program_post_exposed_seconds         = 0.0;
     double engine_commit_output_exposed_seconds = 0.0;
     double engine_maintenance_exposed_seconds   = 0.0;
-    double device_wait_exposed_seconds          = 0.0;
-    double decode_host_exposed_seconds          = 0.0;
+    double device_wait_exposed_seconds           = 0.0;
+    double constraint_draft_wait_exposed_seconds = 0.0;
+    double decode_host_exposed_seconds           = 0.0;
     double decode_device_wait_exposed_seconds   = 0.0;
     std::uint64_t prefill_units                 = 0;
     std::uint64_t decode_rounds                 = 0;
@@ -867,6 +877,25 @@ struct ThinkingBudgetStats {
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
+};
+
+enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
+enum class ConstraintOutputBranch : std::uint8_t { Undecided, Content, Tools };
+
+// State describes the committed output language, including an assistant continuation prefix. Work
+// includes speculative lookahead that was subsequently rolled back. Times are subintervals of
+// existing request timings, not extra latency to add to them.
+struct ConstraintObservation {
+    ConstraintOutputBranch branch = ConstraintOutputBranch::Undecided;
+    bool complete                 = false;
+    bool terminated               = false;
+    ConstraintCacheAccess cache   = ConstraintCacheAccess::Hit;
+    bool timings_collected        = false;
+    double prepare_seconds        = 0.0;
+    double mask_seconds           = 0.0;
+    double matcher_seconds        = 0.0;
+    std::uint64_t mask_positions  = 0;
+    std::uint64_t mask_upload_bytes = 0;
 };
 
 enum class PrefixReusePath : std::uint8_t {
@@ -984,6 +1013,7 @@ struct GenerationResult {
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
+    std::optional<ConstraintObservation> constraint;
 };
 
 struct ArenaMemorySummary {
@@ -1056,8 +1086,9 @@ struct RuntimeHostWorkStats {
     std::uint64_t program_submit_ns       = 0;
     std::uint64_t program_post_ns         = 0;
     std::uint64_t engine_commit_output_ns = 0;
-    std::uint64_t engine_maintenance_ns   = 0;
-    std::uint64_t device_wait_ns          = 0;
+    std::uint64_t engine_maintenance_ns    = 0;
+    std::uint64_t device_wait_ns           = 0;
+    std::uint64_t constraint_draft_wait_ns = 0;
 
     std::uint64_t decode_host_ns         = 0;
     std::uint64_t decode_device_wait_ns  = 0;

@@ -169,8 +169,17 @@ forbidding duplicates. A raw-string parameter ends at `\n</parameter>` — that 
 the value, and the grammar and the parser share the rule so a length or `pattern` assertion is never
 quietly weakened. Nested JSON uses the model template's separators.
 
-One output language per request: a content constraint and a tool constraint are mutually exclusive,
-and each is refused with the others' guarantees still intact.
+**Composition.** A JSON object or JSON Schema constraint may be combined with active tools: the
+compiled language is the union of the JSON body language and the call language, and the session
+decides from the first published byte which branch the answer took — the call decoder then runs only
+on the call branch. GBNF, choice and regex describe a single language, so combining them with tools is
+refused. Either way, a request that cannot honor the constraint is refused with its other guarantees
+intact.
+
+**Observations.** When a request asks for phase timings, the constraint reports what it cost as a
+*subinterval* of existing request timings, never as extra latency to add: compile-cache
+hit/built/waited, mask positions and uploaded bytes, matcher and mask seconds, and the branch the
+answer took. A request without constraint observation reports nothing.
 
 ### 2.7 Rejected combinations
 
@@ -208,6 +217,7 @@ Implemented and verified end-to-end on a real artifact:
 |---|---|
 | Plain decode round with a JSON object or schema constraint | constrained; the published content parses as the declared type |
 | Tool call under `strict`, `Required`, named or single-call choice | constrained; the call is complete and its arguments satisfy the declared schema |
+| JSON body combined with active tools | constrained to the union of body and call languages; the session picks the branch from the first published byte |
 | Plain and drafted rounds with a choice or regex constraint | constrained; the published content is one of the literals, or matches the pattern in full |
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
@@ -221,7 +231,7 @@ Not implemented:
 
 | Not implemented | Consequence |
 |---|---|
-| Content constraints composed with tool constraints | a request may have one output language, so combining them is refused |
+| GBNF, choice or regex composed with tool constraints | those describe a single language, so combining them is refused |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
