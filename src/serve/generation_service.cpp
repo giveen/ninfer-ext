@@ -1,3 +1,5 @@
+#include <charconv>
+
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
@@ -39,14 +41,34 @@ struct RequestLifetime {
 };
 
 ApiError request_error_to_api_error(const ninfer::RequestError& exception,
-                                    std::string_view constraint_param) {
+                                    std::string_view constraint_param,
+                                    std::span<const std::string> tool_schema_params) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
+    // A tool schema failure carries the tool's protocol path, so the client is pointed at the field
+    // it actually sent rather than at an engine-side location.
+    const auto tool_param = [&] {
+        const std::string_view pointer = exception.pointer();
+        const auto split               = pointer.find('/', 1);
+        std::size_t index              = 0;
+        if (pointer.starts_with('/') && split != std::string_view::npos) {
+            const auto number = pointer.substr(1, split - 1);
+            const auto parsed =
+                std::from_chars(number.data(), number.data() + number.size(), index);
+            if (parsed.ec == std::errc{} && parsed.ptr == number.data() + number.size() &&
+                index < tool_schema_params.size() && !tool_schema_params[index].empty() &&
+                (pointer.substr(split) == "/parameters" ||
+                 pointer.substr(split).starts_with("/parameters/"))) {
+                return tool_schema_params[index] + std::string(pointer.substr(split + 11));
+            }
+        }
+        return "tools" + exception.pointer();
+    };
     switch (exception.kind()) {
     case ninfer::RequestErrorKind::InvalidToolConstraint:
         error.status = 400;
-        error.param  = "tools" + exception.pointer();
+        error.param  = tool_param();
         error.code   = "invalid_tool_constraint";
         break;
     case ninfer::RequestErrorKind::InvalidGrammar:
@@ -65,7 +87,9 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
     case ninfer::RequestErrorKind::UnsupportedJsonSchema:
     case ninfer::RequestErrorKind::UnsatisfiableJsonSchema:
         error.status = 400;
-        error.param  = std::string(constraint_param) + exception.pointer();
+        error.param  = exception.source() == ninfer::RequestErrorSource::Tools
+                           ? tool_param()
+                           : std::string(constraint_param) + exception.pointer();
         error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
                            ? "invalid_json_schema"
                        : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
@@ -217,8 +241,9 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
 
 [[noreturn]] void
 throw_request_error(const ninfer::RequestError& exception,
-                    std::string_view constraint_param = "structured_outputs.grammar") {
-    throw ApiException(request_error_to_api_error(exception, constraint_param));
+                    std::string_view constraint_param               = "structured_outputs.grammar",
+                    std::span<const std::string> tool_schema_params = {}) {
+    throw ApiException(request_error_to_api_error(exception, constraint_param, tool_schema_params));
 }
 
 void check_preparation_control(Clock::time_point deadline,
@@ -336,6 +361,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
     prepared.constraint_param               = request.constraint_param;
+    for (const auto& tool : request.tools) { prepared.tool_schema_params.push_back(tool.schema_param); }
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -454,7 +480,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception, prepared.constraint_param);
+        throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params);
     }
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
@@ -467,6 +493,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
+    outcome.constraint          = result.constraint;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 

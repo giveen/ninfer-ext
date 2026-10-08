@@ -1,3 +1,4 @@
+#include "product/constraint_observation.h"
 #include "serve/openai_chat.h"
 
 #include "serve/generation_service.h"
@@ -269,6 +270,9 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                                            {"finish_reason", Json(finish_reason(outcome))}}});
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
+    if (outcome.constraint) {
+        payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    }
     return payload.dump();
 }
 

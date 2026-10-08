@@ -361,6 +361,7 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
               {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
               {"total", request_host_exposed_seconds(timing)}}},
         {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
+        {"constraint_draft_wait_exposed_seconds", timing.constraint_draft_wait_exposed_seconds},
         {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
                         {"rounds", timing.decode_rounds}}},

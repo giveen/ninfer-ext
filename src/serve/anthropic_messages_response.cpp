@@ -1,3 +1,4 @@
+#include "product/constraint_observation.h"
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
@@ -259,15 +260,18 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                                       {"input", parse_tool_input(call)}});
     }
     const StopPresentation stop = stop_presentation(outcome);
-    return OrderedJson{{"id", identity.message_id},
-                       {"type", "message"},
-                       {"role", "assistant"},
-                       {"model", identity.model},
-                       {"content", std::move(content)},
-                       {"stop_reason", stop.reason},
-                       {"stop_sequence", stop.sequence},
-                       {"usage", final_usage(outcome)}}
-        .dump();
+    OrderedJson response{{"id", identity.message_id},
+                         {"type", "message"},
+                         {"role", "assistant"},
+                         {"model", identity.model},
+                         {"content", std::move(content)},
+                         {"stop_reason", stop.reason},
+                         {"stop_sequence", stop.sequence},
+                         {"usage", final_usage(outcome)}};
+    if (outcome.constraint) {
+        response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    }
+    return response.dump();
 }
 
 std::string make_anthropic_count_tokens_response(int input_tokens) {

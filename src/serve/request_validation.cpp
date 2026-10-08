@@ -185,8 +185,15 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
     }
     // Tools and custom stops stay text-only modes: combining them with a constrained language is
     // the tool-composition work, not this entry point.
-    if (request.constraint && (request.uses_tools() || !request.stop_strings.empty())) {
-        bad_request("output constraints cannot be combined with active tools or custom stops",
+    if (request.constraint && !request.stop_strings.empty()) {
+        bad_request("output constraints require model EOS and cannot use custom stops",
+                    request.constraint_param);
+    }
+    // Only a JSON body composes with tool calls; a single-language constraint cannot.
+    if (request.constraint && request.uses_tools() &&
+        request.constraint->kind != OutputConstraintKind::JsonObject &&
+        request.constraint->kind != OutputConstraintKind::JsonSchema) {
+        bad_request("active tools can be combined with JSON output constraints",
                     request.constraint_param);
     }
     if (request.constrains_tools() && !request.stop_strings.empty()) {
