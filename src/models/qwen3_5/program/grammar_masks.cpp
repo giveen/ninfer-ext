@@ -8,6 +8,9 @@ ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* pro
                                                  std::span<const TokenId> drafts) {
     grammar_dead_positions[row] = 0;
     if (provider == nullptr || !provider->constrained(row)) { return {}; }
+    if (drafts.size() + 1U > draft_window + 1U) {
+        throw std::logic_error("constrained round verifies more positions than it can mask");
+    }
     const auto words  = static_cast<std::size_t>(grammar_masks_device.ne[0]);
     const auto offset = row * (draft_window + 1) * words;
     std::span<std::uint32_t> host(static_cast<std::uint32_t*>(grammar_masks_host->data()) + offset,
