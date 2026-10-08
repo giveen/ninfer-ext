@@ -1081,6 +1081,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                         result.generation.max_tokens);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

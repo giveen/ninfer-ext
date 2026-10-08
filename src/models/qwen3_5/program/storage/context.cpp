@@ -882,13 +882,26 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace,
-                                             runtime::ExecutionTiming* failed_timing) {
+                                             runtime::ExecutionTiming* failed_timing,
+                                             runtime::TokenMaskProvider* masks) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
     const std::uint32_t lane = ContractAccess::lane(sequence).value;
     if (requests[lane].lifecycle != Lifecycle::Prefilling) {
         throw std::logic_error("prefill advance requires a prefilling sequence");
+    }
+    // The prefill round samples the first generated token, so the lane's sampling config has to
+    // carry the mask before that round runs. A prefill step serves one sequence, so the constraint
+    // row is 0, and refreshing per step keeps the copy current after a resumed prefill.
+    grammar_dead_positions[0] = 0;
+    if (masks != nullptr && masks->constrained(0)) {
+        auto& host         = *static_cast<qwen3_5::PrefillRoundHost*>(round_host->data());
+        host.sampling      = requests[lane].sampling_host;
+        host.sampling.mask = fill_grammar_mask(masks, 0, {});
+        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &host.sampling, sizeof(host.sampling),
+                                   cudaMemcpyHostToDevice, device.stream));
     }
     try {
         runtime::PrefillStepResult step = advance_prefill_raw(lane, pace, failed_timing);

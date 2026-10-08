@@ -711,9 +711,8 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
             bad_request("function strict must be a boolean", "tools");
         }
         if (item.at("strict").get<bool>()) {
-            bad_request("strict function schema enforcement requires constrained decoding, "
-                        "which the Engine does not provide",
-                        "tools", "strict_tools_not_supported");
+            bad_request("strict function schema enforcement is not implemented", "tools",
+                        "strict_tools_not_supported");
         }
     }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
@@ -959,8 +958,8 @@ void parse_text(const Json& body) {
             bad_request("text.format must be a typed object", "text");
         }
         if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
-            bad_request("structured text output requires constrained decoding, which the Engine "
-                        "does not provide",
+            bad_request("JSON text.format is not implemented; use structured_outputs.grammar "
+                        "for GBNF",
                         "text", "structured_outputs_not_supported");
         }
     }
@@ -1100,6 +1099,7 @@ void reject_unsupported_platform_fields(const Json& body) {
 
 void validate_common_top_level(const Json& body, bool create) {
     static const std::unordered_set<std::string> create_fields = {"background",
+                                                                  "structured_outputs",
                                                                   "chat_template_kwargs",
                                                                   "client_metadata",
                                                                   "context_management",
@@ -1266,6 +1266,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         out.requested_max_output_tokens  = *max_output;
         out.prompt.generation.max_tokens = *max_output;
     }
+    parse_structured_outputs(body, out.prompt.generation);
     return out;
 }
 

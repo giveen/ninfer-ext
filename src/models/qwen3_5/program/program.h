@@ -723,7 +723,8 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
+          constraint_failed_(other.constraint_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -742,6 +743,11 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
+    // A row whose round reached a position its constraint declared unsatisfiable.
+    [[nodiscard]] bool constraint_failed(std::size_t row) const {
+        return constraint_failed_.at(row);
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -753,6 +759,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> constraint_failed_{};
 
     friend struct detail::RuntimeContractAccess;
 };
@@ -909,6 +916,10 @@ public:
     Program(Program&&)                 = delete;
     Program& operator=(Program&&)      = delete;
 
+    // Whether this Program's rounds consume a mask per verify position. A backend that does not
+    // cannot serve a constrained request until its verify positions are integrated.
+    [[nodiscard]] bool consumes_token_masks() const noexcept;
+
     // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
     // capabilities, model state and one immutable pending transaction at a time.
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
@@ -947,7 +958,8 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace = runtime::PrefillPace::Idle,
-                    runtime::ExecutionTiming* failed_timing = nullptr);
+                    runtime::ExecutionTiming* failed_timing = nullptr,
+                    runtime::TokenMaskProvider* masks       = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -982,7 +994,8 @@ public:
         CapturePressurePlan&& pressure, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing = nullptr);
+                                      runtime::ExecutionTiming* failed_timing = nullptr,
+                                      runtime::TokenMaskProvider* masks       = nullptr);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.
@@ -1028,6 +1041,10 @@ private:
 namespace detail {
 
 struct RuntimeContractAccess {
+    static void constraint_failed(PendingBatch& pending, std::size_t row, bool failed) {
+        pending.constraint_failed_.at(row) = failed;
+    }
+
     [[nodiscard]] static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,
                                                       std::uint64_t epoch) noexcept {
         SequenceHandle out;

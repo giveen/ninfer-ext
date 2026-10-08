@@ -42,6 +42,13 @@ struct RoundStateSpec {
     bool lookup_only = false;
 };
 
+// The prefill round samples its first token from pinned host state so a grammar mask can be
+// attached to that one call without touching the captured graph.
+struct PrefillRoundHost {
+    TokenId sampled_token = 0;
+    ops::SamplingConfig sampling;
+};
+
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
 // once per round; only its exact-B prefixes are consumed by the model schedule.
 struct OrdinaryDecodeIngress {

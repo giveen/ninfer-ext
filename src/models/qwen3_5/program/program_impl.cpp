@@ -57,8 +57,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       work(DeviceSpan{workspace_storage.base(), plan.workspace.permanent_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
-      round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
+      round_host(plan.causal_scoring
+                     ? std::nullopt
+                     : std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::PrefillRoundHost))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
@@ -286,6 +287,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.grammar_masks) {
+        grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
+        grammar_masks_host.emplace(grammar_masks_device.bytes());
+    }
     if (plan.persistent.qwen4) {
         const Qwen4PersistentLayout& layout = *plan.persistent.qwen4;
         execution::Qwen4Runtime runtime;
@@ -350,7 +355,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     set_device_i32(io.text_kv_table_row, 0);
     if (!causal_scoring) { set_device_i32(io.backend_kv_table_row, 0); }
 
-    host_tokens = round_host ? static_cast<TokenId*>(round_host->data()) : nullptr;
+    host_tokens = round_host
+                      ? &static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampled_token
+                      : nullptr;
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_5::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<qwen3_5::OrdinaryDecodeEgress*>(

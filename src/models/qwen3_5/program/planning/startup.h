@@ -98,6 +98,7 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> grammar_masks;
     std::optional<Qwen4PersistentLayout> qwen4;
     // Pinned Host cost of one complete Main Text KV page group, taken from the same planned
     // geometry the Device pool binds. The Host RAM budget compares one StateImage against the Main

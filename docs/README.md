@@ -55,6 +55,7 @@ other references own narrower contracts:
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Qwen3.8-Flash-Next hyper-connection, QSA, n-gram PLE, MoE and MTP mathematics and its FP64 oracle |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [Constrained decoding](maintainer/constrained-decoding.md) | request constraints, grammar compilation and caching, per-position masks, the sampling and acceptance contract, and current coverage |
 | [EAGLE3](maintainer/eagle3.md) | autoregressive draft graph, three-layer target feature fusion and draft-vocabulary mapping (chain landed and measured; static draft tree pending) |
 | [Prompt-lookup suffix drafter](maintainer/lookup-drafter.md) | Host suffix index, acceptance model, per-lane choice and its phase plan (active work) |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |

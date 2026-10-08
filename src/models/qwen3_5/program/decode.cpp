@@ -182,6 +182,15 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
                                device.stream));
 }
 
+void ProgramImpl::require_unmasked_round(runtime::TokenMaskProvider* masks,
+                                         std::span<const std::uint32_t> lanes) const {
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        if (masks != nullptr && masks->constrained(row)) {
+            throw std::logic_error("constrained decoding is not implemented for this round");
+        }
+    }
+}
+
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 ||
         source.ne[0] != dimension(parameters.model.config().text.residual_width()) ||
@@ -300,7 +309,8 @@ void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) cons
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                    std::span<const runtime::RoundBudget> budgets,
-                                   runtime::ExecutionTiming* failed_timing) {
+                                   runtime::ExecutionTiming* failed_timing,
+                                   runtime::TokenMaskProvider* masks) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -374,6 +384,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->mtp_kv_table_rows[row] =
                 append_mtp ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
             ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->sampling[row].mask = fill_grammar_mask(masks, row, {});
             const std::span<const TokenId> ledger(sequence.ledger);
             stage_qwen4_round_column(ledger.first(ledger.size() - 1U), ledger.last(1), 0, row);
             ensure_sequence_kv_mapped(sequence, frontier + 1,
@@ -458,7 +469,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                               std::span<const runtime::RoundBudget> budgets,
-                              runtime::ExecutionTiming* failed_timing) {
+                              runtime::ExecutionTiming* failed_timing,
+                              runtime::TokenMaskProvider* masks) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -504,7 +516,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     if (lookup_only) {
         // The first round must measure an ordinary round before anything can be priced against it.
         if (plain_round_seconds_ <= 0.0) {
-            return decode_ordinary_batch(lanes, budgets, failed_timing);
+            return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
         }
         lookup_ratio = lookup_cost_measured ? lookup_cost_ratio() : 1.0;
         // Lookup-only program: a wide verify is only run when it is predicted to commit more tokens
@@ -527,7 +539,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 break;
             }
         }
-        if (!any_proposal) { return decode_ordinary_batch(lanes, budgets, failed_timing); }
+        if (!any_proposal) { return decode_ordinary_batch(lanes, budgets, failed_timing, masks); }
     }
 
     // Every lane shares this round's draft length: the rung whose graphs are predicted to commit
@@ -575,8 +587,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             // anchor alone.
             const std::uint32_t structural_cap =
                 std::min({k, max_by_budget, capacity - sequence.execution_frontier - 1});
-            std::uint32_t extent =
-                lookup_only ? 0U : std::min(sequence.mtp_draft_count, structural_cap);
+            // A constrained row runs without drafts until speculative verify positions consume one
+            // mask each: the round samples its single accepted token from mask position zero, and a
+            // draft chain would need a mask per position inside the same round.
+            const bool constrained = masks != nullptr && masks->constrained(row);
+            std::uint32_t extent   = (lookup_only || constrained)
+                                         ? 0U
+                                         : std::min(sequence.mtp_draft_count, structural_cap);
 
             if (sequence.lookup) {
                 sequence.lookup->sync(sequence.ledger);
@@ -630,6 +647,17 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            mtp_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
+            if (masks != nullptr && masks->constrained(row)) {
+                // The MTP verify samples through the lane's installed config, not the round
+                // ingress, so the mask is written there as well; the ordinary round reads the
+                // ingress copy. Both carry position zero because a constrained row drafts nothing.
+                ops::SamplingConfig lane_config = mtp_host_ingress->sampling[row];
+                Tensor config_lane =
+                    sampling_config.slice(1, static_cast<std::int32_t>(lanes[row]), 1);
+                CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &lane_config, sizeof(lane_config),
+                                           cudaMemcpyHostToDevice, device.stream));
+            }
             if (qwen4_runtime) {
                 std::array<TokenId, kMaximumMtpDraftTokens + 1> round{};
                 round[0] = sequence.ledger.back();
@@ -727,7 +755,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     stats.lookup_drafted_by_match_bucket[bucket] += lookup;
                     stats.lookup_accepted_by_match_bucket[bucket] +=
                         static_cast<std::uint64_t>(accepted_i);
-                } else {
+                } else if (pcur > 0) {
+                    // A zero-extent round verifies no draft position, so it carries no evidence.
                     sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
                 }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
@@ -768,7 +797,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                                  std::span<const runtime::RoundBudget> budgets,
-                                 runtime::ExecutionTiming* failed_timing) {
+                                 runtime::ExecutionTiming* failed_timing,
+                                 runtime::TokenMaskProvider* masks) {
+    // Speculative rounds consume one mask per verify position; until that integration lands, a
+    // constrained request is refused at preparation, and this keeps a future path from silently
+    // running unconstrained.
+    require_unmasked_round(masks, lanes);
     nvtx::ScopedRange round_range(nvtx::Name::DecodeEagle3Round, nvtx::Category::Eagle3,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -936,7 +970,9 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                 stats.rounds_by_draft_length[k - 1U] += 1;
                 stats.drafted_tokens += pcur;
                 stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+                if (pcur > 0) {
+                    sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+                }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
                 }
@@ -975,7 +1011,12 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  std::span<const runtime::RoundBudget> budgets,
-                                 runtime::ExecutionTiming* failed_timing) {
+                                 runtime::ExecutionTiming* failed_timing,
+                                 runtime::TokenMaskProvider* masks) {
+    // Speculative rounds consume one mask per verify position; until that integration lands, a
+    // constrained request is refused at preparation, and this keeps a future path from silently
+    // running unconstrained.
+    require_unmasked_round(masks, lanes);
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -1169,20 +1210,21 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing) {
+                        runtime::ExecutionTiming* failed_timing,
+                        runtime::TokenMaskProvider* masks) {
     if (speculative_backend == SpeculativeBackend::None) {
-        return decode_ordinary_batch(lanes, budgets, failed_timing);
+        return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plain_mtp_batches && lanes.size() > 1) {
-            return decode_ordinary_batch(lanes, budgets, failed_timing);
+            return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
         }
-        return decode_mtp_batch(lanes, budgets, failed_timing);
+        return decode_mtp_batch(lanes, budgets, failed_timing, masks);
     }
     if (speculative_backend == SpeculativeBackend::Eagle3) {
-        return decode_eagle3_batch(lanes, budgets, failed_timing);
+        return decode_eagle3_batch(lanes, budgets, failed_timing, masks);
     }
-    return decode_dflash_batch(lanes, budgets, failed_timing);
+    return decode_dflash_batch(lanes, budgets, failed_timing, masks);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
