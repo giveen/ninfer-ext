@@ -104,6 +104,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec eagle3 requires --draft-tokens in [1,15]");
         }
+        if (options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("--spec eagle3 uses its own draft head, not --lm-head-draft");
+        }
         return;
     }
     throw std::invalid_argument("invalid speculative backend");

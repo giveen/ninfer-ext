@@ -208,10 +208,6 @@ void ProgramImpl::update_seconds_ema(double& value, double sample) noexcept {
     value = value > 0.0 ? value + kAlpha * (sample - value) : sample;
 }
 
-// EAGLE3's draft head and tree cost grow with the batch, so past this width the
-// ordinary round is the better trade and the speculative round is skipped.
-constexpr std::uint32_t kEagle3MaxBatch = 6;
-
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
                                                 std::span<const std::uint32_t> counts) {
@@ -1184,9 +1180,6 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
         return decode_mtp_batch(lanes, budgets, failed_timing);
     }
     if (speculative_backend == SpeculativeBackend::Eagle3) {
-        if (lanes.size() > kEagle3MaxBatch) {
-            return decode_ordinary_batch(lanes, budgets, failed_timing);
-        }
         return decode_eagle3_batch(lanes, budgets, failed_timing);
     }
     return decode_dflash_batch(lanes, budgets, failed_timing);

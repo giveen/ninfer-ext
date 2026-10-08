@@ -172,7 +172,7 @@ struct DFlash2Config {
 
 // EAGLE3 draft: a one-layer autoregressive decoder conditioned on three concatenated target hidden
 // states. SpecForge does not store the target layers in the exported config; it fuses layer 1,
-// num_layers/2 and num_layers-4, which the parser derives from the target and records as
+// num_layers/2 - 1 and num_layers-4, which the parser derives from the target and records as
 // `target_layer_ids`.
 struct Eagle3Config {
     std::uint32_t target_hidden_size = 0;

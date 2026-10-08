@@ -754,7 +754,8 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
         backend_kv_addresses->set_checkpoint_requirement(*sequence.kv->backend,
                                                          retained->backend_frontier);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
         sequence.mtp_kv_valid    = retained->backend_frontier;
         sequence.mtp_draft_count = 0;
     } else if (is_masked_draft_backend(speculative_backend)) {

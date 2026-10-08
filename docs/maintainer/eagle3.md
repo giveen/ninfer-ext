@@ -32,7 +32,7 @@ for Qwen3.5-35B-A3B.
 | Draft hidden / intermediate | 2048 / 16384 |
 | Q heads / KV heads / head dimension | 16 / 16 / 256 |
 | Attention input width (`2·H`) | 4096 |
-| Target layers fused | 3: `1`, `num_layers//2`, `num_layers-4` → `[1, 20, 36]` for the 40-layer target |
+| Target layers fused | 3: `1`, `num_layers//2 - 1`, `num_layers-4` → `[1, 19, 36]` for the 40-layer target |
 | Draft vocabulary | 32,000 (target 248,320) |
 | Norm epsilon / RoPE theta | `1e-6` / `1e7` |
 | `norm_before_residual` / `norm_before_fc` | false / false |

@@ -576,6 +576,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("retained prefix has incomplete MTP KV");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                // EAGLE3 keeps the full draft KV (no bridge lag); the suffix prefill overwrites
+                // from the append frontier and the next round recomputes its anchor seam.
+                const std::uint32_t source_backend = private_source != nullptr
+                                                         ? private_source->mtp_kv_valid
+                                                         : shared_source->backend_frontier;
+                if (!request_plan.prepare_mtp || source_backend < base) {
+                    throw std::logic_error("retained prefix has incomplete EAGLE3 KV");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend)) {
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->dflash_context_frontier
@@ -628,6 +638,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < base) {
+                    throw std::logic_error("resident EAGLE3 KV is shorter than the append frontier");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend) &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
@@ -674,6 +689,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < base) {
+                    throw std::logic_error(
+                        "rewrite-checkpoint EAGLE3 KV is shorter than the append frontier");
+                }
+                sequence.mtp_kv_valid = base;
             } else if (is_masked_draft_backend(speculative_backend)) {
                 if (!dflash || (backend_kv_cache() && !sequence.kv->backend) ||
                     sequence.dflash_context_frontier < base) {
@@ -1295,19 +1316,29 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {
-                if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
-                    throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
+                if (speculative_backend == SpeculativeBackend::Eagle3) {
+                    // EAGLE3 resume keeps the full draft KV, so the exact hit needs no bridge
+                    // forward: the next round's alignment recomputes its anchor seam and cold-starts
+                    // drafting (initial_mtp_extent is always zero for EAGLE3).
+                    if (sequence.mtp_kv_valid != staged.prompt_tokens) {
+                        throw std::logic_error(
+                            "zero-suffix EAGLE3 reuse has incomplete draft KV");
+                    }
+                } else {
+                    if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
+                        throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
+                    }
+                    mark_workspace_usage(workspace_plan.mtp_prefill);
+                    const auto bridge_rope =
+                        prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
+                    execution::mtp_bridge_and_propose(
+                        schedule_state, io.token, sequence.tail_hidden,
+                        checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
+                        bridge_rope, staged.initial_mtp_extent != 0);
+                    sequence.mtp_kv_valid = staged.prompt_tokens;
+                    commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
+                    staged.mtp_bridge = MtpBridgeMode::None;
                 }
-                mark_workspace_usage(workspace_plan.mtp_prefill);
-                const auto bridge_rope =
-                    prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
-                execution::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
-                sequence.mtp_kv_valid = staged.prompt_tokens;
-                commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
-                staged.mtp_bridge = MtpBridgeMode::None;
             }
         }
 

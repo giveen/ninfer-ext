@@ -71,6 +71,7 @@ SpeculativeBackend parse_backend(std::string_view name) {
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
     if (name == "dflash") { return SpeculativeBackend::DFlash; }
     if (name == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (name == "eagle3") { return SpeculativeBackend::Eagle3; }
     throw std::invalid_argument("unknown speculative backend " + std::string(name));
 }
 
@@ -79,6 +80,7 @@ const char* backend_name(SpeculativeBackend backend) noexcept {
         case SpeculativeBackend::Mtp: return "mtp";
         case SpeculativeBackend::DFlash: return "dflash";
         case SpeculativeBackend::DFlash2: return "dflash2";
+        case SpeculativeBackend::Eagle3: return "eagle3";
         default: return "none";
     }
 }
@@ -137,7 +139,10 @@ ninfer::EngineOptions engine_options(const Config& config, bool graph) {
     options.speculative.backend              = config.backend;
     options.speculative.draft_tokens         = config.draft_k;
     options.speculative.fixed_draft          = true;
-    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    // EAGLE3 carries its own 32k draft head, so the generic proposal head does not apply.
+    options.speculative.proposal_head        = config.backend == SpeculativeBackend::Eagle3
+                                                 ? ninfer::ProposalHead::Full
+                                                 : ninfer::ProposalHead::Optimized;
     options.context_cache.device_state_slots = 4;
     return options;
 }
@@ -292,7 +297,7 @@ Config parse_arguments(int argc, char** argv) {
         } else if (arg == "--lengths") {
             config.lengths = parse_lengths(value(i));
         } else if (arg == "--help") {
-            std::cout << "--artifact PATH [--backend mtp|dflash|dflash2] [--draft-k N]\n"
+            std::cout << "--artifact PATH [--backend mtp|dflash|dflash2|eagle3] [--draft-k N]\n"
                          "  [--outputs N] [--max-context N]\n"
                          "  [--kv bf16|int8|fp8|nvfp4|k8v4] [--lengths a,b,c]\n";
             std::exit(0);
@@ -306,7 +311,7 @@ Config parse_arguments(int argc, char** argv) {
         }
     } else {
         if (config.draft_k < 1 || config.draft_k > 15) {
-            throw std::invalid_argument("DFlash/DFlash2 draft-k must be 1..15");
+            throw std::invalid_argument("DFlash/DFlash2/Eagle3 draft-k must be 1..15");
         }
     }
     config.max_context = std::max(config.max_context, config.outputs + config.draft_k + 2);

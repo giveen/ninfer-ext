@@ -195,6 +195,8 @@ NINFER_ARTIFACT_RESIDUE=$PWD/models/qwen3_8_27b_dflash2.ninfer \
   --artifact models/qwen3_8_27b.ninfer --backend mtp --draft-k 5
 ./build/tests/ninfer_qwen3_5_spec_residue_real_test \
   --artifact models/qwen3_8_27b.ninfer --backend dflash2 --draft-k 15
+./build/tests/ninfer_qwen3_5_spec_residue_real_test \
+  --artifact models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer --backend eagle3 --draft-k 3
 ```
 
 Without an artifact, CTest marks these real Engine tests as skipped. Run GPU integration

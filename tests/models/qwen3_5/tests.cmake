@@ -12,6 +12,7 @@ set(NINFER_ARTIFACT_DFLASH  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflas
 set(NINFER_ARTIFACT_DFLASH_PREFILL "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_dflash_prefill_real_test")
 set(NINFER_ARTIFACT_STREAM  "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_stream_real_test")
 set(NINFER_ARTIFACT_RESIDUE "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_spec_residue_real_test")
+set(NINFER_ARTIFACT_RESIDUE_EAGLE3 "" CACHE FILEPATH "Artifact for ninfer_qwen3_5_spec_residue_eagle3_real_test")
 
 ninfer_add_real_test(ninfer_qwen3_5_loading_real_test NINFER_ARTIFACT_LOADING
   ARGS --vision --speculative mtp --proposal optimized
@@ -110,5 +111,10 @@ ninfer_add_real_test(ninfer_qwen3_5_stream_real_test NINFER_ARTIFACT_STREAM
 
 ninfer_add_real_test(ninfer_qwen3_5_spec_residue_real_test NINFER_ARTIFACT_RESIDUE
   ARGS --backend mtp --draft-k 7
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_spec_residue_real.cpp"
+  LIBRARIES ninfer_engine)
+
+ninfer_add_real_test(ninfer_qwen3_5_spec_residue_eagle3_real_test NINFER_ARTIFACT_RESIDUE_EAGLE3
+  ARGS --backend eagle3 --draft-k 3
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_spec_residue_real.cpp"
   LIBRARIES ninfer_engine)
