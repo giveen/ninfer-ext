@@ -31,6 +31,9 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
     }
+    if (spec.proposal_rows < 0) {
+        throw std::invalid_argument("RoundState proposal_rows must not be negative");
+    }
     if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
@@ -169,8 +172,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_continuation_hidden =
             add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
                        "MTP decode target continuation hidden");
-        decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
-                                            "MTP decode proposal logits");
+        // The proposal head's own output region: the target vocabulary by default, the draft
+        // vocabulary for EAGLE3 (its head is projected in place here, never into a wider buffer).
+        decode.proposal_logits = add_tensor(
+            builder, DType::BF16,
+            {layout.spec.proposal_rows > 0 ? layout.spec.proposal_rows : layout.spec.output_rows,
+             batch},
+            "MTP decode proposal logits");
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =

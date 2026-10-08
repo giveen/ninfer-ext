@@ -26,7 +26,11 @@ constexpr std::array kGeometries{
     Geometry{16384, 2560, 421U}, Geometry{1280, 2560, 431U}, Geometry{2560, 640, 433U},
     Geometry{324, 10240, 439U},  Geometry{320, 10240, 443U}, Geometry{10240, 320, 449U},
     Geometry{12800, 2560, 457U}, Geometry{2560, 2560, 461U}, Geometry{2560, 4608, 463U},
-    Geometry{96, 2560, 467U}};
+    Geometry{96, 2560, 467U},
+    // EAGLE3 draft (hidden 2048): attention q/k/v, the SwiGLU gate/up pair and its halves, the
+    // feature projection and the draft head.
+    Geometry{4096, 4096, 471U}, Geometry{32768, 2048, 473U}, Geometry{16384, 2048, 479U},
+    Geometry{2048, 6144, 487U}, Geometry{32000, 2048, 491U}};
 
 int q8_a16_conformance() {
     int failures = 0;

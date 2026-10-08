@@ -26,6 +26,9 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximum
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
+    // Rows of the frame's proposal-logits buffer; zero follows `output_rows`. EAGLE3 sizes it to
+    // its own draft head, whose output region the draft propose writes and reads in place.
+    std::int32_t proposal_rows   = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;

@@ -199,6 +199,17 @@ NINFER_ARTIFACT_RESIDUE=$PWD/models/qwen3_8_27b_dflash2.ninfer \
   --artifact models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer --backend eagle3 --draft-k 3
 ```
 
+A speculative backend must also complete rounds that carry more than one request: the draft
+proposal reads its logits out of the round frame, whose width is fixed by the backend's own head.
+Two lanes is enough to expose a frame that is wider than that head, with capture (the default)
+failing during engine construction rather than at the first batched round:
+
+```bash
+./build/tests/ninfer_qwen3_5_spec_concurrency_eagle3_real_test \
+  --artifact models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer --backend eagle3 --draft-k 3 \
+  --concurrency 2
+```
+
 Without an artifact, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks

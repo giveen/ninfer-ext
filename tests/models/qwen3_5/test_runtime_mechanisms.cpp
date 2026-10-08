@@ -158,6 +158,33 @@ void test_round_layout() {
     expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
+    expect(round.mtp_decode.has_value() &&
+               round.mtp_decode->proposal_logits.shape[0] == 128 &&
+               round.mtp_decode->target_logits.shape[0] == 128,
+           "an unspecified proposal width follows the target vocabulary");
+
+    // The EAGLE3 draft head projects into the round's proposal buffer in place, so that buffer is
+    // exactly the draft vocabulary while the target verify logits stay at the target vocabulary. A
+    // wider proposal buffer makes the draft-vocabulary rows a strided view at batch > 1.
+    ninfer::LayoutBuilder eagle3_builder;
+    q36::RoundStateLayout eagle3 = q36::begin_round_state_layout(
+        eagle3_builder,
+        q36::RoundStateSpec{.hidden          = 32,
+                            .output_rows     = 128,
+                            .proposal_rows   = 37,
+                            .batch_capacity  = 2,
+                            .draft_window    = 3,
+                            .backend         = ninfer::SpeculativeBackend::Eagle3,
+                            .eagle3_fused    = 96});
+    q36::complete_round_state_layout(eagle3_builder, eagle3);
+    (void)eagle3_builder.finish(256);
+    expect(eagle3.mtp_decode.has_value() &&
+               eagle3.mtp_decode->proposal_logits.shape[0] == 37 &&
+               eagle3.mtp_decode->proposal_logits.shape[1] == 2 &&
+               eagle3.mtp_decode->target_logits.shape[0] == 128 &&
+               eagle3.mtp_decode->eagle3_features.has_value() &&
+               eagle3.mtp_decode->eagle3_features->shape[0] == 96,
+           "EAGLE3 sizes the proposal buffer to its draft head beside the target logits");
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(

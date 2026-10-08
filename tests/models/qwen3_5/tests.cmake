@@ -118,3 +118,8 @@ ninfer_add_real_test(ninfer_qwen3_5_spec_residue_eagle3_real_test NINFER_ARTIFAC
   ARGS --backend eagle3 --draft-k 3
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_spec_residue_real.cpp"
   LIBRARIES ninfer_engine)
+
+ninfer_add_real_test(ninfer_qwen3_5_spec_concurrency_eagle3_real_test NINFER_ARTIFACT_RESIDUE_EAGLE3
+  ARGS --backend eagle3 --draft-k 3 --concurrency 2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_spec_concurrency_real.cpp"
+  LIBRARIES ninfer_engine)

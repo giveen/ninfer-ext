@@ -128,54 +128,53 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
 }
 
 // EAGLE3 draft proposal: the draft-vocabulary head over the pre-norm hidden, then the stored
-// draft-to-target map lifts the argmax index to a real token id. `hidden` is [h, batch].
+// draft-to-target map lifts the argmax index to a real token id. `hidden` is [h, batch]; `logits`
+// is the frame's proposal buffer, planned as exactly the draft head's output region.
 void TextContext::eagle3_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     if (eagle3_head_ == nullptr || eagle3_d2t_ == nullptr) {
         throw std::runtime_error("EAGLE3 proposal head is not set");
     }
     const std::int32_t batch = hidden.ne[1];
-    const std::int32_t rows  = eagle3_head_->weight.n; // stored rows; the converter pads the head
+    // The head is bound at the draft vocabulary, so a wider buffer would make the draft-vocabulary
+    // rows a strided view at batch > 1 and the head could not be projected in place.
     if (hidden.dtype != DType::BF16 || batch <= 0 || logits.dtype != DType::BF16 ||
-        logits.ne[0] < rows || logits.ne[1] != batch || draft_tokens.dtype != DType::I32 ||
+        eagle3_head_->weight.n != eagle3_draft_vocab_ || logits.ne[0] != eagle3_draft_vocab_ ||
+        logits.ne[1] != batch || !logits.is_contiguous() || draft_tokens.dtype != DType::I32 ||
         draft_tokens.ne[0] != batch) {
         throw std::invalid_argument("EAGLE3 proposal batch shapes are invalid");
     }
     const auto& draft = *parameters_.draft;
-    Tensor lg         = logits.slice(0, 0, rows);
     Tensor normed     = work_.alloc(DType::BF16, {hidden.ne[0], batch});
     ops::rmsnorm(hidden, draft.final_norm, config_.rms_norm_eps, false, normed, ctx_.stream);
-    project(normed, *eagle3_head_, lg, work_, ctx_.stream);
-    Tensor real = lg.slice(0, 0, eagle3_draft_vocab_);
-    ops::argmax(real, draft_tokens, eagle3_draft_vocab_, ctx_.stream);
+    project(normed, *eagle3_head_, logits, work_, ctx_.stream);
+    ops::argmax(logits, draft_tokens, eagle3_draft_vocab_, ctx_.stream);
     ops::proposal_remap_token_ids(draft_tokens, eagle3_d2t_, eagle3_draft_vocab_, ctx_.stream);
 }
 
 // EAGLE3 top-k first tokens for the static draft tree: one head projection, then repeated
 // argmax with masking so the T winners come out in descending draft-score order (lower draft id
 // wins exact ties, matching argmax). `draft_tokens` is flat [top * batch]; the remap lifts all
-// winners to target ids at once.
+// winners to target ids at once. `logits` carries the same draft-head region as the chain path.
 void TextContext::eagle3_propose_topk_batch(const Tensor& hidden, Tensor& logits,
                                             Tensor& draft_tokens, std::int32_t top) {
     if (eagle3_head_ == nullptr || eagle3_d2t_ == nullptr) {
         throw std::runtime_error("EAGLE3 proposal head is not set");
     }
     const std::int32_t batch = hidden.ne[1];
-    const std::int32_t rows  = eagle3_head_->weight.n; // stored rows; the converter pads the head
     if (top <= 0 || hidden.dtype != DType::BF16 || batch <= 0 || logits.dtype != DType::BF16 ||
-        logits.ne[0] < rows || logits.ne[1] != batch || draft_tokens.dtype != DType::I32 ||
+        eagle3_head_->weight.n != eagle3_draft_vocab_ || logits.ne[0] != eagle3_draft_vocab_ ||
+        logits.ne[1] != batch || !logits.is_contiguous() || draft_tokens.dtype != DType::I32 ||
         draft_tokens.ne[0] != top * batch) {
         throw std::invalid_argument("EAGLE3 top-k proposal batch shapes are invalid");
     }
     const auto& draft = *parameters_.draft;
-    Tensor lg         = logits.slice(0, 0, rows);
     Tensor normed     = work_.alloc(DType::BF16, {hidden.ne[0], batch});
     ops::rmsnorm(hidden, draft.final_norm, config_.rms_norm_eps, false, normed, ctx_.stream);
-    project(normed, *eagle3_head_, lg, work_, ctx_.stream);
-    Tensor real = lg.slice(0, 0, eagle3_draft_vocab_);
+    project(normed, *eagle3_head_, logits, work_, ctx_.stream);
     for (std::int32_t t = 0; t < top; ++t) {
         Tensor winner = draft_tokens.slice(0, t * batch, batch);
-        ops::argmax(real, winner, eagle3_draft_vocab_, ctx_.stream);
-        ops::mask_selected_logits(real, winner, ctx_.stream);
+        ops::argmax(logits, winner, eagle3_draft_vocab_, ctx_.stream);
+        ops::mask_selected_logits(logits, winner, ctx_.stream);
     }
     ops::proposal_remap_token_ids(draft_tokens, eagle3_d2t_, eagle3_draft_vocab_, ctx_.stream);
 }

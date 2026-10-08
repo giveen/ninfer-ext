@@ -291,18 +291,24 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                       "EAGLE3 prefill target positions");
     }
 
+    // The EAGLE3 draft head projects into the frame's proposal buffer directly, so that buffer is
+    // exactly the draft vocabulary wide; every other backend follows the target vocabulary.
+    const auto* const eagle3_config =
+        parameters.model.config().draft && parameters.model.config().draft->eagle3
+            ? &*parameters.model.config().draft->eagle3
+            : nullptr;
+    const std::int32_t proposal_rows =
+        eagle3_config != nullptr ? static_cast<std::int32_t>(eagle3_config->draft_vocab_size) : 0;
+    const std::int32_t eagle3_fused =
+        eagle3_config != nullptr ? static_cast<std::int32_t>(eagle3_config->fused_input_size()) : 0;
     out.round = qwen3_5::begin_round_state_layout(
         builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.residual_width()),
                                          .output_rows    = dimension(config.vocab_size),
+                                         .proposal_rows  = proposal_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .eagle3_fused   = parameters.model.config().draft &&
-                                                             parameters.model.config().draft->eagle3
-                                                               ? static_cast<std::int32_t>(
-                                                                     parameters.model.config()
-                                                                         .draft->eagle3->fused_input_size())
-                                                               : 0,
+                                         .eagle3_fused   = eagle3_fused,
                                          .causal_scoring = plan.causal_scoring,
                                          .plain_batches  = plan.plain_mtp_batches,
                                          .lookup_only    = plan.lookup_only});
