@@ -38,13 +38,13 @@ failures remain direct command diagnostics:
   > answer.txt 2> run.log
 ```
 
-`--grammar-file FILE`, `--json-object` or `--json-schema-file FILE` constrains the generated
-content to a GBNF language, any JSON object, or a JSON Schema; exactly one may be given. The
-constraint applies after the model's reasoning phase, so thinking still precedes the constrained
-answer, and the request is refused when it cannot be combined with the constraint (raw output,
-custom stops, or a backend whose verify rounds consume no token masks). Speculative drafting keeps
-working: each verify position is constrained on its own, so a draft the constraint forbids is not
-accepted:
+`--grammar-file FILE`, `--json-object`, `--json-schema-file FILE`, `--regex PATTERN` or repeated
+`--choice TEXT` constrains the generated content to a GBNF language, any JSON object, a JSON Schema,
+a regular expression, or a finite set of literal answers; exactly one may be given. The constraint
+applies after the model's reasoning phase, so thinking still precedes the constrained answer, and
+the request is refused when it cannot be combined with the constraint (raw output, custom stops, or
+a backend whose verify rounds consume no token masks). Speculative drafting keeps working: each
+verify position is constrained on its own, so a draft the constraint forbids is not accepted:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer --messages msgs.json \

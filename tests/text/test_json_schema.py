@@ -46,6 +46,8 @@ class SchemaContracts(unittest.TestCase):
             ({"type": ["integer", "null"], "exclusiveMinimum": 0, "exclusiveMaximum": 3}, scalars),
             ({"type": "string", "minLength": 1, "maxLength": 2}, strings),
             ({"type": "string", "pattern": "p"}, ["", "p", "apple", "pear", "a\np", "none", 'p"\\\n']),
+            ({"type": "string", "pattern": r"\x41B"}, ["AB", "xABy", "A", "Л"]),
+            ({"type": "string", "pattern": "a\0b"}, ["a\0b", "xa\0by", "a", "ab"]),
             ({"type": "string", "pattern": "^a(b|c){1,2}$"}, ["ab", "abc", "acb", "a", "abbc", "zab", "abz"]),
             ({"type": "string", "pattern": "\\n"}, ["", "\n", "a\nb", "\\n"]),
             # jsonschema uses Python re, whose dot differs from ECMAScript on CR/U+2028/U+2029.

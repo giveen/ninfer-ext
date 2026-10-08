@@ -129,7 +129,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
-           "       [--grammar-file FILE | --json-object | --json-schema-file FILE]\n"
+           "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
+           "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--no-cuda-graph]\n"
@@ -211,6 +212,10 @@ Options parse_options(int argc, char** argv) {
             options.json_object = true;
         } else if (arg == "--json-schema-file") {
             options.json_schema_path = value(arg);
+        } else if (arg == "--regex") {
+            options.regex = value(arg);
+        } else if (arg == "--choice") {
+            options.choices.emplace_back(value(arg));
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
@@ -301,10 +306,11 @@ Options parse_options(int argc, char** argv) {
     }
 
     if (int(!options.grammar_path.empty()) + int(!options.json_schema_path.empty()) +
-            int(options.json_object) >
+            int(options.json_object) + int(options.regex.has_value()) +
+            int(!options.choices.empty()) >
         1) {
-        throw std::invalid_argument(
-            "select only one of --grammar-file, --json-object or --json-schema-file");
+        throw std::invalid_argument("select only one of --grammar-file, --json-object, "
+                                    "--json-schema-file, --regex or --choice");
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);

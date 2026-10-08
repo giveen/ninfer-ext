@@ -188,7 +188,36 @@ int test_standard_field_policy() {
 int test_constrained_decoding_extensions() {
     int failures = 0;
 
-    // GBNF is the supported constrained-output entry point: one nonempty grammar string.
+    // Choice and regex are the other two non-JSON languages: literal alternatives and a pattern.
+    Json language                  = base_request();
+    language["structured_outputs"] = Json{{"choice", {"", "yes", "你好"}}};
+    failures += check(options(parse(language).generation).constraint ==
+                          ninfer::OutputConstraint::choice({"", "yes", "你好"}),
+                      "choice literals were changed in Engine translation");
+    language["structured_outputs"] = Json{{"regex", ""}};
+    failures +=
+        check(options(parse(language).generation).constraint == ninfer::OutputConstraint::regex(""),
+              "empty regex was dropped in Engine translation");
+    for (const auto& value : {Json{{"choice", Json::array()}}, Json{{"choice", {"a", 1}}},
+                              Json{{"regex", 7}}, Json{{"regex", "a"}, {"choice", {"a"}}}}) {
+        language["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(language); }).status == 400,
+                          "invalid choice/regex request accepted");
+    }
+    for (const auto kind :
+         {ninfer::RequestErrorKind::InvalidChoice, ninfer::RequestErrorKind::InvalidRegex}) {
+        const auto param = kind == ninfer::RequestErrorKind::InvalidChoice
+                               ? "structured_outputs.choice"
+                               : "structured_outputs.regex";
+        const auto error = request_error_to_api_error(ninfer::RequestError(kind, "invalid"), param);
+        failures += check(error.status == 400 && error.param == param &&
+                              error.code == (kind == ninfer::RequestErrorKind::InvalidChoice
+                                                 ? "invalid_choice"
+                                                 : "invalid_regex"),
+                          "choice/regex error was misclassified");
+    }
+
+    // GBNF is the other non-JSON entry point: one nonempty grammar string.
     Json gbnf                     = base_request();
     gbnf["structured_outputs"]    = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
     const OpenAIChatRequest wired = parse(gbnf);
@@ -245,8 +274,7 @@ int test_constrained_decoding_extensions() {
         Json body            = base_request();
         body[field]          = value;
         const ApiError error = api_error([&] { (void)parse(body); });
-        failures += check(error.param == field &&
-                              error.message.contains("structured_outputs.grammar"),
+        failures += check(error.param == field && error.message.contains("structured_outputs"),
                           std::string(field) + " alias is refused with a pointer");
     }
 
@@ -262,7 +290,9 @@ int test_constrained_decoding_extensions() {
         Json body            = base_request();
         body[field]          = value;
         const ApiError error = api_error([&] { (void)parse(body); });
-        failures += check(error.param == "structured_outputs.grammar",
+        // A malformed object is refused at the object itself; a malformed or unknown value names
+        // the field it came from.
+        failures += check(error.param.starts_with("structured_outputs"),
                           "malformed structured_outputs is refused at its field");
     }
     Json with_tools    = base_request();

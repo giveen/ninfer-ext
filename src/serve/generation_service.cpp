@@ -45,12 +45,16 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
     error.message = exception.what();
     switch (exception.kind()) {
     case ninfer::RequestErrorKind::InvalidGrammar:
+    case ninfer::RequestErrorKind::InvalidChoice:
+    case ninfer::RequestErrorKind::InvalidRegex:
     case ninfer::RequestErrorKind::ConstraintDeadEnd:
         error.status = 400;
         error.param  = constraint_param;
-        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidGrammar
-                           ? "invalid_grammar"
-                           : "constraint_dead_end";
+        error.code =
+            exception.kind() == ninfer::RequestErrorKind::InvalidGrammar  ? "invalid_grammar"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidChoice ? "invalid_choice"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidRegex  ? "invalid_regex"
+                                                                          : "constraint_dead_end";
         break;
     case ninfer::RequestErrorKind::InvalidJsonSchema:
     case ninfer::RequestErrorKind::UnsupportedJsonSchema:
