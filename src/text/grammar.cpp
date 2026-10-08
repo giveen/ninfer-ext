@@ -1,7 +1,7 @@
 #include "text/grammar.h"
+#include "text/json_schema.h"
 
 #include <xgrammar/xgrammar.h>
-
 #include "grammar_impl.h"
 
 #include <algorithm>
@@ -46,8 +46,6 @@ xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
     return xgrammar::Grammar::FromEBNF(source);
 }
 
-// The public GBNF contract is the language itself: the vendor extensions that change decoding
-// behavior, and token references outside the ordinary vocabulary, are rejected instead of applied.
 void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,
               const std::vector<std::int32_t>& eos) {
     for (int i = 0; i < grammar->NumRules(); ++i) {
@@ -76,13 +74,12 @@ void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& 
         }
     }
 }
-}  // namespace
+} // namespace
 
 class GrammarCompiler::Impl {
 public:
     Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes)
-        : vocab(std::move(vocab_)),
-          eos(std::move(eos_)),
+        : vocab(std::move(vocab_)), eos(std::move(eos_)),
           tokenizer(vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab.size()), eos),
           compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)) {}
 
@@ -120,23 +117,61 @@ GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std
 
 GrammarCompiler::~GrammarCompiler() = default;
 
-std::unique_ptr<GrammarSession> GrammarCompiler::compile(const std::string& source,
+std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
                                                          std::string_view close,
                                                          std::string_view continuation) {
     try {
-        auto grammar = xgrammar::Grammar::FromEBNF(source, "root");
-        validate(grammar, impl_->vocab, impl_->eos);
-        if (!close.empty()) {
-            grammar = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
-        }
-        auto session = std::make_unique<GrammarSession::Impl>(
-            impl_->compiler.CompileGrammar(grammar), static_cast<int>(impl_->vocab.size()));
+        const std::string key = std::to_string(static_cast<int>(constraint.kind)) + ":" +
+                                std::to_string(close.size()) + ":" + std::string(close) +
+                                constraint.source;
+        auto compiled = impl_->compiler.CompileCachedGrammar(key, [&] {
+            auto grammar = [&]() -> xgrammar::Grammar {
+                if (constraint.kind == OutputConstraintKind::Grammar) {
+                    auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
+                    validate(parsed, impl_->vocab, impl_->eos);
+                    return parsed;
+                } else {
+                    std::string source;
+                    if (constraint.kind == OutputConstraintKind::JsonObject) {
+                        if (!constraint.source.empty())
+                            throw RequestError(RequestErrorKind::InvalidJsonSchema,
+                                               "JSON object mode has no source payload");
+                        source = R"({"type":"object"})";
+                    } else if (constraint.kind == OutputConstraintKind::JsonSchema) {
+                        source = prepare_json_schema(constraint.source);
+                    } else {
+                        throw RequestError(RequestErrorKind::InvalidJsonSchema,
+                                           "unknown output constraint kind");
+                    }
+                    return xgrammar::Grammar::FromJSONSchema(
+                        source, false, std::nullopt, std::pair<std::string, std::string>{",", ":"},
+                        false, std::nullopt, false, false);
+                }
+            }();
+            if (!close.empty())
+                grammar = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+            return grammar;
+        });
+        auto session =
+            std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
         if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation))) {
             throw std::invalid_argument("assistant continuation is not a prefix of the grammar");
         }
         return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
+    } catch (const xgrammar::JSONSchemaCompileError& error) {
+        RequestErrorKind kind = RequestErrorKind::InvalidJsonSchema;
+        if (error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema)
+            kind = RequestErrorKind::UnsupportedJsonSchema;
+        else if (error.kind == xgrammar::SchemaErrorType::kUnsatisfiableSchema)
+            kind = RequestErrorKind::UnsatisfiableJsonSchema;
+        throw RequestError(kind,
+                           std::string(error.what()) + " at " +
+                               (error.pointer.empty() ? "/" : error.pointer),
+                           error.pointer);
     } catch (const xgrammar::LogFatalError& error) {
-        throw std::invalid_argument(error.what());
+        if (constraint.kind == OutputConstraintKind::Grammar)
+            throw std::invalid_argument(error.what());
+        throw RequestError(RequestErrorKind::InvalidJsonSchema, error.what());
     }
 }
 
@@ -199,4 +234,4 @@ void GrammarSession::discard() {
     if (impl_->tentative) { impl_->matcher.Rollback(impl_->tentative); }
     impl_->tentative = 0;
 }
-}  // namespace ninfer::text
+} // namespace ninfer::text

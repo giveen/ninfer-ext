@@ -171,8 +171,10 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
-    // GBNF source from structured_outputs.grammar; the CLI reads its own file instead.
-    std::optional<std::string> grammar;
+    // Output constraint from a standard format field or structured_outputs.grammar.
+    std::optional<OutputConstraint> constraint;
+    // Wire location the constraint came from, so its errors name the field the client sent.
+    std::string constraint_param;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;

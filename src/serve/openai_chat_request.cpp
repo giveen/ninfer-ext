@@ -131,17 +131,6 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& format = body.at("response_format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("response_format must contain a string type", "response_format");
-        }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "JSON response_format is not implemented; use structured_outputs.grammar for GBNF",
-                "response_format", "response_format_not_supported");
-        }
-    }
 
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
@@ -887,6 +876,10 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        parse_json_output_format(body.at("response_format"), output.generation, "response_format",
+                                 JsonFormatProtocol::Chat);
+    }
     parse_structured_outputs(body, output.generation);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;

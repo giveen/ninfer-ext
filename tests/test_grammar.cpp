@@ -22,6 +22,11 @@ bool allows(const std::vector<std::uint32_t>& words, int token) {
     return (words.at(token / 32) & (1u << (token % 32))) != 0;
 }
 
+auto compile(ninfer::text::GrammarCompiler& compiler, const std::string& source,
+             std::string_view close, std::string_view continuation) {
+    return compiler.compile(ninfer::OutputConstraint::grammar(source), close, continuation);
+}
+
 void consume(ninfer::text::GrammarSession& session, std::string_view text) {
     for (unsigned char byte : text) {
         require(allows(mask(session), byte), "grammar mask rejected valid bytes");
@@ -58,7 +63,7 @@ void check_finite_language_masks() {
                                                    "letters ::= (\"a\" | \"b\"){1,3} (= suffix)\n"
                                                    "suffix ::= \"你\"?"}) {
         for (const auto& prefix : prefixes) {
-            auto session     = compiler.compile(source, {}, prefix);
+            auto session     = compile(compiler, source, {}, prefix);
             const auto words = mask(*session);
             for (int token = 0; token < static_cast<int>(words.size() * 32); ++token) {
                 bool expected = token == eos && language.contains(prefix);
@@ -83,8 +88,8 @@ void check_compiled_grammar_lifetime() {
     std::unique_ptr<ninfer::text::GrammarSession> session;
     {
         ninfer::text::GrammarCompiler compiler({"a", "b", ""}, {2}, 1);
-        session    = compiler.compile("root ::= \"ab\"", {}, {});
-        auto other = compiler.compile("root ::= \"ba\"", {}, {});
+        session    = compile(compiler, "root ::= \"ab\"", {}, {});
+        auto other = compile(compiler, "root ::= \"ba\"", {}, {});
         require(allows(mask(*other), 1), "small-cache compilation failed");
     }
     session->accept(0);
@@ -107,7 +112,7 @@ int main() {
         vocab.emplace_back("\n</think>\n\n answer"); // One token crosses the channel boundary.
         ninfer::text::GrammarCompiler compiler(std::move(vocab), {256}, 4 * 1024 * 1024);
 
-        auto literal = compiler.compile("root ::= \"ab\" | \"ac\"", {}, {});
+        auto literal = compile(compiler, "root ::= \"ab\" | \"ac\"", {}, {});
         require(allows(mask(*literal), 'a') && !allows(mask(*literal), 256),
                 "initial literal mask");
         std::array<std::int32_t, 2> drafts{'a', 'x'};
@@ -124,33 +129,34 @@ int main() {
         literal->accept(256);
         literal->discard();
         require(allows(mask(*literal), 256), "EOS rollback");
-        auto token_rule = compiler.compile("root ::= Token(97) \"b\"", {}, {});
+        auto token_rule = compile(compiler, "root ::= Token(97) \"b\"", {}, {});
         consume(*token_rule, "ab");
         require(allows(mask(*token_rule), 256), "ordinary token reference did not complete");
-        auto empty = compiler.compile("root ::= \"\"", {}, {});
+        auto empty = compile(compiler, "root ::= \"\"", {}, {});
         require(allows(mask(*empty), 256) && !allows(mask(*empty), 'a'),
                 "empty grammar must allow EOS");
 
-        auto plain_a = compiler.compile("root ::= \"a\"", {}, {});
+        auto plain_a = compile(compiler, "root ::= \"a\"", {}, {});
         consume(*plain_a, "a");
         require(allows(mask(*plain_a), 256), "plain literal did not complete");
-        auto embedded_nul = compiler.compile("root ::= \"a\\0b\"", {}, {});
+        auto embedded_nul = compile(compiler, "root ::= \"a\\0b\"", {}, {});
         consume(*embedded_nul, "a");
         require(allows(mask(*embedded_nul), 0) && !allows(mask(*embedded_nul), 256),
                 "embedded NUL was truncated during grammar compilation or cache lookup");
         consume(*embedded_nul, std::string_view("\0b", 2));
         require(allows(mask(*embedded_nul), 256), "embedded NUL literal did not complete");
 
-        auto unicode = compiler.compile("# recursive Unicode lists\nroot ::= \"[\" (item (\",\" "
-                                        "item)*)? \"]\"\nitem ::= [你界] | root",
-                                        {}, {});
+        auto unicode = compile(compiler,
+                               "# recursive Unicode lists\nroot ::= \"[\" (item (\",\" "
+                               "item)*)? \"]\"\nitem ::= [你界] | root",
+                               {}, {});
         consume(*unicode, "[你,[界,你],[]]");
         require(allows(mask(*unicode), 256), "recursive Unicode completion");
-        auto repeat = compiler.compile("root ::= [a-c]{2,4} \"!\"?", {}, "ab");
+        auto repeat = compile(compiler, "root ::= [a-c]{2,4} \"!\"?", {}, "ab");
         consume(*repeat, "c!");
         require(allows(mask(*repeat), 256), "continuation and bounded repetition");
 
-        auto thinking = compiler.compile("root ::= \" answer\"", "\n</think>\n\n", {});
+        auto thinking = compile(compiler, "root ::= \" answer\"", "\n</think>\n\n", {});
         consume(*thinking, "reason\n<other>\n");
         require(allows(mask(*thinking), 258), "cross-boundary token not admitted");
         thinking->accept(258);
@@ -161,19 +167,19 @@ int main() {
                                    "root ::= Regex(\".*\")", "root[temperature=0.5] ::= \"a\""}) {
             bool rejected = false;
             try {
-                (void)compiler.compile(source, {}, {});
+                (void)compile(compiler, source, {}, {});
             } catch (const std::exception&) { rejected = true; }
             require(rejected, "invalid grammar or special token reference accepted");
         }
         bool rejected = false;
         try {
-            (void)compiler.compile("root ::= \"abc\"", {}, "ax");
+            (void)compile(compiler, "root ::= \"abc\"", {}, "ax");
         } catch (const std::exception&) { rejected = true; }
         require(rejected, "invalid continuation accepted");
         std::vector<std::future<void>> concurrent;
         for (int i = 0; i < 8; ++i) {
             concurrent.push_back(std::async(std::launch::async, [&compiler] {
-                auto session = compiler.compile("root ::= \"independent\"", {}, {});
+                auto session = compile(compiler, "root ::= \"independent\"", {}, {});
                 consume(*session, "independent");
                 require(allows(mask(*session), 256),
                         "shared compilation shared mutable matcher state");
@@ -181,7 +187,7 @@ int main() {
         }
         for (auto& task : concurrent) { task.get(); }
         ninfer::text::GrammarCompiler limited({"a", ""}, {1}, 1024 * 1024);
-        auto dead = limited.compile("root ::= \"ab\"", {}, {});
+        auto dead = compile(limited, "root ::= \"ab\"", {}, {});
         std::vector<std::uint32_t> dead_words(2 * dead->mask_words());
         require(dead->masks(std::array<std::int32_t, 1>{0}, dead_words) == 2,
                 "reachable dead end was not assigned to its prediction position");

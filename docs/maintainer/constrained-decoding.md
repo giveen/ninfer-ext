@@ -12,6 +12,7 @@ mechanism; they are not implemented.
 |---|---|---|
 | Grammar source base | `third_party/xgrammar` | pinned CPU core, compiled into `ninfer_xgrammar`; no CUDA, Python or TVM dependency |
 | Generic text adapter | `src/text/grammar.{h,cpp}` | vocabulary/compiler per model, transactional matcher per request |
+| Schema validation | `src/text/json_schema.{h,cpp}` | validates the supported dialect, keeps property order, normalizes source for the vendor converter, reports a JSON Pointer |
 | Request contract | `RequestOptions::grammar`, `EngineOptions::grammar_cache_bytes` | public API; `ResolvedRequestOptions::grammar` carries it to the session |
 | Compiler ownership | `Frontend::Impl::grammars()` | one immutable compiler per model vocabulary, built on the first constrained request |
 | Matcher ownership | `OutputSession` | the request owns its matcher; the Engine never reaches into grammar state directly |
@@ -20,8 +21,11 @@ mechanism; they are not implemented.
 | Mask consumption | `ops::SamplingConfig::mask` | vocabulary masks in the sampling and speculative-acceptance kernels |
 | Input surfaces | `--grammar-file`, `structured_outputs.grammar` | CLI file, or one nonempty grammar string on all three HTTP protocols |
 
-The public entry points (CLI flag, protocol object, its refusals and error codes) are documented in
-[cli.md](../cli.md) and [serving.md](../serving.md); this document is about the mechanism.
+`OutputConstraint` carries the kind (Grammar, JsonObject, JsonSchema) and its owning source text.
+The public entry points — `--grammar-file`/`--json-object`/`--json-schema-file`,
+`response_format` and its Responses and Anthropic equivalents, `structured_outputs.grammar`, the
+refusals and the error codes — are documented in [cli.md](../cli.md) and
+[serving.md](../serving.md); this document is about the mechanism.
 
 ## 2. Semantics
 
@@ -98,7 +102,27 @@ Raw continuation requests do not get this framing: their grammar starts at the f
 and the prompt is not treated as a grammar prefix. A `ContinueFinalAssistant` request initializes its
 matcher from the assistant text that already exists, so the constraint covers the whole final answer.
 
-### 2.4 Rejected combinations
+### 2.4 JSON object and JSON Schema
+
+`json_object` compiles to a root object language, not to arbitrary JSON. `json_schema` uses the root
+type the caller declared, which may be an object, an array, or a supported scalar. Both compile
+through the vendor's schema converter with compact separators, no indentation and non-strict mode,
+after `prepare_json_schema` validates the source and rejects what the dialect does not support with
+a JSON Pointer.
+
+Semantics that follow from that path:
+
+- property order in the source is the generation order, so the schema text is part of the compile
+  cache key rather than being normalized away;
+- string, bounded-number, array-length and enum constraints become part of the same automaton as a
+  hand-written grammar, so `pattern` and `minLength` can apply together;
+- the vendor does not fetch external documents: document-local `$ref`/`$defs` resolve, remote ones
+  are refused.
+
+A schema error surfaces as a request error whose `param` is the wire field the client sent plus the
+failing JSON Pointer, and whose `code` distinguishes invalid, unsupported and unsatisfiable schemas.
+
+### 2.5 Rejected combinations
 
 `Frontend::make_output_session` refuses a grammar that cannot be honored, and the Engine refuses a
 backend that cannot consume masks. Rejections are request errors (`InvalidGrammar`), never silent
@@ -132,6 +156,7 @@ Implemented and verified end-to-end on a real artifact:
 
 | Path | State |
 |---|---|
+| Plain decode round with a JSON object or schema constraint | constrained; the published content parses as the declared type |
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
 | MTP round with drafts | constrained; the row drafts normally, one mask per verify position |
@@ -144,8 +169,9 @@ Not implemented:
 
 | Not implemented | Consequence |
 |---|---|
-| JSON object, JSON Schema, choice and regex entry points | `response_format`/`text.format` JSON output is still refused, now pointing at GBNF |
-| Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused |
+| Choice and regex entry points | the corresponding vendor extensions are refused |
+| Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
+| Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
 | Jump-forward decoding | not planned here; a mask-only contract is enough for correctness |
 | Grammar-aware sampling-side fast paths | a constrained round takes the general sampler path, which costs more than the unmasked greedy path for the same round |
@@ -161,6 +187,14 @@ Not implemented:
 - `tests/ops/test_sampling.cpp` — masked greedy and masked distribution against the FP64 oracle,
   including a vocabulary where the legal tokens rank below the unmasked top-k, which is what proves
   the mask applies before top-k and normalization rather than after.
+- `tests/text/test_json_schema.cpp` — native schema acceptance/rejection, including the source
+  order that becomes the generation order.
+- `tests/text/test_json_schema.py` — the same schemas checked against the independent `jsonschema`
+  library, driven through a probe binary so the native validator and the library are compared on the
+  same inputs.
+- `ninfer_qwen3_5_grammar_real_test` — the Engine end to end with a real artifact, over content,
+  sampling, thinking, continuation, mixed batches, truncation, raw input and JSON/schema
+  constraints, with and without CUDA Graphs.
 - `ninfer_xgrammar_core_test` — the vendored core's observable contract.
 - `tests/models/qwen3_5/test_mtp_draft_policy.cpp` — an unintended interaction is covered: a
   zero-extent round records no per-position acceptance evidence, so a constrained row cannot bias

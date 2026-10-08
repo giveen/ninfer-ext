@@ -38,14 +38,17 @@ failures remain direct command diagnostics:
   > answer.txt 2> run.log
 ```
 
-`--grammar-file FILE` constrains the generated content to a GBNF language. The grammar applies
-after the model's reasoning phase, so thinking still precedes the constrained answer, and the
-request is refused when it cannot be combined with the grammar (raw output, custom stops, or a
-backend whose verify rounds consume no token masks). Speculative drafting keeps working: each verify
-position is constrained on its own, so a draft the grammar forbids is not accepted:
+`--grammar-file FILE`, `--json-object` or `--json-schema-file FILE` constrains the generated
+content to a GBNF language, any JSON object, or a JSON Schema; exactly one may be given. The
+constraint applies after the model's reasoning phase, so thinking still precedes the constrained
+answer, and the request is refused when it cannot be combined with the constraint (raw output,
+custom stops, or a backend whose verify rounds consume no token masks). Speculative drafting keeps
+working: each verify position is constrained on its own, so a draft the constraint forbids is not
+accepted:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b.ninfer --messages msgs.json   --grammar-file answer.gbnf --greedy --max-new 200
+./build/apps/ninfer models/qwen3_8_27b.ninfer --messages msgs.json \
+  --json-schema-file trip.schema.json --greedy --max-new 200
 ```
 
 `--chat-template FILE` overrides the artifact's built-in template with a local Jinja file.

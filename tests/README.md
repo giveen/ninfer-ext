@@ -49,9 +49,10 @@ ctest --test-dir build --output-on-failure
 
 The suite is largely CPU-bound and single-threaded per test, while each test still
 allocates device fixtures, so a small bounded job count is much faster than a serial run
-and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways
-(142 tests in about 2.3 min against about 16 min serially); `ctest --preset real` runs the
-artifact-dependent model tests one at a time.
+and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways (150 tests, about
+5.5 min, of which `ninfer_offload_moe_exl3_test` alone is 330 s); `ctest --preset fast -E
+offload_moe_exl3` runs the other 149 in about 2.2 min and is the practical inner loop; `ctest
+--preset real` runs the artifact-dependent model tests one at a time.
 
 ```bash
 ctest --preset fast    # six-way parallel, excludes real

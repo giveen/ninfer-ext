@@ -84,9 +84,9 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
-                        const OutputOptions& output               = {},
-                        const ThinkingControlOptions& thinking    = {},
-                        const std::optional<std::string>& grammar = {}) const;
+                        const OutputOptions& output                       = {},
+                        const ThinkingControlOptions& thinking            = {},
+                        const std::optional<OutputConstraint>& constraint = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
     // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence
