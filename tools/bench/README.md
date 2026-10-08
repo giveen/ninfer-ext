@@ -150,6 +150,9 @@ Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset.
   round's draft, up to 7.
 - **DFlash modes.** Use `dflash7` for Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B
   DFlash2 K=7, with companion weights in the selected artifact.
+- **EAGLE3 modes.** `eagle3_3` and `eagle3_5` pin the draft length and `eagle3_adaptive` lets the
+  server choose each round's draft, up to 7, on artifacts that carry the EAGLE3 draft head. EAGLE3
+  drafts through its own head, so the runner never passes `--lm-head-draft` for it.
 - **Sampling.** `--sampling greedy` selects exact argmax; the default is stochastic.
 
 The runners also drive a stock upstream `ninfer-serve` (`--serve PATH`):
@@ -157,7 +160,7 @@ The runners also drive a stock upstream `ninfer-serve` (`--serve PATH`):
 - **Detection.** The runner reads `--help`: a build without `--fixed-draft` has no adaptive MTP.
 - **Fixed modes.** On such a build, fixed MTP modes omit the flag, because that build always drafts
   exactly `--draft-tokens`.
-- **Adaptive mode.** `mtp_adaptive` is rejected on it.
+- **Adaptive mode.** `mtp_adaptive` and `eagle3_adaptive` are rejected on it.
 - **Request log.** Both upstream's schema-v21 log and this fork's v24 are accepted.
 Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
 Both serving runners accept `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` (default: `int8`).

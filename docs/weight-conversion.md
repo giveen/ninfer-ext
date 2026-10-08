@@ -136,10 +136,13 @@ python3 -m tools.convert \
   --out models/qwen3_8_27b_nvfp4.ninfer
 ```
 
-MTP and Vision use the main source. DFlash and DFlash2 use the corresponding named source, supplied
-as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
-components; the Engine loads only the ones selected at startup, including at most one speculative
-backend. Component availability and startup selection are independent.
+MTP and Vision use the main source. DFlash, DFlash2 and EAGLE3 use the corresponding named source,
+supplied as `--source dflash=PATH`, `--source dflash2=PATH` or `--source eagle3=PATH`. The EAGLE3
+component converts a SpecForge `LlamaForCausalLMEagle3` head (for example
+`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`) into `eagle3/*` parameters, inheriting the target's
+token embedding and tokenizer; see [EAGLE3](maintainer/eagle3.md). An artifact may contain several
+optional components; the Engine loads only the ones selected at startup, including at most one
+speculative backend. Component availability and startup selection are independent.
 
 ## Change part of a recipe
 

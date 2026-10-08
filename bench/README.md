@@ -91,7 +91,7 @@ For a DFlash2 companion artifact:
 
 The benchmark disables context retention because every repetition is an independent root request.
 Schema v16 records `speculative_backend`, `draft_tokens`, `tree_width`, and the proposal head
-independently; JSON and CSV identify DFlash2 explicitly;
+independently; JSON and CSV identify DFlash2 explicitly.
 
 For speculative runs, the automatic context covers the whole generation. MTP alone adds lookahead
 KV for drafts past the final frontier. Every speculative backend then rounds up to 64-token pages

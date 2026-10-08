@@ -85,9 +85,9 @@ output capacity for the inserted suffix and the answer:
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
-- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
-  the selected speculative backend;
+- no `--spec` omits MTP/DFlash/DFlash2/EAGLE3 weights and state and the optimized proposal head;
+- `--spec mtp`, `--spec dflash` (35B-A3B), `--spec dflash2` (Qwen3.8-27B) and `--spec eagle3`
+  (artifacts carrying the EAGLE3 draft weights) load only the selected speculative backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
@@ -195,6 +195,14 @@ concurrent requests, sampling penalties, and prefix reuse. An artifact without t
 weights reports a missing DFlash2 component when selected. Vision, MTP and DFlash follow the same
 rule: their weights are required only when that component is enabled at startup.
 
+For an artifact carrying EAGLE3 draft weights, select `--spec eagle3 --draft-tokens N`. EAGLE3
+drafts autoregressively from three captured target layers through its own draft head, so it
+never loads the optimized proposal head: `--lm-head-draft` is rejected, while the adaptive draft
+policy and `--fixed-draft` behave exactly as they do for MTP (window `1..15`). `--draft-tree N`
+selects the static draft-tree root width; only `1` (a chain) is implemented, so a wider tree is
+rejected at startup. See [EAGLE3](maintainer/eagle3.md) for the draft graph, the three-layer target
+conditioning, the draft-KV cost and how to convert an artifact with the head.
+
 Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
 use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
 the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
@@ -215,9 +223,10 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
-| `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--spec mtp\|dflash\|dflash2\|eagle3` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2/EAGLE3 `1..15` | MTP `7`; otherwise unset |
+| `--fixed-draft` | MTP/EAGLE3: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--draft-tree N` | EAGLE3 static draft-tree root width; only `1` (a chain) is implemented | `1` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
 | `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |
