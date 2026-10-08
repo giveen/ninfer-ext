@@ -200,15 +200,6 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
 void mask_selected_logits(Tensor& logits, const Tensor& selected, cudaStream_t stream);
 
 /**
- * @brief Masks one vocabulary row per column of BF16 logits to negative infinity.
- *
- * @details logits is contiguous BF16 [rows,batch] and selected is contiguous I32 [batch].
- * For every column b, logits[selected[b],b] becomes -inf when the selection names a valid row;
- * out-of-range selections are ignored. A repeated argmax over the same logits therefore yields
- * the next-best rows in order, which draft-tree construction uses for top-k first tokens.
- * Only the selected elements change; there is no workspace or other state side effect.
- */
-/**
  * @brief Picks each sequence's winning draft chain by accepted count.
  *
  * @details accepted is contiguous I32 [batch*tree_width] holding per-chain accepted counts in
