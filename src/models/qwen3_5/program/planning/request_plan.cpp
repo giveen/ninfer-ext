@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "core/nvtx.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -209,6 +210,7 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                           const runtime::ResolvedExecutionOptions& options) {
+    nvtx::ScopedRange plan_range(nvtx::Name::RequestPlan, nvtx::Category::Control);
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");

@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 
+#include "core/nvtx.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -2198,6 +2200,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
 ContextTransactionProgress
 ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    nvtx::ScopedRange transaction_range(nvtx::Name::ContextTransaction,
+                                       nvtx::Category::Control);
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {

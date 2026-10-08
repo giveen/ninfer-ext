@@ -95,6 +95,12 @@ enum class Name : std::size_t {
     DecodeDFlashTarget,
     DecodeEagle3Target,
     DecodeEagle3Draft,
+    // Host-side state and paging phases of the Program and the context store.
+    RequestPlan,
+    ContextTransaction,
+    ContextKvMapping,
+    ContextKvStaging,
+    ProgramCommit,
     Count,
 };
 
@@ -224,6 +230,11 @@ enum class Name : std::size_t {
         "decode.dflash.target",
         "decode.eagle3.target",
         "decode.eagle3.draft",
+        "request.plan",
+        "context.transaction",
+        "context.kv_mapping",
+        "context.kv_staging",
+        "program.commit",
     });
     static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {

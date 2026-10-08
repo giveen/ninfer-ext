@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "core/nvtx.h"
 
 #include <algorithm>
 #include <array>
@@ -1469,6 +1470,8 @@ qwen3_5::KVHostStaging* ProgramImpl::stage_text_kv(std::span<const std::uint32_t
     // Sparse attention reads only its selected tokens: a decode round reads Host K/V in place
     // rather than copying every Host page.
     if (!decoder->text_kv_staging || decoder->text_kv.has_qsa_index()) { return nullptr; }
+    nvtx::ScopedRange staging_range(nvtx::Name::ContextKvStaging, nvtx::Category::Control,
+                                    static_cast<std::uint64_t>(lanes.size()));
     std::array<qwen3_5::KVHostStaging::RowPages, kMaximumConcurrency> rows{};
     if (lanes.size() > rows.size()) { throw std::logic_error("KV staging batch is too wide"); }
     for (std::size_t index = 0; index < lanes.size(); ++index) {
@@ -1884,6 +1887,7 @@ std::optional<std::uint32_t> ProgramImpl::device_kv_lease_settlement_tokens(
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
+    nvtx::ScopedRange mapping_range(nvtx::Name::ContextKvMapping, nvtx::Category::Control);
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
@@ -1914,6 +1918,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
 
 void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                      std::uint32_t backend_tokens) {
+    nvtx::ScopedRange commit_range(nvtx::Name::ProgramCommit, nvtx::Category::Control);
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity ||
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
