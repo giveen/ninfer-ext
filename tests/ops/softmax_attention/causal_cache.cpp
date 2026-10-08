@@ -117,6 +117,10 @@ constexpr Geometry kGeometries[] = {
     {"d256-h16-kv2", 16, 2},
 };
 
+// EAGLE3's draft is multi-head: one query head per KV head. The quantized producers do not
+// register this geometry yet, so it is exercised through its BF16 path only.
+constexpr Geometry kMultiHeadGeometry{"d256-h16-kv16", 16, 16};
+
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
 }
@@ -2531,6 +2535,50 @@ int run_geometry(const Geometry& geometry) {
             failures +=
                 run_a3_case(geometry, storage, {16, 17, 1025, 404u}, MappingPattern::Identity);
         }
+        // Long contexts split the key range across partials and merge them; the EAGLE3 draft
+        // reaches this path on any realistic prompt.
+        failures +=
+            run_a1_case(geometry, storage, {1, 2048, 2049, 411u}, MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, storage, {1, 2048, 2049, 412u}, MappingPattern::Fragmented);
+        failures +=
+            run_a1_case(geometry, storage, {1, 8192, 8193, 413u}, MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, storage, {1, 8192, 8193, 414u}, MappingPattern::Fragmented);
+    }
+    return failures;
+}
+
+// EAGLE3's draft geometry: multi-head (16/16) over its own BF16 KV cache. Long contexts exercise
+// the split/merge partials that the grouped and tiled producers feed.
+int run_multi_head_cases() {
+    int failures                  = 0;
+    const Geometry& geometry      = kMultiHeadGeometry;
+    constexpr KvCacheStorage kStorage = KvCacheStorage::BFloat16;
+    for (const MappingPattern mapping :
+         {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
+        failures += run_a1_case(geometry, kStorage, {6, 61, 67, 190u}, mapping);
+        failures += run_a3_case(geometry, kStorage, {1, 128, 129, 191u}, mapping);
+        failures += run_a3_case(geometry, kStorage, {4, 1709, 1713, 192u}, mapping);
+        failures += run_a3_case(geometry, kStorage, {4, 2048, 2052, 193u}, mapping);
+    }
+    const AttentionCase a3_cases[] = {
+        {1, 31, 32, 301u},     {7, 17, 512, 302u},    {17, 31, 48, 303u},
+        {4, 1709, 1713, 304u}, {4, 8192, 8196, 305u}, {1, 16384, 16385, 306u},
+        // Widths above 256 select the tiled producer, which is what a prefill chunk of a
+        // realistic prompt reaches.
+        {300, 0, 300, 320u},   {300, 0, 300, 321u},   {1024, 0, 1024, 322u},
+    };
+    for (const AttentionCase& test_case : a3_cases) {
+        failures += run_a3_case(geometry, kStorage, test_case, MappingPattern::Identity);
+        failures += run_a3_case(geometry, kStorage, test_case, MappingPattern::Fragmented);
+    }
+    const AttentionCase a1_cases[] = {
+        {300, 0, 300, 330u},
+        {1024, 0, 1024, 331u},
+    };
+    for (const AttentionCase& test_case : a1_cases) {
+        failures += run_a1_case(geometry, kStorage, test_case, MappingPattern::Identity);
     }
     return failures;
 }
@@ -2716,6 +2764,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
+    failures += run_multi_head_cases();
     failures += run_fp8_cases();
     failures += run_host_arm_cases();
     failures += run_batch_cases();

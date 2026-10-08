@@ -414,6 +414,24 @@ void ProgramImpl::prepare_graphs() {
             }
         }
     }
+    if (speculative_backend == SpeculativeBackend::Eagle3 && !mtp_rungs.empty()) {
+        // The EAGLE3 kernels (its multi-head causal producer and the draft's q8 projections) live
+        // in their own CUDA module. One representative eager round loads it during startup rather
+        // than making the first prefill pay the module load.
+        MtpRung& rung               = mtp_rungs[mtp_round_rung];
+        const std::uint32_t k       = rung.k;
+        const auto planned_profiles = mtp_graph_profiles(capacity, k);
+        const GraphExecutionProfile code_warm = planned_profiles.front();
+        prepare_representative(code_warm.min, 1, k);
+        device.synchronize();
+        execution::Eagle3BatchContext eagle3_state{
+            execution_core(&rung.records), decoder->text_kv, *decoder->eagle3_cache(), rung.frame,
+            *mtp_host_ingress, *mtp_host_egress, state_images->continuation_hidden_store()};
+        execution::eagle3_decode_batch(
+            eagle3_state, 1, k, mtp_causal_attention_envelopes(code_warm.max, k, capacity),
+            nullptr);
+        device.synchronize();
+    }
     if (is_masked_draft_backend(speculative_backend)) {
         const auto planned_profiles =
             dflash_graph_profiles(speculative_backend, capacity, draft_window);

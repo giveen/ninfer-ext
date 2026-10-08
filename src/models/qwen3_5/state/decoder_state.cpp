@@ -107,9 +107,12 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.mtp_physical_page_groups, spec.qsa_index, spec.kv_stream);
     }
     if (spec.enable_eagle3) {
+        // The draft is multi-head (one query head per KV head); only the BF16 causal producer
+        // registers that geometry, and the draft's single layer makes the wider KV cheap.
         layout.eagle3_kv = plan_cache(builder, 1, spec.capacity, spec.eagle3_kv_heads,
-                                      spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                      spec.eagle3_physical_page_groups, false, spec.kv_stream);
+                                      spec.attention_head_dim, KvCacheStorage::BFloat16,
+                                      spec.kv_table_rows, spec.eagle3_physical_page_groups, false,
+                                      spec.kv_stream);
     }
     if (spec.kv_staging_pages != 0) {
         if (!spec.kv_stream) {
