@@ -359,24 +359,33 @@ struct OutputOptions {
     std::uint32_t tool_name_max_length = 128;
 };
 
-enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema };
+enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema, Choice, Regex };
 
-// Constrains generated content; Chat reasoning retains the model's framing. Source is owning GBNF
-// or JSON Schema text. JsonObject has no source payload.
+// Constrains generated content; Chat reasoning retains the model's framing. Source is owning GBNF,
+// JSON Schema or regex text. Choice owns literal alternatives; JsonObject has no payload.
 struct OutputConstraint {
     OutputConstraintKind kind = OutputConstraintKind::Grammar;
     std::string source;
+    std::vector<std::string> choices;
 
     [[nodiscard]] static OutputConstraint grammar(std::string source) {
-        return {OutputConstraintKind::Grammar, std::move(source)};
+        return {OutputConstraintKind::Grammar, std::move(source), {}};
     }
 
     [[nodiscard]] static OutputConstraint json_object() {
-        return {OutputConstraintKind::JsonObject, {}};
+        return {OutputConstraintKind::JsonObject, {}, {}};
     }
 
     [[nodiscard]] static OutputConstraint json_schema(std::string source) {
-        return {OutputConstraintKind::JsonSchema, std::move(source)};
+        return {OutputConstraintKind::JsonSchema, std::move(source), {}};
+    }
+
+    [[nodiscard]] static OutputConstraint choice(std::vector<std::string> values) {
+        return {OutputConstraintKind::Choice, {}, std::move(values)};
+    }
+
+    [[nodiscard]] static OutputConstraint regex(std::string pattern) {
+        return {OutputConstraintKind::Regex, std::move(pattern), {}};
     }
 
     bool operator==(const OutputConstraint&) const = default;
@@ -624,6 +633,8 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     InvalidGrammar,
+    InvalidChoice,
+    InvalidRegex,
     InvalidJsonSchema,
     UnsupportedJsonSchema,
     UnsatisfiableJsonSchema,

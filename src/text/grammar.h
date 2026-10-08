@@ -12,6 +12,9 @@
 
 namespace ninfer::text {
 
+// Error kind a compilation failure of this constraint kind reports.
+[[nodiscard]] RequestErrorKind constraint_error_kind(OutputConstraintKind kind);
+
 // One immutable vocabulary/compiler per model; one transactional matcher per request.
 class GrammarSession {
 public:

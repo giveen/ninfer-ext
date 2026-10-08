@@ -1023,9 +1023,7 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
             !caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
             !caller_stop.include_model_defaults || caller_stop.publish_stop_token || output.raw ||
             output.preserve_special_tokens) {
-            throw RequestError(constraint->kind == OutputConstraintKind::Grammar
-                                   ? RequestErrorKind::InvalidGrammar
-                                   : RequestErrorKind::InvalidJsonSchema,
+            throw RequestError(text::constraint_error_kind(constraint->kind),
                                "output constraints require default EOS, text output and no "
                                "active tools or custom stops");
         }
@@ -1038,10 +1036,7 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
         } catch (const RequestError&) {
             throw;
         } catch (const std::invalid_argument& error) {
-            throw RequestError(constraint->kind == OutputConstraintKind::Grammar
-                                   ? RequestErrorKind::InvalidGrammar
-                                   : RequestErrorKind::InvalidJsonSchema,
-                               error.what());
+            throw RequestError(text::constraint_error_kind(constraint->kind), error.what());
         }
     }
     return OutputSession(impl_->tokenizer, std::move(policy), output,

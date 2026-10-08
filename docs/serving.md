@@ -229,8 +229,10 @@ The endpoint supports:
 - constrained output on the generated content, accepted on Chat Completions, Responses and
   Messages: `response_format: {"type": "json_object"}` or
   `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`, the Responses
-  `text.format` equivalent, the Anthropic `output_config.format` schema form, and GBNF through
-  `structured_outputs: {"grammar": "<GBNF source>"}`. The constraint applies after the model's
+  `text.format` equivalent, the Anthropic `output_config.format` schema form, GBNF through
+  `structured_outputs: {"grammar": "<GBNF source>"}`, a finite string set through
+  `{"choice": ["yes", "no"]}`, and a regular expression through `{"regex": "[a-z]+"}`. The object
+  takes exactly one of those three keys. The constraint applies after the model's
   reasoning phase. Supported schema keywords and the exact semantics are in
   [constrained decoding](maintainer/constrained-decoding.md); a request is refused when the
   constraint cannot be combined with what it asks for (active tools, custom stops, raw or

@@ -807,6 +807,17 @@ int test_explicit_rejections() {
                                   .prompt.generation.constraint->kind ==
                               ninfer::OutputConstraintKind::JsonObject,
                       "text.format json_object reaches the constraint");
+    for (const auto& value_choice : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        value["text"]                  = Json{{"format", Json{{"type", "text"}}}};
+        value["structured_outputs"]    = value_choice;
+        const auto parsed_choice       = parse_openai_responses_create_request(value, limits());
+        failures += check(parsed_choice.prompt.generation.constraint ==
+                              (value_choice.contains("choice")
+                                   ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                   : ninfer::OutputConstraint::regex("[a-z]+")),
+                          "Responses choice/regex reaches the constraint");
+    }
+    value.erase("structured_outputs");
     value["text"] = Json{{"format", Json{{"type", "json_schema"},
                                         {"name", "trip"},
                                         {"schema", Json{{"type", "object"}}}}}};

@@ -13,6 +13,7 @@ mechanism; they are not implemented.
 | Grammar source base | `third_party/xgrammar` | pinned CPU core, compiled into `ninfer_xgrammar`; no CUDA, Python or TVM dependency |
 | Generic text adapter | `src/text/grammar.{h,cpp}` | vocabulary/compiler per model, transactional matcher per request |
 | Schema validation | `src/text/json_schema.{h,cpp}` | validates the supported dialect, keeps property order, normalizes source for the vendor converter, reports a JSON Pointer |
+| Choice and regex | `src/text/grammar.cpp` | literal alternation and a scalar-value regex automaton |
 | Request contract | `RequestOptions::grammar`, `EngineOptions::grammar_cache_bytes` | public API; `ResolvedRequestOptions::grammar` carries it to the session |
 | Compiler ownership | `Frontend::Impl::grammars()` | one immutable compiler per model vocabulary, built on the first constrained request |
 | Matcher ownership | `OutputSession` | the request owns its matcher; the Engine never reaches into grammar state directly |
@@ -122,7 +123,25 @@ Semantics that follow from that path:
 A schema error surfaces as a request error whose `param` is the wire field the client sent plus the
 failing JSON Pointer, and whose `code` distinguishes invalid, unsupported and unsatisfiable schemas.
 
-### 2.5 Rejected combinations
+### 2.5 Choice and regex
+
+A choice compiles to an alternation of literal byte strings: candidates keep their case, whitespace
+and Unicode exactly, duplicates are dropped, and the order carries no weight, so the compiled result
+is keyed by the normalized set rather than by how the client listed it. A short candidate that
+prefixes a longer one still allows the stop token after the short form, and also allows continuing
+into the longer one.
+
+A regex is matched against the whole content, not searched: an empty pattern admits only the empty
+content. Literals, Unicode characters, character classes, groups, alternation and `*`, `+`, `?`,
+`{m,n}` repetitions are supported; greedy and lazy spellings describe the same language, and no
+capture values are returned. Classes follow ECMAScript semantics (`\d`, `\w` are ASCII, `\s`
+includes Unicode whitespace, `.` excludes `\n`, `\r`, U+2028 and U+2029), escapes such as `\xNN`
+and `\uNNNN` are accepted, and the output contains Unicode scalar values only: a scalar-value pass
+rewrites every class so surrogates can never be published. Anchors are accepted only at the ends of
+the pattern or a top-level branch; backreferences, lookaround, word boundaries, property classes,
+flags, surrogate escapes and unknown escapes are refused as `InvalidRegex`.
+
+### 2.6 Rejected combinations
 
 `Frontend::make_output_session` refuses a grammar that cannot be honored, and the Engine refuses a
 backend that cannot consume masks. Rejections are request errors (`InvalidGrammar`), never silent
@@ -157,6 +176,7 @@ Implemented and verified end-to-end on a real artifact:
 | Path | State |
 |---|---|
 | Plain decode round with a JSON object or schema constraint | constrained; the published content parses as the declared type |
+| Plain and drafted rounds with a choice or regex constraint | constrained; the published content is one of the literals, or matches the pattern in full |
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
 | MTP round with drafts | constrained; the row drafts normally, one mask per verify position |
@@ -169,7 +189,7 @@ Not implemented:
 
 | Not implemented | Consequence |
 |---|---|
-| Choice and regex entry points | the corresponding vendor extensions are refused |
+| Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
@@ -192,6 +212,9 @@ Not implemented:
 - `tests/text/test_json_schema.py` — the same schemas checked against the independent `jsonschema`
   library, driven through a probe binary so the native validator and the library are compared on the
   same inputs.
+- `tests/text/test_regex_choice.cpp` and `tests/text/test_regex_choice.py` — native choice/regex
+  acceptance, with the same candidates and patterns checked against Python's `re`, including escape
+  forms, anchors, alternation and repetition.
 - `ninfer_qwen3_5_grammar_real_test` — the Engine end to end with a real artifact, over content,
   sampling, thinking, continuation, mixed batches, truncation, raw input and JSON/schema
   constraints, with and without CUDA Graphs.

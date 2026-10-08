@@ -134,6 +134,16 @@ int test_envelope_and_field_policy() {
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();
+    body["structured_outputs"] = Json{{"choice", {"yes", "no"}}};
+    failures += check(parse(body).generation.constraint ==
+                          ninfer::OutputConstraint::choice({"yes", "no"}),
+                      "Anthropic choice reaches the constraint");
+    body.erase("structured_outputs");
+    body["structured_outputs"] = Json{{"regex", "[a-z]+"}};
+    failures += check(parse(body).generation.constraint ==
+                          ninfer::OutputConstraint::regex("[a-z]+"),
+                      "Anthropic regex reaches the constraint");
+    body.erase("structured_outputs");
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
                       "a schema format without a schema is refused at its field");
