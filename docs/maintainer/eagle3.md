@@ -217,10 +217,18 @@ What the numbers say:
   acceptances into different throughput. On the same shapes an EAGLE3 round is not obviously the
   cheaper one: its draft decoder is 2,048 wide with one layer, but its attention reads 16 KV heads
   over the whole history per step against the target's 2.
-- Acceptance decays sharply with depth: one CLI decode reported `accepted by pos 7,3,0` over 11
-  rounds at K=3, i.e. roughly 64% for the first draft, 27% for the second and none for the third.
-  Chained depth buys little at this acceptance, and K=5 measured slower than K=3 both here and on
-  the flat corpus.
+- Acceptance decays with depth but keeps paying: a 256-token greedy CLI decode reports per-position
+  acceptance of 76.1/58.7/41.3% at K=3 (92 rounds) and 74.4/57.3/35.4/25.6/15.9% at K=5 (82 rounds),
+  so acceptance length rises from 2.76 to 3.09 tokens per round while per-draft acceptance falls
+  from 58.7% to 41.9%. The two are a wash on throughput, which is why K=5 and K=3 tie here; a
+  position-aware policy should stop extending a chain where the marginal position's expected
+  acceptance no longer repays its step.
+- The draft is ordinary rather than broken: its first-position acceptance (76%) matches MTP's
+  aggregate over three drafts (77%), and its acceptance length sits beside the 2.93/3.35 the head's
+  own release reports for its intended target in SGLang (different engine, target, workload and
+  sampling, so the numbers are indicative, not comparable). MTP's advantage is a flatter decay —
+  its drafts come from the target's own weights, which is also how the head's author deployed EAGLE3
+  (`--speculative-eagle-topk 1`, i.e. a chain, with five draft tokens).
 - The artifact's configuration matters when reading the numbers: without `--proposal` the only MTP
   available is the **full** target head, which is a floor for MTP, not its measured setting — that
   is why the flat-corpus row below understates MTP. Convert an EAGLE3 artifact with `--proposal`
@@ -248,10 +256,12 @@ because the tap sweep ran at these settings.
   --lm-head-draft` 567.5/1,755.9. Its plain-decode numbers sit within 2-4% of the NVFP4 artifact's,
   which is the control for comparing modes across the two quantizations.
 
-Two consequences for the improvement plan: an EAGLE3 head that matched its target would be worth
-more than any round-level tuning (acceptance is the whole deficit), and the static draft tree is the
-cheapest route to more acceptance per verify width, because it spends that width on first-position
-candidates — the only position this head lands reliably.
+Three consequences for the improvement plan. The deficit is depth, not the first token (76% against
+MTP's 77%), so branching where the curve is flat — the static draft tree — is worth more than extra
+chain depth, whose last positions land 26% and 16% of the time. A draft trained for this target, or
+one as strong as the model's own MTP layer, would raise the whole curve. And the chain should stop
+extending when the marginal position stops paying, which today's policy does not do: it adapts the
+draft length from round cost and aggregate acceptance only.
 
 The top-k propose path is verified against the chain path rather than only by its ops oracles: with
 the round temporarily routed through `eagle3_propose_topk_batch(..., top = 1)`, the CLI commits
