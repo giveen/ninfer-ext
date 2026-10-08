@@ -604,9 +604,10 @@ int test_tools_and_effective_subset() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
-    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "clock",
-                      "wire tool list and effective callable subset remain distinct");
+    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"clock"},
+                      "wire tool list and selected callable subset remain distinct");
 
     Json none           = body;
     none["tool_choice"] = "none";
@@ -662,11 +663,15 @@ int test_namespace_tools() {
     failures += check(request.tools.size() == 2 && request.tools[0].at("type") == "namespace" &&
                           request.tools[0].at("tools")[0].at("name") == "now",
                       "wire namespace grouping is retained in the response echo");
-    failures += check(request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "mcp__clock__now" &&
-                          request.prompt.generation.tools[0].description ==
-                              "Clock service\n\nRead the current time",
-                      "allowed namespace function lowers to one Engine tool with shared context");
+    const auto described = std::any_of(
+        request.prompt.generation.tools.begin(), request.prompt.generation.tools.end(),
+        [](const auto& tool) {
+            return tool.description == "Clock service\n\nRead the current time";
+        });
+    failures += check(request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"mcp__clock__now"} && described,
+                      "namespace selection keeps every declaration with shared context");
     failures +=
         check(request.tool_identities.at("mcp__clock__now").name == "now" &&
                   request.tool_identities.at("mcp__clock__now").wire_namespace == "mcp__clock",
@@ -796,10 +801,10 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    failures += check(parse_openai_responses_create_request(value, limits())
+                              .prompt.generation.tools[0]
+                              .strict,
+                      "strict function schema reaches generation");
 
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_object"}}}};

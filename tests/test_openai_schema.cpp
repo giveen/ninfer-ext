@@ -351,16 +351,18 @@ int test_tools() {
     body["tool_choice"]          = "none";
     body["parallel_tool_calls"]  = false;
     const OpenAIChatRequest none = parse(body);
-    failures +=
-        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
-              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+    failures += check(!none.generation.uses_tools() &&
+                          prompt(none.generation).options.tool_jsons.size() == 1,
+                      "tool_choice none keeps declarations in the prompt");
 
     body["tool_choice"] = "required";
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "required tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "required choice reaches generation");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "named tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"} &&
+                          !parse(body).generation.tool_choice.parallel,
+                      "named choice selects exactly one invocation");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -370,23 +372,23 @@ int test_tools() {
               Json{{"mode", "auto"},
                    {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
     const GenerationRequest allowed = parse(body).generation;
-    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
-                          prompt(allowed).options.tool_jsons.size() == 1,
-                      "allowed_tools auto narrows the executable function set");
+    failures += check(allowed.tools.size() == 2 &&
+                          allowed.tool_choice.allowed_names == std::vector<std::string>{"search"} &&
+                          prompt(allowed).options.tool_jsons.size() == 2,
+                      "allowed_tools preserves declarations and selects callable names");
 
     body["tool_choice"] =
         Json{{"type", "allowed_tools"},
              {"mode", "auto"},
              {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
     const GenerationRequest direct_allowed = parse(body).generation;
-    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
+    failures += check(direct_allowed.tools.size() == 2 &&
+                          direct_allowed.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
                       "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"]     = "required";
-    const ApiError required_allowed = api_error([&] { (void)parse(body); });
-    failures +=
-        check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.contains("at least one tool call"),
-              "required allowed_tools reports the unenforceable guarantee");
+    body["tool_choice"]["mode"] = "required";
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "allowed_tools required reaches generation");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
@@ -394,8 +396,11 @@ int test_tools() {
 
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
+    failures += check(
+        parse(body).generation.tools[0].strict &&
+            Json::parse(
+                prompt(parse(body).generation).options.tool_jsons[0])["function"]["strict"] == true,
+        "strict survives prompt and request translation");
     body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
@@ -403,9 +408,8 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "parallel_tool_calls=false reaches generation");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");

@@ -222,7 +222,7 @@ public:
             }
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
-                options.constraint);
+                options.constraint, options.tool_choice);
             // A cold constraint compilation happens here, so the deadline is rechecked before
             // queueing.
             if (Clock::now() >= pending_deadline) {

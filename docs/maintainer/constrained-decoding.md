@@ -14,6 +14,8 @@ mechanism; they are not implemented.
 | Generic text adapter | `src/text/grammar.{h,cpp}` | vocabulary/compiler per model, transactional matcher per request |
 | Schema validation | `src/text/json_schema.{h,cpp}` | validates the supported dialect, keeps property order, normalizes source for the vendor converter, reports a JSON Pointer |
 | Choice and regex | `src/text/grammar.cpp` | literal alternation and a scalar-value regex automaton |
+| Tool contracts | `src/models/qwen3_5/frontend/tool_contract.{h,cpp}` | per-declaration parameters, types and encodings, plus this request's selection |
+| Tool language | `src/models/qwen3_5/frontend/tool_grammar.{h,cpp}` | composes the model's own tool framing with the selected tools' argument languages |
 | Request contract | `RequestOptions::grammar`, `EngineOptions::grammar_cache_bytes` | public API; `ResolvedRequestOptions::grammar` carries it to the session |
 | Compiler ownership | `Frontend::Impl::grammars()` | one immutable compiler per model vocabulary, built on the first constrained request |
 | Matcher ownership | `OutputSession` | the request owns its matcher; the Engine never reaches into grammar state directly |
@@ -141,7 +143,36 @@ rewrites every class so surrogates can never be published. Anchors are accepted 
 the pattern or a top-level branch; backreferences, lookaround, word boundaries, property classes,
 flags, surrogate escapes and unknown escapes are refused as `InvalidRegex`.
 
-### 2.6 Rejected combinations
+### 2.6 Tools
+
+Tool declarations belong to the prompt; **selection and cardinality belong to the request**
+(`RequestOptions::tool_choice`). The declarations are always rendered into the prompt, and a narrowed
+choice never edits that list — it constrains the generated calls instead, so the prompt and the
+cache markers it carries cannot change behind the caller's back.
+
+Three choices compose:
+
+- **structure** — the model's own wrapper and function names;
+- **arguments** — per-tool schemas, when a tool is declared `strict`;
+- **selection** — `Auto` (zero or more calls), `Required` (at least one), an allowed-name set, and
+  whether more than one call may be published.
+
+`ToolConstraintMode::Basic` (the default) constrains every request that has tools, including an
+ordinary `Auto` request with no strict tools, so a call the model does start is well formed.
+`Automatic` constrains only what the request asked for, leaving ordinary free generation untouched.
+`Auto` may emit ordinary content before the call sequence; `Required` starts with a call; once the
+call sequence starts, only further calls and EOS are legal, with a single newline between them. A
+non-strict tool's arguments keep the established best-effort normalization (any order, the
+vocabulary's representable names, values quoted or parsed as JSON), while a strict tool's
+`arguments_json` satisfies its declared schema, generating properties in declaration order and
+forbidding duplicates. A raw-string parameter ends at `\n</parameter>` — that text cannot appear in
+the value, and the grammar and the parser share the rule so a length or `pattern` assertion is never
+quietly weakened. Nested JSON uses the model template's separators.
+
+One output language per request: a content constraint and a tool constraint are mutually exclusive,
+and each is refused with the others' guarantees still intact.
+
+### 2.7 Rejected combinations
 
 `Frontend::make_output_session` refuses a grammar that cannot be honored, and the Engine refuses a
 backend that cannot consume masks. Rejections are request errors (`InvalidGrammar`), never silent
@@ -176,6 +207,7 @@ Implemented and verified end-to-end on a real artifact:
 | Path | State |
 |---|---|
 | Plain decode round with a JSON object or schema constraint | constrained; the published content parses as the declared type |
+| Tool call under `strict`, `Required`, named or single-call choice | constrained; the call is complete and its arguments satisfy the declared schema |
 | Plain and drafted rounds with a choice or regex constraint | constrained; the published content is one of the literals, or matches the pattern in full |
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
@@ -189,7 +221,7 @@ Not implemented:
 
 | Not implemented | Consequence |
 |---|---|
-| Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
+| Content constraints composed with tool constraints | a request may have one output language, so combining them is refused |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
@@ -218,6 +250,13 @@ Not implemented:
 - `ninfer_qwen3_5_grammar_real_test` — the Engine end to end with a real artifact, over content,
   sampling, thinking, continuation, mixed batches, truncation, raw input and JSON/schema
   constraints, with and without CUDA Graphs.
+- `tests/models/qwen3_5/test_tool_constraints.cpp` and `tests/models/qwen3_5/test_tool_schema.py` —
+  the tool language natively, and the same schemas validated through the independent `jsonschema`
+  library via a probe binary, including `const`/`enum` values, ranges, nesting and separator text.
+- `ninfer_qwen3_5_tools_real_test` — the Engine end to end on a real artifact with declared tools:
+  basic, eager and CUDA-Graph modes, speculative drafting on and off, and multiple concurrent lanes,
+  asserting that published calls satisfy their schemas (including a `const` value with a leading
+  space and a non-ASCII body, and a value that contains the parameter terminator text).
 - `ninfer_xgrammar_core_test` — the vendored core's observable contract.
 - `tests/models/qwen3_5/test_mtp_draft_policy.cpp` — an unintended interaction is covered: a
   zero-extent round records no per-position acceptance evidence, so a constrained row cannot bias

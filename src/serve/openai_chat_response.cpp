@@ -147,6 +147,14 @@ const char* finish_reason(ninfer::FinishReason reason) {
     return "stop";
 }
 
+const char* finish_reason(const GenerationOutcome& outcome) {
+    const bool interrupted = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
+                             outcome.finish_reason == ninfer::FinishReason::ContextCapacity ||
+                             outcome.finish_reason == ninfer::FinishReason::Cancelled;
+    return !interrupted && !outcome.tool_calls.empty() ? "tool_calls"
+                                                       : finish_reason(outcome.finish_reason);
+}
+
 std::vector<ToolCall>
 materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
     std::vector<ToolCall> calls;
@@ -255,12 +263,10 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     }
 
     Json payload       = base_payload(identity, "chat.completion");
-    payload["choices"] = Json::array(
-        {Json{{"index", 0},
-              {"message", std::move(message)},
-              {"logprobs", nullptr},
-              {"finish_reason",
-               has_tool_calls ? Json("tool_calls") : Json(finish_reason(outcome.finish_reason))}}});
+    payload["choices"] = Json::array({Json{{"index", 0},
+                                           {"message", std::move(message)},
+                                           {"logprobs", nullptr},
+                                           {"finish_reason", Json(finish_reason(outcome))}}});
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
     return payload.dump();

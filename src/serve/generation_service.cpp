@@ -44,6 +44,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        error.status = 400;
+        error.param  = "tools" + exception.pointer();
+        error.code   = "invalid_tool_constraint";
+        break;
     case ninfer::RequestErrorKind::InvalidGrammar:
     case ninfer::RequestErrorKind::InvalidChoice:
     case ninfer::RequestErrorKind::InvalidRegex:
