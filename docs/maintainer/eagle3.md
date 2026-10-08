@@ -283,8 +283,20 @@ MTP's 77%), so branching where the curve is flat — the static draft tree — i
 chain depth, whose last positions land 26% and 16% of the time. A stronger draft would raise the
 whole curve, but "stronger" means training data and scale rather than a matched target version: the
 target-matched caption head measured *below* the mismatched SpecForge head, and below plain decode at
-C=8. And the chain should stop extending when the marginal position stops paying, which today's
-policy does not do: it adapts the draft length from round cost and aggregate acceptance only.
+C=8. The draft length is already chosen per position: a round's rung is selected by expected committed
+tokens over its measured cost, and that expectation sums each position's prefix-accepted probability,
+so a rung whose deeper positions stopped landing loses to a shorter one. A per-lane extent *inside*
+the chosen rung adds nothing, which a measurement settled: the round's draft loop and verify width
+follow the rung, so a narrower extent pays the same cost for fewer committed tokens. Shortening the
+extent at C=8 drafted 2.94 rather than 3.11 tokens per round and committed 6% fewer tokens per second
+— more rounds instead of cheaper ones — while the same change's gain at C=1 came from a different
+rung mix, not from the extent. Stopping earlier therefore means selecting a narrower rung, which is
+what the ladder is for. Bounded exploration of the longest rung was measured and rejected too: one
+round in 64 running it while that lane's deepest position is still unmeasured gained 1.8% at C=1 and
+0.8% at C=8 on this head but cost 10.9% at C=1 for MTP on Qwen3.8-27B, because a probe can move the
+policy onto a rung priced only by its startup replay — real round times are learned where a model's
+floor is not trusted, and a dense model is trusted — so the longer rung gets adopted on an optimistic
+cost. Exploration needs measured rung costs first.
 
 The top-k propose path is verified against the chain path rather than only by its ops oracles: with
 the round temporarily routed through `eagle3_propose_topk_batch(..., top = 1)`, the CLI commits
