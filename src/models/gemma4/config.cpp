@@ -108,6 +108,7 @@ TextConfig parse_text_config(const artifact::Json& value) {
     }
 
     const std::uint32_t heads = positive(value, "num_attention_heads");
+    out.num_attention_heads   = heads;
     const std::uint32_t kv    = positive(value, "num_key_value_heads");
     const std::uint32_t gkv   = positive(value, "num_global_key_value_heads");
     if (heads % kv != 0 || heads % gkv != 0) {

@@ -47,6 +47,9 @@ struct TextConfig {
     std::uint32_t intermediate_size       = 0;
     std::uint32_t vocab_size              = 0;
     std::uint32_t num_hidden_layers       = 0;
+    // Query heads. The artifact's config names it and the loader's invariants used it, but nothing
+    // downstream could read it until the weight bindings needed the query projection's row count.
+    std::uint32_t num_attention_heads     = 0;
     std::uint32_t max_position_embeddings = 0;
     std::uint32_t sliding_window          = 0;
     std::uint32_t global_layers           = 0;
