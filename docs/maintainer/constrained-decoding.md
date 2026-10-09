@@ -234,7 +234,7 @@ Not implemented:
 | Not implemented | Consequence |
 |---|---|
 | GBNF, choice or regex composed with tool constraints | those describe a single language, so combining them is refused |
-| A captured graph around the two phases | a constrained block round runs eagerly, so it pays the eager round cost until the phase-split graph families land |
+| A captured graph around the two phases | measured unnecessary: the same constrained DFlash2 workload runs at 165.7 tok/s with CUDA Graphs and 165.5 tok/s without (72 rounds, 2.76 accepted tokens/round in both), so splitting the round into capture-able phase families would buy nothing at this scope |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
