@@ -40,6 +40,12 @@ int run_fp8_a16() {
     const auto gemma_invocations = a16_capacity_calls();
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {8192, 5376, 825U, Comparison::Sampled, true, gemma_invocations});
+    for (const auto& [n, seed] : {std::pair{4096, 826U}, std::pair{16384, 827U},
+                                  std::pair{2048, 828U}}) {
+        const auto invocations = a16_capacity_calls();
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, 5376, seed, Comparison::Sampled, true, invocations});
+    }
     std::vector<Invocation> vocabulary_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},
