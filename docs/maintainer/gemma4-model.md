@@ -250,3 +250,16 @@ A related finding, not an attempt: **the tanh-GELU primitive already exists.** `
 and the device helper is reusable. Row 3 therefore needs no new activation mathematics — only the
 fused epilogue and the plumbing that selects it, since the `linear_swiglu` routes hard-code `silu`
 at 37 call sites across about ten tuned files.
+
+- **Fused GeGLU for the NVFP4 `linear_swiglu` parent: scoped, not started.** The activation's home is
+  each route's epilogue, and the four NVFP4 route files carry eight `silu` sites between them:
+  `nvfp4_linear_swiglu_decode.cu` (the kernel body and its launcher), `nvfp4_linear_swiglu_small_t.cu`
+  (the `SwiGluTile` member and its launcher), `nvfp4_linear_swiglu_w4a4.cu` (`Nvfp4SwiGluOutput::combine`
+  and its launcher) and `nvfp4_linear_swiglu_w4a4_tma.cuh` (four sites in the TMA epilogue, launched
+  through `nvfp4_linear_swiglu_w4a4_tma_launch.h`). The activation has to reach them as a kernel
+  argument: `nvfp4_linear_swiglu_plan.h`'s launch declarations, `nvfp4_linear_swiglu_dispatch`'s five
+  cases, and `linear_swiglu`'s wrapper in `src/ops/wrapper/linear_swiglu.cpp`. No new formula is
+  needed — `gelu_one<true>` is it — and support must be all-or-nothing per parent, because an
+  activation that depends on the resolved token range would work at one batch size and throw at
+  another, which is worse than not shipping it. Until then, the unfused path exists:
+  `gelu_mul` on the two halves of a projection output.
