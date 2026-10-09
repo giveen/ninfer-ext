@@ -64,17 +64,17 @@ How the row reacts depends on whether verification reaches it:
   output from that round;
 - a dead end beyond the row's licensed prefix is irrelevant, and the row proceeds normally.
 
-MTP drafts are produced at the end of the previous round and live in `sequence.mtp_drafts` on the
-host, so a constrained MTP row drafts normally: `decode_mtp_batch` passes the very draft span it is
-about to verify to `fill_grammar_mask`, which fills the accepted state plus one mask per draft
-position, and the acceptance kernels read mask position `col` for column `col`. The ordinary batch
-(`decode_ordinary_batch`) fills position zero only, because it verifies a single token.
+MTP and EAGLE3 drafts are produced at the end of the previous round and live in
+`sequence.mtp_drafts` on the host, so a constrained row drafts normally on both: their rounds pass
+the very draft span they are about to verify to `fill_grammar_mask`, which fills the accepted state
+plus one mask per draft position, and the acceptance kernels read mask position `col` for column
+`col`. The ordinary batch (`decode_ordinary_batch`) fills position zero only, because it verifies a
+single token.
 
-The tree and block backends draft *inside* the round, so their positions cannot be masked before it
-runs. `decode_eagle3_batch` and `decode_dflash_batch` therefore refuse a constrained row, and the
-request is refused at preparation for those backends, so the refusal is reported as an
-`InvalidGrammar` request error rather than as a round failure. Masking them needs the draft handoff
-and the forward/finish phase split: the drafts are copied to pinned host memory after the forward
+The block backends (DFlash, DFlash2) draft *inside* the round, so their positions cannot be masked
+before it runs: a constrained request is refused at preparation for them, reported as an
+`InvalidGrammar` request error rather than a round failure. Masking them needs the draft handoff and
+the forward/finish phase split -- the drafts are copied to pinned host memory after the forward
 phase, the provider fills the masks from them, and the verify phase consumes them.
 
 ### 2.2 Transaction boundary
@@ -221,7 +221,7 @@ Implemented and verified end-to-end on a real artifact:
 | Plain and drafted rounds with a choice or regex constraint | constrained; the published content is one of the literals, or matches the pattern in full |
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
-| MTP round with drafts | constrained; the row drafts normally, one mask per verify position |
+| MTP and EAGLE3 rounds with drafts | constrained; the row drafts normally, one mask per verify position |
 | MTP round in lookup mode | constrained through the same lane configuration |
 | Reasoning → content framing | constrained from the exact boundary |
 | Cancellation, failed commit, rejected preview | matcher rolled back to the committed prefix |
@@ -232,6 +232,7 @@ Not implemented:
 | Not implemented | Consequence |
 |---|---|
 | GBNF, choice or regex composed with tool constraints | those describe a single language, so combining them is refused |
+| Masks on the block backends' verify positions | `dflash` and `dflash2` refuse constrained requests; needs the draft handoff and the forward/finish split |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |

@@ -558,9 +558,12 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
+    // A backend consumes token masks when its verify positions can be constrained. EAGLE3 verifies
+    // a host-resident chain like MTP; the DFlash backends draft inside the round and still need the
+    // draft handoff.
     [[nodiscard]] bool consumes_token_masks() const noexcept {
-        return speculative_backend == SpeculativeBackend::None ||
-               speculative_backend == SpeculativeBackend::Mtp;
+        return speculative_backend != SpeculativeBackend::DFlash &&
+               speculative_backend != SpeculativeBackend::DFlash2;
     }
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,

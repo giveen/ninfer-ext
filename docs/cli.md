@@ -43,8 +43,9 @@ failures remain direct command diagnostics:
 a regular expression, or a finite set of literal answers; exactly one may be given. The constraint
 applies after the model's reasoning phase, so thinking still precedes the constrained answer, and
 the request is refused when it cannot be combined with the constraint (raw output, custom stops, or
-a backend whose verify rounds consume no token masks). Speculative drafting keeps working: each
-verify position is constrained on its own, so a draft the constraint forbids is not accepted:
+a backend whose verify rounds consume no token masks, currently `dflash` and `dflash2`). Speculative
+drafting keeps working on `mtp` and `eagle3`: each verify position is constrained on its own, so a
+draft the constraint forbids is not accepted:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer --messages msgs.json \
