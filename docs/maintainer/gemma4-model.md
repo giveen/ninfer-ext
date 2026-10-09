@@ -263,3 +263,35 @@ at 37 call sites across about ten tuned files.
   activation that depends on the resolved token range would work at one batch size and throw at
   another, which is worse than not shipping it. Until then, the unfused path exists:
   `gelu_mul` on the two halves of a projection output.
+
+### 8.1 The stored bindings (read from the artifact, not from the recipe)
+
+Read with `python -m tools.artifact.inspect out/gemma4_31b_base_nvfp4.ninfer --objects --bindings`.
+833 bindings: 50 sliding layers x 14 + 10 global layers x 13 + 3 text-level, which matches the
+structure below exactly.
+
+| Logical name | Shape | Stored as |
+|---|---|---|
+| `text/token_embedding` | 262144 x 5376 | `fp8_e4m3fn_row_bf16` |
+| `text/output_head` | 262144 x 5376 | **BF16**, not the FP8 the plan's row 1 lists |
+| `text/final_norm` | 5376 | BF16 |
+| `text/layers/{l}/input_norm`, `post_attention_norm`, `pre_feedforward_norm`, `post_feedforward_norm` | 5376 | BF16 |
+| `text/layers/{l}/layer_scalar` | 1 | FP32 |
+| sliding `attention/query`, `key`, `value` | 8192, 4096, 4096 x 5376 | one FP8 object of 16384 rows, sliced at rows 0 / 8192 / 12288 |
+| global `attention/query`, `key` | 16384, 2048 x 5376 | one FP8 object of 18432 rows, sliced at rows 0 / 16384; **no `value` binding** |
+| `attention/query_norm`, `key_norm` | 256 sliding, 512 global | BF16 |
+| sliding `attention/output`, global `attention/output` | 5376 x 8192 / 5376 x 16384 | FP8 |
+| `mlp/gate`, `mlp/up` | 21504 x 5376 each | NVFP4, two halves of one 43008-row object |
+| `mlp/down` | 5376 x 21504 | NVFP4 |
+
+Three consequences:
+
+- **The query, key and value parameters are slices of a fused parent**, not separate objects, so a
+  binding must request the *slice* shape (8192 x 5376 and so on) and let the artifact layer resolve
+  the row offset and the scale plane. The absence of a `value` binding on global layers is the
+  `attention_k_eq_v` structure showing up in the artifact, and it is what a loader must branch on.
+- **The MLP is bound as two halves** (21504 each), not as the single 43008-row parent the plan's
+  row 1 lists. The natural route is therefore the unfused one — a linear per half and `gelu_mul`,
+  both of which exist — and `n21504/k5376` is the shape that is actually needed. The fused
+  `n43008/k5376` stays registered for a recipe that fuses the halves.
+- **The head is BF16**, so the FP8 head shape registered for it is not what this artifact uses.
