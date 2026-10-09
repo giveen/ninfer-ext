@@ -23,7 +23,7 @@ namespace ninfer::ops {
  * by the exact stored scale in FP64; the BF16 output is promoted and compared directly with that
  * ideal. Final output storage rounding belongs to the quantized embedding criterion, not the
  * oracle. The registered domains are Q6 `[248320,5120]`, Q8 `[248320,2048]` or
- * `[248320,5120]`, and FP8 `[248320,5120]`. Q6/Q8 scales are FP16; FP8 has one BF16 multiplier per
+ * `[248320,5120]`, and FP8 `[248320,5120]` or `[262144,5376]`. Q6/Q8 scales are FP16; FP8 has one BF16 multiplier per
  * row and requires 4-byte-aligned output storage. `out` must not overlap `ids` or any table plane.
  * There is no workspace or persistent state side effect.
  */

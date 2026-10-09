@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -17,11 +18,11 @@ constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlo
 constexpr int kQ8GroupedBlock = 32;
 constexpr int kQ8RowBlock     = 256;
 
-template <int BlocksPerToken, int Threads>
+template <int D, int BlocksPerToken, int Threads>
 void launch_fp8(const Tensor& ids, const Weight& table, float embed_scale, Tensor& out,
                 cudaStream_t stream) {
     const int grid = ids.ne[0] * BlocksPerToken;
-    embed_gather_fp8_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
+    embed_gather_fp8_kernel<D, BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
         static_cast<const __nv_bfloat16*>(table.scales), embed_scale,
         static_cast<__nv_bfloat16*>(out.data));
@@ -155,10 +156,19 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, float embed_
 void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, float embed_scale,
                              Tensor& out, cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
-    if (T <= 176)
-        launch_fp8<10, 128>(ids, table, embed_scale, out, stream);
-    else
-        launch_fp8<5, 128>(ids, table, embed_scale, out, stream);
+    const std::int32_t d = out.ne[0];
+    if (d == kEmbedGatherFp8D) {
+        if (T <= 176)
+            launch_fp8<kEmbedGatherFp8D, 10, 128>(ids, table, embed_scale, out, stream);
+        else
+            launch_fp8<kEmbedGatherFp8D, 5, 128>(ids, table, embed_scale, out, stream);
+    } else if (d == kEmbedGatherFp8DGemma4) {
+        // One word per thread; tuning the split by token count is a separate question from reaching
+        // this width at all.
+        launch_fp8<kEmbedGatherFp8DGemma4, 21, 64>(ids, table, embed_scale, out, stream);
+    } else {
+        throw std::invalid_argument("embed_gather: unsupported FP8 row width");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

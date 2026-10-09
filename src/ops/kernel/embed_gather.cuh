@@ -21,6 +21,7 @@ inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
+inline constexpr std::int32_t kEmbedGatherFp8DGemma4       = 5376;
 
 // The dequantized row rounded to BF16, then the embedding scale in FP32. Transformers multiplies the
 // gathered embedding by a scale cast to the weight dtype, so the value is rounded once by the
@@ -30,13 +31,13 @@ __device__ __forceinline__ float embed_scaled(float dequantized, float embed_sca
     return __bfloat162float(__float2bfloat16(dequantized)) * embed_scale;
 }
 
-template <int BlocksPerToken, int Threads>
+template <int D, int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                  const __nv_bfloat16* scales, float embed_scale,
                                  __nv_bfloat16* out) {
-    static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
-    constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
+    static_assert(D % BlocksPerToken == 0);
+    constexpr int kValuesPerBlock = D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
@@ -46,8 +47,8 @@ __launch_bounds__(Threads) __global__
     const float scale = __bfloat162float(scales[row]);
 
     const int split_offset = split * kValuesPerBlock;
-    const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
-    auto* output_column    = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D;
+    const auto* code_row   = codes + static_cast<std::int64_t>(row) * D;
+    auto* output_column    = out + static_cast<std::int64_t>(token) * D;
     for (int word_index = static_cast<int>(threadIdx.x); word_index < kWordsPerBlock;
          word_index += Threads) {
         const int offset    = split_offset + word_index * 4;
