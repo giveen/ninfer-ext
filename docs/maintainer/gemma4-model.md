@@ -147,11 +147,33 @@ confirm the mapping: 120 NVFP4, 121 FP8, 362 BF16, 60 FP32.
 Chat, tools and thinking need an instruction-tuned artifact later; the same recipe produces it from
 an `-it` checkpoint.
 
-## 9. Open points
+## 9. What the sibling engines settle
+
+Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and gewell (Apache-2.0)
+`include/gewell/models/gemma4/31b/`, which implement this model:
+
+- **Serving scale.** llama.cpp's loader carries `f_attention_scale = 1.0f` with the comment that Gemma 4
+  uses `self.scaling = 1.0` with no pre-attention scaling — the same invariant this reference states.
+- **Per-layer kind.** It also keeps a separate SWA rope base (`rope_freq_base_train_swa`, 10k) from the
+  global one (1e6), and separate SWA head widths (`n_embd_head_k_swa` / `n_embd_head_v_swa`), so the
+  two geometries this reference describes are the two it branches on.
+- **Sliding layers need no new attention mathematics**: llama.cpp treats them as a standard sliding
+  window (`LLAMA_SWA_TYPE_STANDARD`) over a windowed cache with a mask for the prompt, not as a
+  different attention. The window is a property of the cache and the mask.
+- **Proportional RoPE is a parameterization, not a kernel.** llama.cpp supplies explicit per-pair
+  frequency factors for the global layers. Our `rope` Op cannot express it as it stands: its
+  `phi = pos·θ^(-2i/rotary_dim)` puts the frequency denominator at the rotary width, and it pairs
+  `(i, i + rotary_dim/2)`, where the global layers need the denominator over the *full* head and the
+  pairs `(j, j + head_dim/2)`.
+- **The global K = V compression is already implemented** in gewell's
+  `include/gewell/compact_global_cache.h`, alongside `kv_format.h` and `fp8_attention.h`, for the same
+  card and the same quantization layout this artifact uses.
+
+## 10. Open points
 
 | Question | How it closes |
 |---|---|
-| Sliding mask with images (an image block sees itself bidirectionally, and the window bound is one-sided) | Transformers `create_masks_for_vision_model` / `sliding_window_overlay` at the pinned commit, then an oracle case — P5 |
+| Sliding mask with images. The checkpoint sets `text.use_bidirectional_attention: "vision"`, and llama.cpp reads that flag as *bidirectional attention on the SWA layers only*, dense layers staying causal (`LLAMA_NON_CAUSAL_TYPE_SWA_ONLY`), which agrees with the plan's note that global layers have no overlay — but the plan words it more narrowly, as an image block seeing itself | Transformers `create_masks_for_vision_model` / `sliding_window_overlay` at the pinned commit, then an oracle case — P5 |
 | The assistant drafter's hidden state (before or after the final norm) | The drafter's `modeling_gemma4_assistant.py` — P6 |
 | Whether the compact global KV keeps the oracle's rounding at 128K/256K | The Op criterion at those lengths; fall back to separate K/V rows (+60% global KV) if it does not |
 | `layer_scalar` at layers 0, 1 and 59 (0.036–0.089) in BF16 residual | Oracle error at those layers |
