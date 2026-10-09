@@ -74,6 +74,9 @@ o = W_o · softmax(q·kᵀ · 1.0 + mask) · v
 ```
 
 - RoPE is `rotate_half` over all 256 dims: pairs (j, j+128), `inv_freq_j = 10000^(-2j/256)`.
+- The norms without a weight (`v` here and the shared normalization below) use the `rmsnorm`
+  weightless form, whose gain is exactly one: no weight tensor is read at all, and the
+  normalized row is materialized in BF16, which is the value the cache stores.
 - Query head h reads KV head ⌊h/2⌋.
 - **Scale is exactly 1.0**, not `1/√D`.
 - **Mask:** key position `p_k` is visible to query `p_q` when `0 ≤ p_q − p_k < 1024`. The bound is

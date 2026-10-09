@@ -23,4 +23,12 @@ namespace ninfer::ops {
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);
 
+/**
+ * Weightless form: `ideal[d,r] = x[d,r] * inv_r`, the same normalization with a gain of exactly
+ * one. Every element of the gain is one, so no weight is read at all. Shapes, dtypes, contiguity,
+ * overlap, `eps`, and the numeric criterion are those of the form above; `x` and `out` must not
+ * overlap. The Op uses no workspace or persistent state.
+ */
+void rmsnorm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -128,7 +128,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
-                    cudaStream_t stream, bool sigmoid_gate) {
+                    cudaStream_t stream, bool sigmoid_gate, bool weightless) {
     const std::int32_t d = x.ne[0];
     if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
     const std::int64_t rows = out.numel() / d;
@@ -143,7 +143,10 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     const bool aligned2 =
         ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
-    if (z != nullptr && sigmoid_gate) {
+    if (weightless) {
+        launch_rmsnorm<RmsEpilogue::Weightless>(x, weight, nullptr, out, d, rows, eps, aligned2,
+                                               multiprocessor_count, stream);
+    } else if (z != nullptr && sigmoid_gate) {
         launch_rmsnorm<RmsEpilogue::GatedSigmoid>(x, weight, z, out, d, rows, eps, aligned2,
                                                   multiprocessor_count, stream);
     } else if (z != nullptr) {
