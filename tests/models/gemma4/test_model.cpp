@@ -63,6 +63,23 @@ int main() {
         const auto projection = model->input(weights.text.layers[0].attention.query);
         check(projection.policy == ops::LinearPolicy::A16Only, "query projection policy");
 
+        // The three attention input projections are slices of one fused FP8 parent. A row slice of a
+        // RowScale parent is a whole operand, so each prepares to its own shape.
+        {
+            const auto& attention = weights.text.layers[0].attention;
+            const auto query = ops::prepare_linear_weight(model->input(attention.query));
+            const auto key   = ops::prepare_linear_weight(model->input(attention.key));
+            const auto value = ops::prepare_linear_weight(model->input(attention.value));
+            check(query.weight.n == 8192 && query.weight.k == 5376, "sliced query projection shape");
+            check(key.weight.n == 4096 && key.weight.k == 5376, "sliced key projection shape");
+            check(value.weight.n == 4096 && value.weight.k == 5376, "sliced value projection shape");
+            // The global layers slice a 18432-row parent at 16384 and 2048.
+            const auto& global = weights.text.layers[59].attention;
+            const auto global_query = ops::prepare_linear_weight(model->input(global.query));
+            const auto global_key   = ops::prepare_linear_weight(model->input(global.key));
+            check(global_query.weight.n == 16384, "sliced global query projection shape");
+            check(global_key.weight.n == 2048, "sliced global key projection shape");
+        }
         const float scalar = model->layer_scalar(weights.text.layers[0].layer_scalar);
         check(std::isfinite(scalar), "layer scalar is finite");
         check(scalar != 1.0F, "layer scalar is a learned value, not the neutral one");

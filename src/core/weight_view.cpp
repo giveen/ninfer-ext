@@ -353,8 +353,15 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
-        !is_complete_weight(view)) {
+    // A RowScale parent is one BF16 multiplier per row and nothing else, and the check above already
+    // requires the view to keep the parent's whole K, so a row slice is a complete operand: its codes
+    // and its scale line both start at the slice's first row. That is how the Gemma attention
+    // projections are bound, as slices of one fused input projection, and it is also how the
+    // reference engines read them (gewell issues one linear per projection).
+    //
+    // A BlockScaleK16M128x4 parent carries a divisor per parent tensor, which a row slice cannot
+    // re-derive, so it still requires the complete parent.
+    if (g.layout == QuantLayout::BlockScaleK16M128x4 && !is_complete_weight(view)) {
         throw std::invalid_argument(
             "this native Weight input requires a complete FP8/NVFP4 parent");
     }
