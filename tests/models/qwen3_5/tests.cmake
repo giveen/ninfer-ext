@@ -1,3 +1,8 @@
+ninfer_add_test(ninfer_gemma4_config_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_config.cpp"
+  LIBRARIES ninfer_model_loading)
+
 # Opt-in real-model artifacts, selected by explicit path so a run never depends
 # on glob order or modification time. Configure the ones you have and run
 # `ctest -L real`; an artifact variable left empty makes its test skip (77).

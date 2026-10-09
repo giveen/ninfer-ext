@@ -1,0 +1,81 @@
+#pragma once
+
+// Gemma 4 31B (text) configuration, read from the artifact's own config.
+//
+// The mathematics is in docs/maintainer/gemma4-model.md. This is the immutable shape the loader and
+// the Program consume, and it is deliberately strict: every field the converter writes is named
+// here, an unknown member is an error, and the invariants the mathematics depends on -- the layer
+// pattern, the two attention geometries, proportional RoPE, a plain norm -- are checked rather than
+// assumed.
+
+#include "artifact/schema.h"
+#include "models/registry.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace ninfer::models::gemma4 {
+
+// One attention geometry. The sliding layers use `TextConfig::sliding`, the global layers
+// `TextConfig::global`, and nothing else differs between them.
+struct AttentionGeometry {
+    std::uint32_t num_key_value_heads = 0;
+    std::uint32_t head_dim            = 0;
+    float rope_theta                  = 0.0F;
+    // Rotating dimensions: the whole head for sliding layers, the leading block of the pair
+    // rotation for global ones.
+    std::uint32_t rotary_dim = 0;
+};
+
+struct GlobalAttentionGeometry {
+    // The global layers store no value projection: K is V, normalized without a weight and scaled
+    // by the key norm afterwards, so the value vector serves both q·kᵀ and the output.
+    AttentionGeometry shared;
+    // Proportional RoPE: `rope_angles` frequencies taken against the full head width, so
+    // `rotary_dim == 2 * rope_angles` dims rotate and the rest carry no rotation at all.
+    std::uint32_t rope_angles           = 0;
+    std::uint32_t denominator_head_dim  = 0;
+};
+
+enum class MixerKind : std::uint8_t { SlidingAttention, FullAttention };
+
+struct TextConfig {
+    Architecture architecture             = Architecture::Gemma4;
+    std::uint32_t hidden_size             = 0;
+    std::uint32_t intermediate_size       = 0;
+    std::uint32_t vocab_size              = 0;
+    std::uint32_t num_hidden_layers       = 0;
+    std::uint32_t max_position_embeddings = 0;
+    std::uint32_t sliding_window          = 0;
+    std::uint32_t global_layers           = 0;
+    bool tie_word_embeddings              = false;
+    float rms_norm_eps                    = 0.0F;
+    float embedding_scale                 = 0.0F;
+    float attention_scale                 = 0.0F;
+    float final_logit_softcapping         = 0.0F;
+    std::string hidden_act;
+    std::vector<MixerKind> layer_types;
+    AttentionGeometry sliding;
+    GlobalAttentionGeometry global;
+
+    [[nodiscard]] bool sliding_attention(std::size_t layer) const {
+        return layer_types.at(layer) == MixerKind::SlidingAttention;
+    }
+
+    // The geometry layer `layer` attends with.
+    [[nodiscard]] const AttentionGeometry& geometry(std::size_t layer) const {
+        return sliding_attention(layer) ? sliding : global.shared;
+    }
+};
+
+struct Config {
+    TextConfig text;
+};
+
+// Parses one text component config. Throws ArtifactError on an unknown member or a violated
+// invariant, so a checkpoint this build cannot execute is refused at load rather than misread.
+[[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
+
+} // namespace ninfer::models::gemma4
