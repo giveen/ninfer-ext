@@ -17,6 +17,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "models/gemma4/cache.h"
 #include "models/gemma4/model.h"
 
 #include <cstddef>
@@ -35,11 +36,11 @@ namespace ninfer::models::gemma4 {
  *
  * `hidden_in` and `hidden_out` are contiguous BF16 [hidden_size,1] and must not overlap; the layer
  * reads the residual stream and writes its updated self to `hidden_out`. `position` is the token's
- * absolute position, and the attention's key and value sets are the token itself, which is the
- * single-token case of the caches a Program maintains for longer contexts.
+ * absolute position: the layer writes the token's key and value rows into `cache` and then attends
+ * over everything the cache still makes visible to that position.
  */
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t position, DeviceArena& arena, Tensor& hidden_out,
+                   std::int32_t position, KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
                    DeviceExecutionView execution);
 
 } // namespace ninfer::models::gemma4

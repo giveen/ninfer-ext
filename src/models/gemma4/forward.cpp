@@ -72,8 +72,8 @@ std::size_t layer_workspace_bytes(const TextConfig& config) {
 }
 
 void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                           std::int32_t position, DeviceArena& arena, Tensor& hidden_out,
-                           DeviceExecutionView execution) {
+                           std::int32_t position, KvCache& cache, DeviceArena& arena,
+                           Tensor& hidden_out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -143,15 +143,35 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
               scratch.k_normed, execution);
 
+    // The ring holds the window's worth of rows, so the slot is the position modulo the window and the
+    // query sees exactly the tokens still inside it. A slot no token has written carries an invisible
+    // position, so the whole cache can be handed to the Op without tracking how much is filled.
+    Tensor cache_keys   = cache.keys(layer);
+    Tensor cache_values = cache.values(layer);
+    Tensor cache_pos    = cache.positions(layer);
+    const std::int32_t window_index = cache.slot(layer, position);
+    const std::int32_t window       = static_cast<std::int32_t>(config.sliding_window);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(d) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
+                                   static_cast<std::size_t>(window_index) * row_bytes,
+                               scratch.k_normed.data, row_bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) +
+                                   static_cast<std::size_t>(window_index) * row_bytes,
+                               scratch.v_normed.data, row_bytes, cudaMemcpyDeviceToDevice, stream));
+    cache.mark(layer, position, stream);
+
     {
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
         Tensor q_batch        = scratch.q_normed.view({d, hq, 1, 1});
-        Tensor k_batch        = scratch.k_normed.view({d, hkv, 1, 1});
-        Tensor v_batch        = scratch.v_normed.view({d, hkv, 1, 1});
+        Tensor k_batch        = cache_keys.view({d, hkv, window, 1});
+        Tensor v_batch        = cache_values.view({d, hkv, window, 1});
         Tensor attended_batch = scratch.attended.view({d, hq, 1, 1});
-        ops::sliding_causal_attention(q_batch, k_batch, v_batch, scratch.positions,
-                                      scratch.positions, geometry, config.sliding_window,
-                                      config.attention_scale, attended_batch, stream);
+        Tensor position_q     = scratch.positions.view({1, 1});
+        Tensor position_k     = cache_pos.view({window, 1});
+        ops::sliding_causal_attention(q_batch, k_batch, v_batch, position_q, position_k, geometry,
+                                      config.sliding_window, config.attention_scale, attended_batch,
+                                      stream);
     }
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
     ops::rmsnorm(scratch.projected, model.tensor(weights.post_attention_norm), eps, false,
@@ -177,8 +197,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
 }
 
 void forward_global_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                          std::int32_t position, DeviceArena& arena, Tensor& hidden_out,
-                          DeviceExecutionView execution) {
+                          std::int32_t position, KvCache& cache, DeviceArena& arena,
+                          Tensor& hidden_out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -249,13 +269,27 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     ops::scale_columns(w_kn, q_normed, d / 2 + pairs, d, stream);
 
     ops::compact_kv_rows(value, k_normed, compact, d, pairs, stream);
+
+    // The compact row is written at the token's own position and read back causally, so a slot no
+    // token has written carries an invisible position and the whole cache can be handed to the Op.
+    Tensor cache_rows = cache.keys(layer);
+    Tensor cache_pos  = cache.positions(layer);
+    const std::int32_t capacity  = cache.capacity();
+    const std::int32_t row_index = cache.slot(layer, position);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_rows.data) +
+                                   static_cast<std::size_t>(row_index) * row_bytes,
+                               compact.data, row_bytes, cudaMemcpyDeviceToDevice, stream));
+    cache.mark(layer, position, stream);
+
     {
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
-        Tensor q_batch       = q_normed.view({d, hq, 1, 1});
-        Tensor kv_batch      = compact.view({width, hkv, 1, 1});
+        Tensor q_batch        = q_normed.view({d, hq, 1, 1});
+        Tensor kv_batch       = cache_rows.view({width, hkv, capacity, 1});
         Tensor attended_batch = attended.view({d, hq, 1, 1});
-        Tensor position_q    = positions.view({1, 1});
-        Tensor position_k    = positions.view({1, 1});
+        Tensor position_q     = positions.view({1, 1});
+        Tensor position_k     = cache_pos.view({capacity, 1});
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
                                       config.attention_scale, attended_batch, stream);
     }
@@ -278,12 +312,12 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
 }
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t position, DeviceArena& arena, Tensor& hidden_out,
+                   std::int32_t position, KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
                    DeviceExecutionView execution) {
     if (model.config().sliding_attention(layer)) {
-        forward_sliding_layer(model, layer, hidden_in, position, arena, hidden_out, execution);
+        forward_sliding_layer(model, layer, hidden_in, position, cache, arena, hidden_out, execution);
     } else {
-        forward_global_layer(model, layer, hidden_in, position, arena, hidden_out, execution);
+        forward_global_layer(model, layer, hidden_in, position, cache, arena, hidden_out, execution);
     }
 }
 

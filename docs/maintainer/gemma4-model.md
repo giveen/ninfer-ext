@@ -414,3 +414,30 @@ pages) and the windowed/compact attention over more than one token, the Program 
 workspaces and CUDA graphs, the engine's load path and architecture dispatch, the output head with its
 soft cap, and the numerical gate — the perplexity route against a reference — which nothing here
 substitutes for.
+
+## 14. Cache-backed decoding
+
+`KvCache` gives a sequence its attention state, layer by layer, and `forward_layer` now writes the
+token's rows into it and attends over everything it makes visible. Sliding layers keep a ring of
+`sliding_window` key and value rows, so a token's slot is `position % window` and the query sees
+exactly the tokens still inside the window. Global layers keep one compact row per token at the
+token's own position, up to the cache's capacity.
+
+**Unwritten slots need no bookkeeping.** A slot no token has written carries `kUnwrittenPosition`
+(2^30), and each Op decides visibility by comparing positions: the sliding Op needs
+`0 <= pq - pk < window`, which a far-future key fails, and the compact Op needs `0 <= pq - pk`, which
+it also fails. So a caller can hand the *whole* cache to either Op without tracking how much is filled
+— no fill counter, no per-step position rewrite.
+
+**What the test verifies.** Eight tokens through all 60 layers, then three invariants that together pin
+the ring, the masking, and the cache's involvement: replaying the last token over the same rows and
+input reproduces its hidden state bit for bit; filling *every* unwritten slot with a large pattern
+leaves that hidden state unchanged; and the control, corrupting slot 3 — a token the window still sees
+— *does* change it. The control matters: without it the second check would also pass if the cache were
+ignored altogether.
+
+**Limits, stated plainly.** Capacity bounds the global layers' tokens (64 here), which the plan's
+paging is what lifts; sliding layers are unbounded because the ring is exactly the window. Tokens are
+processed one at a time — correct, and equivalent to a batched prefill because each Op already takes
+the whole cache and its own position array, but not yet measured as a prefill. And the numbers are
+still only structurally checked: finiteness, bounds, and these cache invariants, not a reference.
