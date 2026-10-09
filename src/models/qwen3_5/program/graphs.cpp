@@ -462,7 +462,9 @@ void ProgramImpl::prepare_graphs() {
                                                    *io.dflash_decode,
                                                    *dflash_host_ingress,
                                                    *dflash_host_egress,
-                                                   state_images->continuation_hidden_store()};
+                                                   state_images->continuation_hidden_store(),
+                                                   dflash_draft_handoff->tokens(),
+                                                   dflash_draft_handoff->ready};
         const GraphExecutionProfile code_warm = planned_profiles.front();
         const ops::CausalAttentionExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(

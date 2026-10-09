@@ -558,13 +558,9 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
-    // A backend consumes token masks when its verify positions can be constrained. EAGLE3 verifies
-    // a host-resident chain like MTP; the DFlash backends draft inside the round and still need the
-    // draft handoff.
-    [[nodiscard]] bool consumes_token_masks() const noexcept {
-        return speculative_backend != SpeculativeBackend::DFlash &&
-               speculative_backend != SpeculativeBackend::DFlash2;
-    }
+    // Every backend constrains its verify positions: MTP and EAGLE3 from a host-resident chain, the
+    // DFlash backends from the draft handoff.
+    [[nodiscard]] bool consumes_token_masks() const noexcept { return true; }
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::PrefillPace pace,
@@ -720,6 +716,21 @@ public:
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+    // The chain the DFlash forward phase drafts, published to the host for mask filling.
+    struct DFlashDraftHandoff {
+        PinnedHostBuffer ids;
+        CudaCompletionEvent ready;
+
+        DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
+            : ids(count * sizeof(TokenId)), ready(device) {}
+
+        [[nodiscard]] std::span<TokenId> tokens() const noexcept {
+            return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
+        }
+    };
+    std::optional<DFlashDraftHandoff> dflash_draft_handoff;
+    [[nodiscard]] ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider* provider,
+                                                      std::size_t row);
     [[nodiscard]] ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider* provider,
                                                       std::size_t row,
                                                       std::span<const TokenId> drafts);

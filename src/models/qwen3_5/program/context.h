@@ -111,6 +111,11 @@ struct Eagle3BatchContext {
     qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
+// The DFlash round drafts and verifies in one span of work, but a constrained round has to see the
+// drafted ids on the host before it verifies them. These name the two halves separately; a round
+// with no phase runs the whole span, which is what the captured graph holds.
+enum class SpeculativePhase { Forward, Finish };
+
 struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_5::PagedKVCache& text_cache;
@@ -119,6 +124,10 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // The chain the forward phase drafted, on the host, and the event that publishes it. Both are
+    // owned by the Program and outlive the round.
+    std::span<TokenId> host_drafts;
+    CudaCompletionEvent& drafts_ready;
 };
 
 struct DFlashAppendContext {
@@ -246,5 +255,10 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
+// One half of the round, run eagerly so the host can fill masks between the phases.
+void dflash_decode_batch_phase(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                               DFlashEnvelopes envelopes,
+                               ops::CausalAttentionExecutionEnvelope target_envelope,
+                               SpeculativePhase phase);
 
 } // namespace ninfer::models::qwen3_5::execution

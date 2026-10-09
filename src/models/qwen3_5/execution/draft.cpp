@@ -564,17 +564,23 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::CausalAttentionExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+                              ops::CausalAttentionExecutionEnvelope target_envelope,
+                              std::optional<SpeculativePhase> phase) {
+    return [&state, batch_size, k, envelopes, target_envelope, phase] {
+        const bool forward_phase = !phase || *phase == SpeculativePhase::Forward;
+        const bool finish_phase  = !phase || *phase == SpeculativePhase::Finish;
+        state.execution.work.reset();
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        if (forward_phase) {
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_5::DFlashDecodeIngress),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+        }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
@@ -600,20 +606,35 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
-        state.execution.work.reset();
-        Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {dimension(state.execution.parameters.draft->feature_projection.weight.k),
-                          width, batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
-                                   context_starts, frontiers, compact_features, append_positions,
-                                   append_counts, state.execution.device.stream);
-        append_context_impl(state, compact_features, append_positions, append_counts,
-                            state_destinations, dflash_rows, envelopes.append);
+        if (forward_phase) {
+            Tensor compact_features = state.execution.work.alloc(
+                DType::BF16,
+                {dimension(state.execution.parameters.draft->feature_projection.weight.k), width,
+                 batch_size});
+            ops::prepare_ragged_prefix(
+                dflash_state(state).pending_features, active_lanes, context_starts, frontiers,
+                compact_features, append_positions, append_counts, state.execution.device.stream);
+            append_context_impl(state, compact_features, append_positions, append_counts,
+                                state_destinations, dflash_rows, envelopes.append);
 
-        propose_batch_impl(state, frame, batch_size, k, envelopes);
-        ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
-                                               target_positions, state.execution.device.stream);
+            propose_batch_impl(state, frame, batch_size, k, envelopes);
+            if (phase) {
+                // Only a phased (never captured) round hands the chain to the host and publishes it;
+                // an event record cannot be part of a captured graph.
+                const auto draft_count = static_cast<std::size_t>(k) * batch_size;
+                if (state.host_drafts.size() < draft_count) {
+                    throw std::logic_error("DFlash host draft buffer is too small");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(state.host_drafts.data(), drafts.data,
+                                           draft_count * sizeof(TokenId), cudaMemcpyDeviceToHost,
+                                           state.execution.device.stream));
+                state.drafts_ready.record(state.execution.device.stream);
+            }
+            ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
+                                                   target_positions, state.execution.device.stream);
+        }
 
+        if (!finish_phase) { return; }
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
@@ -686,7 +707,8 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body =
+        dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, std::nullopt);
     capture_graph(state, definition, body);
 }
 
@@ -694,8 +716,17 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body =
+        dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, std::nullopt);
     run_prepared(state, executable, body);
+}
+
+void dflash_decode_batch_phase(DFlashBatchContext& state, std::int32_t batch_size,
+                               std::uint32_t k, DFlashEnvelopes envelopes,
+                               ops::CausalAttentionExecutionEnvelope target_envelope,
+                               SpeculativePhase phase) {
+    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, phase);
+    run_prepared(state, nullptr, body);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

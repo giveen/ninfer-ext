@@ -291,6 +291,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
         grammar_masks_host.emplace(grammar_masks_device.bytes());
     }
+    // A constrained block-backend round reads its drafts back from the device between phases.
+    if (is_masked_draft_backend(speculative_backend)) {
+        dflash_draft_handoff.emplace(device, static_cast<std::size_t>(draft_window) * max_concurrency);
+    }
     if (plan.persistent.qwen4) {
         const Qwen4PersistentLayout& layout = *plan.persistent.qwen4;
         execution::Qwen4Runtime runtime;

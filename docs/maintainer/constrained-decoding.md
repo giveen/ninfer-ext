@@ -72,10 +72,11 @@ plus one mask per draft position, and the acceptance kernels read mask position 
 single token.
 
 The block backends (DFlash, DFlash2) draft *inside* the round, so their positions cannot be masked
-before it runs: a constrained request is refused at preparation for them, reported as an
-`InvalidGrammar` request error rather than a round failure. Masking them needs the draft handoff and
-the forward/finish phase split -- the drafts are copied to pinned host memory after the forward
-phase, the provider fills the masks from them, and the verify phase consumes them.
+before it starts. Their round therefore runs in two phases: the forward phase drafts and copies the
+chain to pinned host memory with a completion event, the provider fills the masks from it, and the
+finish phase verifies against those masks. That split is why a constrained block round runs both
+phases eagerly: the captured graph holds the whole round in one executable and cannot carry the
+handoff between them.
 
 ### 2.2 Transaction boundary
 
@@ -222,6 +223,7 @@ Implemented and verified end-to-end on a real artifact:
 | Prefill round sampling the first generated token | constrained |
 | Ordinary decode round (plain backend, `--draft-tokens 0`) | constrained |
 | MTP and EAGLE3 rounds with drafts | constrained; the row drafts normally, one mask per verify position |
+| DFlash and DFlash2 rounds with drafts | constrained; the forward phase publishes the chain to the host, the provider fills the masks, the finish phase verifies |
 | MTP round in lookup mode | constrained through the same lane configuration |
 | Reasoning → content framing | constrained from the exact boundary |
 | Cancellation, failed commit, rejected preview | matcher rolled back to the committed prefix |
@@ -232,7 +234,7 @@ Not implemented:
 | Not implemented | Consequence |
 |---|---|
 | GBNF, choice or regex composed with tool constraints | those describe a single language, so combining them is refused |
-| Masks on the block backends' verify positions | `dflash` and `dflash2` refuse constrained requests; needs the draft handoff and the forward/finish split |
+| A captured graph around the two phases | a constrained block round runs eagerly, so it pays the eager round cost until the phase-split graph families land |
 | Tool constraints (`strict` schemas, constrained tool calls) | `strict:true` remains refused, and a constraint cannot be combined with active tools |
 | Identifier and unused-keyword composition (`anyOf`/`oneOf`/`allOf` reduction, `$ref` across documents) | schemas using them are refused with a pointer rather than approximated |
 | Masks on draft-producing verify positions (trees and blocks) | `dflash`, `dflash2`, `eagle3` refuse constrained requests; needs the draft handoff and the forward/finish split |
