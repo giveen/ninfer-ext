@@ -22,6 +22,7 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  causal_compact_attention
   compact_kv_rows
   prepare_ragged_prefix
   scale_columns
