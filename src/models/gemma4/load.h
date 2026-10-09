@@ -1,6 +1,8 @@
 #pragma once
 
+#include "artifact/materializer.h"
 #include "models/gemma4/config.h"
+#include "models/gemma4/model.h"
 #include "models/gemma4/weights.h"
 #include "models/load_options.h"
 
@@ -27,6 +29,7 @@ public:
 
     [[nodiscard]] const TextConfig& config() const;
     [[nodiscard]] const ModelWeights& weights() const;
+    [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
     // How many parameters the plan declared, so a caller can walk every one of them.
     [[nodiscard]] std::size_t parameter_count() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
@@ -36,6 +39,8 @@ private:
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
+    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
+                                                    const StartupObserver*);
 };
 
 // The plan borrows `reader`, so the caller owns the Reader for the plan's lifetime.

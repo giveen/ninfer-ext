@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "artifact/views.h" // bind_view
 
 #include <cstdint>
 #include <optional>
@@ -115,9 +116,29 @@ struct LoadPlan::Impl {
     ModelWeights weights;
     artifact::Binder binder;
     std::vector<artifact::ParameterReference> references;
+    artifact::MaterializationPlan plan;
 
     explicit Impl(const artifact::Reader& reader) : binder(reader) {}
 };
+
+// Every Gemma parameter is Device-resident, so unlike the Qwen loader there is no file-mapped branch
+// here: a plan's reference always resolves to a view over the materialized bytes.
+std::vector<BoundWeight> resolve_weights(const std::vector<artifact::ParameterReference>& references,
+                                        const artifact::MaterializedArtifact& materialized) {
+    std::vector<BoundWeight> out;
+    out.reserve(references.size());
+    for (const auto& reference : references) {
+        if (reference.residency != artifact::Residency::Device) {
+            throw artifact::ArtifactError(reference.name +
+                                          ": only device-resident parameters are bound");
+        }
+        BoundWeight bound;
+        bound.name = reference.name;
+        bound.view = artifact::bind_view(reference, materialized);
+        out.push_back(std::move(bound));
+    }
+    return out;
+}
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
@@ -128,6 +149,10 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 const TextConfig& LoadPlan::config() const { return impl_->config; }
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
+
+const artifact::MaterializationPlan& LoadPlan::materialization() const {
+    return impl_->plan;
+}
 
 std::size_t LoadPlan::parameter_count() const { return impl_->references.size(); }
 
@@ -146,7 +171,33 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->weights.text = bind_text(bindings, out->config);
     out->references.reserve(bindings.weights().size());
     for (const auto& pending : bindings.weights()) { out->references.push_back(pending.reference); }
+    // The plan's physical demand is whatever Binding produced; finishing consumes the Binder, so it
+    // must come after every parameter request.
+    out->plan = std::move(out->binder).finish();
     return LoadPlan(std::move(out));
+}
+
+Model::Model(TextConfig config, ModelWeights weights, std::vector<BoundWeight> bound,
+             artifact::MaterializedArtifact backing)
+    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
+      bound_(std::move(bound)) {}
+
+Model::~Model() = default;
+
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+                                        const StartupObserver* observer) {
+    if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
+    auto data    = std::move(plan.impl_);
+    auto backing = artifact::materialize(*data->plan.source, std::move(data->plan), device, observer);
+    auto bound   = resolve_weights(data->references, backing);
+    return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->weights),
+                                            std::move(bound), std::move(backing)));
+}
+
+std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
+                                  DeviceContext& device, const StartupObserver* observer) {
+    artifact::Reader reader(path);
+    return materialize_model(plan_load(reader, options), device, observer);
 }
 
 } // namespace ninfer::models::gemma4
