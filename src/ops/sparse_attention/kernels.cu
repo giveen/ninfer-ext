@@ -248,9 +248,14 @@ __device__ __forceinline__ std::int32_t read_position(const __nv_bfloat16* recor
                                      (static_cast<std::uint32_t>(words[2 * axis + 1]) << 16));
 }
 
-// Scoring split policy: narrow passes spread each column's blocks over about kScoreTargetCtas
-// CTAs, at least kMinScoreBlocks blocks (four per warp) apiece.
-constexpr std::int32_t kScoreTargetCtas = 256;
+// Scoring split policy: a pass spreads each column's blocks over CTAs so that `columns * splits`
+// reaches about kScoreTargetCtas, at least kMinScoreBlocks blocks (four per warp) apiece.
+//
+// The CTA count is the product, not the per-column split: the score kernel walks one warp per block
+// in a serial loop, so with a wide pass the total is what hides the loop's latency. At 256 total a
+// 16k-block pass left each warp ~1.5k dependent iterations and the kernel ran at ~3 GB/s of key
+// traffic; the target is set for a few CTAs per SM on this card instead.
+constexpr std::int32_t kScoreTargetCtas = 8192;
 constexpr std::int32_t kMinScoreBlocks  = 32;
 
 // Visible tokens of this CTA's query column (zero for an invalid column) and its blocks.
