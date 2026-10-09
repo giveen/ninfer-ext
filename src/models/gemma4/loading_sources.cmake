@@ -3,3 +3,5 @@ target_sources(ninfer_model_loading PRIVATE "${CMAKE_CURRENT_LIST_DIR}/config.cp
 target_sources(ninfer_model_loading PRIVATE "${CMAKE_CURRENT_LIST_DIR}/forward.cpp")
 
 target_sources(ninfer_model_loading PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cache.cpp")
+
+target_sources(ninfer_model_loading PRIVATE "${CMAKE_CURRENT_LIST_DIR}/program.cpp")

@@ -537,3 +537,25 @@ prompt, the reference is still my own reading of the architecture rather than Hu
 the logit gap is consistent with the quantization without being attributed to FP8 versus NVFP4 versus
 rounding. A raw prompt is also the right input here: the checkpoint's chat template belongs to the
 instruction-tuned model, which this artifact is not.
+
+## 17. The Program owns the sequence
+
+`gemma4::Program` is the model's own execution object: it holds the KV cache, the per-layer scratch
+arena, the token and hidden buffers and the logits buffer, and exposes `reset`, `position`, `prefill`,
+`decode` and `logits`. It shares no device allocation with any other Program, and it takes the model
+and the execution view per call, so it is bound to streaming but not to a stream. Sampling stays out of
+it on purpose — the Program produces soft-capped logits and the caller decides what to do with them.
+
+The generation logic used to live in the test that drove it; it now lives here, which is where the
+architecture document puts mutable state and execution composition. The verification is that it
+reproduces the previous behavior exactly: the same prompt yields the same tokens *and the same logits*
+— 7001 at 17.625, then 563 at 20.875 — through the Program.
+
+**The engine still cannot load this model, and the reason is architectural rather than small.**
+`runtime::ModelInstance` declares `ModelContract = models::qwen3_5::RuntimeTypes` and holds a Qwen
+`Model`, `Parameters`, `Frontend` and `Program` by name, so `EngineCore<Instance>` is only instantiated
+for Qwen. Reaching `ninfer` and `ninfer-perplexity` needs the plan's P2 boundary extraction: a Program
+contract that both models satisfy, extracted one boundary at a time with the real-model Qwen tests as
+the guard — which the plan's own risk table names as the thing that can destabilize the shipped models.
+That is the next step, and it is why the Program was worth building first: it is the piece the engine
+will call, and it is verifiable on its own today.
