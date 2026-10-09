@@ -124,6 +124,25 @@ o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
   followed by `[256,320)`; the checkpoint defines no order, so this is the representation's own
   contract and the global attention reads it in that order.
 
+### 5.1 What the attention Ops cost us (read before planning rows 4 and 5)
+
+- **The sliding Op's geometry is compile-time and shared.** `kContextQueryHeadDim`,
+  `kContextQueryQHeads` and `kContextQueryKVHeads` live in
+  `ops/softmax_attention/common/context_query.cuh` and are referenced 43 times across five files,
+  including the dense causal route that Qwen uses. A Gemma profile (D 256, 32 query heads, 16 KV
+  heads) is therefore a refactor of shared attention code rather than a configuration, and it
+  rebuilds the dense route too. The window and scale *are* runtime values, but the wrapper admits
+  only windows 2048/4096 and scale 1/sqrt(128), so the profile's window 1024 and scale 1.0 are
+  refused before any kernel is chosen.
+- **The sliding Op is symmetric on the current chunk.** Every live query sees every live temporary
+  row, and context keys within the window; that is the image-block rule. Gemma's text layers need
+  the causal rule (`0 <= p_q - p_k < 1024`), which is one predicate in principle. An attempt that
+  routed the four mask sites through a policy hook was reverted: the existing bidirectional cases
+  stayed green, but causal cases disagreed with the causal oracle *even where the two oracles
+  coincide* — a case with at most one live temporary row — so the kernel's causal path diverges
+  somewhere the mask must be invariant. The cause is unresolved. A next attempt should start from a
+  minimal reproducer (one batch, one live row, an empty committed cache) instead of the full matrix.
+
 ## 6. Weight inventory
 
 From `model.safetensors.index.json` (1,188 tensors). Text lives under `model.language_model.`:
