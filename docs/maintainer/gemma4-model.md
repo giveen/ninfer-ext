@@ -243,3 +243,10 @@ Recorded so the next attempt starts where this one stopped, not from scratch.
   wrong `inv` values in some rows; the fix is a `__syncthreads()` at the top of the reused reduction.
 - **Causal temporary visibility for sliding attention (plan row 4), attempted, reverted.** See
   section 5.1 for the evidence and the recommendation.
+
+A related finding, not an attempt: **the tanh-GELU primitive already exists.** `ops::gelu` carries a
+`GeluMode::Tanh` whose formula is exactly PyTorch's `gelu_pytorch_tanh`
+(`0.5*z*(1 + tanh(sqrt(2/pi)*(z + 0.044715*z^3)))`), qualified by its own FP64 oracle in the suite,
+and the device helper is reusable. Row 3 therefore needs no new activation mathematics — only the
+fused epilogue and the plumbing that selects it, since the `linear_swiglu` routes hard-code `silu`
+at 37 call sites across about ten tuned files.
