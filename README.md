@@ -512,6 +512,11 @@ same device expert cache. Measured on the development machine (RTX 5090, i9-285K
   investigated.
 - Next-layer expert prefetch (the next router applied to this layer's input, fetching its predicted
   misses early) cost 4–8% decode here and is not in the tree.
+- Frequency-protected cache admission (LFRU, scoring slots `freq / (age + 1)` instead of by age)
+  cost 3.9–4.0% **more** misses than the LRU key and is not in the tree: 32,862 and 32,907 misses
+  under LRU against 34,132 (per-expert counts) and 34,173 (sticky frame counts), on one
+  23,430-token prompt and 512 greedy tokens with `qwen3_8_flash_next_nvfp4.ninfer` and 8,237
+  resident slots. Every run produced byte-identical text.
 
 ```bash
 hf download jabbatheduck/ninfer-ext-models --include "qwen3.8-flash-next-exl3-3p5bpw/*" --local-dir models

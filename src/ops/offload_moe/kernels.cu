@@ -200,6 +200,12 @@ __device__ __forceinline__ int block_exclusive_scan(int value, int* scratch, int
 
 // Eviction key of a slot: smaller is older. Stamps at or after `now` (touched by this call) are
 // protected; older stamps order by age, saturated to 32 bits.
+//
+// Measured 2026-10-09 on Qwen3.8-Flash-Next NVFP4: protecting slots by access count instead
+// (LFRU, the score `freq / (age + 1)`) cost 3.9-4.0% more misses than this key at 8,237 resident
+// slots, both as a per-expert count and as a never-reset per-frame count. Recency, not frequency,
+// is the signal this workload carries; do not re-add frequency protection without a new
+// measurement (README, Qwen3.8-Flash-Next section).
 __device__ __forceinline__ std::uint32_t eviction_key(unsigned long long stamp,
                                                       unsigned long long now) {
     if (stamp >= now) { return 0xFFFFFFFFu; }
