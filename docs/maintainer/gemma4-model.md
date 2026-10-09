@@ -295,3 +295,9 @@ Three consequences:
   both of which exist — and `n21504/k5376` is the shape that is actually needed. The fused
   `n43008/k5376` stays registered for a recipe that fuses the halves.
 - **The head is BF16**, so the FP8 head shape registered for it is not what this artifact uses.
+
+**Owner decision on the attention geometry (see 5.1).** Gemma 4 gets its own attention Op in new
+files rather than a refactor of the shared body: the sliding profile first (D 256, 32 query heads,
+16 KV heads, window 1024, causal, scale exactly 1.0), then the global one (D 512, 4 KV heads, the
+compact row). The shared body and Qwen's dense route stay untouched. The cost is real and accepted:
+the softmax core is implemented twice rather than parameterized once.
