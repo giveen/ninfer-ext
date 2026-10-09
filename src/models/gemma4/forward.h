@@ -43,4 +43,15 @@ void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_i
                    std::int32_t position, KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
                    DeviceExecutionView execution);
 
+/**
+ * Applies the output head to a layer stack's final hidden state.
+ *
+ * `hidden_in` is contiguous BF16 [hidden_size,1] and `logits` contiguous BF16 [vocabulary,1]. The head
+ * is the final norm, then the projection through the embedding matrix, which is tied to the token
+ * embedding, and then the logit soft cap. The cap is applied here because it is part of the model's
+ * logits; every consumer that must see uncapped values is the caller's business.
+ */
+void forward_head(const Model& model, const Tensor& hidden_in, DeviceArena& arena, Tensor& logits,
+                  DeviceExecutionView execution);
+
 } // namespace ninfer::models::gemma4

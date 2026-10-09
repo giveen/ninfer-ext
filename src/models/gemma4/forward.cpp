@@ -9,6 +9,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scale_columns.h"
+#include "ninfer/ops/soft_cap.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sliding_causal_attention.h"
 
@@ -309,6 +310,22 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     CUDA_CHECK(cudaMemcpyAsync(hidden_out.data, residual.data,
                                static_cast<std::size_t>(h) * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToDevice, stream));
+}
+
+void forward_head(const Model& model, const Tensor& hidden_in, DeviceArena& arena, Tensor& logits,
+                  DeviceExecutionView execution) {
+    const cudaStream_t stream = execution.stream;
+    const TextConfig& config  = model.config();
+
+    DeviceArena::Scope scope = arena.scope();
+    const std::int32_t h = static_cast<std::int32_t>(config.hidden_size);
+
+    Tensor normed = arena.alloc(DType::BF16, {h, 1, 1});
+    ops::rmsnorm(hidden_in, model.tensor(model.weights().text.final_norm), config.rms_norm_eps, false,
+                 normed, stream);
+    auto weight = ops::prepare_linear_weight(model.input(model.weights().text.output_head)).weight;
+    ops::linear(normed, weight, logits, stream);
+    ops::soft_cap(logits, config.final_logit_softcapping, stream);
 }
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,

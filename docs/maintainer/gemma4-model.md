@@ -469,3 +469,37 @@ product nor the global compact score with its `w_kn` prescale would be exercised
 What it does not cover: the sliding window's boundary (needs more than 1024 tokens), the cross-layer
 composition (errors would compound), the final norm and the head, and the quantized routes' *quality*
 as opposed to their structure. Those are the perplexity route's business.
+
+### 15.1 The output head, and a realistic input
+
+`forward_head` is the final norm, the projection through the tied embedding matrix, and the logit soft
+cap. Its projection is BF16 `[262144, 5376]`, so the BF16 linear needed the shape registered
+(`shapes/n262144_k5376.cu`); the schedule set is copied from an existing shape and is untuned, which
+follows the plan's ordering of correctness before speed.
+
+The layer stack's real input is the embedding of a token scaled by the checkpoint's embedding scale,
+which is the square root of the hidden size (73.321211 for 5376) — the text config does not carry that
+value, the converter derives it. Feeding that instead of white noise puts the run at the magnitudes
+service sees, and the head can then be compared on the engine's own layer output, so the head's error
+is isolated from the layers'.
+
+| Check | Cosine | Relative L2 | Worst max abs diff |
+|---|---|---|---|
+| Layer 0, sliding, 4 tokens | 0.999857 | 0.0170 | 0.129 |
+| Layer 5, global, 4 tokens | 0.999857 | 0.0169 | 0.329 |
+| Head (either layer's output) | 0.999989 | 0.0024 | — |
+
+The relative L2 is higher here than the 0.3% the white-noise runs showed, and the reason is worth
+stating rather than glossing: the *absolute* worst error is smaller (0.129 against 0.224), but a real
+activation's layer output has a smaller norm, so the same absolute error is a larger fraction of it.
+
+**The head check is weaker than the layer check, on purpose stated plainly.** One layer of 60 does not
+produce a final hidden state, so the logits run past the soft cap and `|logits|max` sits exactly at
+30.000. What that verifies is the sign structure — 262144 values agreeing — not the magnitude
+distribution, and the top-1 token disagrees between the engine and the reference because every
+saturated value is ±30 and a 0.2% difference decides which one caps first. A deeper stack would make
+that comparison meaningful.
+
+**A comparison must refuse stale inputs.** An early run of this check compared the reference against a
+dump a *failed* engine run had left behind, and reported a relative L2 of 0.898 for a layer that
+actually agrees to 0.017. The reference now refuses to run unless both dumps exist.

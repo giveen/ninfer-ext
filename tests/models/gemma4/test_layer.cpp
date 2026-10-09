@@ -67,6 +67,7 @@ int main() {
     }
     const char* layer_text  = std::getenv("NINFER_GEMMA_LAYER");
     const char* tokens_text = std::getenv("NINFER_GEMMA_TOKENS");
+    const char* head_text   = std::getenv("NINFER_GEMMA_HEAD");
     const std::size_t layer = layer_text != nullptr ? std::stoul(layer_text) : 0;
     const std::int32_t tokens = tokens_text != nullptr ? std::stoi(tokens_text) : 1;
     int devices = 0;
@@ -82,6 +83,29 @@ int main() {
         const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
         const std::size_t bytes   = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
 
+        // The reference can supply a realistic input: the embedding of a few tokens, which is what the
+        // layer stack sees in service. White noise of the same magnitude drives the logits far past the
+        // soft cap, where the head can only be checked by sign rather than by value.
+        std::vector<std::uint16_t> provided;
+        if (const char* input_path = std::getenv("NINFER_GEMMA_INPUT")) {
+            std::ifstream source(input_path, std::ios::binary);
+            const std::size_t count = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(hidden);
+            std::vector<float> values(count);
+            source.read(reinterpret_cast<char*>(values.data()),
+                        static_cast<std::streamsize>(count * sizeof(float)));
+            if (source.gcount() != static_cast<std::streamsize>(count * sizeof(float))) {
+                std::cerr << "gemma4 layer: could not read " << input_path << '\n';
+                return 1;
+            }
+            provided.resize(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &values[index], sizeof(bits));
+                bits += 0x7FFFU + ((bits >> 16) & 1U);
+                provided[index] = static_cast<std::uint16_t>(bits >> 16);
+            }
+        }
+
         std::vector<std::uint16_t> inputs;
         std::vector<std::uint16_t> outputs;
         void* in  = nullptr;
@@ -93,7 +117,12 @@ int main() {
         cache.configure(config, 64);
         DeviceArena arena(gemma::layer_workspace_bytes(config));
         for (std::int32_t position = 0; position < tokens; ++position) {
-            const std::vector<std::uint16_t> state = hidden_for(hidden, position);
+            const std::vector<std::uint16_t> state =
+                provided.empty()
+                    ? hidden_for(hidden, position)
+                    : std::vector<std::uint16_t>(
+                          provided.begin() + static_cast<std::ptrdiff_t>(position) * hidden,
+                          provided.begin() + static_cast<std::ptrdiff_t>(position + 1) * hidden);
             inputs.insert(inputs.end(), state.begin(), state.end());
             CUDA_CHECK(cudaMemcpy(in, state.data(), bytes, cudaMemcpyHostToDevice));
             Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
@@ -110,6 +139,27 @@ int main() {
             !write_f32("/tmp/gemma_layer.out.f32", outputs)) {
             std::cerr << "gemma4 layer: could not write the dump\n";
             return 1;
+        }
+
+        // The head runs on the last token's layer output, which is dumped above, so the reference can
+        // check it on exactly that input instead of propagating its own layer result into it.
+        if (head_text != nullptr && *head_text != '0') {
+            const std::size_t vocabulary = config.vocab_size;
+            void* logits                 = nullptr;
+            CUDA_CHECK(cudaMalloc(&logits, vocabulary * sizeof(std::uint16_t)));
+            Tensor head_input(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
+            Tensor logit_tensor(static_cast<std::uint8_t*>(logits), DType::BF16,
+                                {static_cast<std::int32_t>(vocabulary), 1});
+            gemma::forward_head(*model, head_input, arena, logit_tensor, device.execution_view());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<std::uint16_t> produced(vocabulary);
+            CUDA_CHECK(cudaMemcpy(produced.data(), logits, vocabulary * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost));
+            if (!write_f32("/tmp/gemma_head.out.f32", produced)) {
+                std::cerr << "gemma4 layer: could not write the head dump\n";
+                return 1;
+            }
+            CUDA_CHECK(cudaFree(logits));
         }
         std::cout << "gemma4 layer: layer " << layer << ", "
                   << (config.sliding_attention(layer) ? "sliding" : "global") << ", " << tokens

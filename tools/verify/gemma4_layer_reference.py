@@ -16,7 +16,7 @@ with scale 1.0, and the global layers' compact-KV form, where a stored row is th
 by the rotated key dims and the query carries the key norm's weight on the dims the rotation leaves
 alone. It reads BF16 weights, so it needs the original checkpoint beside the converted artifact.
 """
-import json, sys
+import json, math, os, sys
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -64,6 +64,20 @@ def rope(x, width, pairs, theta, position):
     view[:, width // 2: width // 2 + pairs] = lo * sin + hi * cos
     return view.reshape(-1)
 
+if len(sys.argv) > 2 and sys.argv[2] == '--write-input':
+    # The layer stack's real input: the embedding of a few tokens, scaled the way the embedding Op
+    # scales it. Written as FP32 holding BF16 values, which is what the engine stores.
+    WRITE_TOKENS = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    table = load('model.language_model.embed_tokens.weight')
+    # The checkpoint's text config carries no embedding_scale; the converter derives the value the
+    # embedding Op uses, which is the square root of the hidden size.
+    scale = math.sqrt(H)
+    ids = torch.arange(1000, 1000 + WRITE_TOKENS)
+    rows = (table[ids] * scale).to(torch.bfloat16).to(torch.float32)
+    rows.numpy().astype(np.float32).tofile('/tmp/gemma_layer.input.f32')
+    print(f'wrote /tmp/gemma_layer.input.f32: {WRITE_TOKENS} tokens, embedding scale {scale:.3f}')
+    sys.exit(0)
+
 W_IN = load(f'{P}.input_layernorm.weight')
 W_POST_ATTN = load(f'{P}.post_attention_layernorm.weight')
 W_PRE_FFN = load(f'{P}.pre_feedforward_layernorm.weight')
@@ -76,6 +90,8 @@ W_G, W_U, W_D = (load(f'{P}.mlp.gate_proj.weight'), load(f'{P}.mlp.up_proj.weigh
 SCALAR = float(load(f'{P}.layer_scalar').reshape(-1)[0])
 W_V = load(f'{P}.self_attn.v_proj.weight') if not FULL else None
 
+if not (os.path.exists('/tmp/gemma_layer.in.f32') and os.path.exists('/tmp/gemma_layer.out.f32')):
+    sys.exit('no dump in /tmp; run ninfer_gemma4_layer_test first')
 inputs = torch.from_numpy(np.fromfile('/tmp/gemma_layer.in.f32', dtype=np.float32).copy())
 if TOKENS is None:
     TOKENS = inputs.numel() // H
@@ -129,6 +145,25 @@ for t in range(TOKENS):
     rel = ((a - b).norm() / b.norm()).item()
     print(f'layer {LAYER} ({"global" if FULL else "sliding"}) token {t}: cosine {cos:.6f}, '
           f'relative L2 {rel:.4f}, max abs diff {torch.abs(a - b).max().item():.4f}')
+# Optional head check. The head reads the engine's own layer output, so this isolates the final norm,
+# the tied output projection and the soft cap from any error the layers themselves contributed.
+if os.path.exists('/tmp/gemma_head.out.f32'):
+    engine_logits = torch.from_numpy(np.fromfile('/tmp/gemma_head.out.f32', dtype=np.float32).copy())
+    W_FINAL = load('model.language_model.norm.weight')
+    W_EMB = load('model.language_model.embed_tokens.weight')
+    CAP = float(CFG['final_logit_softcapping'])
+    n = rmsnorm(engine[(TOKENS - 1) * H:TOKENS * H], W_FINAL, H)
+    # The embedding scale applies at the input; the tied output projection uses the matrix unscaled.
+    logits = CAP * torch.tanh((W_EMB @ n) / CAP)
+    cos = F.cosine_similarity(logits[None], engine_logits[None]).item()
+    rel = ((logits - engine_logits).norm() / engine_logits.norm()).item()
+    agree = int(logits.argmax()) == int(engine_logits.argmax())
+    print(f'head ({"global" if FULL else "sliding"} layer): cosine {cos:.6f}, relative L2 {rel:.4f}, '
+          f'|logits|max {engine_logits.abs().max().item():.3f}, cap {CAP}')
+    print(f'  argmax {int(logits.argmax())} (reference) vs {int(engine_logits.argmax())} (engine): '
+          f'{"agree" if agree else "DIFFER"}')
+    print('  HEAD VERDICT:', 'structural agreement' if cos > 0.99 else 'MISMATCH — investigate')
+
 print('  VERDICT:', 'structural agreement' if min(
     F.cosine_similarity(reference[t * H:(t + 1) * H][None], engine[t * H:(t + 1) * H][None]).item()
     for t in range(TOKENS)) > 0.99 else 'MISMATCH — investigate')
