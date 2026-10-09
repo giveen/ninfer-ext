@@ -72,11 +72,22 @@ int main(int argc, char** argv) {
             options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
         else if (backend == "dflash2")
             options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        else if (backend == "eagle3") {
+            options.speculative.backend = ninfer::SpeculativeBackend::Eagle3;
+            // EAGLE3 carries its own draft head, so the generic proposal head does not apply.
+            options.speculative.proposal_head = ninfer::ProposalHead::Full;
+            options.speculative.draft_tokens  = 3;
+            options.speculative.fixed_draft   = true;
+        }
         else
             require(backend == "none", "unknown backend");
         if (backend != "none") {
-            options.speculative.draft_tokens  = 3;
-            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            options.speculative.draft_tokens = 3;
+            // EAGLE3 carries its own draft head, so the generic proposal head does not apply.
+            options.speculative.proposal_head = options.speculative.backend ==
+                                                        ninfer::SpeculativeBackend::Eagle3
+                                                    ? ninfer::ProposalHead::Full
+                                                    : ninfer::ProposalHead::Optimized;
         }
         ninfer::Engine engine(options);
         const std::string answer =

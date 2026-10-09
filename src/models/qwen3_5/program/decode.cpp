@@ -784,10 +784,6 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                                  std::span<const runtime::RoundBudget> budgets,
                                  runtime::ExecutionTiming* failed_timing,
                                  runtime::TokenMaskProvider* masks) {
-    // Speculative rounds consume one mask per verify position; until that integration lands, a
-    // constrained request is refused at preparation, and this keeps a future path from silently
-    // running unconstrained.
-    require_unmasked_round(masks, lanes);
     nvtx::ScopedRange round_range(nvtx::Name::DecodeEagle3Round, nvtx::Category::Eagle3,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -889,6 +885,11 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
             // themselves.
             mtp_host_ingress->feature_lanes[row] = static_cast<std::int32_t>(row);
             mtp_host_ingress->sampling[row]      = request.sampling_host;
+            // The chain to verify is host-resident before the round, so every verify position gets
+            // its own legal set here, exactly as the MTP round does.
+            mtp_host_ingress->sampling[row].mask =
+                fill_grammar_mask(masks, row,
+                                  std::span<const TokenId>(sequence.mtp_drafts.data(), extent));
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + k));
         }

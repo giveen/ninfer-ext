@@ -237,7 +237,7 @@ The endpoint supports:
   [constrained decoding](maintainer/constrained-decoding.md); a request is refused when the
   constraint cannot be combined with what it asks for (active tools, custom stops, raw or
   special-preserving output, non-default EOS, or a backend whose verify rounds consume no token
-  masks: `dflash`, `dflash2`, `eagle3`). A constrained `mtp` request keeps drafting — every verify
+  masks: `dflash`, `dflash2`). A constrained `mtp` request keeps drafting — every verify
   position gets its own legal set, and a draft the constraint forbids is simply not accepted — and a
   schema error names the field the client sent plus the JSON Pointer that failed.
 
