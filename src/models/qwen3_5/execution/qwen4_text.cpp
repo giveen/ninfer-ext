@@ -162,7 +162,7 @@ void TextContext::qwen4_embed(const Tensor& ids, const Tensor* scatter_indices,
         e = input_embeddings->view({dimension(config_.hidden_size), T});
     } else {
         e = work_.alloc(DType::BF16, {dimension(config_.hidden_size), T});
-        ops::embedding(ids.view({T}), *embed_, e, s);
+        ops::embedding(ids.view({T}), *embed_, 1.0F, e, s);
         if (scatter_indices != nullptr) {
             ops::scatter(*scatter_embeddings, *scatter_indices, e, s);
         }
@@ -633,7 +633,7 @@ void TextContext::qwen4_mtp_stem(const Tensor& ids, const Tensor& hidden,
         if (input_embeddings != nullptr) {
             embedding = input_embeddings->view({H, T});
         } else {
-            ops::embedding(ids.view({T}), *embed_, embedding, s);
+            ops::embedding(ids.view({T}), *embed_, 1.0F, embedding, s);
         }
         Tensor normalized = roots.normalized_embedding;
         ops::rmsnorm(embedding, qwen4_mtp_->embedding_norm, config_.rms_norm_eps, true, normalized,
@@ -875,7 +875,7 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
             const Tensor* mtp_embeddings_ptr = nullptr;
             if (multimodal != nullptr) {
                 mtp_embeddings = work_.alloc(DType::BF16, {H, len});
-                ops::embedding(mtp_ids, *embed_, mtp_embeddings, s);
+                ops::embedding(mtp_ids, *embed_, 1.0F, mtp_embeddings, s);
                 if (!vision_chunk.scatter.empty()) {
                     const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
                         vision_chunk.scatter, alignment_tokens, window);

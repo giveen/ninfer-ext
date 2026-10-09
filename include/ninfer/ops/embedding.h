@@ -13,7 +13,11 @@ namespace ninfer::ops {
  *   ideal[d,t] = dequantize(table)[ids[t],d].
  *
  * `ids` is contiguous I32 [T], `out` is contiguous BF16 [D,T], and every id is in
- * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
+ * [0,vocab). `output_scale` is resolved to BF16, the weight dtype, and then multiplies every
+ * gathered value: the multiply applies to the value the dequantization already rounded to BF16 and
+ * rounds again. A checkpoint's embedding scale is that rounding boundary, so it cannot be folded
+ * into the table's stored scale without changing the result; 1.0F is the identity and leaves dense
+ * copies bit-exact. `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
  * RowSplit, Q8_G32_FP16 RowSplit, or FP8_E4M3FN_ROW_BF16 RowScale. Dense BF16 values are copied
  * bit-exactly. For quantized tables, the oracle independently decodes each code and multiplies it
  * by the exact stored scale in FP64; the BF16 output is promoted and compared directly with that
@@ -23,6 +27,7 @@ namespace ninfer::ops {
  * row and requires 4-byte-aligned output storage. `out` must not overlap `ids` or any table plane.
  * There is no workspace or persistent state side effect.
  */
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+void embedding(const Tensor& ids, const Weight& table, float output_scale, Tensor& out,
+               cudaStream_t stream);
 
 } // namespace ninfer::ops

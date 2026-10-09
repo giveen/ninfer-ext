@@ -307,7 +307,7 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     for (int t : o.tokens) {
         Tensor input(ids.p, DType::I32, {t}), out(output.p, DType::BF16, {spec.d, t});
         const auto launch = [&](cudaStream_t stream) {
-            ops::embedding(input, weight, out, stream);
+            ops::embedding(input, weight, 1.0F, out, stream);
         };
         TimedGraph graph;
         if (o.execution == "graph") {

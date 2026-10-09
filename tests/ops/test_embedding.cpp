@@ -566,7 +566,7 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    const auto launch = [&] { ops::embedding(input, weight, result, device.stream); };
+    const auto launch = [&] { ops::embedding(input, weight, 1.0F, result, device.stream); };
     int failures      = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         const auto selected = phase == 0 ? ids : dflash2_ids(ids.size(), true);
@@ -653,10 +653,47 @@ int test_fp8() {
     Weight invalid      = table.weight();
     invalid.scale_dtype = DType::FP16;
     try {
-        ops::embedding(input, invalid, result, nullptr);
+        ops::embedding(input, invalid, 1.0F, result, nullptr);
         std::cerr << "embedding FP8 accepted malformed row-scale metadata\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+
+    // The embedding scale is applied to the value the dequantization has already rounded to BF16,
+    // and rounded again: Transformers multiplies the gathered embedding by a scale cast to the
+    // weight dtype. So the scaled output is exactly that transform of the unscaled one, and the
+    // Gemma checkpoint's sqrt(hidden_size) is used because its BF16 rounding is not exact -- a
+    // folded scale would round once and differ.
+    {
+        constexpr float kEmbedScale = 73.3212F; // sqrt(5376), as the Gemma 4 config carries it
+        const std::vector<std::int32_t> scale_ids = {0, 3, 3, 17};
+        const std::size_t elements = static_cast<std::size_t>(kFp8D) * scale_ids.size();
+        GuardedDeviceBuffer scale_ids_device(scale_ids.size() * sizeof(std::int32_t));
+        scale_ids_device.copy_from_host(scale_ids.data(),
+                                        scale_ids.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer plain(elements * sizeof(std::uint16_t));
+        GuardedDeviceBuffer scaled(elements * sizeof(std::uint16_t));
+        Tensor scale_input(scale_ids_device.data(), DType::I32,
+                           {static_cast<std::int32_t>(scale_ids.size())});
+        Tensor plain_out(plain.data(), DType::BF16,
+                         {kFp8D, static_cast<std::int32_t>(scale_ids.size())});
+        Tensor scaled_out(scaled.data(), DType::BF16,
+                          {kFp8D, static_cast<std::int32_t>(scale_ids.size())});
+        Weight weight = table.weight();
+        DeviceContext device;
+        ops::embedding(scale_input, weight, 1.0F, plain_out, device.stream);
+        ops::embedding(scale_input, weight, kEmbedScale, scaled_out, device.stream);
+        cuda_synchronize(device.stream);
+        const auto before      = guarded_to_host<std::uint16_t>(plain, elements);
+        const auto after       = guarded_to_host<std::uint16_t>(scaled, elements);
+        const float scale_bf16 = bf16_to_f32(f32_to_bf16(kEmbedScale));
+        std::vector<std::uint16_t> expected_scaled(elements);
+        for (std::size_t i = 0; i < elements; ++i) {
+            expected_scaled[i] = f32_to_bf16(bf16_to_f32(before[i]) * scale_bf16);
+        }
+        failures += verify_exact("embedding FP8 scaled by sqrt(hidden_size)", after, expected_scaled);
+        failures += verify_exact("embedding FP8 identity scale leaves the value untouched", before,
+                                 guarded_to_host<std::uint16_t>(plain, elements));
+    }
     return failures;
 }
 
@@ -699,7 +736,7 @@ int test_dense() {
 
     Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
     Tensor result(output.data(), DType::BF16, {kDenseD, static_cast<std::int32_t>(ids.size())});
-    ops::embedding(input, weight, result, nullptr);
+    ops::embedding(input, weight, 1.0F, result, nullptr);
     cuda_synchronize();
 
     int failures = verify_exact("embedding BF16 [2304,1152]",
