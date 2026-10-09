@@ -530,6 +530,22 @@ def gemma4_31b_base(model, recipe, sources):
         elif "/attention/" in name:
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
 
+    # One fused gate/up parent per layer, bound under one name with the parent's shape. The MLP's
+    # plan row is a fused parent with a GeGLU epilogue, and a consumer needs the complete NVFP4
+    # parent: a row slice of a BlockScaleK16M128x4 parent cannot re-derive its swizzled scales, so
+    # the two halves must be bound as one parameter rather than two slices. The reference engine
+    # reads the two projections separately only because its runtime has no such requirement.
+    for name, gate in model.parameters.items():
+        if not name.startswith("text/layers/") or not name.endswith("/mlp/gate"):
+            continue
+        up = name[: -len("gate")] + "up"
+        if up not in model.parameters:
+            raise ValueError(f"{name}: the fused parent needs a matching up projection")
+        rows = gate.shape[0] + model.parameters[up].shape[0]
+        if model.parameters[up].shape[1] != gate.shape[1]:
+            raise ValueError(f"{name}: gate and up must share K")
+        recipe.group([name, up], shape=(rows, gate.shape[1]))
+
 
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,

@@ -324,3 +324,23 @@ Two corrections to the layer composition came out of reading llama.cpp at the sa
 output is the residual stream itself (the *next* layer applies its own `attn_norm`, so a layer must
 not norm its own output), and the sliding layers norm V weightlessly (`ggml_rms_norm(Vcur, eps)`),
 which the first forward attempt omitted.
+
+**The MLP binding is two slices, and that is the last blocker on a token.** Re-inspecting the
+re-converted artifact: `text/layers/N/mlp/gate` covers bytes [0, 115605504) and `mlp/up` covers
+[115605504, 231211008) of *one* object, exactly as the attention's q/k/v cover three ranges of one
+object. The recipe's `group(selectors, shape=...)` does not merge logical bindings, only the physical
+packing, so it changed nothing: a layer's MLP is still two parameters.
+
+That is fine for the attention, whose parent is FP8 RowScale and whose slices the runtime now accepts,
+and fatal for the MLP, whose parent is BlockScaleK16M128x4 with a swizzled scale plane. Two ways out,
+in order of alignment with the plan:
+
+- Teach the runtime to slice a *128-row-aligned* NVFP4 parent as well, which should be expressible
+  because the slice boundaries land on the swizzle's own block grid (both halves here are 21504 = 168
+  times 128 rows). This keeps the plan's NVFP4 MLP layout and is the smaller change.
+- Or emit the MLP in FP8 like the attention, which makes the slices work through the mechanism that
+  already exists at the cost of the plan's L1 layout for the MLP.
+
+The forward is written, compiles, and fails exactly here: `text/layers/0/mlp/gate: logical shape
+differs from Binding coverage`. Everything before it — the attention path, the norms, the RoPE, the
+sandwich and the fused projections — runs.

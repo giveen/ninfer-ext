@@ -30,7 +30,10 @@ struct AttentionWeights {
 };
 
 struct MlpWeights {
-    WeightId gate, up, down;
+    // The gate and up halves are bound as one fused parent, whose shape is two intermediate rows by
+    // the hidden size. A row slice of an NVFP4 parent cannot re-derive its swizzled scales, so the
+    // consumer needs the complete parent; the two halves are views of the projection's output.
+    WeightId gate_up, down;
 };
 
 struct LayerWeights {
