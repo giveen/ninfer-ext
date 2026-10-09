@@ -40,6 +40,14 @@ and the vision projector's pre-norm are the same formula without a weight.
 
 ```text
 h = embed(token) · √H
+```
+The embedding scale is a rounding boundary, not a constant to fold away: Transformers gathers the
+row (already rounded to BF16 by the table's dequantization) and multiplies it by `√H` cast to the
+weight dtype, so the product is rounded a second time. Folding `√H` into the stored row scale would
+multiply first and round once, which is a different BF16 value, so the scale has to be applied to
+the gathered row.
+
+```text
 for layer ℓ:
     a = attn_ℓ(rmsnorm(h, w_in))
     h = h + rmsnorm(a, w_post_attn)          # sandwich norm on the branch output
