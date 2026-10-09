@@ -100,8 +100,9 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
         weights.attention.key_norm = bindings.parameter(prefix + "attention/key_norm",
                                                         {geometry.head_dim}, kNormFormat);
 
-        weights.mlp.gate_up = bindings.parameter(prefix + "mlp/gate", {2 * intermediate, hidden},
-                                                 kMlpFormat);
+        weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden},
+                                             kMlpFormat);
+        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden}, kMlpFormat);
         weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate}, kMlpFormat);
 
         out.layers.push_back(weights);

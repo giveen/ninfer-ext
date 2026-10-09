@@ -213,7 +213,11 @@ class _Gemma4Builder(_Builder):
                      (intermediate, h), inputs=(prefix + "mlp_input",))
         self.add(prefix + "mlp/down", store, source_prefix + "mlp.down_proj.weight",
                  (h, intermediate), inputs=(prefix + "mlp/product",))
-        self.group(prefix + "mlp/gate", prefix + "mlp/up")
+        # The gate and up halves stay separate objects rather than one packed parent. Packing them
+        # would bind each half as a row slice of a BlockScaleK16M128x4 object, and such a slice
+        # cannot re-derive the swizzled scale plane it shares with its sibling, so no consumer could
+        # execute it. Separate objects are also what the reference engine's converter produces, and
+        # each half then carries its own per-tensor scale.
 
 
 def build_model(

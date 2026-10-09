@@ -29,7 +29,8 @@ struct Scratch {
     Tensor v_normed;    // [D,Hkv,1]
     Tensor attended;    // [Hq*D,1]
     Tensor projected;   // [H,1]     the attention output projection
-    Tensor gate_up;     // [2I,1]    the fused gate/up projection
+    Tensor gate;        // [I,1]     the MLP's gate projection
+    Tensor up;          // [I,1]     the MLP's up projection
     Tensor activated;   // [I,1]
     Tensor down;        // [H,1]
     Tensor positions;   // I32 [1]
@@ -44,10 +45,14 @@ std::size_t sliding_layer_workspace_bytes(const TextConfig& config) {
                             config.sliding.head_dim;
     const std::uint64_t kv = static_cast<std::uint64_t>(config.sliding.num_key_value_heads) *
                              config.sliding.head_dim;
-    // Three hidden-sized buffers, three query-sized, three key/value-sized, three normed head
-    // buffers, the fused gate/up parent, one intermediate buffer, and the position vector. The arena
-    // aligns each allocation to 256 bytes, so the bound carries that per slice.
-    const std::uint64_t elements = 3 * h + 3 * q + 3 * kv + 3 * kv + 2 * i + i;
+    // Every buffer the scratch below allocates, counted exactly so the bound cannot drift from it:
+    //   hidden-sized:        normed, branch, projected, down
+    //   query-sized:         q, q_normed (D by Hq), attended
+    //   key/value-sized:     k, v, k_normed, v_normed
+    //   intermediate-sized:  gate, up, activated
+    // plus one position vector. The arena aligns every allocation to 256 bytes, so the bound carries
+    // that per slice, and an undercount makes the arena refuse an allocation rather than overrun.
+    const std::uint64_t elements = 4 * h + 3 * q + 4 * kv + 3 * i;
     return static_cast<std::size_t>(elements * 2 + 16 * 256 + 64);
 }
 
@@ -63,6 +68,10 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     if (weights.mixer != MixerKind::SlidingAttention) {
         throw std::invalid_argument("forward_sliding_layer: layer is not a sliding layer");
     }
+
+    // The scratch is a per-call frame: take a scope so a caller can hand the same arena to every
+    // layer of a pass, and so `sliding_layer_workspace_bytes` bounds one call rather than all of them.
+    DeviceArena::Scope scope = arena.scope();
 
     const std::int32_t h   = static_cast<std::int32_t>(config.hidden_size);
     const std::int32_t i   = static_cast<std::int32_t>(config.intermediate_size);
@@ -84,7 +93,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     scratch.v_normed  = arena.alloc(DType::BF16, {d, hkv, 1});
     scratch.attended  = arena.alloc(DType::BF16, {q_width, 1, 1});
     scratch.projected = arena.alloc(DType::BF16, {h, 1, 1});
-    scratch.gate_up   = arena.alloc(DType::BF16, {2 * i, 1, 1});
+    scratch.gate      = arena.alloc(DType::BF16, {i, 1, 1});
+    scratch.up        = arena.alloc(DType::BF16, {i, 1, 1});
     scratch.activated = arena.alloc(DType::BF16, {i, 1, 1});
     scratch.down      = arena.alloc(DType::BF16, {h, 1, 1});
     scratch.positions = arena.alloc(DType::I32, {1, 1, 1});
@@ -136,14 +146,9 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     // MLP sublayer: the fused gate/up parent, GeGLU, down, then the sandwich and the layer scalar.
     ops::rmsnorm(residual, model.tensor(weights.pre_feedforward_norm), eps, false, scratch.normed,
                  stream);
-    ops::linear(scratch.normed, to_weight(weights.mlp.gate_up), scratch.gate_up, stream);
-    {
-        // The two halves of a fused parent are views of its output: gate first, then up.
-        Tensor gate = scratch.gate_up.view({i, 1, 1});
-        Tensor up   = Tensor(static_cast<std::uint8_t*>(scratch.gate_up.data) + i * 2, DType::BF16,
-                             {i, 1, 1});
-        ops::gelu_mul(gate, up, scratch.activated, stream);
-    }
+    ops::linear(scratch.normed, to_weight(weights.mlp.gate), scratch.gate, stream);
+    ops::linear(scratch.normed, to_weight(weights.mlp.up), scratch.up, stream);
+    ops::gelu_mul(scratch.gate, scratch.up, scratch.activated, stream);
     ops::linear(scratch.activated, to_weight(weights.mlp.down), scratch.down, stream);
     ops::rmsnorm(scratch.down, model.tensor(weights.post_feedforward_norm), eps, false,
                  scratch.branch, stream);

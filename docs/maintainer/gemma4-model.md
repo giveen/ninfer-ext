@@ -344,3 +344,36 @@ in order of alignment with the plan:
 The forward is written, compiles, and fails exactly here: `text/layers/0/mlp/gate: logical shape
 differs from Binding coverage`. Everything before it — the attention path, the norms, the RoPE, the
 sandwich and the fused projections — runs.
+
+## 12. A sliding layer runs end to end
+
+`forward_sliding_layer` now executes one sliding decoder layer over the produced artifact. The
+verification is structural rather than numerical: 50 sliding layers run in sequence, every hidden
+state is finite, the largest magnitude is 6.59 from an input whose scale is the embedding's own
+(hidden times the square root of the hidden size), a global layer is refused by the sliding path, and
+the fast suite is green at 166 tests. The magnitudes are *not* checked against a reference; the
+perplexity route is the gate for that, and nothing here substitutes for it.
+
+Three things about the artifact and the runtime came out of this, and two of them cost earlier rounds:
+
+- **The MLP's gate and up projections are separate objects** (727 objects for 833 bindings, up 60 from
+  the packed version). Packing them bound each half as a row slice of a `BlockScaleK16M128x4` parent,
+  and such a slice cannot re-derive the swizzled scale plane it shares with its sibling, so no
+  consumer could execute it. `recipe.group(selectors, shape=...)` does not merge logical bindings,
+  only physical packing, so the fix had to come from the builder, which no longer groups them. Each
+  half now carries its own per-tensor scale as a side effect, and separate objects are what the
+  reference engine's converter produces.
+- **The FP8 launcher demanded a parent's absolute plane layout.** It required `qdata` to be the
+  payload base and `scales` to sit at `align_up(n*k, 256)` from it, which no row slice can satisfy —
+  so every sliced FP8 projection was rejected at launch. The check is now relative: the planes must be
+  ordered and inside the payload, which is what the kernel actually indexes. The four FP8 linear
+  tests still pass, so complete weights take the same qualified route.
+- **`DeviceArena` accumulates, so a layer must scope its own scratch.** The `std::bad_alloc` that cost
+  two earlier rounds was this and not the op sequence: the first diagnosis blamed a workspace that was
+  undercounted by one hidden-sized buffer, and correcting the count changed nothing because the real
+  fault was reuse across layers. The layer now opens a `Scope`, which also makes
+  `sliding_layer_workspace_bytes` bound one call rather than a whole pass.
+
+Still open: the global (full-attention) layers, which need the compact K/V path, the KV caches, the
+Program with its state, workspaces and CUDA graphs, the engine's load path and architecture dispatch,
+and the output head.
