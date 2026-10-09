@@ -503,3 +503,37 @@ that comparison meaningful.
 **A comparison must refuse stale inputs.** An early run of this check compared the reference against a
 dump a *failed* engine run had left behind, and reported a relative L2 of 0.898 for a layer that
 actually agrees to 0.017. The reference now refuses to run unless both dumps exist.
+
+## 16. The model generates, and the reference picks the same token
+
+`ninfer_gemma4_generate_test` runs the whole pipeline end to end — the embedding, sixty cached decoder
+layers, the head and a greedy argmax — for a prompt given as token ids, and tokenizing and detokenizing
+happen outside it. The prompt "The capital of France is" (five tokens, `818 5279 529 7001 563`) produces
+
+    The capital of France is France is France is France is France is
+
+which is real English in the right semantic domain, so the pipeline works — and it says *France* where
+*Paris* is expected, and then loops. That is exactly the kind of result that needs an outside opinion
+rather than a guess, so `tools/verify/gemma4_prompt_reference.py` runs the same prompt through all
+sixty layers with the checkpoint's BF16 weights and reports what it would pick:
+
+| | Next token | Its logit |
+|---|---|---|
+| Engine (FP8 attention, NVFP4 MLP) | 7001 | 17.63 |
+| Reference (BF16, FP32 math) | 7001 | 19.19 |
+
+**They agree on the token.** The base checkpoint — this artifact is converted from the base model, not
+an instruction-tuned one — greedily continues "…is France is France…", and the engine reproduces that
+choice. So the loop is the checkpoint's behavior at this prompt, not an engine defect, and the 8%
+logit gap is the quantization's.
+
+The reference also shows why the one-layer head check saturated while this one does not: a full stack
+ends at `|h|max 7.8` with `|logits|max 21.05`, inside the 30.0 cap, whereas a single layer's output is
+not a final hidden state at all.
+
+**What this does and does not establish.** It is symbol-level agreement between the engine and an
+independent implementation of the whole model, which no single-layer check can give. It is still one
+prompt, the reference is still my own reading of the architecture rather than HuggingFace's code, and
+the logit gap is consistent with the quantization without being attributed to FP8 versus NVFP4 versus
+rounding. A raw prompt is also the right input here: the checkpoint's chat template belongs to the
+instruction-tuned model, which this artifact is not.
