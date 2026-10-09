@@ -301,3 +301,26 @@ files rather than a refactor of the shared body: the sliding profile first (D 25
 16 KV heads, window 1024, causal, scale exactly 1.0), then the global one (D 512, 4 KV heads, the
 compact row). The shared body and Qwen's dense route stay untouched. The cost is real and accepted:
 the softmax core is implemented twice rather than parameterized once.
+
+**Blocking finding on the attention input projections (round 18).** The artifact binds
+`attention/query`, `attention/key` and `attention/value` as *slices* of one fused FP8 object, which is
+what the converter's grouping produces and what llama.cpp matches by reading a single `wqkv` tensor in
+one matmul. But nothing in this runtime can turn those slices back into a parent weight:
+
+- `ops::prepare_linear_weight` refuses a slice with "this native Weight input requires a complete
+  FP8/NVFP4 parent".
+- `ops::prepare_attn_input_proj_weights`, which exists to combine exactly these three inputs, refuses
+  the combination with "QKV input projection: unsupported logical geometry" because its registered
+  geometries are Qwen's.
+
+So a Gemma layer cannot consume the artifact's per-projection bindings at all. The fix belongs in the
+converter: bind one parameter for the fused parent (sliding 16384 rows = 8192 + 4096 + 4096, global
+18432 = 16384 + 2048) instead of three slices, which is also the shape `n16384_k5376` and
+`n18432_k5376` that the linear registry expects. The recipe's `group(selectors, shape=...)` looks like
+the mechanism, since grouping without a shape is what produced the physical parent with separate
+logical bindings; that needs verifying by re-converting and re-inspecting.
+
+Two corrections to the layer composition came out of reading llama.cpp at the same time: the layer's
+output is the residual stream itself (the *next* layer applies its own `attn_norm`, so a layer must
+not norm its own output), and the sliding layers norm V weightlessly (`ggml_rms_norm(Vcur, eps)`),
+which the first forward attempt omitted.

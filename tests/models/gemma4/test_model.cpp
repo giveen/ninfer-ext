@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "models/gemma4/load.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <iostream>
@@ -54,6 +55,17 @@ int main() {
 
         const auto& embedding = model->weight(weights.text.token_embedding);
         check(embedding.name == "text/token_embedding", "token embedding name");
+
+        // The three accessor forms the Ops need: a norm weight as a plain tensor, a projection as a
+        // native weight input, and the layer scalar as a host float.
+        const auto norm = model->tensor(weights.text.layers[0].input_norm);
+        check(norm.ne[0] == 5376 && norm.dtype == DType::BF16, "input norm tensor shape");
+        const auto projection = model->input(weights.text.layers[0].attention.query);
+        check(projection.policy == ops::LinearPolicy::A16Only, "query projection policy");
+
+        const float scalar = model->layer_scalar(weights.text.layers[0].layer_scalar);
+        check(std::isfinite(scalar), "layer scalar is finite");
+        check(scalar != 1.0F, "layer scalar is a learned value, not the neutral one");
         const auto& scaled = model->weight(weights.text.layers[0].layer_scalar);
         check(scaled.name == "text/layers/0/layer_scalar", "layer scalar name");
         const auto& query = model->weight(weights.text.layers[0].attention.query);
