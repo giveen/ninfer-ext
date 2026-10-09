@@ -5,6 +5,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,15 @@ int run_fp8_a16() {
         const auto invocations = a16_capacity_calls();
         failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                               {n, 5376, seed, Comparison::Sampled, true, invocations});
+    }
+    // The output projections and the vocabulary head: k becomes the wide side here.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 3> wide_shapes{
+        std::tuple{5376, 8192, 829U}, std::tuple{5376, 16384, 830U},
+        std::tuple{262144, 5376, 831U}};
+    for (const auto& [n, k, seed] : wide_shapes) {
+        const auto invocations = a16_capacity_calls();
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
     }
     std::vector<Invocation> vocabulary_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
