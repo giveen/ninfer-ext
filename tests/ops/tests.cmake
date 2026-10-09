@@ -9,6 +9,7 @@ set(ninfer_op_tests
   rmsnorm_pack_tail
   gated_rmsnorm
   l2norm
+  mul_scalar
   gated_delta_net
   kimi_delta_attention
   causal_conv1d_silu
