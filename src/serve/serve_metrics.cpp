@@ -194,6 +194,16 @@ void ServeMetrics::observe_done(const GenerationOutcome& outcome) {
         metrics.speculative_draft_tokens + metrics.speculative_lookup_draft_tokens;
     spec_accepted_tokens_ +=
         metrics.speculative_accepted_tokens + metrics.speculative_lookup_accepted_tokens;
+    if (outcome.constraint) {
+        const ConstraintObservation& constraint = *outcome.constraint;
+        ++constraint_outcomes_[constraint.terminated ? 0 : constraint.complete ? 1 : 2];
+        ++constraint_cache_[static_cast<unsigned>(constraint.cache)];
+        constraint_prepare_seconds_ += constraint.prepare_seconds;
+        constraint_mask_seconds_ += constraint.mask_seconds;
+        constraint_matcher_seconds_ += constraint.matcher_seconds;
+        constraint_positions_ += constraint.mask_positions;
+        constraint_upload_bytes_ += constraint.mask_upload_bytes;
+    }
     const auto& per_position = metrics.speculative_accepted_per_position;
     if (spec_accepted_per_position_.size() < per_position.size()) {
         spec_accepted_per_position_.resize(per_position.size(), 0);
@@ -311,6 +321,39 @@ std::string ServeMetrics::render(const RuntimeStats& runtime) const {
     w.histogram("ninfer:request_generation_tokens", "Number of generation tokens per request.",
                 generation_tokens_);
 
+    w.family("ninfer:constraint_requests_total", "counter",
+             "Settled constrained requests by language completion.");
+    const char* constraint_outcomes[] = {"terminated", "complete_interrupted",
+                                         "incomplete_interrupted"};
+    for (std::size_t outcome = 0; outcome < 3; ++outcome) {
+        w.sample("ninfer:constraint_requests_total",
+                 static_cast<double>(constraint_outcomes_[outcome]),
+                 "outcome=\"" + std::string(constraint_outcomes[outcome]) + "\"");
+    }
+    w.family("ninfer:constraint_cache_total", "counter",
+             "Compilation cache access for settled constrained requests.");
+    const char* constraint_cache[] = {"hit", "built", "waited"};
+    for (std::size_t access = 0; access < 3; ++access) {
+        w.sample("ninfer:constraint_cache_total", static_cast<double>(constraint_cache_[access]),
+                 "result=\"" + std::string(constraint_cache[access]) + "\"");
+    }
+    w.scalar("ninfer:constraint_prepare_seconds_total", "counter",
+             "Observed constraint preparation work.",
+             constraint_prepare_seconds_);
+    w.scalar("ninfer:constraint_mask_seconds_total", "counter",
+             "Observed CPU mask work, including lookahead rollback.", constraint_mask_seconds_);
+    w.scalar("ninfer:constraint_matcher_seconds_total", "counter",
+             "Observed matcher acceptance and discard work.", constraint_matcher_seconds_);
+    w.scalar("ninfer:constraint_mask_positions_total", "counter",
+             "Evaluated constrained prediction positions.",
+             static_cast<double>(constraint_positions_));
+    w.scalar("ninfer:constraint_mask_upload_bytes_total", "counter",
+             "Submitted mask payload bytes.", static_cast<double>(constraint_upload_bytes_));
+    w.scalar("ninfer:constraint_draft_wait_seconds_total", "counter",
+             "Draft-ready wait, counted once per speculative batch.",
+             static_cast<double>(runtime.host_work.constraint_draft_wait_ns -
+                                 baseline_.host_work.constraint_draft_wait_ns) *
+                 1e-9);
     w.scalar("ninfer:spec_decode_num_drafts_total", "counter",
              "Number of speculative verification rounds (MTP, DFlash and prompt lookup).",
              static_cast<double>(spec_drafts_));

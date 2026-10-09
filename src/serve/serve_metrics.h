@@ -4,6 +4,7 @@
 #include "serve/generation_service.h"
 #include "serve/request_events.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -69,6 +70,15 @@ private:
     std::uint64_t spec_draft_tokens_     = 0;
     std::uint64_t spec_accepted_tokens_  = 0;
     std::vector<std::uint64_t> spec_accepted_per_position_;
+    // Settled constrained requests: completion outcome and compile-cache access, plus the work the
+    // constraint itself reported as subintervals of the request's existing timings.
+    std::array<std::uint64_t, 3> constraint_outcomes_{};
+    std::array<std::uint64_t, 3> constraint_cache_{};
+    double constraint_prepare_seconds_     = 0;
+    double constraint_mask_seconds_        = 0;
+    double constraint_matcher_seconds_     = 0;
+    std::uint64_t constraint_positions_    = 0;
+    std::uint64_t constraint_upload_bytes_ = 0;
 };
 
 // vLLM `finished_reason` label of a completed request: stop, length or abort.
