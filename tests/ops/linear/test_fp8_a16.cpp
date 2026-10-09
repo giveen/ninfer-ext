@@ -35,6 +35,11 @@ int run_fp8_a16() {
     const auto mlp_invocations = a16_capacity_calls();
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {34816, 5120, 821U, Comparison::Sampled, true, mlp_invocations});
+    // Gemma 4's sliding-attention query projection, the first of that model's shapes. It registers
+    // A16-only, so a request for a quantized activation route must fall back to this one.
+    const auto gemma_invocations = a16_capacity_calls();
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {8192, 5376, 825U, Comparison::Sampled, true, gemma_invocations});
     std::vector<Invocation> vocabulary_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},
