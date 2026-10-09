@@ -221,3 +221,25 @@ Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and gewell (Apache-2.0)
 | The assistant drafter's hidden state (before or after the final norm) | The drafter's `modeling_gemma4_assistant.py` — P6 |
 | Whether the compact global KV keeps the oracle's rounding at 128K/256K | The Op criterion at those lengths; fall back to separate K/V rows (+60% global KV) if it does not |
 | `layer_scalar` at layers 0, 1 and 59 (0.036–0.089) in BF16 residual | Oracle error at those layers |
+
+## 11. Unlanded attempts so far
+
+Recorded so the next attempt starts where this one stopped, not from scratch.
+
+- **Fused sublayer boundary (plan row 6), specified and attempted, not landed.** The Op was written
+  as `h' = (h + rmsnorm(y, w_post)) · s` then `x = rmsnorm(h', w_next)`, with `h'` treated as an
+  observable BF16 boundary — the second normalization consumes the stored value, and the test's
+  oracle for `x` therefore starts from the *rounded* scaled residual, which widens its criterion to
+  two roundings. With the layer scalar equal to one, every case passed. With a scalar other than
+  one, elements at small *cancelling* values deviated by up to 0.7% relative — about 3.5 BF16
+  half-ulps, which a single output rounding cannot produce — and the deviation was identical
+  (7.8e-3, one half-step at magnitude 2) across unrelated rows, so it is not a tie case. The Op was
+  reverted rather than shipped. The next attempt should compare `inv` and the residual sum directly
+  between the kernel and an FP64 recomputation, since the terms are fp32-reduced while the ideal is
+  fp64 and the observed deviation is *larger* than that difference explains.
+- **A real bug found while attempting it.** A kernel that reduces a row twice through one shared
+  buffer needs a barrier before the *second* reduction writes its slots, or a thread overwrites the
+  previous total before a slow thread has read it. The first version of the Op raced and produced
+  wrong `inv` values in some rows; the fix is a `__syncthreads()` at the top of the reused reduction.
+- **Causal temporary visibility for sliding attention (plan row 4), attempted, reverted.** See
+  section 5.1 for the evidence and the recommendation.
