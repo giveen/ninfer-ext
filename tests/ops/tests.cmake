@@ -22,6 +22,7 @@ set(ninfer_op_tests
   scalar
   cast
   prepare_ragged_prefix
+  scale_columns
   scatter
   scatter_bf16_batch
   target_logprobs

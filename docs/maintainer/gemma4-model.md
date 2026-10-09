@@ -117,6 +117,10 @@ o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
   non-rotated dims during Q preparation, so one load of `v` serves both QKᵀ and PV. The formula above
   remains the oracle; the reformulation changes rounding, which the Op criterion must cover.
 
+  Both multiplications are the `scale_columns` Op: the whole 512-wide head for `k = n ⊙ w_kn`, and
+  the two non-rotated runs `[64,256)` and `[320,512)` for the query prescale, whose dimensions
+  outside the range stay bit-exact.
+
 ## 6. Weight inventory
 
 From `model.safetensors.index.json` (1,188 tensors). Text lives under `model.language_model.`:
