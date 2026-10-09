@@ -63,7 +63,14 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
     }
 
     const auto* payload = static_cast<const std::byte*>(weight.payload);
-    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset) {
+    // The two planes must be ordered and stay inside the payload. A row slice of a larger FP8 object
+    // offsets both planes by its own first row, so the parent's absolute plane offset does not
+    // describe it and must not be demanded; the kernel indexes the slice's own base plus the strides
+    // validated above, which is why a slice of a fused projection is a whole operand.
+    const auto* codes  = static_cast<const std::byte*>(weight.qdata);
+    const auto* scales = static_cast<const std::byte*>(weight.scales);
+    if (codes < payload || scales < codes + geometry.code_plane_bytes ||
+        scales + geometry.scale_plane_bytes > payload + weight.payload_bytes) {
         throw std::invalid_argument(std::string(operation) + ": invalid FP8 plane geometry");
     }
     return geometry;
