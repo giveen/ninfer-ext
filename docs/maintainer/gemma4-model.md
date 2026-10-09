@@ -377,3 +377,40 @@ Three things about the artifact and the runtime came out of this, and two of the
 Still open: the global (full-attention) layers, which need the compact K/V path, the KV caches, the
 Program with its state, workspaces and CUDA graphs, the engine's load path and architecture dispatch,
 and the output head.
+
+## 13. The whole decoder stack runs
+
+`forward_layer` dispatches on each layer's attention kind, and a pass over the artifact now runs all
+60 layers in order — 50 sliding and 10 global — sharing one arena, every hidden state finite, the
+largest magnitude 5.97, and a layer index outside the stack refused. The fast suite is green at 166
+tests.
+
+**The global path is the compact one.** Its layers store no value projection because `attention_k_eq_v`
+holds: the value side is the key normalized *without* a weight, read from the same raw projection, and
+a second, weighted `key_norm` pass produces the key. Proportional RoPE takes `rope_angles` pairs
+against the full 512-wide head, so the pair partner of dim i is i + 256 and the dims outside those two
+runs carry no rotation — which is exactly the pair structure `compact_kv_rows` stores, giving the
+640-value rows the plan describes. On the non-rotated dims the key the score needs is the value times
+the key norm's weight, so the query carries that weight instead (`w_kn`, two `scale_columns` calls over
+[64,256) and [320,512)).
+
+**The layer scalars verify the load path.** The plan's analysis of this checkpoint records layer 59 at
+0.0364 and the others in 0.44–0.99, and those values are what scale the whole residual stream once per
+layer — which is also why the stream shrinks from the embedding's scale to a few units. The model reads
+back **0.036377 for layer 59** and a band of **[0.036377, 0.992188]**, matching the independent
+prediction. So the magnitudes that looked suspicious earlier are expected behavior, and the load path
+at the end of a 60-layer stack is doing what it should.
+
+**A note on shape order, because it cost a false alarm.** `Tensor` shapes here are column-major: the
+first axis is contiguous. So the attention ops' `[D, Hq, T, B]` places a head's `D` values in one
+contiguous run, which is the *same* layout as the checkpoint's row-major `(head, dim)`. Reasoning from
+the plan's `[16 heads, 256]` notation alone suggested a transpose was needed between the projections
+and the attention; the kernel's own addressing comment (`d + D * (head + Hq * column)`) shows there is
+not, and `rope` and `scale_columns` agree. Read a shape against its convention before concluding a
+transpose is missing.
+
+Still open, in the order they gate a running model: the KV caches (the sliding ring and the global
+pages) and the windowed/compact attention over more than one token, the Program with its state,
+workspaces and CUDA graphs, the engine's load path and architecture dispatch, the output head with its
+soft cap, and the numerical gate — the perplexity route against a reference — which nothing here
+substitutes for.
