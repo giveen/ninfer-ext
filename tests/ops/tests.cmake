@@ -21,6 +21,7 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  compact_kv_rows
   prepare_ragged_prefix
   scale_columns
   scatter

@@ -119,7 +119,10 @@ o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
 
   Both multiplications are the `scale_columns` Op: the whole 512-wide head for `k = n ⊙ w_kn`, and
   the two non-rotated runs `[64,256)` and `[320,512)` for the query prescale, whose dimensions
-  outside the range stay bit-exact.
+  outside the range stay bit-exact. The compact row itself is assembled by `compact_kv_rows`, which
+  puts the value vector first and then the rotated key dimensions in low-then-high order, `[0,64)`
+  followed by `[256,320)`; the checkpoint defines no order, so this is the representation's own
+  contract and the global attention reads it in that order.
 
 ## 6. Weight inventory
 
