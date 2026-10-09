@@ -28,8 +28,14 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, invocations});
+    // Gemma 4's MLP: the fused gate/up parent and the down projection.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {43008, 5376, 709U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5376, 21504, 711U, Comparison::Sampled, true, invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
-                        std::pair{5120, 6144}, std::pair{5120, 17408}}) {
+                        std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{43008, 5376},
+                        std::pair{5376, 21504}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;
