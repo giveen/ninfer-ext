@@ -3,6 +3,16 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+ops::SamplingMask ProgramImpl::bind_grammar_mask(runtime::TokenMaskProvider* provider,
+                                                 std::size_t row) {
+    grammar_dead_positions[row] = 0;
+    if (provider == nullptr || !provider->constrained(row)) { return {}; }
+    const auto words = static_cast<std::size_t>(grammar_masks_device.ne[0]);
+    return {static_cast<const std::uint32_t*>(grammar_masks_device.data) +
+                row * (draft_window + 1) * words,
+            static_cast<std::int32_t>(words)};
+}
+
 ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* provider,
                                                  std::size_t row,
                                                  std::span<const TokenId> drafts) {

@@ -999,10 +999,6 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  std::span<const runtime::RoundBudget> budgets,
                                  runtime::ExecutionTiming* failed_timing,
                                  runtime::TokenMaskProvider* masks) {
-    // Speculative rounds consume one mask per verify position; until that integration lands, a
-    // constrained request is refused at preparation, and this keeps a future path from silently
-    // running unconstrained.
-    require_unmasked_round(masks, lanes);
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -1013,6 +1009,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
+    bool constrained = false;
     const std::uint32_t width           = draft_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
@@ -1102,10 +1099,13 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
+            // The masks are filled between the phases; the ingress only carries their location.
+            dflash_host_ingress->sampling[row].mask = bind_grammar_mask(masks, row);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        constrained = masks != nullptr;
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_width,
@@ -1115,11 +1115,38 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *io.dflash_decode,
             *dflash_host_ingress,
             *dflash_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            dflash_draft_handoff->tokens(),
+            dflash_draft_handoff->ready};
 
         mark_workspace_usage(workspace_plan.dflash_round);
-        execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                       draft_window, envelopes, target_envelope, executable);
+        if (constrained) {
+            // A constrained round needs the chain on the host between drafting and verification, so
+            // it runs the two phases eagerly; the captured graph holds the whole round in one
+            // executable and cannot carry the handoff.
+            execution::dflash_decode_batch_phase(schedule_state,
+                                                 static_cast<std::int32_t>(lanes.size()),
+                                                 draft_window, envelopes, target_envelope,
+                                                 execution::SpeculativePhase::Forward);
+            timing.begin_constraint_wait();
+            dflash_draft_handoff->ready.synchronize();
+            timing.end_constraint_wait();
+            timing.resume_submit();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const auto extent =
+                    static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
+                (void)fill_grammar_mask(
+                    masks, row,
+                    dflash_draft_handoff->tokens().subspan(row * draft_window, extent));
+            }
+            execution::dflash_decode_batch_phase(schedule_state,
+                                                 static_cast<std::int32_t>(lanes.size()),
+                                                 draft_window, envelopes, target_envelope,
+                                                 execution::SpeculativePhase::Finish);
+        } else {
+            execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                           draft_window, envelopes, target_envelope, executable);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
