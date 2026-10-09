@@ -229,7 +229,7 @@ def build_model(
     records = {"text": {"config": config}}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], vision_config=None,
-        overrides=resource_overrides,
+        overrides=resource_overrides, family="gemma",
     )
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
