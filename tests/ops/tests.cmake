@@ -25,6 +25,7 @@ set(ninfer_op_tests
   compact_kv_rows
   prepare_ragged_prefix
   scale_columns
+  sliding_causal_attention
   soft_cap
   scatter
   scatter_bf16_batch
