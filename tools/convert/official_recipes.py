@@ -9,6 +9,7 @@ from .methods import (
     import_encoded,
     q4_rows_maxabs,
     nvfp4_absmax,
+    nvfp4_mse,
 )
 from .sources.compressed_tensors import compressed_matrix_source
 from .sources.exl3 import exl3_matrix_source
@@ -509,6 +510,27 @@ def qwen3_8_flash_next_bf16(model, recipe, sources):
             recipe.group(names)
 
 
+def gemma4_31b_base(model, recipe, sources):
+    """Gemma 4 31B from the base BF16 checkpoint: our own NVFP4 MLPs and FP8 rows elsewhere.
+
+    NVIDIA's NVFP4 checkpoint is an instruction-tuned artifact, so it cannot be imported here;
+    the plan's L1 layout is reached with the converter's own encoders instead (plan 6.2/6.3).
+    """
+    _optional(model, recipe)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name == "text/token_embedding":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            continue
+        if not parameter.projection:
+            continue
+        if "/mlp/" in name:
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif "/attention/" in name:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -522,4 +544,5 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_bf16": qwen3_8_flash_next_bf16,
     "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
+    "gemma4_31b_base": gemma4_31b_base,
 }
