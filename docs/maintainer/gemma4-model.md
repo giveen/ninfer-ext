@@ -441,3 +441,31 @@ paging is what lifts; sliding layers are unbounded because the ring is exactly t
 processed one at a time — correct, and equivalent to a batched prefill because each Op already takes
 the whole cache and its own position array, but not yet measured as a prefill. And the numbers are
 still only structurally checked: finiteness, bounds, and these cache invariants, not a reference.
+
+## 15. The layer forward against an independent reference
+
+`tools/verify/gemma4_layer_reference.py` recomputes one decoder layer from the BF16 checkpoint in
+FP32 — independently of the engine and of the Ops — and compares it with the engine's own output on
+exactly the same input, which `ninfer_gemma4_layer_test` dumps.
+
+**Result: structural agreement on both layer kinds, over four cached tokens.**
+
+| Layer | Kind | worst cosine | worst relative L2 |
+|---|---|---|---|
+| 0 | sliding | 0.999996 | 0.0030 |
+| 5 | global | 0.999999 | 0.0019 |
+
+The engine's weights are FP8 row-scale and NVFP4, so a fraction of a percent is the quantization floor,
+not slack: the check's job is to rule out a *structural* error — a transposed layout, a missing
+rotation, a mis-grouped head, a score computed without the key norm's weight — each of which moves the
+cosine far below 1.
+
+What the four tokens cover: the input norm, both projections, the per-head q and k norms and the
+weightless value norm, both RoPE kinds, the head grouping, the causal attention scores and softmax, the
+output projection, both sandwich norms, GeGLU, the MLP, and the layer scalar. The multi-token case is
+what makes the attention real — with a single key every score would be 1 and neither the sliding dot
+product nor the global compact score with its `w_kn` prescale would be exercised at all.
+
+What it does not cover: the sliding window's boundary (needs more than 1024 tokens), the cross-layer
+composition (errors would compound), the final norm and the head, and the quantized routes' *quality*
+as opposed to their structure. Those are the perplexity route's business.
