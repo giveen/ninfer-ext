@@ -8,10 +8,12 @@
 #include "artifact/materializer.h"
 #include "core/device.h"
 #include "core/weight_view.h"
+#include "ninfer/ops/weight_input.h"
 #include "models/gemma4/config.h"
 #include "models/gemma4/weights.h"
 #include "models/load_options.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -45,6 +47,12 @@ public:
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
+    // The three accessor forms the Ops need. A norm weight is a plain tensor, a projection is a
+    // native weight, and the layer scalar is a host float because mul_scalar takes a value.
+    [[nodiscard]] Tensor tensor(WeightId id) const;
+    [[nodiscard]] ops::WeightInput input(WeightId id) const;
+    [[nodiscard]] float layer_scalar(WeightId id) const;
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
@@ -53,13 +61,14 @@ private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(TextConfig config, ModelWeights weights, std::vector<BoundWeight> bound,
-          artifact::MaterializedArtifact backing);
+          std::vector<float> layer_scalars, artifact::MaterializedArtifact backing);
 
     // Destroyed last: every BoundWeight view borrows these bytes.
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
+    std::vector<float> layer_scalars_;
 };
 
 // Uploads the plan's selected bytes and resolves every bound view. The plan is consumed.

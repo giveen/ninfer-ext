@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "artifact/views.h" // bind_view
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -178,11 +179,32 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 }
 
 Model::Model(TextConfig config, ModelWeights weights, std::vector<BoundWeight> bound,
-             artifact::MaterializedArtifact backing)
+             std::vector<float> layer_scalars, artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
-      bound_(std::move(bound)) {}
+      bound_(std::move(bound)), layer_scalars_(std::move(layer_scalars)) {}
 
 Model::~Model() = default;
+
+Tensor Model::tensor(WeightId id) const {
+    const auto& bound = weight(id);
+    const auto& view  = bound.view;
+    if (view.shape.empty() || view.shape.size() > 4) {
+        throw artifact::ArtifactError(bound.name + ": parameter has no tensor shape");
+    }
+    std::array<std::int32_t, 4> axes{1, 1, 1, 1};
+    for (std::size_t i = 0; i < view.shape.size(); ++i) {
+        axes[i] = static_cast<std::int32_t>(view.shape[view.shape.size() - 1 - i]);
+    }
+    return weight_tensor(view, {axes[0], axes[1], axes[2], axes[3]});
+}
+
+ops::WeightInput Model::input(WeightId id) const {
+    // The activation policy the artifact declares per input is not bound yet, so every weight is
+    // requested as A16-only, which is how the registered Gemma shapes are declared.
+    return ops::WeightInput{weight(id).view, ops::LinearPolicy::A16Only, std::nullopt};
+}
+
+float Model::layer_scalar(WeightId id) const { return layer_scalars_.at(id.index); }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                         const StartupObserver* observer) {
@@ -190,8 +212,22 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto data    = std::move(plan.impl_);
     auto backing = artifact::materialize(*data->plan.source, std::move(data->plan), device, observer);
     auto bound   = resolve_weights(data->references, backing);
+
+    // The layer scalars are consumed as host floats, so read the sixty 4-byte values once here
+    // rather than syncing a device copy on every layer of every token.
+    std::vector<float> layer_scalars(data->references.size(), 1.0F);
+    for (const auto& layer : data->weights.text.layers) {
+        const auto& reference = data->references.at(layer.layer_scalar.index);
+        if (reference.shape.size() != 1 || reference.shape[0] != 1) {
+            throw artifact::ArtifactError(reference.name + ": layer scalar must be [1]");
+        }
+        const Tensor scalar = weight_tensor(bound.at(layer.layer_scalar.index).view, {1, 1, 1, 1});
+        CUDA_CHECK(cudaMemcpy(&layer_scalars[layer.layer_scalar.index], scalar.data,
+                              sizeof(float), cudaMemcpyDeviceToHost));
+    }
     return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->weights),
-                                            std::move(bound), std::move(backing)));
+                                            std::move(bound), std::move(layer_scalars),
+                                            std::move(backing)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
