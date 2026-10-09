@@ -1,6 +1,7 @@
 # Build
 build/
 build-*/
+Testing/
 cmake-build-*/
 *.o
 *.obj
