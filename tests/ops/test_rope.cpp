@@ -32,7 +32,14 @@ struct Geometry {
     int axes;
     int tokens;
     float theta;
+    // Rotated pairs; 0 is the full rotary span, which every profile except the proportional one
+    // uses.
+    int rotary_pairs = 0;
 };
+
+int geometry_rotary_pairs(const Geometry& geometry) {
+    return geometry.rotary_pairs > 0 ? geometry.rotary_pairs : geometry.rotary_dim / 2;
+}
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
     return static_cast<std::size_t>(head_dim) * static_cast<std::size_t>(heads) *
@@ -80,10 +87,11 @@ std::vector<int> make_positions(int axes, int tokens, int first_position) {
 std::vector<double> rope_oracle(const std::vector<float>& input, const std::vector<int>& positions,
                                 const Geometry& geometry, int heads) {
     std::vector<double> output(input.begin(), input.end());
-    const int half = geometry.rotary_dim / 2;
+    const int half  = geometry.rotary_dim / 2;
+    const int pairs = geometry_rotary_pairs(geometry);
     for (int token = 0; token < geometry.tokens; ++token) {
         for (int head = 0; head < heads; ++head) {
-            for (int pair = 0; pair < half; ++pair) {
+            for (int pair = 0; pair < pairs; ++pair) {
                 int axis        = 0;
                 double exponent = 0.0;
                 if (geometry.axes == 2) {
@@ -272,7 +280,8 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, execution);
+    ops::rope(position_tensor, geometry.rotary_dim, geometry_rotary_pairs(geometry),
+              geometry.theta, q_tensor, k_tensor, execution);
     cuda_synchronize();
 
     if (graph) {
@@ -281,8 +290,8 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor,
-                  execution.on_stream(stream));
+        ops::rope(position_tensor, geometry.rotary_dim, geometry_rotary_pairs(geometry),
+                  geometry.theta, q_tensor, k_tensor, execution.on_stream(stream));
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
@@ -345,7 +354,8 @@ int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, execution);
+    ops::rope(position_tensor, geometry.rotary_dim, geometry_rotary_pairs(geometry),
+              geometry.theta, tensor, execution);
     cuda_synchronize();
 
     const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
@@ -406,7 +416,8 @@ int run_vision_packed_case(DeviceExecutionView execution) {
     Tensor k_tensor(packed_data + kPlane, DType::BF16, {kHeadDim, kHeads, kTokens});
     q_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, execution);
+    ops::rope(position_tensor, kHeadDim, kHeadDim / 2, kVisionTheta, q_tensor, k_tensor,
+              execution);
     cuda_synchronize();
 
     const auto got = from_device<std::uint16_t>(packed_device.data(), packed.size());
@@ -444,6 +455,22 @@ int run_vision_packed_case(DeviceExecutionView execution) {
 }
 
 } // namespace
+
+// A pair count outside [1,min(rotary_dim/2,128)] is a domain error, and a mode whose count is fixed
+// by its geometry refuses a different one. Data pointers stay null: every rejection here happens in
+// the contract checks, before the Op reads anything.
+int verify_rejection(DeviceExecutionView execution, const char* label, int head_dim, int axes,
+                     int q_heads, int k_heads, int rotary_dim, int rotary_pairs, float theta) {
+    constexpr int kTokens = 1;
+    Tensor positions(nullptr, DType::I32, {kTokens, axes});
+    Tensor q(nullptr, DType::BF16, {head_dim, q_heads, kTokens});
+    Tensor k(nullptr, DType::BF16, {head_dim, k_heads, kTokens});
+    try {
+        ops::rope(positions, rotary_dim, rotary_pairs, theta, q, k, execution);
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << label << ": rope accepted an unsupported rotary geometry\n";
+    return 1;
+}
 
 int main() {
     if (cuda_unavailable()) {
@@ -492,6 +519,39 @@ int main() {
         run_single_case(execution, {"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 
     failures += run_vision_packed_case(execution);
+
+    // Gemma 4 text attention: the sliding layers rotate the whole 256-wide head at theta 10000, and
+    // the global layers rotate only the leading 64 pairs of a 512-wide head at theta 1e6, whose
+    // frequency denominator is the full head dimension. Both geometries are new here: the sliding
+    // profile is the first full-span D256 case, and the global one is the first proportional case.
+    failures += run_pair_case(execution, {"gemma4 sliding D256 full span", 256, 256, 1, 7, 10'000.0F},
+                              32, 16, 1024);
+    failures += run_pair_case(execution, {"gemma4 sliding D256 decode", 256, 256, 1, 1, 10'000.0F},
+                              32, 16, 131'072);
+    failures += run_pair_case(
+        execution, {"gemma4 sliding D256 long context", 256, 256, 1, 16, 10'000.0F}, 32, 16,
+        262'144);
+    failures += run_pair_case(
+        execution, {"gemma4 global proportional D512", 512, 512, 1, 7, 1.0e6F, 64}, 32, 4, 262'144);
+    failures += run_pair_case(execution, {"gemma4 global proportional D512 batch", 512, 512, 1, 32,
+                                          1.0e6F, 64},
+                              32, 4, 131'072);
+    failures += run_single_case(
+        execution, {"gemma4 global proportional single form", 512, 512, 1, 5, 1.0e6F, 64}, 4,
+        4096);
+
+    // Rotary-geometry boundaries: the pair count, and modes with a fixed one.
+    failures += verify_rejection(execution, "rope pairs=0", 512, 1, 32, 4, 512, 0, 1.0e6F);
+    failures += verify_rejection(execution, "rope pairs beyond the span", 512, 1, 32, 4, 512, 257,
+                                 1.0e6F);
+    failures += verify_rejection(execution, "rope pairs beyond the coefficient cache", 512, 1, 32, 4,
+                                 512, 200, 1.0e6F);
+    failures += verify_rejection(execution, "rope sliding pairs=129", 256, 1, 32, 16, 256, 129,
+                                 10'000.0F);
+    failures += verify_rejection(execution, "rope vision pairs=35", 72, 2, 16, 16, 72, 35,
+                                 10'000.0F);
+    failures += verify_rejection(execution, "rope proportional D512 with mrope axes", 512, 3, 32, 4,
+                                 512, 64, 1.0e6F);
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     failures += run_pair_case(execution, {"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32,

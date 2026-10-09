@@ -68,13 +68,15 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                DeviceExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, execution);
+    ops::rope(positions, dimension(config.rotary_dim), dimension(config.rotary_dim) / 2,
+              config.rope_theta, query, execution);
 }
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
                DeviceExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key, execution);
+    ops::rope(positions, dimension(config.rotary_dim), dimension(config.rotary_dim) / 2,
+              config.rope_theta, query, key, execution);
 }
 
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
@@ -90,8 +92,8 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
     }
     ops::rmsnorm(query, q_norm_weight, rms_norm_eps, true, normalized_query, execution.stream);
     ops::rmsnorm(key, k_norm_weight, rms_norm_eps, true, normalized_key, execution.stream);
-    ops::rope(positions, dimension(rope.rotary_dim), rope.rope_theta, normalized_query,
-              normalized_key, execution);
+    ops::rope(positions, dimension(rope.rotary_dim), dimension(rope.rotary_dim) / 2,
+              rope.rope_theta, normalized_query, normalized_key, execution);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

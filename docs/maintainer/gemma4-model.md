@@ -98,7 +98,14 @@ o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
   `inv_freq_j = 10⁶^(−2j/512)` for j < 64 — the denominator is the **full** head dim — and 0 for
   j = 64..255, and `rotate_half` pairs (j, j+256). Only dims {0..63} ∪ {256..319} rotate. This is
   **not** Qwen's partial RoPE (a contiguous leading block with frequencies normalized to the rotary
-  dim), so a Qwen RoPE kernel must not be reused here without checking.
+  dim): the rotated set is the leading pairs, and the frequency denominator stays the full head
+  dimension. The `rope` Op expresses both kinds through `rotary_pairs`, the count of rotated pairs,
+  taking the denominator from `rotary_dim`: global layers pass `rotary_dim = 512` with
+  `rotary_pairs = 64`, sliding layers `rotary_dim = 256` with `rotary_pairs = 128`. Pairs outside
+  the count and their partners are bit-exact unchanged, which reproduces the checkpoint's zeroed
+  frequencies instead of approximating them with a near-zero rotation. Long-context phases make the
+  generic kernel evaluate its angle in double: at position 262144 the float spacing alone is about
+  0.016 rad, wider than the deviation the rotation is held to.
 - **Compact global KV (private representation, exact reformulation).** On the 384 non-rotated dims
   `k[d] = v[d]·w_kn[d]`, so
   `q·k = Σ_{d∈rot} q[d]·k[d] + Σ_{d∉rot} (q[d]·w_kn[d])·v[d]`.

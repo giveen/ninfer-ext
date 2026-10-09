@@ -268,7 +268,7 @@ void run_text(const Options& options, int query_heads, int key_heads, int tokens
         }
         ops::rmsnorm(t_q, t_q_weight, kTextEps, true, t_qn, launch_stream);
         ops::rmsnorm(t_k, t_k_weight, kTextEps, true, t_kn, launch_stream);
-        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn,
+        ops::rope(t_positions, kTextRotaryDim, kTextRotaryDim / 2, kTextRopeBase, t_qn, t_kn,
                   execution.on_stream(launch_stream));
     };
     if (options.profile) {

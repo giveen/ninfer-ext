@@ -10,10 +10,10 @@
 
 namespace ninfer::ops::detail {
 
-void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 DeviceExecutionView execution);
+void rope_launch(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                 Tensor& q, Tensor& k, DeviceExecutionView execution);
 
-void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        DeviceExecutionView execution);
+void rope_single_launch(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                        Tensor& x, DeviceExecutionView execution);
 
 } // namespace ninfer::ops::detail
