@@ -15,8 +15,10 @@ namespace ninfer::ops {
  *   ideal[R + i, h, t]     = k[i, h, t]          for i < P
  *   ideal[R + P + i, h, t] = k[R/2 + i, h, t]    for i < P
  *
- * `v` and `k` are contiguous BF16 [R,H,T] with equal positive extents, and `out` is contiguous
- * BF16 [R + 2P,H,T]. The first R entries of a compact row hold the value vector; the 2P that
+ * `v` and `k` are contiguous BF16 with equal shapes whose leading extent is R, and `out` is
+ * contiguous BF16 with the same trailing extents and a leading extent of R + 2P. The registered
+ * profile is [R,Hkv,T,B]: one row per (KV head, token, batch), so the batch multiplies the row
+ * count and nothing else changes. The first R entries of a compact row hold the value vector; the 2P that
  * follow hold the rotated key dimensions in low-then-high order, which is the pair structure a
  * rotation of P pairs over an R-wide head produces: dims [0,P) are followed by dims [R/2,R/2+P).
  * The dimensions an R-wide rotation leaves alone are not stored, because the value vector stands in

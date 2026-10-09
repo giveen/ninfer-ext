@@ -48,8 +48,9 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
 }
 
 int run_case(const char* label, std::int32_t rotary_dim, std::int32_t rotary_pairs,
-             std::int32_t heads, std::int32_t tokens, std::uint32_t seed) {
-    const std::int64_t rows = static_cast<std::int64_t>(heads) * tokens;
+             std::int32_t heads, std::int32_t tokens, std::uint32_t seed,
+             std::int32_t batch = 1) {
+    const std::int64_t rows = static_cast<std::int64_t>(heads) * tokens * batch;
     const std::int32_t compact = rotary_dim + 2 * rotary_pairs;
     const std::size_t source_count =
         static_cast<std::size_t>(rows) * static_cast<std::size_t>(rotary_dim);
@@ -74,9 +75,9 @@ int run_case(const char* label, std::int32_t rotary_dim, std::int32_t rotary_pai
     device_k.copy_from_host(k_bits.data(), device_k.bytes());
     device_out.fill(0x7d);
 
-    Tensor v_tensor(device_v.data(), DType::BF16, {rotary_dim, heads, tokens});
-    Tensor k_tensor(device_k.data(), DType::BF16, {rotary_dim, heads, tokens});
-    Tensor out_tensor(device_out.data(), DType::BF16, {compact, heads, tokens});
+    Tensor v_tensor(device_v.data(), DType::BF16, {rotary_dim, heads, tokens, batch});
+    Tensor k_tensor(device_k.data(), DType::BF16, {rotary_dim, heads, tokens, batch});
+    Tensor out_tensor(device_out.data(), DType::BF16, {compact, heads, tokens, batch});
     ops::compact_kv_rows(v_tensor, k_tensor, out_tensor, rotary_dim, rotary_pairs, nullptr);
     cuda_synchronize();
 
@@ -133,6 +134,8 @@ int main() {
     // A different pair count, so the layout is not tied to the Gemma profile.
     failures += run_case("compact_kv_rows full span [512,16]", 256, 128, 16, 5, 3102U);
     failures += run_case("compact_kv_rows single pair [514,2]", 512, 1, 2, 3, 3103U);
+    // Batched: the row count is heads * tokens * batch.
+    failures += run_case("compact_kv_rows batched [640,4,2]", 512, 64, 4, 5, 3106U, 2);
     failures += run_case("compact_kv_rows odd head [128,8]", 64, 32, 8, 9, 3104U);
     // 65536 rows: one more than the largest grid dimension, so the row stride is exercised.
     failures += run_case("compact_kv_rows grid stride [128,8]", 64, 32, 8, 8192, 3105U);
