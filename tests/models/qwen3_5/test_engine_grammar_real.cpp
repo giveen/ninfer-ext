@@ -226,6 +226,20 @@ int main(int argc, char** argv) {
         auto json_thinking                      = json_request;
         json_thinking.execution.thinking.budget = 2;
         record(schema, engine.generate(engine.prepare(prompt(true)), json_thinking));
+        // A continuation that already committed part of a number resumes inside it: the grammar
+        // and the value decoder must agree on the digits the model has not produced yet.
+        auto numeric_prefix                    = prompt();
+        numeric_prefix.context_cache.session_key.reset();
+        numeric_prefix.options.continuation =
+            ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        const std::string partial_number = "{\"description\":\"你好\",\"values\":[1.5e-";
+        numeric_prefix.messages.push_back(
+            {.role  = ninfer::ChatRole::Assistant,
+             .parts = {{.kind = ninfer::MessagePartKind::Text, .text = partial_number}}});
+        auto numeric_suffix    = engine.generate(engine.prepare(numeric_prefix), json_request);
+        numeric_suffix.content = partial_number + numeric_suffix.content;
+        record(schema, numeric_suffix);
+
         auto json_prompt                      = prompt();
         json_prompt.messages[0].parts[0].text = "Return exactly the JSON object {\"ok\":true}.";
         auto object_request                   = json_request;
