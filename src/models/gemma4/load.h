@@ -1,0 +1,44 @@
+#pragma once
+
+#include "models/gemma4/config.h"
+#include "models/gemma4/weights.h"
+#include "models/load_options.h"
+
+#include <filesystem>
+#include <memory>
+
+namespace ninfer::artifact {
+class Reader;
+struct ParameterReference;
+} // namespace ninfer::artifact
+
+namespace ninfer::models::gemma4 {
+
+// Cold load plan. Every declared parameter is resolved against the artifact while planning, so a
+// name, shape or stored format the artifact does not carry is refused here rather than at
+// execution. The plan borrows its Reader until materialization, which is not part of this class yet.
+class LoadPlan {
+public:
+    ~LoadPlan();
+    LoadPlan(LoadPlan&&) noexcept;
+    LoadPlan& operator=(LoadPlan&&) noexcept;
+    LoadPlan(const LoadPlan&)            = delete;
+    LoadPlan& operator=(const LoadPlan&) = delete;
+
+    [[nodiscard]] const TextConfig& config() const;
+    [[nodiscard]] const ModelWeights& weights() const;
+    // How many parameters the plan declared, so a caller can walk every one of them.
+    [[nodiscard]] std::size_t parameter_count() const;
+    [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    explicit LoadPlan(std::unique_ptr<Impl> impl);
+    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
+};
+
+// The plan borrows `reader`, so the caller owns the Reader for the plan's lifetime.
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
+
+} // namespace ninfer::models::gemma4
