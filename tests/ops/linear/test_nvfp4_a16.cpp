@@ -33,9 +33,13 @@ int run_nvfp4_a16() {
                           {43008, 5376, 709U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5376, 21504, 711U, Comparison::Sampled, true, invocations});
+    // The artifact binds the MLP gate and up as two halves, so this is the shape the unfused path
+    // uses; the fused 43008-row parent stays registered for the recipe that fuses them.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {21504, 5376, 712U, Comparison::Sampled, true, invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{43008, 5376},
-                        std::pair{5376, 21504}}) {
+                        std::pair{5376, 21504}, std::pair{21504, 5376}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;
