@@ -64,6 +64,12 @@ struct FlashAttentionParams {
     std::int32_t splits;    // key splits per row tile; 1 writes `out` directly
     float* partial_out;     // [splits, rows, V] unnormalized, when splits > 1
     float* partial_stats;   // [splits, rows, 2] running max and sum
+    // A second key set, scanned after the first with the same strides and visibility: a pass's own
+    // keys beside a cache that does not hold them yet. extra_tokens == 0 means none.
+    const __nv_bfloat16* extra_k;
+    const __nv_bfloat16* extra_v;
+    const std::int32_t* extra_position; // [extra_tokens, B]
+    std::int32_t extra_tokens;
 };
 
 // Partial rows are numbered (batch, kv head, row tile, row) so the combine needs no geometry beyond
@@ -222,22 +228,27 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     if (p.indexed_keys) {
         key_end = query_high == INT_MIN ? 0 : min(p.key_tokens, query_high + 1);
     }
-    const std::int32_t key_tiles  = (key_end + kFlashKeys - 1) / kFlashKeys;
+    const std::int32_t main_tiles = (key_end + kFlashKeys - 1) / kFlashKeys;
+    const std::int32_t key_tiles  = main_tiles + (p.extra_tokens + kFlashKeys - 1) / kFlashKeys;
     const std::int32_t per_split  = (key_tiles + p.splits - 1) / p.splits;
     const std::int32_t tile_begin = split * per_split;
     const std::int32_t tile_end   = min(key_tiles, tile_begin + per_split);
-    for (std::int32_t base = tile_begin * kFlashKeys; base < tile_end * kFlashKeys;
-         base += kFlashKeys) {
+    for (std::int32_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
+        // The tile's key set: the main keys, then the extra ones.
+        const bool extra                 = tile_index >= main_tiles;
+        const std::int32_t base          = (extra ? tile_index - main_tiles : tile_index) * kFlashKeys;
+        const std::int32_t keys          = extra ? p.extra_tokens : p.key_tokens;
+        const __nv_bfloat16* key_rows    = extra ? p.extra_k : p.k;
+        const __nv_bfloat16* value_rows  = extra ? p.extra_v : p.v;
+        const std::int32_t* key_position = extra ? p.extra_position : p.position_k;
         // Positions first: a tile no row can see is skipped before its keys move.
         bool seen = false;
         if (thread < kFlashKeys) {
             const std::int32_t key = base + thread;
             std::int32_t position  = INT_MAX;
-            if (key < p.key_tokens) {
-                position = p.position_k[key + static_cast<std::int64_t>(p.key_tokens) * b];
-            }
+            if (key < keys) position = key_position[key + static_cast<std::int64_t>(keys) * b];
             kpos[thread] = position;
-            seen = key < p.key_tokens && query_high != INT_MIN && position <= query_high &&
+            seen = key < keys && query_high != INT_MIN && position <= query_high &&
                    (p.window == 0 ||
                     static_cast<std::int64_t>(query_low) - position < p.window);
         }
@@ -247,7 +258,13 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             const std::int32_t key = base + r;
             __nv_bfloat16* kdst    = ks + r * Layout::kQStride;
             __nv_bfloat16* vdst    = vs + r * vstride;
-            if (key >= p.key_tokens) {
+            // A key no row can see is not loaded: an unwritten cache slot may hold any bits, and a
+            // masked NaN value would still poison the P*V product.
+            const std::int32_t position = kpos[r];
+            const bool unseen           = position > query_high ||
+                                (p.window != 0 &&
+                                 static_cast<std::int64_t>(query_low) - position >= p.window);
+            if (key >= keys || unseen) {
                 for (int j = lane; j < QK; j += 32) kdst[j] = __float2bfloat16_rn(0.0F);
                 if constexpr (!kCompact) {
                     for (int j = lane; j < V; j += 32) vdst[j] = __float2bfloat16_rn(0.0F);
@@ -256,9 +273,9 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             }
             const std::int64_t row = static_cast<std::int64_t>(kvh) +
                                      static_cast<std::int64_t>(p.kv_heads) *
-                                         (key + static_cast<std::int64_t>(p.key_tokens) * b);
-            flash_copy_row(kdst, p.k + row * p.k_stride, QK, lane, 32);
-            if constexpr (!kCompact) flash_copy_row(vdst, p.v + row * p.v_stride, V, lane, 32);
+                                         (key + static_cast<std::int64_t>(keys) * b);
+            flash_copy_row(kdst, key_rows + row * p.k_stride, QK, lane, 32);
+            if constexpr (!kCompact) flash_copy_row(vdst, value_rows + row * p.v_stride, V, lane, 32);
         }
         __syncthreads();
 
@@ -279,7 +296,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             for (int i = 0; i < 4; ++i) {
                 const int r   = g + (i >= 2 ? 8 : 0);
                 const int col = warp * 8 + 2 * t + (i & 1);
-                const bool ok = qpos[r] != INT_MIN && base + col < p.key_tokens &&
+                const bool ok = qpos[r] != INT_MIN && base + col < keys &&
                                 flash_visible(qpos[r], kpos[col], p.window);
                 ss[r * (kFlashKeys + 1) + col] = ok ? acc[i] * p.scale : -CUDART_INF_F;
             }

@@ -216,6 +216,26 @@ identified; the bytes are the instruction-tuned model's.
 |---|---|---|---:|
 | `out/gemma4_31b_base_nvfp4.ninfer` | `gemma4_31b_base` | plan L1: MLP NVFP4 (converter-encoded, weight-only), attention and embedding FP8 rows, head BF16, norms BF16, `layer_scalar` FP32 | 22.8 GiB |
 | `out/gemma4_31b_g0.ninfer` | `gemma4_31b_g0` | gewell's G0 mask: embedding and head BF16, attention FP8, MLP FP8 in layers 0–5 and every global layer with its predecessor, NVFP4 elsewhere | 27.3 GiB |
+| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory | 23.6 GiB file, 20.9 GiB on the device |
+
+M1 is the serving artifact. The layout came from `tools/verify/gemma4_sensitivity.py` (per-tensor KLD
+against the BF16 checkpoint streamed from host memory, FP32 activations; BF16 activations put a 0.15
+KLD floor under every candidate) and `tools/verify/gemma4_allocate.py`, then whole layouts scored end
+to end, because single-tensor KLDs are heavy-tailed and do not add. On 4 x 2048 calibration tokens:
+
+| Layout | Device GiB | KLD |
+|---|---:|---:|
+| L1 | 22.7 | 0.758 |
+| G0 | 26.6 | 0.708 |
+| Q8 everywhere | 30.4 | 0.083 |
+| Q6 everywhere | 22.3 | 0.358 |
+| M1 | 20.9 | 0.419 |
+| Q5 attention, Q6 MLP | 21.4 | 0.590 |
+
+The 4-bit MLP is almost all of L1's error (BF16 attention with NVFP4 MLPs: 0.711; Q8 attention and
+head with BF16 MLPs: 0.053); attention below Q6 costs a lot; FP8 rows lose to Q8 g32 at equal size;
+the FP8 embedding alone costs 0.19, so M1 keeps it BF16 on the host, where the lookup reads one row
+per token.
 
 Bindings, read from the artifact: q/k/v are row slices of one FP8 parent per layer (sliding 16384 =
 8192 + 4096 + 4096 rows, global 18432 = 16384 + 2048 with no `value` binding); gate and up are
@@ -231,19 +251,26 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 - **Program** (`src/models/gemma4/program.{h,cpp}`): up to eight lanes, each with its own `KvCache`
   and sampler state (device token counts), sharing the scratch arena, logits and token buffers.
   Every allocation is made at construction; `Program::device_bytes` sizes a configuration before it
-  is built. A pass covers at most `kBatch` = 128 tokens; a lane's prompt runs in such passes.
-- **KV cache** (`cache.{h,cpp}`): sliding layers keep a ring of `sliding_window + kBatch` rows. A pass
-  writes all its rows before any of its queries attends, so a ring of exactly the window would let a
-  later token of the pass overwrite a key an earlier query of the same pass still sees; with the
-  slack the replaced row is older than every query's window. Global layers keep one compact row per
-  token at its position, up to the lane's capacity. Unwritten slots carry position 2^30, which both
-  attention Ops treat as invisible, and the attention is handed only the written prefix.
-- **Attention Ops**: `sliding_causal_attention` (D 256, 32/16 heads, window, scale 1.0) and
-  `causal_compact_attention` over the 640-value compact rows. Both are correctness routes: one warp
-  per query row scanning every key, untiled.
-- **Linears**: attention projections FP8 A16 (tensor-core MMA); the MLP's NVFP4 shapes
-  (`n21504_k5376`, `n5376_k21504`) have only A16 SIMT/GEMV routes, no tensor cores and no A4 route;
-  the head is BF16 MMA. GeGLU is unfused (`gelu_mul` on the two halves).
+  is built. A prefill pass covers at most `kPass` = 512 tokens and applies the head to its last token
+  only; scoring runs passes of `kScorePass` = 128 with every column's logits, which sizes the logits
+  buffer.
+- **KV cache** (`cache.{h,cpp}`): sliding layers keep a ring of exactly `sliding_window` rows. A pass
+  wider than one token attends to the ring as it was before the pass plus its own keys, which the
+  sliding Op takes as a second key set, and writes its last window of keys afterwards; so no write
+  replaces a key one of its own queries still sees, whatever the pass width. A single token writes
+  first and attends to the ring alone, since the row it replaces (position p − window) is invisible
+  to it. Global layers keep one compact row per token at its position, up to the lane's capacity.
+  Unwritten slots carry position 2^30, which both attention Ops treat as invisible; the Ops also
+  never load a key no row of the tile can see, so an unwritten slot's bits cannot reach the output.
+- **Attention Ops**: `sliding_causal_attention` (D 256, 32/16 heads, window, scale 1.0, optional
+  second key set) and `causal_compact_attention` over the 640-value compact rows share one
+  tensor-core flash kernel (`gemma_flash_attention.cuh`): BF16 m16n8k16 MMA with FP32 accumulation,
+  16 query rows per block, 32-key tiles skipped by position before they load, online Softmax with P
+  carried as a BF16 hi + lo pair, and a key split with a combine kernel when a pass has few rows.
+- **Linears**: M1's Q6 and Q5 g64 A16 routes carry Gemma's shapes. Single-token passes use the Q6
+  GEMV and single-row Q5 instances at K 5376 and 21504; wider passes reuse the route lists tuned for
+  the nearest Qwen shapes, untuned here. The 5376-wide RMSNorm has a fixed-width route. GeGLU is
+  unfused (`gelu_mul` on the two halves).
 - **Engine** (`src/runtime/engine/gemma_instance.{h,cpp}`): `EngineCore<GemmaInstance>` and
   `CausalScoreCore<GemmaInstance>`, the same controller Qwen uses. Admission is root-only: the
   context cache is switched off for this model, so the identity candidate is always feasible and
@@ -264,15 +291,15 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Chat template | `ninfer_gemma4_frontend_test` | 6 conversations, exact text and ids against transformers |
 | Single layers | `tools/verify/gemma4_layer_reference.py` (FP32 from the BF16 checkpoint) | cosine 0.99986 sliding and global, 4 cached tokens |
 | Head alone | HF's own stack output through this model's head | per-row cosine 0.999996, argmax 70/70 |
-| Whole model, scoring | `ninfer_gemma4_score_test` against `transformers` BF16 on CPU, 1,501 tokens | mean NLL 4.148 against HF's 4.116; past the window 3.020 against 2.990 |
-| Batched against token-at-a-time | `NINFER_GEMMA_SEQUENTIAL=1` on the same text | mean per-target difference 0.29 nats inside the window, 0.13 past it (worst 2.6); before the ring fix 0.36 past it (worst 14.6) |
+| Whole model, scoring | `ninfer_gemma4_score_test` against `transformers` BF16 on CPU, 1,501 tokens | M1: mean NLL 4.075 against HF's 4.116 (L1: 4.148); mean per-target \|difference\| from HF 0.68 (L1: 0.79) |
+| Batched against token-at-a-time | `NINFER_GEMMA_SEQUENTIAL=1` on the same text | M1: mean per-target difference 0.24 nats inside the window, 0.15 past it; the worst single target varies from 4 to 8 nats between builds that only reorder sums |
 | Engine routes | the score test's Engine-core and public-API modes | identical to the Program on 1,500 positions |
 | Generation | `ninfer` CLI, greedy | "The capital of France is Paris."; thinking mode streams reasoning separately from the answer |
 | Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand |
 
 **Per-position divergence from HF is large even where the averages agree.** On the 1,501-token text
-the mean per-target |difference| from HF is 0.79 nats with a 99th percentile of 7.8 and a worst of 23,
-for both of this engine's routes. It is concentrated on low-probability targets: of the 761 targets
+L1's mean per-target |difference| from HF is 0.79 nats with a 99th percentile of 7.8 and a worst of 23,
+for both of this engine's routes; M1's is 0.68, 99th percentile 6.6, and the same worst target. It is concentrated on low-probability targets: of the 761 targets
 HF assigns more than −0.1, both routes put three below −5. Batched and token-at-a-time passes (a
 tiled SIMT linear against a GEMV) differ from each other by a similar amount, which points at the
 sensitivity of this artifact's logit tails to rounding rather than at a structural error, but the
@@ -281,35 +308,37 @@ suggests, which is what plan P4 (precision) addresses.
 
 ## 12. Performance
 
-`ninfer_bench` on an RTX 5090, CUDA 13.4 runtime, L1 artifact, BF16 KV, one request, three
-repetitions:
+`ninfer_bench` on an RTX 5090, CUDA 13.4 runtime, BF16 KV, one request, three repetitions:
 
-| Test | Result |
-|---|---:|
-| pp1024 | 327 tok/s |
-| pp4096 | 220 tok/s |
-| pp8192 | 161 tok/s |
-| tg128 | 41.0 tok/s |
+| Test | L1, untiled attention | M1, current |
+|---|---:|---:|
+| pp1024 | 327 tok/s | 2,388 tok/s |
+| pp4096 | 220 tok/s | 2,108 tok/s |
+| pp8192 | 161 tok/s | 1,837 tok/s |
+| tg128 | 41.0 tok/s | 52.6 tok/s |
 
-The decode ceiling from weight bytes at 1.79 TB/s is about 83 tok/s, so decode runs at about half of
-it, without CUDA Graphs. The bench header reports `decode_path=cuda_graph`; that is the option as
-passed, not what this model ran.
+Decode is measured alone (`-n 128 -r 5`); right after the prefill tests in the same run it reads
+about 1% lower. The decode ceiling from M1's 20.9 GiB of device weights at 1.79 TB/s is about 80
+tok/s, so decode runs at about two thirds of it, without CUDA Graphs. The bench header reports
+`decode_path=cuda_graph`; that is the option as passed, not what this model ran.
 
-An 8K prefill (nsys, one pass) spends 51% of GPU time in `causal_compact_attention`, 18% in
-`sliding_causal_attention`, 27% in the NVFP4 MLP's SIMT kernels and 3% in the FP8 projections. The
-untiled attention routes are therefore the first prefill cost, and the NVFP4 shapes' missing tensor
-core routes the second. Two concurrent requests both progress, but each lane runs its own pass, so a
-second lane re-reads the weights rather than sharing a pass.
+Of a decode token's GPU kernel time (nsys), the Q6 and Q5 linears are 88%, RoPE (a generic kernel)
+4.6%, attention 3.6%, and norms and element-wise kernels the rest. Kernel time is about 18 ms of the
+19 ms per token, so launch gaps, which CUDA Graphs would remove, cost about 5%; the linears' distance
+from the weight-streaming rate is the larger lever. An 8K prefill at 128-token passes spent 46% in the Q6 MMA, 22% in the Q5
+sliced-K MMA and 29% in attention; widening the pass to 512 tokens took pp8192 from 991 to 1,837
+tok/s. Two concurrent requests both progress, but each lane runs its own pass, so a second lane
+re-reads the weights rather than sharing a pass.
 
 ## 13. Not done
 
 | Item | Why it matters | What it needs |
 |---|---|---|
 | Prefix reuse | an agent loop re-prefills its whole history every turn, at the prefill rates above | the D1-b move of the continuation, shared-prefix and capture types into `runtime/contract`; ring-snapshot checkpoints as the state image |
-| Fast prefill | 51 s for 8K tokens | tiled sliding and compact attention; tensor-core NVFP4 routes for the Gemma shapes |
+| Tuned prefill linears | the wide Q6/Q5 routes borrow lists tuned for Qwen shapes | a route sweep at Gemma's N and K |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
 | CUDA Graphs | decode launch overhead | graph capture per lane count |
-| Output constraints, thinking budget | refused | token-mask consumption in the Program; Gemma's thinking-close control span |
+| Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
 | Vision, assistant drafter | plan P5, P6 | |
 

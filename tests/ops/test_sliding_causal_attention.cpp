@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,26 @@ int run_case(const Case& c, std::uint32_t seed) {
             });
     }
 
+    // A key no query sees stands for an unwritten cache slot, which may hold any bits: NaN there must
+    // not reach the output.
+    for (std::int32_t b = 0; b < c.batch; ++b) {
+        for (std::int32_t key = 0; key < c.key_tokens; ++key) {
+            bool seen = false;
+            for (std::int32_t t = 0; t < c.query_tokens; ++t) {
+                const std::int32_t distance =
+                    position_q[t + c.query_tokens * b] - position_k[key + c.key_tokens * b];
+                seen = seen || (distance >= 0 && distance < static_cast<std::int32_t>(c.window));
+            }
+            if (seen) continue;
+            for (std::int32_t h = 0; h < c.kv_heads; ++h) {
+                for (std::int32_t d = 0; d < c.head_dim; ++d) {
+                    k[kv_index(c, d, h, key, b)] = std::numeric_limits<float>::quiet_NaN();
+                    v[kv_index(c, d, h, key, b)] = std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+        }
+    }
+
     // Encode to the BF16 bits the tensors declare; uploading the raw floats would hand the kernel
     // 4-byte values where it reads 2-byte ones.
     const auto q_bits = encode_bf16(q);
@@ -130,23 +151,78 @@ int run_case(const Case& c, std::uint32_t seed) {
     Tensor pk_tensor(device_pk.data(), DType::I32, {c.key_tokens, c.batch});
     Tensor out_tensor(device_out.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
 
-    // Each route is checked: one pass, and the key split a workspace allows.
+    // The same keys as two sets: the first `head` keys of every batch, then the rest as the extra
+    // set, the way a pass's own keys sit beside a ring.
+    const std::int32_t head  = c.key_tokens > 1 ? c.key_tokens / 3 + 1 : c.key_tokens;
+    const std::int32_t extra = c.key_tokens - head;
+    const auto take = [&](const std::vector<std::uint16_t>& bits, std::int32_t from, std::int32_t n) {
+        std::vector<std::uint16_t> part;
+        const std::size_t row = static_cast<std::size_t>(c.head_dim) * c.kv_heads;
+        for (std::int32_t b = 0; b < c.batch; ++b) {
+            const auto* base = bits.data() + (static_cast<std::size_t>(b) * c.key_tokens + from) * row;
+            part.insert(part.end(), base, base + static_cast<std::size_t>(n) * row);
+        }
+        return part;
+    };
+    const auto take_positions = [&](std::int32_t from, std::int32_t n) {
+        std::vector<std::int32_t> part;
+        for (std::int32_t b = 0; b < c.batch; ++b) {
+            const auto* base = position_k.data() + static_cast<std::size_t>(b) * c.key_tokens + from;
+            part.insert(part.end(), base, base + n);
+        }
+        return part;
+    };
+    const std::size_t row_bytes = static_cast<std::size_t>(c.head_dim) * c.kv_heads * 2;
+    GuardedDeviceBuffer device_k1(std::max<std::size_t>(16, row_bytes * head * c.batch));
+    GuardedDeviceBuffer device_v1(std::max<std::size_t>(16, row_bytes * head * c.batch));
+    GuardedDeviceBuffer device_p1(std::max<std::size_t>(16, 4u * head * c.batch));
+    GuardedDeviceBuffer device_k2(std::max<std::size_t>(16, row_bytes * extra * c.batch));
+    GuardedDeviceBuffer device_v2(std::max<std::size_t>(16, row_bytes * extra * c.batch));
+    GuardedDeviceBuffer device_p2(std::max<std::size_t>(16, 4u * extra * c.batch));
+    if (extra > 0) {
+        const auto k1 = take(k_bits, 0, head), v1 = take(v_bits, 0, head);
+        const auto k2 = take(k_bits, head, extra), v2 = take(v_bits, head, extra);
+        const auto p1 = take_positions(0, head), p2 = take_positions(head, extra);
+        device_k1.copy_from_host(k1.data(), k1.size() * 2);
+        device_v1.copy_from_host(v1.data(), v1.size() * 2);
+        device_p1.copy_from_host(p1.data(), p1.size() * 4);
+        device_k2.copy_from_host(k2.data(), k2.size() * 2);
+        device_v2.copy_from_host(v2.data(), v2.size() * 2);
+        device_p2.copy_from_host(p2.data(), p2.size() * 4);
+    }
+
+    // Each route is checked: one pass, the key split a workspace allows, and two key sets.
     const std::size_t split_bytes = ops::sliding_causal_attention_workspace_bytes(
         geometry, c.query_tokens, c.key_tokens, c.batch);
     GuardedDeviceBuffer device_workspace(std::max<std::size_t>(split_bytes, 16));
     int failures = 0;
     std::vector<double> got;
-    for (int route = 0; route < 2; ++route) {
+    const Tensor none;
+    for (int route = 0; route < 3; ++route) {
+        if (route == 2 && extra == 0) continue;
         Tensor workspace;
-        if (route == 1 && split_bytes > 0) {
+        if (route >= 1 && split_bytes > 0) {
             workspace = Tensor(device_workspace.data(), DType::U8,
                                {static_cast<std::int32_t>(split_bytes)});
         }
         device_out.fill(0x7d);
-        ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, pk_tensor, geometry,
-                                      c.window, 1.0F, out_tensor, workspace, nullptr);
+        if (route < 2) {
+            ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, pk_tensor, none,
+                                          none, none, geometry, c.window, 1.0F, out_tensor,
+                                          workspace, nullptr);
+        } else {
+            Tensor k1(device_k1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
+            Tensor v1(device_v1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
+            Tensor p1(device_p1.data(), DType::I32, {head, c.batch});
+            Tensor k2(device_k2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
+            Tensor v2(device_v2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
+            Tensor p2(device_p2.data(), DType::I32, {extra, c.batch});
+            ops::sliding_causal_attention(q_tensor, k1, v1, pq_tensor, p1, k2, v2, p2, geometry,
+                                          c.window, 1.0F, out_tensor, workspace, nullptr);
+        }
         cuda_synchronize();
-        const std::string label = std::string(c.label) + (route == 0 ? " (one pass)" : " (split)");
+        const std::string label = std::string(c.label) +
+                                  (route == 0 ? " (one pass)" : route == 1 ? " (split)" : " (two key sets)");
         got = from_device_bf16(device_out.data(), q_count);
         failures += verify_pointwise(label.c_str(), got, expected, sliding_causal_criterion());
     }

@@ -34,13 +34,13 @@ std::size_t token_count_bytes(const TextConfig& config) {
 }
 
 std::size_t shared_bytes(const TextConfig& config) {
-    const std::size_t batch      = static_cast<std::size_t>(Program::kBatch);
+    const std::size_t pass       = static_cast<std::size_t>(Program::kPass);
     const std::size_t hidden     = config.hidden_size;
     const std::size_t vocabulary = config.vocab_size;
-    return layer_workspace_bytes(config, Program::kBatch) +
+    return layer_workspace_bytes(config, Program::kPass) +
            ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(vocabulary), 1, 1) +
-           batch * sizeof(std::int32_t) + 2 * hidden * batch * sizeof(std::uint16_t) +
-           vocabulary * batch * sizeof(std::uint16_t);
+           pass * sizeof(std::int32_t) + 2 * hidden * pass * sizeof(std::uint16_t) +
+           vocabulary * static_cast<std::size_t>(Program::kScorePass) * sizeof(std::uint16_t);
 }
 
 } // namespace
@@ -48,13 +48,13 @@ std::size_t shared_bytes(const TextConfig& config) {
 std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacity,
                                   std::int32_t lanes) {
     const std::size_t lane =
-        KvCache::device_bytes(config, capacity, kBatch) + token_count_bytes(config);
+        KvCache::device_bytes(config, capacity) + token_count_bytes(config);
     return shared_bytes(config) + static_cast<std::size_t>(lanes) * lane;
 }
 
 Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
                  DeviceContext& device)
-    : model_(&model), arena_(layer_workspace_bytes(model.config(), kBatch)),
+    : model_(&model), arena_(layer_workspace_bytes(model.config(), kPass)),
       sampling_workspace_(std::max<std::size_t>(
           1, ops::sampling_workspace_capacity_bytes(
                  static_cast<std::int32_t>(model.config().vocab_size), 1, 1))),
@@ -68,16 +68,16 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
 
     lanes_.resize(static_cast<std::size_t>(lanes));
     for (Lane& lane : lanes_) {
-        lane.cache.configure(config, capacity, kBatch);
+        lane.cache.configure(config, capacity);
         lane.cache.allocate();
         allocated_bytes_ += lane.cache.bytes();
         lane.token_counts = device_alloc(token_count_bytes(config), allocated_bytes_);
         CUDA_CHECK(cudaMemset(lane.token_counts, 0, token_count_bytes(config)));
     }
     id_buffer_ =
-        device_alloc(static_cast<std::size_t>(kBatch) * sizeof(std::int32_t), allocated_bytes_);
+        device_alloc(static_cast<std::size_t>(kPass) * sizeof(std::int32_t), allocated_bytes_);
     for (void*& state : state_) {
-        state = device_alloc(static_cast<std::size_t>(hidden) * static_cast<std::size_t>(kBatch) *
+        state = device_alloc(static_cast<std::size_t>(hidden) * static_cast<std::size_t>(kPass) *
                                  sizeof(std::uint16_t),
                              allocated_bytes_);
     }
@@ -88,10 +88,10 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
     // The head's output lives outside the layer arena because it outlives a call: it is what the
     // caller reads.
     void* logits = device_alloc(static_cast<std::size_t>(vocabulary) *
-                                    static_cast<std::size_t>(kBatch) * sizeof(std::uint16_t),
+                                    static_cast<std::size_t>(kScorePass) * sizeof(std::uint16_t),
                                 allocated_bytes_);
-    logits_ = Tensor(static_cast<std::uint8_t*>(logits), DType::BF16, {vocabulary, kBatch});
-    id_host_.resize(static_cast<std::size_t>(kBatch));
+    logits_ = Tensor(static_cast<std::uint8_t*>(logits), DType::BF16, {vocabulary, kScorePass});
+    id_host_.resize(static_cast<std::size_t>(kPass));
     for (std::int32_t lane = 0; lane < lanes; ++lane) reset(lane);
     (void)device;
 }
@@ -133,9 +133,10 @@ void Program::reset(std::int32_t lane_index, const ops::SamplingConfig& sampling
 }
 
 void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
-                        std::int32_t first_position, DeviceExecutionView execution) {
-    if (tokens < 1 || tokens > kBatch) {
-        throw std::invalid_argument("gemma4 Program: a batch must be one to kBatch tokens");
+                        std::int32_t first_position, bool every_column,
+                        DeviceExecutionView execution) {
+    if (tokens < 1 || tokens > (every_column ? kScorePass : kPass)) {
+        throw std::invalid_argument("gemma4 Program: a pass is wider than its buffers");
     }
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model_->config();
@@ -165,13 +166,18 @@ void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t to
         std::swap(in, out);
     }
 
-    Tensor head_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
-    // The head's linear expects an output of exactly [N,T], so a batch narrower than the buffer writes
-    // into its first `tokens` columns, which are contiguous.
+    // The head's linear expects an output of exactly [N,T], so a pass narrower than the buffer writes
+    // into its first columns, which are contiguous. Without every column, only the last token's hidden
+    // state reaches the head.
+    const std::int32_t columns = every_column ? tokens : 1;
+    Tensor head_in(static_cast<std::uint8_t*>(in) + static_cast<std::size_t>(tokens - columns) *
+                                                        static_cast<std::size_t>(hidden) *
+                                                        sizeof(std::uint16_t),
+                   DType::BF16, {hidden, columns});
     Tensor logits_batch(static_cast<std::uint8_t*>(logits_.data), DType::BF16,
-                        {static_cast<std::int32_t>(logits_.ne[0]), tokens});
-    forward_head(*model_, head_in, tokens, arena_, logits_batch, execution);
-    last_batch_ = tokens;
+                        {static_cast<std::int32_t>(logits_.ne[0]), columns});
+    forward_head(*model_, head_in, columns, arena_, logits_batch, execution);
+    last_batch_ = columns;
 }
 
 void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids,
@@ -185,8 +191,8 @@ void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids
     std::size_t consumed = 0;
     while (consumed < ids.size()) {
         const std::int32_t batch =
-            static_cast<std::int32_t>(std::min<std::size_t>(kBatch, ids.size() - consumed));
-        run_batch(lane.cache, ids.data() + consumed, batch, lane.position, execution);
+            static_cast<std::int32_t>(std::min<std::size_t>(kPass, ids.size() - consumed));
+        run_batch(lane.cache, ids.data() + consumed, batch, lane.position, false, execution);
         lane.position += batch;
         consumed += static_cast<std::size_t>(batch);
     }
@@ -197,7 +203,7 @@ void Program::decode(std::int32_t lane_index, std::int32_t id, DeviceExecutionVi
     if (lane.position >= capacity_) {
         throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
     }
-    run_batch(lane.cache, &id, 1, lane.position, execution);
+    run_batch(lane.cache, &id, 1, lane.position, false, execution);
     ++lane.position;
 }
 
@@ -233,7 +239,7 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     reset(0);
     KvCache& cache                = lanes_.front().cache;
     const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
-    logits_host_.resize(static_cast<std::size_t>(vocabulary) * static_cast<std::size_t>(kBatch));
+    logits_host_.resize(static_cast<std::size_t>(vocabulary) * static_cast<std::size_t>(kScorePass));
 
     std::vector<float> scores;
     scores.reserve(ids.size() - static_cast<std::size_t>(first_target));
@@ -244,8 +250,8 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     const std::int32_t count = static_cast<std::int32_t>(ids.size());
     std::int32_t position    = 0;
     while (position < count) {
-        const std::int32_t batch = std::min(kBatch, count - position);
-        run_batch(cache, ids.data() + position, batch, position, execution);
+        const std::int32_t batch = std::min(kScorePass, count - position);
+        run_batch(cache, ids.data() + position, batch, position, true, execution);
 
         // A column of the head predicts the token after its own position, so this batch covers the
         // targets from position+1 to position+batch, clipped to the sequence and to first_target.

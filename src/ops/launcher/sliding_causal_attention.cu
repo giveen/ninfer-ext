@@ -11,7 +11,8 @@ namespace ninfer::ops::detail {
 
 void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                      const Tensor& position_q, const Tensor& position_k,
-                                     std::int32_t head_dim, std::int32_t query_heads,
+                                     const Tensor& k_extra, const Tensor& v_extra,
+                                     const Tensor& position_extra, std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
                                      Tensor& out, const Tensor& workspace, cudaStream_t stream) {
     const std::int32_t query_tokens = q.ne[2];
@@ -38,6 +39,14 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
     params.k_stride     = head_dim;
     params.v_stride     = head_dim;
     params.scale        = scale;
+    if (position_extra.data != nullptr && position_extra.ne[0] > 0) {
+        require_flash_alignment(k_extra.data, head_dim, "sliding_causal_attention");
+        require_flash_alignment(v_extra.data, head_dim, "sliding_causal_attention");
+        params.extra_k        = static_cast<const __nv_bfloat16*>(k_extra.data);
+        params.extra_v        = static_cast<const __nv_bfloat16*>(v_extra.data);
+        params.extra_position = static_cast<const std::int32_t*>(position_extra.data);
+        params.extra_tokens   = position_extra.ne[0];
+    }
     switch (head_dim) {
     case 32: launch_gemma_flash_attention<32, 32, false>(params, batch, workspace, stream); break;
     case 64: launch_gemma_flash_attention<64, 64, false>(params, batch, workspace, stream); break;

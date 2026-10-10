@@ -170,70 +170,70 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
               scratch.k_normed, execution);
 
-    // The ring holds the window plus the largest pass, so the slot is the position modulo the ring and
-    // the Op's own window test decides what a query sees. A slot no token has written carries an
-    // invisible position, so the whole cache can be handed to the Op without tracking how much is
-    // filled.
-    if (tokens > cache.ring_tokens() - static_cast<std::int32_t>(config.sliding_window)) {
-        throw std::invalid_argument("forward_sliding_layer: the pass is larger than the ring slack");
-    }
+    // The ring holds the last window of tokens at position modulo the window; a slot no token has
+    // written carries an invisible position. A pass's keys enter the ring as its last `kept` tokens.
+    // A wider pass attends to the ring as it was before the pass plus its own keys as the Op's second
+    // key set, and writes afterwards, so no write replaces a key one of its own queries still sees. A
+    // single token writes first and attends to the ring alone: the slot it replaces holds position
+    // p - window, which query p cannot see, and the key set stays one.
     Tensor cache_keys   = cache.keys(layer);
     Tensor cache_values = cache.values(layer);
     Tensor cache_pos    = cache.positions(layer);
-    const std::int32_t ring         = cache.ring_tokens();
+    const std::int32_t ring = cache.ring_tokens();
+    const bool write_first  = tokens == 1;
+
+    const std::int32_t kept  = std::min(tokens, ring);
+    const std::int32_t first = first_position + tokens - kept;
     const std::size_t row_bytes =
         static_cast<std::size_t>(d) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
-    // The batch's rows are adjacent in the ring unless the run wraps, so the common case is one copy
-    // per plane and the wrapped case falls back to a copy per token.
-    const std::int32_t first_slot = cache.slot(layer, first_position);
-    if (first_slot + tokens <= ring) {
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
-                                       static_cast<std::size_t>(first_slot) * row_bytes,
-                                   scratch.k_normed.data,
-                                   static_cast<std::size_t>(tokens) * row_bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) +
-                                       static_cast<std::size_t>(first_slot) * row_bytes,
-                                   scratch.v_normed.data,
-                                   static_cast<std::size_t>(tokens) * row_bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
-    } else {
-        for (std::int32_t token = 0; token < tokens; ++token) {
-            const std::size_t offset = static_cast<std::size_t>(
-                                           cache.slot(layer, first_position + token)) *
-                                       row_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) + offset,
-                                       static_cast<std::uint8_t*>(scratch.k_normed.data) +
-                                           static_cast<std::size_t>(token) * row_bytes,
-                                       row_bytes, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) + offset,
-                                       static_cast<std::uint8_t*>(scratch.v_normed.data) +
-                                           static_cast<std::size_t>(token) * row_bytes,
-                                       row_bytes, cudaMemcpyDeviceToDevice, stream));
-        }
-    }
-    cache.mark_range(layer, first_position, tokens, stream);
+    // The kept rows are adjacent in the ring unless the run wraps, which splits it into two copies.
+    const auto write_kept = [&] {
+        const std::int32_t first_slot = cache.slot(layer, first);
+        const std::int32_t head_run   = std::min(kept, ring - first_slot);
+        const auto copy_run = [&](std::int32_t slot, std::int32_t from, std::int32_t count) {
+            const std::size_t source = static_cast<std::size_t>(tokens - kept + from) * row_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
+                                           static_cast<std::size_t>(slot) * row_bytes,
+                                       static_cast<std::uint8_t*>(scratch.k_normed.data) + source,
+                                       static_cast<std::size_t>(count) * row_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) +
+                                           static_cast<std::size_t>(slot) * row_bytes,
+                                       static_cast<std::uint8_t*>(scratch.v_normed.data) + source,
+                                       static_cast<std::size_t>(count) * row_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        };
+        copy_run(first_slot, 0, head_run);
+        if (head_run < kept) copy_run(0, head_run, kept - head_run);
+        cache.mark_range(layer, first, kept, stream);
+    };
+    if (write_first) write_kept();
 
     {
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
-        Tensor q_batch        = scratch.q_normed.view({d, hq, tokens, 1});
-        // Until the ring first wraps, only its leading slots have been written, and the Op scans every
-        // key it is given.
-        const std::int32_t filled = std::min(ring, first_position + tokens);
-        Tensor k_batch(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16, {d, hkv, filled, 1});
-        Tensor v_batch(static_cast<std::uint8_t*>(cache_values.data), DType::BF16,
-                       {d, hkv, filled, 1});
+        Tensor q_batch = scratch.q_normed.view({d, hq, tokens, 1});
+        // Until the ring first wraps, only its leading slots hold tokens, and the Op scans every key
+        // it is given. An empty ring is passed as one unwritten slot.
+        const std::int32_t filled =
+            std::clamp(first_position + (write_first ? tokens : 0), 1, ring);
+        Tensor k_ring(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16, {d, hkv, filled, 1});
+        Tensor v_ring(static_cast<std::uint8_t*>(cache_values.data), DType::BF16, {d, hkv, filled, 1});
+        Tensor position_ring(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
+        Tensor position_pass  = scratch.positions.view({tokens, 1});
         Tensor attended_batch = scratch.attended.view({d, hq, tokens, 1});
-        Tensor position_q     = scratch.positions.view({tokens, 1});
-        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
-        const std::size_t split =
-            ops::sliding_causal_attention_workspace_bytes(geometry, tokens, filled, 1);
+        const Tensor none;
+        const Tensor k_pass = write_first ? none : scratch.k_normed.view({d, hkv, tokens, 1});
+        const Tensor v_pass = write_first ? none : scratch.v_normed.view({d, hkv, tokens, 1});
+        const Tensor position_extra = write_first ? none : position_pass;
+        const std::size_t split = ops::sliding_causal_attention_workspace_bytes(
+            geometry, tokens, filled + (write_first ? 0 : tokens), 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
-        ops::sliding_causal_attention(q_batch, k_batch, v_batch, position_q, position_k, geometry,
-                                      config.sliding_window, config.attention_scale, attended_batch,
-                                      workspace, stream);
+        ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_ring, k_pass,
+                                      v_pass, position_extra, geometry, config.sliding_window,
+                                      config.attention_scale, attended_batch, workspace, stream);
     }
+    if (!write_first) write_kept();
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
     ops::rmsnorm(scratch.projected, model.tensor(weights.post_attention_norm), eps, false,
                  scratch.branch, stream);

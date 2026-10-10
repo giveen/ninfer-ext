@@ -25,6 +25,10 @@ namespace ninfer::ops {
  * window may exceed the key count. `window` is at most 4096, which is what keeps the visible keys in
  * shared memory.
  *
+ * `k_extra`, `v_extra` and `position_extra` ([D,Hkv,E,B] and [E,B]) are a second key set the same
+ * formula covers, scanned after the first: a pass's own keys beside a ring that does not hold them
+ * yet, so a pass may be wider than the ring's free slots. An empty `position_extra` means none.
+ *
  * The route is tensor-core flash attention (ops/kernel/gemma_flash_attention.cuh): blocks of 16
  * query rows that share a KV head stream 32-key tiles with an online Softmax, and a tile no row can
  * see is skipped. `head_dim` is 32, 64, 128 or 256. When the rows alone give too few blocks (decode),
@@ -39,10 +43,13 @@ namespace ninfer::ops {
  */
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_k,
+                              const Tensor& k_extra, const Tensor& v_extra,
+                              const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
                               Tensor& out, const Tensor& workspace, cudaStream_t stream);
 
-// Workspace bytes the key split needs for these extents; zero when the route does not split.
+// Workspace bytes the key split needs for these extents (`key_tokens` counts both key sets); zero
+// when the route does not split.
 std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geometry,
                                                      std::int32_t query_tokens,
                                                      std::int32_t key_tokens, std::int32_t batch);

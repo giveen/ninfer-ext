@@ -61,11 +61,12 @@ void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batc
     (void)configured;
     const std::int64_t row_tiles =
         flash_row_tiles(params.query_tokens, params.query_heads, params.kv_heads);
-    const std::size_t needed = flash_workspace_bytes(V, params.query_tokens, params.query_heads,
-                                                     params.kv_heads, params.key_tokens, batch);
+    const std::int32_t all_keys = params.key_tokens + params.extra_tokens;
+    const std::size_t needed    = flash_workspace_bytes(V, params.query_tokens, params.query_heads,
+                                                        params.kv_heads, all_keys, batch);
     params.splits = 1;
     if (needed > 0 && workspace.data != nullptr && workspace.bytes() >= needed) {
-        params.splits = flash_splits(row_tiles, params.kv_heads, batch, params.key_tokens);
+        params.splits = flash_splits(row_tiles, params.kv_heads, batch, all_keys);
         const std::int64_t rows = flash_partial_rows(row_tiles, params.kv_heads, batch);
         params.partial_out   = static_cast<float*>(workspace.data);
         params.partial_stats = params.partial_out + static_cast<std::int64_t>(params.splits) * rows * V;

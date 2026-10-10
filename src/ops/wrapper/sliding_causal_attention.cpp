@@ -36,7 +36,8 @@ void require_positions(const Tensor& tensor, const char* role, std::int32_t exte
 
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_k,
-                              AttentionHeadGeometry geometry, std::uint32_t window, float scale,
+                              const Tensor& k_extra, const Tensor& v_extra,
+                              const Tensor& position_extra, AttentionHeadGeometry geometry, std::uint32_t window, float scale,
                               Tensor& out, const Tensor& workspace, cudaStream_t stream) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
@@ -70,6 +71,23 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     require_positions(position_q, "position_q", query_tokens, batch);
     require_positions(position_k, "position_k", key_tokens, batch);
+    const bool has_extra = position_extra.data != nullptr && position_extra.numel() > 0;
+    if (has_extra) {
+        const std::int32_t extra = position_extra.ne[0];
+        require_bf16(k_extra, "k_extra");
+        require_bf16(v_extra, "v_extra");
+        require_positions(position_extra, "position_extra", extra, batch);
+        if (k_extra.ne[0] != head_dim || v_extra.ne[0] != head_dim ||
+            k_extra.ne[1] != geometry.kv_heads || v_extra.ne[1] != geometry.kv_heads ||
+            k_extra.ne[2] != extra || v_extra.ne[2] != extra || k_extra.ne[3] != batch ||
+            v_extra.ne[3] != batch || k_extra.data == nullptr || v_extra.data == nullptr ||
+            !k_extra.is_contiguous() || !v_extra.is_contiguous() ||
+            !position_extra.is_contiguous()) {
+            throw std::invalid_argument(
+                "sliding_causal_attention: the extra keys must be contiguous [D,Hkv,E,B] with "
+                "[E,B] positions");
+        }
+    }
 
     const bool empty = q.numel() == 0;
     if (empty) { return; }
@@ -83,7 +101,10 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
     }
 
-    detail::sliding_causal_attention_launch(q, k, v, position_q, position_k, head_dim,
+    const Tensor none;
+    detail::sliding_causal_attention_launch(q, k, v, position_q, position_k,
+                                            has_extra ? k_extra : none, has_extra ? v_extra : none,
+                                            has_extra ? position_extra : none, head_dim,
                                             geometry.query_heads, geometry.kv_heads, window, scale,
                                             out, workspace, stream);
 }

@@ -54,7 +54,7 @@ public:
     [[nodiscard]] std::int32_t position(std::int32_t lane) const { return lane_at(lane).position; }
 
     // Consumes tokens for `lane` and leaves the logits of the last one. The tokens are run in passes of
-    // at most kBatch, so a long prompt costs one pass per batch rather than one per token.
+    // at most kPass, so a long prompt costs one pass per kPass tokens rather than one per token.
     void prefill(std::int32_t lane, std::span<const std::int32_t> ids, DeviceExecutionView execution);
 
     // Consumes one token for `lane` and leaves its logits.
@@ -66,7 +66,7 @@ public:
     [[nodiscard]] std::int32_t sample(std::int32_t lane, DeviceExecutionView execution);
 
     // Contiguous BF16 [vocabulary,1] logits for the token the last call consumed, already soft-capped
-    // by the head. The batch's logits live side by side, so this is a view of the last column.
+    // by the head. A scoring pass's logits live side by side, so this is a view of the last column.
     [[nodiscard]] Tensor logits() const noexcept {
         const std::size_t column = static_cast<std::size_t>(last_batch_ - 1);
         return Tensor(static_cast<std::uint8_t*>(logits_.data) +
@@ -88,9 +88,11 @@ public:
                                                   std::int32_t first_target, const LogitsSink& sink,
                                                   DeviceExecutionView execution);
 
-    // The number of tokens one pass covers, which fixes the scratch and logits sizes and the slack the
-    // sliding rings carry.
-    static constexpr std::int32_t kBatch = 128;
+    // The most tokens one pass covers, which fixes the layer scratch. Prefill applies the head to the
+    // pass's last token only; scoring needs every column's logits and runs passes of kScorePass,
+    // which fixes the logits buffer.
+    static constexpr std::int32_t kPass      = 512;
+    static constexpr std::int32_t kScorePass = 128;
 
 private:
     struct Lane {
@@ -104,15 +106,15 @@ private:
     [[nodiscard]] const Lane& lane_at(std::int32_t lane) const;
 
     // Embeds `tokens` ids starting at `first_position`, runs every layer over them in one pass against
-    // `cache`, and applies the head to every column.
+    // `cache`, and applies the head to every column, or to the last one only unless `every_column`.
     void run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
-                   std::int32_t first_position, DeviceExecutionView execution);
+                   std::int32_t first_position, bool every_column, DeviceExecutionView execution);
 
     const Model* model_ = nullptr;
     std::vector<Lane> lanes_;
     DeviceArena arena_;
     DeviceArena sampling_workspace_;
-    Tensor logits_; // [vocabulary, kBatch], one column per token of a pass
+    Tensor logits_; // [vocabulary, kScorePass], one column per token of a scoring pass
     std::vector<std::int32_t> id_host_;
     void* id_buffer_       = nullptr;
     void* state_[2]        = {nullptr, nullptr};
