@@ -16,8 +16,8 @@ constexpr std::array kShapes{
     ShapeEntry{5120, 17408, select_q5_n5120_k17408}, ShapeEntry{1152, 1152, select_q5_n1152_k1152},
     ShapeEntry{1152, 4304, select_q5_n1152_k4304},
     // Gemma 4 31B MLP.
-    ShapeEntry{21504, 5376, select_q5_gemma4},
-    ShapeEntry{5376, 21504, select_q5_gemma4},
+    ShapeEntry{21504, 5376, select_q5_gemma4_k5376},
+    ShapeEntry{5376, 21504, select_q5_gemma4_k21504},
 };
 } // namespace
 

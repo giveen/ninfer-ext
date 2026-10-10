@@ -140,6 +140,9 @@ int main() {
     failures += run_case("rmsnorm offset [256,2,1]", {256, 2}, true, 1105U);
     failures += run_case("rmsnorm offset [256,4,48]", {256, 4, 48}, true, 1106U);
     failures += run_case("rmsnorm plain [2048,1]", {2048, 1}, false, 1201U);
+    // Gemma 4's hidden width, which has its own fixed-width route.
+    failures += run_case("rmsnorm plain [5376,1]", {5376, 1}, false, 1211U);
+    failures += run_case("rmsnorm plain [5376,128]", {5376, 128}, false, 1212U);
     failures += run_case("rmsnorm plain [2048,128]", {2048, 128}, false, 1202U);
     failures += run_case("rmsnorm plain [128,32,7]", {128, 32, 7}, false, 1203U);
     failures += run_case("rmsnorm plain [128,8,128]", {128, 8, 128}, false, 1204U);

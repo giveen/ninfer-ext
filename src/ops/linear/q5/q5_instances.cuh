@@ -24,6 +24,9 @@ using DirectR1T3W2K17408 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 17408, true>;
 using DirectR1T4W2K17408 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 17408, true>;
 
 using DirectR2T4W2G8B4         = Q5A16DirectSimtSchedule<2, 4, 2, 8, 4>;
+// Gemma 4 31B MLP decode: gate/up read K 5376, down K 21504.
+using DirectR1T1W4K5376  = Q5A16DirectSimtSchedule<1, 1, 4, 4, 10, 5376, true>;
+using DirectR1T1W4K21504 = Q5A16DirectSimtSchedule<1, 1, 4, 4, 10, 21504, true>;
 using SlicedR16T8W4S2          = Q5A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T16W4S2         = Q5A16SlicedKMmaSchedule<16, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T32W4S2         = Q5A16SlicedKMmaSchedule<16, 32, 4, 2, Cache::cg, Cache::ca, 2>;
