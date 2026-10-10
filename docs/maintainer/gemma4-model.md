@@ -213,9 +213,10 @@ malformed call, an undeclared tool and a refused `tool_choice`.
 
 ## 9. Artifacts
 
-Both are produced from the instruction-tuned BF16 checkpoint at `/mnt/storage/models/gemma/full-31b`.
-The recipe and the first artifact carry "base" in their names from before the checkpoint was
-identified; the bytes are the instruction-tuned model's.
+All are produced from the instruction-tuned BF16 checkpoint at `/mnt/storage/models/gemma/full-31b`.
+The `gemma4_31b_base` recipe and the L1 artifact carry "base" in their names from before the
+checkpoint was identified; the bytes are the instruction-tuned model's. Only M1 is kept on disk; L1
+and G0 were deleted once M1 superseded them and are rebuilt from their recipes when needed.
 
 | Artifact | Recipe | Layout | Size |
 |---|---|---|---:|
