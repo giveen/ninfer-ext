@@ -531,6 +531,45 @@ def gemma4_31b_base(model, recipe, sources):
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
 
 
+def gemma4_31b_g0(model, recipe, sources):
+    """Gemma 4 31B with gewell's G0 precision layout, which spends precision where it pays.
+
+    G0 keeps embeddings and norms BF16, holds Q/K/V at FP8 throughout, and uses FP8 rather than NVFP4
+    for the O and MLP projections in the first six layers, every global layer and the local layer before
+    it. The cheaper layout this project shipped first - FP8 embedding, NVFP4 MLP everywhere - leaves the
+    head faithful but the logit tails further from HuggingFace than the per-layer agreement predicts, and
+    the tails are what a KLD ranking reads. See section 25 of the model reference.
+    """
+    _optional(model, recipe)
+    # Layers whose O and MLP projections stay at FP8: the first six, then every global layer (5, 11, ...
+    # 59) together with the local layer that precedes it.
+    precise = {0, 1, 2, 3, 4, 5}
+    for layer in range(6, 60, 6):
+        precise.add(layer)
+        precise.add(layer - 1)
+
+    def layer_of(name):
+        parts = name.split("/")
+        return int(parts[2]) if len(parts) > 2 and parts[1] == "layers" else -1
+
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format="bf16")
+            continue
+        if not parameter.projection:
+            continue
+        layer = layer_of(name)
+        if "/mlp/" in name:
+            if layer in precise:
+                recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            else:
+                recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif "/attention/" in name:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -545,4 +584,5 @@ RECIPES = {
     "qwen3_8_flash_next_bf16": qwen3_8_flash_next_bf16,
     "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
     "gemma4_31b_base": gemma4_31b_base,
+    "gemma4_31b_g0": gemma4_31b_g0,
 }

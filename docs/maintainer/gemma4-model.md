@@ -879,3 +879,21 @@ FP8 rather than NVFP4 for the O and MLP projections in the first six layers, eve
 predecessor. This artifact instead quantizes its embedding to FP8 and every MLP to NVFP4, which is
 cheaper and measurably worse. That is the plan's P4 work, and it is now a specific change rather than a
 parameter to search.
+
+### 25.1 The G0 layout, and the shapes it needs
+
+`gemma4_31b_g0` follows gewell's mask: `text/token_embedding` and `text/output_head` are BF16,
+attention projections stay FP8, and MLP projections are FP8 in layers 0-5, 10-11, 16-17, 22-23, 28-29,
+34-35, 40-41, 46-47, 52-53 and 58-59 — the first six, then every global layer and the one before it —
+with NVFP4 elsewhere.
+
+That layout asks for two FP8 linear problems this repository had never instantiated, because the MLP
+had only ever been NVFP4 here: `n21504_k5376` and `n5376_k21504`. Both are registered now, in the same
+per-shape form as the rest, with correctness schedules and the same K-divisibility limit the query
+projection has (5376 = 2^8 * 21 admits 8 values per lane, not 16 or 32). They are inert for the
+artifact this project has been running, and required by the one G0 produces.
+
+The first G0 conversion ran slower than the last one by two orders of magnitude — 23 of 723 steps in
+about half an hour, against 723 in twelve minutes — while other GPU work was running beside it. That is
+the third time this session that concurrent device use distorted a measurement, and this time it wasted
+a conversion.
