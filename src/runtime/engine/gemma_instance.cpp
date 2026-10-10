@@ -525,9 +525,24 @@ constexpr std::uint32_t kDefaultPrefillChunk = 1024;
 } // namespace
 
 EngineOptions gemma_engine_options(EngineOptions options) {
+    // What this model cannot do is refused by name rather than run as if it had been asked for.
+    const auto refuse = [](const char* what) {
+        throw std::invalid_argument(std::string("Gemma 4 does not support ") + what + " yet");
+    };
+    if (options.speculative.backend != SpeculativeBackend::None) refuse("speculative decoding");
+    if (options.enable_vision) refuse("Vision input");
+    if (options.kv_cache != KvCacheStorage::BFloat16) refuse("a KV cache format other than BF16");
+    if (options.kv_stream) refuse("KV streaming");
+    // Every lane holds max_context tokens of global KV, so an explicit capacity below one request's
+    // window cannot be honoured; a larger one is simply not needed.
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kv_capacity.explicit_tokens < options.max_context) {
+        refuse("a KV capacity below max_context (each lane reserves a full window)");
+    }
+    // The context cache is on by default for every product, so it is switched off rather than
+    // refused; Engine::options() reports it disabled.
     options.context_cache = ContextCacheOptions{.enabled = false};
-    options.speculative   = {};
-    options.enable_vision = false;
+    options.kv_capacity   = KvCapacityPolicy::explicit_capacity(options.max_context);
     if (!options.prefill_chunk) options.prefill_chunk = kDefaultPrefillChunk;
     if (!options.idle_prefill_chunk) options.idle_prefill_chunk = *options.prefill_chunk;
     return normalize_engine_options(std::move(options));
