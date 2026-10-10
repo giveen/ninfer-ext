@@ -91,6 +91,11 @@ int main() {
             for (const int id : want) { message << ' ' << std::string(gemma.decode_token_bytes(id)); }
             expect(false, message.str());
         }
+        // Gemma's normalizer only turns a space into U+2581 and its decoder turns every U+2581 back,
+        // so decoding the reference ids is the text itself.
+        const std::string decoded = gemma.decode(want);
+        expect(decoded == text,
+               "case " + std::to_string(index) + " decodes to " + nlohmann::json(decoded).dump());
         ++index;
     }
     if (failures == 0) {

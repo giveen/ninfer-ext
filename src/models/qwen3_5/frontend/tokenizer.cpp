@@ -528,10 +528,10 @@ std::string decode_byte_level_token(std::string_view token, int id) {
     return bytes;
 }
 
-// Gemma's tokens are text: the U+2581 marker stands for a space, a `<0xXX>` token stands for the
-// byte it names (the byte fallback), and every other token is already its own characters.
+// Gemma's tokens are text: every U+2581 marker in a token stands for a space (the decoder's
+// `Replace` applies to the whole piece, so `▁word` is " word"), a `<0xXX>` token stands for the byte
+// it names (the byte fallback), and everything else is already its own characters.
 std::string decode_gemma_token(std::string_view token, int id) {
-    if (token == kGemmaSpaceMarker) { return " "; }
     if (token.size() == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' &&
         token[5] == '>') {
         const auto digit = [&](char value) -> int {
@@ -543,7 +543,17 @@ std::string decode_gemma_token(std::string_view token, int id) {
         };
         return std::string(1, static_cast<char>((digit(token[3]) << 4) | digit(token[4])));
     }
-    return std::string(token);
+    std::string text;
+    text.reserve(token.size());
+    for (std::size_t offset = 0; offset < token.size();) {
+        if (token.substr(offset).starts_with(kGemmaSpaceMarker)) {
+            text.push_back(' ');
+            offset += kGemmaSpaceMarker.size();
+        } else {
+            text.push_back(token[offset++]);
+        }
+    }
+    return text;
 }
 
 std::array<std::string, 256> build_byte_level_encoder() {
