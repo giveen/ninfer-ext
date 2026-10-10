@@ -9,8 +9,9 @@
 //  - Admission is root-only. The Engine runs this model with the context cache disabled, so every
 //    request materializes from an empty lane: the identity candidate is always feasible, is never
 //    expandable, and seals directly. No prefix is reused.
-//  - Each lane runs one token per decode round. There is no speculation, no forced control span and
-//    no token mask, so a constrained request is refused at submission.
+//  - Each lane runs one token per decode round. There is no speculation and no token mask, so a
+//    constrained request is refused at submission. Forced control spans (the thinking budget's
+//    channel close) are appended through append_forced_tokens.
 //  - The prefix-cache machinery the ResourceManager can reach in principle (pressure planning,
 //    captures, checkpoint recovery, continuations) has no Gemma implementation. Its entry points exist
 //    because the common controller is compiled against them, and each refuses by name; with the cache
@@ -342,7 +343,7 @@ public:
                                       std::span<const RoundBudget> budgets,
                                       ExecutionTiming* failed_timing = nullptr,
                                       TokenMaskProvider* masks       = nullptr);
-    [[noreturn]] ExecutionTiming append_forced_tokens(std::span<const SequenceHandle>,
+    [[nodiscard]] ExecutionTiming append_forced_tokens(std::span<const SequenceHandle>,
                                                       std::span<const TokenId>, std::uint32_t,
                                                       std::span<const std::optional<std::uint32_t>>,
                                                       ExecutionTiming* = nullptr);

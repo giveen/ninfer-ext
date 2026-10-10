@@ -276,7 +276,8 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   context cache is switched off for this model, so the identity candidate is always feasible and
   never expandable and seals directly. Each lane decodes alone, one token per round, and samples on
   device. The prefix-cache entry points the controller is compiled against (pressure planning,
-  captures, checkpoint recovery, continuations) and forced control tokens refuse by name. Contract
+  captures, checkpoint recovery, continuations) refuse by name. Forced control tokens (the thinking
+  budget's `<channel|>` close) are appended as one prefill of the lane. Contract
   types this model never constructs are the Qwen contract's pure-data types; moving them into
   `runtime/contract` is the plan's D1-b extraction and is not done.
 - **Refused options**: speculative decoding, Vision, a KV format other than BF16, KV streaming, and
