@@ -27,6 +27,9 @@ struct Case {
     std::uint32_t window;
     // Rotates which slot holds which position, the way the sliding ring stores them.
     std::int32_t ring = 0;
+    // Queries [block_begin, block_end) form an image block: each sees keys up to the block's last
+    // position. Empty when block_end == 0.
+    std::int32_t block_begin = 0, block_end = 0;
 };
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
@@ -71,9 +74,14 @@ int run_case(const Case& c, std::uint32_t seed) {
 
     std::vector<std::int32_t> position_q(static_cast<std::size_t>(c.query_tokens) * c.batch);
     std::vector<std::int32_t> position_k(static_cast<std::size_t>(c.key_tokens) * c.batch);
+    std::vector<std::int32_t> position_high(position_q.size());
+    const bool blocked = c.block_end > 0;
     for (std::int32_t b = 0; b < c.batch; ++b) {
         for (std::int32_t t = 0; t < c.query_tokens; ++t) {
             position_q[t + c.query_tokens * b] = c.first_query_position + t;
+            const bool in_block = t >= c.block_begin && t < c.block_end;
+            position_high[t + c.query_tokens * b] =
+                c.first_query_position + (blocked && in_block ? c.block_end - 1 : t);
         }
         for (std::int32_t s = 0; s < c.key_tokens; ++s) {
             const std::int32_t slot = (s + c.ring) % c.key_tokens;
@@ -96,9 +104,10 @@ int run_case(const Case& c, std::uint32_t seed) {
                 return static_cast<double>(v[kv_index(c, d, kv_head, key, b)]);
             },
             [&](int query, int key) {
-                const std::int32_t distance =
-                    position_q[query + c.query_tokens * b] - position_k[key + c.key_tokens * b];
-                return distance >= 0 && distance < static_cast<std::int32_t>(c.window);
+                const std::int32_t at  = query + c.query_tokens * b;
+                const std::int32_t pk  = position_k[key + c.key_tokens * b];
+                return pk <= position_high[at] &&
+                       position_q[at] - pk < static_cast<std::int32_t>(c.window);
             },
             [&](int d, int head, int token, double value) {
                 expected[index(c, d, head, token, b)] = value;
@@ -111,9 +120,10 @@ int run_case(const Case& c, std::uint32_t seed) {
         for (std::int32_t key = 0; key < c.key_tokens; ++key) {
             bool seen = false;
             for (std::int32_t t = 0; t < c.query_tokens; ++t) {
-                const std::int32_t distance =
-                    position_q[t + c.query_tokens * b] - position_k[key + c.key_tokens * b];
-                seen = seen || (distance >= 0 && distance < static_cast<std::int32_t>(c.window));
+                const std::int32_t at = t + c.query_tokens * b;
+                const std::int32_t pk = position_k[key + c.key_tokens * b];
+                seen = seen || (pk <= position_high[at] &&
+                                position_q[at] - pk < static_cast<std::int32_t>(c.window));
             }
             if (seen) continue;
             for (std::int32_t h = 0; h < c.kv_heads; ++h) {
@@ -136,12 +146,14 @@ int run_case(const Case& c, std::uint32_t seed) {
     GuardedDeviceBuffer device_v(k_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_pq(position_q.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_pk(position_k.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_ph(position_high.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_out(q_count * sizeof(std::uint16_t));
     device_q.copy_from_host(q_bits.data(), device_q.bytes());
     device_k.copy_from_host(k_bits.data(), device_k.bytes());
     device_v.copy_from_host(v_bits.data(), device_v.bytes());
     device_pq.copy_from_host(position_q.data(), device_pq.bytes());
     device_pk.copy_from_host(position_k.data(), device_pk.bytes());
+    device_ph.copy_from_host(position_high.data(), device_ph.bytes());
     device_out.fill(0x7d);
 
     Tensor q_tensor(device_q.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
@@ -149,6 +161,8 @@ int run_case(const Case& c, std::uint32_t seed) {
     Tensor v_tensor(device_v.data(), DType::BF16, {c.head_dim, c.kv_heads, c.key_tokens, c.batch});
     Tensor pq_tensor(device_pq.data(), DType::I32, {c.query_tokens, c.batch});
     Tensor pk_tensor(device_pk.data(), DType::I32, {c.key_tokens, c.batch});
+    const Tensor ph_tensor =
+        blocked ? Tensor(device_ph.data(), DType::I32, {c.query_tokens, c.batch}) : Tensor{};
     Tensor out_tensor(device_out.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
 
     // The same keys as two sets: the first `head` keys of every batch, then the rest as the extra
@@ -207,7 +221,8 @@ int run_case(const Case& c, std::uint32_t seed) {
         }
         device_out.fill(0x7d);
         if (route < 2) {
-            ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, pk_tensor, none,
+            ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, ph_tensor,
+                                          pk_tensor, none,
                                           none, none, geometry, c.window, 1.0F, out_tensor,
                                           workspace, nullptr);
         } else {
@@ -217,7 +232,8 @@ int run_case(const Case& c, std::uint32_t seed) {
             Tensor k2(device_k2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
             Tensor v2(device_v2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
             Tensor p2(device_p2.data(), DType::I32, {extra, c.batch});
-            ops::sliding_causal_attention(q_tensor, k1, v1, pq_tensor, p1, k2, v2, p2, geometry,
+            ops::sliding_causal_attention(q_tensor, k1, v1, pq_tensor, ph_tensor, p1, k2, v2, p2,
+                                          geometry,
                                           c.window, 1.0F, out_tensor, workspace, nullptr);
         }
         cuda_synchronize();
@@ -275,6 +291,20 @@ int main() {
     // Decode over a full rotated ring, which is the case the key split serves.
     failures += run_case({"gemma ring decode", 256, 32, 16, 1152, 1, 1, 1000, 2151, 1, 1024, 77},
                          7109U);
+
+    // Gemma 4 image blocks. Keys ahead of a query inside its block are visible, the window's lower
+    // edge stays at each query, and the block crosses key tiles in rotated ring order. Keys past the
+    // block stay invisible and NaN-poisoned. "image past the window" puts the block's late keys within
+    // reach while its early ones fall out of the window for the block's last queries.
+    failures += run_case({"image block in a ring pass", 256, 32, 16, 1152, 128, 1, 1000, 2024, 1,
+                          1024, 300, 30, 90},
+                         7110U);
+    failures += run_case({"image block, many rows", 64, 8, 4, 200, 70, 2, 0, 130, 1, 1024, 17, 3,
+                          61},
+                         7111U);
+    failures += run_case({"image past the window", 64, 8, 4, 300, 300, 1, 0, 0, 1, 40, 0, 20,
+                          120},
+                         7112U);
 
     std::cout << (failures ? "FAIL" : "OK") << " sliding_causal_attention\n";
     return failures ? 1 : 0;

@@ -10,7 +10,8 @@
 namespace ninfer::ops::detail {
 
 void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                     const Tensor& position_q, const Tensor& position_k,
+                                     const Tensor& position_q, const Tensor& position_q_high,
+                                     const Tensor& position_k,
                                      const Tensor& k_extra, const Tensor& v_extra,
                                      const Tensor& position_extra, std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
@@ -28,6 +29,7 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
     params.k            = static_cast<const __nv_bfloat16*>(k.data);
     params.v            = static_cast<const __nv_bfloat16*>(v.data);
     params.position_q   = static_cast<const std::int32_t*>(position_q.data);
+    params.position_q_high = static_cast<const std::int32_t*>(position_q_high.data);
     params.position_k   = static_cast<const std::int32_t*>(position_k.data);
     params.out          = static_cast<__nv_bfloat16*>(out.data);
     params.query_heads  = query_heads;

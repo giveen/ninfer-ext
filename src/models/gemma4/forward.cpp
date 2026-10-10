@@ -236,8 +236,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
             geometry, tokens, filled + (write_first ? 0 : tokens), 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
-        ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_ring, k_pass,
-                                      v_pass, position_extra, geometry, config.sliding_window,
+        ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, none, position_ring,
+                                      k_pass, v_pass, position_extra, geometry, config.sliding_window,
                                       config.attention_scale, attended_batch, workspace, stream);
     }
     if (!write_first) write_kept();
@@ -502,7 +502,7 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
             Tensor workspace;
             if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
             ops::sliding_causal_attention(q_normed.view({d, hq, 1, 1}), k_ring, v_ring,
-                                          visible_position, p_ring, none, none, none, heads,
+                                          visible_position, none, p_ring, none, none, none, heads,
                                           target.sliding_window, target.attention_scale, out,
                                           workspace, stream);
         } else {

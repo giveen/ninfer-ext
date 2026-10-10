@@ -48,6 +48,8 @@ struct FlashAttentionParams {
     const __nv_bfloat16* k;   // key row (kvh, key, b) at k + (kvh + Hkv * (key + S * b)) * k_stride
     const __nv_bfloat16* v;   // value row likewise with v_stride; the compact rows serve as both
     const std::int32_t* position_q; // [T, B]
+    // The latest key position each query may see, [T, B]; null means its own position (causal).
+    const std::int32_t* position_q_high;
     const std::int32_t* position_k; // [S, B]
     __nv_bfloat16* out;             // [V, Hq, T, B]
     std::int32_t query_heads;
@@ -88,7 +90,7 @@ template <int QK, int V, bool kCompact> struct FlashLayout {
     static constexpr int kVBytes  = kCompact ? 0 : kFlashKeys * kVStride * 2;
     static constexpr int kPBytes  = 2 * kFlashRows * kPStride * 2;
     static constexpr int kSBytes  = kFlashRows * (kFlashKeys + 1) * 4;
-    static constexpr int kStatsBytes = 3 * kFlashRows * 4 + (kFlashRows + kFlashKeys) * 4;
+    static constexpr int kStatsBytes = 3 * kFlashRows * 4 + (2 * kFlashRows + kFlashKeys) * 4;
     static constexpr int kBytes = kQBytes + kKBytes + kVBytes + kPBytes + kSBytes + kStatsBytes;
 };
 
@@ -125,9 +127,11 @@ __device__ __forceinline__ float flash_warp_sum(float value) {
     return value;
 }
 
-__device__ __forceinline__ bool flash_visible(std::int32_t query, std::int32_t key, std::int32_t window) {
-    const std::int64_t distance = static_cast<std::int64_t>(query) - key;
-    return distance >= 0 && (window == 0 || distance < window);
+// A key is visible when it is no later than the query's upper bound and, with a window, less than a
+// window behind the query itself.
+__device__ __forceinline__ bool flash_visible(std::int32_t query, std::int32_t high, std::int32_t key,
+                                              std::int32_t window) {
+    return key <= high && (window == 0 || static_cast<std::int64_t>(query) - key < window);
 }
 
 // Copies `count` BF16 values (a multiple of 8) from global to shared in 16-byte units.
@@ -154,7 +158,8 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     float* row_sum   = row_max + kFlashRows;
     float* row_alpha = row_sum + kFlashRows;
     auto* qpos       = reinterpret_cast<std::int32_t*>(row_alpha + kFlashRows);
-    std::int32_t* kpos = qpos + kFlashRows;
+    std::int32_t* qhigh = qpos + kFlashRows;
+    std::int32_t* kpos  = qhigh + kFlashRows;
     const int vstride  = kCompact ? Layout::kQStride : Layout::kVStride;
 
     const int thread = static_cast<int>(threadIdx.x);
@@ -177,7 +182,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         __nv_bfloat16* dst      = qs + r * Layout::kQStride;
         if (flat >= rows) {
             for (int j = lane; j < QK; j += 32) dst[j] = __float2bfloat16_rn(0.0F);
-            if (lane == 0) qpos[r] = INT_MIN;
+            if (lane == 0) qpos[r] = qhigh[r] = INT_MIN;
             continue;
         }
         const std::int32_t token = static_cast<std::int32_t>(flat / group);
@@ -204,7 +209,11 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         } else {
             flash_copy_row(dst, src, QK, lane, 32);
         }
-        if (lane == 0) qpos[r] = p.position_q[token + static_cast<std::int64_t>(p.query_tokens) * b];
+        if (lane == 0) {
+            const std::int64_t at = token + static_cast<std::int64_t>(p.query_tokens) * b;
+            qpos[r]               = p.position_q[at];
+            qhigh[r]              = p.position_q_high ? p.position_q_high[at] : qpos[r];
+        }
     }
     if (thread < kFlashRows) {
         row_max[thread] = -CUDART_INF_F;
@@ -215,7 +224,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     for (int r = 0; r < kFlashRows; ++r) {
         if (qpos[r] == INT_MIN) continue;
         query_low  = min(query_low, qpos[r]);
-        query_high = max(query_high, qpos[r]);
+        query_high = max(query_high, qhigh[r]);
     }
 
     constexpr int kColumns = V / kFlashWarps;
@@ -297,7 +306,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
                 const int r   = g + (i >= 2 ? 8 : 0);
                 const int col = warp * 8 + 2 * t + (i & 1);
                 const bool ok = qpos[r] != INT_MIN && base + col < keys &&
-                                flash_visible(qpos[r], kpos[col], p.window);
+                                flash_visible(qpos[r], qhigh[r], kpos[col], p.window);
                 ss[r * (kFlashKeys + 1) + col] = ok ? acc[i] * p.scale : -CUDART_INF_F;
             }
         }

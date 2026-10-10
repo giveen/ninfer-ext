@@ -35,8 +35,8 @@ void require_positions(const Tensor& tensor, const char* role, std::int32_t exte
 } // namespace
 
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                              const Tensor& position_q, const Tensor& position_k,
-                              const Tensor& k_extra, const Tensor& v_extra,
+                              const Tensor& position_q, const Tensor& position_q_high,
+                              const Tensor& position_k, const Tensor& k_extra, const Tensor& v_extra,
                               const Tensor& position_extra, AttentionHeadGeometry geometry, std::uint32_t window, float scale,
                               Tensor& out, const Tensor& workspace, cudaStream_t stream) {
     if (!valid_attention_head_geometry(geometry)) {
@@ -71,6 +71,13 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     require_positions(position_q, "position_q", query_tokens, batch);
     require_positions(position_k, "position_k", key_tokens, batch);
+    const bool has_high = position_q_high.data != nullptr;
+    if (has_high) {
+        require_positions(position_q_high, "position_q_high", query_tokens, batch);
+        if (!position_q_high.is_contiguous()) {
+            throw std::invalid_argument("sliding_causal_attention: position_q_high must be contiguous");
+        }
+    }
     const bool has_extra = position_extra.data != nullptr && position_extra.numel() > 0;
     if (has_extra) {
         const std::int32_t extra = position_extra.ne[0];
@@ -102,7 +109,8 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 
     const Tensor none;
-    detail::sliding_causal_attention_launch(q, k, v, position_q, position_k,
+    detail::sliding_causal_attention_launch(q, k, v, position_q,
+                                            has_high ? position_q_high : none, position_k,
                                             has_extra ? k_extra : none, has_extra ? v_extra : none,
                                             has_extra ? position_extra : none, head_dim,
                                             geometry.query_heads, geometry.kv_heads, window, scale,
