@@ -159,4 +159,67 @@ TextConfig parse_text_config(const artifact::Json& value) {
     return out;
 }
 
+DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& target) {
+    const auto draft_fail = [](const std::string& message) -> void {
+        throw artifact::ArtifactError("Gemma 4 drafter config: " + message);
+    };
+    if (!value.is_object()) draft_fail("config must be an object");
+    static constexpr const char* kMembers[] = {
+        "architectures", "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "backbone_hidden_size", "vocab_size", "rms_norm_eps", "hidden_act", "layer_types",
+        "tie_word_embeddings"};
+    for (const auto& member : value.items()) {
+        bool known = false;
+        for (const char* allowed : kMembers) { known = known || member.key() == allowed; }
+        if (!known) draft_fail("unknown member " + member.key());
+    }
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures.at(0) != "Gemma4AssistantForCausalLM" ||
+        value.at("model_type") != "gemma4_assistant") {
+        draft_fail("architectures must be [Gemma4AssistantForCausalLM]");
+    }
+    DraftConfig out;
+    out.hidden_size          = positive(value, "hidden_size");
+    out.intermediate_size    = positive(value, "intermediate_size");
+    out.num_hidden_layers    = positive(value, "num_hidden_layers");
+    out.backbone_hidden_size = positive(value, "backbone_hidden_size");
+    out.rms_norm_eps         = number(value, "rms_norm_eps");
+    if (out.backbone_hidden_size != target.hidden_size) {
+        draft_fail("backbone_hidden_size must be the target's hidden size");
+    }
+    if (positive(value, "vocab_size") != target.vocab_size) {
+        draft_fail("vocab_size must be the target's");
+    }
+    if (value.at("hidden_act") != "gelu_pytorch_tanh") draft_fail("hidden_act must be gelu_pytorch_tanh");
+    if (!boolean(value, "tie_word_embeddings")) draft_fail("the drafter's head is its tied embedding");
+    const auto& layers = value.at("layer_types");
+    if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
+        draft_fail("layer_types must cover every layer");
+    }
+    for (const auto& kind : layers) {
+        if (kind == "sliding_attention") {
+            out.layer_types.push_back(MixerKind::SlidingAttention);
+        } else if (kind == "full_attention") {
+            out.layer_types.push_back(MixerKind::FullAttention);
+        } else {
+            draft_fail("layer_types entries must be sliding_attention or full_attention");
+        }
+    }
+    // The cache each drafter layer shares is the target's last layer of the same kind.
+    bool sliding_found = false, global_found = false;
+    for (std::size_t layer = target.layer_types.size(); layer-- > 0;) {
+        if (!sliding_found && target.sliding_attention(layer)) {
+            out.target_sliding_layer = static_cast<std::uint32_t>(layer);
+            sliding_found            = true;
+        }
+        if (!global_found && !target.sliding_attention(layer)) {
+            out.target_global_layer = static_cast<std::uint32_t>(layer);
+            global_found            = true;
+        }
+    }
+    if (!sliding_found || !global_found) draft_fail("the target lacks a layer of each kind");
+    return out;
+}
+
 } // namespace ninfer::models::gemma4

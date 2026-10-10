@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -270,6 +271,18 @@ int run_bf16_linear() {
         }
     }
     failures += run_selector_linear();
+
+    // The Gemma 4 assistant drafter's shapes, which run one token per step, eager and replayed.
+    constexpr std::array<std::array<std::int32_t, 2>, 7> kDraftShapes{{
+        {1024, 10752}, {8192, 1024}, {16384, 1024}, {1024, 8192}, {1024, 16384},
+        {262144, 1024}, {5376, 1024},
+    }};
+    std::uint32_t seed = 431U;
+    for (const auto& [n, k] : kDraftShapes) {
+        DeviceWeight weight(make_patterned(n, k, seed++));
+        failures += run_bf16_linear_case(weight, 1);
+        failures += run_bf16_linear_case(weight, 1, true);
+    }
     return failures;
 }
 

@@ -157,7 +157,10 @@ def main(argv=None):
             if companions:
                 raise ValueError("Gemma 4 has no DFlash companions")
             model = build_gemma4_model(
-                base, components=components, resource_overrides=overrides
+                base,
+                components=components,
+                resource_overrides=overrides,
+                draft=sources["mtp"] if "mtp" in components else None,
             )
         elif is_qwen4_exp(base.config):
             if companions:

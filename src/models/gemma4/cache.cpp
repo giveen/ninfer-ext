@@ -28,7 +28,8 @@ KvCache::~KvCache() {
 
 KvCache::KvCache(KvCache&& other) noexcept
     : config_(other.config_), layers_(std::move(other.layers_)), owned_(std::move(other.owned_)),
-      capacity_(other.capacity_), bytes_(other.bytes_) {
+      capacity_(other.capacity_), ring_slack_(other.ring_slack_), stale_end_(other.stale_end_),
+      bytes_(other.bytes_) {
     other.layers_.clear();
     other.owned_.clear();
     other.bytes_ = 0;
@@ -42,8 +43,10 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
         config_   = other.config_;
         layers_   = std::move(other.layers_);
         owned_    = std::move(other.owned_);
-        capacity_ = other.capacity_;
-        bytes_    = other.bytes_;
+        capacity_   = other.capacity_;
+        ring_slack_ = other.ring_slack_;
+        stale_end_  = other.stale_end_;
+        bytes_      = other.bytes_;
         other.layers_.clear();
         other.owned_.clear();
         other.bytes_ = 0;
@@ -51,10 +54,13 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
     return *this;
 }
 
-void KvCache::configure(const TextConfig& config, std::int32_t capacity) {
+void KvCache::configure(const TextConfig& config, std::int32_t capacity, std::int32_t ring_slack) {
     if (capacity < 1) throw std::invalid_argument("KvCache: capacity must be positive");
-    config_   = config;
-    capacity_ = capacity;
+    if (ring_slack < 0) throw std::invalid_argument("KvCache: ring slack must not be negative");
+    config_     = config;
+    capacity_   = capacity;
+    ring_slack_ = ring_slack;
+    stale_end_  = 0;
     layers_.assign(config.num_hidden_layers, Layer{});
     std::vector<void*>().swap(owned_);
     bytes_ = 0;
@@ -111,7 +117,8 @@ void KvCache::allocate() {
     for (std::size_t layer = 0; layer < layers_.size(); ++layer) ensure(layer);
 }
 
-std::size_t KvCache::device_bytes(const TextConfig& config, std::int32_t capacity) {
+std::size_t KvCache::device_bytes(const TextConfig& config, std::int32_t capacity,
+                                  std::int32_t ring_slack) {
     std::size_t total = 0;
     for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
         const bool global = !config.sliding_attention(layer);
@@ -120,7 +127,8 @@ std::size_t KvCache::device_bytes(const TextConfig& config, std::int32_t capacit
         const std::size_t heads =
             global ? config.global.shared.num_key_value_heads : config.sliding.num_key_value_heads;
         const std::size_t tokens =
-            global ? static_cast<std::size_t>(capacity) : config.sliding_window;
+            global ? static_cast<std::size_t>(capacity)
+                   : config.sliding_window + static_cast<std::size_t>(ring_slack);
         const std::size_t width = global ? head_dim + 2 * config.global.rope_angles : head_dim;
         total += width * heads * tokens * sizeof(std::uint16_t);
         if (!global) total += head_dim * heads * tokens * sizeof(std::uint16_t);
@@ -133,6 +141,46 @@ void KvCache::reset() {
     for (std::size_t layer = 0; layer < layers_.size(); ++layer) {
         if (layers_[layer].allocated) reset_layer(layer);
     }
+    stale_end_ = 0;
+}
+
+namespace {
+const Tensor& existing(const Tensor& tensor, bool allocated) {
+    if (!allocated) throw std::logic_error("KvCache: the layer has no storage yet");
+    return tensor;
+}
+} // namespace
+
+Tensor KvCache::keys(std::size_t layer) const {
+    return existing(layers_.at(layer).keys, layers_.at(layer).allocated);
+}
+
+Tensor KvCache::values(std::size_t layer) const {
+    return existing(layers_.at(layer).values, layers_.at(layer).allocated);
+}
+
+Tensor KvCache::positions(std::size_t layer) const {
+    return existing(layers_.at(layer).positions, layers_.at(layer).allocated);
+}
+
+void KvCache::forget_stale(std::size_t layer, std::int32_t from, cudaStream_t stream) {
+    if (!config_.sliding_attention(layer) || stale_end_ <= from) return;
+    ensure(layer);
+    const std::int32_t count = std::min(stale_end_ - from, ring_tokens());
+    // The marker vector must outlive the copies, which a pageable source guarantees by staging.
+    const std::vector<std::int32_t> unwritten(static_cast<std::size_t>(count), kUnwrittenPosition);
+    auto* base = static_cast<std::uint8_t*>(layers_[layer].positions.data);
+    const std::int32_t first = slot(layer, from);
+    const std::int32_t head  = std::min(count, ring_tokens() - first);
+    const auto write = [&](std::int32_t at, std::int32_t n) {
+        if (n > 0 && cudaMemcpyAsync(base + static_cast<std::size_t>(at) * sizeof(std::int32_t),
+                                     unwritten.data(), static_cast<std::size_t>(n) * sizeof(std::int32_t),
+                                     cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+            throw std::runtime_error("KvCache: could not forget stale rows");
+        }
+    };
+    write(first, head);
+    write(0, count - head);
 }
 
 Tensor KvCache::keys(std::size_t layer) {

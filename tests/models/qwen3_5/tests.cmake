@@ -133,6 +133,16 @@ ninfer_add_test(ninfer_gemma4_forward_test
   LIBRARIES ninfer_model_loading)
 set_tests_properties(ninfer_gemma4_forward_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_gemma4_draft_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_draft.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_draft_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_mtp_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_mtp.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_mtp_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_gemma4_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_layer.cpp"
   LIBRARIES ninfer_model_loading)

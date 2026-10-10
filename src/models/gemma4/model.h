@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -41,6 +42,9 @@ public:
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
 
+    // The assistant drafter's config, when the drafter was bound (MTP speculation).
+    [[nodiscard]] const std::optional<DraftConfig>& draft_config() const noexcept { return draft_; }
+
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
@@ -60,12 +64,14 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
-    Model(TextConfig config, ModelWeights weights, std::vector<BoundWeight> bound,
-          std::vector<float> layer_scalars, artifact::MaterializedArtifact backing);
+    Model(TextConfig config, std::optional<DraftConfig> draft, ModelWeights weights,
+          std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
+          artifact::MaterializedArtifact backing);
 
     // Destroyed last: every BoundWeight view borrows these bytes.
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
+    std::optional<DraftConfig> draft_;
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<float> layer_scalars_;

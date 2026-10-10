@@ -6,7 +6,10 @@ RMSNorm (no `1 + w` offset), sandwich norms on the branch output, a per-layer `l
 GeGLU MLP, alternating sliding (D256, window 1024) and global (D512, K = V) attention with
 proportional RoPE, attention scale exactly 1.0, and a final logit soft-cap of 30.
 
-Only the text tower is mapped here; the vision tower and the assistant drafter are later phases.
+The text tower is mapped, and with the `mtp` component the official assistant drafter
+(`Gemma4AssistantForCausalLM`, e.g. google/gemma-4-31B-it-assistant) from a separate source. The
+drafter has no key or value projections: each of its layers attends to the target's cache of the same
+kind, the last sliding and the last global layer. The vision tower is a later phase.
 """
 
 from __future__ import annotations
@@ -58,12 +61,10 @@ def _expected_layer_types(layers: int) -> list[str]:
     ]
 
 
-def text_config(source: dict, *, mtp: bool = False) -> dict:
+def text_config(source: dict) -> dict:
     architectures = source.get("architectures")
     if not isinstance(architectures, list) or len(architectures) != 1 or not is_gemma4(source):
         raise ValueError(f"unsupported Gemma 4 architecture {architectures!r}")
-    if mtp:
-        raise ValueError("Gemma 4 has no MTP component in this plan (the drafter is a later phase)")
     raw = source.get("text_config", source)
 
     result: dict = {"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4_text"}
@@ -153,6 +154,72 @@ def text_config(source: dict, *, mtp: bool = False) -> dict:
     return result
 
 
+# The assistant drafter's own structure. Its attention geometry is the target's by construction,
+# because every drafter layer reads the target's cache of the same kind.
+_DRAFT = {
+    "hidden_size": 1024,
+    "intermediate_size": 8192,
+    "num_hidden_layers": 4,
+}
+
+
+def draft_config(source: dict, target: dict) -> dict:
+    """The `mtp` component config for the official Gemma 4 assistant drafter."""
+    if source.get("architectures") != ["Gemma4AssistantForCausalLM"]:
+        raise ValueError(f"unsupported Gemma 4 drafter {source.get('architectures')!r}")
+    if source.get("use_ordered_embeddings", False):
+        raise ValueError("the drafter's ordered (centroid) head is not supported; a full head is")
+    if source.get("backbone_hidden_size") != target["hidden_size"]:
+        raise ValueError("the drafter's backbone_hidden_size must be the target's hidden size")
+    raw = source.get("text_config")
+    if not isinstance(raw, dict):
+        raise ValueError("the drafter needs a text_config")
+    for key, expected in _DRAFT.items():
+        if raw.get(key) != expected:
+            raise ValueError(f"the Gemma 4 31B drafter expects {key} {expected}, got {raw.get(key)}")
+    layers = raw["num_hidden_layers"]
+    if raw.get("num_kv_shared_layers") != layers:
+        raise ValueError("every drafter layer must share the target's KV")
+    _fixed(raw, "hidden_activation", "gelu_pytorch_tanh", "mtp")
+    _fixed(raw, "attention_bias", False, "mtp")
+    _fixed(raw, "attention_k_eq_v", True, "mtp")
+    _fixed(raw, "final_logit_softcapping", None, "mtp")
+    for key, target_key in (
+        ("vocab_size", "vocab_size"),
+        ("num_attention_heads", "num_attention_heads"),
+        ("num_key_value_heads", "num_key_value_heads"),
+        ("num_global_key_value_heads", "num_global_key_value_heads"),
+        ("head_dim", "head_dim"),
+        ("global_head_dim", "global_head_dim"),
+        ("sliding_window", "sliding_window"),
+    ):
+        if raw.get(key) != target[target_key]:
+            raise ValueError(f"the drafter's {key} must equal the target's")
+    if raw.get("rope_parameters") is None:
+        raise ValueError("the drafter needs rope_parameters")
+    for kind in (_SLIDING_ATTENTION, _FULL_ATTENTION):
+        mine, theirs = raw["rope_parameters"].get(kind, {}), target["rope_parameters"][kind]
+        if mine.get("rope_type") != theirs["rope_type"] or \
+                _f32(mine.get("rope_theta"), "mtp.rope_theta") != theirs["rope_theta"]:
+            raise ValueError(f"the drafter's {kind} RoPE must equal the target's")
+    kinds = raw.get("layer_types")
+    if kinds != [_SLIDING_ATTENTION] * (layers - 1) + [_FULL_ATTENTION]:
+        raise ValueError("the drafter expects sliding layers then one global layer")
+    return {
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "model_type": "gemma4_assistant",
+        "hidden_size": raw["hidden_size"],
+        "intermediate_size": raw["intermediate_size"],
+        "num_hidden_layers": layers,
+        "backbone_hidden_size": target["hidden_size"],
+        "vocab_size": raw["vocab_size"],
+        "rms_norm_eps": _f32(raw.get("rms_norm_eps", 1e-6), "mtp.rms_norm_eps"),
+        "hidden_act": "gelu_pytorch_tanh",
+        "layer_types": list(kinds),
+        "tie_word_embeddings": True,
+    }
+
+
 class _Gemma4Builder(_Builder):
     """Maps the Gemma 4 text tower: four norms per layer, a layer scalar, and two attention kinds."""
 
@@ -160,6 +227,32 @@ class _Gemma4Builder(_Builder):
         # Plain RMSNorm (no `1 + w`) and K-norm-of-V are stored as plain weights; `direct`
         # keeps them BF16.
         self.add(name, store, source_name, (width,), direct="bf16")
+
+    def draft_block(self, prefix, source_prefix, store, draft, target, kind):
+        """One drafter layer: the target layer's body without key and value projections."""
+        h = draft["hidden_size"]
+        intermediate = draft["intermediate_size"]
+        attention = prefix + "attention/"
+        head_dim = target["global_head_dim"] if kind == _FULL_ATTENTION else target["head_dim"]
+        q_rows = target["num_attention_heads"] * head_dim
+        for role, source in (("input_norm", "input_layernorm"),
+                             ("post_attention_norm", "post_attention_layernorm"),
+                             ("pre_feedforward_norm", "pre_feedforward_layernorm"),
+                             ("post_feedforward_norm", "post_feedforward_layernorm")):
+            self.weight_vector(prefix + role, store, source_prefix + source + ".weight", h)
+        self.add(prefix + "layer_scalar", store, source_prefix + "layer_scalar", (1,),
+                 direct="fp32")
+        self.add(attention + "query", store, source_prefix + "self_attn.q_proj.weight",
+                 (q_rows, h), inputs=(prefix + "mixer_input",))
+        self.weight_vector(attention + "query_norm", store,
+                           source_prefix + "self_attn.q_norm.weight", head_dim)
+        self.add(attention + "output", store, source_prefix + "self_attn.o_proj.weight",
+                 (h, q_rows), inputs=(attention + "gated_output",))
+        for role in ("gate", "up"):
+            self.add(prefix + "mlp/" + role, store, source_prefix + "mlp." + role + "_proj.weight",
+                     (intermediate, h), inputs=(prefix + "mlp_input",))
+        self.add(prefix + "mlp/down", store, source_prefix + "mlp.down_proj.weight",
+                 (h, intermediate), inputs=(prefix + "mlp/product",))
 
     def block(self, prefix, source_prefix, store, config, kind):
         h = config["hidden_size"]
@@ -225,12 +318,17 @@ def build_model(
     *,
     components: tuple[str, ...] = ("text",),
     resource_overrides: Mapping[str, str | Path] | None = None,
+    draft: SafetensorsSource | None = None,
 ) -> Model:
     selected = set(components)
-    if "text" not in selected or selected - {"text"}:
-        raise ValueError("Gemma 4 supports the text component only in this phase")
+    if "text" not in selected or selected - {"text", "mtp"}:
+        raise ValueError("Gemma 4 supports the text and mtp components")
+    if ("mtp" in selected) != (draft is not None):
+        raise ValueError("the mtp component needs the drafter checkpoint as --source mtp=PATH")
     config = text_config(base.config)
     records = {"text": {"config": config}}
+    if draft is not None:
+        records["mtp"] = {"config": draft_config(draft.config, config)}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], vision_config=None,
         overrides=resource_overrides, family="gemma",
@@ -249,4 +347,19 @@ def build_model(
     for index, kind in enumerate(config["layer_types"]):
         builder.block(f"text/layers/{index}/", text_prefix + f"layers.{index}.", base, config,
                       kind)
+    if draft is not None:
+        mtp = records["mtp"]["config"]
+        d = mtp["hidden_size"]
+        # The drafter reads [target embedding; target hidden] in, and hands a target-width hidden
+        # state to its next step. Its head is tied to its own (otherwise unused) embedding table.
+        builder.add("mtp/pre_projection", draft, "pre_projection.weight", (d, 2 * h),
+                    inputs=("mtp/input",))
+        builder.add("mtp/post_projection", draft, "post_projection.weight", (h, d),
+                    inputs=("mtp/final_hidden",))
+        builder.add("mtp/output_head", draft, "model.embed_tokens.weight", (r, d),
+                    inputs=("mtp/final_hidden",))
+        builder.weight_vector("mtp/final_norm", draft, "model.norm.weight", d)
+        for index, kind in enumerate(mtp["layer_types"]):
+            builder.draft_block(f"mtp/layers/{index}/", f"model.layers.{index}.", draft, mtp,
+                                config, kind)
     return model

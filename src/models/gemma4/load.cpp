@@ -113,10 +113,49 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
     return out;
 }
 
+DraftWeights bind_draft(Bindings& bindings, const TextConfig& target, const DraftConfig& draft) {
+    const std::uint64_t hidden       = draft.hidden_size;
+    const std::uint64_t intermediate = draft.intermediate_size;
+    const std::uint64_t backbone     = draft.backbone_hidden_size;
+    DraftWeights out;
+    // The drafter is BF16 and small; its formats are still the converter's choice.
+    out.pre_projection  = bindings.parameter("mtp/pre_projection", {hidden, 2 * backbone});
+    out.post_projection = bindings.parameter("mtp/post_projection", {backbone, hidden});
+    out.output_head     = bindings.parameter("mtp/output_head", {target.vocab_size, hidden});
+    out.final_norm      = bindings.parameter("mtp/final_norm", {hidden}, kNormFormat);
+    for (std::size_t layer = 0; layer < draft.num_hidden_layers; ++layer) {
+        const bool sliding       = draft.layer_types[layer] == MixerKind::SlidingAttention;
+        const auto& geometry     = sliding ? target.sliding : target.global.shared;
+        const std::string prefix = "mtp/layers/" + std::to_string(layer) + "/";
+        const std::uint64_t query_rows =
+            static_cast<std::uint64_t>(target.num_attention_heads) * geometry.head_dim;
+        DraftLayerWeights weights;
+        weights.mixer = draft.layer_types[layer];
+        weights.input_norm = bindings.parameter(prefix + "input_norm", {hidden}, kNormFormat);
+        weights.post_attention_norm =
+            bindings.parameter(prefix + "post_attention_norm", {hidden}, kNormFormat);
+        weights.pre_feedforward_norm =
+            bindings.parameter(prefix + "pre_feedforward_norm", {hidden}, kNormFormat);
+        weights.post_feedforward_norm =
+            bindings.parameter(prefix + "post_feedforward_norm", {hidden}, kNormFormat);
+        weights.layer_scalar = bindings.parameter(prefix + "layer_scalar", {1}, kScalarFormat);
+        weights.query  = bindings.parameter(prefix + "attention/query", {query_rows, hidden});
+        weights.query_norm =
+            bindings.parameter(prefix + "attention/query_norm", {geometry.head_dim}, kNormFormat);
+        weights.output = bindings.parameter(prefix + "attention/output", {hidden, query_rows});
+        weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden});
+        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden});
+        weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate});
+        out.layers.push_back(weights);
+    }
+    return out;
+}
+
 } // namespace
 
 struct LoadPlan::Impl {
     TextConfig config;
+    std::optional<DraftConfig> draft;
     TextResources resources;
     LoadOptions options;
     ModelWeights weights;
@@ -155,6 +194,8 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 
 const TextConfig& LoadPlan::config() const { return impl_->config; }
 
+const std::optional<DraftConfig>& LoadPlan::draft_config() const { return impl_->draft; }
+
 const TextResources& LoadPlan::resources() const { return impl_->resources; }
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
@@ -187,6 +228,14 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources.chat_template_jinja    = resource("chat_template.jinja");
     Bindings bindings(out->binder);
     out->weights.text = bind_text(bindings, out->config);
+    if (options.mtp()) {
+        if (!reader.directory().components.contains("mtp")) {
+            throw artifact::ArtifactError(
+                "MTP speculation needs the assistant drafter: convert with --components text,mtp");
+        }
+        out->draft = parse_draft_config(reader.directory().component("mtp").config, out->config);
+        out->weights.draft = bind_draft(bindings, out->config, *out->draft);
+    }
     out->references.reserve(bindings.weights().size());
     for (const auto& pending : bindings.weights()) { out->references.push_back(pending.reference); }
     // The plan's physical demand is whatever Binding produced; finishing consumes the Binder, so it
@@ -195,10 +244,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     return LoadPlan(std::move(out));
 }
 
-Model::Model(TextConfig config, ModelWeights weights, std::vector<BoundWeight> bound,
-             std::vector<float> layer_scalars, artifact::MaterializedArtifact backing)
-    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
-      bound_(std::move(bound)), layer_scalars_(std::move(layer_scalars)) {}
+Model::Model(TextConfig config, std::optional<DraftConfig> draft, ModelWeights weights,
+             std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
+             artifact::MaterializedArtifact backing)
+    : backing_(std::move(backing)), config_(std::move(config)), draft_(std::move(draft)),
+      weights_(std::move(weights)), bound_(std::move(bound)),
+      layer_scalars_(std::move(layer_scalars)) {}
 
 Model::~Model() = default;
 
@@ -233,18 +284,22 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     // The layer scalars are consumed as host floats, so read the sixty 4-byte values once here
     // rather than syncing a device copy on every layer of every token.
     std::vector<float> layer_scalars(data->references.size(), 1.0F);
-    for (const auto& layer : data->weights.text.layers) {
-        const auto& reference = data->references.at(layer.layer_scalar.index);
+    const auto read_scalar = [&](WeightId id) {
+        const auto& reference = data->references.at(id.index);
         if (reference.shape.size() != 1 || reference.shape[0] != 1) {
             throw artifact::ArtifactError(reference.name + ": layer scalar must be [1]");
         }
-        const Tensor scalar = weight_tensor(bound.at(layer.layer_scalar.index).view, {1, 1, 1, 1});
-        CUDA_CHECK(cudaMemcpy(&layer_scalars[layer.layer_scalar.index], scalar.data,
-                              sizeof(float), cudaMemcpyDeviceToHost));
+        const Tensor scalar = weight_tensor(bound.at(id.index).view, {1, 1, 1, 1});
+        CUDA_CHECK(cudaMemcpy(&layer_scalars[id.index], scalar.data, sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    };
+    for (const auto& layer : data->weights.text.layers) read_scalar(layer.layer_scalar);
+    if (data->weights.draft) {
+        for (const auto& layer : data->weights.draft->layers) read_scalar(layer.layer_scalar);
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->weights),
-                                            std::move(bound), std::move(layer_scalars),
-                                            std::move(backing)));
+    return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->draft),
+                                            std::move(data->weights), std::move(bound),
+                                            std::move(layer_scalars), std::move(backing)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

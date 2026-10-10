@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <limits>
+#include <optional>
+#include <vector>
 
 namespace ninfer::models::gemma4 {
 
@@ -50,8 +52,27 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// One assistant drafter layer: a target layer's body without key and value projections.
+struct DraftLayerWeights {
+    MixerKind mixer = MixerKind::SlidingAttention;
+    WeightId input_norm, post_attention_norm, pre_feedforward_norm, post_feedforward_norm;
+    WeightId layer_scalar;
+    WeightId query, query_norm, output;
+    MlpWeights mlp;
+};
+
+struct DraftWeights {
+    // [hidden, 2 * target hidden] over [target embedding; target hidden], and back to target width.
+    WeightId pre_projection, post_projection;
+    // The drafter's own tied head: full vocabulary, no soft cap.
+    WeightId output_head, final_norm;
+    std::vector<DraftLayerWeights> layers;
+};
+
 struct ModelWeights {
     TextWeights text;
+    // Bound only when the Engine runs MTP speculation.
+    std::optional<DraftWeights> draft;
 };
 
 } // namespace ninfer::models::gemma4

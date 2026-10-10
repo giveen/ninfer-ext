@@ -2,12 +2,12 @@
 
 Gemma 4 31B (`Gemma4ForCausalLM`, text `gemma4_text`) as NInfer executes it. This is the
 mathematical authority for the implementation and the oracle; it is written from the checkpoint and
-the plan that preceded this work. Vision (P5) and the assistant drafter (P6) are not described here
-yet.
+the plan that preceded this work. The assistant drafter (MTP speculation) is section 12a; Vision (P5)
+is not described here yet.
 
-**Status.** Text generation, chat, tools, thinking, causal scoring and serving run through the
-public Engine. Prefix reuse, constrained output and fast prefill do not exist yet; section 13 lists
-what is not done.
+**Status.** Text generation, chat, tools, thinking with a budget, MTP speculation with the official
+assistant drafter, causal scoring and serving run through the public Engine. Prefix reuse and
+constrained output do not exist yet; section 13 lists what is not done.
 
 ## 1. Configuration (the instruction-tuned checkpoint)
 
@@ -216,7 +216,7 @@ identified; the bytes are the instruction-tuned model's.
 |---|---|---|---:|
 | `out/gemma4_31b_base_nvfp4.ninfer` | `gemma4_31b_base` | plan L1: MLP NVFP4 (converter-encoded, weight-only), attention and embedding FP8 rows, head BF16, norms BF16, `layer_scalar` FP32 | 22.8 GiB |
 | `out/gemma4_31b_g0.ninfer` | `gemma4_31b_g0` | gewell's G0 mask: embedding and head BF16, attention FP8, MLP FP8 in layers 0–5 and every global layer with its predecessor, NVFP4 elsewhere | 27.3 GiB |
-| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory | 23.6 GiB file, 20.9 GiB on the device |
+| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1`, `--components text,mtp --source mtp=/mnt/storage/models/gemma/assistant-31b` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory; the assistant drafter BF16 (`mtp/`, 0.94 GB, bound only with `--spec mtp`) | 24.5 GiB file, 20.9 GiB on the device (21.8 with the drafter) |
 
 M1 is the serving artifact. The layout came from `tools/verify/gemma4_sensitivity.py` (per-tensor KLD
 against the BF16 checkpoint streamed from host memory, FP32 activations; BF16 activations put a 0.15
@@ -254,34 +254,40 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   is built. A prefill pass covers at most `kPass` = 512 tokens and applies the head to its last token
   only; scoring runs passes of `kScorePass` = 128 with every column's logits, which sizes the logits
   buffer.
-- **KV cache** (`cache.{h,cpp}`): sliding layers keep a ring of exactly `sliding_window` rows. A pass
-  wider than one token attends to the ring as it was before the pass plus its own keys, which the
-  sliding Op takes as a second key set, and writes its last window of keys afterwards; so no write
-  replaces a key one of its own queries still sees, whatever the pass width. A single token writes
-  first and attends to the ring alone, since the row it replaces (position p − window) is invisible
-  to it. Global layers keep one compact row per token at its position, up to the lane's capacity.
-  Unwritten slots carry position 2^30, which both attention Ops treat as invisible; the Ops also
-  never load a key no row of the tile can see, so an unwritten slot's bits cannot reach the output.
+- **KV cache** (`cache.{h,cpp}`): sliding layers keep a ring of `sliding_window` + slack rows, the
+  slack being the MTP draft count (zero without speculation). A pass of at most slack + 1 tokens
+  writes first and attends to the ring alone: the rows it replaces are a window older than its first
+  query. A wider pass attends to the ring as it was plus its own keys, which the sliding Op takes as a
+  second key set, and writes its last ring of keys afterwards; so no write replaces a key one of its
+  own queries still sees, whatever the pass width. A verify pass writes rows for drafts that may be
+  rejected: with the slack, the older row a rejected draft replaced is invisible to every later
+  query, and the rejected rows themselves are recorded as stale and forgotten before a wide pass
+  could see them (a narrow one overwrites them first). Global layers keep one compact row per token at
+  its position, up to the lane's capacity. Unwritten slots carry position 2^30, which both attention
+  Ops treat as invisible; the Ops also never load a key no row of the tile can see, so an unwritten
+  or stale slot's bits cannot reach the output.
 - **Attention Ops**: `sliding_causal_attention` (D 256, 32/16 heads, window, scale 1.0, optional
   second key set) and `causal_compact_attention` over the 640-value compact rows share one
   tensor-core flash kernel (`gemma_flash_attention.cuh`): BF16 m16n8k16 MMA with FP32 accumulation,
   16 query rows per block, 32-key tiles skipped by position before they load, online Softmax with P
   carried as a BF16 hi + lo pair, and a key split with a combine kernel when a pass has few rows.
 - **Linears**: M1's Q6 and Q5 g64 A16 routes carry Gemma's shapes. Single-token passes use the Q6
-  GEMV and single-row Q5 instances at K 5376 and 21504; wider passes reuse the route lists tuned for
-  the nearest Qwen shapes, untuned here. The 5376-wide RMSNorm has a fixed-width route. GeGLU is
-  unfused (`gelu_mul` on the two halves).
+  GEMV and single-row Q5 instances at K 5376 and 21504; 2-8 token passes (MTP verification) use one
+  8-token sliced MMA block for Q5, as Q6 already did; wider passes reuse the route lists tuned for
+  the nearest Qwen shapes, untuned here. The drafter's BF16 shapes have single-token GEMV routes.
+  The 5376-wide RMSNorm has a fixed-width route. GeGLU is unfused (`gelu_mul` on the two halves).
 - **Engine** (`src/runtime/engine/gemma_instance.{h,cpp}`): `EngineCore<GemmaInstance>` and
   `CausalScoreCore<GemmaInstance>`, the same controller Qwen uses. Admission is root-only: the
   context cache is switched off for this model, so the identity candidate is always feasible and
-  never expandable and seals directly. Each lane decodes alone, one token per round, and samples on
-  device. The prefix-cache entry points the controller is compiled against (pressure planning,
+  never expandable and seals directly. Each lane decodes alone, one token or one MTP round per
+  decode round, and samples on device. The prefix-cache entry points the controller is compiled against (pressure planning,
   captures, checkpoint recovery, continuations) refuse by name. Forced control tokens (the thinking
   budget's `<channel|>` close) are appended as one prefill of the lane. Contract
   types this model never constructs are the Qwen contract's pure-data types; moving them into
   `runtime/contract` is the plan's D1-b extraction and is not done.
-- **Refused options**: speculative decoding, Vision, a KV format other than BF16, KV streaming, and
-  an explicit KV capacity below `max_context`. `ninfer-perplexity` defaults to FP8 KV, so it needs
+- **Refused options**: speculative backends other than MTP (and MTP's optimized proposal head,
+  prompt-lookup drafts and draft trees), Vision, a KV format other than BF16, KV streaming, and an
+  explicit KV capacity below `max_context`. `ninfer-perplexity` defaults to FP8 KV, so it needs
   `--kv-dtype bf16` for this model. CUDA Graphs are not used whatever `use_cuda_graph` says.
 
 ## 11. Verification
@@ -296,7 +302,9 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Batched against token-at-a-time | `NINFER_GEMMA_SEQUENTIAL=1` on the same text | M1: mean per-target difference 0.24 nats inside the window, 0.15 past it; the worst single target varies from 4 to 8 nats between builds that only reorder sums |
 | Engine routes | the score test's Engine-core and public-API modes | identical to the Program on 1,500 positions |
 | Generation | `ninfer` CLI, greedy | "The capital of France is Paris."; thinking mode streams reasoning separately from the answer |
-| Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand |
+| Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand; the same with `--spec mtp`, plus a thinking budget of 24 closing the channel |
+| Drafter | `ninfer_gemma4_draft_test` dumps, `tools/verify/gemma4_draft_reference.py` runs transformers' `Gemma4AssistantForCausalLM` in FP32 on the same inputs (position 1,501, rings wrapped) | four steps: logits cosine ≥ 0.99996, argmax and top-5 identical, projected-state cosine ≥ 0.99997 |
+| MTP rounds | `ninfer_gemma4_mtp_test`: 384 greedy tokens after a 1,100-token prompt at seven drafts | every ring slot and global row holds its committed position (without the slack the same run leaves 50 wrong); against one fresh scoring pass the output disagrees 1-4 times, the same as plain decode (4) |
 
 **Per-position divergence from HF is large even where the averages agree.** On the 1,501-token text
 L1's mean per-target |difference| from HF is 0.79 nats with a 99th percentile of 7.8 and a worst of 23,
@@ -331,6 +339,62 @@ sliced-K MMA and 29% in attention; widening the pass to 512 tokens took pp8192 f
 tok/s. Two concurrent requests both progress, but each lane runs its own pass, so a second lane
 re-reads the weights rather than sharing a pass.
 
+## 12a. MTP speculation
+
+The official assistant (`google/gemma-4-31B-it-assistant`, `Gemma4AssistantForCausalLM`) is four
+layers at hidden 1024: three sliding and one global, with no key or value projections, a tied
+262,144-row head without soft cap, and `pre_projection` [1024, 10752] / `post_projection` [5376,
+1024]. Its layers attend to the target's cache: the sliding ones to the last sliding layer's ring
+(58), the global one to the last global layer's compact rows (59), whose non-rotated key is the
+stored value times layer 59's key-norm weight, which the drafter's query carries exactly as the
+target's own global query does.
+
+A round, for a lane whose last accepted token (the anchor, at position p) the target has not
+consumed:
+
+1. Draft K tokens greedily. Step 1 reads [scaled target embedding(anchor); the target's
+   post-final-norm state at p − 1]; step i reads [embedding(draft i − 1); the drafter's projected
+   state from step i − 1]. Every step uses RoPE position p and sees exactly the target keys before p
+   (transformers' generator slices the shared KV to the sequence length, which on a rejection round
+   still contains the rejected draft's row at p; NInfer does not show it).
+2. Verify: one target pass over [anchor, drafts] at p..p+K with every column's logits.
+3. Accept with `speculative_accept_greedy_drafts` under the lane's sampler: the longest greedy-draft
+   prefix the target licenses plus its own correction or bonus token, which is exact for greedy and
+   speculative rejection sampling otherwise.
+4. Commit the kept n tokens: the target has consumed p..p+n−1, the drafter's next input state is the
+   verify pass's column n − 1, and the rows past it are stale.
+
+The draft length is the MTP ladder's: `--draft-tokens N --fixed-draft` drafts exactly N; otherwise
+each lane chooses among {2, 3, 4, 7} ∩ below N, plus N, by expected committed tokens per second
+(`qwen3_5::MtpDraftPolicy`, borrowed like the other Qwen contract types until the D1-b extraction).
+Rung times are measured at startup on lane 0 and refined from the rounds that run.
+
+Measured (RTX 5090, M1 with the drafter, 384 output tokens, one request, `ninfer` CLI decode speed;
+sampled is the generation-config default at seed 7):
+
+| Prompt | No MTP | K=3 | K=5 | K=7 | adaptive ≤ 7 | acceptance (adaptive) |
+|---|---:|---:|---:|---:|---:|---:|
+| code, greedy | 52.0 | 136.7 | 162.4 | 167.9 | 168.1 | 49.8% |
+| story, greedy | 51.9 | 99.6 | 98.7 | 104.5 | 102.2 | 33.0% |
+| explain, greedy | 51.7 | 120.4 | 134.6 | 139.9 | 139.5 | 39.6% |
+| math, greedy | 51.5 | 154.7 | 197.7 | 228.0 | 228.5 | 72.9% |
+| translate, greedy | 53.2 | 120.6 | 125.0 | 124.2 | 125.4 | 33.6% |
+| code, sampled | 51.8 | 135.4 | 158.9 | 169.4 | 169.6 | 50.2% |
+| story, sampled | 51.7 | 91.1 | 96.1 | 95.5 | 101.2 | 31.6% |
+| explain, sampled | 51.5 | 124.0 | 134.6 | 142.6 | 135.0 | 37.6% |
+| math, sampled | 51.4 | 145.1 | 192.5 | 239.2 | 239.6 | 77.3% |
+| translate, sampled | 53.2 | 120.6 | 125.3 | 124.8 | 125.4 | 33.6% |
+
+Adaptive is within 5.3% of the best fixed length on every prompt; the worst case is the sampled
+explanation (5.3% under K=7), and it beats every fixed length on the sampled story. These numbers depend on the verify pass being flat in its width: a
+target pass costs 17.7 ms at one token and about 20 ms from two to eight. Before the 2-8 token Q5
+route moved to one 8-token block, five to eight tokens cost 27.7-30.6 ms, K=3 was the best fixed
+length and adaptive lost 3-7% on prose; that state is not what ships. From the startup rung times,
+a drafter step costs 0.7-1.1 ms; its 0.94 GB of weights are about half head, and it has not been
+profiled further. Greedy MTP output can differ from plain greedy output after a
+few hundred tokens because verify passes and single-token passes round differently; the check above
+compares each against one fresh pass instead.
+
 ## 13. Not done
 
 | Item | Why it matters | What it needs |
@@ -341,7 +405,8 @@ re-reads the weights rather than sharing a pass.
 | CUDA Graphs | decode launch overhead | graph capture per lane count |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
-| Vision, assistant drafter | plan P5, P6 | |
+| Vision | plan P5 | |
+| MTP with several lanes in one pass, a cheaper drafter step | each lane verifies alone; drafting is 3-7 ms of a 7-draft round, unprofiled | the lane batching above; a drafter profile, then e.g. a Q8 head qualified against acceptance |
 
 ## 14. What the sibling engines settle
 
@@ -359,6 +424,5 @@ Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and `common/parsers/gemm
 | Question | How it closes |
 |---|---|
 | Sliding mask with images (`use_bidirectional_attention: "vision"`; llama.cpp reads it as bidirectional on SWA layers only) | Transformers `create_masks_for_vision_model` and an oracle case, with Vision (P5) |
-| The assistant drafter's hidden state (before or after the final norm) | `modeling_gemma4_assistant.py`, with P6 |
 | Compact global KV rounding at 128K/256K | the Op criterion at those lengths; separate K/V rows (+60% global KV) if it fails |
 | A fused sublayer boundary (post-norm + residual + scalar + next pre-norm) | an attempt was reverted after elements at small cancelling values deviated by up to 0.7% with a scalar ≠ 1; compare the fp32 `inv` and residual sum against FP64 directly before retrying |

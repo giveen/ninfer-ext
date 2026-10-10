@@ -73,6 +73,21 @@ struct TextConfig {
     }
 };
 
+// The assistant drafter (the artifact's `mtp` component). It has no key or value projections: each of
+// its layers attends to the target's cache of the same kind, the target's last sliding layer and its
+// last global layer, so its attention geometry is the target's and only its widths are its own.
+struct DraftConfig {
+    std::uint32_t hidden_size          = 0;
+    std::uint32_t intermediate_size    = 0;
+    std::uint32_t num_hidden_layers    = 0;
+    std::uint32_t backbone_hidden_size = 0;
+    float rms_norm_eps                 = 0.0F;
+    std::vector<MixerKind> layer_types;
+    // The target layers the drafter's sliding and global layers read.
+    std::uint32_t target_sliding_layer = 0;
+    std::uint32_t target_global_layer  = 0;
+};
+
 struct Config {
     TextConfig text;
 };
@@ -80,5 +95,8 @@ struct Config {
 // Parses one text component config. Throws ArtifactError on an unknown member or a violated
 // invariant, so a checkpoint this build cannot execute is refused at load rather than misread.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
+
+// Parses the `mtp` component against the target it drafts for, with the same strictness.
+[[nodiscard]] DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& target);
 
 } // namespace ninfer::models::gemma4

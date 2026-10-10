@@ -9,9 +9,10 @@
 //  - Admission is root-only. The Engine runs this model with the context cache disabled, so every
 //    request materializes from an empty lane: the identity candidate is always feasible, is never
 //    expandable, and seals directly. No prefix is reused.
-//  - Each lane runs one token per decode round. There is no speculation and no token mask, so a
-//    constrained request is refused at submission. Forced control spans (the thinking budget's
-//    channel close) are appended through append_forced_tokens.
+//  - Each lane runs one round per decode round: one token, or with MTP speculation a drafted round
+//    that licenses up to draft_tokens + 1. There is no token mask, so a constrained request is
+//    refused at submission. Forced control spans (the thinking budget's channel close) are appended
+//    through append_forced_tokens.
 //  - The prefix-cache machinery the ResourceManager can reach in principle (pressure planning,
 //    captures, checkpoint recovery, continuations) has no Gemma implementation. Its entry points exist
 //    because the common controller is compiled against them, and each refuses by name; with the cache
@@ -29,6 +30,7 @@
 #include "models/gemma4/program.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -209,12 +211,12 @@ public:
 
     [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept {
-        return std::span<const TokenId>(tokens_.data(), row_count_);
+        return std::span<const TokenId>(tokens_.data(), row_count_ * row_stride_);
     }
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept {
         return std::span<const std::int32_t>(counts_.data(), row_count_);
     }
-    [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
+    [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] bool constraint_failed(std::size_t row) const {
         if (row >= row_count_) throw std::out_of_range("pending row out of range");
         return false;
@@ -222,11 +224,19 @@ public:
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
+    static constexpr std::size_t kMaximumRowStride = models::gemma4::Program::kMaximumDraftTokens + 1;
+
     std::uint64_t transaction_ = 0;
     std::array<SequenceHandle, kMaximumConcurrency> rows_{};
-    std::array<TokenId, kMaximumConcurrency> tokens_{};
+    // Row r's licensed tokens start at r * row_stride_.
+    std::array<TokenId, kMaximumConcurrency * kMaximumRowStride> tokens_{};
     std::array<std::int32_t, kMaximumConcurrency> counts_{};
-    std::size_t row_count_ = 0;
+    // Rows that ran a speculative round, which commit rolls back past the kept prefix.
+    std::array<bool, kMaximumConcurrency> speculative_{};
+    std::array<std::int32_t, kMaximumConcurrency> drafted_{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_{};
+    std::size_t row_count_    = 0;
+    std::uint32_t row_stride_ = 1;
     ExecutionTiming timing_;
 
     friend class GemmaProgram;
@@ -264,9 +274,11 @@ using ContextTransactionProgress =
 // multi-lane executor.
 class GemmaProgram {
 public:
+    // `draft_tokens` > 0 runs MTP rounds of up to that many drafts: exactly that many when
+    // `adaptive_draft` is false, otherwise a per-lane choice among the MTP ladder's lengths.
     GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity, std::int32_t lanes,
                  std::uint32_t prefill_chunk, std::uint32_t idle_prefill_chunk,
-                 DeviceContext& device);
+                 std::int32_t draft_tokens, bool adaptive_draft, DeviceContext& device);
 
     // Scoring.
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
@@ -384,6 +396,9 @@ private:
         TokenId next_input = -1;
         bool pending       = false;
         GenerationTimings timings;
+        SpeculativeStats speculative;
+        qwen::MtpAcceptanceEstimate acceptance;
+        std::size_t rung = 0;
     };
 
     struct Transaction {
@@ -408,6 +423,9 @@ private:
     std::uint64_t open_pending_    = 0;
     std::uint32_t prefill_chunk_   = 0;
     std::uint32_t idle_chunk_      = 0;
+    // The draft-length policy, with speculation: the shared MTP ladder and acceptance model, with
+    // round times measured at startup and refined as rounds run.
+    std::optional<qwen::MtpDraftPolicy> draft_policy_;
 };
 
 } // namespace gemma_contract

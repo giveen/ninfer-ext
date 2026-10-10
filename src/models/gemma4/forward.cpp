@@ -41,6 +41,11 @@ struct Scratch {
     Tensor positions;   // I32 [T]
 };
 
+// The key-norm weight of a target global layer, which a query attending its compact rows carries.
+WeightId target_layer_key_norm(const Model& model, std::size_t layer) {
+    return model.weights().text.layers.at(layer).attention.key_norm;
+}
+
 } // namespace
 
 std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens) {
@@ -170,17 +175,19 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
               scratch.k_normed, execution);
 
-    // The ring holds the last window of tokens at position modulo the window; a slot no token has
-    // written carries an invisible position. A pass's keys enter the ring as its last `kept` tokens.
-    // A wider pass attends to the ring as it was before the pass plus its own keys as the Op's second
-    // key set, and writes afterwards, so no write replaces a key one of its own queries still sees. A
-    // single token writes first and attends to the ring alone: the slot it replaces holds position
-    // p - window, which query p cannot see, and the key set stays one.
+    // The ring holds the last window plus slack of tokens at position modulo the ring; a slot no token
+    // has written carries an invisible position. A pass's keys enter the ring as its last `kept`
+    // tokens. A pass of at most slack + 1 tokens writes first and attends to the ring alone: the rows
+    // it replaces are a window older than its first query, and the key set stays one. A wider pass
+    // attends to the ring as it was plus its own keys as the Op's second key set, and writes
+    // afterwards, so no write replaces a key one of its own queries still sees; the stale rows a
+    // rolled-back speculation left at its positions are forgotten first.
     Tensor cache_keys   = cache.keys(layer);
     Tensor cache_values = cache.values(layer);
     Tensor cache_pos    = cache.positions(layer);
     const std::int32_t ring = cache.ring_tokens();
-    const bool write_first  = tokens == 1;
+    const bool write_first  = tokens <= cache.ring_slack() + 1;
+    if (!write_first) cache.forget_stale(layer, first_position, stream);
 
     const std::int32_t kept  = std::min(tokens, ring);
     const std::int32_t first = first_position + tokens - kept;
@@ -396,19 +403,149 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
 }
 
 void forward_head(const Model& model, const Tensor& hidden_in, std::int32_t tokens, DeviceArena& arena,
-                  Tensor& logits, DeviceExecutionView execution) {
+                  Tensor& logits, DeviceExecutionView execution, Tensor* normed_out) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
 
     DeviceArena::Scope scope = arena.scope();
     const std::int32_t h = static_cast<std::int32_t>(config.hidden_size);
 
-    Tensor normed = arena.alloc(DType::BF16, {h, tokens});
+    // The caller's buffer may be wider than this pass: its leading columns are contiguous.
+    Tensor normed = normed_out != nullptr ? Tensor(normed_out->data, DType::BF16, {h, tokens})
+                                          : arena.alloc(DType::BF16, {h, tokens});
     ops::rmsnorm(hidden_in, model.tensor(model.weights().text.final_norm), config.rms_norm_eps, false,
                  normed, stream);
     auto weight = ops::prepare_linear_weight(model.input(model.weights().text.output_head)).weight;
     ops::linear(normed, weight, logits, stream);
     ops::soft_cap(logits, config.final_logit_softcapping, stream);
+}
+
+void forward_draft(const Model& model, const Tensor& input, std::int32_t position,
+                   const KvCache& cache, DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
+                   DeviceExecutionView execution) {
+    const cudaStream_t stream = execution.stream;
+    const TextConfig& target  = model.config();
+    if (!model.draft_config() || !model.weights().draft) {
+        throw std::logic_error("forward_draft: the drafter is not loaded");
+    }
+    const DraftConfig& draft    = *model.draft_config();
+    const DraftWeights& weights = *model.weights().draft;
+    // The drafter reads keys strictly before its token, so a token at position 0 has none.
+    if (position < 1 || position > cache.capacity()) {
+        throw std::invalid_argument("forward_draft: position must be in [1, capacity]");
+    }
+
+    DeviceArena::Scope scope = arena.scope();
+    const std::int32_t h  = static_cast<std::int32_t>(draft.hidden_size);
+    const std::int32_t i  = static_cast<std::int32_t>(draft.intermediate_size);
+    const std::int32_t hq = static_cast<std::int32_t>(target.num_attention_heads);
+    const float eps       = draft.rms_norm_eps;
+    auto to_weight = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)).weight; };
+
+    // Two position vectors: RoPE rotates at the token's own position, while visibility is that of the
+    // previous position, which admits exactly the keys before the token. A row the target wrote at or
+    // past the token (a rejected draft's, or none at all) stays invisible either way.
+    Tensor positions = arena.alloc(DType::I32, {2, 1, 1});
+    const std::int32_t host_positions[2] = {position, position - 1};
+    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_positions, sizeof(host_positions),
+                               cudaMemcpyHostToDevice, stream));
+    // The pageable source is staged before the call returns, so the stack array may go.
+    const Tensor rope_position(positions.data, DType::I32, {1, 1, 1});
+    const Tensor visible_position(static_cast<std::uint8_t*>(positions.data) + sizeof(std::int32_t),
+                                  DType::I32, {1, 1});
+
+    Tensor residual  = arena.alloc(DType::BF16, {h, 1});
+    Tensor normed    = arena.alloc(DType::BF16, {h, 1});
+    Tensor branch    = arena.alloc(DType::BF16, {h, 1});
+    Tensor projected = arena.alloc(DType::BF16, {h, 1});
+    Tensor gate      = arena.alloc(DType::BF16, {i, 1});
+    Tensor up        = arena.alloc(DType::BF16, {i, 1});
+    Tensor activated = arena.alloc(DType::BF16, {i, 1});
+    Tensor down      = arena.alloc(DType::BF16, {h, 1});
+    const std::int32_t widest_q = hq * static_cast<std::int32_t>(
+        std::max(target.sliding.head_dim, target.global.shared.head_dim));
+    Tensor q_storage        = arena.alloc(DType::BF16, {widest_q, 1});
+    Tensor q_normed_storage = arena.alloc(DType::BF16, {widest_q, 1});
+    Tensor attended_storage = arena.alloc(DType::BF16, {widest_q, 1});
+
+    ops::linear(input, to_weight(weights.pre_projection), residual, stream);
+
+    for (const DraftLayerWeights& layer : weights.layers) {
+        const bool sliding = layer.mixer == MixerKind::SlidingAttention;
+        const auto& geometry = sliding ? target.sliding : target.global.shared;
+        const std::int32_t d   = static_cast<std::int32_t>(geometry.head_dim);
+        const std::int32_t hkv = static_cast<std::int32_t>(geometry.num_key_value_heads);
+        // The buffers are sized for the wider global head; a sliding layer uses their prefix.
+        Tensor q(q_storage.data, DType::BF16, {hq * d, 1});
+        Tensor q_normed(q_normed_storage.data, DType::BF16, {d, hq, 1});
+        Tensor attended(attended_storage.data, DType::BF16, {hq * d, 1});
+
+        ops::rmsnorm(residual, model.tensor(layer.input_norm), eps, false, normed, stream);
+        ops::linear(normed, to_weight(layer.query), q, stream);
+        ops::rmsnorm(q.view({d, hq, 1}), model.tensor(layer.query_norm), eps, false, q_normed,
+                     stream);
+        const ops::AttentionHeadGeometry heads{d, hq, hkv};
+        if (sliding) {
+            const std::size_t source = draft.target_sliding_layer;
+            ops::rope(rope_position, d, d / 2, geometry.rope_theta, q_normed, execution);
+            const Tensor keys      = cache.keys(source);
+            const Tensor values    = cache.values(source);
+            const Tensor key_pos   = cache.positions(source);
+            const std::int32_t ring = cache.ring_tokens();
+            const Tensor k_ring(keys.data, DType::BF16, {d, hkv, ring, 1});
+            const Tensor v_ring(values.data, DType::BF16, {d, hkv, ring, 1});
+            const Tensor p_ring(key_pos.data, DType::I32, {ring, 1});
+            const Tensor none;
+            Tensor out = attended.view({d, hq, 1, 1});
+            const std::size_t split =
+                ops::sliding_causal_attention_workspace_bytes(heads, 1, ring, 1);
+            Tensor workspace;
+            if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+            ops::sliding_causal_attention(q_normed.view({d, hq, 1, 1}), k_ring, v_ring,
+                                          visible_position, p_ring, none, none, none, heads,
+                                          target.sliding_window, target.attention_scale, out,
+                                          workspace, stream);
+        } else {
+            const std::size_t source = draft.target_global_layer;
+            const std::int32_t pairs = static_cast<std::int32_t>(target.global.rope_angles);
+            const std::int32_t width = d + 2 * pairs;
+            ops::rope(rope_position, d, pairs, geometry.rope_theta, q_normed, execution);
+            // The compact rows hold the weightless value and the rotated key; on the dims that do not
+            // rotate, the key the target scores against is the value times the source layer's key-norm
+            // weight, which the query carries instead, exactly as in the target's own global layer.
+            const Tensor& w_kn = model.tensor(target_layer_key_norm(model, source));
+            ops::scale_columns(w_kn, q_normed, pairs, d / 2, stream);
+            ops::scale_columns(w_kn, q_normed, d / 2 + pairs, d, stream);
+            const Tensor rows    = cache.keys(source);
+            const Tensor row_pos = cache.positions(source);
+            const Tensor kv(rows.data, DType::BF16, {width, hkv, position, 1});
+            const Tensor p_rows(row_pos.data, DType::I32, {position, 1});
+            Tensor out = attended.view({d, hq, 1, 1});
+            const std::size_t split =
+                ops::causal_compact_attention_workspace_bytes(heads, d, 1, position, 1);
+            Tensor workspace;
+            if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+            ops::causal_compact_attention(q_normed.view({d, hq, 1, 1}), kv, visible_position, p_rows,
+                                          heads, d, pairs, target.attention_scale, true, out,
+                                          workspace, stream);
+        }
+        ops::linear(attended, to_weight(layer.output), projected, stream);
+        ops::rmsnorm(projected, model.tensor(layer.post_attention_norm), eps, false, branch, stream);
+        ops::residual_add(branch, residual, stream);
+
+        ops::rmsnorm(residual, model.tensor(layer.pre_feedforward_norm), eps, false, normed, stream);
+        ops::linear(normed, to_weight(layer.mlp.gate), gate, stream);
+        ops::linear(normed, to_weight(layer.mlp.up), up, stream);
+        ops::gelu_mul(gate, up, activated, stream);
+        ops::linear(activated, to_weight(layer.mlp.down), down, stream);
+        ops::rmsnorm(down, model.tensor(layer.post_feedforward_norm), eps, false, branch, stream);
+        ops::residual_add(branch, residual, stream);
+        ops::mul_scalar(residual, model.layer_scalar(layer.layer_scalar), stream);
+    }
+
+    ops::rmsnorm(residual, model.tensor(weights.final_norm), eps, false, normed, stream);
+    ops::linear(normed, to_weight(weights.output_head), logits, stream);
+    ops::linear(normed, to_weight(weights.post_projection), hidden_out, stream);
 }
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,

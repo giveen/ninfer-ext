@@ -913,11 +913,13 @@ describes the planner.
   it from the memory left after weights. With `--kv-stream`, contexts beyond the pool spill to Host KV,
   bounded by `--host-kv-mib`.
 - Tool calls are parsed and returned to the client; NInfer does not execute them.
-- Gemma 4 31B (`Gemma4ForCausalLM`, text only) generates, scores and serves with chat, tools and
-  thinking, but without prefix reuse, speculative decoding, Vision, constrained output, a thinking
-  budget, CUDA Graphs or a KV format other than BF16 (`ninfer-perplexity` needs `--kv-dtype bf16`);
-  top_k is capped at 20. Measured: decode 41 tok/s, prefill 327 tok/s at 1K falling to 161 at 8K.
-  See [the Gemma 4 reference](docs/maintainer/gemma4-model.md).
+- Gemma 4 31B (`Gemma4ForCausalLM`, text only) generates, scores and serves with chat, tools,
+  thinking with a budget, and MTP speculation with the official assistant drafter (`--spec mtp`,
+  converted with `--components text,mtp --source mtp=<assistant checkpoint>`), but without prefix
+  reuse, Vision, constrained output, CUDA Graphs or a KV format other than BF16 (`ninfer-perplexity`
+  needs `--kv-dtype bf16`); top_k is capped at 20. Measured on the M1 artifact (RTX 5090): prefill
+  2,388 tok/s at 1K and 1,837 at 8K; decode 52.6 tok/s, and 100-240 tok/s with adaptive MTP
+  depending on the text. See [the Gemma 4 reference](docs/maintainer/gemma4-model.md).
 
 ## Documentation
 

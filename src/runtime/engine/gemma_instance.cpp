@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -187,13 +188,46 @@ ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandl
 
 GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity,
                            std::int32_t lanes, std::uint32_t prefill_chunk,
-                           std::uint32_t idle_prefill_chunk, DeviceContext& device)
+                           std::uint32_t idle_prefill_chunk, std::int32_t draft_tokens,
+                           bool adaptive_draft, DeviceContext& device)
     : model_(model), device_(device), execution_(device.execution_view()),
-      program_(model, capacity, lanes, device), lanes_(static_cast<std::size_t>(lanes)),
+      program_(model, capacity, lanes, device, draft_tokens), lanes_(static_cast<std::size_t>(lanes)),
       prefill_chunk_(prefill_chunk), idle_chunk_(idle_prefill_chunk) {
     if (prefill_chunk_ == 0 || idle_chunk_ == 0) {
         throw std::invalid_argument("gemma4 Program: prefill chunks must be positive");
     }
+    if (draft_tokens == 0) return;
+    const auto ladder =
+        qwen::mtp_draft_ladder(static_cast<std::uint32_t>(draft_tokens), adaptive_draft);
+    std::vector<double> seconds(ladder.size(), 1.0);
+    // Each rung's round is timed on lane 0 over a short synthetic context: a verify pass's cost is
+    // fixed by its width, and what a long context adds the policy learns from the rounds it runs.
+    constexpr std::int32_t kContext = 64, kWarm = 2, kTimed = 5;
+    const std::int32_t needed = kContext + static_cast<std::int32_t>(ladder.size()) *
+                                               (kWarm + kTimed) + draft_tokens + 2;
+    if (ladder.size() > 1 && program_.capacity() >= needed) {
+        std::vector<TokenId> context(kContext);
+        for (std::int32_t i = 0; i < kContext; ++i) context[static_cast<std::size_t>(i)] = 1000 + i;
+        program_.reset(0);
+        program_.prefill(0, context, execution_);
+        for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
+            std::vector<double> samples;
+            for (std::int32_t round = 0; round < kWarm + kTimed; ++round) {
+                const auto started = Clock::now();
+                const auto result  = program_.speculate(0, context.back(),
+                                                        static_cast<std::int32_t>(ladder[rung]),
+                                                        execution_);
+                program_.commit_round(0, 1, execution_);
+                (void)result;
+                if (round >= kWarm) samples.push_back(seconds_since(started));
+            }
+            std::sort(samples.begin(), samples.end());
+            seconds[rung] = samples[samples.size() / 2];
+        }
+        program_.reset(0);
+    }
+    draft_policy_.emplace(ladder, std::move(seconds));
+    draft_policy_->learn_round_times();
 }
 
 std::vector<float> GemmaProgram::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
@@ -357,6 +391,16 @@ ContextTransactionProgress GemmaProgram::progress_context_transaction(Cancellati
     lane.next_input = -1;
     lane.pending    = false;
     lane.timings    = {};
+    lane.speculative = {};
+    lane.acceptance.reset();
+    lane.rung = draft_policy_ ? draft_policy_->initial_rung() : 0;
+    if (const std::int32_t window = program_.draft_tokens(); window > 0) {
+        lane.speculative.backend      = SpeculativeBackend::Mtp;
+        lane.speculative.enabled      = true;
+        lane.speculative.draft_window = static_cast<std::uint32_t>(window);
+        lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(window), 0);
+        lane.speculative.rounds_by_draft_length.assign(static_cast<std::size_t>(window), 0);
+    }
     bump_revision();
     MaterializationResult result;
     result.status    = ContextTransactionStatus::Published;
@@ -424,6 +468,7 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
     ExecutionTimingRecorder timing(ExecutionTimingPhase::Submit, failed_timing);
     PendingBatch pending;
     pending.transaction_ = next_pending_++;
+    pending.row_stride_  = static_cast<std::uint32_t>(program_.draft_tokens()) + 1;
     // Each lane runs its own pass: the rows share the weights' reads only through the cache, which is
     // the measured cost of not batching lanes into one pass yet.
     for (std::size_t row = 0; row < sequences.size(); ++row) {
@@ -434,14 +479,47 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
         }
         const auto started            = Clock::now();
         const std::int32_t lane_index = static_cast<std::int32_t>(sequences[row].lane_);
-        program_.decode(lane_index, lane->next_input, execution_);
-        timing.begin_wait();
-        pending.tokens_[row] = program_.sample(lane_index, execution_);
-        timing.end_wait();
-        timing.resume_submit();
-        pending.rows_[row]   = sequences[row];
-        pending.counts_[row] = 1;
-        lane->pending        = true;
+        TokenId* out = pending.tokens_.data() + row * pending.row_stride_;
+        // A round drafts no more than the output budget can keep beyond its own token, and no more
+        // than the lane's capacity holds; with nothing to draft it is one plain token.
+        const std::int64_t room = static_cast<std::int64_t>(program_.capacity()) -
+                                  program_.position(lane_index) - 1;
+        std::int32_t length = 0;
+        if (draft_policy_) {
+            const qwen::MtpAcceptanceEstimate* estimate = &lane->acceptance;
+            lane->rung = draft_policy_->select(lane->rung, std::span(&estimate, 1));
+            length     = static_cast<std::int32_t>(draft_policy_->ladder()[lane->rung]);
+        }
+        const std::int32_t drafts = static_cast<std::int32_t>(std::max<std::int64_t>(
+            0, std::min<std::int64_t>({length, budgets[row].generated_tokens_remaining - 1LL,
+                                       room})));
+        if (drafts > 0) {
+            timing.begin_wait();
+            const auto round_started = Clock::now();
+            const auto round = program_.speculate(lane_index, lane->next_input, drafts, execution_);
+            // A clipped round is not the rung's round, so only full ones refine its time.
+            if (drafts == length) draft_policy_->observe_round(lane->rung, seconds_since(round_started));
+            lane->acceptance.observe(static_cast<std::uint32_t>(drafts),
+                                     static_cast<std::uint32_t>(round.accepted_drafts));
+            timing.end_wait();
+            timing.resume_submit();
+            std::copy(round.tokens.begin(), round.tokens.end(), out);
+            pending.counts_[row]      = static_cast<std::int32_t>(round.tokens.size());
+            pending.speculative_[row] = true;
+            pending.drafted_[row]     = drafts;
+            pending.accepted_[row]    = round.accepted_drafts;
+        } else {
+            program_.decode(lane_index, lane->next_input, execution_);
+            timing.begin_wait();
+            out[0] = program_.sample(lane_index, execution_);
+            timing.end_wait();
+            timing.resume_submit();
+            pending.counts_[row]      = 1;
+            pending.speculative_[row] = false;
+            if (lane->speculative.enabled) ++lane->speculative.fallback_steps;
+        }
+        pending.rows_[row] = sequences[row];
+        lane->pending      = true;
         lane->timings.decode_seconds += seconds_since(started);
     }
     pending.row_count_ = sequences.size();
@@ -467,7 +545,8 @@ qwen::CommitResult GemmaProgram::commit(PendingBatch&& pending,
         if (lane == nullptr || !lane->pending ||
             (decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
             (!decision.cancelled && !decision.failed &&
-             (decision.accepted_tokens == 0 || decision.accepted_tokens > 1))) {
+             (decision.accepted_tokens == 0 ||
+              decision.accepted_tokens > static_cast<std::uint32_t>(pending.counts_[row])))) {
             throw std::logic_error("pending transaction decision is invalid");
         }
         lane->pending = false;
@@ -476,10 +555,23 @@ qwen::CommitResult GemmaProgram::commit(PendingBatch&& pending,
             out.rows[row].disposition = decision.cancelled ? CommitDisposition::CancelledReleased
                                                            : CommitDisposition::FailedReleased;
             out.rows[row].timings     = lane->timings;
+            out.rows[row].speculative = lane->speculative;
             release(lane_index);
             continue;
         }
-        lane->next_input = pending.tokens_[row];
+        const auto kept = static_cast<std::int32_t>(decision.accepted_tokens);
+        if (pending.speculative_[row]) {
+            program_.commit_round(static_cast<std::int32_t>(lane_index), kept, execution_);
+            SpeculativeStats& stats = lane->speculative;
+            const std::int32_t drafted = pending.drafted_[row];
+            const std::int32_t used    = std::min(pending.accepted_[row], kept);
+            ++stats.rounds;
+            stats.drafted_tokens += static_cast<std::uint64_t>(drafted);
+            stats.accepted_tokens += static_cast<std::uint64_t>(used);
+            for (std::int32_t i = 0; i < used; ++i) ++stats.accepted_per_position[i];
+            ++stats.rounds_by_draft_length[static_cast<std::size_t>(drafted - 1)];
+        }
+        lane->next_input = pending.tokens_[row * pending.row_stride_ + (kept - 1)];
         lane->phase      = decision.terminal ? Phase::Finishable : Phase::Active;
         out.rows[row].disposition =
             decision.terminal ? CommitDisposition::Finishable : CommitDisposition::Active;
@@ -512,6 +604,7 @@ qwen::FinishResult GemmaProgram::finish(SequenceHandle sequence) noexcept {
     Lane* lane = valid_lane(sequence);
     if (transaction_ || lane == nullptr || lane->phase != Phase::Finishable) return out;
     out.timings     = lane->timings;
+    out.speculative = lane->speculative;
     out.disposition = FinishDisposition::Released;
     out.status      = ConsumeStatus::Consumed;
     release(sequence.lane_);
@@ -522,8 +615,9 @@ qwen::AbortResult GemmaProgram::abort(SequenceHandle sequence) noexcept {
     qwen::AbortResult out;
     Lane* lane = valid_lane(sequence);
     if (lane == nullptr || lane->pending) return out;
-    out.timings = lane->timings;
-    out.status  = ConsumeStatus::Consumed;
+    out.timings     = lane->timings;
+    out.speculative = lane->speculative;
+    out.status      = ConsumeStatus::Consumed;
     release(sequence.lane_);
     return out;
 }
@@ -558,7 +652,23 @@ EngineOptions gemma_engine_options(EngineOptions options) {
     const auto refuse = [](const char* what) {
         throw std::invalid_argument(std::string("Gemma 4 does not support ") + what + " yet");
     };
-    if (options.speculative.backend != SpeculativeBackend::None) refuse("speculative decoding");
+    // MTP speculation with the official assistant drafter; every other backend and MTP option is
+    // refused by name.
+    const SpeculativeOptions& speculative = options.speculative;
+    if (speculative.backend != SpeculativeBackend::None &&
+        speculative.backend != SpeculativeBackend::Mtp) {
+        refuse("speculative backends other than MTP");
+    }
+    if (speculative.backend == SpeculativeBackend::Mtp) {
+        if (speculative.draft_tokens < 1 ||
+            speculative.draft_tokens >
+                static_cast<std::uint32_t>(models::gemma4::Program::kMaximumDraftTokens)) {
+            throw std::invalid_argument("Gemma 4 MTP needs 1 to 7 draft tokens");
+        }
+        if (speculative.proposal_head != ProposalHead::Full) refuse("an optimized proposal head");
+        if (speculative.lookup_drafts != LookupDraftMode::Off) refuse("prompt-lookup drafts");
+        if (speculative.tree_width != 1) refuse("draft trees");
+    }
     if (options.enable_vision) refuse("Vision input");
     if (options.kv_cache != KvCacheStorage::BFloat16) refuse("a KV cache format other than BF16");
     if (options.kv_stream) refuse("KV streaming");
@@ -583,9 +693,12 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     : model(std::move(source)), frontend(resources, options.max_context), program(nullptr),
       capacity(options.max_context) {
     const std::int32_t lanes = static_cast<std::int32_t>(options.max_concurrency);
+    const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+    const std::int32_t draft_tokens =
+        mtp ? static_cast<std::int32_t>(options.speculative.draft_tokens) : 0;
     const std::size_t needed =
         models::gemma4::Program::device_bytes(model->config(), static_cast<std::int32_t>(capacity),
-                                              lanes);
+                                              lanes, draft_tokens);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -600,7 +713,8 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     }
     program = std::make_unique<gemma_contract::GemmaProgram>(
         *model, static_cast<std::int32_t>(capacity), lanes, options.prefill_chunk.value(),
-        options.idle_prefill_chunk.value(), device);
+        options.idle_prefill_chunk.value(), draft_tokens, mtp && !options.speculative.fixed_draft,
+        device);
     std::size_t after_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&after_bytes, &total_bytes));
     kv_capacity_resolution.mode                          = KvCapacityMode::Explicit;

@@ -27,8 +27,10 @@ namespace ninfer::models::gemma4 {
 class Program {
 public:
     // `capacity` bounds the tokens one lane's global layers can hold; sliding layers always hold the
-    // window.
-    Program(const Model& model, std::int32_t capacity, std::int32_t lanes, DeviceContext& device);
+    // window. `draft_tokens` > 0 enables MTP rounds of up to that many drafts, which needs the drafter
+    // loaded, and gives the sliding rings that much slack.
+    Program(const Model& model, std::int32_t capacity, std::int32_t lanes, DeviceContext& device,
+            std::int32_t draft_tokens = 0);
     ~Program();
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
@@ -38,7 +40,34 @@ public:
     // Device bytes the Program allocates for `lanes` lanes of `capacity` tokens, so a caller can size
     // the lanes before constructing one.
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t capacity,
-                                                  std::int32_t lanes);
+                                                  std::int32_t lanes, std::int32_t draft_tokens = 0);
+
+    // The largest draft count a round may use, zero without speculation.
+    [[nodiscard]] std::int32_t draft_tokens() const noexcept { return draft_tokens_; }
+    static constexpr std::int32_t kMaximumDraftTokens = 7;
+
+    // The outcome of one speculative round, before the caller decides how much of it to keep.
+    struct Round {
+        // The licensed tokens: the accepted drafts, then the target's correction or bonus token.
+        std::vector<std::int32_t> tokens;
+        std::int32_t accepted_drafts = 0;
+    };
+
+    /**
+     * One MTP round for `lane`, whose last accepted token `anchor` the target has not consumed yet.
+     * The drafter proposes `drafts` tokens greedily from the anchor and the target's hidden state that
+     * produced it; the target then runs [anchor, drafts] in one pass, and the lane's sampler accepts
+     * the longest prefix its distribution licenses (exactly the greedy chain for a greedy sampler,
+     * speculative rejection sampling otherwise) plus one token of its own. Synchronizes. Nothing is
+     * committed until `commit_round`.
+     */
+    [[nodiscard]] Round speculate(std::int32_t lane, std::int32_t anchor, std::int32_t drafts,
+                                  DeviceExecutionView execution);
+
+    // Keeps the first `kept` tokens of `lane`'s last round (1 to its token count): the target has then
+    // consumed the anchor and the first kept-1 of them, and the last kept token is the next anchor.
+    // The rows written for the rest are rolled back.
+    void commit_round(std::int32_t lane, std::int32_t kept, DeviceExecutionView execution);
 
     [[nodiscard]] std::int32_t lanes() const noexcept {
         return static_cast<std::int32_t>(lanes_.size());
@@ -52,6 +81,9 @@ public:
 
     // Tokens `lane` has consumed, which is also the position its next token occupies.
     [[nodiscard]] std::int32_t position(std::int32_t lane) const { return lane_at(lane).position; }
+
+    // The lane's cache, read-only, for checks of what it holds.
+    [[nodiscard]] const KvCache& cache(std::int32_t lane) const { return lane_at(lane).cache; }
 
     // Consumes tokens for `lane` and leaves the logits of the last one. The tokens are run in passes of
     // at most kPass, so a long prompt costs one pass per kPass tokens rather than one per token.
@@ -100,6 +132,12 @@ private:
         std::int32_t position = 0;
         // Device [vocabulary] I32 occurrence counts the sampler's penalties read.
         void* token_counts = nullptr;
+        // With speculation: device BF16 [hidden], the target's post-final-norm state at the token
+        // before the anchor, which the drafter's first step reads.
+        void* hidden = nullptr;
+        // The round speculate() left for commit_round(): its first position and draft count.
+        std::int32_t round_position = -1;
+        std::int32_t round_drafts   = 0;
     };
 
     [[nodiscard]] Lane& lane_at(std::int32_t lane);
@@ -109,12 +147,25 @@ private:
     // `cache`, and applies the head to every column, or to the last one only unless `every_column`.
     void run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
                    std::int32_t first_position, bool every_column, DeviceExecutionView execution);
+    // The same pass over ids already in the device id buffer.
+    void run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
+                  bool every_column, DeviceExecutionView execution);
+    // Copies column `column` of the last pass's post-final-norm hidden state into the lane's.
+    void keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream);
 
     const Model* model_ = nullptr;
     std::vector<Lane> lanes_;
     DeviceArena arena_;
     DeviceArena sampling_workspace_;
     Tensor logits_; // [vocabulary, kScorePass], one column per token of a scoring pass
+    // [hidden, kScorePass]: the post-final-norm state of every column the head ran over.
+    Tensor head_hidden_;
+    std::int32_t draft_tokens_ = 0;
+    // The drafter's buffers: its input [2 * hidden], output state [hidden], logits [vocabulary], and
+    // the round's I32 scalars and vectors (see speculate()).
+    Tensor draft_input_, draft_hidden_, draft_logits_;
+    void* round_ints_ = nullptr;
+    std::vector<std::int32_t> round_host_;
     std::vector<std::int32_t> id_host_;
     void* id_buffer_       = nullptr;
     void* state_[2]        = {nullptr, nullptr};

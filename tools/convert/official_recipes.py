@@ -604,6 +604,11 @@ def _gemma4_layout(model, recipe, layout_name):
 
     assign("text/token_embedding", layout["embedding"])
     assign("text/output_head", layout["head"])
+    # The assistant drafter, when converted, stays BF16: it is under 1 GB, and its head is what
+    # chooses every draft.
+    for name, parameter in model.parameters.items():
+        if name.startswith("mtp/") and parameter.projection:
+            recipe.assign(name, format="bf16", method=cast_direct)
     for layer, groups in layout["layers"].items():
         for group, short in groups.items():
             for role in _GEMMA4_GROUPS[group]:

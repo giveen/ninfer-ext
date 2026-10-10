@@ -55,6 +55,23 @@ void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_i
  * logits; every consumer that must see uncapped values is the caller's business.
  */
 void forward_head(const Model& model, const Tensor& hidden_in, std::int32_t tokens, DeviceArena& arena,
-                  Tensor& logits, DeviceExecutionView execution);
+                  Tensor& logits, DeviceExecutionView execution, Tensor* normed_out = nullptr);
+
+/**
+ * One step of the assistant drafter, for one token.
+ *
+ * `input` is contiguous BF16 [2 * target hidden, 1]: the target's scaled embedding of the token the
+ * step reads, then a target-width hidden state (the target's post-final-norm state for the step that
+ * follows a target pass, the drafter's own projected state after that). `position` is the absolute
+ * position of that token, which the target has not consumed: every step of a round uses the same
+ * position. The drafter attends, at that RoPE position, to the keys the target's last sliding and last
+ * global layers hold strictly before it, read from `cache`, which it does not change.
+ *
+ * Writes `logits` (BF16 [vocabulary, 1], the drafter's head with no soft cap) and `hidden_out` (BF16
+ * [target hidden, 1], the post-projected state the next step reads).
+ */
+void forward_draft(const Model& model, const Tensor& input, std::int32_t position,
+                   const KvCache& cache, DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
+                   DeviceExecutionView execution);
 
 } // namespace ninfer::models::gemma4

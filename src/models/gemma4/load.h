@@ -39,6 +39,7 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const TextConfig& config() const;
+    [[nodiscard]] const std::optional<DraftConfig>& draft_config() const;
     [[nodiscard]] const TextResources& resources() const;
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
