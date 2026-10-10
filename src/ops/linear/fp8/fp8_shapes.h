@@ -14,6 +14,9 @@ struct Fp8LinearShape {
 extern const Fp8LinearShape kFp8N14336K5120;
 extern const Fp8LinearShape kFp8N16384K5120;
 extern const Fp8LinearShape kFp8N8192K5376;
+// The G0 layout keeps the MLP at FP8 rather than NVFP4 in the sensitive layers.
+extern const Fp8LinearShape kFp8N21504K5376;
+extern const Fp8LinearShape kFp8N5376K21504;
 extern const Fp8LinearShape kFp8N4096K5376;
 extern const Fp8LinearShape kFp8N16384K5376;
 extern const Fp8LinearShape kFp8N2048K5376;

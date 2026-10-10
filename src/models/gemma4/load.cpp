@@ -16,10 +16,8 @@ namespace ninfer::models::gemma4 {
 namespace {
 
 // The formats the artifact stores, checked by the binder on every request.
-constexpr QType kEmbeddingFormat = QType::FP8_E4M3FN_ROW_BF16;
 constexpr QType kHeadFormat      = QType::BF16;
 constexpr QType kProjectionFormat = QType::FP8_E4M3FN_ROW_BF16;
-constexpr QType kMlpFormat        = QType::NVFP4;
 constexpr QType kNormFormat       = QType::BF16;
 constexpr QType kScalarFormat     = QType::FP32;
 
@@ -31,7 +29,10 @@ class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
 
-    WeightId parameter(const std::string& name, artifact::Shape shape, QType format) {
+    // A null format declares no representation constraint, which is what a parameter whose layout the
+    // converter is free to choose needs: the Ops dispatch on what the weight actually is.
+    WeightId parameter(const std::string& name, artifact::Shape shape,
+                       std::optional<QType> format = {}) {
         PendingWeight pending;
         pending.reference = binder_.parameter(name, std::move(shape), artifact::Residency::Device,
                                               format);
@@ -56,8 +57,9 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
     const std::uint64_t vocabulary   = config.vocab_size;
 
     TextWeights out;
-    out.token_embedding = bindings.parameter("text/token_embedding", {vocabulary, hidden},
-                                             kEmbeddingFormat);
+    // The embedding's representation is the layout's choice - a precision layout may keep it BF16 -
+    // and the embedding Op accepts both.
+    out.token_embedding = bindings.parameter("text/token_embedding", {vocabulary, hidden});
     out.output_head = bindings.parameter("text/output_head", {vocabulary, hidden}, kHeadFormat);
     out.final_norm  = bindings.parameter("text/final_norm", {hidden}, kNormFormat);
 
@@ -101,9 +103,9 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
                                                         {geometry.head_dim}, kNormFormat);
 
         weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden},
-                                             kMlpFormat);
-        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden}, kMlpFormat);
-        weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate}, kMlpFormat);
+                                             std::optional<QType>{});
+        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden}, std::optional<QType>{});
+        weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate}, std::optional<QType>{});
 
         out.layers.push_back(weights);
     }
