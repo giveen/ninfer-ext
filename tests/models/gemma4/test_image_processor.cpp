@@ -12,6 +12,7 @@
 
 #include "models/gemma4/image_processor.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -93,8 +94,14 @@ int main() {
         int grid_width = 0, grid_height = 0;
         std::ifstream(base.string() + ".grid") >> grid_width >> grid_height;
         const std::vector<std::uint8_t> bytes = read_bytes(source);
+        const auto started = std::chrono::steady_clock::now();
         const gemma::PreparedImage image =
             gemma::prepare_gemma_image(bytes, media::decode::Policy{});
+        std::cout << "image" << index << ": prepared in "
+                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               started)
+                         .count()
+                  << " ms\n";
         if (image.grid_width != grid_width || image.grid_height != grid_height) {
             std::cerr << "image" << index << ": grid " << image.grid_width << "x" << image.grid_height
                       << ", expected " << grid_width << "x" << grid_height << "\n";

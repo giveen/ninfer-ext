@@ -51,10 +51,11 @@ inactive cache 的保留而丢失完成能力。
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。当前标准架构入口是 `Qwen3_5ForCausalLM` 与
 `Qwen3_5MoeForCausalLM` 与 `Qwen4ExpForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
-`Gemma4ForCausalLM`（文本）是第二个 instance 实现：`GemmaInstance`（`runtime/engine/gemma_instance.h`）
+`Gemma4ForCausalLM`（文本与图像）是第二个 instance 实现：`GemmaInstance`（`runtime/engine/gemma_instance.h`）
 以同一 `EngineCore`/`CausalScoreCore` 驱动 `models/gemma4` 的 Program，只支持 root admission
 （context cache 关闭），前缀复用与捕获的入口按名拒绝；强制控制 token 与 MTP 推测（官方 assistant
-drafter，`MtpDraftPolicy` 选择草稿长度）在 Program 内实现。它暂借 Qwen contract 的纯数据类型与
+drafter，`MtpDraftPolicy` 选择草稿长度）在 Program 内实现。图像由 Gemma frontend 解码、缩放与切块，
+Program 在 prefill 中编码并写入图像 token 的 embedding，prefill 的 pass 与 chunk 边界不切开图像。它暂借 Qwen contract 的纯数据类型与
 MTP 策略，迁到 `runtime/contract` 尚未完成。详见 `docs/maintainer/gemma4-model.md`。
 
 `Qwen4ExpForCausalLM` 的 routed experts 由 loader 以 `HostPinned` 驻留（pinned Host，经 UVA

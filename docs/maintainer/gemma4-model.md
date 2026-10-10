@@ -2,11 +2,11 @@
 
 Gemma 4 31B (`Gemma4ForCausalLM`, text `gemma4_text`) as NInfer executes it. This is the
 mathematical authority for the implementation and the oracle; it is written from the checkpoint and
-the plan that preceded this work. The assistant drafter (MTP speculation) is section 12a; Vision (P5)
-is not described here yet.
+the plan that preceded this work. The assistant drafter (MTP speculation) is section 12a; the image
+encoder and image prompts are section 12b.
 
-**Status.** Text generation, chat, tools, thinking with a budget, MTP speculation with the official
-assistant drafter, causal scoring and serving run through the public Engine. Prefix reuse and
+**Status.** Text generation, chat, tools, thinking with a budget, image input, MTP speculation with
+the official assistant drafter, causal scoring and serving run through the public Engine. Prefix reuse and
 constrained output do not exist yet; section 13 lists what is not done.
 
 ## 1. Configuration (the instruction-tuned checkpoint)
@@ -80,8 +80,12 @@ o = W_o · softmax(q·kᵀ · 1.0 + mask) · v
   normalized row is materialized in BF16, which is the value the cache stores.
 - Query head h reads KV head ⌊h/2⌋.
 - **Scale is exactly 1.0**, not `1/√D`.
-- **Mask:** key position `p_k` is visible to query `p_q` when `0 ≤ p_q − p_k < 1024`. The bound is
-  one-sided, so the window is a causal band of 1024 with the query included.
+- **Mask:** key position `p_k` is visible to query `p_q` when `p_k ≤ high(p_q)` and
+  `p_q − p_k < 1024`, where `high(p_q) = p_q` (a causal band of 1024 with the query included) except
+  for an image's tokens, whose `high` is the image's last position: an image attends bidirectionally
+  within itself (`use_bidirectional_attention: "vision"`, transformers' `create_masks_for_vision_model`:
+  AND(window, OR(causal, same image))). Only the soft tokens form the block; `<|image>` and `<image|>`
+  stay causal. The window's lower edge stays at each token.
 
 ## 5. Global attention (10 layers): K = V and proportional RoPE
 
@@ -95,7 +99,8 @@ q = rope_prop(rmsnorm(W_q x, w_qn))   # [32 heads, 512]
 o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
 ```
 
-- Query head h reads KV head ⌊h/8⌋; always causal, with no image overlay.
+- Query head h reads KV head ⌊h/8⌋; always causal, images included (transformers gives the global
+  layers no image overlay).
 - The checkpoint's `k_norm.weight` is 512 wide on these layers (256 on the sliding ones) and scales
   the normalized vector.
 - **Proportional RoPE:** with D = 512 and factor 0.25, `rope_angles = 64`;
@@ -148,7 +153,7 @@ From `model.safetensors.index.json` (1,188 tensors). Text lives under `model.lan
 | Final | `model.language_model.norm.weight` |
 
 Vision is `model.vision_tower.*` (27 layers, `patch_embedder`, `std_bias`/`std_scale`) plus
-`model.embed_vision.embedding_projection`; the plan puts it in P5.
+`model.embed_vision.embedding_projection`; section 12b maps it.
 
 ## 7. Tokenizer
 
@@ -216,7 +221,7 @@ identified; the bytes are the instruction-tuned model's.
 |---|---|---|---:|
 | `out/gemma4_31b_base_nvfp4.ninfer` | `gemma4_31b_base` | plan L1: MLP NVFP4 (converter-encoded, weight-only), attention and embedding FP8 rows, head BF16, norms BF16, `layer_scalar` FP32 | 22.8 GiB |
 | `out/gemma4_31b_g0.ninfer` | `gemma4_31b_g0` | gewell's G0 mask: embedding and head BF16, attention FP8, MLP FP8 in layers 0–5 and every global layer with its predecessor, NVFP4 elsewhere | 27.3 GiB |
-| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1`, `--components text,mtp --source mtp=/mnt/storage/models/gemma/assistant-31b` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory; the assistant drafter BF16 (`mtp/`, 0.94 GB, bound only with `--spec mtp`) | 24.5 GiB file, 20.9 GiB on the device (21.8 with the drafter) |
+| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1`, `--components text,vision,mtp --source mtp=/mnt/storage/models/gemma/assistant-31b` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory; the assistant drafter BF16 (`mtp/`, 0.94 GB, bound only with `--spec mtp`); the vision tower Q8 g32 with BF16 patch and output projections (`vision/`, 0.6 GiB, bound only with `--vision`) | 25.1 GiB file; 20.9 GiB on the device, 21.8 with the drafter, 22.4 with the drafter and the tower |
 
 M1 is the serving artifact. The layout came from `tools/verify/gemma4_sensitivity.py` (per-tensor KLD
 against the BF16 checkpoint streamed from host memory, FP32 activations; BF16 activations put a 0.15
@@ -286,8 +291,9 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   types this model never constructs are the Qwen contract's pure-data types; moving them into
   `runtime/contract` is the plan's D1-b extraction and is not done.
 - **Refused options**: speculative backends other than MTP (and MTP's optimized proposal head,
-  prompt-lookup drafts and draft trees), Vision, a KV format other than BF16, KV streaming, and an
-  explicit KV capacity below `max_context`. `ninfer-perplexity` defaults to FP8 KV, so it needs
+  prompt-lookup drafts and draft trees), a KV format other than BF16, KV streaming, and an
+  explicit KV capacity below `max_context`. Video, images in tool results and images in causal scoring
+  are refused per request. `ninfer-perplexity` defaults to FP8 KV, so it needs
   `--kv-dtype bf16` for this model. CUDA Graphs are not used whatever `use_cuda_graph` says.
 
 ## 11. Verification
@@ -305,6 +311,11 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand; the same with `--spec mtp`, plus a thinking budget of 24 closing the channel |
 | Drafter | `ninfer_gemma4_draft_test` dumps, `tools/verify/gemma4_draft_reference.py` runs transformers' `Gemma4AssistantForCausalLM` in FP32 on the same inputs (position 1,501, rings wrapped) | four steps: logits cosine ≥ 0.99996, argmax and top-5 identical, projected-state cosine ≥ 0.99997 |
 | MTP rounds | `ninfer_gemma4_mtp_test`: 384 greedy tokens after a 1,100-token prompt at seven drafts | every ring slot and global row holds its committed position (without the slack the same run leaves 50 wrong); against one fresh scoring pass the output disagrees 1-4 times, the same as plain decode (4) |
+| Image preprocessing | `ninfer_gemma4_image_processor_test` on `tools/verify/gemma4_vision_reference.py prepare` (transformers' `Gemma4ImageProcessorPil`) | the resize rule identical over 22 sizes (edge branches, both orientations, up- and downscaling); lossless images' patches within one BF16 rounding (worst 0.004 uint8 steps); a JPEG differs, see 12b |
+| Image encoder | `ninfer_gemma4_vision_test`, `gemma4_vision_reference.py compare` (HF's tower in FP32 on HF's patches) | mean token cosine 0.991 / 0.985 / 0.984 on a photo and two synthetic images, against HF's own BF16 tower at 0.989 / 0.985 / 0.980 |
+| Image prompt | `ninfer_gemma4_image_prompt_test`, `tools/verify/gemma4_image_prompt_reference.py` (HF `Gemma4ForConditionalGeneration` BF16 on CPU), two images and a question, 540 tokens, the second image across a pass boundary | prompt ids identical; 24 greedy steps: top-1 23/24, mean KLD 0.026 |
+| Image mask | the same, at 34 of the first image's own positions, NInfer with and without the block bound against HF with and without `mm_token_type_ids` | NInfer bidirectional: mean KLD 1.35 from HF bidirectional, 3.69 from HF causal; NInfer causal: 0.92 from HF causal (HF's two runs differ by 2.35) |
+| Serving with images | `tools/smoke/serve_contract.py --tools` (image request included) with `--vision --spec mtp`; captions by hand | passes; a photo, a synthetic gradient (its rectangle placed correctly) and a two-image comparison described correctly |
 
 **Per-position divergence from HF is large even where the averages agree.** On the 1,501-token text
 L1's mean per-target |difference| from HF is 0.79 nats with a 99th percentile of 7.8 and a worst of 23,
@@ -395,6 +406,57 @@ profiled further. Greedy MTP output can differ from plain greedy output after a
 few hundred tokens because verify passes and single-token passes round differently; the check above
 compares each against one fresh pass instead.
 
+## 12b. Images
+
+**Encoder** (`src/models/gemma4/vision.{h,cpp}`, transformers' `Gemma4VisionModel` and
+`Gemma4MultimodalEmbedder`), for one image of a W x H patch grid, W and H multiples of 3:
+
+```text
+x = W_patch · p + T_x[column] + T_y[row]          # p: the patch's 768 pixels mapped to 2u/255 − 1
+27 x:  h = x + rmsnorm(W_o · attn(...), w_pa)     # q, k: rmsnorm per head with weights, then 2-D
+       x = h + rmsnorm(W_d (gelu_tanh(W_g n) ⊙ W_u n), w_pf),  n = rmsnorm(h, w_pre)
+       attn: v = rmsnorm(W_v n) without weight; scale 1.0; every patch sees every patch
+s = (√1152 · mean₃ₓ₃(x) − std_bias) ⊙ std_scale  # one soft token per 3x3 cell, row-major
+features = W_embed · rmsnorm(s)                    # weightless; [5376] per soft token
+```
+
+The 2-D RoPE (theta 100) rotates x on dims (j, j+18) and y on (36+j, 54+j), j < 18, at
+`100^(−2j/36)`. The converter stores q/k rows and their norm weights with the middle two 18-dim blocks
+of every head swapped, which is exactly the layout the `rope` Op's Vision 2-D mode rotates (pairs (i,
+i+36), axis 0 for i < 18); scores are unchanged because q and k move together. The MLP width 4304 is
+stored zero-padded to 4352 (GeGLU maps zero to zero), so the groupwise routes' K alignment holds. q, k
+and v are three 1152-row linears because each is normed per head before RoPE. The dense attention is
+`softmax_attention` (D72/H16) at scale 1, a second registered profile; the pooling is
+`vision_pool_standardize`. One image is encoded per call with exactly its own patches: no padding.
+
+**Formats.** Patch and output projections BF16, every layer's linears Q8 g32. The tower amplifies
+weight error: simulated with the converter's encoders, against the FP32 tower on a photo the mean token
+cosine is 0.956 for Q4/Q5 (the Qwen tower's formats), 0.970 Q5, 0.989 Q6 (HF's own BF16 tower) and
+0.999 Q8, and nothing downstream checks image features. Q8 costs 0.6 GiB, Q4/Q5 would cost 0.36.
+
+**Preprocessing** (`src/models/gemma4/image_processor.{h,cpp}`, transformers' `Gemma4ImageProcessor`):
+the largest aspect-preserving size whose sides are multiples of 48 within 280 soft tokens (2,520
+patches), with the reference's zero-side branches and upscaling; torchvision's antialiased bicubic
+(`src/media/decode/resize.h`, shared with Qwen); pixels to `bf16(2·(u·(1/255) − 0.5))`. Only the
+280-token budget is served. JPEG decoding is FFmpeg's, which upsamples 4:2:0 chroma by nearest
+neighbour where Pillow's libjpeg interpolates: on a 19 MP photo the patches differ by 0.75 uint8 steps
+on average (8 at worst), and HF's FP32 tower fed NInfer's decode is at mean token cosine 0.957 from
+itself fed Pillow's. The tower is that sensitive throughout: lossless images that differ only in one
+BF16 rounding of a few thousand values give 0.995-0.998.
+
+**Prompts.** The template writes `<|image|>` for each image part (a message with media is passed as a
+parts list, as transformers' processor does); the frontend expands it to `<|image>` + one image token
+(258880) per soft token + `<image|>`. Text that itself contains the placeholder is refused, as are
+video and images in tool results. The Program writes the encoder's features over the image tokens'
+embeddings (no embedding scale) and gives those tokens the image's last position as their sliding
+upper bound (section 4); a pass never ends inside an image, and the Engine's prefill chunks snap the
+same way, so an image's keys are always in the pass that attends them. Scoring refuses images: its
+128-token passes are narrower than an image block.
+
+**Cost.** Encoding takes 26-28 ms per image of about 2,300 patches on the RTX 5090. A one-image prompt
+of 280 tokens served with `--vision --spec mtp` has a TTFT of 192 ms; a 19 MP JPEG adds about 200 ms of
+single-threaded decode and resize on the request thread (13).
+
 ## 13. Not done
 
 | Item | Why it matters | What it needs |
@@ -405,7 +467,8 @@ compares each against one fresh pass instead.
 | CUDA Graphs | decode launch overhead | graph capture per lane count |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
-| Vision | plan P5 | |
+| Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
+| JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
 | MTP with several lanes in one pass, a cheaper drafter step | each lane verifies alone; drafting is 3-7 ms of a 7-draft round, unprofiled | the lane batching above; a drafter profile, then e.g. a Q8 head qualified against acceptance |
 
 ## 14. What the sibling engines settle
@@ -423,6 +486,5 @@ Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and `common/parsers/gemm
 
 | Question | How it closes |
 |---|---|
-| Sliding mask with images (`use_bidirectional_attention: "vision"`; llama.cpp reads it as bidirectional on SWA layers only) | Transformers `create_masks_for_vision_model` and an oracle case, with Vision (P5) |
 | Compact global KV rounding at 128K/256K | the Op criterion at those lengths; separate K/V rows (+60% global KV) if it fails |
 | A fused sublayer boundary (post-norm + residual + scalar + next pre-norm) | an attempt was reverted after elements at small cancelling values deviated by up to 0.7% with a scalar ≠ 1; compare the fp32 `inv` and residual sum against FP64 directly before retrying |

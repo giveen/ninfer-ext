@@ -79,8 +79,20 @@ int main() {
                                   static_cast<std::size_t>(vision.output_hidden_size) * tokens * 2));
             Tensor out(out_storage, DType::BF16,
                        {static_cast<std::int32_t>(vision.output_hidden_size), tokens});
+            // The second encoding is timed, so first-call costs are not counted.
+            cudaEvent_t start = nullptr, stop = nullptr;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
             gemma::encode_image(*model, image, arena, out, execution);
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            gemma::encode_image(*model, image, arena, out, execution);
+            CUDA_CHECK(cudaEventRecord(stop, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
+            float milliseconds = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            std::cout << "image" << index << ": encoded in " << milliseconds << " ms\n";
             std::vector<std::uint16_t> host(static_cast<std::size_t>(out.numel()));
             CUDA_CHECK(cudaMemcpy(host.data(), out.data, host.size() * 2, cudaMemcpyDeviceToHost));
             std::ofstream(base.string() + ".out.bin", std::ios::binary)
