@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -46,6 +47,20 @@ public:
     // by the head. Sampling is the caller's business.
     [[nodiscard]] const Tensor& logits() const noexcept { return logits_; }
 
+    /**
+     * Scores `ids` causally, from an empty sequence, and returns the natural log-probability of each
+     * target token: one entry for every position from `first_target` on, in order. The probability is
+     * taken from the soft-capped logits the head produced for the preceding position, which is the
+     * distribution the model itself would sample from, and it is normalized over the whole vocabulary
+     * in double precision.
+     *
+     * `first_target` must be at least 1 and less than the token count. The sequence is reset first, so
+     * a Program can score many windows in a row.
+     */
+    [[nodiscard]] std::vector<float> causal_score(std::span<const std::int32_t> ids,
+                                                  std::int32_t first_target,
+                                                  DeviceExecutionView execution);
+
 private:
     // Embeds `id`, runs every layer at `position`, and applies the head.
     void run_token(std::int32_t id, std::int32_t position, DeviceExecutionView execution);
@@ -56,6 +71,8 @@ private:
     Tensor logits_;
     void* id_buffer_    = nullptr;
     void* state_[2]     = {nullptr, nullptr};
+    // Host staging for one position's logits, which scoring reads back per target token.
+    std::vector<std::uint16_t> logits_host_;
     std::int32_t position_ = 0;
     std::int32_t capacity_ = 0;
 };

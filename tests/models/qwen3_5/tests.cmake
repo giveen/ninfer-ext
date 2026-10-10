@@ -137,6 +137,11 @@ ninfer_add_test(ninfer_gemma4_generate_test
   LIBRARIES ninfer_model_loading)
 set_tests_properties(ninfer_gemma4_generate_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_gemma4_score_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_score.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_score_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"
   LIBRARIES ninfer_model_runtime)

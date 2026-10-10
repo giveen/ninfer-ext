@@ -559,3 +559,48 @@ contract that both models satisfy, extracted one boundary at a time with the rea
 the guard — which the plan's own risk table names as the thing that can destabilize the shipped models.
 That is the next step, and it is why the Program was worth building first: it is the piece the engine
 will call, and it is verifiable on its own today.
+
+## 18. Causal scoring, and the missing BOS that made everything look broken
+
+`Program::causal_score` returns the natural log-probability of every target token from `first_target`
+on, which is what `ninfer-perplexity` consumes: `ScoreAggregate::add` accumulates
+`total_nll -= logprob` and `ppl()` is `exp(mean_nll)`. The probability is taken from the soft-capped
+logits of the preceding position — the distribution the model would sample from — and normalized over
+the whole vocabulary in double precision.
+
+**The first measurement said the model was broken, and it was the harness.** Scoring a paragraph of
+plain English gave mean NLL 9.96, perplexity 21092. The independent reference, which shares no code,
+agreed it was broken — 11.21 and 74217. Two independent implementations agreeing on an absurd number
+is a signal about the *input*, not the math: the corpus was tokenized without a leading `<bos>`, which
+Gemma requires, and which `tokenizers` does not add from `tokenizer.json` alone.
+
+With the BOS the same corpus scores **mean NLL 2.676, perplexity 14.53**. The per-token
+log-probabilities show the model doing exactly what it should: −0.0097 for "France" after
+"capital of", and −0.0049 for "Paris" after "The capital of France is". Generation agrees — the same
+prompt now produces
+
+    The capital of France is Paris.
+
+**This corrects section 16.** The looping "France is France is" was not the base checkpoint's
+character, as that section concluded; it was the un-BOS-ed prompt, and the reference agreed with the
+engine there because it was fed the same ids.
+
+**Engine against reference, position by position** on 70 targets of the same corpus:
+
+| | Mean NLL | Perplexity |
+|---|---|---|
+| Engine (FP8 attention, NVFP4 MLP) | 2.676 | 14.53 |
+| Reference (BF16 weights, FP32 math) | 2.878 | 17.77 |
+
+Correlation 0.9824, mean difference 0.20 nats, worst position 3.70 nats, and the first two positions
+agree to 0.02. The gap is the size the single-layer checks predicted would accumulate over sixty
+layers, and it is *not* attributed: quantization, the engine's BF16 activation storage at every layer
+boundary, and the reference's own FP32 assumptions are all candidates. Note the direction — the
+quantized engine is the *more* confident of the two, which is not what quantization alone would do, so
+some of the difference is probably the reference.
+
+What remains before this is P3: scoring runs through a test binary, not the public Engine, so
+`ninfer-perplexity` cannot drive it yet. `runtime::ModelInstance` is still typed to Qwen, and the
+Engine's scoring core reaches a Program through `ModelContract::PreparedPrompt` plus `causal_score`,
+`memory_summary` and `reset_memory_peaks` — a small enough surface that the P2 boundary is now a
+bounded piece of work rather than an open-ended one.

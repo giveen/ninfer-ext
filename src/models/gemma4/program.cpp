@@ -6,9 +6,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::models::gemma4 {
+namespace {
+
+// Widening BF16 to FP32 is the upper half of the pattern, so it is exact.
+float decode_bf16(std::uint16_t value) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+    float decoded;
+    std::memcpy(&decoded, &bits, sizeof(decoded));
+    return decoded;
+}
+
+} // namespace
 
 Program::Program(const Model& model, std::int32_t capacity, DeviceContext& device)
     : model_(&model), cache_(), arena_(layer_workspace_bytes(model.config())),
@@ -74,6 +87,49 @@ void Program::prefill(std::span<const std::int32_t> ids, DeviceExecutionView exe
         run_token(id, position_, execution);
         ++position_;
     }
+}
+
+std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
+                                         std::int32_t first_target, DeviceExecutionView execution) {
+    if (ids.size() < 2) throw std::invalid_argument("gemma4 Program: scoring needs two tokens");
+    if (first_target < 1 || first_target >= static_cast<std::int32_t>(ids.size())) {
+        throw std::invalid_argument("gemma4 Program: first_target is outside the sequence");
+    }
+    if (ids.size() > static_cast<std::size_t>(capacity_)) {
+        throw std::invalid_argument("gemma4 Program: the sequence is longer than the capacity");
+    }
+    reset();
+    const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
+    logits_host_.resize(static_cast<std::size_t>(vocabulary));
+
+    std::vector<float> scores;
+    scores.reserve(ids.size() - static_cast<std::size_t>(first_target));
+    for (std::int32_t index = 0; index < static_cast<std::int32_t>(ids.size()); ++index) {
+        if (index >= first_target) {
+            // The logits in hand were produced by the preceding position, so they are this token's
+            // distribution.
+            CUDA_CHECK(cudaMemcpyAsync(logits_host_.data(), logits_.data,
+                                       static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, execution.stream));
+            CUDA_CHECK(cudaStreamSynchronize(execution.stream));
+            double largest = -std::numeric_limits<double>::infinity();
+            for (std::int32_t id = 0; id < vocabulary; ++id) {
+                largest = std::max(largest, static_cast<double>(
+                                                decode_bf16(logits_host_[static_cast<std::size_t>(id)])));
+            }
+            double total = 0.0;
+            for (std::int32_t id = 0; id < vocabulary; ++id) {
+                total += std::exp(static_cast<double>(
+                                      decode_bf16(logits_host_[static_cast<std::size_t>(id)])) -
+                                  largest);
+            }
+            const double chosen = static_cast<double>(
+                decode_bf16(logits_host_[static_cast<std::size_t>(ids[static_cast<std::size_t>(index)])]));
+            scores.push_back(static_cast<float>(chosen - largest - std::log(total)));
+        }
+        decode(ids[static_cast<std::size_t>(index)], execution);
+    }
+    return scores;
 }
 
 void Program::decode(std::int32_t id, DeviceExecutionView execution) {

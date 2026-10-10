@@ -110,6 +110,19 @@ for layer in range(LAYERS):
     if layer % 10 == 0 or layer == LAYERS - 1:
         print(f'  layer {layer} done, last state |h|max {states[-1].abs().max().item():.3f}', flush=True)
 
+# Per-position scoring, matching Program::causal_score: the distribution that predicts token i comes
+# from the state at position i-1, after the final norm, the tied projection and the soft cap.
+W_FINAL = load('model.language_model.norm.weight')
+logprobs = []
+for t in range(TOKENS - 1):
+    normed = rmsnorm(states[t], W_FINAL, H)
+    row = CAP * torch.tanh((embed @ normed) / CAP)
+    logprobs.append(float(row[ids[t + 1]] - torch.logsumexp(row, dim=0)))
+logprobs = np.array(logprobs, dtype=np.float32)
+logprobs.astype(np.float32).tofile('/tmp/gemma_score.ref.f32')
+mean_nll = -logprobs.mean()
+print(f'reference: {len(logprobs)} scored, mean NLL {mean_nll:.4f}, perplexity {np.exp(mean_nll):.4f}')
+
 final = rmsnorm(states[-1], load('model.language_model.norm.weight'), H)
 logits = CAP * torch.tanh((embed @ final) / CAP)
 best = torch.topk(logits, TOP)
