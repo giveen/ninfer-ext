@@ -849,3 +849,33 @@ exists to make, and the reason it ranks layouts on KLD rather than perplexity.
 engine does differently from HF. The evidence points away from a plain quantization effect — a fraction
 of a percent on hidden states should not move individual logits by 27 — but I have not isolated it, and
 an artifact-level KLD measurement is the way to do that.
+
+## 25. The logit divergence is the stack, not the head
+
+Section 24 left the tail divergence unattributed between the quantization and something the engine does
+differently. HuggingFace's own final-norm input makes it decidable: feed *HF's* stack output through
+this model's head and the only things left in the comparison are the final norm, the tied matmul and
+the soft cap.
+
+| Head only, same input | |
+|---|---|
+| per-row cosine | mean **0.999996**, min 0.999995 |
+| argmax agreement | **70 of 70** |
+| worst single-logit difference | 0.1875 |
+
+**The head is faithful.** So the cosine of 0.972 over the full model is not a head defect: it is the
+sixty layers' accumulated difference, which the per-layer 0.2% and the sequence NLL's 0.2 nats both
+understate because the head's 5376-wide dot products against the embedding amplify a small hidden-state
+perturbation into a large logit swing in the tails.
+
+`ninfer_gemma4_layer_test` grew a head-only mode for this, so any implementation's stack output can be
+pushed through this model's head alone, and `gemma4_hf_reference.py`'s sibling dumps HF's stack output
+and logits side by side.
+
+**What follows from it.** The engine is faithful — head exactly, stack within the quantization's cost —
+so the remaining quality gap is precision, and gewell's layout says where to spend precision rather
+than guessing: its G0 mask keeps **embeddings and norms BF16**, holds Q/K/V at FP8 throughout, and uses
+FP8 rather than NVFP4 for the O and MLP projections in the first six layers, every global layer and its
+predecessor. This artifact instead quantizes its embedding to FP8 and every MLP to NVFP4, which is
+cheaper and measurably worse. That is the plan's P4 work, and it is now a specific change rather than a
+parameter to search.

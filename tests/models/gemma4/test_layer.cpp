@@ -143,6 +143,49 @@ int main() {
 
         // The head runs on the last token's layer output, which is dumped above, so the reference can
         // check it on exactly that input instead of propagating its own layer result into it.
+        // Head-only mode: run the head on the provided hidden state and stop, so an outside
+        // implementation's own stack output can be fed through this model's head alone.
+        if (std::getenv("NINFER_GEMMA_HEAD_ONLY") != nullptr) {
+            if (provided.empty()) {
+                std::cerr << "gemma4 layer: head-only mode needs NINFER_GEMMA_INPUT\n";
+                return 1;
+            }
+            // A batch needs its own buffers and its own scratch: the ones above are sized for the
+            // single-token layer runs.
+            const std::size_t vocabulary = config.vocab_size;
+            void* head_in                = nullptr;
+            void* logits                 = nullptr;
+            CUDA_CHECK(cudaMalloc(&head_in, static_cast<std::size_t>(tokens) * bytes));
+            CUDA_CHECK(cudaMalloc(&logits, static_cast<std::size_t>(vocabulary) *
+                                               static_cast<std::size_t>(tokens) *
+                                               sizeof(std::uint16_t)));
+            CUDA_CHECK(cudaMemcpy(head_in, provided.data(),
+                                  static_cast<std::size_t>(tokens) * bytes, cudaMemcpyHostToDevice));
+            DeviceArena head_arena(gemma::layer_workspace_bytes(config, tokens));
+            Tensor head_input(static_cast<std::uint8_t*>(head_in), DType::BF16, {hidden, tokens});
+            Tensor logit_tensor(static_cast<std::uint8_t*>(logits), DType::BF16,
+                                {static_cast<std::int32_t>(vocabulary), tokens});
+            gemma::forward_head(*model, head_input, tokens, head_arena, logit_tensor,
+                                device.execution_view());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<std::uint16_t> produced(static_cast<std::size_t>(vocabulary) *
+                                                static_cast<std::size_t>(tokens));
+            CUDA_CHECK(cudaMemcpy(produced.data(), logits,
+                                  produced.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+            // Written as per-column rows, one target per column, so the comparison is positional.
+            std::ofstream dump("/tmp/gemma_head_only.f32", std::ios::binary);
+            for (std::size_t column = 0; column < static_cast<std::size_t>(tokens); ++column) {
+                for (std::size_t id = 0; id < vocabulary; ++id) {
+                    const float value =
+                        decode_bf16(produced[id + column * static_cast<std::size_t>(vocabulary)]);
+                    dump.write(reinterpret_cast<const char*>(&value), sizeof(value));
+                }
+            }
+            std::cout << "gemma4 layer: head-only over " << tokens << " tokens, wrote "
+                      << "/tmp/gemma_head_only.f32\n";
+            return 0;
+        }
+
         if (head_text != nullptr && *head_text != '0') {
             const std::size_t vocabulary = config.vocab_size;
             void* logits                 = nullptr;
