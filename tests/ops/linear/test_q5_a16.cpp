@@ -117,6 +117,14 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {1152, 4304, 187U, Comparison::Sampled, false, kN1152K4304});
 
+    // Gemma 4 31B MLP: decode, the 128-token pass and an odd prefill width.
+    constexpr std::array kGemma{a16(1), a16(2), a16(5), a16(9), a16(17), a16(64), a16(128),
+                                a16(1000), graph(1)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {21504, 5376, 229U, Comparison::Sampled, false, kGemma});
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {5376, 21504, 233U, Comparison::Sampled, false, kGemma});
+
     return failures;
 }
 

@@ -570,6 +570,53 @@ def gemma4_31b_g0(model, recipe, sources):
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
 
 
+_GEMMA4_GROUPS = {
+    "attn_qkv": ("attention/query", "attention/key", "attention/value"),
+    "attn_o": ("attention/output",),
+    "mlp_gu": ("mlp/gate", "mlp/up"),
+    "mlp_down": ("mlp/down",),
+}
+_GEMMA4_FORMATS = {"q4": Q4, "q5": Q5, "q6": Q6, "q8": Q8, "fp8": FP8, "nvfp4": "nvfp4"}
+
+
+def _gemma4_layout(model, recipe, layout_name):
+    """Assigns a measured Gemma 4 precision layout (tools/convert/layouts/<name>.json).
+
+    The layout names one format per projection group and layer, and the head's and embedding's. It
+    is the output of tools/verify/gemma4_allocate.py, scored end to end with
+    tools/verify/gemma4_sensitivity.py --assign before it was committed.
+    """
+    import json
+    from pathlib import Path
+
+    layout = json.loads((Path(__file__).parent / "layouts" / f"{layout_name}.json").read_text())
+    _optional(model, recipe)
+
+    def assign(name, short):
+        if short == "bf16":
+            recipe.assign(name, format="bf16")
+        elif short == "nvfp4":
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif short == "fp8":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+        else:
+            _assign(recipe, name, _GEMMA4_FORMATS[short])
+
+    assign("text/token_embedding", layout["embedding"])
+    assign("text/output_head", layout["head"])
+    for layer, groups in layout["layers"].items():
+        for group, short in groups.items():
+            for role in _GEMMA4_GROUPS[group]:
+                name = f"text/layers/{layer}/{role}"
+                if name in model.parameters:
+                    assign(name, short)
+
+
+def gemma4_31b_m1(model, recipe, sources):
+    """Gemma 4 31B, mixed layout M1: Q8/Q6 attention, NVFP4/Q-format MLPs, Q6 head, BF16 embedding."""
+    _gemma4_layout(model, recipe, "gemma4_31b_m1")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -585,4 +632,5 @@ RECIPES = {
     "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
     "gemma4_31b_base": gemma4_31b_base,
     "gemma4_31b_g0": gemma4_31b_g0,
+    "gemma4_31b_m1": gemma4_31b_m1,
 }

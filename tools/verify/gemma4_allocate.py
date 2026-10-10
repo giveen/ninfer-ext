@@ -25,6 +25,8 @@ def main():
                         help="formats a projection group may take")
     parser.add_argument("--head-formats", default="bf16,q8,fp8,q6")
     parser.add_argument("--embedding-formats", default="fp8,q8,q6,q5,q4,nvfp4")
+    parser.add_argument("--attention-formats", help="formats the attention groups may take "
+                        "(default: --formats)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -40,12 +42,19 @@ def main():
         elif c["group"] == "embedding":
             if c["format"] not in args.embedding_formats.split(","):
                 continue
+        elif c["group"].startswith("attn_") and args.attention_formats:
+            if c["format"] not in args.attention_formats.split(","):
+                continue
         elif c["format"] not in allowed:
             continue
         options[key].append((c["format"], c["kld"], c["params"] * bits[c["format"]] / 8))
     head = next(c for c in data["candidates"] if c["group"] == "head")
     if "bf16" in args.head_formats.split(","):
         options[(-1, "head")].append(("bf16", 0.0, head["params"] * 2.0))
+    # The engine keeps the embedding in pinned host memory, so an exact BF16 table costs no device
+    # bytes; the budget is device memory.
+    if "bf16" in args.embedding_formats.split(","):
+        options[(-1, "embedding")].append(("bf16", 0.0, 0.0))
     budget = args.budget_gib * 2**30
     # Norms, scalars and resources are a few MiB; they are counted as fixed overhead.
     overhead = 64 * 2**20

@@ -16,8 +16,6 @@ namespace ninfer::models::gemma4 {
 namespace {
 
 // The formats the artifact stores, checked by the binder on every request.
-constexpr QType kHeadFormat      = QType::BF16;
-constexpr QType kProjectionFormat = QType::FP8_E4M3FN_ROW_BF16;
 constexpr QType kNormFormat       = QType::BF16;
 constexpr QType kScalarFormat     = QType::FP32;
 
@@ -32,10 +30,10 @@ public:
     // A null format declares no representation constraint, which is what a parameter whose layout the
     // converter is free to choose needs: the Ops dispatch on what the weight actually is.
     WeightId parameter(const std::string& name, artifact::Shape shape,
-                       std::optional<QType> format = {}) {
+                       std::optional<QType> format          = {},
+                       artifact::Residency residency        = artifact::Residency::Device) {
         PendingWeight pending;
-        pending.reference = binder_.parameter(name, std::move(shape), artifact::Residency::Device,
-                                              format);
+        pending.reference = binder_.parameter(name, std::move(shape), residency, format);
         weights_.push_back(std::move(pending));
         return WeightId{weights_.size() - 1};
     }
@@ -57,10 +55,12 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
     const std::uint64_t vocabulary   = config.vocab_size;
 
     TextWeights out;
-    // The embedding's representation is the layout's choice - a precision layout may keep it BF16 -
-    // and the embedding Op accepts both.
-    out.token_embedding = bindings.parameter("text/token_embedding", {vocabulary, hidden});
-    out.output_head = bindings.parameter("text/output_head", {vocabulary, hidden}, kHeadFormat);
+    // The embedding's representation is the layout's choice, and it stays in pinned host memory: a
+    // pass gathers one row per token through UVA, which costs nothing measurable beside the layers,
+    // and the 262K-row table then takes no device memory, so a layout can keep it exact (BF16).
+    out.token_embedding = bindings.parameter("text/token_embedding", {vocabulary, hidden}, {},
+                                             artifact::Residency::HostPinned);
+    out.output_head = bindings.parameter("text/output_head", {vocabulary, hidden});
     out.final_norm  = bindings.parameter("text/final_norm", {hidden}, kNormFormat);
 
     out.layers.reserve(config.num_hidden_layers);
@@ -88,15 +88,16 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
         // The three attention input projections are slices of one fused object; requesting the
         // slice's own shape is what makes the artifact resolve its row offset.
         weights.attention.query =
-            bindings.parameter(prefix + "attention/query", {query_rows, hidden}, kProjectionFormat);
+            bindings.parameter(prefix + "attention/query", {query_rows, hidden});
         weights.attention.key =
-            bindings.parameter(prefix + "attention/key", {key_rows, hidden}, kProjectionFormat);
+            bindings.parameter(prefix + "attention/key", {key_rows, hidden});
         if (sliding) {
             weights.attention.value = bindings.parameter(prefix + "attention/value",
-                                                         {key_rows, hidden}, kProjectionFormat);
+                                                         {key_rows, hidden});
         }
-        weights.attention.output = bindings.parameter(prefix + "attention/output", {hidden, query_rows},
-                                                      kProjectionFormat);
+        // Projection formats are the precision layout's choice; the linear Op dispatches on them.
+        weights.attention.output =
+            bindings.parameter(prefix + "attention/output", {hidden, query_rows});
         weights.attention.query_norm = bindings.parameter(prefix + "attention/query_norm",
                                                           {geometry.head_dim}, kNormFormat);
         weights.attention.key_norm = bindings.parameter(prefix + "attention/key_norm",
@@ -133,9 +134,10 @@ std::vector<BoundWeight> resolve_weights(const std::vector<artifact::ParameterRe
     std::vector<BoundWeight> out;
     out.reserve(references.size());
     for (const auto& reference : references) {
-        if (reference.residency != artifact::Residency::Device) {
+        if (reference.residency != artifact::Residency::Device &&
+            reference.residency != artifact::Residency::HostPinned) {
             throw artifact::ArtifactError(reference.name +
-                                          ": only device-resident parameters are bound");
+                                          ": only device or pinned host parameters are bound");
         }
         BoundWeight bound;
         bound.name = reference.name;

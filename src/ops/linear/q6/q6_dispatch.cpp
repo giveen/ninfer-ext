@@ -16,6 +16,16 @@ constexpr std::array kShapes{
     ShapeEntry{248320, 2048, select_q6_n248320_k2048},
     ShapeEntry{1152, 1536, select_q6_n1152_k1536},
     ShapeEntry{248320, 2560, select_q6_n248320_k2560},
+    // Gemma 4 31B: attention, MLP and head.
+    ShapeEntry{8192, 5376, select_q6_gemma4},
+    ShapeEntry{4096, 5376, select_q6_gemma4},
+    ShapeEntry{16384, 5376, select_q6_gemma4},
+    ShapeEntry{2048, 5376, select_q6_gemma4},
+    ShapeEntry{5376, 8192, select_q6_gemma4},
+    ShapeEntry{5376, 16384, select_q6_gemma4},
+    ShapeEntry{21504, 5376, select_q6_gemma4},
+    ShapeEntry{5376, 21504, select_q6_gemma4},
+    ShapeEntry{262144, 5376, select_q6_gemma4},
     // Qwen4Exp dense projections (same list as the Q8 table).
     ShapeEntry{13312, 2560, select_q6_qwen4_exp},
     ShapeEntry{640, 2560, select_q6_qwen4_exp_small},
