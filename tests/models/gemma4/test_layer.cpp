@@ -115,7 +115,7 @@ int main() {
 
         gemma::KvCache cache;
         cache.configure(config, 64);
-        DeviceArena arena(gemma::layer_workspace_bytes(config));
+        DeviceArena arena(gemma::layer_workspace_bytes(config, 1));
         for (std::int32_t position = 0; position < tokens; ++position) {
             const std::vector<std::uint16_t> state =
                 provided.empty()
@@ -127,7 +127,7 @@ int main() {
             CUDA_CHECK(cudaMemcpy(in, state.data(), bytes, cudaMemcpyHostToDevice));
             Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
             Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
-            gemma::forward_layer(*model, layer, hidden_in, position, cache, arena, hidden_out,
+            gemma::forward_layer(*model, layer, hidden_in, position, 1, cache, arena, hidden_out,
                                  device.execution_view());
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<std::uint16_t> produced(hidden);
@@ -150,7 +150,8 @@ int main() {
             Tensor head_input(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
             Tensor logit_tensor(static_cast<std::uint8_t*>(logits), DType::BF16,
                                 {static_cast<std::int32_t>(vocabulary), 1});
-            gemma::forward_head(*model, head_input, arena, logit_tensor, device.execution_view());
+            gemma::forward_head(*model, head_input, 1, arena, logit_tensor,
+                                device.execution_view());
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<std::uint16_t> produced(vocabulary);
             CUDA_CHECK(cudaMemcpy(produced.data(), logits, vocabulary * sizeof(std::uint16_t),

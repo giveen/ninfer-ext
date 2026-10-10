@@ -770,3 +770,49 @@ loudly, which is the next thing to do rather than something to hide.
 
 Twice I explained a number before checking it, and both explanations were wrong. The oracle was three
 directories away the whole time. Querying the reference comes before proposing a cause.
+
+## 23. Batched prefill: the layer stack runs many tokens per pass
+
+`forward_layer` now takes `first_position` and `tokens` instead of a single position, and every buffer
+it allocates scales with the batch: the projections are `[K,T]`, the per-head tensors `[D,H,T]`, and
+the attentions take four-dimensional views of those. Decode is the same call with one token, so there is
+one code path rather than two that have to agree.
+
+Two details make a batch behave like token-at-a-time. Every token's key and value rows are written into
+the cache *before* the attention runs, and each query then sees what the cache makes visible to its own
+position — which is what the Op's per-query visibility rule already means. And the cache's `mark_range`
+records a run of positions, with the ring's rows adjacent unless the run wraps, so the common case is
+one copy per plane and only the wrapped case falls back to a copy per token.
+
+`Program` runs the stack in batches of 128. Its arena and logits buffer are sized for that, `logits()`
+returns a view of the last column so callers that want one row still get one, and `causal_score` walks
+the sequence in batches, scoring the targets each batch's columns predict. A column predicts the token
+after its own position, so a batch of T covers T targets and consecutive batches tile the range without
+gaps or repeats.
+
+**Measured, on the 335-token wikitext slice that had been taking 16.0 s:**
+
+| | Before | After |
+|---|---|---|
+| score rate | 9.4 tok/s | **135.9 tok/s** |
+| mean NLL | 9.0697 | 9.0299 |
+| HF's own | 9.3332 | 9.3332 |
+
+A 14.5-fold speedup, and the answer is not merely the same but slightly closer to the reference. The
+France corpus scores 2.6717 against 2.6761 before, so the change in accumulation order costs a
+fourth decimal place.
+
+**Verified as a generalization, not a change.** All seven Gemma real tests pass — load, model, forward,
+layer, score, generate, tokenizer — the suite is green at 169, and the generation is character for
+character what it was, "The capital of France is Paris.", which is the guard that matters for a change
+to the code every path goes through.
+
+**Two things this does not do.** The batch is a fixed 128 rather than sized to what the device can hold,
+and it is the *prefill* rate that improved: decode still runs one pass per token, so a generation
+measurement will look nothing like 135 tok/s. Both are honest limits rather than oversights.
+
+**And a mistake worth recording.** The first verification run reported the generate test and four suite
+tests failing with a shape error I had just fixed. They were stale binaries: I had built only the two
+targets I named, so the tests still ran the old code. Rebuilding everything showed seven green tests and
+a green suite. Building every target before believing a failure is cheaper than the diagnosis it
+otherwise costs.

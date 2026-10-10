@@ -98,7 +98,7 @@ int main() {
               "layer scalars left the expected band: " + std::to_string(scalar_min) + " to " +
                   std::to_string(scalar_max));
 
-        DeviceArena arena(gemma::layer_workspace_bytes(config));
+        DeviceArena arena(gemma::layer_workspace_bytes(config, 1));
         void* in  = nullptr;
         void* out = nullptr;
         check(cudaMalloc(&in, bytes) == cudaSuccess && cudaMalloc(&out, bytes) == cudaSuccess,
@@ -144,8 +144,8 @@ int main() {
             for (std::size_t index = 0; index < total; ++index) {
                 Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
                 Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
-                gemma::forward_layer(*model, index, hidden_in, position, cache, arena, hidden_out,
-                                     device.execution_view());
+                gemma::forward_layer(*model, index, hidden_in, position, 1, cache, arena,
+                                     hidden_out, device.execution_view());
                 std::swap(in, out);
             }
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -211,7 +211,7 @@ int main() {
         bool refused = false;
         try {
             Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
-            gemma::forward_layer(*model, total, hidden_in, 0, cache, arena, hidden_in,
+            gemma::forward_layer(*model, total, hidden_in, 0, 1, cache, arena, hidden_in,
                                  device.execution_view());
         } catch (const std::exception&) { refused = true; }
         check(refused, "a layer index outside the stack was accepted");

@@ -139,12 +139,33 @@ std::int32_t KvCache::slot(std::size_t layer, std::int32_t position) const {
     return static_cast<std::int32_t>(position % static_cast<std::int32_t>(config_.sliding_window));
 }
 
-void KvCache::mark(std::size_t layer, std::int32_t position, cudaStream_t stream) {
-    const std::int32_t index = slot(layer, position);
-    if (cudaMemcpyAsync(static_cast<std::uint8_t*>(layers_[layer].positions.data) +
-                            static_cast<std::size_t>(index) * 4,
-                        &position, 4, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-        throw std::runtime_error("KvCache: could not record the position");
+void KvCache::mark_range(std::size_t layer, std::int32_t first_position, std::int32_t tokens,
+                        cudaStream_t stream) {
+    if (tokens < 1) { throw std::invalid_argument("KvCache: tokens must be positive"); }
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = first_position + token;
+    }
+    const std::int32_t first = slot(layer, first_position);
+    const std::int32_t last  = slot(layer, first_position + tokens - 1);
+    auto* base               = static_cast<std::uint8_t*>(layers_[layer].positions.data);
+    const std::size_t bytes  = static_cast<std::size_t>(tokens) * sizeof(std::int32_t);
+    if (first + tokens - 1 <= last) {
+        // The run does not wrap: one write covers it.
+        if (cudaMemcpyAsync(base + static_cast<std::size_t>(first) * sizeof(std::int32_t),
+                            positions.data(), bytes, cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess) {
+            throw std::runtime_error("KvCache: could not record the positions");
+        }
+        return;
+    }
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::int32_t index = slot(layer, first_position + token);
+        if (cudaMemcpyAsync(base + static_cast<std::size_t>(index) * sizeof(std::int32_t),
+                            positions.data() + token, sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            stream) != cudaSuccess) {
+            throw std::runtime_error("KvCache: could not record the positions");
+        }
     }
 }
 

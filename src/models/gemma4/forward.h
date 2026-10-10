@@ -27,31 +27,34 @@
 
 namespace ninfer::models::gemma4 {
 
-// Transient capacity one layer needs, at any position and of either kind, so a caller can reuse one
-// arena for every layer of a pass.
-[[nodiscard]] std::size_t layer_workspace_bytes(const TextConfig& config);
+// Transient capacity one layer needs to run `tokens` tokens at once, of either kind, so a caller can
+// reuse one arena for every layer of a pass.
+[[nodiscard]] std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens);
 
 /**
- * Runs one decoder layer for one token, dispatching on the layer's attention kind.
+ * Runs one decoder layer for `tokens` tokens at once, dispatching on the layer's attention kind.
  *
- * `hidden_in` and `hidden_out` are contiguous BF16 [hidden_size,1] and must not overlap; the layer
- * reads the residual stream and writes its updated self to `hidden_out`. `position` is the token's
- * absolute position: the layer writes the token's key and value rows into `cache` and then attends
- * over everything the cache still makes visible to that position.
+ * `hidden_in` and `hidden_out` are contiguous BF16 [hidden_size,tokens] and must not overlap; the
+ * layer reads the residual stream and writes its updated self to `hidden_out`. The tokens occupy the
+ * consecutive absolute positions starting at `first_position`, so a prefill is one call and a decode
+ * is the same call with one token. Every token's key and value rows are written into `cache` before
+ * the attention runs, and each query then sees exactly what the cache makes visible to its own
+ * position, which is what makes a batched prefill produce the same result as token-at-a-time.
  */
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t position, KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
-                   DeviceExecutionView execution);
+                   std::int32_t first_position, std::int32_t tokens, KvCache& cache,
+                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution);
 
 /**
  * Applies the output head to a layer stack's final hidden state.
  *
- * `hidden_in` is contiguous BF16 [hidden_size,1] and `logits` contiguous BF16 [vocabulary,1]. The head
+ * `hidden_in` is contiguous BF16 [hidden_size,tokens] and `logits` contiguous BF16
+ * [vocabulary,tokens], one column per token. The head
  * is the final norm, then the projection through the embedding matrix, which is tied to the token
  * embedding, and then the logit soft cap. The cap is applied here because it is part of the model's
  * logits; every consumer that must see uncapped values is the caller's business.
  */
-void forward_head(const Model& model, const Tensor& hidden_in, DeviceArena& arena, Tensor& logits,
-                  DeviceExecutionView execution);
+void forward_head(const Model& model, const Tensor& hidden_in, std::int32_t tokens, DeviceArena& arena,
+                  Tensor& logits, DeviceExecutionView execution);
 
 } // namespace ninfer::models::gemma4
