@@ -29,18 +29,20 @@ struct PreparedImage {
     [[nodiscard]] std::int32_t soft_tokens() const noexcept { return grid_width * grid_height / 9; }
 };
 
-// The resized (height, width) for an image of `height` x `width` pixels. Throws std::invalid_argument
-// for an image the reference cannot resize (both sides rounding to zero).
+// The resized (height, width) for an image of `height` x `width` pixels. Throws
+// std::invalid_argument for an image the reference cannot resize (both sides rounding to zero).
 struct ImageSize {
     int height = 0;
     int width  = 0;
 };
+
 [[nodiscard]] ImageSize gemma_image_size(int height, int width);
 
 // Pixels the budget holds: a larger image is downscaled.
 inline constexpr std::uint64_t kGemmaImageBudgetPixels = 280ULL * 9ULL * 16ULL * 16ULL;
 
-// Decodes, resizes and patchifies one image. `checkpoint` runs between stages and inside the resize.
+// Decodes, resizes and patchifies one image. `checkpoint` runs between stages and inside the
+// resize.
 [[nodiscard]] PreparedImage prepare_gemma_image(std::span<const std::uint8_t> bytes,
                                                 const media::decode::Policy& policy,
                                                 const std::function<void()>& checkpoint = {});

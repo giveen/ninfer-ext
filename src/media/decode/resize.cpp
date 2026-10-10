@@ -59,11 +59,14 @@ Coefficients coefficients(int input, int output) {
 
 } // namespace
 
-void resize_bicubic(Image& input, int width, int height,
-                    const std::function<void()>& checkpoint) {
+void resize_bicubic(Image& input, int width, int height, const std::function<void()>& checkpoint) {
     if (width <= 0 || height <= 0) throw std::invalid_argument("resize_bicubic: empty size");
     if (input.width == width && input.height == height) { return; }
-    const struct { int w, h; } size{width, height};
+
+    const struct {
+        int w, h;
+    } size{width, height};
+
     const Coefficients horizontal = coefficients(input.width, size.w);
     const Coefficients vertical   = coefficients(input.height, size.h);
     std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);

@@ -26,9 +26,9 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
     packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
-        scale * kLog2E, static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
-        stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1), stride_elements(k, 2),
-        stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
+        scale * kLog2E, static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0),
+        stride_elements(q, 1), stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1),
+        stride_elements(k, 2), stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
     CUDA_CHECK(cudaGetLastError());
 }
 

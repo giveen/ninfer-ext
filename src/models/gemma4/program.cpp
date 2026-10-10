@@ -65,9 +65,8 @@ std::size_t shared_bytes(const TextConfig& config, std::int32_t draft_tokens,
     const std::size_t hidden     = config.hidden_size;
     const std::size_t vocabulary = config.vocab_size;
     const std::size_t score      = static_cast<std::size_t>(Program::kScorePass);
-    std::size_t bytes = arena_bytes(config, vision) +
-                        sampling_bytes(config, draft_tokens) + pass * sizeof(std::int32_t) +
-                        2 * hidden * pass * sizeof(std::uint16_t) +
+    std::size_t bytes = arena_bytes(config, vision) + sampling_bytes(config, draft_tokens) +
+                        pass * sizeof(std::int32_t) + 2 * hidden * pass * sizeof(std::uint16_t) +
                         vocabulary * score * sizeof(std::uint16_t) +
                         hidden * score * sizeof(std::uint16_t);
     if (draft_tokens > 0) {
@@ -91,8 +90,8 @@ std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacit
 Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
                  DeviceContext& device, std::int32_t draft_tokens)
     : model_(&model),
-      arena_(arena_bytes(model.config(),
-                         model.vision_config() ? &*model.vision_config() : nullptr)),
+      arena_(
+          arena_bytes(model.config(), model.vision_config() ? &*model.vision_config() : nullptr)),
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
       draft_tokens_(draft_tokens), capacity_(capacity) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
@@ -245,9 +244,9 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         native_weight(model_->weight(model_->weights().text.token_embedding).view);
     ops::embedding(id_tensor, table, std::sqrt(static_cast<float>(hidden)), embedded, stream);
 
-    // An image's features replace its tokens' embeddings as they are, with no embedding scale, and its
-    // tokens' sliding upper bound is the image's last position. The encoder's scratch is the layer
-    // arena, which no layer holds yet.
+    // An image's features replace its tokens' embeddings as they are, with no embedding scale, and
+    // its tokens' sliding upper bound is the image's last position. The encoder's scratch is the
+    // layer arena, which no layer holds yet.
     Tensor position_high;
     if (!images.empty()) {
         for (std::int32_t token = 0; token < tokens; ++token) {
@@ -263,7 +262,8 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         CUDA_CHECK(cudaEventRecord(vision_start, stream));
         for (const PromptImage& image : images) {
             Tensor features(static_cast<std::uint8_t*>(state_[0]) +
-                                static_cast<std::size_t>(image.begin) * hidden * sizeof(std::uint16_t),
+                                static_cast<std::size_t>(image.begin) * hidden *
+                                    sizeof(std::uint16_t),
                             DType::BF16, {hidden, image.tokens()});
             encode_image(*model_, image.patches, arena_, features, execution);
             const std::int32_t last = first_position + image.begin + image.tokens() - 1;
@@ -272,7 +272,8 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
             }
         }
         CUDA_CHECK(cudaEventRecord(vision_stop, stream));
-        // A pageable source is staged before cudaMemcpyAsync returns, so the next pass may reuse it.
+        // A pageable source is staged before cudaMemcpyAsync returns, so the next pass may reuse
+        // it.
         CUDA_CHECK(cudaMemcpyAsync(high_buffer_, high_host_.data(),
                                    static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, stream));
@@ -335,7 +336,8 @@ void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids
         }
         for (std::int32_t token = image.begin; token < end; ++token) {
             if (ids[static_cast<std::size_t>(token)] != model_->vision_config()->image_token_id) {
-                throw std::invalid_argument("gemma4 Program: an image's tokens must be image tokens");
+                throw std::invalid_argument(
+                    "gemma4 Program: an image's tokens must be image tokens");
             }
         }
         previous_end = end;

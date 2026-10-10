@@ -23,10 +23,10 @@ namespace ninfer::ops {
  * `position_q` and `position_k` are contiguous I32 [T,B] and [S,B]. Only the window bound is
  * one-sided: a key ahead of the query's upper bound is excluded even inside the window, which makes
  * this causal rather than symmetric. An upper bound past the query's own position (I32 [T,B], never
- * below it) opens the keys up to it: Gemma 4 gives every token of an image the block's last position,
- * so the image attends bidirectionally while the window's lower edge stays at each token. A query row with no visible key writes exact BF16 zero, and the
- * window may exceed the key count. `window` is at most 4096, which is what keeps the visible keys in
- * shared memory.
+ * below it) opens the keys up to it: Gemma 4 gives every token of an image the block's last
+ * position, so the image attends bidirectionally while the window's lower edge stays at each token.
+ * A query row with no visible key writes exact BF16 zero, and the window may exceed the key count.
+ * `window` is at most 4096, which is what keeps the visible keys in shared memory.
  *
  * `k_extra`, `v_extra` and `position_extra` ([D,Hkv,E,B] and [E,B]) are a second key set the same
  * formula covers, scanned after the first: a pass's own keys beside a ring that does not hold them
@@ -34,10 +34,10 @@ namespace ninfer::ops {
  *
  * The route is tensor-core flash attention (ops/kernel/gemma_flash_attention.cuh): blocks of 16
  * query rows that share a KV head stream 32-key tiles with an online Softmax, and a tile no row can
- * see is skipped. `head_dim` is 32, 64, 128 or 256. When the rows alone give too few blocks (decode),
- * the keys are split across blocks and merged by a second kernel; that needs `workspace` of at least
- * `sliding_causal_attention_workspace_bytes` bytes, and an empty or smaller workspace selects the
- * one-pass route, which computes the same result.
+ * see is skipped. `head_dim` is 32, 64, 128 or 256. When the rows alone give too few blocks
+ * (decode), the keys are split across blocks and merged by a second kernel; that needs `workspace`
+ * of at least `sliding_causal_attention_workspace_bytes` bytes, and an empty or smaller workspace
+ * selects the one-pass route, which computes the same result.
  *
  * The oracle evaluates the formula naively in FP64 from the represented BF16 q/k/v, with a stable
  * Softmax over exactly the visible set. The BF16 output is promoted for comparison and storage
@@ -46,8 +46,8 @@ namespace ninfer::ops {
  */
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_q_high,
-                              const Tensor& position_k, const Tensor& k_extra, const Tensor& v_extra,
-                              const Tensor& position_extra,
+                              const Tensor& position_k, const Tensor& k_extra,
+                              const Tensor& v_extra, const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
                               Tensor& out, const Tensor& workspace, cudaStream_t stream);
 

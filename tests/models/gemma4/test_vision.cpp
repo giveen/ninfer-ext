@@ -1,9 +1,10 @@
 // The image encoder against its reference.
 //
-// tools/verify/gemma4_vision_reference.py prepare writes transformers' preprocessed patches for a few
-// images (imageN.bin, BF16 [patches, 768], and imageN.grid, "width height" in patches). This test
-// encodes each with the artifact's vision tower and writes its soft tokens to imageN.out.bin (BF16
-// [tokens, 5376]); the script's compare mode runs transformers' tower in FP32 on the same images.
+// tools/verify/gemma4_vision_reference.py prepare writes transformers' preprocessed patches for a
+// few images (imageN.bin, BF16 [patches, 768], and imageN.grid, "width height" in patches). This
+// test encodes each with the artifact's vision tower and writes its soft tokens to imageN.out.bin
+// (BF16 [tokens, 5376]); the script's compare mode runs transformers' tower in FP32 on the same
+// images.
 //
 // NINFER_GEMMA_ARTIFACT     an artifact converted with --components text,vision
 // NINFER_GEMMA_VISION_DUMP  the directory prepare wrote
@@ -48,8 +49,8 @@ int main() {
     try {
         DeviceContext device;
         models::LoadOptions options;
-        options.vision = true;
-        auto model     = gemma::load_model(path, options, device);
+        options.vision     = true;
+        auto model         = gemma::load_model(path, options, device);
         const auto& vision = *model->vision_config();
         DeviceArena arena(gemma::vision_workspace_bytes(vision, vision.max_patches()));
         const DeviceExecutionView execution = device.execution_view();
@@ -72,11 +73,11 @@ int main() {
                          static_cast<std::streamsize>(pixels.size() * 2))) {
                 throw std::runtime_error(base.string() + ".bin is shorter than its grid");
             }
-            image.pixels = pixels;
+            image.pixels              = pixels;
             const std::int32_t tokens = image.patches() / 9;
-            void* out_storage = nullptr;
-            CUDA_CHECK(cudaMalloc(&out_storage,
-                                  static_cast<std::size_t>(vision.output_hidden_size) * tokens * 2));
+            void* out_storage         = nullptr;
+            CUDA_CHECK(cudaMalloc(
+                &out_storage, static_cast<std::size_t>(vision.output_hidden_size) * tokens * 2));
             Tensor out(out_storage, DType::BF16,
                        {static_cast<std::int32_t>(vision.output_hidden_size), tokens});
             // The second encoding is timed, so first-call costs are not counted.
@@ -101,7 +102,8 @@ int main() {
             std::size_t non_finite = 0;
             for (std::uint16_t value : host) non_finite += !std::isfinite(decode_bf16(value));
             std::cout << "image" << index << ": " << image.grid_width << "x" << image.grid_height
-                      << " patches -> " << tokens << " soft tokens, non-finite " << non_finite << "\n";
+                      << " patches -> " << tokens << " soft tokens, non-finite " << non_finite
+                      << "\n";
             failures += non_finite != 0;
             CUDA_CHECK(cudaFree(out_storage));
         }

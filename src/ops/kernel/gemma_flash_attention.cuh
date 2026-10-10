@@ -129,8 +129,8 @@ __device__ __forceinline__ float flash_warp_sum(float value) {
 
 // A key is visible when it is no later than the query's upper bound and, with a window, less than a
 // window behind the query itself.
-__device__ __forceinline__ bool flash_visible(std::int32_t query, std::int32_t high, std::int32_t key,
-                                              std::int32_t window) {
+__device__ __forceinline__ bool flash_visible(std::int32_t query, std::int32_t high,
+                                              std::int32_t key, std::int32_t window) {
     return key <= high && (window == 0 || static_cast<std::int64_t>(query) - key < window);
 }
 

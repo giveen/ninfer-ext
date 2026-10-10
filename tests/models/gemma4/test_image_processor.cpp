@@ -1,12 +1,13 @@
 // Gemma 4's image preprocessing against transformers' processor.
 //
-// tools/verify/gemma4_vision_reference.py prepare writes the processor's resize rule over a table of
-// sizes (sizes.txt: "height width target_height target_width" or "height width error") and, per image,
-// the source path (imageN.source) and the processor's BF16 patches (imageN.bin, imageN.grid). The rule
-// must agree exactly. For a lossless source the patches must agree within one uint8 step (Pillow's
-// bicubic against NInfer's torchvision-matching one, and the BF16 rounding of the mapped value); a
-// JPEG's are reported only, because FFmpeg and Pillow decode it differently. NInfer's patches are
-// written beside the reference's (imageN.ninfer.bin) so the effect of a difference can be measured.
+// tools/verify/gemma4_vision_reference.py prepare writes the processor's resize rule over a table
+// of sizes (sizes.txt: "height width target_height target_width" or "height width error") and, per
+// image, the source path (imageN.source) and the processor's BF16 patches (imageN.bin,
+// imageN.grid). The rule must agree exactly. For a lossless source the patches must agree within
+// one uint8 step (Pillow's bicubic against NInfer's torchvision-matching one, and the BF16 rounding
+// of the mapped value); a JPEG's are reported only, because FFmpeg and Pillow decode it
+// differently. NInfer's patches are written beside the reference's (imageN.ninfer.bin) so the
+// effect of a difference can be measured.
 //
 // NINFER_GEMMA_VISION_DUMP  the directory prepare wrote
 
@@ -62,9 +63,7 @@ int main() {
         try {
             const gemma::ImageSize size = gemma::gemma_image_size(height, width);
             got = std::to_string(size.height) + " " + std::to_string(size.width);
-        } catch (const std::invalid_argument&) {
-            got = "error";
-        }
+        } catch (const std::invalid_argument&) { got = "error"; }
         std::string expected = target_height;
         if (target_height != "error") {
             int target_width = 0;
@@ -94,7 +93,7 @@ int main() {
         int grid_width = 0, grid_height = 0;
         std::ifstream(base.string() + ".grid") >> grid_width >> grid_height;
         const std::vector<std::uint8_t> bytes = read_bytes(source);
-        const auto started = std::chrono::steady_clock::now();
+        const auto started                    = std::chrono::steady_clock::now();
         const gemma::PreparedImage image =
             gemma::prepare_gemma_image(bytes, media::decode::Policy{});
         std::cout << "image" << index << ": prepared in "
@@ -103,12 +102,14 @@ int main() {
                          .count()
                   << " ms\n";
         if (image.grid_width != grid_width || image.grid_height != grid_height) {
-            std::cerr << "image" << index << ": grid " << image.grid_width << "x" << image.grid_height
-                      << ", expected " << grid_width << "x" << grid_height << "\n";
+            std::cerr << "image" << index << ": grid " << image.grid_width << "x"
+                      << image.grid_height << ", expected " << grid_width << "x" << grid_height
+                      << "\n";
             ++failures;
             continue;
         }
-        // NInfer's own patches beside the reference's, so the effect of a difference can be measured.
+        // NInfer's own patches beside the reference's, so the effect of a difference can be
+        // measured.
         std::ofstream(base.string() + ".ninfer.bin", std::ios::binary)
             .write(reinterpret_cast<const char*>(image.pixels->data()),
                    static_cast<std::streamsize>(image.pixels->size() * 2));
@@ -130,11 +131,12 @@ int main() {
             worst = std::max(worst, delta * 255.0 / 2.0);
         }
         std::cout << "image" << index << ": " << grid_width << "x" << grid_height << " patches, "
-                  << differing << " of " << reference.size() << " values differ, worst "
-                  << worst << " uint8 steps\n";
+                  << differing << " of " << reference.size() << " values differ, worst " << worst
+                  << " uint8 steps\n";
         // A lossy source is decoded differently: FFmpeg upsamples 4:2:0 chroma by nearest neighbour
-        // where Pillow's libjpeg interpolates, and their IDCTs differ, so a JPEG is reported, not judged.
-        // Lossless sources must agree within the BF16 rounding of the mapped value (under one step).
+        // where Pillow's libjpeg interpolates, and their IDCTs differ, so a JPEG is reported, not
+        // judged. Lossless sources must agree within the BF16 rounding of the mapped value (under
+        // one step).
         const bool lossy = source.ends_with(".jpg") || source.ends_with(".jpeg");
         if (lossy) {
             std::cout << "image" << index << ": lossy source, decoder difference reported only\n";

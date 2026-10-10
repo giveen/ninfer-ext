@@ -1,17 +1,18 @@
 // An image prompt end to end: the frontend renders a user turn holding images and a question,
 // preprocesses the images and expands their blocks; the Program encodes them, runs the prompt with
-// each image attending bidirectionally within itself, and generates greedily. The prompt ids and every
-// step's logits are written for tools/verify/gemma4_image_prompt_reference.py, which runs transformers'
-// Gemma4ForConditionalGeneration on the same images and question and compares.
+// each image attending bidirectionally within itself, and generates greedily. The prompt ids and
+// every step's logits are written for tools/verify/gemma4_image_prompt_reference.py, which runs
+// transformers' Gemma4ForConditionalGeneration on the same images and question and compares.
 //
-// Those outputs barely depend on whether an image attends bidirectionally, so the test also runs the
-// prompt up to the end of its first image through the layers directly, once with the image's block
-// bound and once causal, and writes the head's logits at a sample of the image's own positions, where
-// the mask decides what each token sees (image_columns.i32, image_logits_{bidirectional,causal}.bf16).
+// Those outputs barely depend on whether an image attends bidirectionally, so the test also runs
+// the prompt up to the end of its first image through the layers directly, once with the image's
+// block bound and once causal, and writes the head's logits at a sample of the image's own
+// positions, where the mask decides what each token sees (image_columns.i32,
+// image_logits_{bidirectional,causal}.bf16).
 //
 // NINFER_GEMMA_ARTIFACT      an artifact converted with --components text,vision
-// NINFER_GEMMA_IMAGES        image paths separated by ':' (lossless, so both sides decode the same pixels)
-// NINFER_GEMMA_IMAGE_DUMP    the directory to write: ids.i32, steps.i32, logits.bf16
+// NINFER_GEMMA_IMAGES        image paths separated by ':' (lossless, so both sides decode the same
+// pixels) NINFER_GEMMA_IMAGE_DUMP    the directory to write: ids.i32, steps.i32, logits.bf16
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -42,7 +43,7 @@ namespace {
 using namespace ninfer;
 namespace gemma = ninfer::models::gemma4;
 
-constexpr std::int32_t kSteps = 24;
+constexpr std::int32_t kSteps   = 24;
 constexpr const char* kQuestion = "Describe each image in one sentence.";
 
 float decode_bf16(std::uint16_t value) {
@@ -57,7 +58,8 @@ std::vector<std::uint8_t> read_bytes(const std::string& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-template <class T> void write(const std::filesystem::path& path, const std::vector<T>& values) {
+template <class T>
+void write(const std::filesystem::path& path, const std::vector<T>& values) {
     std::ofstream(path, std::ios::binary)
         .write(reinterpret_cast<const char*>(values.data()),
                static_cast<std::streamsize>(values.size() * sizeof(T)));
@@ -149,17 +151,17 @@ int main() {
         std::ofstream(out / "question.txt") << kQuestion;
 
         // The first image's own positions, with and without the block bound.
-        const auto& config  = model->config();
-        const auto& first   = prompt_images.front();
+        const auto& config        = model->config();
+        const auto& first         = prompt_images.front();
         const std::int32_t h      = static_cast<std::int32_t>(config.hidden_size);
         const std::int32_t prefix = first.begin + first.tokens();
         std::vector<std::int32_t> columns;
         for (std::int32_t c = first.begin; c < prefix; c += 8) columns.push_back(c);
         if (columns.back() != prefix - 1) columns.push_back(prefix - 1);
         write(out / "image_columns.i32", columns);
-        DeviceArena arena(std::max(gemma::layer_workspace_bytes(config, prefix),
-                                   gemma::vision_workspace_bytes(*model->vision_config(),
-                                                                 first.patches.patches())));
+        DeviceArena arena(std::max(
+            gemma::layer_workspace_bytes(config, prefix),
+            gemma::vision_workspace_bytes(*model->vision_config(), first.patches.patches())));
         const auto bf16 = [](std::int32_t rows, std::int32_t count) {
             void* pointer = nullptr;
             CUDA_CHECK(cudaMalloc(&pointer, static_cast<std::size_t>(rows) * count * 2));
@@ -178,7 +180,8 @@ int main() {
             high[static_cast<std::size_t>(t)] = t >= first.begin ? prefix - 1 : t;
         }
         CUDA_CHECK(cudaMemcpy(high_buffer, high.data(), high.size() * 4, cudaMemcpyHostToDevice));
-        const Weight table = native_weight(model->weight(model->weights().text.token_embedding).view);
+        const Weight table =
+            native_weight(model->weight(model->weights().text.token_embedding).view);
         for (const bool bidirectional : {true, false}) {
             gemma::KvCache cache;
             cache.configure(config, prefix + 8);
@@ -190,7 +193,8 @@ int main() {
                                 static_cast<std::size_t>(first.begin) * h * 2,
                             DType::BF16, {h, first.tokens()});
             gemma::encode_image(*model, first.patches, arena, features, execution);
-            const Tensor bound = bidirectional ? Tensor(high_buffer, DType::I32, {prefix, 1}) : Tensor{};
+            const Tensor bound =
+                bidirectional ? Tensor(high_buffer, DType::I32, {prefix, 1}) : Tensor{};
             int in = 0;
             for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
                 Tensor hidden_in(state[in].data, DType::BF16, {h, prefix});
@@ -214,7 +218,8 @@ int main() {
                                        : "image_logits_causal.bf16"),
                   column_logits);
         }
-        for (Tensor* tensor : {&state[0], &state[1], &head_logits}) CUDA_CHECK(cudaFree(tensor->data));
+        for (Tensor* tensor : {&state[0], &state[1], &head_logits})
+            CUDA_CHECK(cudaFree(tensor->data));
         CUDA_CHECK(cudaFree(id_buffer));
         CUDA_CHECK(cudaFree(high_buffer));
         std::cout << length << " prompt tokens, " << prompt.images.size() << " images, " << kSteps

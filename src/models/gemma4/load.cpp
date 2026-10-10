@@ -156,13 +156,13 @@ VisionWeights bind_vision(Bindings& bindings, const VisionConfig& vision) {
     const std::uint64_t intermediate = vision.intermediate_size;
     const std::uint64_t patch        = 3ULL * vision.patch_size * vision.patch_size;
     VisionWeights out;
-    out.patch_embedding = bindings.parameter("vision/patch_embedding", {hidden, patch});
+    out.patch_embedding    = bindings.parameter("vision/patch_embedding", {hidden, patch});
     out.position_embedding = bindings.parameter(
         "vision/position_embedding", {2ULL * vision.position_embedding_size, hidden}, QType::BF16);
     out.std_bias  = bindings.parameter("vision/std_bias", {hidden}, kScalarFormat);
     out.std_scale = bindings.parameter("vision/std_scale", {hidden}, kScalarFormat);
-    out.embedding_projection = bindings.parameter("vision/embedding_projection",
-                                                  {vision.output_hidden_size, hidden});
+    out.embedding_projection =
+        bindings.parameter("vision/embedding_projection", {vision.output_hidden_size, hidden});
     for (std::size_t layer = 0; layer < vision.num_hidden_layers; ++layer) {
         const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
         VisionLayerWeights weights;
@@ -282,7 +282,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             throw artifact::ArtifactError(
                 "image input needs the vision tower: convert with --components text,vision");
         }
-        out->vision = parse_vision_config(reader.directory().component("vision").config, out->config);
+        out->vision =
+            parse_vision_config(reader.directory().component("vision").config, out->config);
         out->weights.vision = bind_vision(bindings, *out->vision);
     }
     out->references.reserve(bindings.weights().size());
@@ -298,8 +299,7 @@ Model::Model(TextConfig config, std::optional<DraftConfig> draft,
              std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
              artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), draft_(std::move(draft)),
-      vision_(std::move(vision)),
-      weights_(std::move(weights)), bound_(std::move(bound)),
+      vision_(std::move(vision)), weights_(std::move(weights)), bound_(std::move(bound)),
       layer_scalars_(std::move(layer_scalars)) {}
 
 Model::~Model() = default;
@@ -348,9 +348,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     if (data->weights.draft) {
         for (const auto& layer : data->weights.draft->layers) read_scalar(layer.layer_scalar);
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->draft),
-                                            std::move(data->vision), std::move(data->weights), std::move(bound),
-                                            std::move(layer_scalars), std::move(backing)));
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), std::move(data->draft), std::move(data->vision),
+        std::move(data->weights), std::move(bound), std::move(layer_scalars), std::move(backing)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -88,9 +88,10 @@ struct DraftConfig {
     std::uint32_t target_global_layer  = 0;
 };
 
-// The image encoder (the artifact's `vision` component): a ViT over 16-pixel patches whose soft tokens,
-// 3x3-pooled and standardized, are projected into the text width. The converter stores every head's
-// query and key rows with the middle two 18-dim blocks swapped, so the 2-D RoPE Op's layout applies.
+// The image encoder (the artifact's `vision` component): a ViT over 16-pixel patches whose soft
+// tokens, 3x3-pooled and standardized, are projected into the text width. The converter stores
+// every head's query and key rows with the middle two 18-dim blocks swapped, so the 2-D RoPE Op's
+// layout applies.
 struct VisionConfig {
     std::uint32_t hidden_size             = 0;
     std::uint32_t intermediate_size       = 0;

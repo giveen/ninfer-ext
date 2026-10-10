@@ -221,7 +221,7 @@ identified; the bytes are the instruction-tuned model's.
 |---|---|---|---:|
 | `out/gemma4_31b_base_nvfp4.ninfer` | `gemma4_31b_base` | plan L1: MLP NVFP4 (converter-encoded, weight-only), attention and embedding FP8 rows, head BF16, norms BF16, `layer_scalar` FP32 | 22.8 GiB |
 | `out/gemma4_31b_g0.ninfer` | `gemma4_31b_g0` | gewell's G0 mask: embedding and head BF16, attention FP8, MLP FP8 in layers 0–5 and every global layer with its predecessor, NVFP4 elsewhere | 27.3 GiB |
-| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1`, `--components text,vision,mtp --source mtp=/mnt/storage/models/gemma/assistant-31b` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory; the assistant drafter BF16 (`mtp/`, 0.94 GB, bound only with `--spec mtp`); the vision tower Q8 g32 with BF16 patch and output projections (`vision/`, 0.6 GiB, bound only with `--vision`) | 25.1 GiB file; 20.9 GiB on the device, 21.8 with the drafter, 22.4 with the drafter and the tower |
+| `out/gemma4_31b_it_m1.ninfer` | `gemma4_31b_m1`, `--components text,vision,mtp --source mtp=/mnt/storage/models/gemma/assistant-31b` | measured layout `tools/convert/layouts/gemma4_31b_m1.json`: attention and head Q6 g64, each MLP group Q6 or Q5 g64 by measured sensitivity (173 Q6, 68 Q5 of 240 plus the head), embedding BF16 in pinned host memory; the assistant drafter Q6 g64 (`mtp/`, about 0.4 GB, bound only with `--spec mtp`); the vision tower Q6 g64 with BF16 patch and output projections (`vision/`, about 0.45 GiB, bound only with `--vision`) | 24.4 GiB file; 20.9 GiB on the device, 21.7 with the drafter and the tower |
 
 M1 is the serving artifact. The layout came from `tools/verify/gemma4_sensitivity.py` (per-tensor KLD
 against the BF16 checkpoint streamed from host memory, FP32 activations; BF16 activations put a 0.15
@@ -312,9 +312,9 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Drafter | `ninfer_gemma4_draft_test` dumps, `tools/verify/gemma4_draft_reference.py` runs transformers' `Gemma4AssistantForCausalLM` in FP32 on the same inputs (position 1,501, rings wrapped) | four steps: logits cosine ≥ 0.99996, argmax and top-5 identical, projected-state cosine ≥ 0.99997 |
 | MTP rounds | `ninfer_gemma4_mtp_test`: 384 greedy tokens after a 1,100-token prompt at seven drafts | every ring slot and global row holds its committed position (without the slack the same run leaves 50 wrong); against one fresh scoring pass the output disagrees 1-4 times, the same as plain decode (4) |
 | Image preprocessing | `ninfer_gemma4_image_processor_test` on `tools/verify/gemma4_vision_reference.py prepare` (transformers' `Gemma4ImageProcessorPil`) | the resize rule identical over 22 sizes (edge branches, both orientations, up- and downscaling); lossless images' patches within one BF16 rounding (worst 0.004 uint8 steps); a JPEG differs, see 12b |
-| Image encoder | `ninfer_gemma4_vision_test`, `gemma4_vision_reference.py compare` (HF's tower in FP32 on HF's patches) | mean token cosine 0.991 / 0.985 / 0.984 on a photo and two synthetic images, against HF's own BF16 tower at 0.989 / 0.985 / 0.980 |
-| Image prompt | `ninfer_gemma4_image_prompt_test`, `tools/verify/gemma4_image_prompt_reference.py` (HF `Gemma4ForConditionalGeneration` BF16 on CPU), two images and a question, 540 tokens, the second image across a pass boundary | prompt ids identical; 24 greedy steps: top-1 23/24, mean KLD 0.026 |
-| Image mask | the same, at 34 of the first image's own positions, NInfer with and without the block bound against HF with and without `mm_token_type_ids` | NInfer bidirectional: mean KLD 1.35 from HF bidirectional, 3.69 from HF causal; NInfer causal: 0.92 from HF causal (HF's two runs differ by 2.35) |
+| Image encoder | `ninfer_gemma4_vision_test`, `gemma4_vision_reference.py compare` (HF's tower in FP32 on HF's patches) | Q6: mean token cosine 0.987 / 0.978 / 0.979 on a photo and two synthetic images (Q8 gave 0.991 / 0.985 / 0.984), against HF's own BF16 tower at 0.989 / 0.985 / 0.980 |
+| Image prompt | `ninfer_gemma4_image_prompt_test`, `tools/verify/gemma4_image_prompt_reference.py` (HF `Gemma4ForConditionalGeneration` BF16 on CPU), two images and a question, 540 tokens, the second image across a pass boundary | prompt ids identical; 24 greedy steps: top-1 22/24, mean KLD 0.025 (Q8 tower: 23/24, 0.026) |
+| Image mask | the same, at 34 of the first image's own positions, NInfer with and without the block bound against HF with and without `mm_token_type_ids` | Q8 tower: NInfer bidirectional at mean KLD 1.35 from HF bidirectional, 3.69 from HF causal; NInfer causal 0.92 from HF causal (HF's two runs differ by 2.35). Q6 tower: 1.83 and 2.75; causal 0.86 |
 | Serving with images | `tools/smoke/serve_contract.py --tools` (image request included) with `--vision --spec mtp`; captions by hand | passes; a photo, a synthetic gradient (its rectangle placed correctly) and a two-image comparison described correctly |
 
 **Per-position divergence from HF is large even where the averages agree.** On the 1,501-token text
@@ -401,8 +401,13 @@ explanation (5.3% under K=7), and it beats every fixed length on the sampled sto
 target pass costs 17.7 ms at one token and about 20 ms from two to eight. Before the 2-8 token Q5
 route moved to one 8-token block, five to eight tokens cost 27.7-30.6 ms, K=3 was the best fixed
 length and adaptive lost 3-7% on prose; that state is not what ships. From the startup rung times,
-a drafter step costs 0.7-1.1 ms; its 0.94 GB of weights are about half head, and it has not been
-profiled further. Greedy MTP output can differ from plain greedy output after a
+a drafter step costs 0.7-1.1 ms; its 0.94 GB of BF16 weights are about half head, and it has not
+been profiled further. The artifact stores the drafter in Q6 (about 0.4 GB): the target verifies
+every draft, so the format moves only acceptance and step cost. Against BF16, two alternating rounds
+of adaptive MTP over the five prompts, greedy and sampled, ran 4.3% faster on average with Q6 (best
++8.5%, worst -1.9% on sampled code) and 3.9% with Q8 (worst -2.2% on sampled story); acceptance fell
+on prose (greedy story 33-34% to 28-31%) and held elsewhere. The table above was measured with the
+BF16 drafter. Greedy MTP output can differ from plain greedy output after a
 few hundred tokens because verify passes and single-token passes round differently; the check above
 compares each against one fresh pass instead.
 
@@ -429,10 +434,12 @@ and v are three 1152-row linears because each is normed per head before RoPE. Th
 `softmax_attention` (D72/H16) at scale 1, a second registered profile; the pooling is
 `vision_pool_standardize`. One image is encoded per call with exactly its own patches: no padding.
 
-**Formats.** Patch and output projections BF16, every layer's linears Q8 g32. The tower amplifies
+**Formats.** Patch and output projections BF16, every layer's linears Q6 g64. The tower amplifies
 weight error: simulated with the converter's encoders, against the FP32 tower on a photo the mean token
 cosine is 0.956 for Q4/Q5 (the Qwen tower's formats), 0.970 Q5, 0.989 Q6 (HF's own BF16 tower) and
-0.999 Q8, and nothing downstream checks image features. Q8 costs 0.6 GiB, Q4/Q5 would cost 0.36.
+0.999 Q8, and nothing downstream checks image features. Q6 costs about 0.45 GiB (Q8 0.6, Q4/Q5
+0.36). Executed, Q6 lands slightly under HF's BF16 tower on the synthetic images (11): its answers
+match HF as closely as Q8's did, while the logits at the image's own positions moved further.
 
 **Preprocessing** (`src/models/gemma4/image_processor.{h,cpp}`, transformers' `Gemma4ImageProcessor`):
 the largest aspect-preserving size whose sides are multiples of 48 within 280 soft tokens (2,520
@@ -453,7 +460,8 @@ upper bound (section 4); a pass never ends inside an image, and the Engine's pre
 same way, so an image's keys are always in the pass that attends them. Scoring refuses images: its
 128-token passes are narrower than an image block.
 
-**Cost.** Encoding takes 26-28 ms per image of about 2,300 patches on the RTX 5090. A one-image prompt
+**Cost.** Encoding takes 27-33 ms per image of about 2,300 patches on the RTX 5090 (Q8: 26-28; the Q6
+routes borrow Gemma's text list, untuned for these shapes). A one-image prompt
 of 280 tokens served with `--vision --spec mtp` has a TTFT of 192 ms; a 19 MP JPEG adds about 200 ms of
 single-threaded decode and resize on the request thread (13).
 

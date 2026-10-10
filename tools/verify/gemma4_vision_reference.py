@@ -39,7 +39,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
 from tools.artifact.formats import get_format
 from tools.convert.quantization import groupwise
 
-# Candidate vision formats; the artifact's (tools/convert/official_recipes.py) is Q8 throughout.
+# Candidate vision formats; the artifact's (tools/convert/official_recipes.py) is Q6 throughout.
 FORMATS = {"q4": "q4_g64_fp16", "q5": "q5_g64_fp16", "q6": "q6_g64_fp16", "q8": "q8_g32_fp16"}
 GATE_UP = ("mlp.gate_proj", "mlp.up_proj")
 REST = ("mlp.down_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
@@ -177,9 +177,9 @@ def main() -> None:
     c = sub.add_parser("compare")
     c.add_argument("--model", type=Path, required=True)
     c.add_argument("--dump", type=Path, required=True)
-    c.add_argument("--gate-up", choices=sorted(FORMATS), default="q8",
+    c.add_argument("--gate-up", choices=sorted(FORMATS), default="q6",
                    help="the simulated format of the MLP's gate and up projections")
-    c.add_argument("--rest", choices=sorted(FORMATS), default="q8",
+    c.add_argument("--rest", choices=sorted(FORMATS), default="q6",
                    help="the simulated format of q/k/v, the attention output and the MLP's down")
     args = parser.parse_args()
     prepare(args) if args.mode == "prepare" else compare(args)

@@ -2,9 +2,9 @@
 
 // Implements: include/ninfer/ops/vision_pool.h
 //
-// One block per pooled cell; threads stride over the features, each summing its k x k patches in FP32.
-// A cell is at most a few hundred patches' worth of one feature, so the reads are short and coalesced
-// across the threads of a patch column.
+// One block per pooled cell; threads stride over the features, each summing its k x k patches in
+// FP32. A cell is at most a few hundred patches' worth of one feature, so the reads are short and
+// coalesced across the threads of a patch column.
 
 #include <cuda_bf16.h>
 

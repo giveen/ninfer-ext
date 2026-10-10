@@ -164,12 +164,25 @@ VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& 
         throw artifact::ArtifactError("Gemma 4 vision config: " + message);
     };
     if (!value.is_object()) vision_fail("config must be an object");
-    static constexpr const char* kMembers[] = {
-        "architectures", "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
-        "num_attention_heads", "num_key_value_heads", "head_dim", "patch_size",
-        "pooling_kernel_size", "position_embedding_size", "rms_norm_eps", "rope_theta",
-        "hidden_act", "soft_tokens_per_image", "output_hidden_size", "image_token_id",
-        "boi_token_id", "eoi_token_id"};
+    static constexpr const char* kMembers[] = {"architectures",
+                                               "model_type",
+                                               "hidden_size",
+                                               "intermediate_size",
+                                               "num_hidden_layers",
+                                               "num_attention_heads",
+                                               "num_key_value_heads",
+                                               "head_dim",
+                                               "patch_size",
+                                               "pooling_kernel_size",
+                                               "position_embedding_size",
+                                               "rms_norm_eps",
+                                               "rope_theta",
+                                               "hidden_act",
+                                               "soft_tokens_per_image",
+                                               "output_hidden_size",
+                                               "image_token_id",
+                                               "boi_token_id",
+                                               "eoi_token_id"};
     for (const auto& member : value.items()) {
         bool known = false;
         for (const char* allowed : kMembers) { known = known || member.key() == allowed; }
@@ -196,7 +209,8 @@ VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& 
     out.image_token_id          = static_cast<std::int32_t>(positive(value, "image_token_id"));
     out.boi_token_id            = static_cast<std::int32_t>(positive(value, "boi_token_id"));
     out.eoi_token_id            = static_cast<std::int32_t>(positive(value, "eoi_token_id"));
-    if (value.at("hidden_act") != "gelu_pytorch_tanh") vision_fail("hidden_act must be gelu_pytorch_tanh");
+    if (value.at("hidden_act") != "gelu_pytorch_tanh")
+        vision_fail("hidden_act must be gelu_pytorch_tanh");
     // The executed geometry: the dense D72/H16 attention and its 2-D RoPE, 3x3 pooling of 16-pixel
     // patches, and one image block per 512-token prefill pass.
     if (out.hidden_size != 1152 || out.num_attention_heads != 16 || out.head_dim != 72 ||

@@ -33,7 +33,8 @@ int run_case(std::int32_t width, std::int32_t height, std::uint32_t seed) {
     round_to_bf16(x);
     // A ramp along each axis, so cells differ in a way a wrong cell order cannot reproduce.
     for (std::int32_t p = 0; p < patches; ++p) {
-        const float ramp = 0.25f * static_cast<float>(p % width) - 0.5f * static_cast<float>(p / width);
+        const float ramp =
+            0.25f * static_cast<float>(p % width) - 0.5f * static_cast<float>(p / width);
         for (std::int32_t d = 0; d < 8; ++d) {
             x[static_cast<std::size_t>(p) * kFeatures + d] = bf16_to_f32(f32_to_bf16(ramp));
         }
@@ -58,8 +59,8 @@ int run_case(std::int32_t width, std::int32_t height, std::uint32_t seed) {
 
     std::vector<std::uint16_t> x_bits(x.size());
     for (std::size_t i = 0; i < x.size(); ++i) x_bits[i] = f32_to_bf16(x[i]);
-    DeviceBuffer device_x    = to_device(x_bits);
-    DeviceBuffer device_bias = to_device(bias);
+    DeviceBuffer device_x     = to_device(x_bits);
+    DeviceBuffer device_bias  = to_device(bias);
     DeviceBuffer device_scale = to_device(scale);
     GuardedDeviceBuffer device_out(static_cast<std::size_t>(kFeatures) * cells * 2);
     device_out.fill(0x7f);
@@ -73,9 +74,9 @@ int run_case(std::int32_t width, std::int32_t height, std::uint32_t seed) {
 
     const std::string label =
         "vision_pool_standardize " + std::to_string(width) + "x" + std::to_string(height);
-    int failures = verify_pointwise(label.c_str(),
-                                    from_device_bf16(device_out.data(), expected.size()), expected,
-                                    kVisionPoolCriterion);
+    int failures =
+        verify_pointwise(label.c_str(), from_device_bf16(device_out.data(), expected.size()),
+                         expected, kVisionPoolCriterion);
     failures += device_out.verify_guards(label.c_str());
     failures += verify_exact((label + " x unchanged").c_str(),
                              from_device<std::uint16_t>(device_x, x_bits.size()), x_bits);

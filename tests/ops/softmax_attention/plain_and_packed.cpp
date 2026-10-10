@@ -213,10 +213,10 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     const std::string label = "packed_softmax_attention T=" + std::to_string(tokens) +
                               " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
                               storage_name(storage_profile) + " " + entry_name(entry);
-    const std::string qualified_label =
-        input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation"
-        : unit_scale                                    ? label + " scale-1"
-                                                        : label;
+    const std::string qualified_label = input_profile == InputProfile::SegmentIsolation
+                                            ? label + " segment-isolation"
+                                        : unit_scale ? label + " scale-1"
+                                                     : label;
     int failures =
         verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
                          reference, kPackedAttentionBf16Criterion);

@@ -240,8 +240,9 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         // An image's later keys are part of this pass, in the ring (written first) or in the pass's
         // own key set, so its tokens' upper bound always finds them.
         ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_high,
-                                      position_ring, k_pass, v_pass, position_extra, geometry, config.sliding_window,
-                                      config.attention_scale, attended_batch, workspace, stream);
+                                      position_ring, k_pass, v_pass, position_extra, geometry,
+                                      config.sliding_window, config.attention_scale, attended_batch,
+                                      workspace, stream);
     }
     if (!write_first) write_kept();
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);

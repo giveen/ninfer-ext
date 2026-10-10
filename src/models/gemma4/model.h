@@ -70,8 +70,7 @@ private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(TextConfig config, std::optional<DraftConfig> draft, std::optional<VisionConfig> vision,
-          ModelWeights weights,
-          std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
+          ModelWeights weights, std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
           artifact::MaterializedArtifact backing);
 
     // Destroyed last: every BoundWeight view borrows these bytes.

@@ -31,20 +31,20 @@ ImageSize gemma_image_size(int height, int width) {
     const double total_px  = static_cast<double>(height) * width;
     const double target_px = static_cast<double>(kMaxPatches) * kPatch * kPatch;
     const double factor    = std::sqrt(target_px / total_px);
-    int target_height = static_cast<int>(std::floor(factor * height / kSide)) * kSide;
-    int target_width  = static_cast<int>(std::floor(factor * width / kSide)) * kSide;
+    int target_height      = static_cast<int>(std::floor(factor * height / kSide)) * kSide;
+    int target_width       = static_cast<int>(std::floor(factor * width / kSide)) * kSide;
     if (target_height == 0 && target_width == 0) {
         throw std::invalid_argument("image is too small to resize to a 48-pixel multiple");
     }
     const int max_side = (kMaxPatches / (kPool * kPool)) * kSide;
     if (target_height == 0) {
         target_height = kSide;
-        target_width  = std::min(static_cast<int>(std::floor(static_cast<double>(width) / height)) * kSide,
-                                 max_side);
+        target_width  = std::min(
+            static_cast<int>(std::floor(static_cast<double>(width) / height)) * kSide, max_side);
     } else if (target_width == 0) {
         target_width  = kSide;
-        target_height = std::min(static_cast<int>(std::floor(static_cast<double>(height) / width)) * kSide,
-                                 max_side);
+        target_height = std::min(
+            static_cast<int>(std::floor(static_cast<double>(height) / width)) * kSide, max_side);
     }
     if (static_cast<double>(target_height) * target_width > target_px) {
         throw std::invalid_argument("image resize exceeds the patch budget");

@@ -40,6 +40,18 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 2560, select_q6_qwen4_exp},
     ShapeEntry{2560, 4608, select_q6_qwen4_exp},
     ShapeEntry{96, 2560, select_q6_qwen4_exp_small},
+    // Gemma 4 vision: q/k/v and output, and the MLP at its stored width (4304 padded to 4352).
+    ShapeEntry{1152, 1152, select_q6_gemma4},
+    ShapeEntry{4352, 1152, select_q6_gemma4},
+    ShapeEntry{1152, 4352, select_q6_gemma4},
+    // The Gemma 4 assistant drafter: input and output projections, attention, MLP and head.
+    ShapeEntry{1024, 10752, select_q6_gemma4},
+    ShapeEntry{8192, 1024, select_q6_gemma4},
+    ShapeEntry{16384, 1024, select_q6_gemma4},
+    ShapeEntry{1024, 8192, select_q6_gemma4},
+    ShapeEntry{1024, 16384, select_q6_gemma4},
+    ShapeEntry{262144, 1024, select_q6_gemma4},
+    ShapeEntry{5376, 1024, select_q6_gemma4},
 };
 } // namespace
 

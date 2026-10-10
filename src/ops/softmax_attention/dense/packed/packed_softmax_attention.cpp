@@ -15,8 +15,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim = 72;
 constexpr std::int32_t kHeads   = 16;
-// The two registered scales: 1/sqrt(72) for the Qwen vision tower, and 1.0 for Gemma 4's, whose q and
-// k are RMS-normalized per head before the score.
+// The two registered scales: 1/sqrt(72) for the Qwen vision tower, and 1.0 for Gemma 4's, whose q
+// and k are RMS-normalized per head before the score.
 constexpr float kExpectedScale  = 0.11785113019775792073f;
 constexpr float kUnitScale      = 1.0f;
 

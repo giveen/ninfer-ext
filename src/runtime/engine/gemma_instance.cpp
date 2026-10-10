@@ -391,7 +391,7 @@ ContextTransactionProgress GemmaProgram::progress_context_transaction(Cancellati
     lane.phase      = Phase::Prefill;
     lane.epoch      = next_epoch_++;
     lane.prompt     = std::move(transaction.prompt.ids);
-    lane.images     = std::move(transaction.prompt.images);
+    lane.images      = std::move(transaction.prompt.images);
     lane.cursor     = 0;
     lane.next_input = -1;
     lane.pending    = false;
@@ -427,8 +427,8 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
     const std::uint32_t width     = pace == PrefillPace::BesideDecode ? prefill_chunk_ : idle_chunk_;
     std::uint32_t step            = std::min(width, total - lane->cursor);
     const std::int32_t lane_index = static_cast<std::int32_t>(sequence.lane_);
-    // An image is attended as one block, so a chunk that would end inside one ends before it, or, when
-    // the image starts the chunk, takes the whole image.
+    // An image is attended as one block, so a chunk that would end inside one ends before it, or,
+    // when the image starts the chunk, takes the whole image.
     std::vector<models::gemma4::PromptImage> images;
     for (const auto& image : lane->images) {
         const std::uint32_t begin = image.begin;
@@ -444,9 +444,8 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
                                       .grid_height = image.image.grid_height,
                                       .pixels      = *image.image.pixels}});
     }
-    program_.prefill(lane_index,
-                     std::span<const TokenId>(lane->prompt.data() + lane->cursor, step), execution_,
-                     images);
+    program_.prefill(lane_index, std::span<const TokenId>(lane->prompt.data() + lane->cursor, step),
+                     execution_, images);
     // The encoder's device time; the events completed with the prefill, which this call waits for.
     if (!images.empty()) lane->timings.vision_seconds += program_.take_vision_seconds();
     lane->cursor += step;
@@ -728,10 +727,9 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
     const std::int32_t draft_tokens =
         mtp ? static_cast<std::int32_t>(options.speculative.draft_tokens) : 0;
-    const std::size_t needed =
-        models::gemma4::Program::device_bytes(
-            model->config(), static_cast<std::int32_t>(capacity), lanes, draft_tokens,
-            model->vision_config() ? &*model->vision_config() : nullptr);
+    const std::size_t needed = models::gemma4::Program::device_bytes(
+        model->config(), static_cast<std::int32_t>(capacity), lanes, draft_tokens,
+        model->vision_config() ? &*model->vision_config() : nullptr);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));

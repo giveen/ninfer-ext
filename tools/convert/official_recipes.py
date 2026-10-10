@@ -604,12 +604,14 @@ def _gemma4_layout(model, recipe, layout_name):
 
     assign("text/token_embedding", layout["embedding"])
     assign("text/output_head", layout["head"])
-    # The assistant drafter, when converted, stays BF16: it is under 1 GB, and its head is what
-    # chooses every draft.
+    # The assistant drafter, when converted, is Q6 throughout, head included. The target verifies every
+    # draft, so the format moves only acceptance and the drafter's step cost: against BF16, adaptive MTP
+    # ran 4.3% faster on average over five prompts greedy and sampled (Q8 3.9%), worst -1.9%, and the
+    # drafter shrinks from 0.94 to about 0.4 GB.
     for name, parameter in model.parameters.items():
         if name.startswith("mtp/") and parameter.projection:
-            recipe.assign(name, format="bf16", method=cast_direct)
-    # The vision tower, when converted: Q8 for every layer's linears, and BF16 for the patch and output
+            _assign(recipe, name, Q6)
+    # The vision tower, when converted: Q6 for every layer's linears, and BF16 for the patch and output
     # projections. The tower amplifies weight error: against its FP32 output, Q4/Q5 (the Qwen tower's
     # formats) leave a 0.956 mean token cosine on a photo, Q6 0.989 (the BF16 tower's own level) and Q8
     # 0.999 (tools/verify/gemma4_vision_reference.py), and nothing downstream checks image features.
@@ -619,7 +621,7 @@ def _gemma4_layout(model, recipe, layout_name):
         if name in ("vision/patch_embedding", "vision/embedding_projection"):
             recipe.assign(name, format="bf16", method=cast_direct)
         else:
-            _assign(recipe, name, Q8)
+            _assign(recipe, name, Q6)
     for layer, groups in layout["layers"].items():
         for group, short in groups.items():
             for role in _GEMMA4_GROUPS[group]:

@@ -392,8 +392,9 @@ struct Frontend::Impl {
         std::vector<const OwnedMedia*> images;
         for (const ChatMessage& message : input.messages) {
             Json value{{"role", role_name(message.role)}};
-            const bool has_media = std::ranges::any_of(
-                message.parts, [](const MessagePart& part) { return part.kind != MessagePartKind::Text; });
+            const bool has_media = std::ranges::any_of(message.parts, [](const MessagePart& part) {
+                return part.kind != MessagePartKind::Text;
+            });
             if (!has_media) {
                 std::string content;
                 for (const MessagePart& part : message.parts) content += part.text;
@@ -470,8 +471,10 @@ struct Frontend::Impl {
             // turn without opening the next one; the model needs its own turn to answer in.
             text += kModelTurn;
         }
-        return Rendered{.text = std::move(text), .thinking = thinking && !continuation,
-                        .tool_names = std::move(names), .images = std::move(images)};
+        return Rendered{.text       = std::move(text),
+                        .thinking   = thinking && !continuation,
+                        .tool_names = std::move(names),
+                        .images     = std::move(images)};
     }
 };
 
@@ -496,14 +499,17 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const auto media_started = Clock::now();
     for (const OwnedMedia* media : rendered.images) {
         try {
-            // A client that asked for an error instead of a downscale is answered before the decode.
+            // A client that asked for an error instead of a downscale is answered before the
+            // decode.
             if (media->image_resize_policy == ImageResizePolicy::RejectOversized) {
                 const media::decode::ImageInfo info =
                     media::decode::inspect_image(media->bytes, media::decode::Policy{});
-                if (static_cast<std::uint64_t>(info.width) * static_cast<std::uint64_t>(info.height) >
+                if (static_cast<std::uint64_t>(info.width) *
+                        static_cast<std::uint64_t>(info.height) >
                     kGemmaImageBudgetPixels) {
-                    throw RequestError(RequestErrorKind::InvalidMedia,
-                                       "image exceeds the Vision budget and oversized_image is 'error'");
+                    throw RequestError(
+                        RequestErrorKind::InvalidMedia,
+                        "image exceeds the Vision budget and oversized_image is 'error'");
                 }
             }
             images.push_back(prepare_gemma_image(media->bytes, media::decode::Policy{},
@@ -514,7 +520,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                    : RequestErrorKind::InvalidMedia,
                                std::string("image: ") + error.what());
         } catch (const std::invalid_argument& error) {
-            throw RequestError(RequestErrorKind::InvalidMedia, std::string("image: ") + error.what());
+            throw RequestError(RequestErrorKind::InvalidMedia,
+                               std::string("image: ") + error.what());
         }
         prompt.preparation.media_bytes += media->bytes.size();
         prompt.preparation.raw_patches +=
@@ -558,7 +565,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                " tokens, exceeding Engine max_context " +
                                std::to_string(impl_->max_context));
     }
-    prompt.descriptor.has_media = !prompt.images.empty();
+    prompt.descriptor.has_media           = !prompt.images.empty();
     prompt.descriptor.prompt_tokens       = static_cast<std::uint32_t>(prompt.ids.size());
     prompt.descriptor.starts_in_reasoning = rendered.thinking;
     prompt.tool_names                     = std::move(rendered.tool_names);

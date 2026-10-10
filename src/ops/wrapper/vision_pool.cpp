@@ -23,8 +23,9 @@ void vision_pool_standardize(const Tensor& x, int grid_width, int grid_height, i
     if (!std::isfinite(multiplier)) {
         throw std::invalid_argument("vision_pool_standardize: multiplier must be finite");
     }
-    const std::int64_t d     = x.ne[0];
-    const std::int64_t cells = static_cast<std::int64_t>(grid_width / kernel) * (grid_height / kernel);
+    const std::int64_t d = x.ne[0];
+    const std::int64_t cells =
+        static_cast<std::int64_t>(grid_width / kernel) * (grid_height / kernel);
     if (d <= 0 || x.ne[1] != static_cast<std::int64_t>(grid_width) * grid_height || x.ne[2] != 1 ||
         x.ne[3] != 1 || out.ne[0] != d || out.ne[1] != cells || out.ne[2] != 1 || out.ne[3] != 1 ||
         bias.numel() != d || scale.numel() != d) {

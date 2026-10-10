@@ -1,10 +1,11 @@
 #include "ops/linear/bf16/bf16_launch.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 
-// The Gemma 4 vision tower's two BF16 projections: the patch embedding (1152 x 768) over every patch of
-// an image (9 to 2520), and the soft-token projection into the text width (5376 x 1152) over its pooled
-// tokens (1 to 280). Images are encoded whole, so the MMA route carries nearly every call; a single
-// soft token or a handful of patches takes the GEMV or SIMT route. Untuned beyond that.
+// The Gemma 4 vision tower's two BF16 projections: the patch embedding (1152 x 768) over every
+// patch of an image (9 to 2520), and the soft-token projection into the text width (5376 x 1152)
+// over its pooled tokens (1 to 280). Images are encoded whole, so the MMA route carries nearly
+// every call; a single soft token or a handful of patches takes the GEMV or SIMT route. Untuned
+// beyond that.
 
 namespace ninfer::ops::detail {
 namespace {
@@ -24,6 +25,7 @@ Bf16Launch select(std::int32_t tokens) {
 } // namespace
 
 Bf16Launch select_bf16_n1152_k768(std::int32_t t) { return select<Bf16Geometry<1152, 768>>(t); }
+
 Bf16Launch select_bf16_n5376_k1152(std::int32_t t) { return select<Bf16Geometry<5376, 1152>>(t); }
 
 } // namespace ninfer::ops::detail
