@@ -705,3 +705,68 @@ weights behave this way — that is a question about the checkpoint, not about t
 One more finding worth recording: HF's tokenizer does not add the beginning-of-sequence token by
 itself, and without it HF's own reference scores the France sentence at NLL 11.99. An implementation
 that adds it is right here, and the engine does.
+
+## 22. The open findings, resolved
+
+### The long-text comparison is measured, not inferred
+
+The HuggingFace oracle was extended past the 43-token runs that made the agreement look provisional, on
+the exact texts the engine had already scored:
+
+| Text | Tokens | HF, official, BF16 CPU | Engine, FP8 and NVFP4 |
+|---|---|---|---|
+| France sentence | 53 | mean NLL **2.6746** | 2.509 |
+| wikitext slice | 335 | mean NLL **9.3332** | 9.0697 |
+| wikitext slice | 1,514 | mean NLL **9.7178** | 9.6205 |
+
+At 335 tokens the gap is 0.26 nats and at 1,514 it is 0.10, so the engine is faithful to the official
+implementation at the lengths the perplexity tool actually runs. The 1,514-token case also matters for
+another reason: it crosses the 1,024-token sliding window, so the ring, the wrap and the windowed
+visibility are now numerically validated against the reference rather than only structurally.
+
+### The reference I wrote is superseded where it mattered
+
+Every end-to-end number in sections 15 to 20 came from a reference of my own, which cannot catch a
+misreading I share with it. Those claims are now covered by HuggingFace's implementation instead, at
+three lengths and on both an easy and a hard text. The hand-written reference still earns its place for
+per-layer diagnosis, where HF's model would have to be instrumented, but it is no longer the evidence
+for anything end to end.
+
+### The real-model guard: 11 of 14
+
+The ctest run reported 7 passed, 1 failed and 6 skipped. Four of those six run once their inputs are
+supplied, and the way to supply them is worth writing down:
+
+| Test | What it needs |
+|---|---|
+| `loading_real` | an explicit `--artifact <path>`, not the environment variable |
+| `prefix_real` | `NINFER_PREFIX_REAL_SCENARIO`; the default `all` is invalid for this artifact and raises "constraints require default EOS, text output, no custom stops, and one output language" — `pressure-resume` works |
+| `tools_real` | `NINFER_TEST_TOOL_REPORT=<path>` |
+| `grammar_real` | `NINFER_TEST_SCHEMA_REPORT=<path>` |
+| `dflash_real`, `dflash2_real`, `dflash_prefill_real` | remain skipped: the artifact does not carry the `dflash` component, and `dflash2` misparses its argument with an uncaught `stoul` |
+
+### Scoring is launch-bound, by arithmetic
+
+The tool reports 9 to 10 tokens per second. The per-token cost is linear in the tool's own numbers —
+2.9 s for 52 tokens against 16.0 s for 334 — which is about 46 ms per token. The arithmetic work per
+token is roughly 6 GFLOP through 60 layers and 600 kernel launches, which at any plausible rate is
+under a millisecond. So the cost is launch and occupancy, not arithmetic: a thousand-fold under the
+hardware's ability. The fix is the one the plan already names — a batched prefill so one pass covers
+many tokens, and CUDA graphs in the Program — not a faster kernel.
+
+### Generation through the Engine is scoped, not done
+
+`Engine::load` refuses `EnginePurpose::Generation` for this model, and that is a deliberate refusal
+rather than an oversight. `EngineCore` requires fourteen methods of a Program — `abort_pending`,
+`advance_prefill`, `append_forced_tokens`, `commit`, `consumes_token_masks`, `decode`,
+`device_kv_lease_settlement_tokens`, `fail_all_cleanup`, `has_context_transaction`, `memory_summary`,
+`plan_request`, `reset_memory_peaks`, `resource_revision`, `skip_capture` — plus a dozen contract types
+for admission, leases, capture and output sessions. Of those, decode, plan and commit are fundamental to
+generation; leases, capture, forced tokens and context transactions are the Qwen MoE machinery this
+model has no counterpart for. The work is to implement the fundamental three and refuse the rest
+loudly, which is the next thing to do rather than something to hide.
+
+### And the rule this round earned
+
+Twice I explained a number before checking it, and both explanations were wrong. The oracle was three
+directories away the whole time. Querying the reference comes before proposing a cause.
