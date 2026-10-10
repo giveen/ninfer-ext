@@ -7,6 +7,7 @@
 //   NINFER_GEMMA_PROMPT    a file of int32 little-endian token ids
 //   NINFER_GEMMA_FIRST_TARGET  first scored position (default 1)
 
+#include "artifact/reader.h"
 #include "core/device.h"
 #include "models/gemma4/load.h"
 #include "models/gemma4/program.h"
@@ -54,6 +55,22 @@ int main() {
     }
 
     try {
+        // The tokenizer travels inside the artifact. A Gemma tokenizer.json is megabytes, so an empty
+        // view would mean the resource binding silently found nothing.
+        {
+            const models::gemma4::LoadPlan plan =
+                models::gemma4::plan_load(artifact::Reader(artifact));
+            const models::gemma4::TextResources& resources = plan.resources();
+            std::cout << "  artifact resources: tokenizer.json " << resources.tokenizer_json.size()
+                      << " bytes, tokenizer_config.json " << resources.tokenizer_config_json.size()
+                      << " bytes\n";
+            if (resources.tokenizer_json.size() < 100000 ||
+                resources.tokenizer_config_json.empty()) {
+                std::cerr << "gemma4 score: the artifact's tokenizer resources are missing\n";
+                return 1;
+            }
+        }
+
         DeviceContext device;
         const std::vector<std::int32_t> ids = read_ids(prompt_path);
 

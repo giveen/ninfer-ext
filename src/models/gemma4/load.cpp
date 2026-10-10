@@ -114,6 +114,7 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
 
 struct LoadPlan::Impl {
     TextConfig config;
+    TextResources resources;
     LoadOptions options;
     ModelWeights weights;
     artifact::Binder binder;
@@ -150,6 +151,8 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 
 const TextConfig& LoadPlan::config() const { return impl_->config; }
 
+const TextResources& LoadPlan::resources() const { return impl_->resources; }
+
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
 const artifact::MaterializationPlan& LoadPlan::materialization() const {
@@ -168,6 +171,15 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     // Both purposes bind the same parameters: the head the scoring route reads is the head generation
     // samples from, and what differs between the two is how a Program is driven, not what is loaded.
     out->config = parse_text_config(reader.directory().component("text").config);
+    // The tokenizer's files are artifact resources rather than weights, and this is where the frontend
+    // will read them. The Binder must still be alive, so this comes before it is finished.
+    const auto resource = [&](std::string_view role) {
+        const auto bytes = out->binder.host_object(out->binder.resource("text", role));
+        return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    out->resources.tokenizer_json         = resource("tokenizer.json");
+    out->resources.tokenizer_config_json  = resource("tokenizer_config.json");
+    out->resources.generation_config_json = resource("generation_config.json");
     Bindings bindings(out->binder);
     out->weights.text = bind_text(bindings, out->config);
     out->references.reserve(bindings.weights().size());
