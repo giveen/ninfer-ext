@@ -182,6 +182,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources.tokenizer_json         = resource("tokenizer.json");
     out->resources.tokenizer_config_json  = resource("tokenizer_config.json");
     out->resources.generation_config_json = resource("generation_config.json");
+    out->resources.chat_template_jinja    = resource("chat_template.jinja");
     Bindings bindings(out->binder);
     out->weights.text = bind_text(bindings, out->config);
     out->references.reserve(bindings.weights().size());

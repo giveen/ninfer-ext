@@ -112,6 +112,12 @@ ninfer_add_test(ninfer_gemma4_tokenizer_test
   LIBRARIES ninfer_model_runtime ninfer_artifact)
 set_tests_properties(ninfer_gemma4_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_gemma4_frontend_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_frontend.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_artifact)
+set_tests_properties(ninfer_gemma4_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_gemma4_load_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_load.cpp"
   LIBRARIES ninfer_model_loading)

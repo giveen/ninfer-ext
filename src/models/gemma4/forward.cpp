@@ -152,19 +152,23 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
               scratch.k_normed, execution);
 
-    // The ring holds the window's worth of rows, so the slot is the position modulo the window and the
-    // query sees exactly the tokens still inside it. A slot no token has written carries an invisible
-    // position, so the whole cache can be handed to the Op without tracking how much is filled.
+    // The ring holds the window plus the largest pass, so the slot is the position modulo the ring and
+    // the Op's own window test decides what a query sees. A slot no token has written carries an
+    // invisible position, so the whole cache can be handed to the Op without tracking how much is
+    // filled.
+    if (tokens > cache.ring_tokens() - static_cast<std::int32_t>(config.sliding_window)) {
+        throw std::invalid_argument("forward_sliding_layer: the pass is larger than the ring slack");
+    }
     Tensor cache_keys   = cache.keys(layer);
     Tensor cache_values = cache.values(layer);
     Tensor cache_pos    = cache.positions(layer);
-    const std::int32_t window       = static_cast<std::int32_t>(config.sliding_window);
+    const std::int32_t ring         = cache.ring_tokens();
     const std::size_t row_bytes =
         static_cast<std::size_t>(d) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
     // The batch's rows are adjacent in the ring unless the run wraps, so the common case is one copy
     // per plane and the wrapped case falls back to a copy per token.
     const std::int32_t first_slot = cache.slot(layer, first_position);
-    if (first_slot + tokens <= window) {
+    if (first_slot + tokens <= ring) {
         CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
                                        static_cast<std::size_t>(first_slot) * row_bytes,
                                    scratch.k_normed.data,
@@ -195,11 +199,15 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     {
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
         Tensor q_batch        = scratch.q_normed.view({d, hq, tokens, 1});
-        Tensor k_batch        = cache_keys.view({d, hkv, window, 1});
-        Tensor v_batch        = cache_values.view({d, hkv, window, 1});
+        // Until the ring first wraps, only its leading slots have been written, and the Op scans every
+        // key it is given.
+        const std::int32_t filled = std::min(ring, first_position + tokens);
+        Tensor k_batch(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16, {d, hkv, filled, 1});
+        Tensor v_batch(static_cast<std::uint8_t*>(cache_values.data), DType::BF16,
+                       {d, hkv, filled, 1});
         Tensor attended_batch = scratch.attended.view({d, hq, tokens, 1});
         Tensor position_q     = scratch.positions.view({tokens, 1});
-        Tensor position_k     = cache_pos.view({window, 1});
+        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
         ops::sliding_causal_attention(q_batch, k_batch, v_batch, position_q, position_k, geometry,
                                       config.sliding_window, config.attention_scale, attended_batch,
                                       stream);
@@ -329,10 +337,14 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     {
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
         Tensor q_batch        = q_normed.view({d, hq, tokens, 1});
-        Tensor kv_batch       = cache_rows.view({width, hkv, capacity, 1});
+        // Rows sit at their own positions, so the written ones are exactly the leading `filled`, and
+        // the Op scans every key it is given.
+        const std::int32_t filled = first_position + tokens;
+        Tensor kv_batch(static_cast<std::uint8_t*>(cache_rows.data), DType::BF16,
+                        {width, hkv, filled, 1});
         Tensor attended_batch = attended.view({d, hq, tokens, 1});
         Tensor position_q     = positions.view({tokens, 1});
-        Tensor position_k     = cache_pos.view({capacity, 1});
+        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
                                       config.attention_scale, attended_batch, stream);
     }

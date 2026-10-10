@@ -71,8 +71,8 @@ int main() {
         }
         const std::int32_t prompt_length = static_cast<std::int32_t>(ids.size());
 
-        gemma::Program program(*model, prompt_length + steps + 8, device);
-        program.prefill(ids, device.execution_view());
+        gemma::Program program(*model, prompt_length + steps + 8, 1, device);
+        program.prefill(0, ids, device.execution_view());
 
         // Greedy: the model produces logits and sampling is the caller's business.
         const auto sample = [&] {
@@ -97,10 +97,10 @@ int main() {
         for (std::int32_t step = 0; step < steps; ++step) {
             const std::int32_t winner = sample();
             ids.push_back(winner);
-            program.decode(winner, device.execution_view());
+            program.decode(0, winner, device.execution_view());
         }
-        if (program.position() != prompt_length + steps) {
-            std::cerr << "gemma4 generate: the Program consumed " << program.position()
+        if (program.position(0) != prompt_length + steps) {
+            std::cerr << "gemma4 generate: the Program consumed " << program.position(0)
                       << " tokens, expected " << prompt_length + steps << '\n';
             return 1;
         }

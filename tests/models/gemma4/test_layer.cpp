@@ -114,7 +114,7 @@ int main() {
         CUDA_CHECK(cudaMalloc(&out, bytes));
 
         gemma::KvCache cache;
-        cache.configure(config, 64);
+        cache.configure(config, 64, 1);
         DeviceArena arena(gemma::layer_workspace_bytes(config, 1));
         for (std::int32_t position = 0; position < tokens; ++position) {
             const std::vector<std::uint16_t> state =

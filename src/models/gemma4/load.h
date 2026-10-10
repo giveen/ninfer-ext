@@ -27,6 +27,7 @@ struct TextResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
     std::string_view generation_config_json;
+    std::string_view chat_template_jinja;
 };
 
 class LoadPlan {

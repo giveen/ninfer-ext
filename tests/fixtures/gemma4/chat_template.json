@@ -1,0 +1,717 @@
+{
+ "source": "/mnt/storage/models/gemma/full-31b/chat_template.jinja",
+ "source_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+ "oracle": "transformers 5.17.0: apply_chat_template(tokenize=False, add_generation_prompt=True), then encode(add_special_tokens=False)",
+ "cases": [
+  {
+   "name": "single_user",
+   "thinking": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "text": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    3689,
+    563,
+    506,
+    5279,
+    529,
+    7001,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_and_history_thinking",
+   "thinking": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "  You are terse.  "
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello."
+    },
+    {
+     "role": "user",
+     "content": "Count to three."
+    }
+   ],
+   "text": "<bos><|turn>system\n<|think|>\nYou are terse.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHello.<turn|>\n<|turn>user\nCount to three.<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    98,
+    107,
+    3048,
+    659,
+    17514,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    9259,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    4377,
+    531,
+    1806,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  },
+  {
+   "name": "unicode_and_whitespace",
+   "thinking": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Ünïcödé — 中文 😀\n\n  indented\tline "
+    }
+   ],
+   "text": "<bos><|turn>user\nÜnïcödé — 中文 😀\n\n  indented\tline<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    238194,
+    236749,
+    238527,
+    236755,
+    55515,
+    236859,
+    2192,
+    17346,
+    237364,
+    163543,
+    108,
+    138,
+    724,
+    16764,
+    255968,
+    1257,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "tool_declaration",
+   "thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris for two days?"
+    }
+   ],
+   "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris for two days?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    46,
+    163688,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    7777,
+    236787,
+    52,
+    8782,
+    7606,
+    573,
+    496,
+    3207,
+    236761,
+    52,
+    236764,
+    19031,
+    29616,
+    15921,
+    29616,
+    13319,
+    29616,
+    7777,
+    236787,
+    52,
+    17698,
+    1463,
+    52,
+    236764,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    1263,
+    14356,
+    29616,
+    2084,
+    236787,
+    52,
+    86752,
+    52,
+    1263,
+    6805,
+    29616,
+    24626,
+    24845,
+    52,
+    236755,
+    42024,
+    52,
+    236764,
+    52,
+    46435,
+    15882,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    5237,
+    15979,
+    24845,
+    52,
+    13319,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    60688,
+    52,
+    1807,
+    47,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    26588,
+    528,
+    9079,
+    573,
+    1156,
+    2668,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "tool_round_trip",
+   "thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris for two days?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "{\"temp\": 18}"
+    }
+   ],
+   "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris for two days?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:2}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18}<|\"|>}<tool_response|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    46,
+    163688,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    7777,
+    236787,
+    52,
+    8782,
+    7606,
+    573,
+    496,
+    3207,
+    236761,
+    52,
+    236764,
+    19031,
+    29616,
+    15921,
+    29616,
+    13319,
+    29616,
+    7777,
+    236787,
+    52,
+    17698,
+    1463,
+    52,
+    236764,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    1263,
+    14356,
+    29616,
+    2084,
+    236787,
+    52,
+    86752,
+    52,
+    1263,
+    6805,
+    29616,
+    24626,
+    24845,
+    52,
+    236755,
+    42024,
+    52,
+    236764,
+    52,
+    46435,
+    15882,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    5237,
+    15979,
+    24845,
+    52,
+    13319,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    60688,
+    52,
+    1807,
+    47,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    26588,
+    528,
+    9079,
+    573,
+    1156,
+    2668,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    48,
+    6639,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    13319,
+    236787,
+    52,
+    50429,
+    52,
+    236764,
+    14356,
+    236787,
+    236778,
+    236783,
+    49,
+    50,
+    6275,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    2394,
+    236787,
+    52,
+    14937,
+    7617,
+    1083,
+    236743,
+    236770,
+    236828,
+    236783,
+    52,
+    236783,
+    51
+   ]
+  },
+  {
+   "name": "tool_round_trip_thinking",
+   "thinking": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris for two days?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Need the tool.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "sunny"
+    },
+    {
+     "role": "assistant",
+     "content": "It is sunny."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "text": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris for two days?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:2}<tool_call|><|tool_response>response:get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>It is sunny.<turn|>\n<|turn>user\nThanks<turn|>\n<|turn>model\n",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    98,
+    107,
+    46,
+    163688,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    7777,
+    236787,
+    52,
+    8782,
+    7606,
+    573,
+    496,
+    3207,
+    236761,
+    52,
+    236764,
+    19031,
+    29616,
+    15921,
+    29616,
+    13319,
+    29616,
+    7777,
+    236787,
+    52,
+    17698,
+    1463,
+    52,
+    236764,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    1263,
+    14356,
+    29616,
+    2084,
+    236787,
+    52,
+    86752,
+    52,
+    1263,
+    6805,
+    29616,
+    24626,
+    24845,
+    52,
+    236755,
+    42024,
+    52,
+    236764,
+    52,
+    46435,
+    15882,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    35410,
+    52,
+    5237,
+    15979,
+    24845,
+    52,
+    13319,
+    52,
+    1604,
+    2084,
+    236787,
+    52,
+    60688,
+    52,
+    1807,
+    47,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    26588,
+    528,
+    9079,
+    573,
+    1156,
+    2668,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    48,
+    6639,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    13319,
+    236787,
+    52,
+    50429,
+    52,
+    236764,
+    14356,
+    236787,
+    236778,
+    236783,
+    49,
+    50,
+    6275,
+    236787,
+    828,
+    236779,
+    19323,
+    236782,
+    2394,
+    236787,
+    52,
+    185060,
+    52,
+    236783,
+    51,
+    1509,
+    563,
+    17635,
+    236761,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    12879,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ]
+  }
+ ]
+}

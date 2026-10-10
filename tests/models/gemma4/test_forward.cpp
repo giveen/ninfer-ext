@@ -35,6 +35,9 @@ struct SlotLayout {
     std::size_t row_bytes;
 };
 
+// Tokens run one at a time here, so the ring needs one slot beyond the window.
+constexpr std::int32_t kRingSlack = 1;
+
 SlotLayout layout_of(const gemma::TextConfig& config, std::size_t layer, std::int32_t capacity) {
     const bool global = !config.sliding_attention(layer);
     const std::int32_t head_dim =
@@ -44,7 +47,7 @@ SlotLayout layout_of(const gemma::TextConfig& config, std::size_t layer, std::in
     const std::int32_t width =
         global ? head_dim + 2 * static_cast<std::int32_t>(config.global.rope_angles) : head_dim;
     const std::int32_t tokens =
-        global ? capacity : static_cast<std::int32_t>(config.sliding_window);
+        global ? capacity : static_cast<std::int32_t>(config.sliding_window) + kRingSlack;
     return {tokens, static_cast<std::size_t>(width) * heads * sizeof(std::uint16_t)};
 }
 
@@ -135,7 +138,7 @@ int main() {
         const std::int32_t capacity      = 64;
         const std::int32_t tokens_run    = 8;
         gemma::KvCache cache;
-        cache.configure(config, capacity);
+        cache.configure(config, capacity, kRingSlack);
 
         const auto run_token = [&](std::int32_t position) {
             // Each token starts from the embedding's hidden state, so a pass is a function of that

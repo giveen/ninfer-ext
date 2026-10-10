@@ -2,8 +2,11 @@
 
 // One sequence's attention state, per layer.
 //
-// Sliding layers keep a ring of `sliding_window` key and value rows, so a token's slot is its position
-// modulo the window: the keys a query can still see occupy exactly the window's worth of slots.
+// Sliding layers keep a ring of `sliding_window + ring_slack` key and value rows, so a token's slot is
+// its position modulo the ring. The slack is the largest run of tokens one pass writes: a pass writes
+// every row before any of its queries attends, and a ring of exactly the window would let a later token
+// of the run overwrite a key an earlier query of the same run still sees. With the slack, the row a
+// write replaces is older than the window of every query in the run.
 // Global layers keep one compact row per token, written at the token's own position, so their capacity
 // is the number of tokens the caller allows; the plan's paging is what will lift that bound.
 //
@@ -35,8 +38,21 @@ public:
     KvCache(KvCache&&) noexcept;
     KvCache& operator=(KvCache&&) noexcept;
 
-    // Allocates the layers' storage lazily, as each layer is first used.
-    void configure(const TextConfig& config, std::int32_t capacity);
+    // Allocates the layers' storage lazily, as each layer is first used. `ring_slack` is the largest
+    // number of tokens one pass writes.
+    void configure(const TextConfig& config, std::int32_t capacity, std::int32_t ring_slack);
+
+    // Allocates every layer now rather than on first use.
+    void allocate();
+
+    // Device bytes a configured cache holds once every layer is allocated.
+    [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t capacity,
+                                                  std::int32_t ring_slack);
+
+    // Rows in a sliding layer's ring: the window plus the slack.
+    [[nodiscard]] std::int32_t ring_tokens() const noexcept {
+        return static_cast<std::int32_t>(config_.sliding_window) + ring_slack_;
+    }
 
     // Forgets every token: all slots become unwritten, keeping the allocation.
     void reset();
@@ -72,8 +88,9 @@ private:
     TextConfig config_{};
     std::vector<Layer> layers_;
     std::vector<void*> owned_;
-    std::int32_t capacity_ = 0;
-    std::size_t bytes_     = 0;
+    std::int32_t capacity_   = 0;
+    std::int32_t ring_slack_ = 0;
+    std::size_t bytes_       = 0;
 };
 
 } // namespace ninfer::models::gemma4

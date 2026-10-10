@@ -22,46 +22,118 @@ float decode_bf16(std::uint16_t value) {
     return decoded;
 }
 
+void* device_alloc(std::size_t bytes, std::size_t& total) {
+    void* pointer = nullptr;
+    CUDA_CHECK(cudaMalloc(&pointer, bytes));
+    total += bytes;
+    return pointer;
+}
+
+std::size_t token_count_bytes(const TextConfig& config) {
+    return static_cast<std::size_t>(config.vocab_size) * sizeof(std::int32_t);
+}
+
+std::size_t shared_bytes(const TextConfig& config) {
+    const std::size_t batch      = static_cast<std::size_t>(Program::kBatch);
+    const std::size_t hidden     = config.hidden_size;
+    const std::size_t vocabulary = config.vocab_size;
+    return layer_workspace_bytes(config, Program::kBatch) +
+           ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(vocabulary), 1, 1) +
+           batch * sizeof(std::int32_t) + 2 * hidden * batch * sizeof(std::uint16_t) +
+           vocabulary * batch * sizeof(std::uint16_t);
+}
+
 } // namespace
 
-Program::Program(const Model& model, std::int32_t capacity, DeviceContext& device)
-    : model_(&model), cache_(), arena_(layer_workspace_bytes(model.config(), kBatch)),
+std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacity,
+                                  std::int32_t lanes) {
+    const std::size_t lane =
+        KvCache::device_bytes(config, capacity, kBatch) + token_count_bytes(config);
+    return shared_bytes(config) + static_cast<std::size_t>(lanes) * lane;
+}
+
+Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
+                 DeviceContext& device)
+    : model_(&model), arena_(layer_workspace_bytes(model.config(), kBatch)),
+      sampling_workspace_(std::max<std::size_t>(
+          1, ops::sampling_workspace_capacity_bytes(
+                 static_cast<std::int32_t>(model.config().vocab_size), 1, 1))),
       capacity_(capacity) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
-    const std::int32_t hidden     = static_cast<std::int32_t>(model.config().hidden_size);
-    const std::int32_t vocabulary = static_cast<std::int32_t>(model.config().vocab_size);
-    cache_.configure(model.config(), capacity);
-    CUDA_CHECK(cudaMalloc(&id_buffer_, static_cast<std::size_t>(kBatch) * sizeof(std::int32_t)));
-    for (void*& state : state_) {
-        CUDA_CHECK(cudaMalloc(&state, static_cast<std::size_t>(hidden) *
-                                          static_cast<std::size_t>(kBatch) *
-                                          sizeof(std::uint16_t)));
+    if (lanes < 1) throw std::invalid_argument("gemma4 Program: lanes must be positive");
+    const TextConfig& config      = model.config();
+    const std::int32_t hidden     = static_cast<std::int32_t>(config.hidden_size);
+    const std::int32_t vocabulary = static_cast<std::int32_t>(config.vocab_size);
+    allocated_bytes_              = arena_.capacity() + sampling_workspace_.capacity();
+
+    lanes_.resize(static_cast<std::size_t>(lanes));
+    for (Lane& lane : lanes_) {
+        lane.cache.configure(config, capacity, kBatch);
+        lane.cache.allocate();
+        allocated_bytes_ += lane.cache.bytes();
+        lane.token_counts = device_alloc(token_count_bytes(config), allocated_bytes_);
+        CUDA_CHECK(cudaMemset(lane.token_counts, 0, token_count_bytes(config)));
     }
+    id_buffer_ =
+        device_alloc(static_cast<std::size_t>(kBatch) * sizeof(std::int32_t), allocated_bytes_);
+    for (void*& state : state_) {
+        state = device_alloc(static_cast<std::size_t>(hidden) * static_cast<std::size_t>(kBatch) *
+                                 sizeof(std::uint16_t),
+                             allocated_bytes_);
+    }
+    sampling_[0] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(ops::SamplingConfig),
+                                allocated_bytes_);
+    sampling_[1] = device_alloc(sizeof(std::int32_t), allocated_bytes_);
+    sampling_[2] = device_alloc(sizeof(std::int32_t), allocated_bytes_);
     // The head's output lives outside the layer arena because it outlives a call: it is what the
     // caller reads.
-    void* logits = nullptr;
-    CUDA_CHECK(cudaMalloc(&logits, static_cast<std::size_t>(vocabulary) *
-                                       static_cast<std::size_t>(kBatch) * sizeof(std::uint16_t)));
+    void* logits = device_alloc(static_cast<std::size_t>(vocabulary) *
+                                    static_cast<std::size_t>(kBatch) * sizeof(std::uint16_t),
+                                allocated_bytes_);
     logits_ = Tensor(static_cast<std::uint8_t*>(logits), DType::BF16, {vocabulary, kBatch});
     id_host_.resize(static_cast<std::size_t>(kBatch));
+    for (std::int32_t lane = 0; lane < lanes; ++lane) reset(lane);
     (void)device;
 }
 
 Program::~Program() {
+    for (Lane& lane : lanes_) {
+        if (lane.token_counts != nullptr) (void)cudaFree(lane.token_counts);
+    }
     if (id_buffer_ != nullptr) (void)cudaFree(id_buffer_);
     for (void* state : state_) {
         if (state != nullptr) (void)cudaFree(state);
     }
+    for (void* buffer : sampling_) {
+        if (buffer != nullptr) (void)cudaFree(buffer);
+    }
     if (logits_.data != nullptr) (void)cudaFree(logits_.data);
 }
 
-void Program::reset() {
-    cache_.reset();
-    position_ = 0;
+Program::Lane& Program::lane_at(std::int32_t lane) {
+    if (lane < 0 || lane >= lanes()) throw std::out_of_range("gemma4 Program: lane out of range");
+    return lanes_[static_cast<std::size_t>(lane)];
 }
 
-void Program::run_batch(const std::int32_t* ids, std::int32_t tokens, std::int32_t first_position,
-                        DeviceExecutionView execution) {
+const Program::Lane& Program::lane_at(std::int32_t lane) const {
+    if (lane < 0 || lane >= lanes()) throw std::out_of_range("gemma4 Program: lane out of range");
+    return lanes_[static_cast<std::size_t>(lane)];
+}
+
+void Program::reset(std::int32_t lane_index, const ops::SamplingConfig& sampling) {
+    Lane& lane = lane_at(lane_index);
+    lane.cache.reset();
+    lane.position = 0;
+    CUDA_CHECK(cudaMemset(lane.token_counts, 0, token_count_bytes(model_->config())));
+    ops::SamplingConfig installed = sampling;
+    installed.token_counts        = static_cast<std::int32_t*>(lane.token_counts);
+    installed.mask                = {};
+    CUDA_CHECK(cudaMemcpy(static_cast<ops::SamplingConfig*>(sampling_[0]) + lane_index, &installed,
+                          sizeof(installed), cudaMemcpyHostToDevice));
+}
+
+void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
+                        std::int32_t first_position, DeviceExecutionView execution) {
     if (tokens < 1 || tokens > kBatch) {
         throw std::invalid_argument("gemma4 Program: a batch must be one to kBatch tokens");
     }
@@ -69,6 +141,8 @@ void Program::run_batch(const std::int32_t* ids, std::int32_t tokens, std::int32
     const TextConfig& config  = model_->config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
 
+    // The host staging is reused by the next pass, so the copy must have left it before this returns;
+    // a pageable source makes cudaMemcpyAsync stage it before returning.
     std::memcpy(id_host_.data(), ids, static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(),
                                static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
@@ -86,12 +160,12 @@ void Program::run_batch(const std::int32_t* ids, std::int32_t tokens, std::int32
     for (std::size_t layer = 0; layer < model_->weights().text.layers.size(); ++layer) {
         Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
         Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, tokens});
-        forward_layer(*model_, layer, hidden_in, first_position, tokens, cache_, arena_, hidden_out,
+        forward_layer(*model_, layer, hidden_in, first_position, tokens, cache, arena_, hidden_out,
                       execution);
         std::swap(in, out);
     }
 
-    Tensor head_in(static_cast<std::uint8_t*>(state_[0]), DType::BF16, {hidden, tokens});
+    Tensor head_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
     // The head's linear expects an output of exactly [N,T], so a batch narrower than the buffer writes
     // into its first `tokens` columns, which are contiguous.
     Tensor logits_batch(static_cast<std::uint8_t*>(logits_.data), DType::BF16,
@@ -100,18 +174,50 @@ void Program::run_batch(const std::int32_t* ids, std::int32_t tokens, std::int32
     last_batch_ = tokens;
 }
 
-void Program::prefill(std::span<const std::int32_t> ids, DeviceExecutionView execution) {
-    if (position_ + static_cast<std::int32_t>(ids.size()) > capacity_) {
+void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids,
+                      DeviceExecutionView execution) {
+    Lane& lane = lane_at(lane_index);
+    if (ids.empty()) throw std::invalid_argument("gemma4 Program: prefill needs tokens");
+    if (static_cast<std::size_t>(lane.position) + ids.size() >
+        static_cast<std::size_t>(capacity_)) {
         throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
     }
     std::size_t consumed = 0;
     while (consumed < ids.size()) {
         const std::int32_t batch =
             static_cast<std::int32_t>(std::min<std::size_t>(kBatch, ids.size() - consumed));
-        run_batch(ids.data() + consumed, batch, position_, execution);
-        position_ += batch;
+        run_batch(lane.cache, ids.data() + consumed, batch, lane.position, execution);
+        lane.position += batch;
         consumed += static_cast<std::size_t>(batch);
     }
+}
+
+void Program::decode(std::int32_t lane_index, std::int32_t id, DeviceExecutionView execution) {
+    Lane& lane = lane_at(lane_index);
+    if (lane.position >= capacity_) {
+        throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
+    }
+    run_batch(lane.cache, &id, 1, lane.position, execution);
+    ++lane.position;
+}
+
+std::int32_t Program::sample(std::int32_t lane_index, DeviceExecutionView execution) {
+    const Lane& lane          = lane_at(lane_index);
+    const cudaStream_t stream = execution.stream;
+    const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
+    const std::int32_t position   = lane.position;
+    CUDA_CHECK(cudaMemcpyAsync(sampling_[2], &position, sizeof(position), cudaMemcpyHostToDevice,
+                               stream));
+    Tensor out(static_cast<std::uint8_t*>(sampling_[1]), DType::I32, {1});
+    Tensor positions(static_cast<std::uint8_t*>(sampling_[2]), DType::I32, {1});
+    sampling_workspace_.reset();
+    ops::sample(logits(), out, vocabulary,
+                static_cast<const ops::SamplingConfig*>(sampling_[0]) + lane_index, positions,
+                ops::kSamplePurposeDecode, sampling_workspace_, stream);
+    std::int32_t token = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&token, sampling_[1], sizeof(token), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return token;
 }
 
 std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
@@ -124,7 +230,8 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     if (ids.size() > static_cast<std::size_t>(capacity_)) {
         throw std::invalid_argument("gemma4 Program: the sequence is longer than the capacity");
     }
-    reset();
+    reset(0);
+    KvCache& cache                = lanes_.front().cache;
     const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
     logits_host_.resize(static_cast<std::size_t>(vocabulary) * static_cast<std::size_t>(kBatch));
 
@@ -138,7 +245,7 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     std::int32_t position    = 0;
     while (position < count) {
         const std::int32_t batch = std::min(kBatch, count - position);
-        run_batch(ids.data() + position, batch, position, execution);
+        run_batch(cache, ids.data() + position, batch, position, execution);
 
         // A column of the head predicts the token after its own position, so this batch covers the
         // targets from position+1 to position+batch, clipped to the sequence and to first_target.
@@ -183,12 +290,8 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
         }
         position += batch;
     }
+    lanes_.front().position = count;
     return scores;
-}
-
-void Program::decode(std::int32_t id, DeviceExecutionView execution) {
-    run_batch(&id, 1, position_, execution);
-    ++position_;
 }
 
 } // namespace ninfer::models::gemma4

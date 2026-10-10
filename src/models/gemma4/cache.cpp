@@ -28,7 +28,7 @@ KvCache::~KvCache() {
 
 KvCache::KvCache(KvCache&& other) noexcept
     : config_(other.config_), layers_(std::move(other.layers_)), owned_(std::move(other.owned_)),
-      capacity_(other.capacity_), bytes_(other.bytes_) {
+      capacity_(other.capacity_), ring_slack_(other.ring_slack_), bytes_(other.bytes_) {
     other.layers_.clear();
     other.owned_.clear();
     other.bytes_ = 0;
@@ -42,8 +42,9 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
         config_   = other.config_;
         layers_   = std::move(other.layers_);
         owned_    = std::move(other.owned_);
-        capacity_ = other.capacity_;
-        bytes_    = other.bytes_;
+        capacity_   = other.capacity_;
+        ring_slack_ = other.ring_slack_;
+        bytes_      = other.bytes_;
         other.layers_.clear();
         other.owned_.clear();
         other.bytes_ = 0;
@@ -51,10 +52,12 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
     return *this;
 }
 
-void KvCache::configure(const TextConfig& config, std::int32_t capacity) {
+void KvCache::configure(const TextConfig& config, std::int32_t capacity, std::int32_t ring_slack) {
     if (capacity < 1) throw std::invalid_argument("KvCache: capacity must be positive");
-    config_   = config;
-    capacity_ = capacity;
+    if (ring_slack < 1) throw std::invalid_argument("KvCache: ring slack must be positive");
+    config_     = config;
+    capacity_   = capacity;
+    ring_slack_ = ring_slack;
     layers_.assign(config.num_hidden_layers, Layer{});
     std::vector<void*>().swap(owned_);
     bytes_ = 0;
@@ -73,7 +76,7 @@ void KvCache::ensure(std::size_t layer) {
     const std::int32_t heads = static_cast<std::int32_t>(
         global ? config_.global.shared.num_key_value_heads : config_.sliding.num_key_value_heads);
     const std::int32_t tokens =
-        global ? capacity_ : static_cast<std::int32_t>(config_.sliding_window);
+        global ? capacity_ : ring_tokens();
     const std::int32_t width =
         global ? head_dim + 2 * static_cast<std::int32_t>(config_.global.rope_angles) : head_dim;
 
@@ -107,6 +110,30 @@ void KvCache::reset_layer(std::size_t layer) {
     }
 }
 
+void KvCache::allocate() {
+    for (std::size_t layer = 0; layer < layers_.size(); ++layer) ensure(layer);
+}
+
+std::size_t KvCache::device_bytes(const TextConfig& config, std::int32_t capacity,
+                                  std::int32_t ring_slack) {
+    std::size_t total = 0;
+    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+        const bool global = !config.sliding_attention(layer);
+        const std::size_t head_dim =
+            global ? config.global.shared.head_dim : config.sliding.head_dim;
+        const std::size_t heads =
+            global ? config.global.shared.num_key_value_heads : config.sliding.num_key_value_heads;
+        const std::size_t tokens = global ? static_cast<std::size_t>(capacity)
+                                          : config.sliding_window +
+                                                static_cast<std::size_t>(ring_slack);
+        const std::size_t width = global ? head_dim + 2 * config.global.rope_angles : head_dim;
+        total += width * heads * tokens * sizeof(std::uint16_t);
+        if (!global) total += head_dim * heads * tokens * sizeof(std::uint16_t);
+        total += tokens * sizeof(std::int32_t);
+    }
+    return total;
+}
+
 void KvCache::reset() {
     for (std::size_t layer = 0; layer < layers_.size(); ++layer) {
         if (layers_[layer].allocated) reset_layer(layer);
@@ -136,7 +163,7 @@ std::int32_t KvCache::slot(std::size_t layer, std::int32_t position) const {
         }
         return position;
     }
-    return static_cast<std::int32_t>(position % static_cast<std::int32_t>(config_.sliding_window));
+    return position % ring_tokens();
 }
 
 void KvCache::mark_range(std::size_t layer, std::int32_t first_position, std::int32_t tokens,

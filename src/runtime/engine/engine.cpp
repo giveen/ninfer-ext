@@ -169,9 +169,11 @@ class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
-    using GemmaScoringCore = runtime::CausalScoreCore<runtime::GemmaInstance>;
+    using GemmaGenerationCore = runtime::EngineCore<runtime::GemmaInstance>;
+    using GemmaScoringCore    = runtime::CausalScoreCore<runtime::GemmaInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<ScoringCore>, std::unique_ptr<GemmaScoringCore>>;
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<GemmaGenerationCore>,
+                              std::unique_ptr<GemmaScoringCore>>;
     using Active = std::variant<std::unique_ptr<runtime::ModelInstance>,
                                 std::unique_ptr<runtime::GemmaInstance>>;
 
@@ -181,17 +183,17 @@ public:
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         runtime::ContextMachineCostModel context_cost;
         if (runtime::artifact_is_gemma(options.artifact_path)) {
-            // This model is offload-free, has no paged KV and no admission planner, so nothing about
-            // the options is resolved by a target plan; what the Engine reports beyond the
-            // architecture stays at its default rather than being invented.
-            if (options.purpose != EnginePurpose::CausalScoring) {
-                throw std::invalid_argument(
-                    "this artifact is a Gemma model, which the Engine can score but not yet generate");
-            }
-            auto instance = runtime::load_gemma_instance(options.artifact_path,
-                                                         models::load_options(options),
-                                                         options.max_context, device);
+            // This model runs root-only, without speculation or Vision; the options say so rather
+            // than carrying settings the Engine would silently ignore.
+            options       = runtime::gemma_engine_options(std::move(options));
+            auto instance = runtime::load_gemma_instance(options, device);
             load.architecture = "gemma4";
+            const auto& text  = instance->model->config();
+            model_metadata.model_id       = options.artifact_path.stem().string();
+            model_metadata.vocab_size     = text.vocab_size;
+            model_metadata.embedding_size = text.hidden_size;
+            model_metadata.native_context = text.max_position_embeddings;
+            load.model_name               = model_metadata.model_id;
             active.emplace<std::unique_ptr<runtime::GemmaInstance>>(std::move(instance));
         } else {
             auto constructed  = runtime::construct_model(options, device);
@@ -214,7 +216,11 @@ public:
             [&](auto& instance) -> Core {
                 using Backend = typename std::remove_cvref_t<decltype(instance)>::element_type;
                 if constexpr (std::is_same_v<Backend, runtime::GemmaInstance>) {
-                    return std::make_unique<GemmaScoringCore>(*instance, device);
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<GemmaScoringCore>(*instance, device);
+                    }
+                    return std::make_unique<GemmaGenerationCore>(*instance, device, options,
+                                                                 std::move(context_cost));
                 } else if (options.purpose == EnginePurpose::CausalScoring) {
                     return std::make_unique<ScoringCore>(*instance, device);
                 } else {
@@ -266,9 +272,13 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
         [&](auto& instance) -> PreparedPrompt {
             using Backend = typename std::remove_cvref_t<decltype(instance)>::element_type;
             if constexpr (std::is_same_v<Backend, runtime::GemmaInstance>) {
-                (void)input;
-                (void)control;
-                throw std::logic_error("this model cannot build a prompt from text or media yet");
+                auto prepared            = instance->frontend.prepare(std::move(input), control);
+                const PromptSummary info = prepared.summary();
+                const SamplingMode sampling_mode =
+                    info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+                const PromptPreparationStats preparation = prepared.preparation_stats();
+                return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+                    info, preparation, sampling_mode, std::move(prepared)));
             } else {
                 auto prepared      = instance->frontend.prepare(std::move(input), control);
                 PromptSummary info = prepared.summary();
@@ -428,7 +438,15 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 throw std::logic_error("Engine generation core is unavailable");
             } else if constexpr (std::is_same_v<CoreState,
                                                 std::unique_ptr<Impl::GemmaScoringCore>>) {
-                throw std::logic_error("this model cannot generate through the Engine yet");
+                throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState,
+                                                std::unique_ptr<Impl::GemmaGenerationCore>>) {
+                auto submission = core->submit(
+                    std::get<runtime::GemmaPreparedPrompt>(std::move(prompt.impl_->value)),
+                    prompt_summary, prepare_seconds, std::move(resolved_options), consumer_mode,
+                    observation, pending_deadline);
+                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                    impl_, std::move(submission), resolved_sampling));
             } else {
                 auto submission = core->submit(
                     std::get<models::qwen3_5::PreparedPrompt>(std::move(prompt.impl_->value)),
