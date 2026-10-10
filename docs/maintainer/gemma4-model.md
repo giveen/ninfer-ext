@@ -638,3 +638,39 @@ What remains for P3: `Engine::Impl` holds `active` and `core` as concrete Qwen t
 is the next step — an alternative in each variant, a helper for the ten `active` sites, a branch in
 `construct_model` on the artifact's architecture, and a frontend for this model. The artifact already
 carries its tokenizer resources, which is the part that would otherwise need a re-conversion.
+
+## 20. The Engine drives this model
+
+`Engine::load` now probes the artifact's declared architecture and takes a Gemma branch: it loads the
+model through `gemma4::load_model`, wraps it as `runtime::GemmaInstance`, and constructs
+`runtime::CausalScoreCore<GemmaInstance>` instead of the Qwen cores. `Engine::Impl::active` and
+`Impl::Core` are variants over the two model kinds, the ten places the Engine reached through `active`
+became visits, and `PreparedPrompt::Impl` holds whichever model's prepared prompt it was given, since
+only that model's core can consume it.
+
+**Verified through the public API**, not through a copy of the path:
+
+    the Engine, through its public API, matches the Program on 70 positions
+
+with the same mean NLL 2.676 and perplexity 14.53 the direct route produces. So an artifact with
+`architectures: ["Gemma4ForCausalLM"]` loads, is recognized, and is scored by the Engine's own variant
+dispatch and scoring core.
+
+Four things are deliberately narrow, and each says so rather than pretending:
+
+- **Generation is refused, loudly.** A Gemma artifact with `EnginePurpose::Generation` throws "this
+  artifact is a Gemma model, which the Engine can score but not yet generate". The generation core's
+  Programme surface is fourteen methods of leases, capture, output sessions and context transactions,
+  and none of that exists here yet.
+- **A prompt cannot be built from text or media.** `GemmaFrontend::prepare` and `tokenize_text` throw;
+  only `prepare_tokens` works, which is what scoring needs because the caller already has ids. The
+  artifact carries its tokenizer resources, so the data is there when a tokenizer frontend is written.
+- **The logits sink is still refused**, so the KLD route cannot run for this model.
+- **`LoadSummary` and `ModelMetadata` are mostly defaulted** for this branch — only the architecture
+  string is set. They are Qwen-shaped, and filling them with invented numbers would be worse than
+  leaving them empty.
+
+Also removed: `gemma4::plan_load` had rejected every purpose except `Generation`, a placeholder from
+when only the generation route existed. Scoring binds the same parameters — the head it reads is the
+head generation samples from — so the guard was wrong, and the Engine's scoring load hit it
+immediately.

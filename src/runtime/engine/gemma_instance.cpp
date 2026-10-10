@@ -1,8 +1,40 @@
 #include "runtime/engine/gemma_instance.h"
 
+#include "artifact/reader.h"
+
 #include <stdexcept>
 
 namespace ninfer::runtime {
+
+GemmaPreparedPrompt GemmaFrontend::prepare_tokens(std::vector<TokenId> token_ids,
+                                                bool allow_prefix_identity) const {
+    (void)allow_prefix_identity;
+    GemmaPreparedPrompt prompt;
+    prompt.descriptor.prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
+    prompt.ids                   = std::move(token_ids);
+    return prompt;
+}
+
+GemmaPreparedPrompt GemmaFrontend::prepare(PromptInput input, const PreparationControl& control) const {
+    (void)input;
+    (void)control;
+    throw std::logic_error("Gemma prompts from text or media are not implemented");
+}
+
+std::uint32_t GemmaFrontend::count_tokens(PromptInput input, const PreparationControl& control) const {
+    (void)input;
+    (void)control;
+    throw std::logic_error("Gemma prompt counting is not implemented");
+}
+
+std::vector<TokenId> GemmaFrontend::tokenize_text(std::string_view text) const {
+    (void)text;
+    throw std::logic_error("Gemma tokenization is not implemented");
+}
+
+MediaCacheSummary GemmaFrontend::media_cache_summary() const { return MediaCacheSummary{}; }
+
+ModelSamplingDefaults GemmaFrontend::sampling_defaults() const { return ModelSamplingDefaults{}; }
 
 GemmaEngineProgram::GemmaEngineProgram(const models::gemma4::Model& model, std::int32_t capacity,
                                        DeviceContext& device)
@@ -54,6 +86,15 @@ std::unique_ptr<GemmaInstance> load_gemma_instance(const std::string& path,
                                                    std::uint32_t capacity, DeviceContext& device) {
     auto model = models::gemma4::load_model(path, options, device);
     return std::make_unique<GemmaInstance>(std::move(model), capacity, device);
+}
+
+bool artifact_is_gemma(const std::string& path) {
+    artifact::Reader reader(path);
+    const artifact::Json& config = reader.directory().component("text").config;
+    if (!config.contains("architectures")) { return false; }
+    const auto& architectures = config.at("architectures");
+    return architectures.is_array() && !architectures.empty() &&
+           architectures.at(0) == "Gemma4ForCausalLM";
 }
 
 } // namespace ninfer::runtime

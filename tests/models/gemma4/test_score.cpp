@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "models/gemma4/load.h"
 #include "models/gemma4/program.h"
+#include "ninfer/engine.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/gemma_instance.h"
 
@@ -86,6 +87,7 @@ int main() {
         // The Engine's own scoring core, instantiated on this model. It must produce exactly what the
         // Program does directly, since it is the same Program behind one adapter.
         if (std::getenv("NINFER_GEMMA_ENGINE_CORE") != nullptr) {
+          {
             runtime::GemmaPreparedPrompt prompt;
             prompt.ids = ids;
             auto instance = runtime::load_gemma_instance(artifact, models::LoadOptions{},
@@ -107,6 +109,33 @@ int main() {
             }
             std::cout << "  the Engine's scoring core matches the Program on " << logprobs.size()
                       << " positions\n";
+          }
+        }
+
+        // The whole public route: the Engine picks this model from the artifact's architecture, loads
+        // it, and scores through its own core and variant dispatch. Scoped so only one 24 GB model is
+        // resident at a time.
+        if (std::getenv("NINFER_GEMMA_ENGINE_API") != nullptr) {
+            EngineOptions options;
+            options.artifact_path = artifact;
+            options.purpose       = EnginePurpose::CausalScoring;
+            options.max_context   = static_cast<std::uint32_t>(ids.size()) + 8;
+            Engine engine(std::move(options));
+            const std::vector<float> through_api = engine.score_tokens(ids, first, {});
+            if (through_api.size() != logprobs.size()) {
+                std::cerr << "gemma4 score: the Engine returned " << through_api.size()
+                          << " scores, the Program returned " << logprobs.size() << '\n';
+                return 1;
+            }
+            for (std::size_t index = 0; index < logprobs.size(); ++index) {
+                if (through_api[index] != logprobs[index]) {
+                    std::cerr << "gemma4 score: the Engine differs at " << index << ": "
+                              << through_api[index] << " against " << logprobs[index] << '\n';
+                    return 1;
+                }
+            }
+            std::cout << "  the Engine, through its public API, matches the Program on "
+                      << logprobs.size() << " positions\n";
         }
 
         std::ofstream output("/tmp/gemma_score.out.f32", std::ios::binary);

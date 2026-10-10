@@ -165,9 +165,8 @@ const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>(reader);
     out->options = options;
-    if (options.purpose != EnginePurpose::Generation) {
-        throw artifact::ArtifactError("Gemma 4 text loads for Generation in this build");
-    }
+    // Both purposes bind the same parameters: the head the scoring route reads is the head generation
+    // samples from, and what differs between the two is how a Program is driven, not what is loaded.
     out->config = parse_text_config(reader.directory().component("text").config);
     Bindings bindings(out->binder);
     out->weights.text = bind_text(bindings, out->config);
