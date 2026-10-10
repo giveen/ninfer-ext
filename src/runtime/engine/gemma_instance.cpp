@@ -1,17 +1,57 @@
 #include "runtime/engine/gemma_instance.h"
 
+#include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 
 #include <stdexcept>
 
 namespace ninfer::runtime {
+namespace {
+
+namespace text_frontend = models::qwen3_5::frontend;
+
+// The artifact's resources are only mapped for the duration of a load, so a reader is opened, the
+// bytes are copied out, and it goes away again.
+std::string read_tokenizer_resource(const std::string& path, const char* role) {
+    artifact::Reader reader(path);
+    artifact::Binder binder(reader);
+    const auto bytes = binder.host_object(binder.resource("text", role));
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+} // namespace
+
+
+GemmaFrontend::GemmaFrontend(std::string tokenizer_json, std::string tokenizer_config_json,
+                             std::string generation_config_json)
+    : tokenizer_json_(std::move(tokenizer_json)),
+      tokenizer_config_json_(std::move(tokenizer_config_json)),
+      generation_config_json_(std::move(generation_config_json)) {
+    tokenizer_ = std::make_unique<text_frontend::Tokenizer>(text_frontend::TokenizerResources{
+        .tokenizer_json         = tokenizer_json_,
+        .tokenizer_config_json  = tokenizer_config_json_,
+        .generation_config_json = generation_config_json_,
+        .family                 = text_frontend::TokenizerFamily::Gemma,
+    });
+    // This pipeline's config declares a beginning-of-sequence token, so the id comes from the
+    // pipeline rather than from a constant.
+    const std::vector<int> bos = tokenizer_->encode("<bos>", text_frontend::EncodeOptions{});
+    if (bos.size() != 1) {
+        throw std::runtime_error("gemma4 frontend: <bos> is not a single token in this pipeline");
+    }
+    bos_ = bos.front();
+}
 
 GemmaPreparedPrompt GemmaFrontend::prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity) const {
     (void)allow_prefix_identity;
+    // Deliberately transparent: the token count a caller handed over is the count it gets back, which
+    // is what the Engine's scoring contract checks against its own window. The beginning-of-sequence
+    // token is the tokenizer's business, added below.
     GemmaPreparedPrompt prompt;
     prompt.descriptor.prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
-    prompt.ids                   = std::move(token_ids);
+    prompt.ids                      = std::move(token_ids);
     return prompt;
 }
 
@@ -28,8 +68,16 @@ std::uint32_t GemmaFrontend::count_tokens(PromptInput input, const PreparationCo
 }
 
 std::vector<TokenId> GemmaFrontend::tokenize_text(std::string_view text) const {
-    (void)text;
-    throw std::logic_error("Gemma tokenization is not implemented");
+    const std::vector<int> encoded = tokenizer_->encode(text);
+    std::vector<TokenId> ids(encoded.begin(), encoded.end());
+    // Text becomes the ids the model would see, and this pipeline's config declares a
+    // beginning-of-sequence token: without it the model is asked about a sequence that does not start
+    // the way it was trained to, which moves every probability in the sequence. Prepending here and
+    // not in prepare_tokens also keeps the token count the caller planned its windows over.
+    if (bos_ >= 0 && (ids.empty() || ids.front() != bos_)) {
+        ids.insert(ids.begin(), bos_);
+    }
+    return ids;
 }
 
 MediaCacheSummary GemmaFrontend::media_cache_summary() const { return MediaCacheSummary{}; }
@@ -60,8 +108,12 @@ MemorySummary GemmaEngineProgram::memory_summary() const {
 void GemmaEngineProgram::reset_memory_peaks() noexcept {}
 
 GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source, std::uint32_t capacity_in,
-                             DeviceContext& device)
-    : model(std::move(source)), program(nullptr), capacity(capacity_in) {
+                             std::string tokenizer_json, std::string tokenizer_config_json,
+                             std::string generation_config_json, DeviceContext& device)
+    : model(std::move(source)),
+      frontend(std::move(tokenizer_json), std::move(tokenizer_config_json),
+               std::move(generation_config_json)),
+      program(nullptr), capacity(capacity_in) {
     program = std::make_unique<GemmaEngineProgram>(*model, static_cast<std::int32_t>(capacity),
                                                    device);
     // No paged KV here: the sliding layers hold their window and the global layers hold the tokens the
@@ -84,8 +136,13 @@ GemmaInstance::~GemmaInstance() = default;
 std::unique_ptr<GemmaInstance> load_gemma_instance(const std::string& path,
                                                    models::LoadOptions options,
                                                    std::uint32_t capacity, DeviceContext& device) {
+    std::string tokenizer_json = read_tokenizer_resource(path, "tokenizer.json");
+    std::string tokenizer_config = read_tokenizer_resource(path, "tokenizer_config.json");
+    std::string generation_config = read_tokenizer_resource(path, "generation_config.json");
     auto model = models::gemma4::load_model(path, options, device);
-    return std::make_unique<GemmaInstance>(std::move(model), capacity, device);
+    return std::make_unique<GemmaInstance>(std::move(model), capacity, std::move(tokenizer_json),
+                                           std::move(tokenizer_config),
+                                           std::move(generation_config), device);
 }
 
 bool artifact_is_gemma(const std::string& path) {

@@ -19,11 +19,20 @@
 #include "ninfer/types.h"
 #include "runtime/engine/kv_capacity.h"
 
+#include <memory>
+#include <string>
+
+
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <span>
 #include <vector>
+
+// The shared tokenizer is held by pointer, so the header needs only its name.
+namespace ninfer::models::qwen3_5::frontend {
+class Tokenizer;
+} // namespace ninfer::models::qwen3_5::frontend
 
 namespace ninfer::runtime {
 
@@ -52,6 +61,11 @@ struct GemmaRuntimeTypes {
 // here yet and say so rather than returning something empty.
 class GemmaFrontend {
 public:
+    // The resource strings are copied rather than viewed: the artifact's bytes live as long as a
+    // load's Reader, which does not outlive the frontend. A Gemma tokenizer.json is tens of megabytes.
+    GemmaFrontend(std::string tokenizer_json, std::string tokenizer_config_json,
+                  std::string generation_config_json);
+
     [[nodiscard]] GemmaPreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                      bool allow_prefix_identity = true) const;
     [[nodiscard]] GemmaPreparedPrompt prepare(PromptInput input,
@@ -61,6 +75,15 @@ public:
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
+
+private:
+    std::string tokenizer_json_;
+    std::string tokenizer_config_json_;
+    std::string generation_config_json_;
+    // The shared tokenizer, which already implements this pipeline's family; held by pointer because
+    // it is not copyable.
+    std::unique_ptr<models::qwen3_5::frontend::Tokenizer> tokenizer_;
+    TokenId bos_ = -1;
 };
 
 // models::gemma4::Program with the signatures the Engine's scoring core calls.
@@ -89,7 +112,8 @@ struct GemmaInstance {
     const std::uint32_t capacity;
 
     GemmaInstance(std::unique_ptr<models::gemma4::Model> model, std::uint32_t capacity,
-                  DeviceContext& device);
+                  std::string tokenizer_json, std::string tokenizer_config_json,
+                  std::string generation_config_json, DeviceContext& device);
     ~GemmaInstance();
     GemmaInstance(const GemmaInstance&)            = delete;
     GemmaInstance& operator=(const GemmaInstance&) = delete;
