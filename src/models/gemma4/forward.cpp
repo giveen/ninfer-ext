@@ -26,6 +26,7 @@ struct Scratch {
     Tensor q;           // [Hq*D,T]  raw query projection
     Tensor k;           // [Hkv*D,T]
     Tensor v;           // [Hkv*D,T]
+    Tensor qkv;         // the one frame q, k and v are row views of
     Tensor q_heads;     // [D,Hq,T]  the same storage, as heads for the norms and RoPE
     Tensor k_heads;     // [D,Hkv,T]
     Tensor v_heads;     // [D,Hkv,T]
@@ -44,6 +45,64 @@ struct Scratch {
 // The key-norm weight of a target global layer, which a query attending its compact rows carries.
 WeightId target_layer_key_norm(const Model& model, std::size_t layer) {
     return model.weights().text.layers.at(layer).attention.key_norm;
+}
+
+// The attention input projections are declared as one group by the converter
+// (tools/convert/gemma4.py `group(query, key, value)`) and bound as row slices of a single packed
+// object. When those slices are contiguous from the object's first row, one Linear over the union
+// runs exactly the rows the three separate launches run, through the same route: a Q6 GEMV splits a
+// row's K range from K and the split index alone, so which block computes a row does not change its
+// reduction order. The three results are bit-identical -- the generated token ids of a greedy
+// decode match the unfused build exactly -- so this trades 150 launches a token for 50 without
+// touching arithmetic.
+//
+// The check below is by plane offset and covers the row-split Q6 layout only; any other format,
+// a differing quantisation, or a slice that is not exactly where it should be keeps the three
+// separate launches. `prepare_linear_weight` returns a copy of the stored weight, so the addresses
+// compared here are the artifact's own slice addresses.
+bool qkv_slices_are_contiguous(const Weight& query, const Weight& key, const Weight& value) {
+    if (query.qtype != QType::Q6_G64_FP16 || query.layout != QuantLayout::RowSplit ||
+        query.group != 64) {
+        return false;
+    }
+    const Weight* members[] = {&query, &key, &value};
+    for (const Weight* member : members) {
+        if (member->qtype != query.qtype || member->layout != query.layout ||
+            member->group != query.group || member->scale_dtype != query.scale_dtype ||
+            member->k != query.k || member->padded_shape[1] != query.padded_shape[1] ||
+            member->weight_scale_divisor != query.weight_scale_divisor ||
+            member->input_scale_divisor != query.input_scale_divisor) {
+            return false;
+        }
+        if (member->qdata == nullptr || member->qhigh == nullptr || member->scales == nullptr) {
+            return false;
+        }
+    }
+    // Per-group plane widths of the row-split Q6 layout, from q6_a16_simt.cuh: a row's group
+    // index advances by padded_k/64 in a 32-byte code plane, a 16-byte high plane and a 2-byte
+    // scale plane.
+    const std::uint64_t groups = static_cast<std::uint64_t>(query.padded_shape[1]) / 64;
+    const std::uint64_t rows_q = static_cast<std::uint64_t>(query.n);
+    const std::uint64_t rows_k = static_cast<std::uint64_t>(key.n);
+    const auto is_at = [](const void* base, std::uint64_t groups_ahead, std::uint64_t per_group,
+                          const void* expected) {
+        return static_cast<const void*>(static_cast<const std::uint8_t*>(base) +
+                                       groups_ahead * per_group) == expected;
+    };
+    return is_at(query.qdata, rows_q * groups, 32, key.qdata) &&
+           is_at(query.qhigh, rows_q * groups, 16, key.qhigh) &&
+           is_at(query.scales, rows_q * groups, 2, key.scales) &&
+           is_at(key.qdata, rows_k * groups, 32, value.qdata) &&
+           is_at(key.qhigh, rows_k * groups, 16, value.qhigh) &&
+           is_at(key.scales, rows_k * groups, 2, value.scales);
+}
+
+// The same weight with the union row count. `query`'s planes begin at the object's first row once
+// `qkv_slices_are_contiguous` holds, so only `n` changes.
+Weight fused_qkv_weight(const Weight& query, std::int32_t rows) {
+    Weight fused = query;
+    fused.n      = rows;
+    return fused;
 }
 
 } // namespace
@@ -127,11 +186,31 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     const float eps             = config.rms_norm_eps;
 
     Scratch scratch;
+    // The union is one frame the three can be viewed from only at T=1, which is why decode fuses
+    // and every wider pass keeps the three launches: tensors are column-major with dim 0 fastest,
+    // so a
+    // row slice of a [Q+2KV,T] frame carries that frame's token stride and is not contiguous for
+    // T>1 -- which rmsnorm requires. At T=1 the frame's row 0 is byte 0, so a [rows,1] slice is
+    // exactly a standalone [rows,1] tensor. See qkv_slices_are_contiguous for the weight side.
+    const Weight query_weight =
+        ops::prepare_linear_weight(model.input(weights.attention.query)).weight;
+    const Weight key_weight = ops::prepare_linear_weight(model.input(weights.attention.key)).weight;
+    const Weight value_weight =
+        ops::prepare_linear_weight(model.input(weights.attention.value)).weight;
+    const bool fuse_qkv =
+        tokens == 1 && qkv_slices_are_contiguous(query_weight, key_weight, value_weight);
     scratch.normed    = arena.alloc(DType::BF16, {h, tokens});
     scratch.branch    = arena.alloc(DType::BF16, {h, tokens});
-    scratch.q         = arena.alloc(DType::BF16, {q_width, tokens});
-    scratch.k         = arena.alloc(DType::BF16, {kv_width, tokens});
-    scratch.v         = arena.alloc(DType::BF16, {kv_width, tokens});
+    if (fuse_qkv) {
+        scratch.qkv = arena.alloc(DType::BF16, {q_width + 2 * kv_width, tokens});
+        scratch.q   = scratch.qkv.slice(0, 0, q_width);
+        scratch.k   = scratch.qkv.slice(0, q_width, kv_width);
+        scratch.v   = scratch.qkv.slice(0, q_width + kv_width, kv_width);
+    } else {
+        scratch.q = arena.alloc(DType::BF16, {q_width, tokens});
+        scratch.k = arena.alloc(DType::BF16, {kv_width, tokens});
+        scratch.v = arena.alloc(DType::BF16, {kv_width, tokens});
+    }
     scratch.q_normed  = arena.alloc(DType::BF16, {d, hq, tokens});
     scratch.k_normed  = arena.alloc(DType::BF16, {d, hkv, tokens});
     scratch.v_normed  = arena.alloc(DType::BF16, {d, hkv, tokens});
@@ -157,9 +236,14 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     // Attention sublayer. The key and value sets are the token itself, so the same position vector
     // serves both sides of the causal window.
     ops::rmsnorm(residual, model.tensor(weights.input_norm), eps, false, scratch.normed, stream);
-    ops::linear(scratch.normed, to_weight(weights.attention.query), scratch.q, stream);
-    ops::linear(scratch.normed, to_weight(weights.attention.key), scratch.k, stream);
-    ops::linear(scratch.normed, to_weight(weights.attention.value), scratch.v, stream);
+    if (fuse_qkv) {
+        ops::linear(scratch.normed,
+                    fused_qkv_weight(query_weight, q_width + 2 * kv_width), scratch.qkv, stream);
+    } else {
+        ops::linear(scratch.normed, query_weight, scratch.q, stream);
+        ops::linear(scratch.normed, key_weight, scratch.k, stream);
+        ops::linear(scratch.normed, value_weight, scratch.v, stream);
+    }
 
     // Per-head norms: q and k carry a weight, v is normalized without one.
     scratch.q_heads = scratch.q.view({d, hq, tokens});
