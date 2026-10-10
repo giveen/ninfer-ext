@@ -536,6 +536,15 @@ struct DecoderState {
     std::uint64_t decoded_bytes    = 0;
     std::optional<std::uint32_t> matched_stop;
     bool terminal = false;
+    // Thinking budget: model-origin tokens inside the thought channel, and the forced close.
+    std::uint32_t model_thinking_tokens = 0;
+    std::uint32_t injected_tokens       = 0;
+    bool control_pending                = false;
+    bool control_applied                = false;
+
+    [[nodiscard]] bool thinking() const noexcept {
+        return region == Region::Reasoning || region == Region::ChannelHeader;
+    }
 };
 
 struct StopMatch {
@@ -560,6 +569,8 @@ public:
     TokenId channel_close = -1;
     TokenId call_open     = -1;
     TokenId call_close    = -1;
+    std::optional<std::uint32_t> thinking_budget;
+    std::array<TokenId, 1> thinking_control{};
 
     DecoderState state;
     DecoderState preview;
@@ -743,12 +754,20 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
     Impl& impl = *impl_;
+    if (impl.state.control_pending) {
+        throw std::logic_error("model output cannot advance while thinking control is pending");
+    }
     impl.preview = impl.state;
     impl.preview_output.clear();
-    const auto complete = [&](std::uint32_t count, FinishReason reason) {
+    const auto complete = [&](std::uint32_t count, FinishReason reason,
+                              runtime::ContinuationAction continuation =
+                                  runtime::ContinuationAction::Decode) {
+        if (reason != FinishReason::None) impl.preview.control_pending = false;
         impl.preview_ready = true;
-        return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
+        return runtime::OutputDecision{
+            .accepted_tokens = count, .finish_reason = reason, .continuation = continuation};
     };
+    const bool budgeted = impl.thinking_budget && !impl.state.control_applied;
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
@@ -764,6 +783,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
         StopMatch match;
         impl.feed_token(impl.preview, token, impl.preview_output, count, &match);
+        if (budgeted && impl.preview.thinking() &&
+            ++impl.preview.model_thinking_tokens > *impl.thinking_budget) {
+            throw std::logic_error("model output exceeded the licensed thinking budget");
+        }
         if (match.found) {
             impl.preview.utf8_pending.clear();
             impl.preview.stop_pending = {};
@@ -778,7 +801,54 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         impl.terminalize(impl.preview, impl.preview_output, count);
         return complete(count, limit_reason);
     }
+    if (budgeted && impl.preview.thinking() &&
+        impl.preview.model_thinking_tokens == *impl.thinking_budget) {
+        impl.preview.control_pending = true;
+        return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
+    }
     return complete(count, FinishReason::None);
+}
+
+std::uint32_t
+OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
+    if (impl_ == nullptr || !impl_->thinking_budget || impl_->state.control_applied) {
+        return total_budget_remaining;
+    }
+    const DecoderState& s = impl_->state;
+    if (s.control_pending) return 0;
+    // Outside the channel one token may open it, and that token counts against the budget.
+    if (s.model_thinking_tokens >= *impl_->thinking_budget) return s.thinking() ? 0 : total_budget_remaining;
+    return std::min(total_budget_remaining, *impl_->thinking_budget - s.model_thinking_tokens);
+}
+
+std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept {
+    if (impl_ == nullptr || !impl_->state.control_pending) return {};
+    return impl_->thinking_control;
+}
+
+std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
+    if (impl_ == nullptr || !impl_->thinking_budget || impl_->state.control_applied) return 0;
+    return static_cast<std::uint32_t>(impl_->thinking_control.size());
+}
+
+void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
+    if (impl_ == nullptr) throw std::logic_error("output session is empty");
+    if (!impl_->thinking_budget || effective_output_tokens <= *impl_->thinking_budget) return;
+    if (effective_output_tokens - *impl_->thinking_budget < impl_->thinking_control.size() + 1U) {
+        throw std::invalid_argument(
+            "effective output capacity after the thinking budget must fit the channel close and "
+            "one post-close model token");
+    }
+}
+
+ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
+    if (impl_ == nullptr) return {};
+    return ThinkingBudgetStats{
+        .configured_budget     = impl_->thinking_budget,
+        .model_thinking_tokens = impl_->state.model_thinking_tokens,
+        .injected_tokens       = impl_->state.injected_tokens,
+        .applied               = impl_->state.control_applied,
+    };
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
@@ -796,8 +866,33 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
-runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId>, std::uint32_t) {
-    throw std::logic_error("Gemma output has no target control to preview");
+runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> tokens,
+                                                       std::uint32_t total_budget_remaining) {
+    if (impl_ == nullptr) throw std::logic_error("output session is empty");
+    if (impl_->state.terminal) throw std::logic_error("output session is already terminal");
+    if (impl_->preview_ready) throw std::logic_error("output session already has a preview");
+    const std::span<const TokenId> expected = pending_control_tokens();
+    if (expected.empty() || !std::ranges::equal(tokens, expected)) {
+        throw std::invalid_argument("thinking control preview requires the exact pending span");
+    }
+    if (tokens.size() > total_budget_remaining) {
+        throw std::invalid_argument("thinking control span exceeds the remaining output budget");
+    }
+    Impl& impl   = *impl_;
+    impl.preview = impl.state;
+    impl.preview_output.clear();
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        impl.feed_token(impl.preview, tokens[index], impl.preview_output,
+                        static_cast<std::uint32_t>(index + 1), nullptr);
+    }
+    if (impl.preview.thinking()) {
+        throw std::logic_error("the forced channel close did not end the thought channel");
+    }
+    impl.preview.control_pending = false;
+    impl.preview.control_applied = true;
+    impl.preview.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl.preview_ready           = true;
+    return runtime::OutputDecision{.accepted_tokens = static_cast<std::uint32_t>(tokens.size())};
 }
 
 std::uint32_t OutputSession::grammar_masks(std::span<const TokenId>, std::span<std::uint32_t>) {
@@ -848,10 +943,6 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         throw RequestError(RequestErrorKind::InvalidGrammar,
                            "this Gemma model does not support output constraints");
     }
-    if (thinking.budget) {
-        throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
-                           "this Gemma model does not support a thinking budget");
-    }
     const bool has_tools = prompt.tool_names && !prompt.tool_names->empty();
     if (has_tools && (tool_choice.mode == ToolChoiceMode::Required || tool_choice.allowed_names)) {
         throw RequestError(RequestErrorKind::InvalidToolConstraint,
@@ -869,6 +960,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     impl->channel_close    = impl_->channel_close;
     impl->call_open        = impl_->call_open;
     impl->call_close       = impl_->call_close;
+    impl->thinking_budget  = thinking.budget;
+    impl->thinking_control = {impl_->channel_close};
     impl->policy.strings   = caller_stop.strings;
     impl->policy.publish_stop_token = caller_stop.publish_stop_token;
     impl->policy.token_ids          = caller_stop.token_ids;

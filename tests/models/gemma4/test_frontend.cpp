@@ -201,6 +201,55 @@ int main() {
         expect(out.finish == FinishReason::OutputLimit, "the budget finishes the request");
     }
 
+    // A thinking budget: the channel's tokens count against it, and at the budget the session asks
+    // for <channel|> to be forced. After the forced close the model's tokens are the answer.
+    {
+        gemma::OutputSession session = frontend.make_output_session(
+            plain_prompt, {}, {}, ThinkingControlOptions{.budget = 4});
+        const std::vector<int> thought = tokenizer.encode("<|channel>thought\nlong long long long");
+        std::string reasoning, content;
+        const auto collect = [&](const gemma::PublishedOutput& output) {
+            for (const OutputDelta& delta : output) {
+                (delta.channel == OutputChannel::Reasoning ? reasoning : content) += delta.text;
+            }
+        };
+        runtime::OutputDecision decision{};
+        std::size_t fed = 0;
+        for (; fed < thought.size(); ++fed) {
+            expect(session.model_token_budget_remaining(100) > 0, "the budget admits each token");
+            const TokenId token = thought[fed];
+            decision = session.preview_model(std::span<const TokenId>(&token, 1), 100,
+                                             FinishReason::OutputLimit);
+            collect(session.commit_preview());
+            if (decision.continuation == runtime::ContinuationAction::ApplyTargetControl) break;
+        }
+        expect(fed == 3, "the fourth thinking token reaches the budget, after " +
+                             std::to_string(fed + 1) + " tokens");
+        expect(session.model_token_budget_remaining(100) == 0, "no model token passes a pending close");
+        const auto control = session.pending_control_tokens();
+        expect(control.size() == 1, "the forced span is one token");
+        if (control.size() == 1) {
+            const std::vector<TokenId> forced(control.begin(), control.end());
+            const auto applied = session.preview_control(forced, 100);
+            expect(applied.accepted_tokens == 1, "the close is accepted");
+            collect(session.commit_preview());
+        }
+        const std::vector<int> answer = tokenizer.encode("Four.<turn|>");
+        for (const int token : answer) {
+            const TokenId id = token;
+            decision = session.preview_model(std::span<const TokenId>(&id, 1), 100,
+                                             FinishReason::OutputLimit);
+            collect(session.commit_preview());
+            if (decision.finish_reason != FinishReason::None) break;
+        }
+        // The four budgeted tokens are <|channel>, "thought", "\n" and "long".
+        expect(reasoning == "long", "the reasoning is cut at the budget: '" + reasoning + "'");
+        expect(content == "Four.", "the answer follows the forced close: '" + content + "'");
+        const ThinkingBudgetStats stats = session.thinking_stats();
+        expect(stats.applied && stats.model_thinking_tokens == 4 && stats.injected_tokens == 1,
+               "the stats record the forced close");
+    }
+
     // Tool calls.
     PromptInput with_tools = plain;
     with_tools.options.tool_jsons.push_back(

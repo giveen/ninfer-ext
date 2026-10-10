@@ -92,17 +92,16 @@ public:
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();
 
-    // Gemma has no thinking budget and no forced control suffix: the model budget is the request's,
-    // and no control is ever pending.
+    // A thinking budget counts the model's tokens inside its thought channel. When they reach it,
+    // the session asks the Engine to force `<channel|>`, which closes the channel, and the model
+    // continues with its answer.
     [[nodiscard]] std::uint32_t
-    model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
-        return total_budget_remaining;
-    }
-    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept { return {}; }
-    [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept { return 0; }
+    model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
+    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
+    [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept;
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
-    void validate_generation_capacity(std::uint32_t) const noexcept {}
+    void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
 
     // No output constraint reaches this session: the Program consumes no token masks, so the Engine
     // refuses a constrained request before it gets here.
@@ -117,7 +116,7 @@ public:
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
-    [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept { return {}; }
+    [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
 private:

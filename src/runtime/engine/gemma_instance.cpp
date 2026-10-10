@@ -147,11 +147,40 @@ ContextTransactionReserveStatus GemmaProgram::reserve_active_capture_with_pressu
     std::optional<CheckpointRef>, bool, qwen::CapturePressurePlan&&, CancellationFlagView) {
     unsupported("prefix capture");
 }
-ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandle>,
-                                                   std::span<const TokenId>, std::uint32_t,
+// The forced span (the thinking budget's channel close) follows the last accepted token, which no
+// pass has consumed yet: that token and every forced token but the last run now, and the last one
+// becomes the next decode's input, exactly as a sampled token would.
+ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandle> sequences,
+                                                   std::span<const TokenId> tokens,
+                                                   std::uint32_t row_stride,
                                                    std::span<const std::optional<std::uint32_t>>,
-                                                   ExecutionTiming*) {
-    throw std::logic_error("Gemma output has no forced control tokens");
+                                                   ExecutionTiming* failed_timing) {
+    if (sequences.empty() || row_stride == 0 || tokens.size() != sequences.size() * row_stride) {
+        throw std::invalid_argument("forced-token rows are invalid");
+    }
+    ExecutionTimingRecorder timing(ExecutionTimingPhase::Submit, failed_timing);
+    std::vector<TokenId> span(row_stride);
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        Lane* lane = valid_lane(sequences[row]);
+        if (lane == nullptr || lane->phase != Phase::Active || lane->pending || lane->next_input < 0) {
+            throw std::logic_error("forced tokens reached a sequence that is not decoding");
+        }
+        const auto row_tokens = tokens.subspan(row * row_stride, row_stride);
+        if (static_cast<std::int64_t>(program_.position(static_cast<std::int32_t>(sequences[row].lane_))) +
+                row_stride + 1 > program_.capacity()) {
+            throw std::logic_error("forced tokens exceed the sequence's context capacity");
+        }
+        span[0] = lane->next_input;
+        std::copy(row_tokens.begin(), row_tokens.end() - 1, span.begin() + 1);
+        const auto started = Clock::now();
+        program_.prefill(static_cast<std::int32_t>(sequences[row].lane_), span, execution_);
+        lane->next_input = row_tokens.back();
+        lane->timings.decode_seconds += seconds_since(started);
+    }
+    timing.begin_wait();
+    device_.synchronize();
+    timing.end_wait();
+    return timing.finish();
 }
 
 // ---- Program ------------------------------------------------------------------------------------
