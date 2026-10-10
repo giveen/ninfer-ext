@@ -2,7 +2,7 @@
 
 // Gemma 4 text parameters, in the vocabulary the artifact binds.
 //
-// The stored names and shapes are recorded in docs/maintainer/gemma4-model.md §8.1 and were read
+// The stored names and shapes are recorded in docs/maintainer/gemma4-model.md §9 and were read
 // from the artifact itself. Two structural facts follow from what is stored:
 //
 //  - The query, key and value parameters are slices of one fused projection object per layer, so

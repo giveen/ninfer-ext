@@ -538,7 +538,7 @@ def gemma4_31b_g0(model, recipe, sources):
     for the O and MLP projections in the first six layers, every global layer and the local layer before
     it. The cheaper layout this project shipped first - FP8 embedding, NVFP4 MLP everywhere - leaves the
     head faithful but the logit tails further from HuggingFace than the per-layer agreement predicts, and
-    the tails are what a KLD ranking reads. See section 25 of the model reference.
+    the tails are what a KLD ranking reads. See docs/maintainer/gemma4-model.md §9.
     """
     _optional(model, recipe)
     # Layers whose O and MLP projections stay at FP8: the first six, then every global layer (5, 11, ...

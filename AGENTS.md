@@ -32,8 +32,10 @@ approval requirements beyond the user's instructions and the actual execution en
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` and `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, whose
-routed experts stay in pinned Host memory behind a Program-owned device expert cache); official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. The implementation targets `sm_120a` and
+routed experts stay in pinned Host memory behind a Program-owned device expert cache), and
+`Gemma4ForCausalLM` text (Gemma 4 31B, its own Program behind the same Engine; see
+`docs/maintainer/gemma4-model.md` for what it does not support yet); official Qwen3.6/3.8 artifacts
+and user recipes use the same architecture, binding and execution path. The implementation targets `sm_120a` and
 is tuned on NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
