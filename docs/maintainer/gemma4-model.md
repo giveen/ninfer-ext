@@ -461,24 +461,114 @@ upper bound (section 4); a pass never ends inside an image, and the Engine's pre
 same way, so an image's keys are always in the pass that attends them. Scoring refuses images: its
 128-token passes are narrower than an image block.
 
-**Cost.** Encoding takes 27-33 ms per image of about 2,300 patches on the RTX 5090 (Q8: 26-28; the Q6
-routes borrow Gemma's text list, untuned for these shapes). A one-image prompt
+**Cost.** Encoding takes 27-33 ms per image of about 2,300 patches on the RTX 5090 (Q8: 26-28;
+since section 12c the Q6 routes are selected for these shapes rather than borrowed from Gemma's text
+list, which removes 12% of the encoder's Linear time at 2,520 patches and 1.3x to 3.6x at the shorter
+extents a non-square image produces, while the Q8 tower still wins on the widest count). A one-image prompt
 of 280 tokens served with `--vision --spec mtp` has a TTFT of 192 ms; a 19 MP JPEG adds about 200 ms of
 single-threaded decode and resize on the request thread (13).
+
+## 12c. Linear route tuning (Q6 and Q5)
+
+The Q6 and Q5 A16 routes for every Gemma 4 geometry were selected by a temporary private-launcher
+sweep, then verified through the public Linear benchmark and the Op conformance tests. The sweep
+harness is development scratch: it includes the private launcher headers, which
+[linear-benchmark](../maintainer/linear-benchmark.md) forbids the retained benchmark, and it was
+deleted when the sweep ended. It reproduced `bench/ops/linear_bench.cu`'s fixture and cold-cache
+timing exactly, which the table below depends on: at four of six sampled points its production row
+matched the public benchmark to the last 0.001 us, and within 3% at the other two.
+
+**What was wrong.** `select_q6_gemma4` sent every Gemma text geometry, and (via the dispatch table)
+every vision and drafter geometry, to the route list tuned for `N=34816, K=5120`. That list assumes
+a row extent sixteen times wider than most Gemma shapes have, so from 32 to 384 tokens it leaves the
+work to sliced-K routes with too few blocks, and its tile ladder starts where the geometry wants to
+stop. The vision tower is the extreme case: an encoder call uses every patch of one image as its
+token extent, so the extent is 9..2520 rather than a request length, and none of those extents
+resembles a language-model pass.
+
+**Measured, on the shipped route** (public Linear benchmark, median of 20 cold-cache samples,
+before -> after):
+
+| Geometry | Role | T | before | after | gain |
+|---|---|---:|---:|---:|---:|
+| `5376x21504` | MLP down, Q6 | 64 | 317.4 us | 165.9 us | 1.91x |
+| `4096x5376` | sliding key/value | 64 | 81.9 | 43.0 | 1.90x |
+| `2048x5376` | global key = value | 128 | 124.9 | 41.0 | 3.05x |
+| `5376x8192` | sliding output | 64 | 122.9 | 63.5 | 1.94x |
+| `21504x5376` | MLP gate/up, Q5 | 128 | 251.9 | 168.0 | 1.50x |
+| `1152x4352` | vision MLP down | 384 | 100.4 | 47.1 | 2.13x |
+| `1024x10752` | drafter pre-projection | 2 | 26.6 | 18.4 | 1.44x |
+| `16384x1024` | drafter attention | 1 | 16.4 | 14.3 | 1.14x |
+| `262144x1024` | drafter tie head | 1 | 161.8 | 143.4 | 1.13x |
+
+The extents that carry the bulk of a real request were already the best registered route and are
+unchanged: at T=512 and T=1024 the wide shapes measure 4096x5376 139.3 us, 2048x5376 139.3 us,
+8192x5376 546.8 us and 21504x5376 1206.3 us before and after, and the Q5 pair likewise. The gaps
+are in the prefill *tail*, in MTP verify widths, and in vision.
+
+**Two corrections the sweep forced.** A first attempt gave `4096x5376` and `8192x5376` an 80-token
+tile across 129..768 tokens; at 512 tokens that tile ends in a masked tail and cost 1.45x, and at
+192/256 it lost to the inherited 96/128-token tiles. Both shapes now hand everything above their
+measured crossover back to the inherited list, keeping a 1.12x gain at 384/768 unclaimed rather than
+risking the much more common prefill width. The same review removed a sliced route from
+`2048x5376` above 512 tokens, where the 128-token tile is 1.36x better.
+
+**Vision has one more finding.** For a 128-token MMA tile, a patch count that is *not* a multiple of
+128 ends in a masked tail of up to 127 columns, which costs more than the tile's width is worth:
+at 2376/2400/2520 patches `t128` measures 65.5 us on `1152x1152` against 53.2-55.3 for a 96-token
+tile, and `1152x4352` measures 229-233 against 180-182. Those two selectors therefore choose
+`t128` only when the patch count divides by 128 and `t96` otherwise. `4352x1152` has no such
+preference and keeps `t128`.
+
+**What the sweep did not fix.** Decode is 88% Linear and runs at about two thirds of the
+weight-streaming rate, but the sweep found only a 1.06-1.14x spread among the registered
+single-token routes: at T=1 the shapes that matter are already at or near the best *registered*
+candidate. The remaining gap needs new instances rather than a new selection - `4096x5376` at T=1
+streams its 16.5 MB of weights at 806 GB/s against the measured 1674.5 GB/s read ceiling, so a
+single-token route with more rows in flight is the next lever. That is not in this change.
+
+**Coverage and limits.** `tests/ops/linear/test_q6_a16.cpp` and `test_q5_a16.cpp` already qualify
+every Gemma geometry against the FP64 oracle, at T = 1, 2, 5, 17, 64, 128 and 1000 for the text
+shapes, 9, 36, 630, 2340 and 2520 for vision, and T = 1 for the drafter, so the changed intervals are
+covered rather than assumed. Sweep-to-sweep repeatability at a fixed point and route measured 0-5%
+(with 4096x5376 at T=512 and 1024 showing 4% and 1.5% between runs of the *unmodified* binary), so
+gains below about 10% are not distinguishable and no route was changed for one. Two routes that the
+sweep suggested but that measured inside that band were left alone.
+
+**Product effect.** Two alternating A/B rounds against the unmodified build (the workflow warns that
+back-to-back runs drift by about 1% from heat, so the builds were swapped rather than compared across
+sessions) measure the standard matrix unchanged:
+
+| Test | before | after | |
+|---|---:|---:|---:|
+| pp1024 | 2289.3 / 2261.0 | 2259.2 / 2240.0 | 0.989x |
+| pp8192 | 1719.6 / 1688.7 | 1703.1 / 1688.2 | 0.995x |
+| tg128 | 48.5 / 47.9 | 47.9 / 47.7 | 0.991x |
+
+That is expected rather than disappointing: `ninfer_bench` prefills at the 1024-token chunk the
+Engine picks by default and decodes at T=1, and both were already the best registered route. The
+change is worth what it does elsewhere, and elsewhere is measurable: `pp1150` - one full pass and one
+126-token tail - with `--spec mtp --draft-tokens 5` measures 2012.8 -> 2113.1 prefill tok/s (1.05x)
+and 201.4 -> 203.5 decode tok/s (1.01x), because that tail is 11% of the request's prefill work and
+runs 1.7x faster on `4096x5376`. A request whose prompt divides evenly by 1024 sees none of it.
+
+The absolute numbers are 5-7% below the figures in section 12, which were taken in an earlier session;
+a mid-session comparison of unmodified builds drifts by up to 4% on repeated points, so the section 12
+table and this one should not be differenced across sessions.
 
 ## 13. Not done
 
 | Item | Why it matters | What it needs |
 |---|---|---|
 | Prefix reuse | an agent loop re-prefills its whole history every turn, at the prefill rates above | the D1-b move of the continuation, shared-prefix and capture types into `runtime/contract`; ring-snapshot checkpoints as the state image |
-| Tuned prefill linears | the wide Q6/Q5 routes borrow lists tuned for Qwen shapes | a route sweep at Gemma's N and K |
+| Decode single-token routes | at T=1 the wide shapes stream 806-1246 GB/s against the measured 1674.5 GB/s read ceiling, and no *registered* candidate is more than 1.14x better there | new instances rather than a new selection: more rows in flight per block, which is a kernel change, not a route change (12c) |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
 | CUDA Graphs | decode launch overhead | graph capture per lane count |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
 | JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
-| MTP with several lanes in one pass, a cheaper drafter step | each lane verifies alone; drafting is 3-7 ms of a 7-draft round, unprofiled | the lane batching above; a drafter profile, then e.g. a Q8 head qualified against acceptance |
+| MTP with several lanes in one pass, a cheaper drafter step | each lane verifies alone; drafting is 3-7 ms of a 7-draft round | the lane batching above. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
 
 ## 14. What the sibling engines settle
 
