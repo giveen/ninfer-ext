@@ -69,10 +69,32 @@ struct DraftWeights {
     std::vector<DraftLayerWeights> layers;
 };
 
+// One vision encoder layer: sandwich norms, q/k/v with per-head q and k norms (q and k rows stored
+// in the RoPE Op's layout), and a GeGLU MLP. There is no layer scalar.
+struct VisionLayerWeights {
+    WeightId input_norm, post_attention_norm, pre_feedforward_norm, post_feedforward_norm;
+    WeightId query, key, value, query_norm, key_norm, output;
+    MlpWeights mlp;
+};
+
+struct VisionWeights {
+    // [hidden, 3 * 16 * 16] over a patch's pixels in (row, column, channel) order.
+    WeightId patch_embedding;
+    // [2 * position_embedding_size, hidden]: the x table, then the y table.
+    WeightId position_embedding;
+    // FP32 [hidden] standardization of the pooled tokens.
+    WeightId std_bias, std_scale;
+    // [text hidden, hidden] from the weightless-normed soft tokens.
+    WeightId embedding_projection;
+    std::vector<VisionLayerWeights> layers;
+};
+
 struct ModelWeights {
     TextWeights text;
     // Bound only when the Engine runs MTP speculation.
     std::optional<DraftWeights> draft;
+    // Bound only when the Engine accepts images.
+    std::optional<VisionWeights> vision;
 };
 
 } // namespace ninfer::models::gemma4

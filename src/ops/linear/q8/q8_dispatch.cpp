@@ -61,6 +61,10 @@ constexpr std::array kShapes{
     ShapeEntry{16384, 2048, select_q8_generic},
     ShapeEntry{2048, 6144, select_q8_generic},
     ShapeEntry{32000, 2048, select_q8_generic},
+    // Gemma 4's vision tower: q/k/v and output, and the MLP at its stored width (4304 padded to 4352).
+    ShapeEntry{1152, 1152, select_q8_generic},
+    ShapeEntry{4352, 1152, select_q8_generic},
+    ShapeEntry{1152, 4352, select_q8_generic},
 };
 } // namespace
 

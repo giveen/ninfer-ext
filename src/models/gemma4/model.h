@@ -45,6 +45,11 @@ public:
     // The assistant drafter's config, when the drafter was bound (MTP speculation).
     [[nodiscard]] const std::optional<DraftConfig>& draft_config() const noexcept { return draft_; }
 
+    // The vision tower's config, when the tower was bound (image input).
+    [[nodiscard]] const std::optional<VisionConfig>& vision_config() const noexcept {
+        return vision_;
+    }
+
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
@@ -64,7 +69,8 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
-    Model(TextConfig config, std::optional<DraftConfig> draft, ModelWeights weights,
+    Model(TextConfig config, std::optional<DraftConfig> draft, std::optional<VisionConfig> vision,
+          ModelWeights weights,
           std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
           artifact::MaterializedArtifact backing);
 
@@ -72,6 +78,7 @@ private:
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     std::optional<DraftConfig> draft_;
+    std::optional<VisionConfig> vision_;
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<float> layer_scalars_;

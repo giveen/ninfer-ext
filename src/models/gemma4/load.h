@@ -40,6 +40,7 @@ public:
 
     [[nodiscard]] const TextConfig& config() const;
     [[nodiscard]] const std::optional<DraftConfig>& draft_config() const;
+    [[nodiscard]] const std::optional<VisionConfig>& vision_config() const;
     [[nodiscard]] const TextResources& resources() const;
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;

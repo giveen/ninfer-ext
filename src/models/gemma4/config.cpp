@@ -159,6 +159,66 @@ TextConfig parse_text_config(const artifact::Json& value) {
     return out;
 }
 
+VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& text) {
+    const auto vision_fail = [](const std::string& message) -> void {
+        throw artifact::ArtifactError("Gemma 4 vision config: " + message);
+    };
+    if (!value.is_object()) vision_fail("config must be an object");
+    static constexpr const char* kMembers[] = {
+        "architectures", "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "head_dim", "patch_size",
+        "pooling_kernel_size", "position_embedding_size", "rms_norm_eps", "rope_theta",
+        "hidden_act", "soft_tokens_per_image", "output_hidden_size", "image_token_id",
+        "boi_token_id", "eoi_token_id"};
+    for (const auto& member : value.items()) {
+        bool known = false;
+        for (const char* allowed : kMembers) { known = known || member.key() == allowed; }
+        if (!known) vision_fail("unknown member " + member.key());
+    }
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures.at(0) != "Gemma4VisionModel" || value.at("model_type") != "gemma4_vision") {
+        vision_fail("architectures must be [Gemma4VisionModel]");
+    }
+    VisionConfig out;
+    out.hidden_size             = positive(value, "hidden_size");
+    out.intermediate_size       = positive(value, "intermediate_size");
+    out.num_hidden_layers       = positive(value, "num_hidden_layers");
+    out.num_attention_heads     = positive(value, "num_attention_heads");
+    out.head_dim                = positive(value, "head_dim");
+    out.patch_size              = positive(value, "patch_size");
+    out.pooling_kernel_size     = positive(value, "pooling_kernel_size");
+    out.position_embedding_size = positive(value, "position_embedding_size");
+    out.soft_tokens_per_image   = positive(value, "soft_tokens_per_image");
+    out.output_hidden_size      = positive(value, "output_hidden_size");
+    out.rms_norm_eps            = number(value, "rms_norm_eps");
+    out.rope_theta              = number(value, "rope_theta");
+    out.image_token_id          = static_cast<std::int32_t>(positive(value, "image_token_id"));
+    out.boi_token_id            = static_cast<std::int32_t>(positive(value, "boi_token_id"));
+    out.eoi_token_id            = static_cast<std::int32_t>(positive(value, "eoi_token_id"));
+    if (value.at("hidden_act") != "gelu_pytorch_tanh") vision_fail("hidden_act must be gelu_pytorch_tanh");
+    // The executed geometry: the dense D72/H16 attention and its 2-D RoPE, 3x3 pooling of 16-pixel
+    // patches, and one image block per 512-token prefill pass.
+    if (out.hidden_size != 1152 || out.num_attention_heads != 16 || out.head_dim != 72 ||
+        positive(value, "num_key_value_heads") != 16) {
+        vision_fail("the tower must be 1152 wide with 16 heads of 72");
+    }
+    if (out.patch_size != 16 || out.pooling_kernel_size != 3) {
+        vision_fail("patches must be 16 pixels pooled 3x3");
+    }
+    if (out.soft_tokens_per_image != 280) vision_fail("soft_tokens_per_image must be 280");
+    if (out.output_hidden_size != text.hidden_size) {
+        vision_fail("output_hidden_size must be the text hidden size");
+    }
+    if (out.image_token_id >= static_cast<std::int32_t>(text.vocab_size) ||
+        out.boi_token_id >= static_cast<std::int32_t>(text.vocab_size) ||
+        out.eoi_token_id >= static_cast<std::int32_t>(text.vocab_size)) {
+        vision_fail("image token ids must be in the vocabulary");
+    }
+    if (!(out.rope_theta > 0.0F)) vision_fail("rope_theta must be positive");
+    return out;
+}
+
 DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& target) {
     const auto draft_fail = [](const std::string& message) -> void {
         throw artifact::ArtifactError("Gemma 4 drafter config: " + message);

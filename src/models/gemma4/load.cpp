@@ -151,11 +151,50 @@ DraftWeights bind_draft(Bindings& bindings, const TextConfig& target, const Draf
     return out;
 }
 
+VisionWeights bind_vision(Bindings& bindings, const VisionConfig& vision) {
+    const std::uint64_t hidden       = vision.hidden_size;
+    const std::uint64_t intermediate = vision.intermediate_size;
+    const std::uint64_t patch        = 3ULL * vision.patch_size * vision.patch_size;
+    VisionWeights out;
+    out.patch_embedding = bindings.parameter("vision/patch_embedding", {hidden, patch});
+    out.position_embedding = bindings.parameter(
+        "vision/position_embedding", {2ULL * vision.position_embedding_size, hidden}, QType::BF16);
+    out.std_bias  = bindings.parameter("vision/std_bias", {hidden}, kScalarFormat);
+    out.std_scale = bindings.parameter("vision/std_scale", {hidden}, kScalarFormat);
+    out.embedding_projection = bindings.parameter("vision/embedding_projection",
+                                                  {vision.output_hidden_size, hidden});
+    for (std::size_t layer = 0; layer < vision.num_hidden_layers; ++layer) {
+        const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
+        VisionLayerWeights weights;
+        weights.input_norm = bindings.parameter(prefix + "input_norm", {hidden}, kNormFormat);
+        weights.post_attention_norm =
+            bindings.parameter(prefix + "post_attention_norm", {hidden}, kNormFormat);
+        weights.pre_feedforward_norm =
+            bindings.parameter(prefix + "pre_feedforward_norm", {hidden}, kNormFormat);
+        weights.post_feedforward_norm =
+            bindings.parameter(prefix + "post_feedforward_norm", {hidden}, kNormFormat);
+        weights.query = bindings.parameter(prefix + "attention/query", {hidden, hidden});
+        weights.key   = bindings.parameter(prefix + "attention/key", {hidden, hidden});
+        weights.value = bindings.parameter(prefix + "attention/value", {hidden, hidden});
+        weights.query_norm =
+            bindings.parameter(prefix + "attention/query_norm", {vision.head_dim}, kNormFormat);
+        weights.key_norm =
+            bindings.parameter(prefix + "attention/key_norm", {vision.head_dim}, kNormFormat);
+        weights.output   = bindings.parameter(prefix + "attention/output", {hidden, hidden});
+        weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden});
+        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden});
+        weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate});
+        out.layers.push_back(weights);
+    }
+    return out;
+}
+
 } // namespace
 
 struct LoadPlan::Impl {
     TextConfig config;
     std::optional<DraftConfig> draft;
+    std::optional<VisionConfig> vision;
     TextResources resources;
     LoadOptions options;
     ModelWeights weights;
@@ -195,6 +234,8 @@ LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 const TextConfig& LoadPlan::config() const { return impl_->config; }
 
 const std::optional<DraftConfig>& LoadPlan::draft_config() const { return impl_->draft; }
+
+const std::optional<VisionConfig>& LoadPlan::vision_config() const { return impl_->vision; }
 
 const TextResources& LoadPlan::resources() const { return impl_->resources; }
 
@@ -236,6 +277,14 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->draft = parse_draft_config(reader.directory().component("mtp").config, out->config);
         out->weights.draft = bind_draft(bindings, out->config, *out->draft);
     }
+    if (options.vision) {
+        if (!reader.directory().components.contains("vision")) {
+            throw artifact::ArtifactError(
+                "image input needs the vision tower: convert with --components text,vision");
+        }
+        out->vision = parse_vision_config(reader.directory().component("vision").config, out->config);
+        out->weights.vision = bind_vision(bindings, *out->vision);
+    }
     out->references.reserve(bindings.weights().size());
     for (const auto& pending : bindings.weights()) { out->references.push_back(pending.reference); }
     // The plan's physical demand is whatever Binding produced; finishing consumes the Binder, so it
@@ -244,10 +293,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     return LoadPlan(std::move(out));
 }
 
-Model::Model(TextConfig config, std::optional<DraftConfig> draft, ModelWeights weights,
+Model::Model(TextConfig config, std::optional<DraftConfig> draft,
+             std::optional<VisionConfig> vision, ModelWeights weights,
              std::vector<BoundWeight> bound, std::vector<float> layer_scalars,
              artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), draft_(std::move(draft)),
+      vision_(std::move(vision)),
       weights_(std::move(weights)), bound_(std::move(bound)),
       layer_scalars_(std::move(layer_scalars)) {}
 
@@ -298,7 +349,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         for (const auto& layer : data->weights.draft->layers) read_scalar(layer.layer_scalar);
     }
     return std::unique_ptr<Model>(new Model(std::move(data->config), std::move(data->draft),
-                                            std::move(data->weights), std::move(bound),
+                                            std::move(data->vision), std::move(data->weights), std::move(bound),
                                             std::move(layer_scalars), std::move(backing)));
 }
 

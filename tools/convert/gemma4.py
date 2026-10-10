@@ -9,17 +9,32 @@ proportional RoPE, attention scale exactly 1.0, and a final logit soft-cap of 30
 The text tower is mapped, and with the `mtp` component the official assistant drafter
 (`Gemma4AssistantForCausalLM`, e.g. google/gemma-4-31B-it-assistant) from a separate source. The
 drafter has no key or value projections: each of its layers attends to the target's cache of the same
-kind, the last sliding and the last global layer. The vision tower is a later phase.
+kind, the last sliding and the last global layer.
+
+The `vision` component is the image encoder (a 27-layer ViT over 16-pixel patches with 2-D RoPE, 3x3
+average pooling and standardization) and the projection of its soft tokens into the text width. Its
+query and key rows are stored with the middle two 18-dim blocks of every 72-wide head swapped, which
+turns Gemma's axial RoPE (x rotates pairs (j, j+18), y pairs (36+j, 54+j)) into the 2-D layout the
+vision RoPE Op rotates (pairs (i, i+36), axis 0 for i < 18). Scores are unchanged because q and k
+move together; the per-head norm weights move with them. The MLP's intermediate width (4304) is stored
+padded to 4352 with zero gate and up rows and zero down columns: GeGLU maps a zero gate and up to an
+exact zero, so the padding adds nothing, and the padded width is a multiple of 128 as the groupwise
+routes need.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
+
+import torch
 from typing import Mapping
 
-from .model import Model
+from .model import Model, Parameter
 from .qwen3_5 import _Builder, _f32, _fixed, _positive
+from .sources.logical import LogicalSource, transpose_source
+from .sources.safetensors import tensor_source
 from .sources.safetensors import SafetensorsSource
 from .resources import load_resources
 
@@ -220,6 +235,102 @@ def draft_config(source: dict, target: dict) -> dict:
     }
 
 
+# The vision tower's structure, and the image processor constants it is trained with.
+_VISION = {
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "num_hidden_layers": 27,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 16,
+    "head_dim": 72,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "position_embedding_size": 10240,
+}
+_VISION_ROPE_THETA = 100.0
+# The stored MLP width: the intermediate padded to a multiple of 128.
+_VISION_PADDED_INTERMEDIATE = 4352
+# Soft tokens per image: the processor's default budget, and the only one the converted artifact
+# serves (one image block must fit one 512-token prefill pass).
+_VISION_SOFT_TOKENS = 280
+
+
+def vision_config(source: dict, processor: dict, text: dict) -> dict:
+    """The `vision` component config, checked against the image processor it is trained with."""
+    raw = source.get("vision_config")
+    if not isinstance(raw, dict) or raw.get("model_type") != "gemma4_vision":
+        raise ValueError("the Gemma 4 checkpoint has no gemma4_vision tower")
+    for key, expected in _VISION.items():
+        if raw.get(key) != expected:
+            raise ValueError(f"Gemma 4 31B vision expects {key} {expected}, got {raw.get(key)}")
+    _fixed(raw, "hidden_activation", "gelu_pytorch_tanh", "vision")
+    _fixed(raw, "attention_bias", False, "vision")
+    _fixed(raw, "use_clipped_linears", False, "vision")
+    _fixed(raw, "standardize", True, "vision")
+    _fixed(raw, "global_head_dim", _VISION["head_dim"], "vision")
+    rope = raw.get("rope_parameters")
+    # The checkpoint names the type "default"; the tower's rotary embedding is axial regardless.
+    if not isinstance(rope, dict) or _f32(rope.get("rope_theta"), "vision.rope_theta") != \
+            _VISION_ROPE_THETA:
+        raise ValueError("Gemma 4 vision expects RoPE theta 100")
+    text_raw = source.get("text_config", {})
+    if text_raw.get("use_bidirectional_attention") != "vision":
+        raise ValueError("Gemma 4 31B expects bidirectional sliding attention within an image")
+
+    image = processor.get("image_processor")
+    if not isinstance(image, dict) or image.get("image_processor_type") != "Gemma4ImageProcessor":
+        raise ValueError("processor_config.json needs a Gemma4ImageProcessor")
+    for key, expected in (("patch_size", _VISION["patch_size"]),
+                          ("pooling_kernel_size", _VISION["pooling_kernel_size"]),
+                          ("max_soft_tokens", _VISION_SOFT_TOKENS),
+                          ("do_resize", True), ("do_rescale", True), ("do_normalize", False),
+                          ("do_convert_rgb", True), ("resample", 3)):
+        if image.get(key) != expected:
+            raise ValueError(f"the Gemma 4 image processor expects {key} {expected!r}, "
+                             f"got {image.get(key)!r}")
+    if abs(float(image.get("rescale_factor", 0.0)) - 1.0 / 255.0) > 1e-12:
+        raise ValueError("the Gemma 4 image processor expects rescale_factor 1/255")
+
+    ids = {}
+    for key in ("image_token_id", "boi_token_id", "eoi_token_id"):
+        ids[key] = _positive(source.get(key), key)
+    return {
+        "architectures": ["Gemma4VisionModel"],
+        "model_type": "gemma4_vision",
+        **_VISION,
+        "intermediate_size": _VISION_PADDED_INTERMEDIATE,
+        "rms_norm_eps": _f32(raw.get("rms_norm_eps", 1e-6), "vision.rms_norm_eps"),
+        "rope_theta": _VISION_ROPE_THETA,
+        "hidden_act": "gelu_pytorch_tanh",
+        "soft_tokens_per_image": _VISION_SOFT_TOKENS,
+        "output_hidden_size": text["hidden_size"],
+        **ids,
+    }
+
+
+def _swapped_head_rows(heads: int, head_dim: int) -> tuple[tuple[int, int], ...]:
+    """Row ranges that store each head's blocks in the order [0, 2, 1, 3] of four quarter-heads."""
+    quarter = head_dim // 4
+    ranges = []
+    for head in range(heads):
+        base = head * head_dim
+        for block in (0, 2, 1, 3):
+            ranges.append((base + block * quarter, base + (block + 1) * quarter))
+    return tuple(ranges)
+
+
+def _zero_padded(source: LogicalSource, shape: tuple[int, int]) -> LogicalSource:
+    """`source` in the top-left corner of a zero matrix of `shape`."""
+    rows, columns = source.shape
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        padded = torch.zeros(shape, dtype=torch.float32)
+        padded[:rows, :columns] = source.values().reshape(rows, columns).float()
+        return padded.reshape(-1)[begin:end]
+
+    return LogicalSource(shape, f"zero_padded({source.label}, {shape})", read)
+
+
 class _Gemma4Builder(_Builder):
     """Maps the Gemma 4 text tower: four norms per layer, a layer scalar, and two attention kinds."""
 
@@ -227,6 +338,82 @@ class _Gemma4Builder(_Builder):
         # Plain RMSNorm (no `1 + w`) and K-norm-of-V are stored as plain weights; `direct`
         # keeps them BF16.
         self.add(name, store, source_name, (width,), direct="bf16")
+
+    def swapped_vector(self, name, store, source_name, width):
+        """A per-head norm weight with its middle two quarters swapped, like the q and k rows."""
+        quarter = width // 4
+
+        def factory(selected, format=None):
+            if format is not None:
+                raise ValueError(f"{name}: a norm weight has no encoded source")
+            ref = tensor_source(selected, source_name, (2, 2, quarter), source_shape=(width,))
+            return transpose_source(ref, (1, 0, 2), (width,))
+
+        self.model.add(Parameter(name, (width,), factory(store), factory, (), "bf16",
+                                 residency=name.split("/", 1)[0]))
+
+    def padded_matrix(self, name, store, source_name, source_shape, shape, inputs):
+        """A matrix stored zero-padded to `shape`; the padding is read as values, never encoded."""
+
+        def factory(selected, format=None):
+            if format is not None:
+                raise ValueError(f"{name}: a padded matrix has no encoded source")
+            return _zero_padded(tensor_source(selected, source_name, source_shape), shape)
+
+        self.model.add(Parameter(name, shape, factory(store), factory, tuple(inputs), "bf16",
+                                 residency=name.split("/", 1)[0]))
+
+    def vision(self, store, vision):
+        h = vision["hidden_size"]
+        intermediate = _VISION["intermediate_size"]
+        padded = vision["intermediate_size"]
+        heads, head_dim = vision["num_attention_heads"], vision["head_dim"]
+        patch = 3 * vision["patch_size"] ** 2
+        positions = vision["position_embedding_size"]
+        tower = "model.vision_tower."
+        # The patch projection reads a patch's pixels in (row, column, channel) order, which is the
+        # processor's patch layout, so the weight is stored as it is.
+        self.add("vision/patch_embedding", store, tower + "patch_embedder.input_proj.weight",
+                 (h, patch), inputs=("vision/patch_input",))
+        # The x table then the y table: row x of the first half and row 10240 + y of the second.
+        self.add("vision/position_embedding", store,
+                 tower + "patch_embedder.position_embedding_table", (2 * positions, h),
+                 source_shape=(2, positions, h))
+        self.add("vision/std_bias", store, tower + "std_bias", (h,), direct="fp32")
+        self.add("vision/std_scale", store, tower + "std_scale", (h,), direct="fp32")
+        swapped = _swapped_head_rows(heads, head_dim)
+        for index in range(vision["num_hidden_layers"]):
+            prefix = f"vision/layers/{index}/"
+            source_prefix = tower + f"encoder.layers.{index}."
+            for role, source in (("input_norm", "input_layernorm"),
+                                 ("post_attention_norm", "post_attention_layernorm"),
+                                 ("pre_feedforward_norm", "pre_feedforward_layernorm"),
+                                 ("post_feedforward_norm", "post_feedforward_layernorm")):
+                self.weight_vector(prefix + role, store, source_prefix + source + ".weight", h)
+            attention = prefix + "attention/"
+            for role, source in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj")):
+                self.add(attention + role, store,
+                         source_prefix + "self_attn." + source + ".linear.weight", (h, h),
+                         rows=None if role == "value" else swapped,
+                         inputs=(prefix + "attention_input",))
+            self.group(*(attention + role for role in ("query", "key", "value")))
+            for role, source in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
+                self.swapped_vector(attention + role, store,
+                                    source_prefix + "self_attn." + source + ".weight", head_dim)
+            self.add(attention + "output", store, source_prefix + "self_attn.o_proj.linear.weight",
+                     (h, h), inputs=(attention + "attended",))
+            for role in ("gate", "up"):
+                self.padded_matrix(prefix + "mlp/" + role, store,
+                                   source_prefix + "mlp." + role + "_proj.linear.weight",
+                                   (intermediate, h), (padded, h), (prefix + "mlp_input",))
+            self.padded_matrix(prefix + "mlp/down", store,
+                               source_prefix + "mlp.down_proj.linear.weight", (h, intermediate),
+                               (h, padded), (prefix + "mlp/product",))
+        # The pooled, standardized soft tokens are RMS-normalized without a weight and projected into
+        # the text width.
+        self.add("vision/embedding_projection", store,
+                 "model.embed_vision.embedding_projection.weight",
+                 (vision["output_hidden_size"], h), inputs=("vision/soft_tokens",))
 
     def draft_block(self, prefix, source_prefix, store, draft, target, kind):
         """One drafter layer: the target layer's body without key and value projections."""
@@ -321,14 +508,17 @@ def build_model(
     draft: SafetensorsSource | None = None,
 ) -> Model:
     selected = set(components)
-    if "text" not in selected or selected - {"text", "mtp"}:
-        raise ValueError("Gemma 4 supports the text and mtp components")
+    if "text" not in selected or selected - {"text", "mtp", "vision"}:
+        raise ValueError("Gemma 4 supports the text, vision and mtp components")
     if ("mtp" in selected) != (draft is not None):
         raise ValueError("the mtp component needs the drafter checkpoint as --source mtp=PATH")
     config = text_config(base.config)
     records = {"text": {"config": config}}
     if draft is not None:
         records["mtp"] = {"config": draft_config(draft.config, config)}
+    if "vision" in selected:
+        processor = json.loads((Path(base.root) / "processor_config.json").read_text())
+        records["vision"] = {"config": vision_config(base.config, processor, config)}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], vision_config=None,
         overrides=resource_overrides, family="gemma",
@@ -347,6 +537,8 @@ def build_model(
     for index, kind in enumerate(config["layer_types"]):
         builder.block(f"text/layers/{index}/", text_prefix + f"layers.{index}.", base, config,
                       kind)
+    if "vision" in selected:
+        builder.vision(base, records["vision"]["config"])
     if draft is not None:
         mtp = records["mtp"]["config"]
         d = mtp["hidden_size"]

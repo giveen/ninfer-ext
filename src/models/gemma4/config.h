@@ -88,6 +88,32 @@ struct DraftConfig {
     std::uint32_t target_global_layer  = 0;
 };
 
+// The image encoder (the artifact's `vision` component): a ViT over 16-pixel patches whose soft tokens,
+// 3x3-pooled and standardized, are projected into the text width. The converter stores every head's
+// query and key rows with the middle two 18-dim blocks swapped, so the 2-D RoPE Op's layout applies.
+struct VisionConfig {
+    std::uint32_t hidden_size             = 0;
+    std::uint32_t intermediate_size       = 0;
+    std::uint32_t num_hidden_layers       = 0;
+    std::uint32_t num_attention_heads     = 0;
+    std::uint32_t head_dim                = 0;
+    std::uint32_t patch_size              = 0;
+    std::uint32_t pooling_kernel_size     = 0;
+    std::uint32_t position_embedding_size = 0;
+    std::uint32_t soft_tokens_per_image   = 0;
+    std::uint32_t output_hidden_size      = 0;
+    float rms_norm_eps                    = 0.0F;
+    float rope_theta                      = 0.0F;
+    std::int32_t image_token_id           = 0;
+    std::int32_t boi_token_id             = 0;
+    std::int32_t eoi_token_id             = 0;
+
+    // The most patches one image has: its soft tokens times the pooling cell.
+    [[nodiscard]] std::uint32_t max_patches() const noexcept {
+        return soft_tokens_per_image * pooling_kernel_size * pooling_kernel_size;
+    }
+};
+
 struct Config {
     TextConfig text;
 };
@@ -98,5 +124,8 @@ struct Config {
 
 // Parses the `mtp` component against the target it drafts for, with the same strictness.
 [[nodiscard]] DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& target);
+
+// Parses the `vision` component against the text width it projects into.
+[[nodiscard]] VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& text);
 
 } // namespace ninfer::models::gemma4

@@ -30,7 +30,9 @@ constexpr std::array kGeometries{
     // EAGLE3 draft (hidden 2048): attention q/k/v, the SwiGLU gate/up pair and its halves, the
     // feature projection and the draft head.
     Geometry{4096, 4096, 471U}, Geometry{512, 4096, 499U},    Geometry{32768, 2048, 473U},
-    Geometry{16384, 2048, 479U}, Geometry{2048, 6144, 487U},  Geometry{32000, 2048, 491U}};
+    Geometry{16384, 2048, 479U}, Geometry{2048, 6144, 487U},  Geometry{32000, 2048, 491U},
+    // Gemma 4 vision (hidden 1152, MLP stored at 4352).
+    Geometry{1152, 1152, 503U},  Geometry{4352, 1152, 509U},  Geometry{1152, 4352, 521U}};
 
 int q8_a16_conformance() {
     int failures = 0;
@@ -61,6 +63,10 @@ int q8_a16_conformance() {
             for (int t : {12, 13, 14}) calls.push_back({t});
         }
         if (shape.n == 248320) calls.push_back({34});
+        // Gemma 4 vision: one image's patches, up to the 2520-patch maximum.
+        if (shape.k == 4352 || shape.n == 4352 || (shape.n == 1152 && shape.k == 1152)) {
+            for (int t : {630, 2340, 2520}) calls.push_back({t});
+        }
         if (shape.n == 2048 && shape.k == 16384) {
             for (int t : {383,  384,  385,  479,  480,  481,  639,  640,  641,  703,
                           704,  705,  959,  960,  961,  1343, 1344, 1345, 1679, 1680,
