@@ -604,3 +604,37 @@ What remains before this is P3: scoring runs through a test binary, not the publ
 Engine's scoring core reaches a Program through `ModelContract::PreparedPrompt` plus `causal_score`,
 `memory_summary` and `reset_memory_peaks` — a small enough surface that the P2 boundary is now a
 bounded piece of work rather than an open-ended one.
+
+## 19. The Engine's instance boundary, second implementation
+
+The Engine's cores are templated on an instance: `EngineCore<Instance>` for generation and
+`CausalScoreCore<Instance>` for scoring, and `runtime::ModelInstance` is the only thing they have ever
+been instantiated with. `runtime::GemmaInstance`, `runtime::GemmaEngineProgram` and
+`runtime::GemmaPreparedPrompt` are now a second implementation of the same boundary, in the runtime
+layer beside the Qwen one rather than in the model, so `models/gemma4` stays free of engine types.
+
+Sizing it first paid off: the Engine reaches through `active` in only ten places (six `frontend`, four
+`capacity`), and the scoring core asks an instance for exactly three things — `causal_score`,
+`memory_summary` and `reset_memory_peaks` — plus a `PreparedPrompt` and a
+`KvCapacityResolution`. That is small enough that the boundary can be widened one piece at a time.
+
+**Verified by driving the Engine's own core.** `ninfer_gemma4_score_test` with
+`NINFER_GEMMA_ENGINE_CORE=1` instantiates `runtime::CausalScoreCore<runtime::GemmaInstance>` and runs
+the same corpus through it, then compares entry by entry against the direct `Program::causal_score`
+path: **70 of 70 positions identical**, and the same mean NLL 2.676 and perplexity 14.53. So the
+boundary is real and behaves, without the Engine itself having changed.
+
+Two things are deliberately absent and say so. Per-position logits are not produced, and the adapter
+*throws* if a `LogitsSink` is passed rather than scoring without it — those rows are what the KLD route
+reads, and silence there would look like a working KLD path. And `memory_summary` reports an empty
+summary: the paged-KV accounting the Qwen program fills does not exist here, so zeros are honest where
+invented numbers would not be.
+
+The test also had to be restructured for a physical reason worth recording: two 24 GB models do not fit
+beside each other on a 32 GB device, so the direct path runs in its own scope and releases its model
+before the instance loads one.
+
+What remains for P3: `Engine::Impl` holds `active` and `core` as concrete Qwen types, so the dispatch
+is the next step — an alternative in each variant, a helper for the ten `active` sites, a branch in
+`construct_model` on the artifact's architecture, and a frontend for this model. The artifact already
+carries its tokenizer resources, which is the part that would otherwise need a re-conversion.

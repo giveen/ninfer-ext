@@ -10,6 +10,8 @@
 #include "core/device.h"
 #include "models/gemma4/load.h"
 #include "models/gemma4/program.h"
+#include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/gemma_instance.h"
 
 #include <cmath>
 #include <cstdint>
@@ -52,12 +54,16 @@ int main() {
 
     try {
         DeviceContext device;
-        auto model = gemma::load_model(artifact, models::LoadOptions{}, device);
         const std::vector<std::int32_t> ids = read_ids(prompt_path);
 
-        gemma::Program program(*model, static_cast<std::int32_t>(ids.size()) + 8, device);
-        const std::vector<float> logprobs =
-            program.causal_score(ids, first, device.execution_view());
+        // The direct path, scoped so the model it needs is released before the Engine core loads its
+        // own: two of these do not fit beside each other on a 32 GB device.
+        std::vector<float> logprobs;
+        {
+            auto model = gemma::load_model(artifact, models::LoadOptions{}, device);
+            gemma::Program program(*model, static_cast<std::int32_t>(ids.size()) + 8, device);
+            logprobs = program.causal_score(ids, first, device.execution_view());
+        }
 
         double total = 0.0;
         for (const float logprob : logprobs) {
@@ -76,6 +82,32 @@ int main() {
             std::cout << ' ' << logprobs[index];
         }
         std::cout << '\n';
+
+        // The Engine's own scoring core, instantiated on this model. It must produce exactly what the
+        // Program does directly, since it is the same Program behind one adapter.
+        if (std::getenv("NINFER_GEMMA_ENGINE_CORE") != nullptr) {
+            runtime::GemmaPreparedPrompt prompt;
+            prompt.ids = ids;
+            auto instance = runtime::load_gemma_instance(artifact, models::LoadOptions{},
+                                                         static_cast<std::uint32_t>(ids.size()) + 8,
+                                                         device);
+            runtime::CausalScoreCore<runtime::GemmaInstance> core(*instance, device);
+            const std::vector<float> through_core = core.score(std::move(prompt), first, {});
+            if (through_core.size() != logprobs.size()) {
+                std::cerr << "gemma4 score: the Engine core returned " << through_core.size()
+                          << " scores, the Program returned " << logprobs.size() << '\n';
+                return 1;
+            }
+            for (std::size_t index = 0; index < logprobs.size(); ++index) {
+                if (through_core[index] != logprobs[index]) {
+                    std::cerr << "gemma4 score: the Engine core differs at " << index << ": "
+                              << through_core[index] << " against " << logprobs[index] << '\n';
+                    return 1;
+                }
+            }
+            std::cout << "  the Engine's scoring core matches the Program on " << logprobs.size()
+                      << " positions\n";
+        }
 
         std::ofstream output("/tmp/gemma_score.out.f32", std::ios::binary);
         output.write(reinterpret_cast<const char*>(logprobs.data()),

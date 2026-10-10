@@ -25,3 +25,6 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_text
   ninfer_media_decode)
 add_library(ninfer::engine ALIAS ninfer_engine)
+
+# The Gemma side of the instance boundary, next to the Qwen one it mirrors.
+target_sources(ninfer_engine PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/gemma_instance.cpp")
