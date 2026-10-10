@@ -87,10 +87,12 @@ Upstream's official v3 artifacts work unchanged:
 | Qwen3.8-Flash-Next | `nvfp4` | `qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer` (+ 3 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next) |
 | Qwen3.8-Flash-Next | `exl3` 4.0 bpw | `qwen3.8-flash-next-exl3-4bpw/qwen3_8_flash_next_exl3_4bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-4bpw) |
 | Qwen3.8-Flash-Next | `exl3` 3.5 bpw | `qwen3.8-flash-next-exl3-3p5bpw/qwen3_8_flash_next_exl3_3p5bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-3p5bpw) |
+| Gemma 4 31B | `M1` (Q6/Q5 g64) | `gemma4-31b-it-m1/gemma4_31b_it_m1.ninfer` | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-31b-it-m1) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
 hf download jabbatheduck/ninfer-ext-models qwen3_8_27b_exl3_4bpw.ninfer --local-dir models
+hf download jabbatheduck/ninfer-ext-models --include "gemma4-31b-it-m1/*" --local-dir models
 ```
 
 The `exl3` rows and the Qwen3.8-Flash-Next rows are this fork's own artifacts, published on Hugging
@@ -918,9 +920,19 @@ describes the planner.
   message, no video), and MTP speculation with the official assistant drafter (`--spec mtp`,
   converted with `--components text,mtp --source mtp=<assistant checkpoint>`), but without prefix
   reuse, constrained output, CUDA Graphs or a KV format other than BF16 (`ninfer-perplexity`
-  needs `--kv-dtype bf16`); top_k is capped at 20. Measured on the M1 artifact (RTX 5090): prefill
-  2,388 tok/s at 1K and 1,837 at 8K; decode 52.6 tok/s, and 100-240 tok/s with adaptive MTP
-  depending on the text. See [the Gemma 4 reference](docs/maintainer/gemma4-model.md).
+  needs `--kv-dtype bf16`); top_k is capped at 20. The M1 artifact is published on Hugging Face
+  ([download](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-31b-it-m1)).
+  Measured on it (RTX 5090):
+
+  | Stat | Value |
+  |---|---|
+  | Prefill `pp1024` / `pp8192` | 2,388 / 1,837 tok/s |
+  | Decode `tg128` | 52.6 tok/s (100-240 with adaptive MTP, depending on the text) |
+  | Layout KLD vs the BF16 checkpoint | 0.419 (4 x 2048 calibration tokens) |
+  | Causal perplexity (BF16 KV) | 14.53 (mean NLL 2.676) |
+
+  See [the Gemma 4 reference](docs/maintainer/gemma4-model.md) for the layout comparison and the
+  full verification record.
 
 ## Documentation
 
