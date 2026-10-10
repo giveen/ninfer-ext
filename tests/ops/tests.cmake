@@ -20,6 +20,7 @@ set(ninfer_op_tests
   gdn_gating_proj
   rope
   vision_pos_embed
+  vision_pool
   sampling
   scalar
   cast

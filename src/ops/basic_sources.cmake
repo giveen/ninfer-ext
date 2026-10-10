@@ -33,6 +33,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/soft_cap.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pool.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/argmax.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/cast.cpp"
@@ -66,4 +67,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/soft_cap.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pool.cpp"
 )
