@@ -459,6 +459,9 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
     progress.service_units = static_cast<std::uint32_t>(1U + (step - 1U) / prefill_chunk_);
     progress.complete      = lane->cursor == total;
     if (progress.complete) {
+        // Every image is encoded by now, so its patches are not needed any longer.
+        lane->images.clear();
+        lane->images.shrink_to_fit();
         timing.begin_wait();
         const TokenId token = program_.sample(lane_index, execution_);
         timing.end_wait();

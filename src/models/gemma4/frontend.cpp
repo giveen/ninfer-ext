@@ -496,6 +496,16 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const auto media_started = Clock::now();
     for (const OwnedMedia* media : rendered.images) {
         try {
+            // A client that asked for an error instead of a downscale is answered before the decode.
+            if (media->image_resize_policy == ImageResizePolicy::RejectOversized) {
+                const media::decode::ImageInfo info =
+                    media::decode::inspect_image(media->bytes, media::decode::Policy{});
+                if (static_cast<std::uint64_t>(info.width) * static_cast<std::uint64_t>(info.height) >
+                    kGemmaImageBudgetPixels) {
+                    throw RequestError(RequestErrorKind::InvalidMedia,
+                                       "image exceeds the Vision budget and oversized_image is 'error'");
+                }
+            }
             images.push_back(prepare_gemma_image(media->bytes, media::decode::Policy{},
                                                  [&] { check_control(control); }));
         } catch (const media::decode::Error& error) {
@@ -505,15 +515,6 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                std::string("image: ") + error.what());
         } catch (const std::invalid_argument& error) {
             throw RequestError(RequestErrorKind::InvalidMedia, std::string("image: ") + error.what());
-        }
-        if (media->image_resize_policy == ImageResizePolicy::RejectOversized) {
-            const media::decode::ImageInfo info =
-                media::decode::inspect_image(media->bytes, media::decode::Policy{});
-            if (static_cast<std::uint64_t>(info.width) * static_cast<std::uint64_t>(info.height) >
-                kGemmaImageBudgetPixels) {
-                throw RequestError(RequestErrorKind::InvalidMedia,
-                                   "image exceeds the Vision budget and oversized_image is 'error'");
-            }
         }
         prompt.preparation.media_bytes += media->bytes.size();
         prompt.preparation.raw_patches +=
