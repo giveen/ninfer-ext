@@ -816,3 +816,36 @@ tests failing with a shape error I had just fixed. They were stale binaries: I h
 targets I named, so the tests still ran the old code. Rebuilding everything showed seven green tests and
 a green suite. Building every target before believing a failure is cheaper than the diagnosis it
 otherwise costs.
+
+## 24. The logits sink, and what the rows revealed
+
+`GemmaEngineProgram` used to throw when given a `LogitsSink`, so the KLD route could not run for this
+model. It now hands over the soft-capped logits it takes its own distribution from: one row per scored
+target, each `vocabulary` wide, side by side, as a view of the staging buffer — the layout the KLD route
+reads, and the same values the log-probabilities are computed from.
+
+**Verified against HuggingFace's logits for the same 71 tokens**, which the oracle writes out for
+exactly this purpose:
+
+| | |
+|---|---|
+| rows compared | 70 targets of 262144 |
+| argmax agreement | 61 of 70, including the last row |
+| per-row cosine | mean 0.972, min 0.748 |
+| worst single-logit difference | 27.1 |
+
+The alignment is right: the *chosen* tokens agree, the returned log-probabilities reproduce from the
+rows, and the last row's argmax matches HF exactly. What does not match is the rest of the
+distribution — a few logits per row differ by up to 27, which drags the cosine down while leaving the
+mean NLL within 0.2 nats of HF's.
+
+**That is a real characterization of this artifact, and it is not good news for KLD.** Per-layer hidden
+states agree to 0.2%, the sequence-level NLL agrees to 0.1 to 0.3 nats, but the logit *tails* diverge
+by far more than either would predict. KLD is tail-sensitive, so a KLD against a BF16 reference would
+report a much larger gap than the perplexity does — which is precisely the comparison the plan's P4
+exists to make, and the reason it ranks layouts on KLD rather than perplexity.
+
+**Not resolved:** whether that tail divergence is the quantization's own behaviour or something the
+engine does differently from HF. The evidence points away from a plain quantization effect — a fraction
+of a percent on hidden states should not move individual logits by 27 — but I have not isolated it, and
+an artifact-level KLD measurement is the way to do that.

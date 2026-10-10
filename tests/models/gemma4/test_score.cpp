@@ -80,7 +80,34 @@ int main() {
         {
             auto model = gemma::load_model(artifact, models::LoadOptions{}, device);
             gemma::Program program(*model, static_cast<std::int32_t>(ids.size()) + 8, device);
-            logprobs = program.causal_score(ids, first, device.execution_view());
+            logprobs = program.causal_score(ids, first, {}, device.execution_view());
+
+        // The logits the KLD route reads: one row per scored target, each `vocabulary` wide. Dumping
+        // them lets HuggingFace's own logits check that they belong to the targets they claim.
+        if (std::getenv("NINFER_GEMMA_SINK_DUMP") != nullptr) {
+            std::vector<float> rows;
+            const LogitsSink sink = [&](const ScoredLogits& view) {
+                const std::size_t width = static_cast<std::size_t>(view.vocab_size);
+                for (std::size_t column = 0; column < view.columns; ++column) {
+                    for (std::size_t id = 0; id < width; ++id) {
+                        const std::uint16_t code = view.values[column * width + id];
+                        const std::uint32_t bits   = static_cast<std::uint32_t>(code) << 16;
+                        float value;
+                        std::memcpy(&value, &bits, sizeof(value));
+                        rows.push_back(value);
+                    }
+                }
+                std::cout << "  sink: first_target " << view.first_target << ", columns " << view.columns
+                          << ", vocabulary " << view.vocab_size << '\n';
+            };
+            const std::vector<float> through_sink = program.causal_score(ids, first, sink,
+                                                                        device.execution_view());
+            std::ofstream dump("/tmp/gemma_sink.f32", std::ios::binary);
+            dump.write(reinterpret_cast<const char*>(rows.data()),
+                       static_cast<std::streamsize>(rows.size() * sizeof(float)));
+            std::cout << "  sink rows: " << rows.size() << " values for " << through_sink.size()
+                      << " targets\n";
+        }
         }
 
         double total = 0.0;

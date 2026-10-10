@@ -65,7 +65,7 @@ public:
      * a Program can score many windows in a row.
      */
     [[nodiscard]] std::vector<float> causal_score(std::span<const std::int32_t> ids,
-                                                  std::int32_t first_target,
+                                                  std::int32_t first_target, const LogitsSink& sink,
                                                   DeviceExecutionView execution);
 
 private:

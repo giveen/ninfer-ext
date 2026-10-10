@@ -91,11 +91,8 @@ GemmaEngineProgram::GemmaEngineProgram(const models::gemma4::Model& model, std::
 std::vector<float> GemmaEngineProgram::causal_score(GemmaPreparedPrompt&& prompt,
                                                     std::uint32_t first_target,
                                                     const LogitsSink& logits) {
-    if (logits) {
-        throw std::logic_error(
-            "Gemma scoring does not provide per-position logits yet, so the KLD route cannot run");
-    }
-    return program_.causal_score(prompt.ids, static_cast<std::int32_t>(first_target), execution_);
+    return program_.causal_score(prompt.ids, static_cast<std::int32_t>(first_target), logits,
+                                 execution_);
 }
 
 MemorySummary GemmaEngineProgram::memory_summary() const {

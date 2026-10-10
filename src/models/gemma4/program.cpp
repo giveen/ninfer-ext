@@ -115,7 +115,8 @@ void Program::prefill(std::span<const std::int32_t> ids, DeviceExecutionView exe
 }
 
 std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
-                                         std::int32_t first_target, DeviceExecutionView execution) {
+                                         std::int32_t first_target, const LogitsSink& sink_in,
+                                         DeviceExecutionView execution) {
     if (ids.size() < 2) throw std::invalid_argument("gemma4 Program: scoring needs two tokens");
     if (first_target < 1 || first_target >= static_cast<std::int32_t>(ids.size())) {
         throw std::invalid_argument("gemma4 Program: first_target is outside the sequence");
@@ -129,6 +130,10 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
 
     std::vector<float> scores;
     scores.reserve(ids.size() - static_cast<std::size_t>(first_target));
+    // The sink sees the soft-capped logits the distribution is taken from, one row per scored target,
+    // side by side and each `vocabulary` wide, which is the layout the KLD route reads. It is handed a
+    // view of the staging buffer, so it must return before the next batch overwrites it.
+    LogitsSink sink = std::move(sink_in);
     const std::int32_t count = static_cast<std::int32_t>(ids.size());
     std::int32_t position    = 0;
     while (position < count) {
@@ -161,6 +166,19 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
                 const double chosen =
                     static_cast<double>(decode_bf16(column[ids[static_cast<std::size_t>(target)]]));
                 scores.push_back(static_cast<float>(chosen - largest - std::log(total)));
+            }
+            if (sink) {
+                const std::size_t offset = static_cast<std::size_t>(first - position - 1) *
+                                           static_cast<std::size_t>(vocabulary);
+                const std::size_t columns = static_cast<std::size_t>(last - first + 1);
+                ScoredLogits view;
+                view.values       = std::span<const std::uint16_t>(logits_host_.data() + offset,
+                                                                   columns *
+                                                                       static_cast<std::size_t>(vocabulary));
+                view.vocab_size   = static_cast<std::uint32_t>(vocabulary);
+                view.columns      = static_cast<std::uint32_t>(columns);
+                view.first_target = static_cast<std::uint32_t>(first);
+                sink(view);
             }
         }
         position += batch;
