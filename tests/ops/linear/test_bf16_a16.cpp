@@ -283,6 +283,17 @@ int run_bf16_linear() {
         failures += run_bf16_linear_case(weight, 1);
         failures += run_bf16_linear_case(weight, 1, true);
     }
+
+    // The Gemma 4 vision tower's projections: patches of one image (9 to 2520) and its pooled soft
+    // tokens (1 to 280), across every route boundary.
+    DeviceWeight patch_weight(make_patterned(1152, 768, seed++));
+    for (int tokens : {1, 2, 8, 9, 36, 63, 64, 65, 129, 630, 2520}) {
+        failures += run_bf16_linear_case(patch_weight, tokens);
+    }
+    DeviceWeight soft_weight(make_patterned(5376, 1152, seed++));
+    for (int tokens : {1, 3, 8, 9, 70, 128, 129, 280}) {
+        failures += run_bf16_linear_case(soft_weight, tokens);
+    }
     return failures;
 }
 

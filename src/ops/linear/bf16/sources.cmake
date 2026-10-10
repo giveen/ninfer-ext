@@ -5,4 +5,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n256_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n262144_k5376.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/gemma4_draft.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/gemma4_vision.cu"
 )

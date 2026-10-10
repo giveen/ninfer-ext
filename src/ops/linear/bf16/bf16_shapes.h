@@ -17,5 +17,8 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n1024_k16384(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n262144_k1024(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n5376_k1024(std::int32_t tokens);
+// The Gemma 4 vision tower: patch embedding and the soft-token projection into the text width.
+[[nodiscard]] Bf16Launch select_bf16_n1152_k768(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n5376_k1152(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail
