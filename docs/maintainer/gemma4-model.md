@@ -674,3 +674,34 @@ Also removed: `gemma4::plan_load` had rejected every purpose except `Generation`
 when only the generation route existed. Scoring binds the same parameters — the head it reads is the
 head generation samples from — so the guard was wrong, and the Engine's scoring load hit it
 immediately.
+
+## 21. The engine against HuggingFace's own implementation
+
+Sections 15 through 20 compared this model against a reference I wrote. That is weaker evidence than it
+looks: a misreading shared by the engine and my reference would pass, and I flagged that every round.
+The alternative turned out to be on the machine all along. `transformers` 5.x ships
+`transformers.models.gemma4` — the maintainer environment's 4.57.6 does not, which is why I had
+concluded none existed — and `tools/verify/gemma4_hf_reference.py` runs HF's own model in BF16 on the
+CPU, on ids the engine is then fed unchanged.
+
+| Text | HF, BF16, CPU | Engine, FP8 attention and NVFP4 MLPs |
+|---|---|---|
+| France sentence | mean NLL **2.837** | mean NLL **2.509** |
+| wikitext slice | mean NLL **8.215** | mean NLL **9.070** |
+
+**Two conclusions, and the second one is the important one.**
+
+First, the engine is faithful to the official implementation on both an easy and a hard text: the gaps
+are 0.33 and 0.86 nats, in the direction and size quantization produces, and they are the only
+quantitative end-to-end agreement this model has.
+
+Second, **the perplexity that looked absurd is the model's own.** HuggingFace scores real prose at
+NLL 8.2 as well — PPL 3,700 — so this checkpoint is simply weak on prose, and no amount of engine work
+will change that. Every earlier symptom now fits: the "France is France is" loop at NLL 9.96, the
+corpus scores near 9, and the checkpoint's own `.eval_results` card pointing at
+`google/gemma-4-31B-**it**` rather than at a base model. What is *not* explained is why these base
+weights behave this way — that is a question about the checkpoint, not about this engine.
+
+One more finding worth recording: HF's tokenizer does not add the beginning-of-sequence token by
+itself, and without it HF's own reference scores the France sentence at NLL 11.99. An implementation
+that adds it is right here, and the engine does.
