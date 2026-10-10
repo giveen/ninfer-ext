@@ -63,7 +63,7 @@ struct ContextAttentionExecutionEnvelope {
 /**
  * Dense, non-causal single-segment attention.
  *
- * The registered profile is D=72, Hq=Hkv=16, scale=1/sqrt(72). q/k/v are BF16 [72,16,T]
+ * The registered profile is D=72, Hq=Hkv=16, scale 1/sqrt(72) or 1. q/k/v are BF16 [72,16,T]
  * with contiguous feature and head dimensions; their token stride may be padded. out is contiguous
  * BF16 [72,16,T]. Every query attends all T keys. q/k/v/out are mutually non-overlapping, inputs
  * are unchanged, out is completely overwritten, and the Op has no persistent state side effect.

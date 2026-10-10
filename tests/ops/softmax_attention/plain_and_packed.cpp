@@ -43,8 +43,7 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 
 void packed_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
-                             std::vector<double>& out) {
-    constexpr double scale = 1.0 / std::sqrt(72.0);
+                             double scale, std::vector<double>& out) {
     out.assign(q.size(), 0.0);
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
@@ -82,6 +81,9 @@ enum class PublicEntry {
 enum class InputProfile {
     Random,
     SegmentIsolation,
+    // Gemma 4's vision heads: q and k RMS-normalized per head (entries of RMS about 1), scored at
+    // scale 1, so logits reach tens and the Softmax is sharp.
+    UnitScaleNormed,
 };
 
 const char* storage_name(StorageProfile profile) {
@@ -108,9 +110,12 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     std::vector<float> q(value_count);
     std::vector<float> k(value_count);
     std::vector<float> v(value_count);
-    fill_uniform(q, seed, -1.0f, 1.0f);
-    fill_uniform(k, seed + 1, -1.0f, 1.0f);
+    const bool unit_scale = input_profile == InputProfile::UnitScaleNormed;
+    const float qk_range  = unit_scale ? 1.7f : 1.0f; // uniform on +-1.7 has RMS ~1
+    fill_uniform(q, seed, -qk_range, qk_range);
+    fill_uniform(k, seed + 1, -qk_range, qk_range);
     fill_uniform(v, seed + 2, -2.0f, 2.0f);
+    const float scale = unit_scale ? 1.0f : kScale;
     if (input_profile == InputProfile::SegmentIsolation) {
         std::ranges::fill(q, 0.0f);
         std::ranges::fill(k, 0.0f);
@@ -127,7 +132,8 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     round_to_bf16(v);
 
     std::vector<double> reference;
-    packed_attention_oracle(q, k, v, cu_seqlens, reference);
+    packed_attention_oracle(q, k, v, cu_seqlens, unit_scale ? 1.0 : 1.0 / std::sqrt(72.0),
+                            reference);
 
     const auto q_expected = bf16_bits(q);
     const auto k_expected = bf16_bits(k);
@@ -187,10 +193,10 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
         if (cu_seqlens.size() != 2) {
             throw std::logic_error("plain case requires exactly one segment");
         }
-        ops::softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, workspace,
+        ops::softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, scale, workspace,
                                out_tensor, nullptr);
     } else if (entry == PublicEntry::CuSeqlensArena) {
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, cu_tensor,
+        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, scale, cu_tensor,
                                       workspace, out_tensor, nullptr);
     } else {
         const int segment_length = cu_seqlens[1] - cu_seqlens[0];
@@ -199,7 +205,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                 throw std::logic_error("uniform case requires equal segments");
             }
         }
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale,
+        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, scale,
                                       segment_length, out_tensor, nullptr);
     }
     cuda_synchronize();
@@ -208,7 +214,9 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                               " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
                               storage_name(storage_profile) + " " + entry_name(entry);
     const std::string qualified_label =
-        input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation" : label;
+        input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation"
+        : unit_scale                                    ? label + " scale-1"
+                                                        : label;
     int failures =
         verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
                          reference, kPackedAttentionBf16Criterion);
@@ -268,6 +276,15 @@ int run_softmax_attention_plain_and_packed_tests() {
         run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    // Gemma 4 vision: one image per call up to the 2520-patch maximum, and two packed images.
+    failures += run_case({0, 9}, 41u, StorageProfile::Contiguous, PublicEntry::Plain,
+                         InputProfile::UnitScaleNormed);
+    failures += run_case({0, 630}, 43u, StorageProfile::Contiguous, PublicEntry::Plain,
+                         InputProfile::UnitScaleNormed);
+    failures += run_case({0, 2520}, 47u, StorageProfile::Contiguous, PublicEntry::Plain,
+                         InputProfile::UnitScaleNormed);
+    failures += run_case({0, 324, 1053}, 53u, StorageProfile::Contiguous,
+                         PublicEntry::CuSeqlensArena, InputProfile::UnitScaleNormed);
 
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';
