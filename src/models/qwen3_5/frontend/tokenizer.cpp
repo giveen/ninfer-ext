@@ -27,14 +27,19 @@ namespace uni = ninfer::text::unicode_internal;
 
 constexpr std::int64_t kMaxTokenId = 1'000'000;
 
+// U+2581, the marker Gemma's normalizer writes in place of a space.
+constexpr std::string_view kGemmaSpaceMarker = "\xe2\x96\x81";
+
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-void validate_pipeline(const Json& root, const Json& model) {
-    const auto require = [](bool valid, const char* field) {
+void validate_pipeline(const Json& root, const Json& model, TokenizerFamily family) {
+    const char* family_name = family == TokenizerFamily::Gemma ? "Gemma" : "Qwen";
+    const auto require = [family_name](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
-                                        " is not supported by the Qwen tokenizer");
+                                        " is not supported by the " + family_name +
+                                        " tokenizer");
         }
     };
     const auto type = [](const Json& value, const char* name) {
@@ -42,8 +47,30 @@ void validate_pipeline(const Json& root, const Json& model) {
     };
     // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
     // An explicit description must agree with the implemented transformations.
-    if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
-    if (root.contains("pre_tokenizer")) {
+    if (family == TokenizerFamily::Gemma) {
+        // Gemma's normalizer replaces a space with the U+2581 marker and leaves the text
+        // otherwise alone; its pre-tokenizer splits on newlines only, because a BPE merge may not
+        // cross a newline, and declares no byte-level step -- the symbols are raw UTF-8.
+        if (root.contains("normalizer")) {
+            const auto& normalizer = root["normalizer"];
+            require(type(normalizer, "Replace") &&
+                        normalizer.contains("pattern") && normalizer["pattern"].is_object() &&
+                        normalizer["pattern"].value("String", std::string{}) == " " &&
+                        normalizer.value("content", std::string{}) == kGemmaSpaceMarker,
+                    "normalizer");
+        }
+        if (root.contains("pre_tokenizer")) {
+            const auto& pre = root["pre_tokenizer"];
+            require(type(pre, "Split") && pre.contains("pattern") && pre["pattern"].is_object() &&
+                        pre["pattern"].value("String", std::string{}) == " " &&
+                        pre.value("behavior", std::string{}) == "MergedWithPrevious" &&
+                        pre.value("invert", Json(false)) == false,
+                    "pre_tokenizer");
+        }
+    } else if (root.contains("normalizer")) {
+        require(type(root["normalizer"], "NFC"), "normalizer");
+    }
+    if (family == TokenizerFamily::Qwen && root.contains("pre_tokenizer")) {
         const auto& pre = root["pre_tokenizer"];
         require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
                     pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
@@ -59,9 +86,38 @@ void validate_pipeline(const Json& root, const Json& model) {
                     bytes.value("use_regex", Json(true)) == false,
                 "pre_tokenizer.ByteLevel");
     }
-    if (root.contains("decoder")) { require(type(root["decoder"], "ByteLevel"), "decoder"); }
-    if (root.contains("post_processor") && !root["post_processor"].is_null()) {
-        require(type(root["post_processor"], "ByteLevel"), "post_processor");
+    if (family == TokenizerFamily::Gemma) {
+        // The decoder unwinds the alphabet: the marker becomes a space again, an unmergeable
+        // character is written from its `<0xXX>` bytes, and the pieces are fused into text.
+        if (root.contains("decoder")) {
+            const auto& decoder = root["decoder"];
+            const auto& steps   = decoder.is_object() && decoder.contains("decoders")
+                                      ? decoder["decoders"]
+                                      : Json();
+            require(type(decoder, "Sequence") && steps.is_array() && steps.size() == 3 &&
+                        type(steps[0], "Replace") && steps[0].value("content", std::string{}) == " " &&
+                        steps[0].contains("pattern") && steps[0]["pattern"].is_object() &&
+                        steps[0]["pattern"].value("String", std::string{}) == kGemmaSpaceMarker &&
+                        type(steps[1], "ByteFallback") && type(steps[2], "Fuse"),
+                    "decoder");
+        }
+        if (root.contains("post_processor") && !root["post_processor"].is_null()) {
+            // A template that adds nothing: the runtime applies the chat protocol itself.
+            const auto& post = root["post_processor"];
+            const auto& specials = post.is_object() && post.contains("special_tokens")
+                                       ? post["special_tokens"]
+                                       : Json();
+            const auto& single = post.is_object() && post.contains("single") ? post["single"] : Json();
+            require(type(post, "TemplateProcessing") && specials.is_object() &&
+                        specials.empty() && single.is_array() && single.size() == 1,
+                    "post_processor");
+        }
+        require(model.value("byte_fallback", Json(false)) == true, "model.byte_fallback");
+    } else {
+        if (root.contains("decoder")) { require(type(root["decoder"], "ByteLevel"), "decoder"); }
+        if (root.contains("post_processor") && !root["post_processor"].is_null()) {
+            require(type(root["post_processor"], "ByteLevel"), "post_processor");
+        }
     }
     if (model.contains("dropout") && !model["dropout"].is_null()) {
         require(model["dropout"].is_number() && model["dropout"] == 0, "model.dropout");
@@ -261,16 +317,26 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
         AddedToken token = parse_added_token(item, label);
         validate_supported_added_token(token, label);
         const auto index = static_cast<std::size_t>(token.id);
-        if (occupied_vocab_ids.contains(token.id)) {
-            throw std::invalid_argument("field added_tokens overlaps existing id in " +
-                                        std::string(label));
+        // A checkpoint may list a special token in the vocabulary as well as in added_tokens: some
+        // write the specials with the base vocabulary (Gemma) and some do not (Qwen). That is the
+        // same token twice, so it is accepted only when the two definitions agree.
+        const bool in_vocab_id      = occupied_vocab_ids.contains(token.id);
+        const bool in_vocab_content = occupied_vocab_tokens.contains(token.content);
+        if (in_vocab_id || in_vocab_content) {
+            const bool agrees = in_vocab_id && in_vocab_content &&
+                                index < id_to_token.size() &&
+                                id_to_token[index] == token.content &&
+                                occupied_vocab_tokens.at(token.content) == token.id;
+            if (!agrees) {
+                throw std::invalid_argument("field added_tokens overlaps existing id in " +
+                                            std::string(label));
+            }
         }
         if (!seen_added_ids.insert(token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate id in " +
                                         std::string(label));
         }
-        if (occupied_vocab_tokens.contains(token.content) ||
-            !seen_added_contents.emplace(token.content, token.id).second) {
+        if (!seen_added_contents.emplace(token.content, token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate content mapping in " +
                                         std::string(label));
         }
@@ -285,8 +351,17 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                 std::vector<std::string>& id_to_token,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
-                                std::vector<AddedToken>& tokens) {
-    const Json& decoder = require_object_field(root, "added_tokens_decoder", label);
+                                std::vector<AddedToken>& tokens, bool required) {
+    if (!root.contains("added_tokens_decoder") || root["added_tokens_decoder"].is_null()) {
+        // Some checkpoints describe their added tokens once, in tokenizer.json alone (Gemma);
+        // others repeat them here so the two can be cross-checked (Qwen).
+        if (required) {
+            throw std::invalid_argument("missing field added_tokens_decoder in " +
+                                        std::string(label));
+        }
+        return;
+    }
+    const Json& decoder = root["added_tokens_decoder"];
     std::unordered_map<int, std::size_t> token_by_id;
     std::unordered_map<std::string, int> token_by_content;
     std::unordered_set<int> decoder_ids;
@@ -315,7 +390,12 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
             }
             continue;
         }
-        if (occupied_vocab_ids.contains(id)) {
+        const auto existing_content = occupied_vocab_tokens.find(token.content);
+        if (occupied_vocab_ids.contains(id) &&
+            !(existing_content != occupied_vocab_tokens.end() &&
+              existing_content->second == id &&
+              static_cast<std::size_t>(id) < id_to_token.size() &&
+              id_to_token[static_cast<std::size_t>(id)] == token.content)) {
             throw std::invalid_argument("added_tokens_decoder overlaps vocabulary id " +
                                         std::to_string(id));
         }
@@ -425,6 +505,12 @@ std::unordered_map<std::uint32_t, char> build_byte_level_decoder() {
     return decoder;
 }
 
+// Qwen's pipeline requires NFC. Gemma's normalizer only rewrites a space to the U+2581 marker,
+// which the symbol builder applies, so its text is used exactly as it arrives.
+std::string normalize_for_family(std::string_view text, TokenizerFamily family) {
+    return family == TokenizerFamily::Gemma ? std::string(text) : uni::normalize_nfc(text);
+}
+
 std::string decode_byte_level_token(std::string_view token, int id) {
     static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
     std::string bytes;
@@ -440,6 +526,34 @@ std::string decode_byte_level_token(std::string_view token, int id) {
         bytes.push_back(byte->second);
     }
     return bytes;
+}
+
+// Gemma's tokens are text: every U+2581 marker in a token stands for a space (the decoder's
+// `Replace` applies to the whole piece, so `▁word` is " word"), a `<0xXX>` token stands for the byte
+// it names (the byte fallback), and everything else is already its own characters.
+std::string decode_gemma_token(std::string_view token, int id) {
+    if (token.size() == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' &&
+        token[5] == '>') {
+        const auto digit = [&](char value) -> int {
+            if (value >= '0' && value <= '9') { return value - '0'; }
+            if (value >= 'A' && value <= 'F') { return value - 'A' + 10; }
+            if (value >= 'a' && value <= 'f') { return value - 'a' + 10; }
+            throw std::invalid_argument("Tokenizer::decode token id " + std::to_string(id) +
+                                        " has a malformed byte fallback");
+        };
+        return std::string(1, static_cast<char>((digit(token[3]) << 4) | digit(token[4])));
+    }
+    std::string text;
+    text.reserve(token.size());
+    for (std::size_t offset = 0; offset < token.size();) {
+        if (token.substr(offset).starts_with(kGemmaSpaceMarker)) {
+            text.push_back(' ');
+            offset += kGemmaSpaceMarker.size();
+        } else {
+            text.push_back(token[offset++]);
+        }
+    }
+    return text;
 }
 
 std::array<std::string, 256> build_byte_level_encoder() {
@@ -593,30 +707,108 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
     return ids;
 }
 
+// The BPE input alphabet: one symbol per position of a word, with the source byte offset just past
+// it. Qwen's alphabet is one byte per symbol through the GPT-2 byte table; Gemma's is one UTF-8
+// character, with a space rendered as the U+2581 marker and any character the vocabulary lacks
+// falling back to its bytes' `<0xXX>` tokens.
+struct BpeSymbol {
+    int token              = -1;
+    std::size_t source_end = 0;
+};
+
+struct SymbolContext {
+    TokenizerFamily family                    = TokenizerFamily::Qwen;
+    const std::array<int, 256>* byte_token_ids = nullptr;
+    const std::unordered_map<std::string, int>* vocab = nullptr;
+    int marker_token                          = -1;
+    const std::array<int, 256>* byte_fallback  = nullptr;
+};
+
+// Bytes of a Gemma-family tokenizer that hold the `<0xXX>` fallback for each byte value.
+std::array<int, 256> load_byte_fallback_ids(const std::unordered_map<std::string, int>& token_to_id) {
+    static const char* digits = "0123456789ABCDEF";
+    std::array<int, 256> ids;
+    ids.fill(-1);
+    for (std::size_t byte = 0; byte < ids.size(); ++byte) {
+        std::string name = "<0x00>";
+        name[3]          = digits[(byte >> 4) & 0xF];
+        name[4]          = digits[byte & 0xF];
+        const auto token = token_to_id.find(name);
+        if (token != token_to_id.end()) { ids[byte] = token->second; }
+    }
+    return ids;
+}
+
+// A merge may not cross a newline, so Gemma's words are the runs of newlines and of everything
+// else; every other boundary is decided by the merges themselves.
+std::size_t gemma_word_end(std::string_view text, std::size_t begin) {
+    const bool newline = text[begin] == '\n';
+    std::size_t end    = begin;
+    while (end < text.size() && (text[end] == '\n') == newline) { ++end; }
+    return end;
+}
+
+void build_word_symbols(std::string_view text, std::size_t begin, std::size_t end,
+                        const SymbolContext& context, std::vector<BpeSymbol>& symbols) {
+    symbols.clear();
+    if (context.family == TokenizerFamily::Qwen) {
+        for (std::size_t at = begin; at < end; ++at) {
+            const int token = (*context.byte_token_ids)[static_cast<unsigned char>(text[at])];
+            if (token < 0) {
+                throw std::invalid_argument(
+                    "Tokenizer::encode produced byte symbol outside vocabulary");
+            }
+            symbols.push_back(BpeSymbol{token, at + 1});
+        }
+        return;
+    }
+    for (std::size_t at = begin; at < end;) {
+        const uni::CodepointSpan span = qwen_codepoint_at(text, at);
+        if (span.value == ' ' && context.marker_token >= 0) {
+            symbols.push_back(BpeSymbol{context.marker_token, at + span.length});
+            at += span.length;
+            continue;
+        }
+        const auto found = context.vocab->find(std::string(text.substr(at, span.length)));
+        if (found != context.vocab->end()) {
+            symbols.push_back(BpeSymbol{found->second, at + span.length});
+        } else {
+            for (std::size_t byte = at; byte < at + span.length; ++byte) {
+                const int token = (*context.byte_fallback)[static_cast<unsigned char>(text[byte])];
+                if (token < 0) {
+                    throw std::invalid_argument(
+                        "Tokenizer::encode has no byte fallback for a character outside the "
+                        "vocabulary");
+                }
+                symbols.push_back(BpeSymbol{token, byte + 1});
+            }
+        }
+        at += span.length;
+    }
+}
+
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
-                               const BpeMergeTable& merge_rules,
-                               const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
+                               const BpeMergeTable& merge_rules, const SymbolContext& context,
+                               std::size_t max_tokens,
                                std::vector<std::size_t>* token_ends = nullptr,
                                std::vector<BpeWordEnd>* word_ends   = nullptr) {
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
+    std::vector<BpeSymbol> symbols;
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = qwen_word_end(normalized, begin);
-        const std::string_view word(normalized.data() + begin, end - begin);
-        std::vector<BpeNode> nodes(word.size());
-        for (std::size_t index = 0; index < word.size(); ++index) {
-            const unsigned char byte = static_cast<unsigned char>(word[index]);
-            const int symbol         = byte_token_ids[byte];
-            if (symbol < 0) {
-                throw std::invalid_argument(
-                    "Tokenizer::encode produced byte symbol outside vocabulary");
-            }
+        const std::size_t end = context.family == TokenizerFamily::Gemma
+                                    ? gemma_word_end(normalized, begin)
+                                    : qwen_word_end(normalized, begin);
+        build_word_symbols(normalized, begin, end, context, symbols);
+        std::vector<BpeNode> nodes(symbols.size());
+        for (std::size_t index = 0; index < symbols.size(); ++index) {
             nodes[index] =
-                BpeNode{.symbol   = symbol,
+                BpeNode{.symbol   = symbols[index].token,
                         .previous = index == 0 ? -1 : static_cast<int>(index - 1),
-                        .next     = index + 1 == word.size() ? -1 : static_cast<int>(index + 1),
-                        .end      = index + 1};
+                        .next     = index + 1 == symbols.size() ? -1 : static_cast<int>(index + 1),
+                        // Word-local, as the token boundary mapping adds the word's own begin.
+                        .end      = symbols[index].source_end - begin};
         }
 
         std::priority_queue<BpeCandidate, std::vector<BpeCandidate>, LaterBpeCandidate> queue;
@@ -686,8 +878,8 @@ struct IndexedByteBoundary {
 
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
-                          const BpeMergeTable& merge_rules,
-                          const std::array<int, 256>& byte_token_ids, std::size_t max_tokens) {
+                          const BpeMergeTable& merge_rules, const SymbolContext& symbols,
+                          std::size_t max_tokens) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
         for (const IndexedByteBoundary boundary : boundaries) {
@@ -697,7 +889,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         return true;
     }
 
-    const std::string normalized = uni::normalize_nfc(text);
+    const std::string normalized = normalize_for_family(text, symbols.family);
     const bool has_internal_boundary =
         std::ranges::any_of(boundaries, [&](IndexedByteBoundary boundary) {
             const std::size_t local = boundary.offset - text_offset;
@@ -706,7 +898,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     std::vector<std::size_t> token_ends;
     std::vector<BpeWordEnd> word_ends;
     if (has_internal_boundary) { token_ends.reserve(normalized.size()); }
-    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, byte_token_ids,
+    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, symbols,
                                    max_tokens, has_internal_boundary ? &token_ends : nullptr,
                                    has_internal_boundary ? &word_ends : nullptr)) {
         return false;
@@ -728,14 +920,14 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     for (std::size_t request = 0; request < boundaries.size(); ++request) {
         const std::size_t raw_end = boundaries[request].offset - text_offset;
         if (raw_end != raw_begin) {
-            independently_normalized +=
-                uni::normalize_nfc(text.substr(raw_begin, raw_end - raw_begin));
+            independently_normalized += normalize_for_family(
+                text.substr(raw_begin, raw_end - raw_begin), symbols.family);
             raw_begin = raw_end;
         }
         normalized_boundaries[request] = independently_normalized.size();
     }
     if (raw_begin != text.size()) {
-        independently_normalized += uni::normalize_nfc(text.substr(raw_begin));
+        independently_normalized += normalize_for_family(text.substr(raw_begin), symbols.family);
     }
 
     if (independently_normalized != normalized) {
@@ -787,13 +979,14 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         resources.generation_config_json.empty()) {
         throw std::invalid_argument("embedded tokenizer resources are empty");
     }
+    family_ = resources.family;
     constexpr std::string_view tokenizer_label        = "tokenizer.json";
     constexpr std::string_view tokenizer_config_label = "tokenizer_config.json";
     const Json root = read_json_asset(resources.tokenizer_json, tokenizer_label);
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
-    validate_pipeline(root, model);
+    validate_pipeline(root, model, resources.family);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
@@ -805,7 +998,8 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     added_tokens_ = load_added_tokens(root, tokenizer_label, decoded_token_bytes_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
     merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, decoded_token_bytes_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_,
+                               resources.family != TokenizerFamily::Gemma);
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
         if (!content.empty()) {
@@ -824,13 +1018,31 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         special_token_ids_.at(index) = token.special;
     }
     for (std::size_t index = 0; index < decoded_token_bytes_.size(); ++index) {
-        if (valid_token_ids_[index] && !added_token_ids[index]) {
+        if (family_ == TokenizerFamily::Gemma) {
+            decoded_token_bytes_[index] =
+                decode_gemma_token(decoded_token_bytes_[index], static_cast<int>(index));
+        } else if (valid_token_ids_[index] && !added_token_ids[index]) {
             decoded_token_bytes_[index] =
                 decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
         }
     }
     bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
     byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
+    if (family_ == TokenizerFamily::Gemma) {
+        // Gemma's alphabet is characters, so every byte needs its `<0xXX>` fallback and the
+        // U+2581 marker must exist: without them the encoder would differ from the checkpoint.
+        byte_fallback_ids_     = load_byte_fallback_ids(vocab_token_to_id_);
+        const auto marker      = vocab_token_to_id_.find(std::string(kGemmaSpaceMarker));
+        const bool complete =
+            marker != vocab_token_to_id_.end() &&
+            std::all_of(byte_fallback_ids_.begin(), byte_fallback_ids_.end(),
+                        [](int id) { return id >= 0; });
+        if (!complete) {
+            throw std::invalid_argument(
+                "tokenizer.json lacks the Gemma alphabet: U+2581 marker and <0xXX> fallbacks");
+        }
+        gemma_marker_token_ = marker->second;
+    }
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
 
@@ -870,13 +1082,17 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
         while (end < boundaries.size() && boundaries[end].offset <= offset) { ++end; }
         return end;
     };
+    const SymbolContext symbols{.family         = family_,
+                                .byte_token_ids = &byte_token_ids_,
+                                .vocab          = &vocab_token_to_id_,
+                                .marker_token   = gemma_marker_token_,
+                                .byte_fallback  = &byte_fallback_ids_};
     const auto append_ordinary = [&](std::size_t begin, std::size_t end) {
         const std::size_t request_end = boundary_end_through(end);
-        const bool complete =
-            append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
+        const bool complete          = append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
                                  std::span<const IndexedByteBoundary>(boundaries)
                                      .subspan(boundary_cursor, request_end - boundary_cursor),
-                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens);
+                                 bpe_merge_rules_, symbols, options.max_tokens);
         boundary_cursor = request_end;
         return complete;
     };

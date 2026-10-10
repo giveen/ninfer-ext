@@ -209,7 +209,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
                 ops::rope(layer_positions.view({layer_columns}),
-                          dimension(config.attention.head_dim), config.rope_theta, key,
+                          dimension(config.attention.head_dim), dimension(config.attention.head_dim) / 2,
+                          config.rope_theta, key,
                           state.execution.device.execution_view());
                 Tensor key_batch =
                     key.view({dimension(config.attention.head_dim),
@@ -286,8 +287,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.mask_token_id), ids, positions, stream);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       flat_residual, stream);
+        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding, 1.0F, flat_residual, stream);
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -412,8 +412,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                   state.execution.device.stream);
         Tensor residual =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       residual, state.execution.device.stream);
+        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding, 1.0F, residual, state.execution.device.stream);
 
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -454,7 +453,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                              state.execution.device.stream);
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
-                ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
+                ops::rope(positions.view({columns}), dimension(config.attention.head_dim), dimension(config.attention.head_dim) / 2,
                           config.rope_theta, query, key, state.execution.device.execution_view());
                 Tensor query_batch = query.view({dimension(config.attention.head_dim),
                                                  dimension(config.attention.num_attention_heads),

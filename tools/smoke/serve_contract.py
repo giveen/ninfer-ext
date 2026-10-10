@@ -366,7 +366,57 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def exercise_tools(base_url: str, model: str) -> str:
+    """One tool round trip: the model calls the declared tool, then answers from its result."""
+    question = [{"role": "user", "content": "Use the tool: what is the weather in Paris?"}]
+    called = json_response(
+        base_url,
+        "POST",
+        "/v1/chat/completions",
+        {"model": model, "messages": question, "tools": [_WEATHER_TOOL],
+         "max_completion_tokens": 256, "temperature": 0},
+    )
+    choice = called["choices"][0]
+    calls = choice["message"].get("tool_calls") or []
+    if choice.get("finish_reason") != "tool_calls" or len(calls) != 1:
+        raise ContractError(f"expected one tool call, got {choice!r}")
+    call = calls[0]
+    if call["function"]["name"] != "get_weather" or json.loads(
+        call["function"]["arguments"]
+    ).get("city") is None:
+        raise ContractError(f"tool call has the wrong function or arguments: {call!r}")
+    history = question + [
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        {"role": "tool", "tool_call_id": call["id"], "content": "{\"temp_c\": 18}"},
+    ]
+    answered = json_response(
+        base_url,
+        "POST",
+        "/v1/chat/completions",
+        {"model": model, "messages": history, "tools": [_WEATHER_TOOL],
+         "max_completion_tokens": 128, "temperature": 0},
+    )
+    answer = answered["choices"][0]["message"].get("content") or ""
+    if "18" not in answer:
+        raise ContractError(f"the answer does not use the tool result: {answer!r}")
+    return answered["choices"][0].get("finish_reason")
+
+
+def exercise(base_url: str, model: str, vision: bool = True, tools: bool = False) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if (
@@ -505,6 +555,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         }:
             raise ContractError("Responses delete returned the wrong object")
 
+    image_prompt_tokens = None
     image_messages = [
         {
             "role": "user",
@@ -514,14 +565,16 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
             ],
         }
     ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError(
-            "image request did not expand the prompt through the Vision frontend"
+    if vision:
+        image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+        image_prompt_tokens, _ = require_usage(
+            image_response.get("usage"), "prompt_tokens", "completion_tokens"
         )
+        if image_prompt_tokens <= input_tokens:
+            raise ContractError(
+                "image request did not expand the prompt through the Vision frontend"
+            )
+    tool_finish = exercise_tools(base_url, model) if tools else None
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -549,6 +602,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "responses_output_tokens": response_output_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
+        "tool_round_trip_finish_reason": tool_finish,
     }
 
 
@@ -557,11 +611,16 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
     parser.add_argument("--health-timeout", type=float, default=300.0)
+    parser.add_argument("--text-only", action="store_true",
+                        help="skip the image request, for a model served without Vision")
+    parser.add_argument("--tools", action="store_true",
+                        help="also run one tool-call round trip")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    result = exercise(base_url, args.model, vision=not args.text_only, tools=args.tools)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

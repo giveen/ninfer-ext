@@ -66,7 +66,7 @@ def normalize_tokenizer(tokenizer: dict) -> bool:
     return changed
 
 
-def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
+def normalize_tokenizer_config(tokenizer: dict, config: dict, *, family: str = "qwen") -> bool:
     """Rewrite tokenizer_config.json to the contract the runtime enforces: the added-token decoder
     map it cross-checks, the Qwen prefix semantics, and the official pad token. Newer Transformers
     writes added tokens only in tokenizer.json and omits add_bos_token; the runtime requires both.
@@ -78,7 +78,9 @@ def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
     if config.get("add_prefix_space", True) is not False:
         config["add_prefix_space"] = False
         changed = True
-    if config.get("pad_token") != "<|endoftext|>":
+    if family != "gemma" and config.get("pad_token") != "<|endoftext|>":
+        # The Qwen pad token is the runtime's; Gemma keeps the pad its checkpoint names, because
+        # it has no <|endoftext|> in its vocabulary.
         config["pad_token"] = "<|endoftext|>"
         changed = True
     existing = config.get("added_tokens_decoder")
@@ -105,7 +107,72 @@ def normalize_tokenizer_config(tokenizer: dict, config: dict) -> bool:
     return True
 
 
-def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict) -> None:
+GEMMA_SPACE_MARKER = "\u2581"
+
+
+def validate_gemma_tokenizer(tokenizer: dict) -> None:
+    """Refuse a Gemma resource set the runtime would refuse.
+
+    Mirrors the Gemma half of validate_pipeline in src/models/qwen3_5/frontend/tokenizer.cpp. The
+    pipeline is not rewritten: its semantics are part of the checkpoint, and a rewrite would make
+    the artifact tokenize differently from the model that produced it."""
+
+    def fail(message: str) -> None:
+        raise ValueError(f"tokenizer resources the runtime cannot load: {message}")
+
+    normalizer = tokenizer.get("normalizer")
+    if normalizer is not None:
+        pattern = normalizer.get("pattern") if isinstance(normalizer, dict) else None
+        if (
+            not isinstance(normalizer, dict)
+            or normalizer.get("type") != "Replace"
+            or not isinstance(pattern, dict)
+            or pattern.get("String") != " "
+            or normalizer.get("content") != GEMMA_SPACE_MARKER
+        ):
+            fail("Gemma tokenizer.json normalizer must replace a space with U+2581")
+    pre = tokenizer.get("pre_tokenizer")
+    if pre is not None:
+        pattern = pre.get("pattern") if isinstance(pre, dict) else None
+        if (
+            not isinstance(pre, dict)
+            or pre.get("type") != "Split"
+            or not isinstance(pattern, dict)
+            or pattern.get("String") != " "
+            or pre.get("behavior") != "MergedWithPrevious"
+            or pre.get("invert", False) is not False
+        ):
+            fail("Gemma tokenizer.json pre_tokenizer must be one space Split, MergedWithPrevious")
+    decoder = tokenizer.get("decoder")
+    if decoder is not None:
+        steps = decoder.get("decoders") if isinstance(decoder, dict) else None
+        first = steps[0] if isinstance(steps, list) and steps else None
+        if (
+            not isinstance(decoder, dict)
+            or decoder.get("type") != "Sequence"
+            or not isinstance(steps, list)
+            or len(steps) != 3
+            or not isinstance(first, dict)
+            or first.get("type") != "Replace"
+            or first.get("content") != " "
+            or not isinstance(first.get("pattern"), dict)
+            or first["pattern"].get("String") != GEMMA_SPACE_MARKER
+            or steps[1].get("type") != "ByteFallback"
+            or steps[2].get("type") != "Fuse"
+        ):
+            fail("Gemma tokenizer.json decoder must be Replace, ByteFallback, Fuse")
+    post = tokenizer.get("post_processor")
+    if isinstance(post, dict) and post.get("type") != "TemplateProcessing":
+        fail("Gemma tokenizer.json post_processor must add no tokens")
+    if isinstance(post, dict) and post.get("special_tokens"):
+        fail("Gemma tokenizer.json post_processor must add no tokens")
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or model.get("byte_fallback") is not True:
+        fail("Gemma tokenizer.json model.byte_fallback must be true")
+
+
+def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict, *,
+                                  family: str = "qwen") -> None:
     """Reject a resource set the runtime tokenizer loader would refuse, before writing the artifact.
 
     Mirrors the checks in src/models/qwen3_5/frontend/tokenizer.cpp: the pipeline description, the
@@ -126,10 +193,11 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
     for field in ("continuing_subword_prefix", "end_of_word_suffix"):
         if model.get(field) not in (None, ""):
             fail(f"tokenizer.json model.{field} must be empty")
-    normalizer = tokenizer.get("normalizer")
-    if normalizer is not None and normalizer.get("type") != "NFC":
+    if family == "gemma":
+        pre = None  # checked by validate_gemma_tokenizer, which the pipeline is not rewritten for
+    elif (normalizer := tokenizer.get("normalizer")) is not None and normalizer.get("type") != "NFC":
         fail("tokenizer.json normalizer must be NFC")
-    pre = tokenizer.get("pre_tokenizer")
+    pre = tokenizer.get("pre_tokenizer") if family != "gemma" else None
     if pre is not None:
         parts = pre.get("pretokenizers")
         if pre.get("type") != "Sequence" or not isinstance(parts, list) or len(parts) != 2:
@@ -149,12 +217,13 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
             or bytes_level.get("use_regex", True) is not False
         ):
             fail("tokenizer.json pre_tokenizer.ByteLevel flags are unsupported")
-    decoder = tokenizer.get("decoder")
-    if decoder is not None and decoder.get("type") != "ByteLevel":
-        fail("tokenizer.json decoder must be ByteLevel")
-    post = tokenizer.get("post_processor")
-    if post is not None and post.get("type") != "ByteLevel":
-        fail("tokenizer.json post_processor must be ByteLevel or null")
+    if family != "gemma":
+        decoder = tokenizer.get("decoder")
+        if decoder is not None and decoder.get("type") != "ByteLevel":
+            fail("tokenizer.json decoder must be ByteLevel")
+        post = tokenizer.get("post_processor")
+        if post is not None and post.get("type") != "ByteLevel":
+            fail("tokenizer.json post_processor must be ByteLevel or null")
     added = tokenizer.get("added_tokens")
     if not isinstance(added, list):
         fail("tokenizer.json added_tokens must be an array")
@@ -187,7 +256,7 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
         fail("tokenizer_config.json add_bos_token must be false")
     if config.get("add_prefix_space", True) is not False:
         fail("tokenizer_config.json add_prefix_space must be false")
-    if config.get("pad_token") != "<|endoftext|>":
+    if family != "gemma" and config.get("pad_token") != "<|endoftext|>":
         fail("tokenizer_config.json pad_token must be <|endoftext|>")
     eos = generation.get("eos_token_id")
     if type(eos) is not int and not (isinstance(eos, list) and eos and all(type(v) is int for v in eos)):
@@ -295,6 +364,7 @@ def load_resources(
     vocab_size: int,
     vision_config: Mapping[str, int] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
+    family: str = "qwen",
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
     overrides = {} if overrides is None else dict(overrides)
     roles = {"text": TEXT_RESOURCES}
@@ -337,12 +407,14 @@ def load_resources(
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data
-    if normalize_tokenizer(parsed["tokenizer.json"]):
+    if family == "gemma":
+        validate_gemma_tokenizer(parsed["tokenizer.json"])
+    elif normalize_tokenizer(parsed["tokenizer.json"]):
         payloads["resource/text/tokenizer.json"] = json.dumps(
             parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
     if normalize_tokenizer_config(
-        parsed["tokenizer.json"], parsed["tokenizer_config.json"]
+        parsed["tokenizer.json"], parsed["tokenizer_config.json"], family=family
     ):
         payloads["resource/text/tokenizer_config.json"] = json.dumps(
             parsed["tokenizer_config.json"], ensure_ascii=False, separators=(",", ":")
@@ -360,6 +432,7 @@ def load_resources(
         parsed["tokenizer.json"],
         parsed["tokenizer_config.json"],
         parsed.get("generation_config.json", {}),
+        family=family,
     )
     count, special = token_domain(
         parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size

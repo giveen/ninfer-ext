@@ -1,0 +1,217 @@
+{
+ "source": "google/gemma-4-31B-it tokenizer.json (base checkpoint, /mnt/storage/models/gemma/full-31b)",
+ "source_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+ "oracle": "tokenizers 0.22.2: Tokenizer.from_file(...).encode(text, add_special_tokens=False)",
+ "cases": [
+  {
+   "text": "a b",
+   "ids": [
+    236746,
+    518
+   ]
+  },
+  {
+   "text": "a  b",
+   "ids": [
+    236746,
+    138,
+    236763
+   ]
+  },
+  {
+   "text": "a   b",
+   "ids": [
+    236746,
+    139,
+    236763
+   ]
+  },
+  {
+   "text": "  leading",
+   "ids": [
+    138,
+    26016
+   ]
+  },
+  {
+   "text": "trailing  ",
+   "ids": [
+    136697,
+    138
+   ]
+  },
+  {
+   "text": "a b c d",
+   "ids": [
+    236746,
+    518,
+    505,
+    513
+   ]
+  },
+  {
+   "text": "a\nb",
+   "ids": [
+    236746,
+    107,
+    236763
+   ]
+  },
+  {
+   "text": "a\r\nb",
+   "ids": [
+    236746,
+    251,
+    107,
+    236763
+   ]
+  },
+  {
+   "text": "\n\n\n",
+   "ids": [
+    109
+   ]
+  },
+  {
+   "text": "a\n  b",
+   "ids": [
+    236746,
+    107,
+    138,
+    236763
+   ]
+  },
+  {
+   "text": "line1\nline2\nline3",
+   "ids": [
+    1257,
+    236770,
+    107,
+    1257,
+    236778,
+    107,
+    1257,
+    236800
+   ]
+  },
+  {
+   "text": "def f(x):\n    return x",
+   "ids": [
+    2063,
+    517,
+    236769,
+    236781,
+    1473,
+    107,
+    140,
+    2060,
+    1123
+   ],
+   "note": "no word-level split: '(' 'x' '):' stay separate"
+  },
+  {
+   "text": "Hello,  world!",
+   "ids": [
+    9259,
+    236764,
+    138,
+    12392,
+    236888
+   ]
+  },
+  {
+   "text": "héllo wörld",
+   "ids": [
+    236754,
+    7869,
+    844,
+    515,
+    4010,
+    671
+   ]
+  },
+  {
+   "text": "日本語のテキスト",
+   "ids": [
+    94951,
+    236945,
+    95830
+   ]
+  },
+  {
+   "text": "emoji 🎉 test",
+   "ids": [
+    67906,
+    204906,
+    1594
+   ]
+  },
+  {
+   "text": "é combining",
+   "ids": [
+    236744,
+    238288,
+    26614
+   ]
+  },
+  {
+   "text": "Привет мир",
+   "ids": [
+    116130,
+    58562
+   ]
+  },
+  {
+   "text": "",
+   "ids": [
+    245863
+   ],
+   "note": "private use area, expects byte fallback if absent from vocab"
+  },
+  {
+   "text": "𲎰",
+   "ids": [
+    478,
+    416,
+    380,
+    414
+   ],
+   "note": "CJK extension, expects byte fallback if absent from vocab"
+  },
+  {
+   "text": "tab\there",
+   "ids": [
+    4823,
+    255968,
+    8472
+   ]
+  },
+  {
+   "text": "\u0001\u0002",
+   "ids": [
+    249732,
+    241247
+   ]
+  },
+  {
+   "text": "a                b",
+   "ids": [
+    236746,
+    152,
+    236763
+   ]
+  },
+  {
+   "text": "word \t mixed \n spaces",
+   "ids": [
+    3017,
+    236743,
+    255968,
+    9726,
+    236743,
+    107,
+    9952
+   ]
+  }
+ ]
+}

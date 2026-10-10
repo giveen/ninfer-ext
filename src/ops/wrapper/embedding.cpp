@@ -169,9 +169,13 @@ void require_q8_metadata(const Weight& table, const Tensor& out) {
 }
 
 void require_fp8_metadata(const Weight& table, const Tensor& out) {
-    constexpr std::int32_t kVocabulary = 248320;
-    constexpr std::int32_t kHidden     = 5120;
-    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+    constexpr std::int32_t kQwenVocabulary  = 248320;
+    constexpr std::int32_t kQwenHidden      = 5120;
+    constexpr std::int32_t kGemmaVocabulary = 262144;
+    constexpr std::int32_t kGemmaHidden     = 5376;
+    const bool qwen  = table.n == kQwenVocabulary && table.k == kQwenHidden;
+    const bool gemma = table.n == kGemmaVocabulary && table.k == kGemmaHidden;
+    if ((!qwen && !gemma) || out.ne[0] != table.k) {
         throw std::invalid_argument("embedding: unsupported FP8 table shape");
     }
     if ((reinterpret_cast<std::uintptr_t>(out.data) &
@@ -194,7 +198,9 @@ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
 
 } // namespace
 
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void embedding(const Tensor& ids, const Weight& table, float output_scale, Tensor& out,
+               cudaStream_t stream) {
+    output_scale = detail::bf16_rounded_scale(output_scale);
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
     if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
 
@@ -212,25 +218,25 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
             throw std::invalid_argument("embedding: dense table data must be non-null");
         }
         const Tensor dense = as_dense(table);
-        detail::embed_gather_dense_launch(ids, dense, out, stream);
+        detail::embed_gather_dense_launch(ids, dense, output_scale, out, stream);
     } break;
     case QType::Q6_G64_FP16:
         require_q6_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_q6_launch(ids, table, out, stream);
+        detail::embed_gather_q6_launch(ids, table, output_scale, out, stream);
         break;
     case QType::Q8_G32_FP16:
         require_q8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_q8_launch(ids, table, out, stream);
+        detail::embed_gather_q8_launch(ids, table, output_scale, out, stream);
         break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_fp8_launch(ids, table, out, stream);
+        detail::embed_gather_fp8_launch(ids, table, output_scale, out, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

@@ -411,7 +411,8 @@ int run_text_case(int query_heads, int key_heads, int tokens, int first_position
     // The route this replaces, on the same inputs.
     ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
     ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
-    ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
+    ops::rope(position_tensor, kTextRotaryDim, kTextRotaryDim / 2,
+              static_cast<float>(kTheta), q_split, k_split,
               execution);
     cuda_synchronize();
 
@@ -480,7 +481,8 @@ int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t
                       nullptr);
     ops::rmsnorm(q_in, q_weight_tensor, static_cast<float>(kEpsilon), true, q_split, nullptr);
     ops::rmsnorm(k_in, k_weight_tensor, static_cast<float>(kEpsilon), true, k_split, nullptr);
-    ops::rope(position_tensor, kTextRotaryDim, static_cast<float>(kTheta), q_split, k_split,
+    ops::rope(position_tensor, kTextRotaryDim, kTextRotaryDim / 2,
+              static_cast<float>(kTheta), q_split, k_split,
               execution);
     cuda_synchronize();
 

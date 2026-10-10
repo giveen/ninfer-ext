@@ -40,10 +40,22 @@ struct DecodedTokenView {
     bool special = false;
 };
 
+// The tokenizer.json pipeline a model's resources describe. The runtime implements each family
+// explicitly; a resource set that disagrees with its family is refused at load rather than
+// tokenized differently from the checkpoint that produced it.
+enum class TokenizerFamily : std::uint8_t {
+    // NFC, a word-level `Split` with the Qwen pattern, and GPT-2 byte-level symbols.
+    Qwen,
+    // A `Replace` normalizer that turns a space into U+2581, newline-only word boundaries, and raw
+    // UTF-8 symbols with `<0xXX>` byte fallback (Gemma).
+    Gemma,
+};
+
 struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
     std::string_view generation_config_json;
+    TokenizerFamily family = TokenizerFamily::Qwen;
 };
 
 struct BpeMergeRule {
@@ -159,6 +171,11 @@ private:
     std::unordered_map<std::string, int> vocab_token_to_id_;
     BpeMergeTable bpe_merge_rules_;
     std::array<int, 256> byte_token_ids_{};
+    // Gemma's alphabet: the `<0xXX>` fallback for every byte, and the id of the U+2581 marker a
+    // space is written as.
+    std::array<int, 256> byte_fallback_ids_{};
+    int gemma_marker_token_                 = -1;
+    TokenizerFamily family_                 = TokenizerFamily::Qwen;
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;

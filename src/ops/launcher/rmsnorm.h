@@ -12,6 +12,6 @@ namespace ninfer::ops::detail {
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
-                    cudaStream_t stream, bool sigmoid_gate = false);
+                    cudaStream_t stream, bool sigmoid_gate = false, bool weightless = false);
 
 } // namespace ninfer::ops::detail

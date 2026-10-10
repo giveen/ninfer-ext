@@ -103,10 +103,11 @@ template <int Br, int Bc>
 __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const PackedAttentionTile* __restrict__ tiles,
-    std::int32_t tokens, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
-    std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
-    std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
-    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+    std::int32_t tokens, std::int32_t uniform_segment_length, float scale_log2e,
+    __nv_bfloat16* __restrict__ out, std::int64_t q_stride_d, std::int64_t q_stride_h,
+    std::int64_t q_stride_t, std::int64_t k_stride_d, std::int64_t k_stride_h,
+    std::int64_t k_stride_t, std::int64_t v_stride_d, std::int64_t v_stride_h,
+    std::int64_t v_stride_t) {
     static_assert(Br == 16 || Br == 32 || Br == 64);
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
     constexpr int D             = kPackedAttentionHeadDim;
@@ -117,7 +118,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = Bc / 16;
     constexpr int RowBytes      = Dp * static_cast<int>(sizeof(__nv_bfloat16));
-    constexpr float ScaleLog2E  = 0.11785113019775792073f * 1.4426950408889634074f;
+    const float ScaleLog2E      = scale_log2e;
     constexpr unsigned FullMask = 0xffffffffu;
 
     PackedAttentionTile tile;

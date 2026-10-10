@@ -1,6 +1,7 @@
 set(ninfer_op_tests
   add_bias
   gelu
+  gelu_mul
   silu_mul
   residual_add
   sigmoid_mul
@@ -8,6 +9,7 @@ set(ninfer_op_tests
   rmsnorm_pack_tail
   gated_rmsnorm
   l2norm
+  mul_scalar
   gated_delta_net
   kimi_delta_attention
   causal_conv1d_silu
@@ -18,10 +20,16 @@ set(ninfer_op_tests
   gdn_gating_proj
   rope
   vision_pos_embed
+  vision_pool
   sampling
   scalar
   cast
+  causal_compact_attention
+  compact_kv_rows
   prepare_ragged_prefix
+  scale_columns
+  sliding_causal_attention
+  soft_cap
   scatter
   scatter_bf16_batch
   target_logprobs

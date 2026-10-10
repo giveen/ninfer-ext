@@ -86,7 +86,7 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
 
     Tensor g_flat = g.view({h, columns});
     Tensor emb    = work_.alloc(DType::BF16, {h, columns});
-    ops::embedding(ids.view({columns}), *embed_, emb, s);
+    ops::embedding(ids.view({columns}), *embed_, 1.0F, emb, s);
     Tensor e = work_.alloc(DType::BF16, {h, columns});
     Tensor u = work_.alloc(DType::BF16, {h, columns});
     ops::rmsnorm(emb, layer.input_norm, config_.rms_norm_eps, false, e, s);
@@ -105,7 +105,8 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
     project(x, layer.key, k_flat, work_, s);
     project(x, layer.value, v_flat, work_, s);
 
-    ops::rope(rope_positions.view({columns}), rotary, config.draft->rope_theta, q, k,
+    ops::rope(rope_positions.view({columns}), rotary, rotary / 2, config.draft->rope_theta,
+              q, k,
               ctx_.execution_view());
 
     Tensor a = work_.alloc(DType::BF16, {head_dim, q_heads, width, batch});

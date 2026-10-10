@@ -45,7 +45,7 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
              float input_scale = 4.0F, bool bf16x2_unaligned = false, bool replay = false,
-             int width = 0) {
+             int width = 0, bool weightless = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d);
     fill_uniform(input, seed, -input_scale, input_scale);
@@ -74,8 +74,17 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
+    // The weightless form carries no weight operand; the oracle represents its gain as a vector of
+    // ones, which is exact. The replay phase negates the weight, so the selection happens at each
+    // call rather than in a capture.
+    const std::vector<float> weightless_gain(shape.d, 1.0F);
     const auto launch = [&] {
-        ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor, device.stream);
+        if (weightless) {
+            ops::rmsnorm(input_tensor, kEps, output_tensor, device.stream);
+        } else {
+            ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor,
+                         device.stream);
+        }
     };
     int failures = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
@@ -103,7 +112,8 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         else
             launch();
         cuda_synchronize(device.stream);
-        const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset);
+        const auto reference =
+            rmsnorm_oracle(input, weightless ? weightless_gain : weight, shape, unit_offset);
         failures += verify_reduction(label, from_device_bf16(output_data, count), reference,
                                      rmsnorm_bf16_criterion());
         failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
@@ -130,6 +140,9 @@ int main() {
     failures += run_case("rmsnorm offset [256,2,1]", {256, 2}, true, 1105U);
     failures += run_case("rmsnorm offset [256,4,48]", {256, 4, 48}, true, 1106U);
     failures += run_case("rmsnorm plain [2048,1]", {2048, 1}, false, 1201U);
+    // Gemma 4's hidden width, which has its own fixed-width route.
+    failures += run_case("rmsnorm plain [5376,1]", {5376, 1}, false, 1211U);
+    failures += run_case("rmsnorm plain [5376,128]", {5376, 128}, false, 1212U);
     failures += run_case("rmsnorm plain [2048,128]", {2048, 128}, false, 1202U);
     failures += run_case("rmsnorm plain [128,32,7]", {128, 32, 7}, false, 1203U);
     failures += run_case("rmsnorm plain [128,8,128]", {128, 8, 128}, false, 1204U);
@@ -176,6 +189,24 @@ int main() {
             failures += run_case("rmsnorm QK scale/unaligned", {256, 4, 17}, offset, 2002U, scale,
                                  true, true);
         }
+    // Gemma 4 weightless norms: sliding v is 16 heads x 256, and the global shared normalization
+    // feeding both v and the pre-rotation k is 4 heads x 512.
+    failures += run_case("rmsnorm weightless [256,16,1]", {256, 16, 1}, false, 3001U, 4.0F, false,
+                         false, 0, true);
+    failures += run_case("rmsnorm weightless [256,16,7]", {256, 16, 7}, false, 3002U, 4.0F, false,
+                         false, 0, true);
+    failures += run_case("rmsnorm weightless [512,4,1]", {512, 4, 1}, false, 3003U, 4.0F, false,
+                         false, 0, true);
+    failures += run_case("rmsnorm weightless [512,4,128]", {512, 4, 128}, false, 3004U, 4.0F, false,
+                         true, 0, true);
+    failures += run_case("rmsnorm weightless unaligned [256,16,7]", {256, 16, 7}, false, 3005U, 4.0F,
+                         true, false, 0, true);
+    failures += run_case("rmsnorm weightless replay [512,4,7]", {512, 4, 7}, false, 3006U, 4.0F,
+                         false, true, 0, true);
+    for (float scale : {0.0f, 1.e-5f, 4096.f}) {
+        failures += run_case("rmsnorm weightless scale", {256, 16, 17}, false, 3007U, scale, false,
+                             false, 0, true);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }

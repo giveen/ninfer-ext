@@ -5,6 +5,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,26 @@ int run_fp8_a16() {
     const auto mlp_invocations = a16_capacity_calls();
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {34816, 5120, 821U, Comparison::Sampled, true, mlp_invocations});
+    // Gemma 4's sliding-attention query projection, the first of that model's shapes. It registers
+    // A16-only, so a request for a quantized activation route must fall back to this one.
+    const auto gemma_invocations = a16_capacity_calls();
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {8192, 5376, 825U, Comparison::Sampled, true, gemma_invocations});
+    for (const auto& [n, seed] : {std::pair{4096, 826U}, std::pair{16384, 827U},
+                                  std::pair{2048, 828U}}) {
+        const auto invocations = a16_capacity_calls();
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, 5376, seed, Comparison::Sampled, true, invocations});
+    }
+    // The output projections and the vocabulary head: k becomes the wide side here.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 3> wide_shapes{
+        std::tuple{5376, 8192, 829U}, std::tuple{5376, 16384, 830U},
+        std::tuple{262144, 5376, 831U}};
+    for (const auto& [n, k, seed] : wide_shapes) {
+        const auto invocations = a16_capacity_calls();
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
+    }
     std::vector<Invocation> vocabulary_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},

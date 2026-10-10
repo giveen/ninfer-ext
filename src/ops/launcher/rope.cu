@@ -74,9 +74,12 @@ void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStre
             token_stride(k));
 }
 
-bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                       DeviceExecutionView execution) {
+bool launch_fixed_pair(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                       Tensor& q, Tensor& k, DeviceExecutionView execution) {
     const auto stream = execution.stream;
+    // The specialized kernels span the whole rotary dimension; a partial profile takes the generic
+    // kernel, which is the only one that bounds its pair loop and its coefficient cache.
+    if (rotary_pairs != rotary_dim / 2) { return false; }
     if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) { return false; }
     const int axes = positions.ne[1];
     if (axes == 1 && q.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F && q.ne[1] == 32 &&
@@ -140,8 +143,9 @@ bool launch_text_single(const Tensor& positions, int axes, Tensor& x,
     return false;
 }
 
-bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                                  DeviceExecutionView execution) {
+bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, int rotary_pairs,
+                                  float theta, Tensor& x, DeviceExecutionView execution) {
+    if (rotary_pairs != rotary_dim / 2) { return false; }
     if (!bf16x2_aligned(x)) { return false; }
     const int axes = positions.ne[1];
     if (axes == 1 && x.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F) {
@@ -169,8 +173,8 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     return false;
 }
 
-void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor* q, Tensor* k,
-                    cudaStream_t stream) {
+void launch_generic(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                    Tensor* q, Tensor* k, cudaStream_t stream) {
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
@@ -178,24 +182,24 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
         static_cast<const std::int32_t*>(positions.data), positions.ne[1],
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
-        theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens, token_stride(q),
-        token_stride(k));
+        rotary_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
+        token_stride(q), token_stride(k));
 }
 
 } // namespace
 
-void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 DeviceExecutionView execution) {
-    if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, execution)) {
-        launch_generic(positions, rotary_dim, theta, &q, &k, execution.stream);
+void rope_launch(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                 Tensor& q, Tensor& k, DeviceExecutionView execution) {
+    if (!launch_fixed_pair(positions, rotary_dim, rotary_pairs, theta, q, k, execution)) {
+        launch_generic(positions, rotary_dim, rotary_pairs, theta, &q, &k, execution.stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        DeviceExecutionView execution) {
-    if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, execution)) {
-        launch_generic(positions, rotary_dim, theta, &x, nullptr, execution.stream);
+void rope_single_launch(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
+                        Tensor& x, DeviceExecutionView execution) {
+    if (!launch_fixed_single_dispatch(positions, rotary_dim, rotary_pairs, theta, x, execution)) {
+        launch_generic(positions, rotary_dim, rotary_pairs, theta, &x, nullptr, execution.stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

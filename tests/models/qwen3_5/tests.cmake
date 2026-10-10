@@ -1,3 +1,8 @@
+ninfer_add_test(ninfer_gemma4_config_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_config.cpp"
+  LIBRARIES ninfer_model_loading)
+
 # Opt-in real-model artifacts, selected by explicit path so a run never depends
 # on glob order or modification time. Configure the ones you have and run
 # `ctest -L real`; an artifact variable left empty makes its test skip (77).
@@ -101,6 +106,72 @@ ninfer_add_test(ninfer_qwen3_5_mtp_draft_policy_test
 ninfer_add_test(ninfer_qwen3_5_suffix_drafter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_suffix_drafter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+
+ninfer_add_test(ninfer_gemma4_tokenizer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_tokenizer.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_artifact)
+set_tests_properties(ninfer_gemma4_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_frontend_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_frontend.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_artifact)
+set_tests_properties(ninfer_gemma4_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_load_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_load.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_load_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_model_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_model.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_model_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_forward_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_forward.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_forward_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_draft_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_draft.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_draft_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_mtp_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_mtp.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_mtp_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_vision_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_vision.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_vision_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_image_processor_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_image_processor.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_image_processor_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_image_prompt_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_image_prompt.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_image_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_layer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_layer.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_layer_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_generate_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_generate.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_generate_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_score_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_score.cpp"
+  LIBRARIES ninfer_model_loading ninfer_engine)
+set_tests_properties(ninfer_gemma4_score_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"

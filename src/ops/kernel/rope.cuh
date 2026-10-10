@@ -177,18 +177,23 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
+// `rotary_pairs` bounds both the coefficient cache and the applied pairs; `half` remains the
+// partner offset, so a partial profile leaves pairs [rotary_pairs,rotary_dim/2) and their partners
+// untouched.
 static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                            __nv_bfloat16* q, __nv_bfloat16* k,
                                            std::int32_t head_dim, std::int32_t rotary_dim,
-                                           float theta, std::int32_t q_heads, std::int32_t k_heads,
+                                           std::int32_t rotary_pairs, float theta,
+                                           std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
                                            std::int64_t k_token_stride) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
-    const int half = rotary_dim / 2;
+    const int half  = rotary_dim / 2;
+    const int pairs = rotary_pairs;
     __shared__ float cos_cache[kRopeMaxHalf];
     __shared__ float sin_cache[kRopeMaxHalf];
-    if (threadIdx.x < static_cast<unsigned>(half)) {
+    if (threadIdx.x < static_cast<unsigned>(pairs)) {
         const int pair = static_cast<int>(threadIdx.x);
         if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
@@ -197,11 +202,19 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
-            const float angle =
-                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+            // The phase is evaluated in double. A long-context phase reaches the position
+            // magnitude, where float spacing alone (about 0.016 at 262144) exceeds the tolerance
+            // the rotation is held to; the cached coefficient is bounded by one, so float storage
+            // for it is exact enough.
+            const double frequency = pow(static_cast<double>(theta), static_cast<double>(exponent));
+            const double angle =
+                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                 frequency;
-            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            double sine   = 0.0;
+            double cosine = 0.0;
+            sincos(angle, &sine, &cosine);
+            sin_cache[pair] = static_cast<float>(sine);
+            cos_cache[pair] = static_cast<float>(cosine);
         }
     }
     __syncthreads();
@@ -217,7 +230,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
         const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
         const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
                                   static_cast<std::int64_t>(head) * head_dim;
-        for (int pair = lane; pair < half; pair += 32) {
+        for (int pair = lane; pair < pairs; pair += 32) {
             const float first        = __bfloat162float(data[base + pair]);
             const float second       = __bfloat162float(data[base + pair + half]);
             const float c            = cos_cache[pair];

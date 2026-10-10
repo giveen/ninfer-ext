@@ -91,8 +91,28 @@ void geometry_and_views() {
     WeightView fp8_rows{{128, 64}, {{&fp8_parent, 0, 128 * 64}}};
     require(weight_row_planes(fp8_rows.parts.front()).scales == fp8.data() + 16384,
             "FP8 view recomputed the parent scale base");
-    rejects<std::invalid_argument>([&] { (void)native_weight(fp8_rows); },
-                                   "complete-parent ABI accepted an FP8 submatrix");
+    // A RowScale parent is one multiplier per row and the plane helper offsets both planes by the
+    // view's first row, so a row slice of it is a whole operand. Gemma 4's attention projections are
+    // bound exactly that way: three slices of one fused input projection.
+    const WeightView fp8_tail{{128, 64}, {{&fp8_parent, 128 * 64, 256 * 64}}};
+    const auto tail_planes = weight_row_planes(fp8_tail.parts.front());
+    require(tail_planes.scales == fp8.data() + 16384 + 128 * 2,
+            "a RowScale row slice must offset its scale line");
+    const auto tail = native_weight(fp8_tail);
+    require(tail.n == 128 && tail.k == 64 && tail.qdata == tail_planes.codes &&
+                tail.scales == tail_planes.scales,
+            "native RowScale row slice lost its planes");
+
+    // A BlockScale parent's scales are swizzled over the whole tensor, so a row slice cannot
+    // re-derive them and the complete parent is still required. That, not RowScale, is what the
+    // complete-parent requirement protects.
+    const auto block_geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                                std::array<std::uint64_t, 2>{256, 64});
+    std::vector<std::byte> block(block_geometry.bytes);
+    WeightParent block_parent{block_geometry, block.data()};
+    const WeightView block_rows{{128, 64}, {{&block_parent, 0, 128 * 64}}};
+    rejects<std::invalid_argument>([&] { (void)native_weight(block_rows); },
+                                   "complete-parent ABI accepted a swizzled submatrix");
 
     // Row-grouped 4-bit table rows carry no padding: K/2 code bytes and K/32 binary16 scales per row.
     const auto q4_rows = weight_geometry(QType::Q4_G32_FP16_ROWS, QuantLayout::RowGroup,

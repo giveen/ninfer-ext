@@ -15,6 +15,9 @@ Architecture resolve_architecture(std::string_view architecture, std::string_vie
     if (architecture == "Qwen4ExpForCausalLM" && model_type == "qwen4_exp_text") {
         return Architecture::Qwen4Exp;
     }
+    if (architecture == "Gemma4ForCausalLM" && model_type == "gemma4_text") {
+        return Architecture::Gemma4;
+    }
     throw std::invalid_argument("unsupported architecture/config pair " +
                                 std::string(architecture) + "/" + std::string(model_type));
 }
@@ -27,6 +30,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen3_5MoeForCausalLM";
     case Architecture::Qwen4Exp:
         return "Qwen4ExpForCausalLM";
+    case Architecture::Gemma4:
+        return "Gemma4ForCausalLM";
     }
     return {};
 }

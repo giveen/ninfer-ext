@@ -15,15 +15,19 @@ namespace {
 
 constexpr std::int32_t kHeadDim = 72;
 constexpr std::int32_t kHeads   = 16;
+// The two registered scales: 1/sqrt(72) for the Qwen vision tower, and 1.0 for Gemma 4's, whose q
+// and k are RMS-normalized per head before the score.
 constexpr float kExpectedScale  = 0.11785113019775792073f;
+constexpr float kUnitScale      = 1.0f;
 
 void require_profile(AttentionHeadGeometry geometry, float scale, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         geometry.query_heads != kHeads || geometry.kv_heads != kHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-7f) {
-        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(72)");
+    if (!std::isfinite(scale) ||
+        (std::abs(scale - kExpectedScale) > 1.0e-7f && scale != kUnitScale)) {
+        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(72) or 1");
     }
 }
 
@@ -98,7 +102,7 @@ void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                        Tensor& out, cudaStream_t stream) {
     const std::int32_t tokens = validate_qkv(q, k, v, out, geometry, scale, "softmax_attention");
     auto scope                = workspace.scope();
-    detail::packed_attention_uniform_launch(q, k, v, tokens, out, stream);
+    detail::packed_attention_uniform_launch(q, k, v, tokens, scale, out, stream);
 }
 
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -116,7 +120,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scratch_scope = workspace.scope();
     Tensor tiles       = allocate_workspace(workspace, tokens, segments);
     Tensor* tiles_ptr  = tiles.data == nullptr ? nullptr : &tiles;
-    detail::packed_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream);
+    detail::packed_attention_launch(q, k, v, cu_seqlens, tiles_ptr, scale, out, stream);
 }
 
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -127,7 +131,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (segment_length <= 0 || tokens % segment_length != 0) {
         throw std::invalid_argument("packed_softmax_attention: invalid uniform segment length");
     }
-    detail::packed_attention_uniform_launch(q, k, v, segment_length, out, stream);
+    detail::packed_attention_uniform_launch(q, k, v, segment_length, scale, out, stream);
 }
 
 } // namespace ninfer::ops

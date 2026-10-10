@@ -9,6 +9,7 @@ from .methods import (
     import_encoded,
     q4_rows_maxabs,
     nvfp4_absmax,
+    nvfp4_mse,
 )
 from .sources.compressed_tensors import compressed_matrix_source
 from .sources.exl3 import exl3_matrix_source
@@ -509,6 +510,131 @@ def qwen3_8_flash_next_bf16(model, recipe, sources):
             recipe.group(names)
 
 
+def gemma4_31b_base(model, recipe, sources):
+    """Gemma 4 31B from the base BF16 checkpoint: our own NVFP4 MLPs and FP8 rows elsewhere.
+
+    NVIDIA's NVFP4 checkpoint is an instruction-tuned artifact, so it cannot be imported here;
+    the plan's L1 layout is reached with the converter's own encoders instead (plan 6.2/6.3).
+    """
+    _optional(model, recipe)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name == "text/token_embedding":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            continue
+        if not parameter.projection:
+            continue
+        if "/mlp/" in name:
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif "/attention/" in name:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+
+
+def gemma4_31b_g0(model, recipe, sources):
+    """Gemma 4 31B with gewell's G0 precision layout, which spends precision where it pays.
+
+    G0 keeps embeddings and norms BF16, holds Q/K/V at FP8 throughout, and uses FP8 rather than NVFP4
+    for the O and MLP projections in the first six layers, every global layer and the local layer before
+    it. The cheaper layout this project shipped first - FP8 embedding, NVFP4 MLP everywhere - leaves the
+    head faithful but the logit tails further from HuggingFace than the per-layer agreement predicts, and
+    the tails are what a KLD ranking reads. See docs/maintainer/gemma4-model.md §9.
+    """
+    _optional(model, recipe)
+    # Layers whose O and MLP projections stay at FP8: the first six, then every global layer (5, 11, ...
+    # 59) together with the local layer that precedes it.
+    precise = {0, 1, 2, 3, 4, 5}
+    for layer in range(6, 60, 6):
+        precise.add(layer)
+        precise.add(layer - 1)
+
+    def layer_of(name):
+        parts = name.split("/")
+        return int(parts[2]) if len(parts) > 2 and parts[1] == "layers" else -1
+
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format="bf16")
+            continue
+        if not parameter.projection:
+            continue
+        layer = layer_of(name)
+        if "/mlp/" in name:
+            if layer in precise:
+                recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            else:
+                recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif "/attention/" in name:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+
+
+_GEMMA4_GROUPS = {
+    "attn_qkv": ("attention/query", "attention/key", "attention/value"),
+    "attn_o": ("attention/output",),
+    "mlp_gu": ("mlp/gate", "mlp/up"),
+    "mlp_down": ("mlp/down",),
+}
+_GEMMA4_FORMATS = {"q4": Q4, "q5": Q5, "q6": Q6, "q8": Q8, "fp8": FP8, "nvfp4": "nvfp4"}
+
+
+def _gemma4_layout(model, recipe, layout_name):
+    """Assigns a measured Gemma 4 precision layout (tools/convert/layouts/<name>.json).
+
+    The layout names one format per projection group and layer, and the head's and embedding's. It
+    is the output of tools/verify/gemma4_allocate.py, scored end to end with
+    tools/verify/gemma4_sensitivity.py --assign before it was committed.
+    """
+    import json
+    from pathlib import Path
+
+    layout = json.loads((Path(__file__).parent / "layouts" / f"{layout_name}.json").read_text())
+    _optional(model, recipe)
+
+    def assign(name, short):
+        if short == "bf16":
+            recipe.assign(name, format="bf16")
+        elif short == "nvfp4":
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif short == "fp8":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+        else:
+            _assign(recipe, name, _GEMMA4_FORMATS[short])
+
+    assign("text/token_embedding", layout["embedding"])
+    assign("text/output_head", layout["head"])
+    # The assistant drafter, when converted, is Q6 throughout, head included. The target verifies every
+    # draft, so the format moves only acceptance and the drafter's step cost: against BF16, adaptive MTP
+    # ran 4.3% faster on average over five prompts greedy and sampled (Q8 3.9%), worst -1.9%, and the
+    # drafter shrinks from 0.94 to about 0.4 GB.
+    for name, parameter in model.parameters.items():
+        if name.startswith("mtp/") and parameter.projection:
+            _assign(recipe, name, Q6)
+    # The vision tower, when converted: Q6 for every layer's linears, and BF16 for the patch and output
+    # projections. The tower amplifies weight error: against its FP32 output, Q4/Q5 (the Qwen tower's
+    # formats) leave a 0.956 mean token cosine on a photo, Q6 0.989 (the BF16 tower's own level) and Q8
+    # 0.999 (tools/verify/gemma4_vision_reference.py), and nothing downstream checks image features.
+    for name, parameter in model.parameters.items():
+        if not name.startswith("vision/") or not parameter.projection:
+            continue
+        if name in ("vision/patch_embedding", "vision/embedding_projection"):
+            recipe.assign(name, format="bf16", method=cast_direct)
+        else:
+            _assign(recipe, name, Q6)
+    for layer, groups in layout["layers"].items():
+        for group, short in groups.items():
+            for role in _GEMMA4_GROUPS[group]:
+                name = f"text/layers/{layer}/{role}"
+                if name in model.parameters:
+                    assign(name, short)
+
+
+def gemma4_31b_m1(model, recipe, sources):
+    """Gemma 4 31B, mixed layout M1: Q8/Q6 attention, NVFP4/Q-format MLPs, Q6 head, BF16 embedding."""
+    _gemma4_layout(model, recipe, "gemma4_31b_m1")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -522,4 +648,7 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_bf16": qwen3_8_flash_next_bf16,
     "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
+    "gemma4_31b_base": gemma4_31b_base,
+    "gemma4_31b_g0": gemma4_31b_g0,
+    "gemma4_31b_m1": gemma4_31b_m1,
 }

@@ -383,7 +383,8 @@ void run_text_single(DeviceExecutionView execution, int tokens, int axes, bool c
             if (control) {
                 launch_text_control<Heads, 0>(tpos, tx, tx, execution.on_stream(stream));
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, execution.on_stream(stream));
+                ops::rope(tpos, kTextRotaryDim, kTextRotaryDim / 2, kTextTheta, tx,
+                          execution.on_stream(stream));
             }
         },
         bytes);
@@ -426,7 +427,8 @@ void run_text(DeviceExecutionView execution, int tokens, int axes, bool control,
             } else if (candidate_block != 0) {
                 launch_text_candidate<QHeads, KHeads>(tpos, tq, tk, candidate_block, stream);
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
+                ops::rope(tpos, kTextRotaryDim, kTextRotaryDim / 2, kTextTheta, tq, tk,
+                          execution.on_stream(stream));
             }
         },
         bytes);
@@ -465,7 +467,8 @@ void run_dflash(DeviceExecutionView execution, int tokens, bool control, int can
         } else if (candidate_block != 0) {
             launch_dflash_candidate(tpos, tq, tk, block, stream);
         } else {
-            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
+            ops::rope(tpos, kDflashRotaryDim, kDflashRotaryDim / 2, kTextTheta, tq, tk,
+                      execution.on_stream(stream));
         }
     };
     if (profile) {
@@ -513,7 +516,8 @@ void run_dflash_single_k(DeviceExecutionView execution, int tokens, bool control
                         tx.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), 0);
                 CUDA_CHECK(cudaGetLastError());
             } else {
-                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, execution.on_stream(stream));
+                ops::rope(tpos, kDflashRotaryDim, kDflashRotaryDim / 2, kTextTheta, tx,
+                          execution.on_stream(stream));
             }
         },
         bytes);
@@ -540,7 +544,8 @@ void run_vision(DeviceExecutionView execution, int patches, bool control) {
             if (control) {
                 launch_vision_control(tpos, tq, tk, stream);
             } else {
-                ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, execution.on_stream(stream));
+                ops::rope(tpos, kVisionHeadDim, kVisionHeadDim / 2, kVisionTheta, tq, tk,
+                          execution.on_stream(stream));
             }
         },
         bytes);

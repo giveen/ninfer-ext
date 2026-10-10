@@ -13,6 +13,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
+from .gemma4 import build_model as build_gemma4_model, is_gemma4
 from .qwen4_exp import build_model as build_qwen4_exp_model, is_qwen4_exp
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -152,7 +153,16 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2", "eagle3") if key in components
         }
-        if is_qwen4_exp(base.config):
+        if is_gemma4(base.config):
+            if companions:
+                raise ValueError("Gemma 4 has no DFlash companions")
+            model = build_gemma4_model(
+                base,
+                components=components,
+                resource_overrides=overrides,
+                draft=sources["mtp"] if "mtp" in components else None,
+            )
+        elif is_qwen4_exp(base.config):
             if companions:
                 raise ValueError("Qwen4Exp has no DFlash companions")
             model = build_qwen4_exp_model(

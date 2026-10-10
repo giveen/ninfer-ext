@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -270,6 +271,29 @@ int run_bf16_linear() {
         }
     }
     failures += run_selector_linear();
+
+    // The Gemma 4 assistant drafter's shapes, which run one token per step, eager and replayed.
+    constexpr std::array<std::array<std::int32_t, 2>, 7> kDraftShapes{{
+        {1024, 10752}, {8192, 1024}, {16384, 1024}, {1024, 8192}, {1024, 16384},
+        {262144, 1024}, {5376, 1024},
+    }};
+    std::uint32_t seed = 431U;
+    for (const auto& [n, k] : kDraftShapes) {
+        DeviceWeight weight(make_patterned(n, k, seed++));
+        failures += run_bf16_linear_case(weight, 1);
+        failures += run_bf16_linear_case(weight, 1, true);
+    }
+
+    // The Gemma 4 vision tower's projections: patches of one image (9 to 2520) and its pooled soft
+    // tokens (1 to 280), across every route boundary.
+    DeviceWeight patch_weight(make_patterned(1152, 768, seed++));
+    for (int tokens : {1, 2, 8, 9, 36, 63, 64, 65, 129, 630, 2520}) {
+        failures += run_bf16_linear_case(patch_weight, tokens);
+    }
+    DeviceWeight soft_weight(make_patterned(5376, 1152, seed++));
+    for (int tokens : {1, 3, 8, 9, 70, 128, 129, 280}) {
+        failures += run_bf16_linear_case(soft_weight, tokens);
+    }
     return failures;
 }
 

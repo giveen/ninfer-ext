@@ -21,13 +21,23 @@ inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
+inline constexpr std::int32_t kEmbedGatherFp8DGemma4       = 5376;
 
-template <int BlocksPerToken, int Threads>
+// The dequantized row rounded to BF16, then the embedding scale in FP32. Transformers multiplies the
+// gathered embedding by a scale cast to the weight dtype, so the value is rounded once by the
+// dequantization and once by the multiplication; this is that order, and folding the scale into the
+// stored row scale would round only once and give a different BF16 value.
+__device__ __forceinline__ float embed_scaled(float dequantized, float embed_scale) {
+    return __bfloat162float(__float2bfloat16(dequantized)) * embed_scale;
+}
+
+template <int D, int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                 const __nv_bfloat16* scales, __nv_bfloat16* out) {
-    static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
-    constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
+                                 const __nv_bfloat16* scales, float embed_scale,
+                                 __nv_bfloat16* out) {
+    static_assert(D % BlocksPerToken == 0);
+    constexpr int kValuesPerBlock = D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
@@ -37,8 +47,8 @@ __launch_bounds__(Threads) __global__
     const float scale = __bfloat162float(scales[row]);
 
     const int split_offset = split * kValuesPerBlock;
-    const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
-    auto* output_column    = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D;
+    const auto* code_row   = codes + static_cast<std::int64_t>(row) * D;
+    auto* output_column    = out + static_cast<std::int64_t>(token) * D;
     for (int word_index = static_cast<int>(threadIdx.x); word_index < kWordsPerBlock;
          word_index += Threads) {
         const int offset    = split_offset + word_index * 4;
@@ -49,7 +59,8 @@ __launch_bounds__(Threads) __global__
             values.__x           = static_cast<std::uint16_t>(word >> (pair * 16));
             const float2 decoded = static_cast<float2>(values);
             reinterpret_cast<__nv_bfloat162*>(output_column + offset + pair * 2)[0] =
-                __floats2bfloat162_rn(decoded.x * scale, decoded.y * scale);
+                __floats2bfloat162_rn(embed_scaled(decoded.x * scale, embed_scale),
+                                      embed_scaled(decoded.y * scale, embed_scale));
         }
     }
 }
@@ -65,21 +76,23 @@ __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* nibble, const 
 }
 
 __global__ void embed_gather_dense_kernel(const std::int32_t* ids, const __nv_bfloat16* table,
-                                          __nv_bfloat16* out, std::int32_t d, std::int32_t T) {
+                                          float embed_scale, __nv_bfloat16* out, std::int32_t d,
+                                          std::int32_t T) {
     const std::int64_t n      = static_cast<std::int64_t>(d) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
         const std::int32_t t = static_cast<std::int32_t>(i / d);
         const std::int32_t k = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
-        out[i]               = table[static_cast<std::int64_t>(ids[t]) * d + k];
+        out[i]               = __float2bfloat16(embed_scaled(
+            __bfloat162float(table[static_cast<std::int64_t>(ids[t]) * d + k]), embed_scale));
     }
 }
 
 __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                        const std::uint8_t* high, const std::uint8_t* scales,
-                                       __nv_bfloat16* out, std::int32_t d, std::int32_t T,
-                                       std::int32_t padded_d) {
+                                       float embed_scale, __nv_bfloat16* out, std::int32_t d,
+                                       std::int32_t T, std::int32_t padded_d) {
     const std::int32_t kg     = padded_d / kEmbedGatherQ6Group;
     const std::int64_t n      = static_cast<std::int64_t>(d) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -99,14 +112,15 @@ __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8
         const float scale = __half2float(__ushort_as_half(scale_bits));
         const int code    = unpack_q6_code(codes + group_index * kEmbedGatherQ6NibbleBpr,
                                            high + group_index * kEmbedGatherQ6HighBpr, lane);
-        out[i]            = __float2bfloat16(static_cast<float>(code) * scale);
+        out[i] = __float2bfloat16(embed_scaled(static_cast<float>(code) * scale, embed_scale));
     }
 }
 
 __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
     void embed_gather_q6_grouped_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                         const std::uint8_t* high, const std::uint8_t* scales,
-                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T) {
+                                        float embed_scale, __nv_bfloat16* out, std::int32_t d,
+                                        std::int32_t T) {
     const std::int32_t kg           = d / kEmbedGatherQ6Group;
     const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ6GroupsPerBlock);
     const std::int32_t t            = static_cast<std::int32_t>(blockIdx.x) / group_blocks;
@@ -130,12 +144,13 @@ __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
                                        high + group_index * kEmbedGatherQ6HighBpr, lane);
     const std::int64_t out_idx = static_cast<std::int64_t>(t) * d +
                                  static_cast<std::int64_t>(g) * kEmbedGatherQ6Group + lane;
-    out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
+    out[out_idx] = __float2bfloat16(embed_scaled(static_cast<float>(code) * scale, embed_scale));
 }
 
 __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                       const std::uint8_t* scales, __nv_bfloat16* out,
-                                       std::int32_t d, std::int32_t T, std::int32_t padded_d) {
+                                       const std::uint8_t* scales, float embed_scale,
+                                       __nv_bfloat16* out, std::int32_t d, std::int32_t T,
+                                       std::int32_t padded_d) {
     const std::int32_t kg     = padded_d / kEmbedGatherQ8Group;
     const std::int64_t n      = static_cast<std::int64_t>(d) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -153,14 +168,15 @@ __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8
                                        << 8);
         const float scale = __half2float(__ushort_as_half(scale_bits));
         const auto code = static_cast<std::int8_t>(codes[group_index * kEmbedGatherQ8Group + lane]);
-        out[i]          = __float2bfloat16(static_cast<float>(code) * scale);
+        out[i] = __float2bfloat16(embed_scaled(static_cast<float>(code) * scale, embed_scale));
     }
 }
 
 template <int Blocks, int Threads, bool PairStore>
 __launch_bounds__(Threads) __global__
     void embed_gather_q8_packed_5120_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                            const std::uint8_t* scales, __nv_bfloat16* out) {
+                                            const std::uint8_t* scales, float embed_scale,
+                                            __nv_bfloat16* out) {
     constexpr int D = 5120, Values = D / Blocks, Words = Values / 4;
     static_assert(D % Blocks == 0 && Values % 32 == 0);
     const int token      = static_cast<int>(blockIdx.x) / Blocks;
@@ -180,8 +196,9 @@ __launch_bounds__(Threads) __global__
         for (int pair = 0; pair < 2; ++pair) {
             const auto q0    = static_cast<std::int8_t>((word >> (pair * 16)) & 255u);
             const auto q1    = static_cast<std::int8_t>((word >> (pair * 16 + 8)) & 255u);
-            const auto value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                                     static_cast<float>(q1) * scale);
+            const auto value = __floats2bfloat162_rn(
+                embed_scaled(static_cast<float>(q0) * scale, embed_scale),
+                embed_scaled(static_cast<float>(q1) * scale, embed_scale));
             if constexpr (PairStore)
                 reinterpret_cast<__nv_bfloat162*>(output + d)[pair] = value;
             else {
@@ -194,7 +211,8 @@ __launch_bounds__(Threads) __global__
 
 __launch_bounds__(32) __global__
     void embed_gather_q8_grouped_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                             const std::uint8_t* scales, __nv_bfloat16* out) {
+                                             const std::uint8_t* scales, float embed_scale,
+                                             __nv_bfloat16* out) {
     const std::int32_t t   = static_cast<std::int32_t>(blockIdx.x) / kEmbedGatherQ8Groups;
     const std::int32_t g   = static_cast<std::int32_t>(blockIdx.x) - t * kEmbedGatherQ8Groups;
     const std::int32_t row = ids[t];
@@ -211,12 +229,13 @@ __launch_bounds__(32) __global__
         codes[group_index * kEmbedGatherQ8Group + static_cast<std::int32_t>(threadIdx.x)]);
     const std::int64_t out_idx = static_cast<std::int64_t>(t) * kEmbedGatherQ8D +
                                  static_cast<std::int64_t>(g) * kEmbedGatherQ8Group + threadIdx.x;
-    out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
+    out[out_idx] = __float2bfloat16(embed_scaled(static_cast<float>(code) * scale, embed_scale));
 }
 
 __launch_bounds__(256) __global__
     void embed_gather_q8_row_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                         const std::uint8_t* scales, __nv_bfloat16* out) {
+                                         const std::uint8_t* scales, float embed_scale,
+                                         __nv_bfloat16* out) {
     const int tid = static_cast<int>(threadIdx.x);
     const int t   = static_cast<int>(blockIdx.x);
     const int row = ids[t];
@@ -243,7 +262,8 @@ __launch_bounds__(256) __global__
             const auto q0   = static_cast<std::int8_t>((word >> shift) & 0xffu);
             const auto q1   = static_cast<std::int8_t>((word >> (shift + 8)) & 0xffu);
             out_pairs[word_index * 2 + pair] = __floats2bfloat162_rn(
-                static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
+                embed_scaled(static_cast<float>(q0) * scale, embed_scale),
+                embed_scaled(static_cast<float>(q1) * scale, embed_scale));
         }
     }
 }
