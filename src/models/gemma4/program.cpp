@@ -49,12 +49,23 @@ std::size_t sampling_bytes(const TextConfig& config, std::int32_t draft_tokens) 
     return std::max<std::size_t>(1, bytes);
 }
 
-std::size_t shared_bytes(const TextConfig& config, std::int32_t draft_tokens) {
+// The pass scratch: one layer of a full pass, or one image's encoder when the tower is bound.
+std::size_t arena_bytes(const TextConfig& config, const VisionConfig* vision) {
+    std::size_t bytes = layer_workspace_bytes(config, Program::kPass);
+    if (vision != nullptr) {
+        bytes = std::max(bytes, vision_workspace_bytes(
+                                    *vision, static_cast<std::int32_t>(vision->max_patches())));
+    }
+    return bytes;
+}
+
+std::size_t shared_bytes(const TextConfig& config, std::int32_t draft_tokens,
+                         const VisionConfig* vision) {
     const std::size_t pass       = static_cast<std::size_t>(Program::kPass);
     const std::size_t hidden     = config.hidden_size;
     const std::size_t vocabulary = config.vocab_size;
     const std::size_t score      = static_cast<std::size_t>(Program::kScorePass);
-    std::size_t bytes = layer_workspace_bytes(config, Program::kPass) +
+    std::size_t bytes = arena_bytes(config, vision) +
                         sampling_bytes(config, draft_tokens) + pass * sizeof(std::int32_t) +
                         2 * hidden * pass * sizeof(std::uint16_t) +
                         vocabulary * score * sizeof(std::uint16_t) +
@@ -62,22 +73,26 @@ std::size_t shared_bytes(const TextConfig& config, std::int32_t draft_tokens) {
     if (draft_tokens > 0) {
         bytes += (3 * hidden + vocabulary) * sizeof(std::uint16_t) + kRoundInts * sizeof(std::int32_t);
     }
+    if (vision != nullptr) bytes += pass * sizeof(std::int32_t);
     return bytes;
 }
 
 } // namespace
 
 std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacity,
-                                  std::int32_t lanes, std::int32_t draft_tokens) {
+                                  std::int32_t lanes, std::int32_t draft_tokens,
+                                  const VisionConfig* vision) {
     std::size_t lane =
         KvCache::device_bytes(config, capacity, draft_tokens) + token_count_bytes(config);
     if (draft_tokens > 0) lane += static_cast<std::size_t>(config.hidden_size) * sizeof(std::uint16_t);
-    return shared_bytes(config, draft_tokens) + static_cast<std::size_t>(lanes) * lane;
+    return shared_bytes(config, draft_tokens, vision) + static_cast<std::size_t>(lanes) * lane;
 }
 
 Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
                  DeviceContext& device, std::int32_t draft_tokens)
-    : model_(&model), arena_(layer_workspace_bytes(model.config(), kPass)),
+    : model_(&model),
+      arena_(arena_bytes(model.config(),
+                         model.vision_config() ? &*model.vision_config() : nullptr)),
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
       draft_tokens_(draft_tokens), capacity_(capacity) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
@@ -140,6 +155,11 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
         round_host_.resize(kRoundInts);
     }
     id_host_.resize(static_cast<std::size_t>(kPass));
+    if (model.vision_config()) {
+        high_buffer_ =
+            device_alloc(static_cast<std::size_t>(kPass) * sizeof(std::int32_t), allocated_bytes_);
+        high_host_.resize(static_cast<std::size_t>(kPass));
+    }
     for (std::int32_t lane = 0; lane < lanes; ++lane) reset(lane);
     (void)device;
 }
@@ -149,6 +169,11 @@ Program::~Program() {
         if (lane.token_counts != nullptr) (void)cudaFree(lane.token_counts);
     }
     if (id_buffer_ != nullptr) (void)cudaFree(id_buffer_);
+    if (high_buffer_ != nullptr) (void)cudaFree(high_buffer_);
+    for (const auto& [start, stop] : vision_events_) {
+        (void)cudaEventDestroy(start);
+        (void)cudaEventDestroy(stop);
+    }
     for (void* state : state_) {
         if (state != nullptr) (void)cudaFree(state);
     }
@@ -190,7 +215,7 @@ void Program::reset(std::int32_t lane_index, const ops::SamplingConfig& sampling
 
 void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
                         std::int32_t first_position, bool every_column,
-                        DeviceExecutionView execution) {
+                        DeviceExecutionView execution, std::span<const PromptImage> images) {
     if (tokens < 1 || tokens > (every_column ? kScorePass : kPass)) {
         throw std::invalid_argument("gemma4 Program: a pass is wider than its buffers");
     }
@@ -204,11 +229,12 @@ void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t to
     CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(),
                                static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
-    run_pass(cache, tokens, first_position, every_column, execution);
+    run_pass(cache, tokens, first_position, every_column, execution, images);
 }
 
 void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
-                       bool every_column, DeviceExecutionView execution) {
+                       bool every_column, DeviceExecutionView execution,
+                       std::span<const PromptImage> images) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model_->config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
@@ -219,6 +245,40 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         native_weight(model_->weight(model_->weights().text.token_embedding).view);
     ops::embedding(id_tensor, table, std::sqrt(static_cast<float>(hidden)), embedded, stream);
 
+    // An image's features replace its tokens' embeddings as they are, with no embedding scale, and its
+    // tokens' sliding upper bound is the image's last position. The encoder's scratch is the layer
+    // arena, which no layer holds yet.
+    Tensor position_high;
+    if (!images.empty()) {
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            high_host_[static_cast<std::size_t>(token)] = first_position + token;
+        }
+        if (vision_events_used_ == vision_events_.size()) {
+            cudaEvent_t start = nullptr, stop = nullptr;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+            vision_events_.emplace_back(start, stop);
+        }
+        const auto [vision_start, vision_stop] = vision_events_[vision_events_used_++];
+        CUDA_CHECK(cudaEventRecord(vision_start, stream));
+        for (const PromptImage& image : images) {
+            Tensor features(static_cast<std::uint8_t*>(state_[0]) +
+                                static_cast<std::size_t>(image.begin) * hidden * sizeof(std::uint16_t),
+                            DType::BF16, {hidden, image.tokens()});
+            encode_image(*model_, image.patches, arena_, features, execution);
+            const std::int32_t last = first_position + image.begin + image.tokens() - 1;
+            for (std::int32_t token = image.begin; token < image.begin + image.tokens(); ++token) {
+                high_host_[static_cast<std::size_t>(token)] = last;
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(vision_stop, stream));
+        // A pageable source is staged before cudaMemcpyAsync returns, so the next pass may reuse it.
+        CUDA_CHECK(cudaMemcpyAsync(high_buffer_, high_host_.data(),
+                                   static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        position_high = Tensor(static_cast<std::uint8_t*>(high_buffer_), DType::I32, {tokens, 1});
+    }
+
     // Sixty layers, so an even number of swaps leaves the result where it started.
     void* in  = state_[0];
     void* out = state_[1];
@@ -226,7 +286,7 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
         Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, tokens});
         forward_layer(*model_, layer, hidden_in, first_position, tokens, cache, arena_, hidden_out,
-                      execution);
+                      execution, position_high);
         std::swap(in, out);
     }
 
@@ -255,23 +315,72 @@ void Program::keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream) 
 }
 
 void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids,
-                      DeviceExecutionView execution) {
+                      DeviceExecutionView execution, std::span<const PromptImage> images) {
     Lane& lane = lane_at(lane_index);
     if (ids.empty()) throw std::invalid_argument("gemma4 Program: prefill needs tokens");
     if (static_cast<std::size_t>(lane.position) + ids.size() >
         static_cast<std::size_t>(capacity_)) {
         throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
     }
+    if (!images.empty() && !model_->vision_config()) {
+        throw std::invalid_argument("gemma4 Program: images need the vision tower loaded");
+    }
+    std::int32_t previous_end = 0;
+    for (const PromptImage& image : images) {
+        const std::int32_t end = image.begin + image.tokens();
+        if (image.tokens() < 1 || image.begin < previous_end ||
+            end > static_cast<std::int32_t>(ids.size()) || image.tokens() > kPass) {
+            throw std::invalid_argument(
+                "gemma4 Program: images must be ascending, disjoint and inside the call");
+        }
+        for (std::int32_t token = image.begin; token < end; ++token) {
+            if (ids[static_cast<std::size_t>(token)] != model_->vision_config()->image_token_id) {
+                throw std::invalid_argument("gemma4 Program: an image's tokens must be image tokens");
+            }
+        }
+        previous_end = end;
+    }
     std::size_t consumed = 0;
+    std::size_t next     = 0; // the first image not consumed yet
+    std::vector<PromptImage> pass_images;
     while (consumed < ids.size()) {
-        const std::int32_t batch =
+        std::int32_t batch =
             static_cast<std::int32_t>(std::min<std::size_t>(kPass, ids.size() - consumed));
-        run_batch(lane.cache, ids.data() + consumed, batch, lane.position, false, execution);
+        const std::int32_t first = static_cast<std::int32_t>(consumed);
+        // A pass that would end inside an image ends where the image begins instead.
+        pass_images.clear();
+        for (std::size_t index = next; index < images.size(); ++index) {
+            const PromptImage& image = images[index];
+            if (image.begin >= first + batch) break;
+            if (image.begin + image.tokens() > first + batch) {
+                batch = image.begin - first;
+                break;
+            }
+            PromptImage local = image;
+            local.begin -= first;
+            pass_images.push_back(local);
+        }
+        next += pass_images.size();
+        run_batch(lane.cache, ids.data() + consumed, batch, lane.position, false, execution,
+                  pass_images);
         lane.position += batch;
         consumed += static_cast<std::size_t>(batch);
     }
     keep_hidden(lane, 0, execution.stream);
     lane.round_position = -1;
+}
+
+double Program::take_vision_seconds() {
+    double seconds = 0.0;
+    for (std::size_t pair = 0; pair < vision_events_used_; ++pair) {
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventSynchronize(vision_events_[pair].second));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, vision_events_[pair].first,
+                                        vision_events_[pair].second));
+        seconds += milliseconds / 1000.0;
+    }
+    vision_events_used_ = 0;
+    return seconds;
 }
 
 void Program::decode(std::int32_t lane_index, std::int32_t id, DeviceExecutionView execution) {

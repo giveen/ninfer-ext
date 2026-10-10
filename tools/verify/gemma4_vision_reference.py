@@ -1,8 +1,10 @@
 """Compares NInfer's Gemma 4 image encoder with transformers' on identical patches.
 
 `prepare` runs transformers' Gemma4ImageProcessorPil (Pillow bicubic) on each image and writes, per
-image, the BF16 patches the tower reads (2 * pixel - 1, patch-major, pixels in (row, column, channel) order) and the
-patch grid. ninfer_gemma4_vision_test encodes them and writes its soft tokens beside them. `compare`
+image, the source path and the BF16 patches the tower reads (2 * pixel - 1, patch-major, pixels in (row, column, channel) order) and the
+patch grid, and the processor's resize rule over a table of image sizes (sizes.txt).
+ninfer_gemma4_image_processor_test checks NInfer's preprocessing against those; ninfer_gemma4_vision_test
+encodes the patches and writes its soft tokens beside them. `compare`
 then runs transformers' Gemma4VisionModel and Gemma4MultimodalEmbedder (only the tower is loaded) on
 the processor's own padded tensors in FP32, and reports per-token cosine and relative L2 of NInfer
 against it, with transformers' BF16 tower against the same FP32 as the floor. A third reference runs the
@@ -25,7 +27,10 @@ import torch
 from PIL import Image
 from safetensors import safe_open
 from transformers import Gemma4Config
-from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+from transformers.models.gemma4.image_processing_pil_gemma4 import (
+    Gemma4ImageProcessorPil,
+    get_aspect_ratio_preserving_size,
+)
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4MultimodalEmbedder,
     Gemma4VisionModel,
@@ -74,8 +79,22 @@ def to_bf16_bits(values: torch.Tensor) -> np.ndarray:
     return values.to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
 
 
+# Image sizes (height, width) covering square, both orientations, extreme aspects, the zero-side edge
+# branches, images already at a target size, upscaling and downscaling.
+SIZES = [(1, 1), (10, 10), (47, 47), (48, 48), (48, 2000), (2000, 48), (30, 5000), (5000, 30),
+         (1, 20000), (20000, 1), (100, 37), (371, 130), (480, 640), (640, 480), (768, 1024),
+         (1080, 1920), (1920, 1080), (4000, 3000), (816, 816), (672, 960), (9999, 7), (7, 9999)]
+
+
 def prepare(args) -> None:
     args.dump.mkdir(parents=True, exist_ok=True)
+    with open(args.dump / "sizes.txt", "w") as sizes:
+        for height, width in SIZES:
+            try:
+                target = get_aspect_ratio_preserving_size(height, width, 16, 280 * 9, 3)
+                sizes.write(f"{height} {width} {target[0]} {target[1]}\n")
+            except ValueError:
+                sizes.write(f"{height} {width} error\n")
     for index, image in enumerate(args.images):
         pixels, positions, tokens = processed(args.model, image)
         real = (positions[0] >= 0).all(dim=-1)

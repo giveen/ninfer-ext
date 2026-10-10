@@ -1,5 +1,6 @@
 #include "models/gemma4/frontend.h"
 
+#include "media/decode/decode.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "text/jinja.h"
 
@@ -303,6 +304,9 @@ struct Frontend::Impl {
     TokenId channel_close = -1;
     TokenId call_open     = -1;
     TokenId call_close    = -1;
+    TokenId image_token   = -1;
+    TokenId image_open    = -1;
+    TokenId image_close   = -1;
 
     Impl(const FrontendResources& resources, std::uint32_t context)
         : tokenizer(std::make_shared<const tf::Tokenizer>(tf::TokenizerResources{
@@ -321,6 +325,9 @@ struct Frontend::Impl {
         channel_close = marker_id(*tokenizer, "<channel|>");
         call_open     = marker_id(*tokenizer, "<|tool_call>");
         call_close    = marker_id(*tokenizer, "<tool_call|>");
+        image_token   = marker_id(*tokenizer, "<|image|>");
+        image_open    = marker_id(*tokenizer, "<|image>");
+        image_close   = marker_id(*tokenizer, "<image|>");
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -347,6 +354,8 @@ struct Frontend::Impl {
         std::string text;
         bool thinking = false;
         std::shared_ptr<const std::vector<std::string>> tool_names;
+        // The image parts, in the order the template writes their placeholders.
+        std::vector<const OwnedMedia*> images;
     };
 
     Rendered render(const PromptInput& input, const PreparationControl& control) const {
@@ -380,16 +389,36 @@ struct Frontend::Impl {
         context["bos_token"]             = std::string(kBos);
 
         Json messages = Json::array();
+        std::vector<const OwnedMedia*> images;
         for (const ChatMessage& message : input.messages) {
             Json value{{"role", role_name(message.role)}};
-            std::string content;
-            for (const MessagePart& part : message.parts) {
-                if (part.kind != MessagePartKind::Text) {
-                    throw std::invalid_argument("this Gemma model does not accept media input yet");
+            const bool has_media = std::ranges::any_of(
+                message.parts, [](const MessagePart& part) { return part.kind != MessagePartKind::Text; });
+            if (!has_media) {
+                std::string content;
+                for (const MessagePart& part : message.parts) content += part.text;
+                value["content"] = std::move(content);
+            } else {
+                // A message with media is a parts list, as transformers' processor passes it; the
+                // template trims each text part and writes <|image|> for each image.
+                if (message.role == ChatRole::Tool) {
+                    throw RequestError(RequestErrorKind::InvalidMedia,
+                                       "Gemma does not accept images in tool results");
                 }
-                content += part.text;
+                Json parts = Json::array();
+                for (const MessagePart& part : message.parts) {
+                    if (part.kind == MessagePartKind::Text) {
+                        parts.push_back({{"type", "text"}, {"text", part.text}});
+                    } else if (part.media.kind != MediaKind::Image) {
+                        throw RequestError(RequestErrorKind::InvalidMedia,
+                                           "Gemma accepts images only, not video");
+                    } else {
+                        parts.push_back({{"type", "image"}});
+                        images.push_back(&part.media);
+                    }
+                }
+                value["content"] = std::move(parts);
             }
-            value["content"] = std::move(content);
             if (!message.reasoning_content.empty()) {
                 value["reasoning_content"] = message.reasoning_content;
             }
@@ -442,7 +471,7 @@ struct Frontend::Impl {
             text += kModelTurn;
         }
         return Rendered{.text = std::move(text), .thinking = thinking && !continuation,
-                        .tool_names = std::move(names)};
+                        .tool_names = std::move(names), .images = std::move(images)};
     }
 };
 
@@ -462,17 +491,73 @@ std::string Frontend::render(const PromptInput& input, const PreparationControl&
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     const auto start            = Clock::now();
     Impl::Rendered rendered     = impl_->render(input, control);
+    PreparedPrompt prompt;
+    std::vector<PreparedImage> images;
+    const auto media_started = Clock::now();
+    for (const OwnedMedia* media : rendered.images) {
+        try {
+            images.push_back(prepare_gemma_image(media->bytes, media::decode::Policy{},
+                                                 [&] { check_control(control); }));
+        } catch (const media::decode::Error& error) {
+            throw RequestError(error.kind() == media::decode::ErrorKind::BudgetExceeded
+                                   ? RequestErrorKind::MediaBudgetExceeded
+                                   : RequestErrorKind::InvalidMedia,
+                               std::string("image: ") + error.what());
+        } catch (const std::invalid_argument& error) {
+            throw RequestError(RequestErrorKind::InvalidMedia, std::string("image: ") + error.what());
+        }
+        if (media->image_resize_policy == ImageResizePolicy::RejectOversized) {
+            const media::decode::ImageInfo info =
+                media::decode::inspect_image(media->bytes, media::decode::Policy{});
+            if (static_cast<std::uint64_t>(info.width) * static_cast<std::uint64_t>(info.height) >
+                kGemmaImageBudgetPixels) {
+                throw RequestError(RequestErrorKind::InvalidMedia,
+                                   "image exceeds the Vision budget and oversized_image is 'error'");
+            }
+        }
+        prompt.preparation.media_bytes += media->bytes.size();
+        prompt.preparation.raw_patches +=
+            static_cast<std::uint64_t>(images.back().grid_width) * images.back().grid_height;
+        prompt.preparation.vision_tokens += static_cast<std::uint64_t>(images.back().soft_tokens());
+        prompt.preparation.patch_bytes += images.back().pixels->size() * sizeof(std::uint16_t);
+    }
+    prompt.preparation.media_items = images.size();
+    prompt.preparation.media_preprocess_seconds =
+        std::chrono::duration<double>(Clock::now() - media_started).count();
+    prompt.preparation.media_preprocess_work_seconds = prompt.preparation.media_preprocess_seconds;
+
     const auto tokenize_started = Clock::now();
     const std::vector<int> encoded = impl_->tokenizer->encode(rendered.text);
     check_control(control);
-    if (encoded.size() > impl_->max_context) {
+    // Every image token the text holds is a placeholder the template wrote for an image part: one
+    // the user typed would take an image's place, so the counts must agree.
+    std::size_t placeholders = 0;
+    for (const int id : encoded) placeholders += id == impl_->image_token;
+    if (placeholders != images.size()) {
+        throw RequestError(RequestErrorKind::InvalidMedia,
+                           "the prompt text contains the image placeholder <|image|>");
+    }
+    prompt.ids.reserve(encoded.size());
+    std::size_t next = 0;
+    for (const int id : encoded) {
+        if (id != impl_->image_token) {
+            prompt.ids.push_back(id);
+            continue;
+        }
+        PreparedImage& image = images[next++];
+        prompt.ids.push_back(impl_->image_open);
+        prompt.images.push_back({static_cast<std::uint32_t>(prompt.ids.size()), image});
+        prompt.ids.insert(prompt.ids.end(), static_cast<std::size_t>(image.soft_tokens()),
+                          impl_->image_token);
+        prompt.ids.push_back(impl_->image_close);
+    }
+    if (prompt.ids.size() > impl_->max_context) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           "prepared prompt has " + std::to_string(encoded.size()) +
+                           "prepared prompt has " + std::to_string(prompt.ids.size()) +
                                " tokens, exceeding Engine max_context " +
                                std::to_string(impl_->max_context));
     }
-    PreparedPrompt prompt;
-    prompt.ids.assign(encoded.begin(), encoded.end());
+    prompt.descriptor.has_media = !prompt.images.empty();
     prompt.descriptor.prompt_tokens       = static_cast<std::uint32_t>(prompt.ids.size());
     prompt.descriptor.starts_in_reasoning = rendered.thinking;
     prompt.tool_names                     = std::move(rendered.tool_names);

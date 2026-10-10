@@ -100,7 +100,8 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
 
 void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
                            std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                           DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution) {
+                           DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
+                           const Tensor& position_high) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -236,8 +237,10 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
             geometry, tokens, filled + (write_first ? 0 : tokens), 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
-        ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, none, position_ring,
-                                      k_pass, v_pass, position_extra, geometry, config.sliding_window,
+        // An image's later keys are part of this pass, in the ring (written first) or in the pass's
+        // own key set, so its tokens' upper bound always finds them.
+        ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_high,
+                                      position_ring, k_pass, v_pass, position_extra, geometry, config.sliding_window,
                                       config.attention_scale, attended_batch, workspace, stream);
     }
     if (!write_first) write_kept();
@@ -550,10 +553,16 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution) {
+                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
+                   const Tensor& position_high) {
+    if (position_high.data != nullptr &&
+        (position_high.dtype != DType::I32 || position_high.ne[0] != tokens ||
+         position_high.ne[1] != 1)) {
+        throw std::invalid_argument("forward_layer: position_high must be I32 [tokens,1]");
+    }
     if (model.config().sliding_attention(layer)) {
         forward_sliding_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
-                              hidden_out, execution);
+                              hidden_out, execution, position_high);
     } else {
         forward_global_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
                              hidden_out, execution);

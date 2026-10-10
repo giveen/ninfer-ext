@@ -13,7 +13,11 @@
 //   tool calls   <|tool_call>call:NAME{key:value,...}<tool_call|>, strings delimited by <|"|>, and
 //                then <|tool_response>, which is a default stop token: that is the model handing
 //                control to the tool runner.
+//   images       the template writes <|image|> for an image part; the prompt carries it as
+//                <|image> + one image token per soft token + <image|>, and the image's features
+//                replace those tokens' embeddings. Video and images in tool results are refused.
 
+#include "models/gemma4/image_processor.h"
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
 
@@ -40,9 +44,17 @@ struct FrontendResources {
     std::string chat_template_jinja;
 };
 
+// One image of a prepared prompt: its soft tokens are ids [begin, begin + image.soft_tokens()).
+struct PromptImageInput {
+    std::uint32_t begin = 0;
+    PreparedImage image;
+};
+
 class PreparedPrompt {
 public:
     std::vector<TokenId> ids;
+    // In prompt order.
+    std::vector<PromptImageInput> images;
     PromptSummary descriptor;
     PromptPreparationStats preparation;
     // Tool declarations the prompt carried, by name, so the decoder can tell a declared call from

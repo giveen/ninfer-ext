@@ -148,6 +148,16 @@ ninfer_add_test(ninfer_gemma4_vision_test
   LIBRARIES ninfer_model_loading)
 set_tests_properties(ninfer_gemma4_vision_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_gemma4_image_processor_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_image_processor.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_image_processor_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_image_prompt_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_image_prompt.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_image_prompt_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_gemma4_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_layer.cpp"
   LIBRARIES ninfer_model_loading)

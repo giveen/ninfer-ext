@@ -41,9 +41,14 @@ namespace ninfer::models::gemma4 {
  * the attention runs, and each query then sees exactly what the cache makes visible to its own
  * position, which is what makes a batched prefill produce the same result as token-at-a-time.
  */
+//
+// `position_high`, when given, is device I32 [tokens,1]: the latest position each token's sliding
+// attention may see. An image's tokens see their whole image (its last position); every other token,
+// and every global layer, stays causal. Empty means causal throughout.
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution);
+                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
+                   const Tensor& position_high = {});
 
 /**
  * Applies the output head to a layer stack's final hidden state.

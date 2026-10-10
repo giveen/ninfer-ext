@@ -14,6 +14,7 @@
 #include "core/tensor.h"
 #include "models/gemma4/cache.h"
 #include "models/gemma4/model.h"
+#include "models/gemma4/vision.h"
 #include "ninfer/ops/sampling.h"
 
 #include <cstdint>
@@ -23,6 +24,15 @@
 #include <cuda_runtime.h>
 
 namespace ninfer::models::gemma4 {
+
+// One image of a prompt: its soft tokens occupy ids [begin, begin + patches / 9), every one of them the
+// image token, and the encoder's features replace their embeddings.
+struct PromptImage {
+    std::int32_t begin = 0;
+    ImagePatches patches;
+
+    [[nodiscard]] std::int32_t tokens() const noexcept { return patches.patches() / 9; }
+};
 
 class Program {
 public:
@@ -38,9 +48,11 @@ public:
     Program& operator=(Program&&)      = delete;
 
     // Device bytes the Program allocates for `lanes` lanes of `capacity` tokens, so a caller can size
-    // the lanes before constructing one.
+    // the lanes before constructing one. `vision` is the bound tower's config, which widens the scratch
+    // to encode one image.
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config, std::int32_t capacity,
-                                                  std::int32_t lanes, std::int32_t draft_tokens = 0);
+                                                  std::int32_t lanes, std::int32_t draft_tokens = 0,
+                                                  const VisionConfig* vision = nullptr);
 
     // The largest draft count a round may use, zero without speculation.
     [[nodiscard]] std::int32_t draft_tokens() const noexcept { return draft_tokens_; }
@@ -87,7 +99,16 @@ public:
 
     // Consumes tokens for `lane` and leaves the logits of the last one. The tokens are run in passes of
     // at most kPass, so a long prompt costs one pass per kPass tokens rather than one per token.
-    void prefill(std::int32_t lane, std::span<const std::int32_t> ids, DeviceExecutionView execution);
+    //
+    // `images` (ascending, disjoint, inside `ids`) are encoded and their features replace their tokens'
+    // embeddings; an image attends bidirectionally within itself in the sliding layers, so a pass never
+    // ends inside one, and an image must lie wholly in one call. Images need the vision tower loaded.
+    void prefill(std::int32_t lane, std::span<const std::int32_t> ids, DeviceExecutionView execution,
+                 std::span<const PromptImage> images = {});
+
+    // Device seconds the image encoder spent since the last call, read once the stream has completed
+    // the prefill that encoded them.
+    [[nodiscard]] double take_vision_seconds();
 
     // Consumes one token for `lane` and leaves its logits.
     void decode(std::int32_t lane, std::int32_t id, DeviceExecutionView execution);
@@ -145,11 +166,14 @@ private:
 
     // Embeds `tokens` ids starting at `first_position`, runs every layer over them in one pass against
     // `cache`, and applies the head to every column, or to the last one only unless `every_column`.
+    // `images` lie inside the pass, with `begin` relative to its first token.
     void run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t tokens,
-                   std::int32_t first_position, bool every_column, DeviceExecutionView execution);
+                   std::int32_t first_position, bool every_column, DeviceExecutionView execution,
+                   std::span<const PromptImage> images = {});
     // The same pass over ids already in the device id buffer.
     void run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
-                  bool every_column, DeviceExecutionView execution);
+                  bool every_column, DeviceExecutionView execution,
+                  std::span<const PromptImage> images = {});
     // Copies column `column` of the last pass's post-final-norm hidden state into the lane's.
     void keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream);
 
@@ -168,6 +192,12 @@ private:
     std::vector<std::int32_t> round_host_;
     std::vector<std::int32_t> id_host_;
     void* id_buffer_       = nullptr;
+    // With the vision tower: device I32 [kPass], a pass's sliding-attention upper bounds.
+    void* high_buffer_     = nullptr;
+    std::vector<std::int32_t> high_host_;
+    // Start/stop events around each pass's encoding, reused; `vision_events_used_` pairs are pending.
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> vision_events_;
+    std::size_t vision_events_used_ = 0;
     void* state_[2]        = {nullptr, nullptr};
     void* sampling_[3]     = {nullptr, nullptr, nullptr}; // configs [lanes], token [1], position [1]
     // Host staging for one pass's logits, which scoring reads back per target token.

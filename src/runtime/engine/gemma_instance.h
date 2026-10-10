@@ -390,6 +390,8 @@ private:
         Phase phase          = Phase::Free;
         std::uint64_t epoch  = 0;
         std::vector<TokenId> prompt;
+        // The prompt's images, ascending; a prefill call never ends inside one.
+        std::vector<models::gemma4::PromptImageInput> images;
         std::uint32_t cursor = 0;
         // The last accepted token, which the next decode round feeds; its key and value are not
         // written until then.
