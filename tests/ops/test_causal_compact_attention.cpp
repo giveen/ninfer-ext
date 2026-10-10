@@ -122,13 +122,31 @@ int run_case(const Case& c) {
     Tensor pk_tensor(device_pk.data(), DType::I32, {c.key_tokens, c.batch});
     Tensor out_tensor(device_out.data(), DType::BF16, {c.rotary_dim, c.query_heads, c.query_tokens, c.batch});
 
-    ops::causal_compact_attention(q_tensor, kv_tensor, pq_tensor, pk_tensor, geometry,
-                                  c.rotary_dim, c.rope_angles, 1.0F, out_tensor, nullptr);
-    cuda_synchronize();
-
-    const auto got = from_device_bf16(device_out.data(), q_count);
-    int failures = verify_pointwise(c.label, got, expected, causal_compact_criterion());
-    failures += device_out.verify_guards("causal_compact_attention");
+    // The keys here hold their own index as position, so `indexed_keys` is a true statement and must
+    // not change the result. Each route is checked: one pass, and the key split a workspace allows.
+    const std::size_t split_bytes = ops::causal_compact_attention_workspace_bytes(
+        geometry, c.rotary_dim, c.query_tokens, c.key_tokens, c.batch);
+    GuardedDeviceBuffer device_workspace(std::max<std::size_t>(split_bytes, 16));
+    int failures = 0;
+    for (int route = 0; route < 3; ++route) {
+        const bool split   = route > 0;
+        const bool indexed = route == 2;
+        Tensor workspace;
+        if (split && split_bytes > 0) {
+            workspace = Tensor(device_workspace.data(), DType::U8,
+                               {static_cast<std::int32_t>(split_bytes)});
+        }
+        device_out.fill(0x7d);
+        ops::causal_compact_attention(q_tensor, kv_tensor, pq_tensor, pk_tensor, geometry,
+                                      c.rotary_dim, c.rope_angles, 1.0F, indexed, out_tensor,
+                                      workspace, nullptr);
+        cuda_synchronize();
+        const std::string label = std::string(c.label) +
+                                  (route == 0 ? " (one pass)" : route == 1 ? " (split)" : " (split, indexed)");
+        const auto got = from_device_bf16(device_out.data(), q_count);
+        failures += verify_pointwise(label.c_str(), got, expected, causal_compact_criterion());
+        failures += device_out.verify_guards("causal_compact_attention");
+    }
     return failures;
 }
 
@@ -149,6 +167,10 @@ int main() {
     failures += run_case({"narrow rotation", 128, 16, 8, 2, 5, 3, 1, 2, 8103U});
     // Every key is ahead of the query, so nothing is visible and the output is exact zero.
     failures += run_case({"no visible key", 64, 8, 4, 2, 4, 2, 1, 100, 8104U});
+    // Gemma's geometry over many key tiles, with more query rows than one block.
+    failures += run_case({"gemma global long", 512, 64, 32, 4, 700, 40, 1, 660, 8105U});
+    // Decode: one query row per head over a long cache, which is the case the key split serves.
+    failures += run_case({"gemma global decode", 512, 64, 32, 4, 2000, 1, 1, 1500, 8106U});
 
     std::cout << (failures ? "FAIL" : "OK") << " causal_compact_attention\n";
     return failures ? 1 : 0;

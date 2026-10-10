@@ -37,7 +37,7 @@ void require_positions(const Tensor& tensor, const char* role, std::int32_t exte
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_k,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, cudaStream_t stream) {
+                              Tensor& out, const Tensor& workspace, cudaStream_t stream) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
     }
@@ -85,7 +85,18 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     detail::sliding_causal_attention_launch(q, k, v, position_q, position_k, head_dim,
                                             geometry.query_heads, geometry.kv_heads, window, scale,
-                                            out, stream);
+                                            out, workspace, stream);
+}
+
+std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geometry,
+                                                     std::int32_t query_tokens,
+                                                     std::int32_t key_tokens, std::int32_t batch) {
+    if (!valid_attention_head_geometry(geometry)) {
+        throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
+    }
+    return detail::sliding_causal_attention_workspace_bytes(geometry.head_dim, query_tokens,
+                                                            geometry.query_heads,
+                                                            geometry.kv_heads, key_tokens, batch);
 }
 
 } // namespace ninfer::ops

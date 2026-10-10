@@ -72,7 +72,25 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
     const std::uint64_t global  = 4 * h + 3 * global_q + 3 * global_kv + compact + 3 * i;
     if (tokens < 1) throw std::invalid_argument("layer_workspace_bytes: tokens must be positive");
     const std::uint64_t t = static_cast<std::uint64_t>(tokens);
-    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 16 * 256 + t * 4);
+    // The attention's key split needs its own workspace when a pass has few rows. Its size depends on
+    // the pass width, not the key count once the keys are many, so the largest over every width up
+    // to `tokens` against an unbounded cache bounds it.
+    std::size_t split = 0;
+    const ops::AttentionHeadGeometry sliding_heads{
+        static_cast<std::int32_t>(config.sliding.head_dim),
+        static_cast<std::int32_t>(config.num_attention_heads),
+        static_cast<std::int32_t>(config.sliding.num_key_value_heads)};
+    const ops::AttentionHeadGeometry global_heads{
+        static_cast<std::int32_t>(config.global.shared.head_dim),
+        static_cast<std::int32_t>(config.num_attention_heads),
+        static_cast<std::int32_t>(config.global.shared.num_key_value_heads)};
+    for (std::int32_t width = 1; width <= tokens; ++width) {
+        split = std::max(split, ops::sliding_causal_attention_workspace_bytes(sliding_heads, width,
+                                                                              1 << 24, 1));
+        split = std::max(split, ops::causal_compact_attention_workspace_bytes(
+                                    global_heads, global_heads.head_dim, width, 1 << 24, 1));
+    }
+    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 17 * 256 + t * 4) + split;
 }
 
 void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
@@ -208,9 +226,13 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         Tensor attended_batch = scratch.attended.view({d, hq, tokens, 1});
         Tensor position_q     = scratch.positions.view({tokens, 1});
         Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
+        const std::size_t split =
+            ops::sliding_causal_attention_workspace_bytes(geometry, tokens, filled, 1);
+        Tensor workspace;
+        if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
         ops::sliding_causal_attention(q_batch, k_batch, v_batch, position_q, position_k, geometry,
                                       config.sliding_window, config.attention_scale, attended_batch,
-                                      stream);
+                                      workspace, stream);
     }
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
     ops::rmsnorm(scratch.projected, model.tensor(weights.post_attention_norm), eps, false,
@@ -345,8 +367,14 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
         Tensor attended_batch = attended.view({d, hq, tokens, 1});
         Tensor position_q     = positions.view({tokens, 1});
         Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
+        const std::size_t split =
+            ops::causal_compact_attention_workspace_bytes(heads, d, tokens, filled, 1);
+        Tensor workspace;
+        if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+        // Rows sit at their own positions, which is what `indexed_keys` states.
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
-                                      config.attention_scale, attended_batch, stream);
+                                      config.attention_scale, true, attended_batch, workspace,
+                                      stream);
     }
     ops::linear(attended, to_weight(weights.attention.output), projected, stream);
     ops::rmsnorm(projected, model.tensor(weights.post_attention_norm), eps, false, branch, stream);

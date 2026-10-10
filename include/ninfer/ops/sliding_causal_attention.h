@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -24,10 +25,12 @@ namespace ninfer::ops {
  * window may exceed the key count. `window` is at most 4096, which is what keeps the visible keys in
  * shared memory.
  *
- * The Op is deliberately a straightforward implementation rather than a replica of the shared
- * sliding Op: the head dimension and head counts are runtime values, so nothing here is instantiated
- * per geometry. Its cost is that the visible set is scanned three times per row and the value
- * reduction is not tiled; a tuned route is a later decision.
+ * The route is tensor-core flash attention (ops/kernel/gemma_flash_attention.cuh): blocks of 16
+ * query rows that share a KV head stream 32-key tiles with an online Softmax, and a tile no row can
+ * see is skipped. `head_dim` is 32, 64, 128 or 256. When the rows alone give too few blocks (decode),
+ * the keys are split across blocks and merged by a second kernel; that needs `workspace` of at least
+ * `sliding_causal_attention_workspace_bytes` bytes, and an empty or smaller workspace selects the
+ * one-pass route, which computes the same result.
  *
  * The oracle evaluates the formula naively in FP64 from the represented BF16 q/k/v, with a stable
  * Softmax over exactly the visible set. The BF16 output is promoted for comparison and storage
@@ -37,6 +40,11 @@ namespace ninfer::ops {
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_k,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, cudaStream_t stream);
+                              Tensor& out, const Tensor& workspace, cudaStream_t stream);
+
+// Workspace bytes the key split needs for these extents; zero when the route does not split.
+std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geometry,
+                                                     std::int32_t query_tokens,
+                                                     std::int32_t key_tokens, std::int32_t batch);
 
 } // namespace ninfer::ops

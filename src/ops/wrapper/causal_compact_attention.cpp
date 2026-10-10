@@ -37,7 +37,8 @@ void require_positions(const Tensor& tensor, const char* role, std::int32_t toke
 void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& position_q,
                               const Tensor& position_k, AttentionHeadGeometry geometry,
                               std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
-                              Tensor& out, cudaStream_t stream) {
+                              bool indexed_keys, Tensor& out, const Tensor& workspace,
+                              cudaStream_t stream) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("causal_compact_attention: invalid head geometry");
     }
@@ -85,8 +86,20 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
     }
 
     detail::causal_compact_attention_launch(q, kv, position_q, position_k, rotary_dim, rope_angles,
-                                            geometry.query_heads, geometry.kv_heads, scale, out,
-                                            stream);
+                                            geometry.query_heads, geometry.kv_heads, scale,
+                                            indexed_keys, out, workspace, stream);
+}
+
+std::size_t causal_compact_attention_workspace_bytes(AttentionHeadGeometry geometry,
+                                                     std::int32_t rotary_dim,
+                                                     std::int32_t query_tokens,
+                                                     std::int32_t key_tokens, std::int32_t batch) {
+    if (!valid_attention_head_geometry(geometry)) {
+        throw std::invalid_argument("causal_compact_attention: invalid head geometry");
+    }
+    return detail::causal_compact_attention_workspace_bytes(rotary_dim, query_tokens,
+                                                            geometry.query_heads,
+                                                            geometry.kv_heads, key_tokens, batch);
 }
 
 } // namespace ninfer::ops

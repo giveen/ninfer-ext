@@ -14,6 +14,12 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
                                      const Tensor& position_q, const Tensor& position_k,
                                      std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
-                                     Tensor& out, cudaStream_t stream);
+                                     Tensor& out, const Tensor& workspace, cudaStream_t stream);
+
+std::size_t sliding_causal_attention_workspace_bytes(std::int32_t head_dim,
+                                                     std::int32_t query_tokens,
+                                                     std::int32_t query_heads,
+                                                     std::int32_t kv_heads, std::int32_t key_tokens,
+                                                     std::int32_t batch);
 
 } // namespace ninfer::ops::detail

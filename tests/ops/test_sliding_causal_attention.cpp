@@ -24,6 +24,8 @@ struct Case {
     std::int32_t key_tokens, query_tokens, batch;
     std::int32_t first_key_position, first_query_position, key_step;
     std::uint32_t window;
+    // Rotates which slot holds which position, the way the sliding ring stores them.
+    std::int32_t ring = 0;
 };
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
@@ -73,7 +75,8 @@ int run_case(const Case& c, std::uint32_t seed) {
             position_q[t + c.query_tokens * b] = c.first_query_position + t;
         }
         for (std::int32_t s = 0; s < c.key_tokens; ++s) {
-            position_k[s + c.key_tokens * b] = c.first_key_position + s * c.key_step + b;
+            const std::int32_t slot = (s + c.ring) % c.key_tokens;
+            position_k[s + c.key_tokens * b] = c.first_key_position + slot * c.key_step + b;
         }
     }
 
@@ -127,13 +130,26 @@ int run_case(const Case& c, std::uint32_t seed) {
     Tensor pk_tensor(device_pk.data(), DType::I32, {c.key_tokens, c.batch});
     Tensor out_tensor(device_out.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
 
-    ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, pk_tensor, geometry,
-                                  c.window, 1.0F, out_tensor, nullptr);
-    cuda_synchronize();
-
-    const auto got = from_device_bf16(device_out.data(), q_count);
-    int failures =
-        verify_pointwise(c.label, got, expected, sliding_causal_criterion());
+    // Each route is checked: one pass, and the key split a workspace allows.
+    const std::size_t split_bytes = ops::sliding_causal_attention_workspace_bytes(
+        geometry, c.query_tokens, c.key_tokens, c.batch);
+    GuardedDeviceBuffer device_workspace(std::max<std::size_t>(split_bytes, 16));
+    int failures = 0;
+    std::vector<double> got;
+    for (int route = 0; route < 2; ++route) {
+        Tensor workspace;
+        if (route == 1 && split_bytes > 0) {
+            workspace = Tensor(device_workspace.data(), DType::U8,
+                               {static_cast<std::int32_t>(split_bytes)});
+        }
+        device_out.fill(0x7d);
+        ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, pk_tensor, geometry,
+                                      c.window, 1.0F, out_tensor, workspace, nullptr);
+        cuda_synchronize();
+        const std::string label = std::string(c.label) + (route == 0 ? " (one pass)" : " (split)");
+        got = from_device_bf16(device_out.data(), q_count);
+        failures += verify_pointwise(label.c_str(), got, expected, sliding_causal_criterion());
+    }
 
     // Where no key at all is visible the contract is exact zero, not a Softmax of nothing.
     if (c.first_query_position - (c.first_key_position + (c.key_tokens - 1) * c.key_step) >=
@@ -173,6 +189,16 @@ int main() {
     failures += run_case({"two batches", 128, 16, 8, 6, 3, 2, 40, 44, 1, 16}, 7105U);
     // Future keys only: every distance is negative, so again nothing is visible.
     failures += run_case({"future keys only", 32, 4, 2, 4, 2, 1, 500, 0, 1, 64}, 7106U);
+
+    // A full Gemma ring: 1152 slots in rotated order behind a 128-token pass, so the visible set
+    // spans many key tiles, starts mid-ring, and some tiles are invisible to every row.
+    failures += run_case({"gemma ring pass", 256, 32, 16, 1152, 128, 1, 1000, 2024, 1, 1024, 300},
+                         7107U);
+    // More query rows than one block, with a window that cuts through a tile.
+    failures += run_case({"many rows", 64, 8, 4, 200, 70, 2, 0, 150, 1, 37, 17}, 7108U);
+    // Decode over a full rotated ring, which is the case the key split serves.
+    failures += run_case({"gemma ring decode", 256, 32, 16, 1152, 1, 1, 1000, 2151, 1, 1024, 77},
+                         7109U);
 
     std::cout << (failures ? "FAIL" : "OK") << " sliding_causal_attention\n";
     return failures ? 1 : 0;
