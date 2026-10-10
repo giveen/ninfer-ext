@@ -549,6 +549,11 @@ qwen::CommitResult GemmaProgram::commit(PendingBatch&& pending,
               decision.accepted_tokens > static_cast<std::uint32_t>(pending.counts_[row])))) {
             throw std::logic_error("pending transaction decision is invalid");
         }
+        // The split marks a prefix-identity boundary for the context cache, which this model does not
+        // keep, and Gemma's frontend never sets one.
+        if (decision.prefix_execution_split_after) {
+            throw std::logic_error("Gemma keeps no prefix identity to split");
+        }
         lane->pending = false;
         const std::uint32_t lane_index = pending.rows_[row].lane_;
         if (decision.cancelled || decision.failed) {
