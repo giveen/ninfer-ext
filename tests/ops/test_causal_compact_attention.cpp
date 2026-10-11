@@ -172,6 +172,12 @@ int main() {
     // Decode: one query row per head over a long cache, which is the case the key split serves.
     failures += run_case({"gemma global decode", 512, 64, 32, 4, 2000, 1, 1, 1500, 8106U});
 
+    // Prefill-sized passes take the tiled kernel: one late in a long cache, one at an 8K prompt's
+    // depth, and two batches.
+    failures += run_case({"gemma global prefill", 512, 64, 32, 4, 1200, 256, 1, 944, 8107U});
+    failures += run_case({"gemma global prefill at 8K", 512, 64, 32, 4, 8000, 64, 1, 7936, 8109U});
+    failures += run_case({"gemma global prefill two batches", 512, 64, 32, 4, 300, 40, 2, 260, 8108U});
+
     std::cout << (failures ? "FAIL" : "OK") << " causal_compact_attention\n";
     return failures ? 1 : 0;
 }

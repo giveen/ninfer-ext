@@ -926,8 +926,8 @@ describes the planner.
 
   | Stat | Value |
   |---|---|
-  | Prefill `pp1024` / `pp8192` | 2,388 / 1,837 tok/s |
-  | Decode `tg128` | 52.6 tok/s (100-240 with adaptive MTP, depending on the text) |
+  | Prefill `pp1024` / `pp8192` | 2,476 / 2,189 tok/s |
+  | Decode `tg128` | 56.6 tok/s (100-240 with adaptive MTP, depending on the text) |
   | Layout KLD vs the BF16 checkpoint | 0.419 (4 x 2048 calibration tokens) |
   | Causal perplexity (BF16 KV) | 14.53 (mean NLL 2.676) |
 

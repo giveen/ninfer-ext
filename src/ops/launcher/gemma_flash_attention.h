@@ -45,11 +45,40 @@ inline std::size_t flash_workspace_bytes(std::int32_t value_width, std::int32_t 
            (static_cast<std::size_t>(value_width) + 2) * sizeof(float);
 }
 
+// Row tiles per KV head from which a pass takes the tiled kernel. Below it the tiled grid is too
+// small to fill the GPU, and the decode kernel's 16-row blocks and key split do better.
+inline constexpr std::int64_t kFlashTiledMinTiles = 8;
+
+template <int QK, int V, bool kCompact>
+void launch_gemma_flash_attention_tiled(const FlashAttentionParams& params, std::int32_t batch,
+                                        cudaStream_t stream) {
+    using Config      = FlashTiledConfig<QK, V, kCompact>;
+    const auto kernel = gemma_flash_attention_tiled_kernel<QK, V, kCompact>;
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        Config::kBytes));
+        return true;
+    }();
+    (void)configured;
+    const std::int64_t rows =
+        static_cast<std::int64_t>(params.query_tokens) * (params.query_heads / params.kv_heads);
+    const dim3 grid(static_cast<unsigned>((rows + Config::kRows - 1) / Config::kRows),
+                    static_cast<unsigned>(params.kv_heads), static_cast<unsigned>(batch));
+    kernel<<<grid, Config::kThreads, Config::kBytes, stream>>>(params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // `workspace` may be empty; the keys are split only when it holds what the split needs, so a caller
-// without one gets the one-pass route.
+// without one gets the one-pass route. Passes with many query rows take the tiled kernel, which
+// never splits.
 template <int QK, int V, bool kCompact>
 void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batch,
                                   const Tensor& workspace, cudaStream_t stream) {
+    if (static_cast<std::int64_t>(params.query_tokens) * (params.query_heads / params.kv_heads) >=
+        kFlashTiledMinTiles * FlashTiledConfig<QK, V, kCompact>::kRows) {
+        launch_gemma_flash_attention_tiled<QK, V, kCompact>(params, batch, stream);
+        return;
+    }
     using Layout      = FlashLayout<QK, V, kCompact>;
     const auto kernel = gemma_flash_attention_kernel<QK, V, kCompact>;
     // Every route needs more than the default 48 KiB of dynamic shared memory at its widest.

@@ -278,9 +278,16 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   or stale slot's bits cannot reach the output.
 - **Attention Ops**: `sliding_causal_attention` (D 256, 32/16 heads, window, scale 1.0, optional
   second key set) and `causal_compact_attention` over the 640-value compact rows share one
-  tensor-core flash kernel (`gemma_flash_attention.cuh`): BF16 m16n8k16 MMA with FP32 accumulation,
-  16 query rows per block, 32-key tiles skipped by position before they load, online Softmax with P
-  carried as a BF16 hi + lo pair, and a key split with a combine kernel when a pass has few rows.
+  tensor-core flash kernel family (`gemma_flash_attention.cuh`): BF16 m16n8k16 MMA with FP32
+  accumulation, key tiles skipped by position before they load, and an online Softmax with P carried
+  as a BF16 hi + lo pair. A pass with few rows (decode, MTP verification, short prefill tails) takes
+  16 query rows per block with a key split and a combine kernel. From eight row tiles per KV head
+  (512 rows for the sliding geometry, 256 for the global one) a pass takes the tiled kernel instead:
+  each warp keeps 16 rows' S, Softmax state and P in registers, a block holds 64 rows (32 for the
+  512-wide value, where two warps split the QK dims and exchange the halves of S, then each
+  accumulates half the value), and key tiles stream through two cp.async stages into swizzled rows
+  read with `ldmatrix`. Both routes give the same worst-case error against the FP64 oracle on every
+  test case (the limit ratio is BF16 output rounding).
 - **Linears**: M1's Q6 and Q5 g64 A16 routes carry Gemma's shapes. Single-token passes use the Q6
   GEMV and single-row Q5 instances at K 5376 and 21504; 2-8 token passes (MTP verification) use one
   8-token sliced MMA block for Q5, as Q6 already did; wider passes reuse the route lists tuned for
@@ -341,6 +348,23 @@ suggests, which is what plan P4 (precision) addresses.
 | pp4096 | 220 tok/s | 2,108 tok/s |
 | pp8192 | 161 tok/s | 1,837 tok/s |
 | tg128 | 41.0 tok/s | 52.6 tok/s |
+
+Later changes, measured as alternating builds in one session (current master between two runs of
+the changed build; `-n 128 -r 3`, `-p 1024,8192 -r 2`, `-pg 8192,64`, MTP at seven drafts):
+
+| Test | before | after | change |
+|---|---:|---:|---:|
+| pp1024 | 2,377 | 2,469 / 2,483 | +4.2% |
+| pp8192 | 1,831 | 2,184 / 2,194 | +19.5% |
+| tg128 | 53.00 | 56.49 / 56.70 | +6.8% |
+| decode after an 8K prompt | 49.18 | 51.55 / 51.64 | +4.9% |
+| tg128, MTP | 262.3 | 268.1 / 272.1 | +2.2% / +3.7% |
+
+Decode gains come from the RoPE coefficient change (section 5) and the single-token Q6 direct
+route (12c); prefill gains from the tiled attention kernel (section 10), which took attention from
+34.5% to 17.8% of pp8192's kernel time: about 57 useful TFLOP/s for the global layers and 55 for the
+sliding ones over the whole run, against 19 and 31-34 before. MTP acceptance is unchanged within
+run-to-run variation (0.878-0.883 on both builds).
 
 Decode is measured alone (`-n 128 -r 5`); right after the prefill tests in the same run it reads
 about 1% lower. The decode ceiling from M1's 20.9 GiB of device weights at 1.79 TB/s is about 80
@@ -581,6 +605,7 @@ table and this one should not be differenced across sessions.
 | Prefix reuse | an agent loop re-prefills its whole history every turn, at the prefill rates above | the D1-b move of the continuation, shared-prefix and capture types into `runtime/contract`; ring-snapshot checkpoints as the state image |
 | Decode single-token routes | after the direct route (12c) the Q6 shapes stream 1.40-1.47 TB/s in the Linear benchmark against the Q5 direct route's 1.59 and the 1674.5 GB/s read ceiling | the remaining Q6 decode cost against Q5's: 2 more bytes a lane per 8 weights and the high-bit merge |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
+| Tiled attention wave quantization | a 512-token pass gives the global layers 512 blocks of near-equal work, one per SM at a time: 3.01 waves run as 4 | finer work items for the last wave (a key split there with the existing combine), or a block small enough for two per SM |
 | CUDA Graphs | decode launch overhead (about 0.9 ms of a token) | a decode step bakes per-token host values into its launches: ring-slot copy offsets, the `filled` key count as a tensor shape, and attention split grids sized by context length. Those need device-resident parameters or per-length graph profiles as Qwen's Program has, then capture per lane count |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |

@@ -302,6 +302,16 @@ int main() {
     failures +=
         run_case({"image past the window", 64, 8, 4, 300, 300, 1, 0, 0, 1, 40, 0, 20, 120}, 7112U);
 
+    // Prefill-sized passes take the tiled kernel: a 512-token pass over a rotated ring whose last
+    // 512 slots are the pass's own keys, the same with an image block, and two batches with a
+    // window that binds inside a 32-key tile.
+    failures += run_case(
+        {"gemma prefill pass", 256, 32, 16, 1664, 512, 1, 1000, 2152, 1, 1024, 300}, 7113U);
+    failures += run_case({"gemma prefill pass with image", 256, 32, 16, 1664, 512, 1, 1000, 2152,
+                          1, 1024, 300, 100, 356},
+                         7114U);
+    failures += run_case({"tiled two batches", 64, 8, 4, 700, 300, 2, 0, 400, 1, 45, 51}, 7115U);
+
     std::cout << (failures ? "FAIL" : "OK") << " sliding_causal_attention\n";
     return failures ? 1 : 0;
 }
