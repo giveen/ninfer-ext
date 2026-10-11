@@ -22,23 +22,33 @@ inline std::int64_t flash_row_tiles(std::int32_t query_tokens, std::int32_t quer
     return (rows + kFlashRows - 1) / kFlashRows;
 }
 
-// Key splits per row tile: when the rows alone give fewer blocks than the device has SMs, the keys
-// are divided until there are about two blocks per SM, keeping at least two key tiles per split.
+// The most resident blocks a split decision assumes, which bounds the workspace on any device; a
+// device with more is treated as having this many.
+inline constexpr std::int64_t kFlashMaxResident = 512;
+
+// Key splits per row tile. `resident` is how many blocks of the kernel the device runs at once.
+// When the rows alone fill less than half of that, the keys are divided so the grid is one full
+// wave: a second, partial wave would leave most SMs idle while it runs. A split keeps at least two
+// key tiles. The count depends only on the shapes and the device, never on how many keys are filled,
+// so a captured decode step keeps its grid; each block finds its key range from the filled length.
 inline std::int32_t flash_splits(std::int64_t row_tiles, std::int32_t kv_heads, std::int32_t batch,
-                                 std::int32_t key_tokens) {
-    const std::int64_t blocks   = row_tiles * kv_heads * batch;
+                                 std::int32_t key_tokens, std::int64_t resident) {
+    resident                     = std::min(resident, kFlashMaxResident);
+    const std::int64_t blocks    = row_tiles * kv_heads * batch;
     const std::int32_t key_tiles = (key_tokens + kFlashKeys - 1) / kFlashKeys;
-    if (blocks >= 128 || key_tiles < 4) return 1;
-    const std::int64_t wanted = std::min<std::int64_t>(64, (256 + blocks - 1) / blocks);
+    if (2 * blocks > resident || key_tiles < 4) return 1;
+    const std::int64_t wanted = std::min<std::int64_t>(kFlashMaxSplits, resident / blocks);
     return static_cast<std::int32_t>(std::max<std::int64_t>(1, std::min<std::int64_t>(wanted, key_tiles / 2)));
 }
 
+// Bytes the split route may need on any device: the splits at kFlashMaxResident.
 inline std::size_t flash_workspace_bytes(std::int32_t value_width, std::int32_t query_tokens,
                                          std::int32_t query_heads, std::int32_t kv_heads,
                                          std::int32_t key_tokens, std::int32_t batch) {
     if (query_tokens <= 0 || key_tokens <= 0 || batch <= 0 || kv_heads <= 0) return 0;
     const std::int64_t row_tiles = flash_row_tiles(query_tokens, query_heads, kv_heads);
-    const std::int32_t splits    = flash_splits(row_tiles, kv_heads, batch, key_tokens);
+    const std::int32_t splits =
+        flash_splits(row_tiles, kv_heads, batch, key_tokens, kFlashMaxResident);
     if (splits == 1) return 0;
     const std::int64_t rows = flash_partial_rows(row_tiles, kv_heads, batch);
     return static_cast<std::size_t>(splits) * static_cast<std::size_t>(rows) *
@@ -73,7 +83,8 @@ void launch_gemma_flash_attention_tiled(const FlashAttentionParams& params, std:
 // never splits.
 template <int QK, int V, bool kCompact>
 void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batch,
-                                  const Tensor& workspace, cudaStream_t stream) {
+                                  const Tensor& workspace, DeviceExecutionView execution) {
+    const cudaStream_t stream = execution.stream;
     if (static_cast<std::int64_t>(params.query_tokens) * (params.query_heads / params.kv_heads) >=
         kFlashTiledMinTiles * FlashTiledConfig<QK, V, kCompact>::kRows) {
         launch_gemma_flash_attention_tiled<QK, V, kCompact>(params, batch, stream);
@@ -81,13 +92,21 @@ void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batc
     }
     using Layout      = FlashLayout<QK, V, kCompact>;
     const auto kernel = gemma_flash_attention_kernel<QK, V, kCompact>;
-    // Every route needs more than the default 48 KiB of dynamic shared memory at its widest.
-    static const bool configured = [&] {
+    // Every route needs more than the default 48 KiB of dynamic shared memory at its widest. The
+    // blocks one SM holds at once fix how many a full wave is.
+    static const int per_sm = [&] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         Layout::kBytes));
-        return true;
+        int blocks = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, kFlashThreads,
+                                                                 Layout::kBytes));
+        return std::max(blocks, 1);
     }();
-    (void)configured;
+    if (execution.multiprocessor_count <= 0) {
+        throw std::invalid_argument("gemma flash attention: the execution view has no SM count");
+    }
+    const std::int64_t resident =
+        static_cast<std::int64_t>(per_sm) * execution.multiprocessor_count;
     const std::int64_t row_tiles =
         flash_row_tiles(params.query_tokens, params.query_heads, params.kv_heads);
     const std::int32_t all_keys = params.key_tokens + params.extra_tokens;
@@ -95,7 +114,7 @@ void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batc
                                                         params.kv_heads, all_keys, batch);
     params.splits = 1;
     if (needed > 0 && workspace.data != nullptr && workspace.bytes() >= needed) {
-        params.splits = flash_splits(row_tiles, params.kv_heads, batch, all_keys);
+        params.splits = flash_splits(row_tiles, params.kv_heads, batch, all_keys, resident);
         const std::int64_t rows = flash_partial_rows(row_tiles, params.kv_heads, batch);
         params.partial_out   = static_cast<float*>(workspace.data);
         params.partial_stats = params.partial_out + static_cast<std::int64_t>(params.splits) * rows * V;
@@ -107,7 +126,7 @@ void launch_gemma_flash_attention(FlashAttentionParams params, std::int32_t batc
     if (params.splits > 1) {
         const std::int64_t rows = flash_partial_rows(row_tiles, params.kv_heads, batch);
         gemma_flash_attention_combine_kernel<V>
-            <<<static_cast<unsigned>(rows), 128, 0, stream>>>(params, row_tiles);
+            <<<static_cast<unsigned>(rows), kFlashCombineThreads, 0, stream>>>(params, row_tiles);
         CUDA_CHECK(cudaGetLastError());
     }
 }

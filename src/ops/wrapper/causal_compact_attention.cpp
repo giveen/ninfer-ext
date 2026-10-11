@@ -38,7 +38,7 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
                               const Tensor& position_k, AttentionHeadGeometry geometry,
                               std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
                               bool indexed_keys, Tensor& out, const Tensor& workspace,
-                              cudaStream_t stream) {
+                              DeviceExecutionView execution) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("causal_compact_attention: invalid head geometry");
     }
@@ -87,7 +87,7 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
 
     detail::causal_compact_attention_launch(q, kv, position_q, position_k, rotary_dim, rope_angles,
                                             geometry.query_heads, geometry.kv_heads, scale,
-                                            indexed_keys, out, workspace, stream);
+                                            indexed_keys, out, workspace, execution);
 }
 
 std::size_t causal_compact_attention_workspace_bytes(AttentionHeadGeometry geometry,

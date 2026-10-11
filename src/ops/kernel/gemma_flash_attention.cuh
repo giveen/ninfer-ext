@@ -443,10 +443,25 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     }
 }
 
+// The most key splits a row tile takes; the combine's weights live in one warp's two lanes each.
+inline constexpr int kFlashMaxSplits = 64;
+inline constexpr int kFlashCombineThreads = 256;
+
 // Merges the splits of every partial row: out = sum_s O_s e^(m_s - M) / sum_s l_s e^(m_s - M).
-// One block per partial row (every batch), a thread per value column.
+// One block per partial row (every batch). One warp derives the splits' weights e^(m_s - M) once;
+// then a thread owns four value columns of one group of splits, every group's partial sums meet in
+// shared memory, and the first group writes the row. The splits are summed in groups rather than in
+// order, which is a reassociation of FP32 additions.
 template <int V>
-__global__ void gemma_flash_attention_combine_kernel(FlashAttentionParams p, std::int64_t row_tiles) {
+__launch_bounds__(kFlashCombineThreads) __global__
+    void gemma_flash_attention_combine_kernel(FlashAttentionParams p, std::int64_t row_tiles) {
+    static_assert(V % 4 == 0 && V / 4 <= kFlashCombineThreads, "four columns a thread");
+    constexpr int kColumnThreads = V / 4;
+    constexpr int kGroups        = kFlashCombineThreads / kColumnThreads;
+    __shared__ float weight[kFlashMaxSplits];
+    __shared__ float inverse_sum;
+    __shared__ float4 partial[kGroups > 1 ? kGroups - 1 : 1][kColumnThreads];
+
     const std::int64_t row   = blockIdx.x;
     const std::int64_t total = gridDim.x;
     const std::int32_t group = p.query_heads / p.kv_heads;
@@ -456,12 +471,58 @@ __global__ void gemma_flash_attention_combine_kernel(FlashAttentionParams p, std
     const std::int32_t b     = static_cast<std::int32_t>(row / kFlashRows / row_tiles / p.kv_heads);
     const std::int64_t flat  = tile * kFlashRows + r;
     if (flat >= static_cast<std::int64_t>(p.query_tokens) * group) return;
-    float high = -CUDART_INF_F;
-    for (int s = 0; s < p.splits; ++s) high = fmaxf(high, p.partial_stats[(s * total + row) * 2]);
-    float sum = 0.0F;
-    for (int s = 0; s < p.splits; ++s) {
-        const float m = p.partial_stats[(s * total + row) * 2];
-        if (m != -CUDART_INF_F) sum += p.partial_stats[(s * total + row) * 2 + 1] * __expf(m - high);
+    const int thread = static_cast<int>(threadIdx.x);
+
+    if (thread < 32) {
+        float m[2], l[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int s = thread + 32 * i;
+            m[i]        = -CUDART_INF_F;
+            l[i]        = 0.0F;
+            if (s < p.splits) {
+                m[i] = p.partial_stats[(s * total + row) * 2];
+                l[i] = p.partial_stats[(s * total + row) * 2 + 1];
+            }
+        }
+        const float high = flash_warp_max(fmaxf(m[0], m[1]));
+        float sum        = 0.0F;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float w = m[i] == -CUDART_INF_F ? 0.0F : __expf(m[i] - high);
+            if (thread + 32 * i < p.splits) weight[thread + 32 * i] = w;
+            sum += l[i] * w;
+        }
+        sum = flash_warp_sum(sum);
+        if (thread == 0) inverse_sum = sum > 0.0F ? 1.0F / sum : 0.0F;
+    }
+    __syncthreads();
+
+    const int column = thread % kColumnThreads;
+    const int split0 = thread / kColumnThreads;
+    float4 value     = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+#pragma unroll 4
+    for (int s = split0; s < p.splits; s += kGroups) {
+        const float w = weight[s];
+        if (w == 0.0F) continue;
+        const float4 o = reinterpret_cast<const float4*>(p.partial_out + (s * total + row) * V)[column];
+        value.x += o.x * w;
+        value.y += o.y * w;
+        value.z += o.z * w;
+        value.w += o.w * w;
+    }
+    if constexpr (kGroups > 1) {
+        if (split0 > 0) partial[split0 - 1][column] = value;
+        __syncthreads();
+        if (split0 > 0) return;
+#pragma unroll
+        for (int g = 0; g < kGroups - 1; ++g) {
+            const float4 o = partial[g][column];
+            value.x += o.x;
+            value.y += o.y;
+            value.z += o.z;
+            value.w += o.w;
+        }
     }
     const std::int32_t token = static_cast<std::int32_t>(flat / group);
     const std::int32_t head  = kvh * group + static_cast<std::int32_t>(flat % group);
@@ -470,17 +531,11 @@ __global__ void gemma_flash_attention_combine_kernel(FlashAttentionParams p, std
                  static_cast<std::int64_t>(p.query_heads) *
                      (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
                     V;
-    for (int col = static_cast<int>(threadIdx.x); col < V; col += static_cast<int>(blockDim.x)) {
-        float value = 0.0F;
-        if (sum > 0.0F) {
-            for (int s = 0; s < p.splits; ++s) {
-                const float m = p.partial_stats[(s * total + row) * 2];
-                if (m != -CUDART_INF_F) value += p.partial_out[(s * total + row) * V + col] * __expf(m - high);
-            }
-            value /= sum;
-        }
-        dst[col] = __float2bfloat16_rn(value);
-    }
+    const float scale = inverse_sum;
+    *reinterpret_cast<__nv_bfloat162*>(dst + 4 * column) =
+        __floats2bfloat162_rn(value.x * scale, value.y * scale);
+    *reinterpret_cast<__nv_bfloat162*>(dst + 4 * column + 2) =
+        __floats2bfloat162_rn(value.z * scale, value.w * scale);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -350,7 +350,7 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_high,
                                       position_ring, k_pass, v_pass, position_extra, geometry,
                                       config.sliding_window, config.attention_scale, attended_batch,
-                                      workspace, stream);
+                                      workspace, execution);
     }
     if (!write_first) write_kept();
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
@@ -480,7 +480,7 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
         // Rows sit at their own positions, which is what `indexed_keys` states.
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
                                       config.attention_scale, true, attended_batch, workspace,
-                                      stream);
+                                      execution);
     }
     ops::linear(attended, to_weight(weights.attention.output), projected, stream);
     ops::rmsnorm(projected, model.tensor(weights.post_attention_norm), eps, false, branch, stream);
@@ -603,7 +603,7 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
             ops::sliding_causal_attention(q_normed.view({d, hq, 1, 1}), k_ring, v_ring,
                                           visible_position, none, p_ring, none, none, none, heads,
                                           target.sliding_window, target.attention_scale, out,
-                                          workspace, stream);
+                                          workspace, execution);
         } else {
             const std::size_t source = draft.target_global_layer;
             const std::int32_t pairs = static_cast<std::int32_t>(target.global.rope_angles);
@@ -626,7 +626,7 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
             if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
             ops::causal_compact_attention(q_normed.view({d, hq, 1, 1}), kv, visible_position, p_rows,
                                           heads, d, pairs, target.attention_scale, true, out,
-                                          workspace, stream);
+                                          workspace, execution);
         }
         ops::linear(attended, to_weight(layer.output), projected, stream);
         ops::rmsnorm(projected, model.tensor(layer.post_attention_norm), eps, false, branch, stream);

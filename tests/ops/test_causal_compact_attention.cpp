@@ -12,6 +12,14 @@ using namespace ninfer::test;
 
 namespace {
 
+// The legacy default stream with the device's SM count, which the key split policy reads.
+DeviceExecutionView test_execution() {
+    int device = 0, count = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+    return {nullptr, count};
+}
+
 constexpr PointwiseCriterion causal_compact_criterion() {
     return {/*absolute*/ 2.0e-5, /*relative*/ 4.5e-3};
 }
@@ -139,7 +147,7 @@ int run_case(const Case& c) {
         device_out.fill(0x7d);
         ops::causal_compact_attention(q_tensor, kv_tensor, pq_tensor, pk_tensor, geometry,
                                       c.rotary_dim, c.rope_angles, 1.0F, indexed, out_tensor,
-                                      workspace, nullptr);
+                                      workspace, test_execution());
         cuda_synchronize();
         const std::string label = std::string(c.label) +
                                   (route == 0 ? " (one pass)" : route == 1 ? " (split)" : " (split, indexed)");
@@ -171,6 +179,9 @@ int main() {
     failures += run_case({"gemma global long", 512, 64, 32, 4, 700, 40, 1, 660, 8105U});
     // Decode: one query row per head over a long cache, which is the case the key split serves.
     failures += run_case({"gemma global decode", 512, 64, 32, 4, 2000, 1, 1, 1500, 8106U});
+    // Decode at an 8K depth over a larger cache: more than 32 key splits, so the combine weighs
+    // splits in both of its lanes, and the indexed scan stops at the query.
+    failures += run_case({"gemma global decode at 8K", 512, 64, 32, 4, 8300, 1, 1, 8100, 8110U});
 
     // Prefill-sized passes take the tiled kernel: one late in a long cache, one at an 8K prompt's
     // depth, and two batches.

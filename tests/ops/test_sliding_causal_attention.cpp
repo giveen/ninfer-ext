@@ -13,6 +13,14 @@ using namespace ninfer::test;
 
 namespace {
 
+// The legacy default stream with the device's SM count, which the key split policy reads.
+DeviceExecutionView test_execution() {
+    int device = 0, count = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+    return {nullptr, count};
+}
+
 // One storage rounding of a weighted average of represented BF16 values, with an absolute floor so a
 // value that cancels to nothing is not judged by a relative rule.
 constexpr PointwiseCriterion sliding_causal_criterion() {
@@ -223,7 +231,7 @@ int run_case(const Case& c, std::uint32_t seed) {
         if (route < 2) {
             ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, ph_tensor,
                                           pk_tensor, none, none, none, geometry, c.window, 1.0F,
-                                          out_tensor, workspace, nullptr);
+                                          out_tensor, workspace, test_execution());
         } else {
             Tensor k1(device_k1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
             Tensor v1(device_v1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
@@ -232,7 +240,7 @@ int run_case(const Case& c, std::uint32_t seed) {
             Tensor v2(device_v2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
             Tensor p2(device_p2.data(), DType::I32, {extra, c.batch});
             ops::sliding_causal_attention(q_tensor, k1, v1, pq_tensor, ph_tensor, p1, k2, v2, p2,
-                                          geometry, c.window, 1.0F, out_tensor, workspace, nullptr);
+                                          geometry, c.window, 1.0F, out_tensor, workspace, test_execution());
         }
         cuda_synchronize();
         const std::string label = std::string(c.label) +

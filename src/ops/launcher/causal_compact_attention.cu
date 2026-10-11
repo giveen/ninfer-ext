@@ -14,7 +14,8 @@ void causal_compact_attention_launch(const Tensor& q, const Tensor& kv, const Te
                                      const Tensor& position_k, std::int32_t rotary_dim,
                                      std::int32_t rope_angles, std::int32_t query_heads,
                                      std::int32_t kv_heads, float scale, bool indexed_keys,
-                                     Tensor& out, const Tensor& workspace, cudaStream_t stream) {
+                                     Tensor& out, const Tensor& workspace,
+                                     DeviceExecutionView execution) {
     const std::int32_t query_tokens = q.ne[2];
     const std::int32_t key_tokens   = kv.ne[2];
     const std::int32_t batch        = q.ne[3];
@@ -41,11 +42,11 @@ void causal_compact_attention_launch(const Tensor& q, const Tensor& kv, const Te
     params.scale        = scale;
     params.indexed_keys = indexed_keys;
     if (rotary_dim == 512 && rope_angles == 64) {
-        launch_gemma_flash_attention<640, 512, true>(params, batch, workspace, stream);
+        launch_gemma_flash_attention<640, 512, true>(params, batch, workspace, execution);
     } else if (rotary_dim == 128 && rope_angles == 16) {
-        launch_gemma_flash_attention<160, 128, true>(params, batch, workspace, stream);
+        launch_gemma_flash_attention<160, 128, true>(params, batch, workspace, execution);
     } else if (rotary_dim == 64 && rope_angles == 8) {
-        launch_gemma_flash_attention<80, 64, true>(params, batch, workspace, stream);
+        launch_gemma_flash_attention<80, 64, true>(params, batch, workspace, execution);
     } else {
         throw std::invalid_argument(
             "causal_compact_attention: (rotary_dim, rope_angles) must be (512,64), (128,16) or "

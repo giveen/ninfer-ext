@@ -2,6 +2,7 @@
 
 // ninfer::ops::detail - private launch prototype for sliding_causal_attention.
 
+#include "core/device.h"
 #include "core/tensor.h"
 
 #include <cstdint>
@@ -16,7 +17,8 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
                                      const Tensor& v_extra, const Tensor& position_extra,
                                      std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
-                                     Tensor& out, const Tensor& workspace, cudaStream_t stream);
+                                     Tensor& out, const Tensor& workspace,
+                                     DeviceExecutionView execution);
 
 std::size_t sliding_causal_attention_workspace_bytes(std::int32_t head_dim,
                                                      std::int32_t query_tokens,

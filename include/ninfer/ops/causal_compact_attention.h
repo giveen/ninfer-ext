@@ -1,9 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/attention_geometry.h"
-
-#include <cuda_runtime.h> // cudaStream_t
 
 #include <cstddef>
 #include <cstdint>
@@ -47,7 +46,7 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
                               const Tensor& position_k, AttentionHeadGeometry geometry,
                               std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
                               bool indexed_keys, Tensor& out, const Tensor& workspace,
-                              cudaStream_t stream);
+                              DeviceExecutionView execution);
 
 std::size_t causal_compact_attention_workspace_bytes(AttentionHeadGeometry geometry,
                                                      std::int32_t rotary_dim,
