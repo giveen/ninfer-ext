@@ -143,10 +143,13 @@ int main() {
             // Each token starts from the embedding's hidden state, so a pass is a function of that
             // state and the cache alone.
             CUDA_CHECK(cudaMemcpy(in, host.data(), bytes, cudaMemcpyHostToDevice));
+            DeviceArena::Scope scope = arena.scope();
+            const gemma::PassIndices indices = gemma::write_pass_indices(
+                cache, position, 1, arena, device.execution_view().stream);
             for (std::size_t index = 0; index < total; ++index) {
                 Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
                 Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
-                gemma::forward_layer(*model, index, hidden_in, position, 1, cache, arena,
+                gemma::forward_layer(*model, index, hidden_in, position, 1, indices, cache, arena,
                                      hidden_out, device.execution_view());
                 std::swap(in, out);
             }
@@ -212,7 +215,10 @@ int main() {
         bool refused = false;
         try {
             Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
-            gemma::forward_layer(*model, total, hidden_in, 0, 1, cache, arena, hidden_in,
+            DeviceArena::Scope scope = arena.scope();
+            const gemma::PassIndices indices =
+                gemma::write_pass_indices(cache, 0, 1, arena, device.execution_view().stream);
+            gemma::forward_layer(*model, total, hidden_in, 0, 1, indices, cache, arena, hidden_in,
                                  device.execution_view());
         } catch (const std::exception&) { refused = true; }
         check(refused, "a layer index outside the stack was accepted");

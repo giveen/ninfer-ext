@@ -9,6 +9,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scale_columns.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/soft_cap.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sliding_causal_attention.h"
@@ -39,8 +40,28 @@ struct Scratch {
     Tensor up;          // [I,T]     the MLP's up projection
     Tensor activated;   // [I,T]
     Tensor down;        // [H,T]
-    Tensor positions;   // I32 [T]
 };
+
+// I32 [n] as BF16 [2,n], so `scatter`'s exact column copy moves whole 32-bit positions.
+Tensor positions_as_pairs(const Tensor& positions) {
+    return Tensor(positions.data, DType::BF16, {2, static_cast<std::int32_t>(positions.ne[0])});
+}
+
+// Writes the `kept` trailing tokens' rows of `rows` (BF16 [width,tokens]) and their positions into a
+// cache layer whose slot for each token `slots` names: rows into `cache_rows` (BF16 [width,slots]),
+// positions into `cache_positions` (I32 [slots]). Every index is on the device.
+void write_cache_rows(const Tensor& rows, const PassIndices& indices, const Tensor& slots,
+                      std::int32_t kept, const Tensor& cache_rows, const Tensor& cache_positions,
+                      cudaStream_t stream) {
+    const std::int32_t tokens = static_cast<std::int32_t>(rows.ne[1]);
+    const std::int32_t skip   = tokens - kept;
+    const Tensor index        = slots.slice(0, skip, kept);
+    Tensor destination        = cache_rows;
+    ops::scatter(rows.slice(1, skip, kept), index, destination, stream);
+    Tensor position_destination = positions_as_pairs(cache_positions);
+    ops::scatter(positions_as_pairs(indices.positions).slice(1, skip, kept), index,
+                 position_destination, stream);
+}
 
 // The key-norm weight of a target global layer, which a query attending its compact rows carries.
 WeightId target_layer_key_norm(const Model& model, std::size_t layer) {
@@ -128,7 +149,7 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
     //   query-sized:         q, q_normed, attended
     //   key/value-sized:     k, value, k_normed
     //   compact (global):    the R + 2P by Hkv compact row
-    // plus one position vector per token. Every buffer scales with the batch. Sliding layers add a v
+    // plus the pass's two index vectors. Every buffer scales with the batch. Sliding layers add a v
     // projection on top of the key/value buffers.
     // The arena aligns every allocation to 256 bytes, so the bound carries that per slice, and an
     // undercount makes the arena refuse an allocation rather than overrun.
@@ -154,12 +175,36 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
         split = std::max(split, ops::causal_compact_attention_workspace_bytes(
                                     global_heads, global_heads.head_dim, width, 1 << 24, 1));
     }
-    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 17 * 256 + t * 4) + split;
+    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 18 * 256 + t * 8) + split;
+}
+
+PassIndices write_pass_indices(const KvCache& cache, std::int32_t first_position,
+                               std::int32_t tokens, DeviceArena& arena, cudaStream_t stream) {
+    if (tokens < 1) throw std::invalid_argument("write_pass_indices: tokens must be positive");
+    if (first_position < 0) {
+        throw std::invalid_argument("write_pass_indices: positions must not be negative");
+    }
+    PassIndices indices;
+    indices.positions  = arena.alloc(DType::I32, {tokens});
+    indices.ring_slots = arena.alloc(DType::I32, {tokens});
+    const std::int32_t ring = cache.ring_tokens();
+    std::vector<std::int32_t> host(2 * static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        host[static_cast<std::size_t>(token)] = first_position + token;
+        host[static_cast<std::size_t>(tokens + token)] = (first_position + token) % ring;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(tokens) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(indices.positions.data, host.data(), bytes, cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(indices.ring_slots.data, host.data() + tokens, bytes,
+                               cudaMemcpyHostToDevice, stream));
+    return indices;
 }
 
 void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                           std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                           DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
+                           std::int32_t first_position, std::int32_t tokens,
+                           const PassIndices& indices, KvCache& cache, DeviceArena& arena,
+                           Tensor& hidden_out, DeviceExecutionView execution,
                            const Tensor& position_high) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
@@ -220,15 +265,6 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     scratch.up        = arena.alloc(DType::BF16, {i, tokens});
     scratch.activated = arena.alloc(DType::BF16, {i, tokens});
     scratch.down      = arena.alloc(DType::BF16, {h, tokens});
-    scratch.positions = arena.alloc(DType::I32, {tokens, 1, 1});
-
-    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        host_positions[static_cast<std::size_t>(token)] = first_position + token;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(scratch.positions.data, host_positions.data(),
-                               static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
 
     Tensor residual = hidden_in;
     auto to_weight  = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)).weight; };
@@ -257,8 +293,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
 
     // RoPE rotates in place over the head dimension; the sliding layers rotate the whole head, so
     // the pair count is half of it.
-    ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
-              scratch.k_normed, execution);
+    ops::rope(indices.positions.view({tokens, 1, 1}), d, d / 2, config.sliding.rope_theta,
+              scratch.q_normed, scratch.k_normed, execution);
 
     // The ring holds the last window plus slack of tokens at position modulo the ring; a slot no token
     // has written carries an invisible position. A pass's keys enter the ring as its last `kept`
@@ -274,44 +310,32 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     const bool write_first  = tokens <= cache.ring_slack() + 1;
     if (!write_first) cache.forget_stale(layer, first_position, stream);
 
-    const std::int32_t kept  = std::min(tokens, ring);
-    const std::int32_t first = first_position + tokens - kept;
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(d) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
-    // The kept rows are adjacent in the ring unless the run wraps, which splits it into two copies.
-    const auto write_kept = [&] {
-        const std::int32_t first_slot = cache.slot(layer, first);
-        const std::int32_t head_run   = std::min(kept, ring - first_slot);
-        const auto copy_run = [&](std::int32_t slot, std::int32_t from, std::int32_t count) {
-            const std::size_t source = static_cast<std::size_t>(tokens - kept + from) * row_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
-                                           static_cast<std::size_t>(slot) * row_bytes,
-                                       static_cast<std::uint8_t*>(scratch.k_normed.data) + source,
-                                       static_cast<std::size_t>(count) * row_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) +
-                                           static_cast<std::size_t>(slot) * row_bytes,
-                                       static_cast<std::uint8_t*>(scratch.v_normed.data) + source,
-                                       static_cast<std::size_t>(count) * row_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
-        };
-        copy_run(first_slot, 0, head_run);
-        if (head_run < kept) copy_run(0, head_run, kept - head_run);
-        cache.mark_range(layer, first, kept, stream);
+    // The kept rows go to the slots `indices` names, so the writes carry no host offset; the last
+    // ring of a pass has distinct slots.
+    const std::int32_t kept = std::min(tokens, ring);
+    const std::int32_t row  = d * hkv;
+    const auto write_kept   = [&] {
+        const Tensor key_rows(cache_keys.data, DType::BF16, {row, ring});
+        const Tensor value_rows(cache_values.data, DType::BF16, {row, ring});
+        write_cache_rows(scratch.k_normed.view({row, tokens}), indices, indices.ring_slots, kept,
+                         key_rows, cache_pos, stream);
+        Tensor value_destination = value_rows;
+        ops::scatter(scratch.v_normed.view({row, tokens}).slice(1, tokens - kept, kept),
+                     indices.ring_slots.slice(0, tokens - kept, kept), value_destination, stream);
     };
     if (write_first) write_kept();
 
     {
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
         Tensor q_batch = scratch.q_normed.view({d, hq, tokens, 1});
-        // Until the ring first wraps, only its leading slots hold tokens, and the Op scans every key
-        // it is given. An empty ring is passed as one unwritten slot.
-        const std::int32_t filled =
-            std::clamp(first_position + (write_first ? tokens : 0), 1, ring);
+        // A narrow pass attends to the whole ring, whose unwritten slots are invisible, so its
+        // launches are the same at every position. A wide pass runs eagerly and passes only the
+        // leading slots the ring has filled before it (one unwritten slot when it is empty).
+        const std::int32_t filled = write_first ? ring : std::clamp(first_position, 1, ring);
         Tensor k_ring(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16, {d, hkv, filled, 1});
         Tensor v_ring(static_cast<std::uint8_t*>(cache_values.data), DType::BF16, {d, hkv, filled, 1});
         Tensor position_ring(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
-        Tensor position_pass  = scratch.positions.view({tokens, 1});
+        Tensor position_pass  = indices.positions.view({tokens, 1});
         Tensor attended_batch = scratch.attended.view({d, hq, tokens, 1});
         const Tensor none;
         const Tensor k_pass = write_first ? none : scratch.k_normed.view({d, hkv, tokens, 1});
@@ -354,8 +378,9 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
 }
 
 void forward_global_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                          std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                          DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution) {
+                          std::int32_t first_position, std::int32_t tokens,
+                          const PassIndices& indices, KvCache& cache, DeviceArena& arena,
+                          Tensor& hidden_out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -398,15 +423,7 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     Tensor gate      = arena.alloc(DType::BF16, {i, tokens});
     Tensor up        = arena.alloc(DType::BF16, {i, tokens});
     Tensor activated = arena.alloc(DType::BF16, {i, tokens});
-    Tensor positions = arena.alloc(DType::I32, {tokens, 1, 1});
-
-    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        host_positions[static_cast<std::size_t>(token)] = first_position + token;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_positions.data(),
-                               static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
+    const Tensor positions = indices.positions.view({tokens, 1, 1});
 
     Tensor residual = hidden_in;
     auto to_weight  = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)).weight; };
@@ -436,34 +453,28 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
 
     ops::compact_kv_rows(value, k_normed, compact, d, pairs, stream);
 
-    // The compact row is written at the token's own position and read back causally, so a slot no
-    // token has written carries an invisible position and the whole cache can be handed to the Op.
+    // The compact row is written at the token's own position, the slot the positions themselves
+    // name, and read back causally, so a slot no token has written carries an invisible position and
+    // the whole cache can be handed to the Op.
     Tensor cache_rows = cache.keys(layer);
     Tensor cache_pos  = cache.positions(layer);
-    const std::int32_t capacity  = cache.capacity();
-    const std::int32_t row_index = cache.slot(layer, first_position);
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
-    // A batch occupies consecutive positions, so its rows are consecutive too.
-    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_rows.data) +
-                                   static_cast<std::size_t>(row_index) * row_bytes,
-                               compact.data, static_cast<std::size_t>(tokens) * row_bytes,
-                               cudaMemcpyDeviceToDevice, stream));
-    cache.mark_range(layer, first_position, tokens, stream);
+    const std::int32_t capacity = cache.capacity();
+    write_cache_rows(compact.view({width * hkv, tokens}), indices, indices.positions, tokens,
+                     Tensor(cache_rows.data, DType::BF16, {width * hkv, capacity}), cache_pos,
+                     stream);
 
     {
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
         Tensor q_batch        = q_normed.view({d, hq, tokens, 1});
-        // Rows sit at their own positions, so the written ones are exactly the leading `filled`, and
-        // the Op scans every key it is given.
-        const std::int32_t filled = first_position + tokens;
+        // The Op is handed the whole capacity: with `indexed_keys` it stops at the latest query's
+        // position on the device, so the launches do not depend on how much of the cache is filled.
         Tensor kv_batch(static_cast<std::uint8_t*>(cache_rows.data), DType::BF16,
-                        {width, hkv, filled, 1});
+                        {width, hkv, capacity, 1});
         Tensor attended_batch = attended.view({d, hq, tokens, 1});
         Tensor position_q     = positions.view({tokens, 1});
-        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
+        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {capacity, 1});
         const std::size_t split =
-            ops::causal_compact_attention_workspace_bytes(heads, d, tokens, filled, 1);
+            ops::causal_compact_attention_workspace_bytes(heads, d, tokens, capacity, 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
         // Rows sit at their own positions, which is what `indexed_keys` states.
@@ -637,20 +648,24 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
 }
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   const Tensor& position_high) {
+                   std::int32_t first_position, std::int32_t tokens, const PassIndices& indices,
+                   KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
+                   DeviceExecutionView execution, const Tensor& position_high) {
+    if (indices.positions.dtype != DType::I32 || indices.positions.ne[0] != tokens ||
+        indices.ring_slots.dtype != DType::I32 || indices.ring_slots.ne[0] != tokens) {
+        throw std::invalid_argument("forward_layer: indices must be I32 [tokens]");
+    }
     if (position_high.data != nullptr &&
         (position_high.dtype != DType::I32 || position_high.ne[0] != tokens ||
          position_high.ne[1] != 1)) {
         throw std::invalid_argument("forward_layer: position_high must be I32 [tokens,1]");
     }
     if (model.config().sliding_attention(layer)) {
-        forward_sliding_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
-                              hidden_out, execution, position_high);
+        forward_sliding_layer(model, layer, hidden_in, first_position, tokens, indices, cache,
+                              arena, hidden_out, execution, position_high);
     } else {
-        forward_global_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
-                             hidden_out, execution);
+        forward_global_layer(model, layer, hidden_in, first_position, tokens, indices, cache,
+                             arena, hidden_out, execution);
     }
 }
 

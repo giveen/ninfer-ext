@@ -27,27 +27,49 @@
 
 namespace ninfer::models::gemma4 {
 
-// Transient capacity one layer needs to run `tokens` tokens at once, of either kind, so a caller can
-// reuse one arena for every layer of a pass.
+// Transient capacity one pass needs: the pass's indices (`write_pass_indices`) plus the scratch of one
+// layer running `tokens` tokens at once, of either kind, so a caller can reuse one arena for every
+// layer of a pass.
 [[nodiscard]] std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens);
+
+// The device I32 [tokens] vectors every layer of one pass reads: each token's absolute position, and
+// the sliding-ring slot that position occupies. The layers take positions and cache slots from here
+// rather than from the host, so a pass's launches do not depend on where in the sequence it runs:
+// that is what lets one captured decode graph serve every position.
+struct PassIndices {
+    Tensor positions;
+    Tensor ring_slots;
+};
+
+// Allocates the indices for the tokens at `first_position`.. from `arena` (the caller's scope owns
+// them) and writes them on `stream`. The pageable source is staged before the call returns.
+[[nodiscard]] PassIndices write_pass_indices(const KvCache& cache, std::int32_t first_position,
+                                             std::int32_t tokens, DeviceArena& arena,
+                                             cudaStream_t stream);
 
 /**
  * Runs one decoder layer for `tokens` tokens at once, dispatching on the layer's attention kind.
  *
  * `hidden_in` and `hidden_out` are contiguous BF16 [hidden_size,tokens] and must not overlap; the
  * layer reads the residual stream and writes its updated self to `hidden_out`. The tokens occupy the
- * consecutive absolute positions starting at `first_position`, so a prefill is one call and a decode
- * is the same call with one token. Every token's key and value rows are written into `cache` before
- * the attention runs, and each query then sees exactly what the cache makes visible to its own
- * position, which is what makes a batched prefill produce the same result as token-at-a-time.
+ * consecutive absolute positions starting at `first_position`, which `indices` holds on the device,
+ * so a prefill is one call and a decode is the same call with one token. Every token's key and value
+ * rows are written into `cache` before the attention runs, and each query then sees exactly what the
+ * cache makes visible to its own position, which is what makes a batched prefill produce the same
+ * result as token-at-a-time.
+ *
+ * A pass of at most `cache.ring_slack() + 1` tokens issues the same launches at every position: its
+ * cache writes are indexed on the device and its attention scans the whole ring and the whole global
+ * capacity, whose unwritten and future slots are invisible.
  */
 //
 // `position_high`, when given, is device I32 [tokens,1]: the latest position each token's sliding
 // attention may see. An image's tokens see their whole image (its last position); every other
 // token, and every global layer, stays causal. Empty means causal throughout.
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
+                   std::int32_t first_position, std::int32_t tokens, const PassIndices& indices,
+                   KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
+                   DeviceExecutionView execution,
                    const Tensor& position_high = {});
 
 /**

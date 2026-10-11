@@ -10,9 +10,11 @@
 // a request never discovers half way through that its cache does not fit.
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/tensor.h"
 #include "models/gemma4/cache.h"
+#include "models/gemma4/forward.h"
 #include "models/gemma4/model.h"
 #include "models/gemma4/vision.h"
 #include "ninfer/ops/sampling.h"
@@ -38,9 +40,10 @@ class Program {
 public:
     // `capacity` bounds the tokens one lane's global layers can hold; sliding layers always hold the
     // window. `draft_tokens` > 0 enables MTP rounds of up to that many drafts, which needs the drafter
-    // loaded, and gives the sliding rings that much slack.
+    // loaded, and gives the sliding rings that much slack. With `cuda_graphs`, each lane's decode
+    // step is captured once into a CUDA Graph and replayed (see decode()).
     Program(const Model& model, std::int32_t capacity, std::int32_t lanes, DeviceContext& device,
-            std::int32_t draft_tokens = 0);
+            std::int32_t draft_tokens = 0, bool cuda_graphs = false);
     ~Program();
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
@@ -161,6 +164,8 @@ private:
         // The round speculate() left for commit_round(): its first position and draft count.
         std::int32_t round_position = -1;
         std::int32_t round_drafts   = 0;
+        // The lane's one-token pass, captured on its first decode after the Program's warm-up.
+        DecodeGraphExecutable decode_graph;
     };
 
     [[nodiscard]] Lane& lane_at(std::int32_t lane);
@@ -176,6 +181,12 @@ private:
     void run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
                   bool every_column, DeviceExecutionView execution,
                   std::span<const PromptImage> images = {});
+    // Embeds the first `tokens` ids of the device id buffer into the pass state.
+    void embed(std::int32_t tokens, cudaStream_t stream);
+    // Every layer and the head over the embedded pass state, at the positions `indices` holds.
+    void run_layers(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
+                    const PassIndices& indices, bool every_column, DeviceExecutionView execution,
+                    const Tensor& position_high);
     // Copies column `column` of the last pass's post-final-norm hidden state into the lane's.
     void keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream);
 
@@ -207,6 +218,9 @@ private:
     std::vector<std::uint16_t> logits_host_;
     std::int32_t last_batch_      = 1;
     std::int32_t capacity_        = 0;
+    bool cuda_graphs_             = false;
+    // Set once a decode has run eagerly; graphs are captured only after that.
+    bool decode_warm_ = false;
     std::size_t allocated_bytes_  = 0;
 };
 

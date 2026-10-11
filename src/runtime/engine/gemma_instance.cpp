@@ -189,9 +189,10 @@ ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandl
 GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity,
                            std::int32_t lanes, std::uint32_t prefill_chunk,
                            std::uint32_t idle_prefill_chunk, std::int32_t draft_tokens,
-                           bool adaptive_draft, DeviceContext& device)
+                           bool adaptive_draft, bool cuda_graphs, DeviceContext& device)
     : model_(model), device_(device), execution_(device.execution_view()),
-      program_(model, capacity, lanes, device, draft_tokens), lanes_(static_cast<std::size_t>(lanes)),
+      program_(model, capacity, lanes, device, draft_tokens, cuda_graphs),
+      lanes_(static_cast<std::size_t>(lanes)),
       prefill_chunk_(prefill_chunk), idle_chunk_(idle_prefill_chunk) {
     if (prefill_chunk_ == 0 || idle_chunk_ == 0) {
         throw std::invalid_argument("gemma4 Program: prefill chunks must be positive");
@@ -745,7 +746,7 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     program = std::make_unique<gemma_contract::GemmaProgram>(
         *model, static_cast<std::int32_t>(capacity), lanes, options.prefill_chunk.value(),
         options.idle_prefill_chunk.value(), draft_tokens, mtp && !options.speculative.fixed_draft,
-        device);
+        options.use_cuda_graph, device);
     std::size_t after_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&after_bytes, &total_bytes));
     kv_capacity_resolution.mode                          = KvCapacityMode::Explicit;

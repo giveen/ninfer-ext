@@ -306,7 +306,15 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   prompt-lookup drafts and draft trees), a KV format other than BF16, KV streaming, and an
   explicit KV capacity below `max_context`. Video, images in tool results and images in causal scoring
   are refused per request. `ninfer-perplexity` defaults to FP8 KV, so it needs
-  `--kv-dtype bf16` for this model. CUDA Graphs are not used whatever `use_cuda_graph` says.
+  `--kv-dtype bf16` for this model.
+- **CUDA Graphs** (`use_cuda_graph`, on by default): each lane's one-token decode step is captured
+  once, on its first decode after the Program's first (eager) one, and replayed for every later
+  step. That works because a one-token pass issues the same launches at every position: the token
+  id and the pass's positions and ring slots (`PassIndices`) are the only host inputs, written
+  before the replay; every cache write is a device-indexed `scatter`; and the attention Ops are
+  handed the whole sliding ring and the whole global capacity, whose unwritten and future slots are
+  invisible (the compact Op's `indexed_keys` stops at the query on the device). MTP rounds and
+  prefill passes run eagerly.
 
 ## 11. Verification
 
@@ -368,12 +376,26 @@ run-to-run variation (0.878-0.883 on both builds).
 
 Decode is measured alone (`-n 128 -r 5`); right after the prefill tests in the same run it reads
 about 1% lower. The decode ceiling from M1's 20.9 GiB of device weights at 1.79 TB/s is about 80
-tok/s, so decode runs at about two thirds of it, without CUDA Graphs. The bench header reports
-`decode_path=cuda_graph`; that is the option as passed, not what this model ran.
+tok/s, so decode ran at about two thirds of it. The figures above it were taken before decode had
+CUDA Graphs.
+
+CUDA Graphs, measured in one session (graphs, `--no-cuda-graph` on the same build, the previous
+commit, graphs again): tg128 56.09 / 56.54 against 55.55 eager and 55.99 for the previous commit;
+decode after an 8K prompt 52.31 / 52.35 against 51.72 and 51.77; pp1024 2,515 / 2,511 against 2,493
+and 2,490. The gain is small because an eager decode token's launch gaps are only about 0.5 ms
+(nsys: an 18.18 ms span over 17.66 ms of kernels), and a replayed graph still pays a per-kernel
+latency over ~1,370 kernels a token. The eager path itself measures 0.8% below the previous commit
+at short context, where the whole-ring sliding scan launches its full key split over a ring that is
+mostly unwritten; at 8K it is level. MTP throughput is unchanged in principle (its rounds run
+eagerly) and measured 267.5-282.9 tok/s across the four runs, a spread the adaptive draft policy's
+round count (57-60) alone explains. Greedy decode is token-identical between the graph and eager
+paths (`ninfer_gemma4_generate_test`, 48 steps after an 1,100-token prompt) and against the
+previous commit.
 
 Of a decode token's GPU kernel time (nsys), the Q6 and Q5 linears are 88%, RoPE (a generic kernel)
 4.6%, attention 3.6%, and norms and element-wise kernels the rest. Kernel time is about 18 ms of the
-19 ms per token, so launch gaps, which CUDA Graphs would remove, cost about 5%; the linears' distance
+19 ms per token under nsys, so launch gaps looked like about 5% (about 3% measured more carefully,
+above); the linears' distance
 from the weight-streaming rate is the larger lever. An 8K prefill at 128-token passes spent 46% in the Q6 MMA, 22% in the Q5
 sliced-K MMA and 29% in attention; widening the pass to 512 tokens took pp8192 from 991 to 1,837
 tok/s. Two concurrent requests both progress, but each lane runs its own pass, so a second lane
@@ -606,7 +628,7 @@ table and this one should not be differenced across sessions.
 | Decode single-token routes | after the direct route (12c) the Q6 shapes stream 1.40-1.47 TB/s in the Linear benchmark against the Q5 direct route's 1.59 and the 1674.5 GB/s read ceiling | the remaining Q6 decode cost against Q5's: 2 more bytes a lane per 8 weights and the high-bit merge |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
 | Tiled attention wave quantization | a 512-token pass gives the global layers 512 blocks of near-equal work, one per SM at a time: 3.01 waves run as 4 | finer work items for the last wave (a key split there with the existing combine), or a block small enough for two per SM |
-| CUDA Graphs | decode launch overhead (about 0.9 ms of a token) | a decode step bakes per-token host values into its launches: ring-slot copy offsets, the `filled` key count as a tensor shape, and attention split grids sized by context length. Those need device-resident parameters or per-length graph profiles as Qwen's Program has, then capture per lane count |
+| Fewer decode kernels | a decode token is ~1,370 kernels; graphs removed the host side of the launch cost (section 12) but not the per-kernel latency | fusing the per-sublayer norm, residual add and layer scalar; a first attempt failed the numerics (section 15) |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |

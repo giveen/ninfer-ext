@@ -88,12 +88,12 @@ std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacit
 }
 
 Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
-                 DeviceContext& device, std::int32_t draft_tokens)
+                 DeviceContext& device, std::int32_t draft_tokens, bool cuda_graphs)
     : model_(&model),
       arena_(
           arena_bytes(model.config(), model.vision_config() ? &*model.vision_config() : nullptr)),
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
-      draft_tokens_(draft_tokens), capacity_(capacity) {
+      draft_tokens_(draft_tokens), capacity_(capacity), cuda_graphs_(cuda_graphs) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
     if (lanes < 1) throw std::invalid_argument("gemma4 Program: lanes must be positive");
     if (draft_tokens < 0 || draft_tokens > kMaximumDraftTokens) {
@@ -231,18 +231,23 @@ void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t to
     run_pass(cache, tokens, first_position, every_column, execution, images);
 }
 
-void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
-                       bool every_column, DeviceExecutionView execution,
-                       std::span<const PromptImage> images) {
-    const cudaStream_t stream = execution.stream;
-    const TextConfig& config  = model_->config();
-    const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
+void Program::embed(std::int32_t tokens, cudaStream_t stream) {
+    const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
     Tensor id_tensor(static_cast<std::uint8_t*>(id_buffer_), DType::I32, {tokens});
     Tensor embedded(static_cast<std::uint8_t*>(state_[0]), DType::BF16, {hidden, tokens});
     // The embedding scale the converter derives: the square root of the hidden size.
     const Weight table =
         native_weight(model_->weight(model_->weights().text.token_embedding).view);
     ops::embedding(id_tensor, table, std::sqrt(static_cast<float>(hidden)), embedded, stream);
+}
+
+void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
+                       bool every_column, DeviceExecutionView execution,
+                       std::span<const PromptImage> images) {
+    const cudaStream_t stream = execution.stream;
+    const TextConfig& config  = model_->config();
+    const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
+    embed(tokens, stream);
 
     // An image's features replace its tokens' embeddings as they are, with no embedding scale, and
     // its tokens' sliding upper bound is the image's last position. The encoder's scratch is the
@@ -280,14 +285,23 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         position_high = Tensor(static_cast<std::uint8_t*>(high_buffer_), DType::I32, {tokens, 1});
     }
 
+    DeviceArena::Scope scope  = arena_.scope();
+    const PassIndices indices = write_pass_indices(cache, first_position, tokens, arena_, stream);
+    run_layers(cache, tokens, first_position, indices, every_column, execution, position_high);
+}
+
+void Program::run_layers(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
+                         const PassIndices& indices, bool every_column,
+                         DeviceExecutionView execution, const Tensor& position_high) {
+    const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
     // Sixty layers, so an even number of swaps leaves the result where it started.
     void* in  = state_[0];
     void* out = state_[1];
     for (std::size_t layer = 0; layer < model_->weights().text.layers.size(); ++layer) {
         Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
         Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, tokens});
-        forward_layer(*model_, layer, hidden_in, first_position, tokens, cache, arena_, hidden_out,
-                      execution, position_high);
+        forward_layer(*model_, layer, hidden_in, first_position, tokens, indices, cache, arena_,
+                      hidden_out, execution, position_high);
         std::swap(in, out);
     }
 
@@ -390,9 +404,36 @@ void Program::decode(std::int32_t lane_index, std::int32_t id, DeviceExecutionVi
     if (lane.position >= capacity_) {
         throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
     }
-    run_batch(lane.cache, &id, 1, lane.position, false, execution);
+    const cudaStream_t stream = execution.stream;
+    // The token and the pass indices are written before the pass, outside any graph: they are the
+    // only inputs a decode step takes from the host.
+    id_host_[0] = id;
+    CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(), sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    DeviceArena::Scope scope  = arena_.scope();
+    const PassIndices indices = write_pass_indices(lane.cache, lane.position, 1, arena_, stream);
+    const auto pass = [&] {
+        embed(1, stream);
+        run_layers(lane.cache, 1, lane.position, indices, false, execution, {});
+    };
+    // A one-token pass issues the same launches at every position (forward.h), so the lane's graph,
+    // captured once, replays every later step. The first decode of the Program runs eagerly, so every
+    // launcher's one-time setup has happened before anything is captured; the legacy default stream
+    // cannot be captured at all.
+    if (cuda_graphs_ && decode_warm_ && stream != nullptr) {
+        if (!lane.decode_graph.ready()) {
+            DecodeGraphDefinition definition;
+            definition.capture(stream, pass);
+            lane.decode_graph.instantiate(definition);
+        }
+        lane.decode_graph.launch(stream);
+        last_batch_ = 1;
+    } else {
+        pass();
+        decode_warm_ = true;
+    }
     ++lane.position;
-    keep_hidden(lane, 0, execution.stream);
+    keep_hidden(lane, 0, stream);
     lane.round_position = -1;
 }
 
