@@ -125,4 +125,17 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
                    const KvCache& cache, DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
                    DeviceExecutionView execution);
 
+// One lane of a batched drafter step: the cache it reads and the position of its token.
+struct DraftLane {
+    const KvCache* cache  = nullptr;
+    std::int32_t position = 0;
+};
+
+// The same step for several lanes at once: `input` [2 * target hidden, lanes], `logits`
+// [vocabulary, lanes] and `hidden_out` [target hidden, lanes] hold one column per lane, in order.
+// The projections and MLP run once over every column; each lane attends to its own cache.
+void forward_draft(const Model& model, const Tensor& input, std::span<const DraftLane> lanes,
+                   DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
+                   DeviceExecutionView execution);
+
 } // namespace ninfer::models::gemma4

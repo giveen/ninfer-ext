@@ -79,6 +79,13 @@ public:
      */
     [[nodiscard]] Round speculate(std::int32_t lane, std::int32_t anchor, std::int32_t drafts,
                                   DeviceExecutionView execution);
+    // The same round for several distinct lanes at once, returned in their order. The lanes share
+    // every weight read: each drafter step runs once over the lanes still drafting, and one target
+    // pass verifies every lane's [anchor, drafts], each against its own cache. Synchronizes once.
+    [[nodiscard]] std::vector<Round> speculate(std::span<const std::int32_t> lanes,
+                                               std::span<const std::int32_t> anchors,
+                                               std::span<const std::int32_t> drafts,
+                                               DeviceExecutionView execution);
 
     // Keeps the first `kept` tokens of `lane`'s last round (1 to its token count): the target has then
     // consumed the anchor and the first kept-1 of them, and the last kept token is the next anchor.
@@ -182,9 +189,12 @@ private:
         // With speculation: device BF16 [hidden], the target's post-final-norm state at the token
         // before the anchor, which the drafter's first step reads.
         void* hidden = nullptr;
-        // The round speculate() left for commit_round(): its first position and draft count.
+        // The round speculate() left for commit_round(): its first position and draft count, and
+        // with speculation the verify pass's post-final-norm states, device BF16 [hidden, drafts + 1],
+        // copied out so later passes cannot overwrite them before the commit picks one.
         std::int32_t round_position = -1;
         std::int32_t round_drafts   = 0;
+        void* round_hidden          = nullptr;
         // The logits column the lane's last pass left for sample().
         std::int32_t column = 0;
     };
@@ -225,8 +235,8 @@ private:
     // [hidden, kScorePass]: the post-final-norm state of every column the head ran over.
     Tensor head_hidden_;
     std::int32_t draft_tokens_ = 0;
-    // The drafter's buffers: its input [2 * hidden], output state [hidden], logits [vocabulary], and
-    // the round's I32 scalars and vectors (see speculate()).
+    // The drafter's buffers, one column per lane: its input [2 * hidden], output state [hidden],
+    // logits [vocabulary], and each lane's I32 round block (see speculate()).
     Tensor draft_input_, draft_hidden_, draft_logits_;
     void* round_ints_ = nullptr;
     std::vector<std::int32_t> round_host_;

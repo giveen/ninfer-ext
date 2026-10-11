@@ -103,6 +103,41 @@ std::vector<std::vector<std::int32_t>> generate(gemma::Program& program,
     return generate(program, lanes, order, execution, [](std::int32_t) {});
 }
 
+// Prefills every assigned lane and draws its first token, then runs batched MTP rounds, each lane
+// drafting its own count and keeping its whole licensed run, until every lane has kSteps + 1 tokens.
+std::vector<std::vector<std::int32_t>> speculate(gemma::Program& program,
+                                                 std::span<const Assignment> lanes,
+                                                 std::span<const std::int32_t> drafts,
+                                                 DeviceExecutionView execution) {
+    std::vector<std::vector<std::int32_t>> tokens(lanes.size());
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        program.reset(lanes[i].lane);
+        program.prefill(lanes[i].lane, lanes[i].prompt, execution);
+        tokens[i].push_back(program.sample(lanes[i].lane, execution));
+    }
+    for (;;) {
+        std::vector<std::int32_t> active, anchors, counts;
+        std::vector<std::size_t> index;
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            if (tokens[i].size() > static_cast<std::size_t>(kSteps)) continue;
+            active.push_back(lanes[i].lane);
+            anchors.push_back(tokens[i].back());
+            counts.push_back(drafts[i]);
+            index.push_back(i);
+        }
+        if (active.empty()) break;
+        const auto rounds = program.speculate(active, anchors, counts, execution);
+        for (std::size_t k = 0; k < active.size(); ++k) {
+            program.commit_round(active[k], static_cast<std::int32_t>(rounds[k].tokens.size()),
+                                 execution);
+            auto& out = tokens[index[k]];
+            out.insert(out.end(), rounds[k].tokens.begin(), rounds[k].tokens.end());
+        }
+    }
+    for (auto& out : tokens) out.resize(static_cast<std::size_t>(kSteps) + 1);
+    return tokens;
+}
+
 bool equal(const std::vector<std::int32_t>& a, const std::vector<std::int32_t>& b, const char* what) {
     const auto mismatch = std::mismatch(a.begin(), a.end(), b.begin(), b.end());
     if (mismatch.first == a.end() && mismatch.second == b.end()) {
@@ -132,7 +167,16 @@ int main() {
     try {
         DeviceContext device;
         const DeviceExecutionView execution = device.execution_view();
-        auto model = gemma::load_model(artifact, models::LoadOptions{}, device);
+        // With the drafter when the artifact carries one, for the MTP rounds.
+        models::LoadOptions options;
+        options.speculative = SpeculativeBackend::Mtp;
+        auto model = [&] {
+            try {
+                return gemma::load_model(artifact, options, device);
+            } catch (const std::exception&) {
+                return gemma::load_model(artifact, models::LoadOptions{}, device);
+            }
+        }();
         const std::vector<std::int32_t> ids = read_ids(prompt_path);
         if (ids.size() < 1100) {
             std::cerr << "gemma4 batch: the prompt needs at least 1,100 tokens\n";
@@ -157,6 +201,7 @@ int main() {
         // Partner swap, with the idle lane: C waits in lane 2 through the first run.
         const Assignment with_b[] = {{0, a}, {1, b}};
         const std::int32_t lanes01[] = {0, 1};
+        const std::int32_t lane0b[]  = {1};
         graphs.reset(2);
         graphs.prefill(2, c, execution);
         const std::int32_t idle_first = graphs.sample(2, execution);
@@ -209,10 +254,30 @@ int main() {
         const Assignment three[] = {{0, a}, {1, b}, {2, c}};
         const std::int32_t lanes012[] = {0, 1, 2};
         const auto replayed = generate(graphs, three, lanes012, execution);
-        gemma::Program eager(*model, capacity, 3, device, 0, false);
-        const auto direct = generate(eager, three, lanes012, execution);
-        for (std::size_t i = 0; i < 3; ++i) {
-            failures += !equal(replayed[i], direct[i], "three lanes, graph against eager");
+        {
+            gemma::Program eager(*model, capacity, 3, device, 0, false);
+            const auto direct = generate(eager, three, lanes012, execution);
+            for (std::size_t i = 0; i < 3; ++i) {
+                failures += !equal(replayed[i], direct[i], "three lanes, graph against eager");
+            }
+        }
+
+        // MTP rounds batched across lanes at different draft counts, against each lane's own rounds
+        // and against plain greedy decode.
+        if (model->draft_config()) {
+            gemma::Program mtp(*model, capacity, 3, device, gemma::Program::kMaximumDraftTokens, true);
+            const Assignment pair[]       = {{0, a}, {2, b}};
+            const std::int32_t counts[]   = {7, 3};
+            const auto together           = speculate(mtp, pair, counts, execution);
+            const auto solo_mtp_a         = speculate(mtp, std::span(pair, 1), std::span(counts, 1), execution);
+            const auto solo_mtp_b         = speculate(mtp, std::span(pair + 1, 1), std::span(counts + 1, 1), execution);
+            failures += !equal(together[0], solo_mtp_a[0], "MTP lane 0 batched against its own rounds");
+            failures += !equal(together[1], solo_mtp_b[0], "MTP lane 2 batched against its own rounds");
+            const auto plain_b = generate(graphs, std::span(with_b + 1, 1), lane0b, execution)[0];
+            failures += !equal(together[0], alone_a, "MTP lane 0 batched against plain greedy");
+            failures += !equal(together[1], plain_b, "MTP lane 2 batched against plain greedy");
+        } else {
+            std::cout << "  no drafter in the artifact: MTP batching not checked\n";
         }
 
         std::cout << (failures == 0 ? "OK" : "FAIL") << " gemma4 batch\n";

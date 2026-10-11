@@ -299,7 +299,12 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   never expandable and seals directly. A decode round's plain rows decode together in one pass
   (`Program::decode` over a span of lanes: every column-wise step runs once over one column per
   lane, and each lane's cache writes and attention run per `PassSegment` against its own cache);
-  a row with drafts runs its own MTP round. Every lane samples on device, with one sync a round. The prefix-cache entry points the controller is compiled against (pressure planning,
+  the rows with drafts share one MTP round (`Program::speculate` over a span of lanes: each
+  drafter step runs once over the lanes still drafting, which are a prefix of the batch in
+  descending draft count, one verify pass carries every lane's [anchor, drafts] as its own segment,
+  and each lane's sampler accepts against its own columns). Every lane samples on device, with one
+  sync a round. A round's time is every lane's round time, so the adaptive draft policy learns the
+  batched cost. The prefix-cache entry points the controller is compiled against (pressure planning,
   captures, checkpoint recovery, continuations) refuse by name. Forced control tokens (the thinking
   budget's `<channel|>` close) are appended as one prefill of the lane. Contract
   types this model never constructs are the Qwen contract's pure-data types; moving them into
@@ -334,7 +339,7 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Generation | `ninfer` CLI, greedy | "The capital of France is Paris."; thinking mode streams reasoning separately from the answer |
 | Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand; the same with `--spec mtp`, plus a thinking budget of 24 closing the channel |
 | Drafter | `ninfer_gemma4_draft_test` dumps, `tools/verify/gemma4_draft_reference.py` runs transformers' `Gemma4AssistantForCausalLM` in FP32 on the same inputs (position 1,501, rings wrapped) | four steps: logits cosine ≥ 0.99996, argmax and top-5 identical, projected-state cosine ≥ 0.99997 |
-| Batched decode | `ninfer_gemma4_batch_test`: three prompts from the 1,100-token file (one longer than the ring), 33 greedy tokens a lane | lane 0 identical beside different partners and with the lanes named in either order; a lane idle through batched rounds then identical to its own solo run; three lanes identical with and without CUDA Graphs; lane 0 batched identical to lane 0 alone in this run (the test only requires a near tie at a first difference, since T=1 and T>1 take different Linear routes) |
+| Batched decode | `ninfer_gemma4_batch_test`: three prompts from the 1,100-token file (one longer than the ring), 33 greedy tokens a lane | lane 0 identical beside different partners and with the lanes named in either order; a lane idle through batched rounds then identical to its own solo run; three lanes identical with and without CUDA Graphs; lane 0 batched identical to lane 0 alone in this run (the test only requires a near tie at a first difference, since T=1 and T>1 take different Linear routes); two lanes in batched MTP rounds at 7 and 3 drafts identical to each lane's own rounds and to plain greedy decode |
 | MTP rounds | `ninfer_gemma4_mtp_test`: 384 greedy tokens after a 1,100-token prompt at seven drafts | every ring slot and global row holds its committed position (without the slack the same run leaves 50 wrong); against one fresh scoring pass the output disagrees 1-4 times, the same as plain decode (4) |
 | Image preprocessing | `ninfer_gemma4_image_processor_test` on `tools/verify/gemma4_vision_reference.py prepare` (transformers' `Gemma4ImageProcessorPil`) | the resize rule identical over 22 sizes (edge branches, both orientations, up- and downscaling); lossless images' patches within one BF16 rounding (worst 0.004 uint8 steps); a JPEG differs, see 12b |
 | Image encoder | `ninfer_gemma4_vision_test`, `gemma4_vision_reference.py compare` (HF's tower in FP32 on HF's patches) | Q6: mean token cosine 0.987 / 0.978 / 0.979 on a photo and two synthetic images (Q8 gave 0.991 / 0.985 / 0.984), against HF's own BF16 tower at 0.989 / 0.985 / 0.980 |
@@ -438,10 +443,21 @@ where every lane ran its own pass:
 
 The repository's serving harness (`tools/bench/run_serve_concurrency.py`) does not run this model
 (it requires a `prefill_signature` in the server's start log), so these come from a scratch client
-with the same request shape. With MTP (`--spec mtp --draft-tokens 7`) one request decodes at 111
-tok/s, but four give 95.7 tok/s together, below plain batched decode, because each MTP round still
-runs its lane alone. Attention is still per lane (60 layers x C launches a round); its share of a
-C=8 round was not measured.
+with the same request shape. Attention is still per lane (60 layers x C launches a round); its
+share of a C=8 round was not measured.
+
+MTP rounds batch the same way (section 10). Same requests with `--spec mtp --draft-tokens 7`,
+against the commit where every lane drafted and verified alone:
+
+| C | aggregate tok/s | per request | before: aggregate | before: per request |
+|---:|---:|---:|---:|---:|
+| 1 | 108.1 | 108.5 | 108.7 | 109.2 |
+| 2 | 162.3 | 85.1 | 95.1 | 47.9 |
+| 4 | 251.4 | 66.6 | 96.1 | 25.1 |
+
+At C=8 an MTP server does not start, before and after this change: the KV allocation runs out of
+device memory at max context 2048 and also at 1024. Plain decode at C=8 and max context 1024 was
+level across the change (288.1 against 290.4 tok/s, one run each).
 
 ## 12a. MTP speculation
 
@@ -676,7 +692,7 @@ table and this one should not be differenced across sessions.
 | FP8 KV | refused | the codecs of plan row 7 |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
 | JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
-| MTP with several lanes in one pass, a cheaper drafter step | each lane drafts and verifies alone, so with MTP four requests serve 95.7 tok/s together against 165.8 for plain batched decode; drafting is 3-7 ms of a 7-draft round | batched drafting and verify passes over the lane batching of section 10, or a policy that stops drafting when several lanes are active. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
+| MTP at eight lanes, a cheaper drafter step | an MTP server with eight lanes fails its KV allocation at max context 1024 and 2048; drafting is 3-7 ms of a 7-draft round | the device budget of eight MTP lanes. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
 
 ## 14. What the sibling engines settle
 
