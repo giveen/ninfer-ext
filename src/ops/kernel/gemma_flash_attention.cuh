@@ -143,6 +143,16 @@ __device__ __forceinline__ void flash_copy_row(__nv_bfloat16* dst, const __nv_bf
     for (int i = lane; i < count / 8; i += lanes) { to[i] = from[i]; }
 }
 
+// One 16-byte asynchronous copy from global to shared, or 16 zero bytes when `copy` is false (`src`
+// is then not read).
+__device__ __forceinline__ void flash_copy16(__nv_bfloat16* dst, const __nv_bfloat16* src,
+                                             bool copy) {
+    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(address), "l"(src), "r"(copy ? 16 : 0));
+}
+
 template <int QK, int V, bool kCompact>
 __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(FlashAttentionParams p) {
     using Layout = FlashLayout<QK, V, kCompact>;
@@ -264,29 +274,40 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         }
         if (!__syncthreads_or(seen)) continue;
 
-        for (int r = warp; r < kFlashKeys; r += kFlashWarps) {
-            const std::int32_t key = base + r;
-            __nv_bfloat16* kdst    = ks + r * Layout::kQStride;
-            __nv_bfloat16* vdst    = vs + r * vstride;
-            // A key no row can see is not loaded: an unwritten cache slot may hold any bits, and a
-            // masked NaN value would still poison the P*V product.
+        // The whole tile is issued at once as 16-byte asynchronous copies, so its loads overlap
+        // instead of costing a memory latency per row. A key no row can see is zero-filled rather
+        // than loaded: an unwritten cache slot may hold any bits, and a masked NaN value would still
+        // poison the P*V product.
+        const auto copied = [&](int r) {
             const std::int32_t position = kpos[r];
-            const bool unseen           = position > query_high ||
-                                (p.window != 0 &&
-                                 static_cast<std::int64_t>(query_low) - position >= p.window);
-            if (key >= keys || unseen) {
-                for (int j = lane; j < QK; j += 32) kdst[j] = __float2bfloat16_rn(0.0F);
-                if constexpr (!kCompact) {
-                    for (int j = lane; j < V; j += 32) vdst[j] = __float2bfloat16_rn(0.0F);
-                }
-                continue;
-            }
-            const std::int64_t row = static_cast<std::int64_t>(kvh) +
-                                     static_cast<std::int64_t>(p.kv_heads) *
-                                         (key + static_cast<std::int64_t>(keys) * b);
-            flash_copy_row(kdst, key_rows + row * p.k_stride, QK, lane, 32);
-            if constexpr (!kCompact) flash_copy_row(vdst, value_rows + row * p.v_stride, V, lane, 32);
+            return base + r < keys && position <= query_high &&
+                   (p.window == 0 || static_cast<std::int64_t>(query_low) - position < p.window);
+        };
+        const auto key_row = [&](int r) {
+            return static_cast<std::int64_t>(kvh) +
+                   static_cast<std::int64_t>(p.kv_heads) *
+                       (base + r + static_cast<std::int64_t>(keys) * b);
+        };
+        constexpr int kKChunks = QK / 8;
+        for (int at = thread; at < kFlashKeys * kKChunks; at += kFlashThreads) {
+            const int r     = at / kKChunks;
+            const int c     = at % kKChunks;
+            const bool copy = copied(r);
+            flash_copy16(ks + r * Layout::kQStride + c * 8,
+                         copy ? key_rows + key_row(r) * p.k_stride + c * 8 : key_rows, copy);
         }
+        if constexpr (!kCompact) {
+            constexpr int kVChunks = V / 8;
+            for (int at = thread; at < kFlashKeys * kVChunks; at += kFlashThreads) {
+                const int r     = at / kVChunks;
+                const int c     = at % kVChunks;
+                const bool copy = copied(r);
+                flash_copy16(vs + r * vstride + c * 8,
+                             copy ? value_rows + key_row(r) * p.v_stride + c * 8 : value_rows, copy);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
 
         // S: warp w scores keys [8w, 8w + 8) for all sixteen rows.
@@ -378,9 +399,11 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         const std::int64_t base_row =
             static_cast<std::int64_t>(split) * total +
             ((static_cast<std::int64_t>(b) * p.kv_heads + kvh) * row_tiles + tile) * kFlashRows;
+        // Padding rows are never combined, so they are not written.
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             const int r = g + 8 * half;
+            if (first + r >= rows) continue;
             float* dst  = p.partial_out + (base_row + r) * V;
 #pragma unroll
             for (int n = 0; n < kTiles; ++n) {
@@ -389,7 +412,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
                 dst[col + 1]  = o[n][2 * half + 1];
             }
         }
-        if (thread < kFlashRows) {
+        if (thread < kFlashRows && first + thread < rows) {
             p.partial_stats[(base_row + thread) * 2]     = row_max[thread];
             p.partial_stats[(base_row + thread) * 2 + 1] = row_sum[thread];
         }
@@ -532,14 +555,6 @@ __device__ __forceinline__ void flash_ldsm_x4_trans(std::uint32_t (&r)[4], const
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(address));
-}
-
-__device__ __forceinline__ void flash_copy16(__nv_bfloat16* dst, const __nv_bfloat16* src,
-                                             bool copy) {
-    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                 :
-                 : "r"(address), "l"(src), "r"(copy ? 16 : 0));
 }
 
 __device__ __forceinline__ std::uint32_t flash_pack_float(float lo, float hi) {

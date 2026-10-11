@@ -392,6 +392,15 @@ round count (57-60) alone explains. Greedy decode is token-identical between the
 paths (`ninfer_gemma4_generate_test`, 48 steps after an 1,100-token prompt) and against the
 previous commit.
 
+Decode attention issues each key tile as one block-wide batch of 16-byte `cp.async` copies. It used
+to copy a row per warp at a time, paying a memory latency per row: ncu put the global layers' kernel
+at 332 GB/s at 8K, stalled on long scoreboard. Under ncu's base clocks the global kernel went from
+148.5 to 86.2 us and the sliding one from 22.7 to 20.6 us; the arithmetic is unchanged and greedy
+decode is token-identical. Measured in one session (new, previous commit, new): tg128 56.37 / 56.15
+against 55.50; decode after an 8K prompt 53.91 / 52.68 against 51.87; after a 32K prompt 50.29 /
+49.89 against 45.49. The global kernel still waits for each tile before computing (25% of DRAM peak
+under ncu), and its combine of 64 splits costs 37.5 us there; section 13 lists both.
+
 Of a decode token's GPU kernel time (nsys), the Q6 and Q5 linears are 88%, RoPE (a generic kernel)
 4.6%, attention 3.6%, and norms and element-wise kernels the rest. Kernel time is about 18 ms of the
 19 ms per token under nsys, so launch gaps looked like about 5% (about 3% measured more carefully,
@@ -628,6 +637,7 @@ table and this one should not be differenced across sessions.
 | Decode single-token routes | after the direct route (12c) the Q6 shapes stream 1.40-1.47 TB/s in the Linear benchmark against the Q5 direct route's 1.59 and the 1674.5 GB/s read ceiling | the remaining Q6 decode cost against Q5's: 2 more bytes a lane per 8 weights and the high-bit merge |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
 | Tiled attention wave quantization | a 512-token pass gives the global layers 512 blocks of near-equal work, one per SM at a time: 3.01 waves run as 4 | finer work items for the last wave (a key split there with the existing combine), or a block small enough for two per SM |
+| Global decode attention at long context | one key tile in flight per block, one block per SM (68 KB shared): 25% of DRAM peak at 8K; the 64-split combine is a serial loop per row (37.5 us under ncu, 43% of the kernel) | a combine parallel over splits, wave-sized splits fixed by the device rather than the capacity, and loads overlapped with compute (16-key stages to fit two in shared memory) |
 | Fewer decode kernels | a decode token is ~1,370 kernels; graphs removed the host side of the launch cost (section 12) but not the per-kernel latency | fusing the per-sublayer norm, residual add and layer scalar; a first attempt failed the numerics (section 15) |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
