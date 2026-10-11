@@ -497,8 +497,10 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
     PendingBatch pending;
     pending.transaction_ = next_pending_++;
     pending.row_stride_  = static_cast<std::uint32_t>(program_.draft_tokens()) + 1;
-    // Each lane runs its own pass: the rows share the weights' reads only through the cache, which is
-    // the measured cost of not batching lanes into one pass yet.
+    // A speculative row runs its own round. Every plain row joins one batched pass after the loop:
+    // the lanes share the weights' reads, and each attends to its own cache.
+    std::vector<std::size_t> plain_rows;
+    std::vector<std::int32_t> plain_lanes, plain_ids;
     for (std::size_t row = 0; row < sequences.size(); ++row) {
         Lane* lane = valid_lane(sequences[row]);
         if (lane == nullptr || lane->phase != Phase::Active || lane->pending ||
@@ -537,11 +539,9 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
             pending.drafted_[row]     = drafts;
             pending.accepted_[row]    = round.accepted_drafts;
         } else {
-            program_.decode(lane_index, lane->next_input, execution_);
-            timing.begin_wait();
-            out[0] = program_.sample(lane_index, execution_);
-            timing.end_wait();
-            timing.resume_submit();
+            plain_rows.push_back(row);
+            plain_lanes.push_back(lane_index);
+            plain_ids.push_back(lane->next_input);
             pending.counts_[row]      = 1;
             pending.speculative_[row] = false;
             if (lane->speculative.enabled) ++lane->speculative.fallback_steps;
@@ -549,6 +549,20 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
         pending.rows_[row] = sequences[row];
         lane->pending      = true;
         lane->timings.decode_seconds += seconds_since(started);
+    }
+    if (!plain_rows.empty()) {
+        // Every lane of the batch spends the batch's whole time in its decode.
+        const auto started = Clock::now();
+        program_.decode(plain_lanes, plain_ids, execution_);
+        timing.begin_wait();
+        const std::vector<std::int32_t> drawn = program_.sample(plain_lanes, execution_);
+        timing.end_wait();
+        timing.resume_submit();
+        const double seconds = seconds_since(started);
+        for (std::size_t i = 0; i < plain_rows.size(); ++i) {
+            pending.tokens_[plain_rows[i] * pending.row_stride_] = drawn[i];
+            valid_lane(sequences[plain_rows[i]])->timings.decode_seconds += seconds;
+        }
     }
     pending.row_count_ = sequences.size();
     open_pending_      = pending.transaction_;

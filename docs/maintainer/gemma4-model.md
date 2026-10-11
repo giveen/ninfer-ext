@@ -296,8 +296,10 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 - **Engine** (`src/runtime/engine/gemma_instance.{h,cpp}`): `EngineCore<GemmaInstance>` and
   `CausalScoreCore<GemmaInstance>`, the same controller Qwen uses. Admission is root-only: the
   context cache is switched off for this model, so the identity candidate is always feasible and
-  never expandable and seals directly. Each lane decodes alone, one token or one MTP round per
-  decode round, and samples on device. The prefix-cache entry points the controller is compiled against (pressure planning,
+  never expandable and seals directly. A decode round's plain rows decode together in one pass
+  (`Program::decode` over a span of lanes: every column-wise step runs once over one column per
+  lane, and each lane's cache writes and attention run per `PassSegment` against its own cache);
+  a row with drafts runs its own MTP round. Every lane samples on device, with one sync a round. The prefix-cache entry points the controller is compiled against (pressure planning,
   captures, checkpoint recovery, continuations) refuse by name. Forced control tokens (the thinking
   budget's `<channel|>` close) are appended as one prefill of the lane. Contract
   types this model never constructs are the Qwen contract's pure-data types; moving them into
@@ -307,10 +309,12 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   explicit KV capacity below `max_context`. Video, images in tool results and images in causal scoring
   are refused per request. `ninfer-perplexity` defaults to FP8 KV, so it needs
   `--kv-dtype bf16` for this model.
-- **CUDA Graphs** (`use_cuda_graph`, on by default): each lane's one-token decode step is captured
-  once, on its first decode after the Program's first (eager) one, and replayed for every later
-  step. That works because a one-token pass issues the same launches at every position: the token
-  id and the pass's positions and ring slots (`PassIndices`) are the only host inputs, written
+- **CUDA Graphs** (`use_cuda_graph`, on by default): the decode pass of each set of lanes is
+  captured once, on its first round after the Program's first (eager) decode, and replayed for every
+  later round of that set; the 16 most recently used sets are kept. The lanes are laid out in
+  ascending order, so a set's layout does not depend on the order a caller names them in. That
+  works because a round of one-token segments issues the same launches at every position: the token
+  ids and the pass's positions and ring slots (`PassIndices`) are the only host inputs, written
   before the replay; every cache write is a device-indexed `scatter`; and the attention Ops are
   handed the whole sliding ring and the whole global capacity, whose unwritten and future slots are
   invisible (the compact Op's `indexed_keys` stops at the query on the device). MTP rounds and
@@ -330,6 +334,7 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 | Generation | `ninfer` CLI, greedy | "The capital of France is Paris."; thinking mode streams reasoning separately from the answer |
 | Serving | `tools/smoke/serve_contract.py --text-only --tools` | OpenAI chat/Responses, stored continuation, Anthropic, count_tokens, one tool round trip; plus streamed reasoning, Anthropic `tool_use` and two concurrent requests checked by hand; the same with `--spec mtp`, plus a thinking budget of 24 closing the channel |
 | Drafter | `ninfer_gemma4_draft_test` dumps, `tools/verify/gemma4_draft_reference.py` runs transformers' `Gemma4AssistantForCausalLM` in FP32 on the same inputs (position 1,501, rings wrapped) | four steps: logits cosine ≥ 0.99996, argmax and top-5 identical, projected-state cosine ≥ 0.99997 |
+| Batched decode | `ninfer_gemma4_batch_test`: three prompts from the 1,100-token file (one longer than the ring), 33 greedy tokens a lane | lane 0 identical beside different partners and with the lanes named in either order; a lane idle through batched rounds then identical to its own solo run; three lanes identical with and without CUDA Graphs; lane 0 batched identical to lane 0 alone in this run (the test only requires a near tie at a first difference, since T=1 and T>1 take different Linear routes) |
 | MTP rounds | `ninfer_gemma4_mtp_test`: 384 greedy tokens after a 1,100-token prompt at seven drafts | every ring slot and global row holds its committed position (without the slack the same run leaves 50 wrong); against one fresh scoring pass the output disagrees 1-4 times, the same as plain decode (4) |
 | Image preprocessing | `ninfer_gemma4_image_processor_test` on `tools/verify/gemma4_vision_reference.py prepare` (transformers' `Gemma4ImageProcessorPil`) | the resize rule identical over 22 sizes (edge branches, both orientations, up- and downscaling); lossless images' patches within one BF16 rounding (worst 0.004 uint8 steps); a JPEG differs, see 12b |
 | Image encoder | `ninfer_gemma4_vision_test`, `gemma4_vision_reference.py compare` (HF's tower in FP32 on HF's patches) | Q6: mean token cosine 0.987 / 0.978 / 0.979 on a photo and two synthetic images (Q8 gave 0.991 / 0.985 / 0.984), against HF's own BF16 tower at 0.989 / 0.985 / 0.980 |
@@ -416,8 +421,27 @@ Of a decode token's GPU kernel time (nsys), the Q6 and Q5 linears are 88%, RoPE 
 above); the linears' distance
 from the weight-streaming rate is the larger lever. An 8K prefill at 128-token passes spent 46% in the Q6 MMA, 22% in the Q5
 sliced-K MMA and 29% in attention; widening the pass to 512 tokens took pp8192 from 991 to 1,837
-tok/s. Two concurrent requests both progress, but each lane runs its own pass, so a second lane
-re-reads the weights rather than sharing a pass.
+tok/s.
+
+Concurrent decode shares one pass across lanes (section 10). A pass of T columns costs little more
+than one: in the Linear benchmark the Gemma shapes take 1.0-1.6x their T=1 time at T=8 (21504x5376
+61.4 -> 67.6 us, 5376x21504 65.5 -> 86.0). Through `ninfer-serve`, C greedy requests of 512 tokens
+each (`ignore_eos`, short prompts, no MTP, BF16 KV, max context 2048), against the previous commit
+where every lane ran its own pass:
+
+| C | aggregate tok/s | per request | before: aggregate | before: per request |
+|---:|---:|---:|---:|---:|
+| 1 | 57.5 | 57.6 | 57.1 | 57.2 |
+| 2 | 92.2 | 46.3 | 56.8 | 28.5 |
+| 4 | 165.8 | 41.8 | 56.5 | 14.2 |
+| 8 | 291.0 | 37.1 | 56.2 | 7.1 |
+
+The repository's serving harness (`tools/bench/run_serve_concurrency.py`) does not run this model
+(it requires a `prefill_signature` in the server's start log), so these come from a scratch client
+with the same request shape. With MTP (`--spec mtp --draft-tokens 7`) one request decodes at 111
+tok/s, but four give 95.7 tok/s together, below plain batched decode, because each MTP round still
+runs its lane alone. Attention is still per lane (60 layers x C launches a round); its share of a
+C=8 round was not measured.
 
 ## 12a. MTP speculation
 
@@ -644,7 +668,7 @@ table and this one should not be differenced across sessions.
 |---|---|---|
 | Prefix reuse | an agent loop re-prefills its whole history every turn, at the prefill rates above | the D1-b move of the continuation, shared-prefix and capture types into `runtime/contract`; ring-snapshot checkpoints as the state image |
 | Decode single-token routes | measured 2026-10-11, nothing left to take: the Linear benchmark's T=1 times fit `bytes / 1.52 TB/s + 3.9 us` across the Q6 shapes (2048x5376 to 21504x5376, within its 2.048 us timer steps), so streaming is about 91% of the 1674.5 GB/s read ceiling and the shortfall of the smaller shapes is a fixed per-launch cost; Q5 21504x5376 streams the same. Inside a CUDA-Graph decode step that cost is gone: at 8K the Q6 5376-row kernels take 3,250 us a token against 3,258 predicted from 1.52 TB/s alone, and Q5 gate/up 50.9 us against 49.9 | none on the GEMVs; fewer bytes (a smaller format) or fewer kernels are the levers |
-| Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
+| Batched attention across lanes | a decode round shares every weight read, but each lane's attention is its own launch (60 x C a round) | per-lane caches laid out for the Ops' batch dimension, worth it only if attention's measured share of a C=8 round is large |
 | Tiled attention wave quantization | a 512-token pass gives the global layers 512 blocks of near-equal work, one per SM at a time: 3.01 waves run as 4 | finer work items for the last wave (a key split there with the existing combine), or a block small enough for two per SM |
 | Global decode attention at long context | one key tile in flight per block, one block per SM (68 KB shared): 25% of DRAM peak at 8K | tried and dropped (2026-10-11): 16-key tiles through three cp.async stages (88 KB), scoring split over two halves of the dims, took the global kernel from 86.2 to 67.2 us under ncu's base clocks at 8K, but the bench was level at 8K and 32K and 1.1-1.5% slower after a 64K prompt. Per-tile fixed costs (a position round trip and four barriers) double with 16-key tiles; a next attempt should keep 32-key tiles, e.g. 8 query rows instead of 16 in shared memory to fit two stages |
 | Fewer decode kernels | a decode token is ~1,370 kernels; graphs removed the host side of the launch cost (section 12) but not the per-kernel latency | fusing the per-sublayer norm, residual add and layer scalar; a first attempt failed the numerics (section 15) |
@@ -652,7 +676,7 @@ table and this one should not be differenced across sessions.
 | FP8 KV | refused | the codecs of plan row 7 |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
 | JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
-| MTP with several lanes in one pass, a cheaper drafter step | each lane verifies alone; drafting is 3-7 ms of a 7-draft round | the lane batching above. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
+| MTP with several lanes in one pass, a cheaper drafter step | each lane drafts and verifies alone, so with MTP four requests serve 95.7 tok/s together against 165.8 for plain batched decode; drafting is 3-7 ms of a 7-draft round | batched drafting and verify passes over the lane batching of section 10, or a policy that stops drafting when several lanes are active. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
 
 ## 14. What the sibling engines settle
 

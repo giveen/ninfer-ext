@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include <cuda_runtime.h>
 
@@ -32,17 +33,31 @@ namespace ninfer::models::gemma4 {
 // layer of a pass.
 [[nodiscard]] std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens);
 
-// The device I32 [tokens] vectors every layer of one pass reads: each token's absolute position, and
-// the sliding-ring slot that position occupies. The layers take positions and cache slots from here
-// rather than from the host, so a pass's launches do not depend on where in the sequence it runs:
-// that is what lets one captured decode graph serve every position.
+// One lane's share of a pass: `tokens` consecutive columns from `column`, the lane's tokens at the
+// positions from `first_position`, attending to and written into `cache`. A prefill or a verify pass
+// is one segment; a decode round over several lanes is one single-token segment per lane, so the
+// lanes share every weight read while each attends to its own cache.
+struct PassSegment {
+    KvCache* cache              = nullptr;
+    std::int32_t first_position = 0;
+    std::int32_t column         = 0;
+    std::int32_t tokens         = 0;
+};
+
+// The device I32 [columns] vectors every layer of one pass reads: each column's absolute position, and
+// the sliding-ring slot that position occupies in its lane's cache. The layers take positions and
+// cache slots from here rather than from the host, so a pass's launches do not depend on where in the
+// sequence it runs: that is what lets one captured decode graph serve every position.
 struct PassIndices {
     Tensor positions;
     Tensor ring_slots;
 };
 
-// Allocates the indices for the tokens at `first_position`.. from `arena` (the caller's scope owns
-// them) and writes them on `stream`. The pageable source is staged before the call returns.
+// Allocates the indices for `segments`, which tile [0, columns) in order, from `arena` (the caller's
+// scope owns them) and writes them on `stream`. The pageable source is staged before the call returns.
+[[nodiscard]] PassIndices write_pass_indices(std::span<const PassSegment> segments,
+                                             DeviceArena& arena, cudaStream_t stream);
+// The same for one lane's tokens at `first_position`...
 [[nodiscard]] PassIndices write_pass_indices(const KvCache& cache, std::int32_t first_position,
                                              std::int32_t tokens, DeviceArena& arena,
                                              cudaStream_t stream);
@@ -70,6 +85,15 @@ void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_i
                    std::int32_t first_position, std::int32_t tokens, const PassIndices& indices,
                    KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
                    DeviceExecutionView execution,
+                   const Tensor& position_high = {});
+
+// The same layer over several lanes' `segments` at once, `hidden_in`/`hidden_out` [hidden_size,
+// columns] with the segments tiling the columns in order. Every column-wise step (norms, projections,
+// RoPE, the MLP) runs once over all columns; each segment's cache writes and attention run against its
+// own cache, exactly as the one-lane call would run them. `position_high` needs a single segment.
+void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
+                   std::span<const PassSegment> segments, const PassIndices& indices,
+                   DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
                    const Tensor& position_high = {});
 
 /**

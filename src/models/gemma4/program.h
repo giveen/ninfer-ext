@@ -20,6 +20,7 @@
 #include "ninfer/ops/sampling.h"
 
 #include <cstdint>
+#include <map>
 #include <span>
 #include <vector>
 
@@ -115,13 +116,33 @@ public:
     // completed the prefill that encoded them.
     [[nodiscard]] double take_vision_seconds();
 
-    // Consumes one token for `lane` and leaves its logits.
+    // Consumes one token for each of `lanes` (distinct) in one pass and leaves each lane's logits.
+    // The lanes share every weight read: the pass runs the norms, projections and MLP once over one
+    // column per lane, and each lane's attention against its own cache. With CUDA Graphs on, a set of
+    // lanes that decodes again replays a graph captured for that set (see kDecodeGraphs).
+    void decode(std::span<const std::int32_t> lanes, std::span<const std::int32_t> ids,
+                DeviceExecutionView execution);
+    // The same for one lane.
     void decode(std::int32_t lane, std::int32_t id, DeviceExecutionView execution);
 
-    // Draws the token after the one `lane` consumed last from the logits the last call left, with the
-    // lane's sampler. The draw is keyed by the position the token will occupy, so it does not depend on
-    // how the lanes interleave, and the lane's token counts include it afterwards. Synchronizes.
+    // Draws the token after the one each of `lanes` consumed last from the logits its last pass left,
+    // with the lane's sampler, and returns them in order. A draw is keyed by the position the token
+    // will occupy, so it does not depend on how the lanes interleave, and the lane's token counts
+    // include it afterwards. Synchronizes once.
+    [[nodiscard]] std::vector<std::int32_t> sample(std::span<const std::int32_t> lanes,
+                                                   DeviceExecutionView execution);
     [[nodiscard]] std::int32_t sample(std::int32_t lane, DeviceExecutionView execution);
+
+    // The most lane sets whose decode graphs are kept; the least recently used is dropped beyond it.
+    static constexpr std::size_t kDecodeGraphs = 16;
+
+    // The BF16 [vocabulary,1] logits `lane`'s last pass left for it, which sample() draws from.
+    [[nodiscard]] Tensor logits(std::int32_t lane) const {
+        const std::size_t column = static_cast<std::size_t>(lane_at(lane).column);
+        return Tensor(static_cast<std::uint8_t*>(logits_.data) +
+                          column * static_cast<std::size_t>(logits_.ne[0]) * sizeof(std::uint16_t),
+                      DType::BF16, {logits_.ne[0], 1});
+    }
 
     // Contiguous BF16 [vocabulary,1] logits for the token the last call consumed, already soft-capped
     // by the head. A scoring pass's logits live side by side, so this is a view of the last column.
@@ -164,8 +185,14 @@ private:
         // The round speculate() left for commit_round(): its first position and draft count.
         std::int32_t round_position = -1;
         std::int32_t round_drafts   = 0;
-        // The lane's one-token pass, captured on its first decode after the Program's warm-up.
-        DecodeGraphExecutable decode_graph;
+        // The logits column the lane's last pass left for sample().
+        std::int32_t column = 0;
+    };
+
+    // A decode pass captured for one set of lanes (a bit per lane), replayed whenever that set decodes.
+    struct DecodeGraph {
+        DecodeGraphExecutable executable;
+        std::uint64_t last_used = 0;
     };
 
     [[nodiscard]] Lane& lane_at(std::int32_t lane);
@@ -183,10 +210,10 @@ private:
                   std::span<const PromptImage> images = {});
     // Embeds the first `tokens` ids of the device id buffer into the pass state.
     void embed(std::int32_t tokens, cudaStream_t stream);
-    // Every layer and the head over the embedded pass state, at the positions `indices` holds.
-    void run_layers(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
-                    const PassIndices& indices, bool every_column, DeviceExecutionView execution,
-                    const Tensor& position_high);
+    // Every layer and the head over the embedded pass state: `segments` tile its columns, at the
+    // positions `indices` holds.
+    void run_layers(std::span<const PassSegment> segments, const PassIndices& indices,
+                    bool every_column, DeviceExecutionView execution, const Tensor& position_high);
     // Copies column `column` of the last pass's post-final-norm hidden state into the lane's.
     void keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream);
 
@@ -213,7 +240,11 @@ private:
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> vision_events_;
     std::size_t vision_events_used_ = 0;
     void* state_[2]        = {nullptr, nullptr};
-    void* sampling_[3]     = {nullptr, nullptr, nullptr}; // configs [lanes], token [1], position [1]
+    // configs [lanes], drawn tokens [lanes], positions [lanes]
+    void* sampling_[3] = {nullptr, nullptr, nullptr};
+    std::vector<std::int32_t> sampled_host_;
+    std::map<std::uint64_t, DecodeGraph> decode_graphs_;
+    std::uint64_t decode_rounds_ = 0;
     // Host staging for one pass's logits, which scoring reads back per target token.
     std::vector<std::uint16_t> logits_host_;
     std::int32_t last_batch_      = 1;

@@ -919,15 +919,17 @@ describes the planner.
   budget, images (`--vision`, converted with `--components text,vision`; one or more images per
   message, no video), and MTP speculation with the official assistant drafter (`--spec mtp`,
   converted with `--components text,mtp --source mtp=<assistant checkpoint>`), but without prefix
-  reuse, constrained output, CUDA Graphs or a KV format other than BF16 (`ninfer-perplexity`
-  needs `--kv-dtype bf16`); top_k is capped at 20. The M1 artifact is published on Hugging Face
+  reuse, constrained output or a KV format other than BF16 (`ninfer-perplexity` needs
+  `--kv-dtype bf16`); top_k is capped at 20. Concurrent requests decode together in one pass; MTP
+  rounds still run one request at a time, so with several requests MTP serves less than plain decode. The M1 artifact is published on Hugging Face
   ([download](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-31b-it-m1)).
   Measured on it (RTX 5090):
 
   | Stat | Value |
   |---|---|
   | Prefill `pp1024` / `pp8192` | 2,476 / 2,189 tok/s |
-  | Decode `tg128` | 56.6 tok/s (100-240 with adaptive MTP, depending on the text) |
+  | Decode `tg128` | 57 tok/s (100-240 with adaptive MTP, depending on the text) |
+  | Concurrent decode, no MTP (aggregate at 1 / 2 / 4 / 8 requests) | 57.5 / 92.2 / 165.8 / 291.0 tok/s |
   | Layout KLD vs the BF16 checkpoint | 0.419 (4 x 2048 calibration tokens) |
   | Causal perplexity (BF16 KV) | 14.53 (mean NLL 2.676) |
 

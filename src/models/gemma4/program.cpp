@@ -95,7 +95,8 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
       draft_tokens_(draft_tokens), capacity_(capacity), cuda_graphs_(cuda_graphs) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
-    if (lanes < 1) throw std::invalid_argument("gemma4 Program: lanes must be positive");
+    // A decode round names its lanes by a bit each (decode_graphs_).
+    if (lanes < 1 || lanes > 64) throw std::invalid_argument("gemma4 Program: lanes must be in [1, 64]");
     if (draft_tokens < 0 || draft_tokens > kMaximumDraftTokens) {
         throw std::invalid_argument("gemma4 Program: draft tokens must be in [0, 7]");
     }
@@ -128,8 +129,11 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
     }
     sampling_[0] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(ops::SamplingConfig),
                                 allocated_bytes_);
-    sampling_[1] = device_alloc(sizeof(std::int32_t), allocated_bytes_);
-    sampling_[2] = device_alloc(sizeof(std::int32_t), allocated_bytes_);
+    sampling_[1] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
+                                allocated_bytes_);
+    sampling_[2] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
+                                allocated_bytes_);
+    sampled_host_.resize(static_cast<std::size_t>(lanes));
     // The head's output lives outside the layer arena because it outlives a call: it is what the
     // caller reads.
     void* logits = device_alloc(static_cast<std::size_t>(vocabulary) *
@@ -286,22 +290,24 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
     }
 
     DeviceArena::Scope scope  = arena_.scope();
-    const PassIndices indices = write_pass_indices(cache, first_position, tokens, arena_, stream);
-    run_layers(cache, tokens, first_position, indices, every_column, execution, position_high);
+    const PassSegment segment{&cache, first_position, 0, tokens};
+    const PassIndices indices = write_pass_indices(std::span(&segment, 1), arena_, stream);
+    run_layers(std::span(&segment, 1), indices, every_column, execution, position_high);
 }
 
-void Program::run_layers(KvCache& cache, std::int32_t tokens, std::int32_t first_position,
-                         const PassIndices& indices, bool every_column,
-                         DeviceExecutionView execution, const Tensor& position_high) {
+void Program::run_layers(std::span<const PassSegment> segments, const PassIndices& indices,
+                         bool every_column, DeviceExecutionView execution,
+                         const Tensor& position_high) {
     const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
+    const std::int32_t tokens = static_cast<std::int32_t>(indices.positions.ne[0]);
     // Sixty layers, so an even number of swaps leaves the result where it started.
     void* in  = state_[0];
     void* out = state_[1];
     for (std::size_t layer = 0; layer < model_->weights().text.layers.size(); ++layer) {
         Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, tokens});
         Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, tokens});
-        forward_layer(*model_, layer, hidden_in, first_position, tokens, indices, cache, arena_,
-                      hidden_out, execution, position_high);
+        forward_layer(*model_, layer, hidden_in, segments, indices, arena_, hidden_out, execution,
+                      position_high);
         std::swap(in, out);
     }
 
@@ -384,6 +390,7 @@ void Program::prefill(std::int32_t lane_index, std::span<const std::int32_t> ids
     }
     keep_hidden(lane, 0, execution.stream);
     lane.round_position = -1;
+    lane.column         = 0;
 }
 
 double Program::take_vision_seconds() {
@@ -399,42 +406,82 @@ double Program::take_vision_seconds() {
     return seconds;
 }
 
-void Program::decode(std::int32_t lane_index, std::int32_t id, DeviceExecutionView execution) {
-    Lane& lane = lane_at(lane_index);
-    if (lane.position >= capacity_) {
-        throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
+void Program::decode(std::int32_t lane, std::int32_t id, DeviceExecutionView execution) {
+    decode(std::span(&lane, 1), std::span(&id, 1), execution);
+}
+
+void Program::decode(std::span<const std::int32_t> lanes, std::span<const std::int32_t> ids,
+                     DeviceExecutionView execution) {
+    const std::int32_t count = static_cast<std::int32_t>(lanes.size());
+    if (count < 1 || ids.size() != lanes.size() || count > kScorePass) {
+        throw std::invalid_argument("gemma4 Program: a decode round needs one id per lane");
+    }
+    // The columns follow the lanes in ascending order, so a set of lanes always lays its pass out the
+    // same way and its captured graph matches whatever order the caller named them in.
+    std::vector<std::int32_t> order(lanes.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<std::int32_t>(i);
+    std::sort(order.begin(), order.end(),
+              [&](std::int32_t a, std::int32_t b) { return lanes[a] < lanes[b]; });
+    std::uint64_t set = 0;
+    std::vector<PassSegment> segments;
+    segments.reserve(lanes.size());
+    for (std::int32_t column = 0; column < count; ++column) {
+        const std::int32_t index = order[static_cast<std::size_t>(column)];
+        Lane& lane               = lane_at(lanes[index]);
+        const std::uint64_t bit  = std::uint64_t{1} << lanes[index];
+        if ((set & bit) != 0) throw std::invalid_argument("gemma4 Program: a lane decodes once a round");
+        set |= bit;
+        if (lane.position >= capacity_) {
+            throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
+        }
+        segments.push_back({&lane.cache, lane.position, column, 1});
+        id_host_[static_cast<std::size_t>(column)] = ids[index];
     }
     const cudaStream_t stream = execution.stream;
-    // The token and the pass indices are written before the pass, outside any graph: they are the
-    // only inputs a decode step takes from the host.
-    id_host_[0] = id;
-    CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(), sizeof(std::int32_t),
+    // The tokens and the pass indices are written before the pass, outside any graph: they are the
+    // only inputs a decode round takes from the host.
+    CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(),
+                               static_cast<std::size_t>(count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
     DeviceArena::Scope scope  = arena_.scope();
-    const PassIndices indices = write_pass_indices(lane.cache, lane.position, 1, arena_, stream);
-    const auto pass = [&] {
-        embed(1, stream);
-        run_layers(lane.cache, 1, lane.position, indices, false, execution, {});
+    const PassIndices indices = write_pass_indices(segments, arena_, stream);
+    const auto pass           = [&] {
+        embed(count, stream);
+        run_layers(segments, indices, true, execution, {});
     };
-    // A one-token pass issues the same launches at every position (forward.h), so the lane's graph,
-    // captured once, replays every later step. The first decode of the Program runs eagerly, so every
-    // launcher's one-time setup has happened before anything is captured; the legacy default stream
-    // cannot be captured at all.
+    // A round of one-token segments issues the same launches at every position (forward.h), so the
+    // graph a set of lanes captures replays every later round of that set. The first decode of the
+    // Program runs eagerly, so every launcher's one-time setup has happened before anything is
+    // captured; the legacy default stream cannot be captured at all.
     if (cuda_graphs_ && decode_warm_ && stream != nullptr) {
-        if (!lane.decode_graph.ready()) {
+        auto found = decode_graphs_.find(set);
+        if (found == decode_graphs_.end()) {
+            if (decode_graphs_.size() >= kDecodeGraphs) {
+                decode_graphs_.erase(std::min_element(decode_graphs_.begin(), decode_graphs_.end(),
+                                                      [](const auto& a, const auto& b) {
+                                                          return a.second.last_used <
+                                                                 b.second.last_used;
+                                                      }));
+            }
             DecodeGraphDefinition definition;
             definition.capture(stream, pass);
-            lane.decode_graph.instantiate(definition);
+            found = decode_graphs_.try_emplace(set).first;
+            found->second.executable.instantiate(definition);
         }
-        lane.decode_graph.launch(stream);
-        last_batch_ = 1;
+        found->second.last_used = ++decode_rounds_;
+        found->second.executable.launch(stream);
+        last_batch_ = count;
     } else {
         pass();
         decode_warm_ = true;
     }
-    ++lane.position;
-    keep_hidden(lane, 0, stream);
-    lane.round_position = -1;
+    for (std::int32_t column = 0; column < count; ++column) {
+        Lane& lane = lane_at(lanes[order[static_cast<std::size_t>(column)]]);
+        ++lane.position;
+        lane.column = column;
+        keep_hidden(lane, column, stream);
+        lane.round_position = -1;
+    }
 }
 
 Program::Round Program::speculate(std::int32_t lane_index, std::int32_t anchor, std::int32_t drafts,
@@ -541,23 +588,41 @@ void Program::commit_round(std::int32_t lane_index, std::int32_t kept,
     lane.round_position = -1;
 }
 
-std::int32_t Program::sample(std::int32_t lane_index, DeviceExecutionView execution) {
-    const Lane& lane          = lane_at(lane_index);
-    const cudaStream_t stream = execution.stream;
+std::int32_t Program::sample(std::int32_t lane, DeviceExecutionView execution) {
+    return sample(std::span(&lane, 1), execution).front();
+}
+
+std::vector<std::int32_t> Program::sample(std::span<const std::int32_t> lanes,
+                                          DeviceExecutionView execution) {
+    if (lanes.empty() || lanes.size() > lanes_.size()) {
+        throw std::invalid_argument("gemma4 Program: sample takes one to lanes() lanes");
+    }
+    const cudaStream_t stream     = execution.stream;
     const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
-    const std::int32_t position   = lane.position;
-    CUDA_CHECK(cudaMemcpyAsync(sampling_[2], &position, sizeof(position), cudaMemcpyHostToDevice,
-                               stream));
-    Tensor out(static_cast<std::uint8_t*>(sampling_[1]), DType::I32, {1});
-    Tensor positions(static_cast<std::uint8_t*>(sampling_[2]), DType::I32, {1});
-    sampling_workspace_.reset();
-    ops::sample(logits(), out, vocabulary,
-                static_cast<const ops::SamplingConfig*>(sampling_[0]) + lane_index, positions,
-                ops::kSamplePurposeDecode, sampling_workspace_, stream);
-    std::int32_t token = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&token, sampling_[1], sizeof(token), cudaMemcpyDeviceToHost, stream));
+    const std::size_t column_bytes =
+        static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t);
+    auto* drawn     = static_cast<std::int32_t*>(sampling_[1]);
+    auto* positions = static_cast<std::int32_t*>(sampling_[2]);
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const Lane& lane = lane_at(lanes[i]);
+        // A pageable source is staged before cudaMemcpyAsync returns.
+        CUDA_CHECK(cudaMemcpyAsync(positions + i, &lane.position, sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        const Tensor column(static_cast<std::uint8_t*>(logits_.data) +
+                                static_cast<std::size_t>(lane.column) * column_bytes,
+                            DType::BF16, {vocabulary, 1});
+        Tensor out(static_cast<void*>(drawn + i), DType::I32, {1});
+        Tensor position(static_cast<void*>(positions + i), DType::I32, {1});
+        // The draws run in stream order, so each may reuse the workspace the previous one used.
+        sampling_workspace_.reset();
+        ops::sample(column, out, vocabulary,
+                    static_cast<const ops::SamplingConfig*>(sampling_[0]) + lanes[i], position,
+                    ops::kSamplePurposeDecode, sampling_workspace_, stream);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), drawn, lanes.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return token;
+    return {sampled_host_.begin(), sampled_host_.begin() + static_cast<std::ptrdiff_t>(lanes.size())};
 }
 
 std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
