@@ -500,6 +500,14 @@ int main() {
         execution, {"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
     failures +=
         run_pair_case(execution, {"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
+    // Qwen4Exp (Flash-Next) text attention, 24Q/2K, has no fixed pair route and takes the generic
+    // kernel: decode near the native-context tail, and a full 512-token pass, in both position forms.
+    failures += run_pair_case(execution, {"qwen4exp text mrope decode", 256, 64, 3, 1, kTextTheta},
+                              24, 2, 262'000);
+    failures += run_pair_case(execution, {"qwen4exp text mrope pass", 256, 64, 3, 512, kTextTheta},
+                              24, 2, 4096);
+    failures += run_pair_case(execution, {"qwen4exp text 1-D pass", 256, 64, 1, 512, kTextTheta},
+                              24, 2, 131'072);
 
     // Exercise both public forms on either side of the large-block residency boundary.
     const int large_block_capacity = execution.multiprocessor_count * 6;
