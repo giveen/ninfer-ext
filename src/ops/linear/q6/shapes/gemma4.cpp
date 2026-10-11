@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 
 // Sliding key and value: the most numerous text projection, 100 of the 240 MLP/attention objects.
 Q6Launch select_q6_gemma4_n4096_k5376(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k5376;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s2;
@@ -23,7 +23,7 @@ Q6Launch select_q6_gemma4_n4096_k5376(std::int32_t tokens) {
 
 // Sliding query.
 Q6Launch select_q6_gemma4_n8192_k5376(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k5376;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 64) return select_q6_n34816_k5120(tokens);
@@ -34,7 +34,7 @@ Q6Launch select_q6_gemma4_n8192_k5376(std::int32_t tokens) {
 
 // Global query.
 Q6Launch select_q6_gemma4_n16384_k5376(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k5376;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 128) return select_q6_n34816_k5120(tokens);
@@ -44,7 +44,7 @@ Q6Launch select_q6_gemma4_n16384_k5376(std::int32_t tokens) {
 
 // Global key, which is also its value.
 Q6Launch select_q6_gemma4_n2048_k5376(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k5376;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r16_t24_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r16_t32_w4_s2;
@@ -55,7 +55,7 @@ Q6Launch select_q6_gemma4_n2048_k5376(std::int32_t tokens) {
 
 // MLP gate and up, the Q6 half of the projection.
 Q6Launch select_q6_gemma4_n21504_k5376(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k5376;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 128) return select_q6_n34816_k5120(tokens);
     if (tokens <= 192) return launch_q6_a16_mma_r64_t96;
@@ -63,10 +63,12 @@ Q6Launch select_q6_gemma4_n21504_k5376(std::int32_t tokens) {
 }
 
 // The vocabulary head keeps the inherited list: the sweep found nothing above 9% there.
+// The single-token direct route measures within noise of the GEMV here (675.8 vs 686.1 us).
 Q6Launch select_q6_gemma4_n262144_k5376(std::int32_t tokens) { return select_q6_gemma4(tokens); }
 
 // Sliding output projection.
 Q6Launch select_q6_gemma4_k8192(std::int32_t tokens) {
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k8192;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s2;
@@ -79,6 +81,7 @@ Q6Launch select_q6_gemma4_k8192(std::int32_t tokens) {
 
 // Global output projection.
 Q6Launch select_q6_gemma4_k16384(std::int32_t tokens) {
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k16384;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s2;
@@ -91,7 +94,7 @@ Q6Launch select_q6_gemma4_k16384(std::int32_t tokens) {
 
 // MLP down, the Q6 half.
 Q6Launch select_q6_gemma4_k21504(std::int32_t tokens) {
-    if (tokens == 1) return launch_q6_a16_gemv_r4_w2_g16;
+    if (tokens == 1) return launch_q6_a16_direct_r1_t1_w4_k21504;
     if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s2;

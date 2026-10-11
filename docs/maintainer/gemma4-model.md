@@ -531,6 +531,20 @@ candidate. The remaining gap needs new instances rather than a new selection - `
 streams its 16.5 MB of weights at 806 GB/s against the measured 1674.5 GB/s read ceiling, so a
 single-token route with more rows in flight is the next lever. That is not in this change.
 
+**Single-token direct route (later change).** `q6_a16_direct_simt` is Q5's direct SIMT dataflow
+over the Q6 planes: one row a 128-thread block, loads straight from global memory, the row unrolled
+over a static K (5376, 8192, 16384, 21504; 48 registers, no spills). ncu had put the staged GEMV's
+limit at shared-memory issue (MIO throttle) rather than DRAM. Public Linear benchmark at T=1,
+before -> after: `16384x5376` 55.3 -> 47.1 us, `2048x5376` 14.3 -> 10.2, `21504x5376` 67.6 -> 61.4,
+`5376x8192` 28.7 -> 24.6, `5376x16384` 53.2 -> 49.2, `5376x21504` 73.7 -> 63.5. The output
+projections had no GEMV route before (the staged GEMV loses to the sliced-K route there, 32.8 vs
+28.7 us), and the unfused sliding shapes gain too (`4096x5376` 20.5 -> 16.4, `8192x5376` 32.8 ->
+26.6). The head stays on the GEMV: 686.1 -> 675.8 us is inside the noise band. Variants with 8
+warps, 2 rows, 2 phases or a different residency were none faster and several slower, by up to
+2 us on `2048x5376` and `5376x8192`. With the RoPE change above, tg128 goes 53.06 -> 56.69/56.71
+tok/s (master between two branch runs) with pp1024 and pp8192 unchanged (2377-2396 vs 2384-2387,
+1836 vs 1840).
+
 **Coverage and limits.** `tests/ops/linear/test_q6_a16.cpp` and `test_q5_a16.cpp` already qualify
 every Gemma geometry against the FP64 oracle, at T = 1, 2, 5, 17, 64, 128 and 1000 for the text
 shapes, 9, 36, 630, 2340 and 2520 for vision, and T = 1 for the drafter, so the changed intervals are
@@ -565,9 +579,9 @@ table and this one should not be differenced across sessions.
 | Item | Why it matters | What it needs |
 |---|---|---|
 | Prefix reuse | an agent loop re-prefills its whole history every turn, at the prefill rates above | the D1-b move of the continuation, shared-prefix and capture types into `runtime/contract`; ring-snapshot checkpoints as the state image |
-| Decode single-token routes | at T=1 the wide shapes stream 806-1246 GB/s against the measured 1674.5 GB/s read ceiling, and no *registered* candidate is more than 1.14x better there | new instances rather than a new selection: more rows in flight per block, which is a kernel change, not a route change (12c) |
+| Decode single-token routes | after the direct route (12c) the Q6 shapes stream 1.40-1.47 TB/s in the Linear benchmark against the Q5 direct route's 1.59 and the 1674.5 GB/s read ceiling | the remaining Q6 decode cost against Q5's: 2 more bytes a lane per 8 weights and the high-bit merge |
 | Lanes in one pass | concurrency re-reads the weights per lane | per-lane caches laid out for the Ops' batch dimension; one pass over B columns |
-| CUDA Graphs | decode launch overhead | graph capture per lane count |
+| CUDA Graphs | decode launch overhead (about 0.9 ms of a token) | a decode step bakes per-token host values into its launches: ring-slot copy offsets, the `filled` key count as a tensor shape, and attention split grids sized by context length. Those need device-resident parameters or per-length graph profiles as Qwen's Program has, then capture per lane count |
 | Output constraints | refused | token-mask consumption in the Program |
 | FP8 KV | refused | the codecs of plan row 7 |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
