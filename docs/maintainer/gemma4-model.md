@@ -114,7 +114,11 @@ o = W_o · softmax(q·kᵀ · 1.0 + causal) · v
   the count and their partners are bit-exact unchanged, which reproduces the checkpoint's zeroed
   frequencies instead of approximating them with a near-zero rotation. Long-context phases make the
   generic kernel evaluate its angle in double: at position 262144 the float spacing alone is about
-  0.016 rad, wider than the deviation the rotation is held to.
+  0.016 rad, wider than the deviation the rotation is held to. The per-pair frequencies are
+  evaluated once per geometry on the host and passed by value, so a block does one double multiply
+  and range reduction per pair and a float `sincosf` on the reduced phase; blocks split a token's
+  heads four at a time. This took a decode RoPE launch from 12.5 to 2.4 us with every oracle
+  case's error statistics unchanged.
 - **Compact global KV (private representation, exact reformulation).** On the 384 non-rotated dims
   `k[d] = v[d]·w_kn[d]`, so
   `q·k = Σ_{d∈rot} q[d]·k[d] + Σ_{d∉rot} (q[d]·w_kn[d])·v[d]`.
