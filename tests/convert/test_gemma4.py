@@ -96,9 +96,13 @@ def test_only_the_moe_profile_carries_the_moe_block():
     assert "enable_moe_block" not in dense and "num_experts" not in dense
     assert moe["enable_moe_block"] is True
     assert moe["num_experts"] == 128 and moe["top_k_experts"] == 8
-    assert moe["moe_intermediate_size"] == 704
-    # The dense MLP is kept in parallel with the routed experts, not replaced by them.
-    assert moe["intermediate_size"] == 2112
+    # The stored widths, not the checkpoint's 2112 and 704: the block-scaled layout needs output rows
+    # in multiples of 128, so the dense MLP is stored padded to 2176 and the expert MLP to 768
+    # (model reference 16.1). The padding is exact.
+    assert moe["intermediate_size"] == 2176
+    assert moe["moe_intermediate_size"] == 768
+    # The dense MLP is kept in parallel with the routed experts, not replaced by them: both stored
+    # widths are present above, 2176 for the dense branch and 768 for the routed one.
 
 
 def test_the_profile_is_selected_by_the_layer_count():

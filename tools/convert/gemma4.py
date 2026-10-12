@@ -46,6 +46,8 @@ _TEXT_31B = {
     "name": "Gemma 4 31B",
     "hidden_size": 5376,
     "intermediate_size": 21504,
+    # The width the artifact stores, which is the checkpoint's own when it already suits the layout.
+    "intermediate_size_stored": 21504,
     "num_hidden_layers": 60,
     "num_attention_heads": 32,
     "sliding_num_key_value_heads": 16,
@@ -68,6 +70,9 @@ _TEXT_26B = {
     "name": "Gemma 4 26B-A4B",
     "hidden_size": 2816,
     "intermediate_size": 2112,
+    # 2112 is 33 x 64 but not a multiple of the block-scaled layout's 128 output rows, so the dense
+    # MLP is stored padded to 2176 exactly as the experts are stored padded to 768.
+    "intermediate_size_stored": 2176,
     "num_hidden_layers": 30,
     "num_attention_heads": 16,
     "sliding_num_key_value_heads": 8,
@@ -84,7 +89,13 @@ _TEXT_26B = {
     "enable_moe_block": True,
     "num_experts": 128,
     "top_k_experts": 8,
+    # The checkpoint's expert MLP width and the width the artifact stores are different. The
+    # block-scaled weight layout needs its output rows in multiples of 128 and 704 is not one, so the
+    # gate and up halves are stored padded to 768 with matching zero columns in the down projection.
+    # GeGLU maps a zero gate and up to an exact zero, so the padding contributes nothing; the vision
+    # tower's 4304-wide MLP is padded to 4352 for the same reason.
     "moe_intermediate_size": 704,
+    "moe_stored_intermediate_size": 768,
 }
 _GLOBAL_EVERY = 6  # global layers at 5, 11, ... (the last layer is forced global)
 
@@ -135,6 +146,9 @@ def text_config(source: dict) -> dict:
             raise ValueError(
                 f"{profile['name']} expects text.{key} {expected}, got {result[key]}"
             )
+    # The artifact stores the dense MLP at the width the block-scaled layout needs, not the
+    # checkpoint's own: the 26B's 2112 rows are stored padded to 2176, exactly as its experts are.
+    result["intermediate_size"] = profile["intermediate_size_stored"]
 
     _fixed(raw, "hidden_activation", "gelu_pytorch_tanh", "text")
     _fixed(raw, "attention_bias", False, "text")
@@ -196,11 +210,14 @@ def text_config(source: dict) -> dict:
     if profile["enable_moe_block"]:
         result["enable_moe_block"] = True
         for key in ("num_experts", "top_k_experts", "moe_intermediate_size"):
-            result[key] = _positive(raw.get(key), "text." + key)
-            if result[key] != profile[key]:
+            value = _positive(raw.get(key), "text." + key)
+            if value != profile[key]:
                 raise ValueError(
-                    f"{profile['name']} expects text.{key} {profile[key]}, got {result[key]}"
+                    f"{profile['name']} expects text.{key} {profile[key]}, got {value}"
                 )
+            result[key] = value
+        # The artifact stores the expert MLP at the width the layout needs, not the checkpoint's.
+        result["moe_intermediate_size"] = profile["moe_stored_intermediate_size"]
 
     # RoPE differs by layer kind: sliding rotates the full 256 dims at theta 10k; global is
     # proportional at theta 1e6 with 64 angles over a 512-wide denominator, so only dims
@@ -483,6 +500,26 @@ class _Gemma4Builder(_Builder):
                  "model.embed_vision.embedding_projection.weight",
                  (vision["output_hidden_size"], h), inputs=("vision/soft_tokens",))
 
+    def padded_expert(self, name, store, source_name, bank_shape, offset, source_shape, shape,
+                      inputs):
+        """One expert's matrix out of a fused bank, zero-padded to the width the artifact stores.
+
+        The checkpoint's expert MLP is narrower than the stored one -- 704 against 768 -- because the
+        block-scaled weight layout needs its output rows in multiples of 128. GeGLU maps a zero gate
+        and up to an exact zero, and the down projection's padded columns are zero, so the padding
+        contributes nothing. The vision tower's 4304-wide MLP is padded for the same reason.
+        """
+
+        def factory(selected, format=None):
+            if format is not None:
+                raise ValueError(f"{name}: a padded expert matrix has no encoded source")
+            sliced = tensor_source(selected, source_name, source_shape, offset=offset,
+                                   source_shape=bank_shape)
+            return _zero_padded(sliced, shape)
+
+        self.model.add(Parameter(name, shape, factory(store), factory, tuple(inputs), "bf16",
+                                 residency=name.split("/", 1)[0]))
+
     def moe(self, prefix, source_prefix, store, config):
         """The routed-expert block (model reference section 16).
 
@@ -491,7 +528,14 @@ class _Gemma4Builder(_Builder):
         its own banks. There is no shared expert: Gemma's dense MLP runs in parallel instead and
         `block` maps it independently.
         """
-        h, e, ir = config["hidden_size"], config["num_experts"], config["moe_intermediate_size"]
+        h, e = config["hidden_size"], config["num_experts"]
+        stored       = config["moe_intermediate_size"]  # the width the artifact stores, padded
+        gate_up_bank = source_prefix + "experts.gate_up_proj"
+        down_bank    = source_prefix + "experts.down_proj"
+        # The checkpoint's own width comes from the bank it is stored in: [E, 2 * I, H], gate first.
+        gate_up_shape = tuple(store.describe(gate_up_bank).shape)
+        down_shape    = tuple(store.describe(down_bank).shape)
+        ir            = gate_up_shape[1] // 2
         sp, p = source_prefix + "router.", prefix + "moe/"
         # The router normalizes the pre-FFN residual without a weight, scales it by `router.scale`
         # and 1/sqrt(H), and projects; the routing weights are renormalized before per_expert_scale.
@@ -513,13 +557,12 @@ class _Gemma4Builder(_Builder):
         for expert in range(e):
             ep = p + f"experts/{expert}/"
             for index, role in enumerate(("gate", "up")):
-                self.add(ep + role, store, source_prefix + "experts.gate_up_proj", (ir, h),
-                         source_shape=(e, 2 * ir, h), offset=(expert * 2 + index) * ir * h,
-                         inputs=(expert_input,))
+                self.padded_expert(ep + role, store, gate_up_bank, gate_up_shape,
+                                   (expert * 2 + index) * ir * h, (ir, h), (stored, h),
+                                   inputs=(expert_input,))
                 gate_up.append(ep + role)
-            self.add(ep + "down", store, source_prefix + "experts.down_proj", (h, ir),
-                     source_shape=(e, h, ir), offset=expert * h * ir,
-                     inputs=(ep + "product",))
+            self.padded_expert(ep + "down", store, down_bank, down_shape, expert * h * ir,
+                               (h, ir), (h, stored), inputs=(ep + "product",))
             downs.append(ep + "down")
         self.group(*gate_up)
         self.group(*downs)
@@ -551,8 +594,10 @@ class _Gemma4Builder(_Builder):
                  (h, intermediate), inputs=(prefix + "mlp/product",))
 
     def block(self, prefix, source_prefix, store, config, kind):
-        h = config["hidden_size"]
-        intermediate = config["intermediate_size"]
+        h            = config["hidden_size"]
+        intermediate = config["intermediate_size"]  # the stored width, padded when the layout needs
+        # The checkpoint's own width, read from the tensor the source stores it in.
+        source_intermediate = int(store.describe(source_prefix + "mlp.gate_proj.weight").shape[0])
         attention = prefix + "attention/"
         global_layer = kind == _FULL_ATTENTION
         kv_heads = (config["num_global_key_value_heads"] if global_layer
@@ -597,11 +642,13 @@ class _Gemma4Builder(_Builder):
             self.group(*roles)
 
         for role in ("gate", "up"):
-            self.add(prefix + "mlp/" + role, store,
-                     source_prefix + "mlp." + role + "_proj.weight",
-                     (intermediate, h), inputs=(prefix + "mlp_input",))
-        self.add(prefix + "mlp/down", store, source_prefix + "mlp.down_proj.weight",
-                 (h, intermediate), inputs=(prefix + "mlp/product",))
+            self.padded_matrix(prefix + "mlp/" + role, store,
+                               source_prefix + "mlp." + role + "_proj.weight",
+                               (source_intermediate, h), (intermediate, h),
+                               (prefix + "mlp_input",))
+        self.padded_matrix(prefix + "mlp/down", store, source_prefix + "mlp.down_proj.weight",
+                           (h, source_intermediate), (h, intermediate),
+                           (prefix + "mlp/product",))
         # The gate and up halves stay separate objects rather than one packed parent. Packing them
         # would bind each half as a row slice of a BlockScaleK16M128x4 object, and such a slice
         # cannot re-derive the swizzled scale plane it shares with its sibling, so no consumer could

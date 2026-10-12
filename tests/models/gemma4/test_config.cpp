@@ -108,7 +108,7 @@ int main() {
         read_file(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/gemma4/text_config_26b.json");
     const Json moe_config = Json::parse(moe_fixture).at("config");
     const auto moe        = parse_text_config(moe_config);
-    expect(moe.hidden_size == 2816 && moe.intermediate_size == 2112, "26B widths");
+    expect(moe.hidden_size == 2816 && moe.intermediate_size == 2176, "26B widths (stored, padded)");
     expect(moe.num_hidden_layers == 30 && moe.global_layers == 5, "26B layers");
     expect(moe.layer_types.at(5) == MixerKind::FullAttention &&
                moe.layer_types.at(29) == MixerKind::FullAttention &&
@@ -121,8 +121,9 @@ int main() {
     expect(moe.sliding.rotary_dim == 256 && moe.global.shared.rotary_dim == 128,
            "26B rotary widths");
     expect(moe.enable_moe_block && moe.num_experts == 128 && moe.top_k_experts == 8 &&
-               moe.moe_intermediate_size == 704,
-           "26B MoE widths");
+               moe.moe_intermediate_size == 768,
+           "26B MoE widths (768, the stored width: the checkpoint's 704 is zero-padded so the "
+           "block-scaled layout sees 128-row multiples)");
 
     // MoE refusals: widths with no flag, a top-k wider than the expert set, and a zero count.
     Json partial                = moe_config;
