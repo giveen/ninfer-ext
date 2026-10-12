@@ -831,3 +831,29 @@ Checked against transformers **v5.6.2** `modeling_gemma4.py` (the version the ch
   have no consumer in either sibling's 26B drafter, consistent with `use_ordered_embeddings: false`;
   confirm against this project's own 31B `mtp` component before landing the 26B drafter.
 
+### 16.4 How NInfer executes it
+
+`ops::gemma_moe_router` and `ops::gemma_moe_experts` implement §16.2's router and expert apply, and
+`forward.cpp`'s `feed_forward_sublayer` runs the layer's two branches. The block is per layer, not a
+second execution path: a sliding and a global layer differ only in their attention, and both carry
+their own `MoeWeights`.
+
+- **The router** is one CTA per token: the weightless norm, `router.scale` and `H^(-1/2)`, the
+  projection, softmax, then a top-k whose tie-break is the lower expert index, renormalization, and
+  `per_expert_scale`. It writes `I32 [K,T]` ids and `FP32 [K,T]` weights.
+- **The experts** read a bank **in place at its stored spans**, so an expert is a row range of its
+  bank and no per-expert copy is ever materialized. The bank's format is a reader policy: a BF16
+  reader, and an NVFP4 reader that decodes E2M1 codes against an E4M3 sixteen-element block scale and
+  divides by the source row's divisor.
+- **A routed expert bank is read, never fed to a linear route**, so its input edge is `A16Only` and
+  it carries no activation divisor — the one permission by which the 26B's expert banks differ from
+  its dense MLP.
+- **The padded width is inert**: the zero gate/up rows and matching zero down columns of §16.1 cannot
+  contribute, because GeGLU maps zero to zero. The expert test pins this rather than assuming it.
+- **The MoE branch adds no large scratch.** It reuses the dense branch's `[H,T]` buffers in place —
+  `normed` once the gate/up projections have read it, `down` once the dense branch's post-norm has
+  read it, and the attention's `projected` once its post-norm has — so the only new storage is the
+  router's output, `2·K·T·4` bytes per layer per pass.
+- The 26B's assistant is dense (`enable_moe_block: false`, four layers), so the drafter path is
+  unchanged by the block.
+
