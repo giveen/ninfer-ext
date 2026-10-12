@@ -20,7 +20,7 @@
 
 namespace ninfer::ops::detail {
 
-// A BF16 bank: the stored element is the value, and there is no source divisor to apply.
+// A BF16 bank: the stored element is the value.
 struct Bf16BankReader {
     const __nv_bfloat16* values;
     int columns;
@@ -28,15 +28,12 @@ struct Bf16BankReader {
     __device__ __forceinline__ float operator()(int row, int column) const {
         return __bfloat162float(values[static_cast<std::size_t>(row) * columns + column]);
     }
-
-    __device__ __forceinline__ float row_scale(int) const { return 1.0F; }
 };
 
 // An NVFP4 bank: 4-bit e2m1 codes two per byte along the columns, one e4m3 scale per 16-element
 // block in the K16M128x4 tiling, and the weight divisor of the source matrix the row belongs to.
-// The divisor is constant along a row, so `row_scale` hands it back once per row and the caller
-// multiplies the row's finished sum by it -- the same arithmetic with one load and one reciprocal
-// per row instead of per element.
+// The divisor is applied exactly as the offload MoE route applies its stacked sources':
+// `value * (1 / divisors[row / divisor_rows])`.
 struct Nvfp4BankReader {
     const std::uint8_t* codes;
     const std::uint8_t* scales;
@@ -50,11 +47,7 @@ struct Nvfp4BankReader {
         const float2 pair        = decode_nvfp4_e2m1x2(codes[code_offset]);
         const float code         = (column & 1) == 0 ? pair.x : pair.y;
         const std::uint8_t scale = scales[nvfp4_scale_byte_runtime(row, column / 16, columns / 64)];
-        return code * decode_nvfp4_e4m3(scale);
-    }
-
-    __device__ __forceinline__ float row_scale(int row) const {
-        return __frcp_rn(divisors[row / divisor_rows]);
+        return code * decode_nvfp4_e4m3(scale) * __frcp_rn(divisors[row / divisor_rows]);
     }
 };
 
@@ -119,8 +112,8 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
                 g += gate_up(gate_row, h) * value;
                 u += gate_up(up_row, h) * value;
             }
-            gate[i] = g * gate_up.row_scale(gate_row);
-            up[i]   = u * gate_up.row_scale(up_row);
+            gate[i] = g;
+            up[i]   = u;
         }
         __syncthreads();
         for (int i = threadIdx.x; i < intermediate; i += blockDim.x) {
@@ -146,7 +139,7 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
             }
             float acc = (a0 + a1) + (a2 + a3);
             for (; i < intermediate; ++i) { acc += down(row, i) * product[i]; }
-            accumulator[h] += weight * down.row_scale(row) * acc;
+            accumulator[h] += weight * acc;
         }
         __syncthreads();
     }
