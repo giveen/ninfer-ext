@@ -6,8 +6,8 @@
 // from the artifact itself. Two structural facts follow from what is stored:
 //
 //  - The query, key and value parameters are slices of one fused projection object per layer, so
-//    each carries the slice's own shape here (8192 x 5376 and so on) while the artifact resolves the
-//    row offset and the scale plane.
+//    each carries the slice's own shape here (8192 x 5376 and so on) while the artifact resolves
+//    the row offset and the scale plane.
 //  - Global layers bind no value at all: attention_k_eq_v makes the weightless key normalization
 //    serve as the value, so `AttentionWeights::value` stays unset there, which `mixer` tells a
 //    consumer how to interpret.
@@ -32,9 +32,27 @@ struct AttentionWeights {
 };
 
 struct MlpWeights {
-    // The gate and up projections are separate objects, not slices of one packed parent: a row slice
-    // of an NVFP4 parent cannot re-derive the swizzled scale plane, so each half is bound whole.
+    // The gate and up projections are separate objects, not slices of one packed parent: a row
+    // slice of an NVFP4 parent cannot re-derive the swizzled scale plane, so each half is bound
+    // whole.
     WeightId gate, up, down;
+};
+
+// The routed-expert block of a 26B-A4B layer (model reference section 16): a router over the
+// pre-FFN residual and one expert MLP per expert, in parallel with the dense `mlp` above, plus the
+// three FFN norms the block adds. A 31B layer carries none of it, so this stays unset there.
+struct MoeWeights {
+    // [num_experts, hidden], over the weightless-normalized residual scaled by `router_scale` and
+    // 1/sqrt(hidden); the top-k weights are renormalized before `per_expert_scale` is applied.
+    WeightId router;
+    WeightId router_scale;
+    WeightId per_expert_scale;
+    // One entry per expert. The checkpoint stores each bank fused -- gate and up in one
+    // [experts, 2 * intermediate, hidden] tensor with the gate half first -- and the artifact
+    // resolves an expert's slice of it.
+    std::vector<MlpWeights> experts;
+    // The dense branch's own post-norm, then the MoE branch's pre- and post-norms.
+    WeightId post_feedforward_norm_1, pre_feedforward_norm_2, post_feedforward_norm_2;
 };
 
 struct LayerWeights {
@@ -45,6 +63,8 @@ struct LayerWeights {
     WeightId layer_scalar;
     AttentionWeights attention;
     MlpWeights mlp;
+    // Set only on a model whose config enables the MoE block.
+    std::optional<MoeWeights> moe;
 };
 
 struct TextWeights {
