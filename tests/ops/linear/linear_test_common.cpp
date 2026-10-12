@@ -43,6 +43,9 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
+    case ActivationCompute::A8Pair:
+        // The second term's pass rounds the accumulated output once more than A16 does.
+        return {2.0 * kBf16UnitRoundoff, kBf16UnitRoundoff, 3.0 * kBf16UnitRoundoff};
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:

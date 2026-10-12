@@ -76,6 +76,7 @@ void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32
 void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8Pair:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
         return;

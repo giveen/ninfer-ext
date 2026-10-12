@@ -26,6 +26,41 @@ struct LinearBf16Output {
     }
 };
 
+// Adds each result into the destination instead of replacing it. The two-term E4M3 activation route
+// runs its second term through the same kernel and accumulates onto the first term's output.
+struct LinearBf16AccumulateOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int token) const {
+        return data + static_cast<std::int64_t>(token) * rows + row;
+    }
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        __nv_bfloat16* destination = at(row, token);
+        *destination               = __float2bfloat16_rn(__bfloat162float(*destination) + value);
+    }
+
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
+        const uint4 existing = load_vec<uint4>(at(row, token));
+        const auto* add      = reinterpret_cast<const __nv_bfloat162*>(&values);
+        const auto* base     = reinterpret_cast<const __nv_bfloat162*>(&existing);
+        __nv_bfloat162 pairs[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 low  = __bfloat1622float2(base[i]);
+            const float2 high = __bfloat1622float2(add[i]);
+            pairs[i]          = __floats2bfloat162_rn(low.x + high.x, low.y + high.y);
+        }
+        uint4 summed;
+        summed.x = *reinterpret_cast<const unsigned*>(&pairs[0]);
+        summed.y = *reinterpret_cast<const unsigned*>(&pairs[1]);
+        summed.z = *reinterpret_cast<const unsigned*>(&pairs[2]);
+        summed.w = *reinterpret_cast<const unsigned*>(&pairs[3]);
+        store_vec(at(row, token), summed);
+    }
+};
+
 struct LinearBf16StridedOutput {
     __nv_bfloat16* data;
     std::int64_t leading_dim;

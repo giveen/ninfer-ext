@@ -278,6 +278,7 @@ void require_q8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
 void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8Pair:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
         return;

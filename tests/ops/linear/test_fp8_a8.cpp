@@ -111,9 +111,9 @@ int run_fp8_a8() {
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
-    failures += run_shape(
-        "FP8_A16", ActivationCompute::A16, make_fp8_weight,
-        {5120, 6144, 855U, Comparison::Sampled, true, residual6144_decode_invocations});
+    failures +=
+        run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                  {5120, 6144, 855U, Comparison::Sampled, true, residual6144_decode_invocations});
     constexpr std::array residual6144_invocations{
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -139,9 +139,9 @@ int run_fp8_a8() {
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
-    failures += run_shape(
-        "FP8_A16", ActivationCompute::A16, make_fp8_weight,
-        {5120, 17408, 867U, Comparison::Sampled, true, residual17408_decode_invocations});
+    failures +=
+        run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                  {5120, 17408, 867U, Comparison::Sampled, true, residual17408_decode_invocations});
     constexpr std::array residual17408_invocations{
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -160,9 +160,27 @@ int run_fp8_a8() {
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
     };
-    failures += run_shape(
-        "FP8_A8", ActivationCompute::A8, make_fp8_weight,
-        {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
+    failures +=
+        run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                  {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
+
+    // Two-term E4M3 activation: the same eight-bit route carrying a second residual term, which
+    // must land at the A16 floor instead of the single-term A8 allowance.
+    constexpr std::array pair_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA8Pair, true},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8Pair, true},
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+    };
+    failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
+                          {14336, 5120, 877U, Comparison::Sampled, true, pair_invocations});
+    failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
+                          {16384, 5120, 879U, Comparison::Sampled, true, pair_invocations});
+    failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
+                          {5120, 6144, 881U, Comparison::Sampled, true, pair_invocations});
+    failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
+                          {5120, 17408, 883U, Comparison::Sampled, true, pair_invocations});
 
     struct Problem {
         std::int32_t rows;

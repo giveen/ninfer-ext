@@ -72,6 +72,7 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8Pair:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
         return;

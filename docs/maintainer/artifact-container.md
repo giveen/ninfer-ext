@@ -434,6 +434,7 @@ weight divisor。Materializer 上传 parent 的原始编码，Op 准备其真实
 | activation_policy | 允许集合 |
 |---|---|
 | A16Only | A16 |
+| AllowA8Pair | A16、A8Pair |
 | AllowA8 | A16、A8 |
 | AllowA4 | A16、A8、A4 |
 

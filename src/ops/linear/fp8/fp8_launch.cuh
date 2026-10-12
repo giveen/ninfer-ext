@@ -41,6 +41,13 @@ void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace
         fp8_a8_operands(w, scratch, x.ne[1]),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream);
+    if (scratch.codes_lo != nullptr) {
+        // Second E4M3 term: the same kernel again, accumulating onto the completed first term.
+        launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            fp8_a8_residual_operands(w, scratch, x.ne[1]),
+            LinearBf16AccumulateOutput{static_cast<__nv_bfloat16*>(out.data), w.n},
+            LinearIdentityEpilogue{}, stream);
+    }
 }
 
 template <class Geometry, class Schedule>
@@ -51,5 +58,11 @@ void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Works
         fp8_a8_operands(w, scratch, x.ne[1]),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream, scratch.partials);
+    if (scratch.codes_lo != nullptr) {
+        launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            fp8_a8_residual_operands(w, scratch, x.ne[1]),
+            LinearBf16AccumulateOutput{static_cast<__nv_bfloat16*>(out.data), w.n},
+            LinearIdentityEpilogue{}, stream, scratch.partials);
+    }
 }
 } // namespace ninfer::ops::detail

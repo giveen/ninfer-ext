@@ -4,6 +4,7 @@
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/ninfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
+//   ./build/bench/ninfer_linear_bench --qtype fp8 --policy a8pair --n 14336 --k 5120 --t 2048
 //   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
 //   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
@@ -251,6 +252,7 @@ const char* qtype_name(QType qtype) {
 
 const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
+    if (policy == LinearPolicy::AllowA8Pair) { return "A8Pair"; }
     if (policy == LinearPolicy::AllowA8) { return "A8"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
@@ -271,9 +273,10 @@ QType parse_qtype(std::string_view text) {
 LinearPolicy parse_policy(std::string_view text) {
     const std::string value = lower(text);
     if (value == "a16" || value == "a16only") { return LinearPolicy::A16Only; }
+    if (value == "a8pair" || value == "allowa8pair") { return LinearPolicy::AllowA8Pair; }
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, or a4");
+    throw std::invalid_argument("Linear benchmark policy must be a16, a8pair, a8, or a4");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -316,9 +319,9 @@ Sweep parse_sweep(std::string_view text) {
     }
     Sweep sweep;
     sweep.begin = parse_i32(value.substr(0, first), "sweep start");
-    sweep.end   = parse_i32(value.substr(first + 1, second == std::string::npos ? std::string::npos
-                                                                                : second - first - 1),
-                            "sweep end");
+    sweep.end = parse_i32(value.substr(first + 1, second == std::string::npos ? std::string::npos
+                                                                              : second - first - 1),
+                          "sweep end");
     if (second != std::string::npos) {
         sweep.step = parse_i32(value.substr(second + 1), "sweep step");
     }
@@ -336,7 +339,7 @@ void usage(const char* argv0) {
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
-                 "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
+                 "  --policy a16|a8pair|a8|a4 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -602,7 +605,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
-    const double seconds = timing.median_us * 1.0e-6;
+    const double seconds      = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
 

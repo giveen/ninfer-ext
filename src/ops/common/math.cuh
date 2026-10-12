@@ -81,6 +81,16 @@ __device__ __forceinline__ float2 bf16x2_bits_to_float2(std::uint32_t bits) {
     return bf16x2_to_float2(load_vec<__nv_bfloat162>(&bits));
 }
 
+// Exact E4M3 decode of the finite values a saturating E4M3 encoder produces.
+__device__ __forceinline__ float fp8_e4m3_to_float(std::uint8_t byte) {
+    const int exponent    = (byte >> 3) & 0xF;
+    const int mantissa    = byte & 0x7;
+    const float magnitude = exponent == 0
+                                ? ldexpf(static_cast<float>(mantissa), -9)
+                                : ldexpf(1.0F + static_cast<float>(mantissa) / 8.0F, exponent - 7);
+    return (byte & 0x80) != 0 ? -magnitude : magnitude;
+}
+
 __device__ __forceinline__ void load_bf16x4(float (&values)[4], const __nv_bfloat16* source) {
     // The source must be 8-byte aligned. A built-in vector keeps one 64-bit load;
     // loading a pair-of-pairs struct can scalarize into two 32-bit requests.

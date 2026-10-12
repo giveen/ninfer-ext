@@ -19,14 +19,22 @@ namespace ninfer::ops {
  * policy.
  */
 enum class LinearPolicy : std::uint8_t {
-    A16Only, ///< Admit only A16 compute profiles.
-    AllowA8, ///< Admit either A16 or A8 compute profiles.
-    AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    A16Only,     ///< Admit only A16 compute profiles.
+    AllowA8Pair, ///< Admit A16 or the two-term E4M3 A8 profile.
+    AllowA8,     ///< Admit either A16 or A8 compute profiles.
+    AllowA4,     ///< Admit A16, A8 or A4 compute profiles.
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4;
+    return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8Pair ||
+           policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4;
+}
+
+// The two-term profile keeps the eight-bit MMA rate but carries the activation as two E4M3 terms,
+// which lands the activation error at the A16 floor. It is its own permission: a format without a
+// registered two-term route stays at A16 rather than falling back to a less accurate A8 route.
+[[nodiscard]] constexpr bool allows_a8_pair(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8Pair;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -35,6 +43,27 @@ enum class LinearPolicy : std::uint8_t {
 
 [[nodiscard]] constexpr bool allows_a4(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4;
+}
+
+/**
+ * The permission whose route set is the intersection of both operands, for inputs that must share
+ * one activation quantization. AllowA8Pair is a distinct route family: its only common route with
+ * the A8 or A4 families is A16.
+ */
+[[nodiscard]] constexpr LinearPolicy intersect_linear_policy(LinearPolicy left,
+                                                             LinearPolicy right) noexcept {
+    if (left == right) { return left; }
+    if (left == LinearPolicy::A16Only || right == LinearPolicy::A16Only) {
+        return LinearPolicy::A16Only;
+    }
+    if (left == LinearPolicy::AllowA4) {
+        return right == LinearPolicy::AllowA8Pair ? LinearPolicy::A16Only : right;
+    }
+    if (right == LinearPolicy::AllowA4) {
+        return left == LinearPolicy::AllowA8Pair ? LinearPolicy::A16Only : left;
+    }
+    // AllowA8Pair with AllowA8: A16 alone is common.
+    return LinearPolicy::A16Only;
 }
 
 /**
@@ -96,8 +125,10 @@ enum class LinearPolicy : std::uint8_t {
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. Every policy permits the existing A16 implementations of BF16 and Q4/Q5/Q6/Q8.
- * FP8 accepts all three policies; AllowA8 and AllowA4 permit the private resolver to select a
- * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
+ * FP8 accepts all four policies; AllowA8 and AllowA4 permit the private resolver to select a
+ * qualified A16 or A8 route for the registered problem and T, and AllowA8Pair permits the two-term
+ * E4M3 A8 route, which carries the activation as a residual pair so that its error lands at the
+ * A16 floor while keeping the eight-bit MMA rate. FP8 `[248320,5120]` retains A16
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the

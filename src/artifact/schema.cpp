@@ -193,8 +193,8 @@ void parse_files(Directory& out, const Json& files, std::string_view entry_name)
         } else {
             file.path        = require_id(value.at("path"), "file path");
             const auto& path = *file.path;
-            if (path == "." || path == ".." || path.contains('/') ||
-                path.contains('\\') || !names.insert(path).second) {
+            if (path == "." || path == ".." || path.contains('/') || path.contains('\\') ||
+                !names.insert(path).second) {
                 throw ArtifactError("invalid or duplicate sibling filename: " + path);
             }
         }
@@ -238,14 +238,13 @@ void parse_objects(Directory& out, const Json& objects) {
         if (kind == "tensor") {
             const std::uint64_t divisors =
                 value.contains("divisors") ? require_u64(value.at("divisors"), id, true) : 1;
-            const std::uint64_t bitrate_half_bits = value.contains("bitrate_half_bits")
-                                                        ? require_u64(value.at("bitrate_half_bits"),
-                                                                      id, true)
-                                                        : 0;
+            const std::uint64_t bitrate_half_bits =
+                value.contains("bitrate_half_bits")
+                    ? require_u64(value.at("bitrate_half_bits"), id, true)
+                    : 0;
             out.objects.emplace_back(TensorObject{
                 id, parse_shape(value.at("shape"), id), require_id(value.at("format"), id),
-                require_id(value.at("layout"), id), offset, bytes, divisors,
-                bitrate_half_bits});
+                require_id(value.at("layout"), id), offset, bytes, divisors, bitrate_half_bits});
         } else {
             out.objects.emplace_back(
                 ResourceObject{id, require_id(value.at("encoding"), id), offset, bytes});
@@ -315,6 +314,8 @@ void parse_uses(Directory& out, const Json& values) {
             const auto policy = require_id(value.at("activation_policy"), label);
             if (policy == "A16Only") {
                 use.activation_policy = ActivationPolicy::A16Only;
+            } else if (policy == "AllowA8Pair") {
+                use.activation_policy = ActivationPolicy::AllowA8Pair;
             } else if (policy == "AllowA8") {
                 use.activation_policy = ActivationPolicy::AllowA8;
             } else if (policy == "AllowA4") {

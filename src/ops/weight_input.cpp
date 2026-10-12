@@ -61,18 +61,10 @@ bool contiguous(const WeightView& view) {
 LinearPolicy common_policy(std::span<const WeightInput> inputs) {
     auto result = LinearPolicy::AllowA4;
     for (const auto& input : inputs) {
-        switch (input.policy) {
-        case LinearPolicy::A16Only:
-            result = LinearPolicy::A16Only;
-            break;
-        case LinearPolicy::AllowA8:
-            if (result == LinearPolicy::AllowA4) { result = LinearPolicy::AllowA8; }
-            break;
-        case LinearPolicy::AllowA4:
-            break;
-        default:
+        if (!valid_linear_policy(input.policy)) {
             throw std::invalid_argument("invalid projection activation policy");
         }
+        result = intersect_linear_policy(result, input.policy);
     }
     return result;
 }

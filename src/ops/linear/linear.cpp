@@ -37,6 +37,7 @@ std::int64_t checked_numel(const Tensor& tensor, const char* label) {
 void validate_linear_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8Pair:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
         return;

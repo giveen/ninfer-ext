@@ -34,6 +34,9 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
         case artifact::ActivationPolicy::A16Only:
             result.policy = ops::LinearPolicy::A16Only;
             break;
+        case artifact::ActivationPolicy::AllowA8Pair:
+            result.policy = ops::LinearPolicy::AllowA8Pair;
+            break;
         case artifact::ActivationPolicy::AllowA8:
             result.policy = ops::LinearPolicy::AllowA8;
             break;

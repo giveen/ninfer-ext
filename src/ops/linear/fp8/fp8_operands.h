@@ -41,6 +41,17 @@ inline Fp8A8Operands fp8_a8_operands(const Weight& w, Fp8A8Workspace x, int toke
             tokens};
 }
 
+// The second term of the two-term activation route: the residual plane pair, same weight.
+inline Fp8A8Operands fp8_a8_residual_operands(const Weight& w, Fp8A8Workspace x, int tokens) {
+    return {x.codes_lo,
+            x.scales_lo,
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const __nv_bfloat16*>(w.scales),
+            w.n,
+            w.k,
+            tokens};
+}
+
 // Private template admission is independent of the public finite shape registry.
 template <class Schedule, class Operands>
 inline void validate_fp8_operands(const Operands& p) {

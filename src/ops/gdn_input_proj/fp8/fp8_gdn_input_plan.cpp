@@ -16,7 +16,7 @@ enum class Fp8GdnInputRoute : std::uint8_t {
 
 Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 gdn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Fp8GdnInputRoute::A16; }
+    if (policy == LinearPolicy::A16Only || allows_a8_pair(policy)) { return Fp8GdnInputRoute::A16; }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 gdn_input_proj: unsupported policy");
     }

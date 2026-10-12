@@ -35,7 +35,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv: invalid compute policy");
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    if (!allows_a4(policy)) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");

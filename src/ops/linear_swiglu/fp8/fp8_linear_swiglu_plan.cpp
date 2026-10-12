@@ -19,7 +19,7 @@ enum class Fp8LinearSwiGluRoute : std::uint8_t {
 
 Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 linear_swiglu: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Fp8LinearSwiGluRoute::A16; }
+    if (policy == LinearPolicy::A16Only || allows_a8_pair(policy)) { return Fp8LinearSwiGluRoute::A16; }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 linear_swiglu admits only A16 or A8");
     }

@@ -12,6 +12,8 @@ namespace ninfer::test::linear {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
+    // Two-term E4M3 activation: A16-class accuracy on the eight-bit MMA, one extra output rounding.
+    A8Pair,
     A8,
     A4,
 };
