@@ -74,6 +74,20 @@ constexpr std::array kShapes{
     ShapeEntry{1024, 16384, select_q8_generic},
     ShapeEntry{262144, 1024, select_q8_generic},
     ShapeEntry{5376, 1024, select_q8_generic},
+    // Gemma 4 26B-A4B (hidden 2816): the fused qkv parent and its query/key/value slices at both
+    // head widths, the attention output at both, the two dense-MLP shapes, and the tied head. The
+    // routed experts are deliberately absent: the MoE expert apply reads their banks through its
+    // own decoder and never reaches a linear route.
+    ShapeEntry{8192, 2816, select_q8_generic},
+    ShapeEntry{4096, 2816, select_q8_generic},
+    ShapeEntry{2048, 2816, select_q8_generic},
+    ShapeEntry{9216, 2816, select_q8_generic},
+    ShapeEntry{1024, 2816, select_q8_generic},
+    ShapeEntry{2816, 4096, select_q8_generic},
+    ShapeEntry{2816, 8192, select_q8_generic},
+    ShapeEntry{2176, 2816, select_q8_generic},
+    ShapeEntry{2816, 2176, select_q8_generic},
+    ShapeEntry{262144, 2816, select_q8_generic},
 };
 } // namespace
 
