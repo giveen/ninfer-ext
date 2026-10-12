@@ -377,7 +377,7 @@ def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() 
     assert grouped == {name for name in model.parameters if "/moe/experts/" in name}
 
 
-def test_gemma4_26b_qat_recipe_puts_only_the_experts_on_their_trained_grid() -> None:
+def test_gemma4_26b_qat_recipe_puts_every_projection_on_its_trained_grid() -> None:
     model = _gemma4_26b_model()
     recipe = Recipe(model)
     gemma4_26b_a4b_qat(model, recipe, {})
@@ -386,7 +386,15 @@ def test_gemma4_26b_qat_recipe_puts_only_the_experts_on_their_trained_grid() -> 
         (selection,) = recipe.selections[name]
         assert selection.format == "q4_g32_fp16_rows"
         assert selection.method is q4_rows_qat
-    (dense,) = recipe.selections[f"{layer}/mlp/gate"]
-    assert dense.format == "q8_g32_fp16"
+    for name in (f"{layer}/mlp/gate", f"{layer}/attention/query", f"{layer}/attention/output",
+                 "text/output_head"):
+        (selection,) = recipe.selections[name]
+        assert selection.format == "q4_g32_fp16_rows", name
+        assert selection.method is q4_rows_qat
+    # The token table is a gather the embedding Op reads as row-split int8.
+    (table,) = recipe.selections["text/token_embedding"]
+    assert table.format == "q8_g32_fp16"
+    (router,) = recipe.selections[f"{layer}/moe/router"]
+    assert router.format == "bf16"
     grouped = {name for names, _ in recipe.explicit_groups for name in names}
     assert grouped == {name for name in model.parameters if "/moe/experts/" in name}
