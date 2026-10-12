@@ -197,6 +197,13 @@ measured saturated decodes. That is P0's last bullet.
   FP64 oracle in `tests/ops/gemma_moe_router_ref.h` and three cases in
   `tests/ops/test_gemma_moe_router.cpp` (the stored geometry, an exact tie at the boundary, and the
   renormalize-then-scale order). What remains here is the expert apply and the parallel combine.
+- **Landed**: the expert apply is `ops::gemma_moe_experts` over the two expert-major banks, with
+  `tests/ops/gemma_moe_experts_ref.h` and a case that runs it at the *stored* width over a bank whose
+  padding rows and columns are zero and requires the oracle's logical-width result — which is what
+  makes the padding arithmetically invisible rather than merely believed to be. Both routes are
+  BF16-bank routes: the artifact's banks are NVFP4, so a block-scaled bank profile is the next route
+  here (a BF16-expert recipe is what exercises this pair end to end today), and the layer's combine
+  with the dense branch is the remaining piece of P2.
 - **DECIDE**: a Gemma-specific MoE op, or generalizing `ops/wrapper/sparse_moe.cpp`. That op is
   specialized to Qwen4Exp's geometry by `constexpr` (`kHidden = 2048`, `kExperts = 256`,
   `kExpertRows = 1024`, `kIntermediate = 512`, a shared-expert bias row), and Gemma's layer is a
