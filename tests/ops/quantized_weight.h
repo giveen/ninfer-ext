@@ -275,11 +275,11 @@ struct PackedWeight {
                 static_cast<std::size_t>(groups_per_row) * detail::high_bytes_per_group(spec);
             const std::size_t scale_row =
                 static_cast<std::size_t>(groups_per_row) * sizeof(std::uint16_t);
-            w.qdata = static_cast<const std::uint8_t*>(w.qdata) +
-                      static_cast<std::size_t>(row_begin) * code_row;
+            w.qdata  = static_cast<const std::uint8_t*>(w.qdata) +
+                       static_cast<std::size_t>(row_begin) * code_row;
             w.qhigh  = high_row == 0 ? nullptr
                                      : static_cast<const std::uint8_t*>(w.qhigh) +
-                                          static_cast<std::size_t>(row_begin) * high_row;
+                                           static_cast<std::size_t>(row_begin) * high_row;
             w.scales = static_cast<const std::uint8_t*>(w.scales) +
                        static_cast<std::size_t>(row_begin) * scale_row;
         } else if (w.layout == QuantLayout::BlockScaleK16M128x4) {
@@ -287,8 +287,8 @@ struct PackedWeight {
                 throw std::invalid_argument(
                     "quantized-weight fixture: NVFP4 row view must align to 128 rows");
             }
-            w.qdata = static_cast<const std::uint8_t*>(w.qdata) +
-                      static_cast<std::size_t>(row_begin) * w.k / 2;
+            w.qdata  = static_cast<const std::uint8_t*>(w.qdata) +
+                       static_cast<std::size_t>(row_begin) * w.k / 2;
             w.scales = static_cast<const std::uint8_t*>(w.scales) +
                        static_cast<std::size_t>(row_begin / 128) *
                            static_cast<std::size_t>(w.k / 64) * 512;
@@ -320,6 +320,10 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
+    // NVFP4 only: how many rows share one weight divisor. Zero means the whole matrix does, which
+    // is what a single quantised weight has; a stacked bank sets it to one source matrix's rows,
+    // and the fixture then writes a distinct divisor per source.
+    std::int32_t weight_divisor_rows = 0;
 };
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
@@ -411,13 +415,25 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 "quantized-weight fixture: NVFP4 divisors must be finite and positive");
         }
 
+        // A stacked plane carries one divisor per source matrix; the default is one for the whole
+        // matrix, which is what a single quantised weight has.
+        const std::int32_t divisor_rows =
+            options.weight_divisor_rows > 0 ? options.weight_divisor_rows : n;
+        if ((n % divisor_rows) != 0 || (divisor_rows % 128) != 0) {
+            throw std::invalid_argument(
+                "quantized-weight fixture: divisor rows must divide N and be a multiple of 128");
+        }
+        const std::int32_t divisor_count = n / divisor_rows;
+
         PackedWeight packed;
         packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k / 2;
         packed.scale_plane_offset =
             detail::align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
         packed.scale_plane_bytes     = static_cast<std::uint64_t>(n) * k / 16;
         packed.weight_divisor_offset = packed.scale_plane_offset + packed.scale_plane_bytes;
-        packed.payload.assign(static_cast<std::size_t>(packed.weight_divisor_offset) + 4U, 0);
+        packed.payload.assign(static_cast<std::size_t>(packed.weight_divisor_offset) +
+                                  static_cast<std::size_t>(divisor_count) * sizeof(float),
+                              0);
 
         for (std::int32_t row = 0; row < n; ++row) {
             for (std::int32_t column = 0; column < k; column += 2) {
@@ -457,14 +473,21 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                     static_cast<std::size_t>(row_inner % 32) * 16U +
                     static_cast<std::size_t>(row_inner / 32) * 4U +
                     static_cast<std::size_t>(scale_lane);
-                const std::size_t pattern = (static_cast<std::uint32_t>(row) * 5U +
-                                             static_cast<std::uint32_t>(group) * 3U + seed) &
-                                            7U;
+                const std::size_t pattern     = (static_cast<std::uint32_t>(row) * 5U +
+                                                 static_cast<std::uint32_t>(group) * 3U + seed) &
+                                                7U;
                 packed.payload[stored_offset] = kScaleWords[pattern];
             }
         }
-        detail::store_u32_le(packed.payload, packed.weight_divisor_offset,
-                             detail::float_bits(options.weight_scale_divisor));
+        // Distinct divisors per source, so a reader that ignores the array cannot pass.
+        for (std::int32_t index = 0; index < divisor_count; ++index) {
+            const float divisor =
+                options.weight_scale_divisor * (1.0F + 0.5F * static_cast<float>(index));
+            detail::store_u32_le(packed.payload,
+                                 packed.weight_divisor_offset +
+                                     static_cast<std::size_t>(index) * sizeof(float),
+                                 detail::float_bits(divisor));
+        }
 
         packed.weight.qtype                = QType::NVFP4;
         packed.weight.layout               = QuantLayout::BlockScaleK16M128x4;
@@ -491,7 +514,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         packed.weight.weight_scale_divisor = options.weight_scale_divisor;
         packed.weight.input_scale_divisor  = options.input_scale_divisor;
         packed.weight.weight_divisors      = packed.payload.data() + packed.weight_divisor_offset;
-        packed.weight.weight_divisor_rows  = n;
+        packed.weight.weight_divisor_rows  = divisor_rows;
         return packed;
     }
     if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
@@ -583,7 +606,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             std::uint8_t* high   = high_bytes_per_group == 0
                                        ? nullptr
                                        : packed.payload.data() + packed.high_plane_offset +
-                                           group_index * high_bytes_per_group;
+                                             group_index * high_bytes_per_group;
             for (std::int32_t lane = 0; lane < partial_group_lanes; ++lane) {
                 codes[lane] =
                     static_cast<std::int8_t>(detail::unpack_lowbit_code(nibble, high, spec, lane));
@@ -691,9 +714,15 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
             static_cast<std::size_t>(row_tile * k_tiles + scale_tile) * 512U +
             static_cast<std::size_t>(row_inner % 32) * 16U +
             static_cast<std::size_t>(row_inner / 32) * 4U + static_cast<std::size_t>(scale_lane);
+        // A stacked plane carries one divisor per source matrix, and the row says which.
+        const std::size_t divisor_offset =
+            packed.weight_divisor_offset +
+            static_cast<std::size_t>(row / weight.weight_divisor_rows) * sizeof(float);
+        float divisor = 0.0F;
+        std::memcpy(&divisor, packed.payload.data() + divisor_offset, sizeof(float));
         const double decoded = detail::decode_e2m1(code) *
                                detail::decode_e4m3fn(packed.payload[scale_offset]) /
-                               static_cast<double>(weight.weight_scale_divisor);
+                               static_cast<double>(divisor);
         return static_cast<double>(static_cast<float>(decoded));
     }
 
@@ -709,9 +738,9 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     const int nibble_bytes            = detail::nibble_bytes_per_group(spec);
     const int high_bytes              = detail::high_bytes_per_group(spec);
 
-    const std::uint8_t* nibble       = packed.payload.data() + group_index * nibble_bytes;
-    const std::uint8_t* high         = high_bytes == 0 ? nullptr
-                                                       : packed.payload.data() + packed.high_plane_offset +
+    const std::uint8_t* nibble = packed.payload.data() + group_index * nibble_bytes;
+    const std::uint8_t* high = high_bytes == 0 ? nullptr
+                                               : packed.payload.data() + packed.high_plane_offset +
                                                      group_index * high_bytes;
     const std::uint16_t stored_scale = detail::load_u16_le(
         packed.payload, packed.scale_plane_offset + group_index * sizeof(std::uint16_t));
@@ -764,8 +793,8 @@ inline std::vector<float> decode_row_split_lowbit(const std::vector<std::uint8_t
         static_cast<std::size_t>(n) * static_cast<std::size_t>(kg) * static_cast<std::size_t>(nib);
     const std::size_t high_bytes = static_cast<std::size_t>(n) * static_cast<std::size_t>(kg) *
                                    static_cast<std::size_t>(high_bpr);
-    const std::size_t high_off  = detail::align_up_size(nibble_bytes, 256);
-    const std::size_t scale_off = high_off + detail::align_up_size(high_bytes, 256);
+    const std::size_t high_off   = detail::align_up_size(nibble_bytes, 256);
+    const std::size_t scale_off  = high_off + detail::align_up_size(high_bytes, 256);
 
     std::vector<float> deq(static_cast<std::size_t>(n) * k);
     for (std::int32_t row = 0; row < n; ++row) {

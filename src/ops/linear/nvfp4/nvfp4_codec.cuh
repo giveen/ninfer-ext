@@ -23,18 +23,26 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
     return static_cast<float2>(value).x;
 }
 
+// The tiling with the tile count as a value, for a route that is one kernel over several admitted
+// geometries. `nvfp4_scale_byte` below is the same address with the count as a compile-time
+// constant.
+__device__ __forceinline__ std::int64_t nvfp4_scale_byte_runtime(int row, int group,
+                                                                 int scale_tiles_per_row) {
+    const int m_tile     = row / 128;
+    const int row_inner  = row - m_tile * 128;
+    const int scale_tile = group / 4;
+    const int scale_lane = group & 3;
+    return (static_cast<std::int64_t>(m_tile) * scale_tiles_per_row + scale_tile) * 512 +
+           (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
+}
+
 // One e4m3 block scale in the K16M128x4 layout. A 512-byte tile holds 128 rows by four groups,
 // with the rows interleaved so that four rows 32 apart share one 16-byte line. `ScaleTilesPerRow`
 // is the matrix's column count over 64; a caller that owns rows of a larger plane than a
 // registered linear shape supplies it directly.
 template <int ScaleTilesPerRow>
 __device__ __forceinline__ std::int64_t nvfp4_scale_byte(int row, int group) {
-    const int m_tile     = row / 128;
-    const int row_inner  = row - m_tile * 128;
-    const int scale_tile = group / 4;
-    const int scale_lane = group & 3;
-    return (static_cast<std::int64_t>(m_tile) * ScaleTilesPerRow + scale_tile) * 512 +
-           (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
+    return nvfp4_scale_byte_runtime(row, group, ScaleTilesPerRow);
 }
 
 struct alignas(8) Nvfp4QuantizedK16 {

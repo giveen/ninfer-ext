@@ -179,6 +179,90 @@ int run_padding_case() {
                     narrow_gate_up, narrow_down, kLogical, kTokens);
 }
 
+// The artifact's own bank format. Each expert is a separately quantised source with its own
+// divisor, and the fixture writes distinct divisors per source, so a reader that ignored the
+// divisor array would disagree here.
+int run_nvfp4_case() {
+    constexpr std::int32_t kHidden       = 256;
+    constexpr std::int32_t kExperts      = 4;
+    constexpr std::int32_t kTopK         = 2;
+    constexpr std::int32_t kIntermediate = 128;
+    constexpr std::int32_t kTokens       = 4;
+
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 2.0F;
+    options.input_scale_divisor  = 1.0F;
+    // One divisor per expert: an expert's gate and up rows together, then its down rows.
+    options.weight_divisor_rows = 2 * kIntermediate;
+    const auto gate_up          = quantized_weight::make_patterned_weight(
+        QType::NVFP4, kExperts * 2 * kIntermediate, kHidden, 31, options);
+    options.weight_divisor_rows = kHidden;
+    const auto down = quantized_weight::make_patterned_weight(QType::NVFP4, kExperts * kHidden,
+                                                              kIntermediate, 32, options);
+
+    std::vector<float> x(static_cast<std::size_t>(kHidden) * kTokens);
+    fill_uniform(x, 41, -2.0F, 2.0F);
+    round_to_bf16(x);
+    const auto x_bits = encode(x);
+
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kTopK) * kTokens);
+    std::vector<float> routing(static_cast<std::size_t>(kTopK) * kTokens);
+    for (std::int32_t token = 0; token < kTokens; ++token) {
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::size_t at = static_cast<std::size_t>(rank) * kTokens + token;
+            ids[at]              = (rank + 2 * token) % kExperts;
+            routing[at]          = 0.3F + 0.2F * static_cast<float>(rank);
+        }
+    }
+
+    const auto reference = gemma_moe_experts_ref::run(x_bits, kHidden, kTokens, ids, routing,
+                                                      gate_up, down, kIntermediate, kTopK);
+
+    GuardedDeviceBuffer gate_up_device(gate_up.payload.size());
+    GuardedDeviceBuffer down_device(down.payload.size());
+    gate_up_device.copy_from_host(gate_up.payload.data(), gate_up_device.bytes());
+    down_device.copy_from_host(down.payload.data(), down_device.bytes());
+    GuardedDeviceBuffer x_device(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer ids_device(ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer routing_device(routing.size() * sizeof(float));
+    GuardedDeviceBuffer out_device(x_bits.size() * sizeof(std::uint16_t));
+    x_device.copy_from_host(x_bits.data(), x_device.bytes());
+    ids_device.copy_from_host(ids.data(), ids_device.bytes());
+    routing_device.copy_from_host(routing.data(), routing_device.bytes());
+
+    Tensor x_tensor(x_device.data(), DType::BF16, {kHidden, kTokens});
+    Tensor ids_tensor(ids_device.data(), DType::I32, {kTopK, kTokens});
+    Tensor routing_tensor(routing_device.data(), DType::FP32, {kTopK, kTokens});
+    Tensor out_tensor(out_device.data(), DType::BF16, {kHidden, kTokens});
+
+    ops::GemmaMoeExpertWeights weights;
+    weights.gate_up = gate_up.device_weight(gate_up_device.data());
+    weights.down    = down.device_weight(down_device.data());
+    const ops::GemmaMoeExpertGeometry geometry{kHidden, kExperts, kTopK, kIntermediate};
+
+    std::vector<std::uint16_t> poison(x_bits.size(), f32_to_bf16(-12345.0F));
+    out_device.copy_from_host(poison.data(), out_device.bytes());
+    ops::gemma_moe_experts(x_tensor, ids_tensor, routing_tensor, weights, geometry, out_tensor,
+                           nullptr);
+    cuda_synchronize();
+
+    const auto got = from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
+    int failures   = verify_pointwise("nvfp4 bank out", std::vector<double>(got.begin(), got.end()),
+                                      reference, kCriterion);
+    // Read only: the codes, scales and divisor planes come back exactly as they went in.
+    failures +=
+        verify_exact("nvfp4 gate_up preserved",
+                     from_device<std::uint8_t>(gate_up_device.data(),
+                                               static_cast<std::int64_t>(gate_up_device.bytes())),
+                     gate_up.payload);
+    failures +=
+        verify_exact("nvfp4 down preserved",
+                     from_device<std::uint8_t>(down_device.data(),
+                                               static_cast<std::int64_t>(down_device.bytes())),
+                     down.payload);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -186,12 +270,15 @@ int main() {
     try {
         failures += run_medium_case();
         failures += run_padding_case();
+        failures += run_nvfp4_case();
     } catch (const std::exception& error) {
         std::cerr << "gemma_moe_experts: " << error.what() << '\n';
         return 1;
     }
     if (failures == 0) {
-        std::cout << "OK: gemma_moe_experts matches its oracle and the padded width is inert\n";
+        std::cout << "OK: gemma_moe_experts matches its oracle over a BF16 bank, over the stored "
+                     "width with inert padding, and over a stacked NVFP4 bank whose per-source "
+                     "divisors matter\n";
     }
     return failures == 0 ? 0 : 1;
 }

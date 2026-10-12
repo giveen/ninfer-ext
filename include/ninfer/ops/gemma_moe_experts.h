@@ -37,8 +37,12 @@ namespace ninfer::ops {
  *   out             contiguous BF16 [H,T], completely overwritten.
  *
  * Supported domain:
- *   T >= 1, H >= 1, E >= 1, 1 <= K <= E, I >= 1. Both banks are BF16; a block-scaled bank profile
- * is a separate route, admitted when a recipe stores one.
+ *   T >= 1, H >= 1, E >= 1, 1 <= K <= E, I >= 1. Both banks are BF16, or both are NVFP4 in the
+ *   registered K16M128x4 block-scaled layout (N a multiple of 128 and K of 64, which the stored
+ *   padded widths satisfy), and the two banks share one format. An NVFP4 bank is a stack of
+ *   separately quantised source matrices, so it carries a weight divisor per source and a stored
+ *   value is `e2m1(codes) * e4m3(block scale) / divisor(row)` -- the same reading the offload MoE
+ *   route applies to its own stacked planes.
  *
  * Numeric:
  *   The activations are the represented BF16 values and the weights the exact decode of their
