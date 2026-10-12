@@ -50,6 +50,16 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                     reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
             return;
         }
+        if (aligned2 && d == 2816) {
+            // Gemma 4 26B-A4B's hidden row: 1408 pairs are exactly 11 per thread of a 128-thread
+            // CTA. The generic route took 5.6 us per decode row, seven of them a layer.
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 128, 11, true, 2816>
+                <<<static_cast<unsigned>(rows), 128, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
     }
     if constexpr (Epilogue == RmsEpilogue::Offset) {
         if (aligned2 && d == 256) {
