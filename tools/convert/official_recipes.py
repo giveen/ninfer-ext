@@ -665,7 +665,12 @@ def gemma4_26b_a4b_base(model, recipe, sources):
             continue
         if not parameter.projection:
             continue
-        if "/moe/experts/" in name or "/mlp/" in name:
+        if "/moe/experts/" in name:
+            # The experts are read by the MoE Op's own decoder, which computes in the represented
+            # activations: no linear route consumes them, so nothing grants A4 and none of them
+            # carries a calibration divisor.
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+        elif "/mlp/" in name:
             recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
         elif "/attention/" in name:
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")

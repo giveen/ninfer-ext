@@ -261,4 +261,20 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
 }
 
+GemmaMoeExpertWeights prepare_gemma_moe_expert_weights(std::span<const WeightInput> gate_up,
+                                                       std::span<const WeightInput> down) {
+    require(!gate_up.empty() && !down.empty(),
+            "gemma_moe_experts: both banks need at least one expert part");
+    const auto gate_up_bank = single(gate_up);
+    const auto down_bank    = single(down);
+    // The Op picks its bank reader from the format, so a block-scaled bank beside a BF16 one has no
+    // route behind it.
+    const auto format = gate_up_bank.weight.qtype;
+    require(format == down_bank.weight.qtype,
+            "gemma_moe_experts: the two banks must share one format");
+    require(format == QType::BF16 || format == QType::NVFP4,
+            "gemma_moe_experts: the banks must be BF16 or NVFP4");
+    return {gate_up_bank.weight, down_bank.weight};
+}
+
 } // namespace ninfer::ops

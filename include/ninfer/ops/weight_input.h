@@ -3,6 +3,7 @@
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "ninfer/ops/gemma_moe_experts.h"
 
 #include <optional>
 #include <span>
@@ -53,5 +54,13 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                            std::span<const WeightInput> expert_gate_up,
                            std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
                            const WeightInput& shared_up, const WeightInput& shared_down);
+
+// The two expert-major banks of a Gemma 4 MoE layer, from one part per expert per projection in
+// bank order: each bank becomes one contiguous Weight, so an expert is a fixed row range of it. The
+// parts must not grant A4: this Op decodes the stored codes itself and computes in the represented
+// activations, so no activation-quantised route consumes them and no calibration divisor exists.
+[[nodiscard]] GemmaMoeExpertWeights
+prepare_gemma_moe_expert_weights(std::span<const WeightInput> gate_up,
+                                 std::span<const WeightInput> down);
 
 } // namespace ninfer::ops

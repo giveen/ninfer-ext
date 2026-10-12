@@ -295,6 +295,27 @@ def test_nvfp4_without_an_a4_permission_warns_about_the_decode_only_route():
         recipe.prepare(device="cpu")
 
 
+def test_a_routed_expert_bank_is_not_warned_about_its_activation_policy():
+    """A routed-expert bank is read by a MoE Op, not by the linear routes.
+
+    The A16/A4 split the warning is about belongs to the linear Op: an A16Only input puts its
+    prefill chunks on the 32-token chunked weight-streaming route. An expert bank never reaches
+    that Op -- a MoE decoder reads its experts over the represented activations -- so its input
+    edge's policy costs nothing and must not be warned about, even at A16Only.
+    """
+
+    model = Model({"text": {"config": {}}})
+    source, _, _ = _encoded_source("up", 2.0)
+    name = "text/layers/0/moe/experts/0/up"
+    model.add(Parameter(name, source.shape, source, inputs=("input",)))
+    recipe = Recipe(model)
+    recipe.assign(name, format="nvfp4", method=import_encoded)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        recipe.prepare(device="cpu")
+    assert not [w for w in caught if "decode-only path at prefill" in str(w.message)]
+
+
 def test_unequal_nvfp4_sources_with_different_divisors_are_refused_at_plan_time():
     """A divisor per source addresses an equal share of the rows, so the sources must be equal.
 

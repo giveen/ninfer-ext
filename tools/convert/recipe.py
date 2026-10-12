@@ -294,7 +294,11 @@ class Recipe:
         offenders = sorted(
             name
             for name in self.selections
-            if any(selection.format == "nvfp4" for selection in self.selections[name])
+            # A routed-expert bank is not a linear projection: a MoE Op reads its experts directly,
+            # so its input edge's A16/A4 split is not the linear routes' and the warning below does
+            # not apply to it.
+            if "/moe/experts/" not in name
+            and any(selection.format == "nvfp4" for selection in self.selections[name])
             and any(
                 self.policies.get((name, input_name)) == "A16Only"
                 for input_name in self.model.parameters[name].inputs
