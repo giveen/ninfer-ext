@@ -203,6 +203,27 @@ measured saturated decodes. That is P0's last bullet.
   different shape *and* a different computation (parallel dense MLP, `per_expert_scale`, renormalized
   weights). Recommendation: a Gemma-specific op, following §5.1's precedent that Gemma keeps its own
   attention Ops rather than bending a shared route.
+- **Reference: the in-project Qwen3.6-35B-A3B MoE** (`ops::sparse_moe`, 256 experts, top-8). Its shape
+  decides the rest of P2 rather than leaving it to taste:
+  - **One `Weight` per bank, not one per expert.** `SparseMoeWeights` is `routed_gate_up` +
+    `routed_down`, and the wrapper validates them as one matrix each
+    (`kRoutedGateRows = kExperts * kExpertRows`, `kRoutedDownRows = kExperts * kHidden`). The artifact
+    side agrees: the binding documentation says the experts "keep the per-layer gate/up and down
+    parents, so an expert is a row range of its bank". The Gemma banks are therefore
+    `gate_up [128 * 1536, 2816]` (per expert: 768 gate rows then 768 up rows, which is the source's
+    own `[E, 2I, H]` order preserved) and `down [128 * 2816, 768]`.
+  - **`kExpertRows = 2 * kIntermediate`**: gate and up are interleaved per expert inside one bank.
+    Gemma's checkpoint already stores them that way, so the grouping needs no reordering.
+  - **The padded width is transparent.** The op works over the stored 768 and the zero rows and
+    columns are inert, so nothing downstream needs to know the checkpoint's 704.
+  - **Routes per regime**, each with its own plan: `decode/`, `prefill/`, `small_t/`. The Gemma route
+    starts with one correct route and splits when the performance phase asks for it.
+  - **Routing belongs to the Op's workspace**, not to the caller: `sparse_moe` keeps ids and alpha in
+    its own workspace tensors. `gemma_moe_router` currently exposes them as outputs, which is what the
+    qualification test wants; the fused layer Op may hold them internally instead.
+  - **The tie-break matches**: `sparse_moe_ranked_better` is
+    `a.value > b.value || (a.value == b.value && a.id < b.id)`, the same total order
+    `gemma_moe_router` implements and tests.
 - Shape it around the payoff: per decode token, stream **only the top-8 experts** (8 × 5.95 M ≈ 47.6 M
   params/layer), which is the whole reason this model exists. The expert weight layout must therefore
   be expert-major so a round reads 8 contiguous expert slabs.
