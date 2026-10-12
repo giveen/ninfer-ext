@@ -35,18 +35,26 @@ struct GlobalAttentionGeometry {
     AttentionGeometry shared;
     // Proportional RoPE: `rope_angles` frequencies taken against the full head width, so
     // `rotary_dim == 2 * rope_angles` dims rotate and the rest carry no rotation at all.
-    std::uint32_t rope_angles           = 0;
-    std::uint32_t denominator_head_dim  = 0;
+    std::uint32_t rope_angles          = 0;
+    std::uint32_t denominator_head_dim = 0;
 };
 
 enum class MixerKind : std::uint8_t { SlidingAttention, FullAttention };
 
 struct TextConfig {
-    Architecture architecture             = Architecture::Gemma4;
-    std::uint32_t hidden_size             = 0;
-    std::uint32_t intermediate_size       = 0;
-    std::uint32_t vocab_size              = 0;
-    std::uint32_t num_hidden_layers       = 0;
+    Architecture architecture       = Architecture::Gemma4;
+    std::uint32_t hidden_size       = 0;
+    std::uint32_t intermediate_size = 0;
+    // The MoE block (Gemma 4 26B-A4B, section 16 of the model reference): a router over
+    // `num_experts` that selects `top_k_experts` per token, whose routed expert MLP of width
+    // `moe_intermediate_size` runs in parallel with the dense MLP above. Every one of them is zero
+    // on the 31B, whose artifacts carry none of the members at all.
+    bool enable_moe_block               = false;
+    std::uint32_t num_experts           = 0;
+    std::uint32_t top_k_experts         = 0;
+    std::uint32_t moe_intermediate_size = 0;
+    std::uint32_t vocab_size            = 0;
+    std::uint32_t num_hidden_layers     = 0;
     // Query heads. The artifact's config names it and the loader's invariants used it, but nothing
     // downstream could read it until the weight bindings needed the query projection's row count.
     std::uint32_t num_attention_heads     = 0;
@@ -73,9 +81,9 @@ struct TextConfig {
     }
 };
 
-// The assistant drafter (the artifact's `mtp` component). It has no key or value projections: each of
-// its layers attends to the target's cache of the same kind, the target's last sliding layer and its
-// last global layer, so its attention geometry is the target's and only its widths are its own.
+// The assistant drafter (the artifact's `mtp` component). It has no key or value projections: each
+// of its layers attends to the target's cache of the same kind, the target's last sliding layer and
+// its last global layer, so its attention geometry is the target's and only its widths are its own.
 struct DraftConfig {
     std::uint32_t hidden_size          = 0;
     std::uint32_t intermediate_size    = 0;
