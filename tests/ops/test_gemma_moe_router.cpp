@@ -47,22 +47,6 @@ std::vector<std::uint16_t> constant_bits(std::size_t count, float value) {
     return encode(values);
 }
 
-// A 1-D BF16 weight, which the direct-weight helper only builds for matrices.
-Weight vector_weight(const void* data, std::int32_t extent) {
-    Weight weight{};
-    weight.payload         = data;
-    weight.payload_bytes   = static_cast<std::size_t>(extent) * sizeof(std::uint16_t);
-    weight.qtype           = QType::BF16;
-    weight.shape[0]        = extent;
-    weight.padded_shape[0] = extent;
-    weight.ndim            = 1;
-    weight.qdata           = data;
-    weight.n               = extent;
-    weight.k               = 1;
-    weight.layout          = QuantLayout::Contiguous;
-    return weight;
-}
-
 int run_case(const char* label, direct_bf16_weight::HostWeight router,
              const std::vector<std::uint16_t>& router_scale,
              const std::vector<std::uint16_t>& per_expert_scale,
@@ -91,8 +75,8 @@ int run_case(const char* label, direct_bf16_weight::HostWeight router,
 
     ops::GemmaMoeRouterWeights weights;
     weights.router           = router_device.view();
-    weights.router_scale     = vector_weight(router_scale_device.data(), hidden);
-    weights.per_expert_scale = vector_weight(expert_scale_device.data(), experts);
+    weights.router_scale     = Tensor(router_scale_device.data(), DType::BF16, {hidden});
+    weights.per_expert_scale = Tensor(expert_scale_device.data(), DType::BF16, {experts});
     const ops::GemmaMoeRouterGeometry geometry{hidden, experts, top_k, kEps};
 
     ops::gemma_moe_router(x_tensor, weights, geometry, ids_tensor, weights_tensor, nullptr);
