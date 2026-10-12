@@ -192,6 +192,11 @@ measured saturated decodes. That is P0's last bullet.
 - Evidence: conversion report + load smoke test; `tests/convert/` extended.
 
 ### P2 — The MoE route
+- **Landed**: the router and its selection are `ops::gemma_moe_router` — contract in
+  `include/ninfer/ops/gemma_moe_router.h`, kernel/launcher/wrapper in `src/ops/{kernel,launcher,wrapper}/`,
+  FP64 oracle in `tests/ops/gemma_moe_router_ref.h` and three cases in
+  `tests/ops/test_gemma_moe_router.cpp` (the stored geometry, an exact tie at the boundary, and the
+  renormalize-then-scale order). What remains here is the expert apply and the parallel combine.
 - **DECIDE**: a Gemma-specific MoE op, or generalizing `ops/wrapper/sparse_moe.cpp`. That op is
   specialized to Qwen4Exp's geometry by `constexpr` (`kHidden = 2048`, `kExperts = 256`,
   `kExpertRows = 1024`, `kIntermediate = 512`, a shared-expert bias row), and Gemma's layer is a
