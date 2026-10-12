@@ -4,11 +4,18 @@ import torch
 
 from dataclasses import replace
 
-from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax, nvfp4_mse
+from tools.convert.methods import (
+    fp8_row_maxabs,
+    import_encoded,
+    nvfp4_absmax,
+    nvfp4_mse,
+    q4_rows_qat,
+)
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
     gemma4_26b_a4b_base,
+    gemma4_26b_a4b_qat,
     qwen3_6_27b,
     qwen3_8_27b,
     qwen3_8_27b_bf16,
@@ -330,6 +337,7 @@ def _gemma4_26b_model() -> Model:
 
 def test_gemma4_26b_recipe_is_registered() -> None:
     assert RECIPES["gemma4_26b_a4b_base"] is gemma4_26b_a4b_base
+    assert RECIPES["gemma4_26b_a4b_qat"] is gemma4_26b_a4b_qat
 
 
 def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() -> None:
@@ -365,5 +373,20 @@ def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() 
         assert selection(name).format == "bf16", f"{name} must stay at the source precision"
 
     # Every expert bank becomes one parent, so an expert is a fixed row range of its bank.
+    grouped = {name for names, _ in recipe.explicit_groups for name in names}
+    assert grouped == {name for name in model.parameters if "/moe/experts/" in name}
+
+
+def test_gemma4_26b_qat_recipe_puts_only_the_experts_on_their_trained_grid() -> None:
+    model = _gemma4_26b_model()
+    recipe = Recipe(model)
+    gemma4_26b_a4b_qat(model, recipe, {})
+    layer = "text/layers/0"
+    for name in (f"{layer}/moe/experts/0/gate", f"{layer}/moe/experts/1/down"):
+        (selection,) = recipe.selections[name]
+        assert selection.format == "q4_g32_fp16_rows"
+        assert selection.method is q4_rows_qat
+    (dense,) = recipe.selections[f"{layer}/mlp/gate"]
+    assert dense.format == "q8_g32_fp16"
     grouped = {name for names, _ in recipe.explicit_groups for name in names}
     assert grouped == {name for name in model.parameters if "/moe/experts/" in name}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from tools.artifact.codecs.row_group import decode_row_group_words, encode_row_group
-from tools.convert.quantization.row_group import quantize_rows
+from tools.convert.quantization.row_group import quantize_rows, quantize_rows_on_grid
 
 FORMAT = "q4_g32_fp16_rows"
 
@@ -72,3 +72,45 @@ def test_streamed_row_group_conversion_round_trips_through_the_artifact(tmp_path
     expected = quantize_rows(source.float(), FORMAT, device="cpu")
     assert torch.equal(codes, expected.codes)
     assert torch.equal(scales.view(torch.int16), expected.scales.view(torch.int16))
+
+
+def test_grid_recovery_reproduces_a_learned_int4_grid_exactly() -> None:
+    # A QAT source: per group a learned step d and integer codes in [-8, 7] whose extremes need not
+    # reach -8 or 7, stored as BF16(d * k) -- the case max|x| / 7 gets wrong.
+    generator = torch.Generator().manual_seed(11)
+    n, k = 32, 256
+    steps = torch.exp(torch.empty(n, k // 32, 1).uniform_(-7.0, -4.0, generator=generator))
+    reach = torch.randint(3, 9, (n, k // 32, 1), generator=generator)
+    codes = torch.randint(-8, 8, (n, k // 32, 32), generator=generator)
+    codes = torch.maximum(torch.minimum(codes, reach - 1), -reach)
+    source = (codes.float() * steps).reshape(n, k).to(torch.bfloat16)
+    source[2] = 0.0
+    # One group on no 4-bit grid at all: the fallback still bounds its error.
+    source[4, :32] = torch.linspace(-1.0, 1.0, 32).to(torch.bfloat16) * 1e-2
+
+    quantized = quantize_rows_on_grid(source, FORMAT, device="cpu")
+    assert quantized.codes.dtype == torch.int8 and quantized.scales.dtype == torch.float16
+    assert int(quantized.codes.min()) >= -8 and int(quantized.codes.max()) <= 7
+    assert quantized.scales[2].tolist() == [0.0] * (k // 32)
+    restored = (
+        quantized.codes.float().reshape(n, k // 32, 32) * quantized.scales.float().unsqueeze(2)
+    ).reshape(n, k)
+    on_grid = torch.ones(n, k, dtype=torch.bool)
+    on_grid[4, :32] = False
+    # Every on-grid value comes back within one BF16 ulp: the step is exact, and only its binary16
+    # rounding can move the product across a BF16 rounding boundary.
+    words = lambda t: t.to(torch.bfloat16).view(torch.int16).int()  # noqa: E731
+    ulps = (words(restored) - words(source.float())).abs()[on_grid]
+    assert int(ulps.max()) <= 1
+
+    # The maxabs method, by contrast, lands far off the grid.
+    plain = quantize_rows(source.float(), FORMAT, device="cpu")
+    plain_restored = (
+        plain.codes.float().reshape(n, k // 32, 32) * plain.scales.float().unsqueeze(2)
+    ).reshape(n, k)
+    assert int((words(plain_restored) - words(source.float())).abs()[on_grid].max()) > 1
+    # The group on no grid takes the least-squares step, no worse than max|x| / 7.
+    target = source[4, :32].float()
+    assert float(((restored[4, :32] - target) ** 2).sum()) <= float(
+        ((plain_restored[4, :32] - target) ** 2).sum()
+    )
