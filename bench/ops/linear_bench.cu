@@ -46,8 +46,8 @@ constexpr double kRtx5090SustainedReadGBs = 1674.5;
 // NVIDIA's GB202 table reports dense/sparse pairs at boost clock. Keep input and accumulator
 // precision explicit for the qualified Tensor Core routes below.
 constexpr double kRtx5090Fp8Fp16AccumulateTFLOPs  = 838.0;
-constexpr double kRtx5090Fp8Fp32AccumulateTFLOPs  = 419.0;
-constexpr double kRtx5090Bf16Fp32AccumulateTFLOPs = 209.5;
+constexpr double kRtx5090Fp8Fp32AccumulateTFLOPs  = bench::kMmaFp8BlockScaleTflops;
+constexpr double kRtx5090Bf16Fp32AccumulateTFLOPs = bench::kMmaBf16F32AccumTflops;
 constexpr std::uint64_t kDefaultFlushBytes        = 256ULL << 20;
 constexpr int kDefaultWarmup                      = 3;
 constexpr int kDefaultRepeat                      = 20;

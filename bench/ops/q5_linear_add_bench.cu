@@ -36,7 +36,7 @@ constexpr int kDefaultRepeat           = 50;
 constexpr double kDramSpecGBs          = 1792.0;
 // NVIDIA's GB202 table reports dense/sparse pairs at boost clock; keep the accumulator precision
 // explicit. SIMT and split-K routes report no Tensor Core ratio.
-constexpr double kBf16Fp32AccumulateTFLOPs = 209.5;
+constexpr double kBf16Fp32AccumulateTFLOPs = bench::kMmaBf16F32AccumTflops;
 
 struct Options {
     std::int32_t hidden = 0;
@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
             const std::size_t residual_bytes = static_cast<std::size_t>(kRows) * tokens * 2;
             const auto restore               = [&](cudaStream_t prepare_stream) {
                 CUDA_CHECK(cudaMemcpyAsync(residual.p, residual_init.p, residual_bytes,
-                                                         cudaMemcpyDeviceToDevice, prepare_stream));
+                                           cudaMemcpyDeviceToDevice, prepare_stream));
             };
             const auto body = [&](cudaStream_t launch_stream) {
                 ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,

@@ -34,7 +34,7 @@ constexpr std::int32_t kHeads   = 16;
 constexpr float kScale          = 0.11785113019775792073F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kHeads, kHeads};
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
+constexpr double kDenseBf16TcTflops = bench::kMmaBf16F32AccumTflops;
 constexpr double kRtx5090DramGBs    = 1792.0;
 
 enum class Entry : std::uint8_t { Uniform, Packed, Both };
