@@ -848,6 +848,17 @@ their own `MoeWeights`.
 - **A routed expert bank is read, never fed to a linear route**, so its input edge is `A16Only` and
   it carries no activation divisor — the one permission by which the 26B's expert banks differ from
   its dense MLP.
+- **A quantized linear route resolves its geometry from a fixed registry of hand-tuned shape files**
+  (`src/ops/linear/<format>/<format>_dispatch.cpp`), and the FP8, NVFP4, Q4–Q6 and BF16 registries
+  hold only the Qwen and 31B geometries. The row-split int8 route is the only one whose registry
+  carries a generic selector (`select_q8_generic`, already used by the EAGLE3 drafter and the vision
+  tower), so every 26B projection a linear route touches is `q8_g32_fp16`: the fused qkv parent and
+  its query/key/value slices at both head widths, the attention output at both, the dense MLP's
+  gate/up and down, and the tied head. The same ten shapes are in `test_q8_a16.cpp`'s geometry table,
+  where the T sweep meets the FP64 oracle. The routed experts are again the exception, because no
+  linear route sees them: they keep NVFP4, and they are the only part of this model that spends four
+  bits on this pass. Registering NVFP4 shapes for the dense MLP is what closes that difference, and
+  it is a P5 item rather than a P3 one.
 - **The padded width is inert**: the zero gate/up rows and matching zero down columns of §16.1 cannot
   contribute, because GeGLU maps zero to zero. The expert test pins this rather than assuming it.
 - **The MoE branch adds no large scratch.** It reuses the dense branch's `[H,T]` buffers in place —
