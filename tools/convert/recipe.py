@@ -8,6 +8,8 @@ from fnmatch import fnmatchcase
 from math import prod
 from typing import Sequence
 
+import warnings
+
 import torch
 
 from tools.artifact.layouts import encoded_size
@@ -278,7 +280,37 @@ class Recipe:
         self.aliases[parameter] = target
         self.selections[parameter] = list(self.selections[target])
 
+    def _warn_nvfp4_activation_policies(self) -> None:
+        """Warn about an NVFP4 projection whose inputs may not use A4.
+
+        The registered NVFP4 shapes route to the A4 kernel from 8 tokens up and to a
+        32-token-chunked weight-streaming A16 kernel below it, so an A16Only input makes every
+        prefill chunk of that projection take the decode-only path: measured 28.8 ms against
+        0.59 ms for the same 4096-token `N=5120 K=17408` projection, and prefill always runs
+        chunks far above 8 tokens. The engine serves this configuration, so it is a warning
+        rather than a refusal; a policy is a permission, not a mandate, and granting it here is
+        the only way the A4 route can be taken.
+        """
+        offenders = sorted(
+            name
+            for name in self.selections
+            if any(selection.format == "nvfp4" for selection in self.selections[name])
+            and any(
+                self.policies.get((name, input_name)) == "A16Only"
+                for input_name in self.model.parameters[name].inputs
+            )
+        )
+        if offenders:
+            warnings.warn(
+                "nvfp4 weights with an A16Only input policy run the decode-only path at prefill: "
+                + ", ".join(offenders)
+                + ' (pass activation_policy="AllowA4" on their inputs)',
+                UserWarning,
+                stacklevel=2,
+            )
+
     def prepare(self, *, device="cuda", rows_per_chunk=512) -> PreparedRecipe:
+        self._warn_nvfp4_activation_policies()
         weights = []
         fragments = {name: [] for name in self.selections}
         auxiliary_values = dict(self.auxiliary_overrides)

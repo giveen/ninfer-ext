@@ -35,6 +35,23 @@ namespace ninfer::bench {
 
 constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
 
+// Tensor-core instruction ceilings on RTX 5090 (sm_120a), in TFLOP/s. Measured by
+// bench/ops/mma_peak_bench.cu with a register-only MMA loop: no memory traffic and no epilogue,
+// so these bound the tensor pipe alone. Rank an Op against the ceiling of the form it issues,
+// not against a vendor library's achieved rate.
+//
+// On this part the plain FP8 form pays a half-rate FP32-accumulate penalty that the block-scaled
+// kind::mxf8f6f4 form does not, which is why the block-scaled figure is 1.88x the plain one and
+// why the A8 route (block-scaled) must not be ranked against the plain form's number.
+constexpr double kMmaBf16F32AccumTflops =
+    262.7; // mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+constexpr double kMmaFp8PlainF32AccumTflops =
+    515.2; // mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+constexpr double kMmaFp8BlockScaleTflops =
+    970.0; // kind::mxf8f6f4 block_scale scale_vec::1X m16n8k32
+constexpr double kMmaNvfp4BlockScaleTflops =
+    2100.8; // kind::mxf4nvf4 block_scale scale_vec::4X m16n8k64
+
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
     std::memcpy(&u, &f, 4);
@@ -415,15 +432,13 @@ inline void print_result(const char* tag, const Result& r) {
 // argv);` keeps the call sites `next("--flag")` unchanged.
 inline auto required_argument(int& index, int argc, char** argv) {
     return [&index, argc, argv](const char* label) -> std::string_view {
-        if (++index >= argc) {
-            throw std::invalid_argument(std::string("missing ") + label);
-        }
+        if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
         return argv[index];
     };
 }
 
-// Parse a comma-separated list of positive int32 values, e.g. a T sweep "1,4,8,16". `flag` names the
-// option in the error.
+// Parse a comma-separated list of positive int32 values, e.g. a T sweep "1,4,8,16". `flag` names
+// the option in the error.
 inline std::vector<std::int32_t> parse_i32_list(std::string_view raw, const char* flag) {
     std::vector<std::int32_t> result;
     std::size_t begin = 0;

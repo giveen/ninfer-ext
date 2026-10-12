@@ -43,6 +43,7 @@ struct Result {
     bench::ColdTiming timing;
     double effective_gbs;
     double useful_tflops;
+    double tensor_percent;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -99,18 +100,30 @@ const char* policy_name(ops::LinearPolicy policy) {
     return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
 }
 
+// Ceiling the point is ranked against, or 0 for "no percentage". The A4 route issues the
+// block-scaled kind::mxf4nvf4 MMA; the A16 route dequantizes into the bf16 MMA. Below these
+// extents the Op streams the weight for too few tokens to fill the tensor pipe, so its time is
+// bandwidth and a tensor-core percentage would not mean anything.
+double mma_peak_tflops(ops::LinearPolicy policy, std::int32_t tokens) {
+    if (policy == ops::LinearPolicy::AllowA4) {
+        return tokens >= 4 ? bench::kMmaNvfp4BlockScaleTflops : 0.0;
+    }
+    return tokens >= 2 ? bench::kMmaBf16F32AccumTflops : 0.0;
+}
+
 void write_csv(const Options& options, const std::vector<Result>& results,
                std::uint64_t weight_bytes) {
     if (options.csv_out.empty()) { return; }
     std::ofstream out = bench::open_csv(options.csv_out);
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
-           "useful_tflops,warmup,repeat,flush_bytes\n";
+           "useful_tflops,tensor_peak_percent,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << "linear_add,NVFP4," << policy_name(options.policy) << ',' << options.n << ','
             << options.k << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
-            << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
-            << ',' << options.repeat << ',' << kFlushBytes << '\n';
+            << ',' << result.effective_gbs << ',' << result.useful_tflops << ','
+            << result.tensor_percent << ',' << options.warmup << ',' << options.repeat << ','
+            << kFlushBytes << '\n';
     }
 }
 
@@ -118,10 +131,10 @@ void write_csv(const Options& options, const std::vector<Result>& results,
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse_options(argc, argv);
+        const Options options    = parse_options(argc, argv);
         const std::int32_t max_t = *std::ranges::max_element(options.t_sweep);
         const std::int32_t min_t = *std::ranges::min_element(options.t_sweep);
-        cudaStream_t stream = nullptr;
+        cudaStream_t stream      = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t);
@@ -162,23 +175,34 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
-        std::printf("%-11s %3s %8s %8s %6s %11s %11s %11s %10s %10s\n", "op", "pol", "N", "K", "T",
-                    "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s");
+        std::printf("%-11s %3s %8s %8s %6s %11s %11s %11s %10s %10s %8s\n", "op", "pol", "N", "K",
+                    "T", "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.t_sweep) {
             const auto launch = make_launch(tokens);
             const bench::ColdTiming timing =
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
-            const double seconds      = timing.median_us * 1.0e-6;
-            const double useful_flops = 2.0 * static_cast<double>(options.n) * options.k * tokens;
-            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +
-                                       2.0 * static_cast<double>(options.k) * tokens +
-                                       4.0 * static_cast<double>(options.n) * tokens;
+            const double seconds       = timing.median_us * 1.0e-6;
+            const double useful_flops  = 2.0 * static_cast<double>(options.n) * options.k * tokens;
+            const double model_bytes   = static_cast<double>(packed.model_weight_bytes()) +
+                                         2.0 * static_cast<double>(options.k) * tokens +
+                                         4.0 * static_cast<double>(options.n) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
-            std::printf("%-11s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n", "linear_add",
-                        policy_name(options.policy), options.n, options.k, tokens, timing.median_us,
-                        timing.min_us, timing.p95_us, effective_gbs, useful_tflops);
-            results.push_back({tokens, timing, effective_gbs, useful_tflops});
+            const double peak_tflops   = mma_peak_tflops(options.policy, tokens);
+            const double tensor_percent =
+                peak_tflops > 0.0 ? 100.0 * useful_tflops / peak_tflops : 0.0;
+            if (tensor_percent > 0.0) {
+                std::printf("%-11s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",
+                            "linear_add", policy_name(options.policy), options.n, options.k, tokens,
+                            timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
+                            useful_tflops, tensor_percent);
+            } else {
+                std::printf("%-11s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8s\n",
+                            "linear_add", policy_name(options.policy), options.n, options.k, tokens,
+                            timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
+                            useful_tflops, "-");
+            }
+            results.push_back({tokens, timing, effective_gbs, useful_tflops, tensor_percent});
         }
         write_csv(options, results, packed.model_weight_bytes());
         CUDA_CHECK(cudaStreamDestroy(stream));

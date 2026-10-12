@@ -37,7 +37,7 @@ constexpr std::int32_t kKvHeads    = 8;
 constexpr float kScale             = 0.08838834764831844055F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
+constexpr double kDenseBf16TcTflops = bench::kMmaBf16F32AccumTflops;
 constexpr double kRtx5090DramGBs    = 1792.0;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };

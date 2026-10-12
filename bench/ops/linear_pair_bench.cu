@@ -30,7 +30,7 @@ constexpr std::int32_t kFirstRow    = 4096;
 constexpr std::int32_t kSecondRow   = 5120;
 constexpr std::int32_t kRows        = 1024;
 constexpr double kRtx5090ReadGBs    = 1674.5;
-constexpr double kRtx5090Bf16Tflops = 209.5;
+constexpr double kRtx5090Bf16Tflops = bench::kMmaBf16F32AccumTflops;
 
 enum class Execution : std::uint8_t { Eager, Graph };
 
@@ -99,7 +99,7 @@ std::vector<std::int32_t> parse_sweep(std::string_view text) {
     const std::int32_t begin = parse_positive_i32(text.substr(0, first), "sweep start");
     const std::int32_t end   = parse_positive_i32(
         text.substr(first + 1, second == std::string_view::npos ? text.size() - first - 1
-                                                                  : second - first - 1),
+                                                                : second - first - 1),
         "sweep end");
     const std::int32_t step = second == std::string_view::npos
                                   ? 1
@@ -187,7 +187,7 @@ double useful_flops(std::int32_t k, std::int32_t tokens) {
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse_options(argc, argv);
+        const Options options             = parse_options(argc, argv);
         const std::int32_t maximum_tokens = *std::ranges::max_element(options.tokens);
 
         int device = 0;

@@ -27,9 +27,9 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kRows            = 5120;
-constexpr std::size_t kFlushBytes       = 256ULL << 20;
-constexpr double kFp8Fp32AccumulatePeak = 419.0;
+constexpr std::int32_t kRows        = 5120;
+constexpr std::size_t kFlushBytes   = 256ULL << 20;
+constexpr double kFp8BlockScalePeak = bench::kMmaFp8BlockScaleTflops;
 
 struct Options {
     std::int32_t k           = 0;
@@ -169,21 +169,21 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
-        std::printf("# fp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n", kFp8Fp32AccumulatePeak);
+        std::printf("# fp8_block_scale_peak_tflops=%.1f cache=cold\n", kFp8BlockScalePeak);
         std::printf("%-4s %8s %8s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "N", "K", "T",
                     "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.t_sweep) {
             const bench::ColdTiming timing = bench::measure_cold_launch(
                 [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush, stream,
                 options.warmup, options.repeat);
-            const double seconds = timing.median_us * 1.0e-6;
-            const double flops   = 2.0 * static_cast<double>(kRows) * options.k * tokens;
-            const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
-                                 2.0 * static_cast<double>(options.k) * tokens +
-                                 4.0 * static_cast<double>(kRows) * tokens;
+            const double seconds        = timing.median_us * 1.0e-6;
+            const double flops          = 2.0 * static_cast<double>(kRows) * options.k * tokens;
+            const double bytes          = static_cast<double>(packed.model_weight_bytes()) +
+                                          2.0 * static_cast<double>(options.k) * tokens +
+                                          4.0 * static_cast<double>(kRows) * tokens;
             const double tflops         = flops / seconds / 1.0e12;
             const double tensor_percent = uses_tensor_cores(options, tokens)
-                                              ? 100.0 * tflops / kFp8Fp32AccumulatePeak
+                                              ? 100.0 * tflops / kFp8BlockScalePeak
                                               : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {
                 std::printf("%-4s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",

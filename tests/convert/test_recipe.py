@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import warnings
 from dataclasses import replace
 
 import pytest
@@ -265,6 +266,33 @@ def test_sources_sharing_one_nvfp4_divisor_stay_at_one_divisor():
     recipe.group(("gate", "up"))
     prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
     assert prepared.weights[0].spec.divisors == 1
+
+
+def test_nvfp4_without_an_a4_permission_warns_about_the_decode_only_route():
+    """An A16Only NVFP4 projection is served, but prefill pays the 32-token chunked A16 route.
+
+    The A4 kernel is only reachable from 8 tokens up, so an A16Only input puts every prefill
+    chunk of that projection on the decode-only path (28.8 ms against 0.59 ms for the same
+    4096-token N=5120 K=17408 projection). Permitting A4 silences the warning.
+    """
+
+    model = Model({"text": {"config": {}}})
+    source, _, _ = _encoded_source("gate", 2.0)
+    model.add(Parameter("gate", source.shape, source, inputs=("input",)))
+    recipe = Recipe(model)
+    recipe.assign("gate", format="nvfp4", method=import_encoded)
+    with pytest.warns(UserWarning, match="decode-only path at prefill"):
+        recipe.prepare(device="cpu")
+
+    recipe.use(
+        "gate",
+        "input",
+        activation_policy="AllowA4",
+        auxiliaries={"activation_input_divisor": 3.0},
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        recipe.prepare(device="cpu")
 
 
 def test_unequal_nvfp4_sources_with_different_divisors_are_refused_at_plan_time():
