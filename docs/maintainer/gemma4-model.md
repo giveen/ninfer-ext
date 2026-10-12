@@ -711,3 +711,115 @@ Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and `common/parsers/gemm
 |---|---|
 | Compact global KV rounding at 128K/256K | the Op criterion at those lengths; separate K/V rows (+60% global KV) if it fails |
 | A fused sublayer boundary (post-norm + residual + scalar + next pre-norm) | an attempt was reverted after elements at small cancelling values deviated by up to 0.7% with a scalar ≠ 1; compare the fp32 `inv` and residual sum against FP64 directly before retrying |
+
+## 16. Gemma 4 26B-A4B (the MoE variant)
+
+**Status.** Planned, not executed: the work is on branch `gemma4-26b` and its phases are in
+`docs/maintainer/gemma4-26b-plan.md`. Sections 1–15 remain the 31B authority and this section is the
+26B one; where they differ, this section wins for the 26B.
+
+### 16.1 Configuration
+
+Measured from `/mnt/storage/models/gemma/26b-full` (`config.json`, `model.safetensors.index.json`, and
+the safetensors headers of both shards): `Gemma4ForConditionalGeneration`, QAT-trained, BF16,
+26,544,131,376 parameters, 1,013 tensors. Text lives under `model.language_model.`, the vision tower
+(355 tensors, 27 layers) and the audio config are out of scope exactly as in §1.
+
+| field | value |
+|---|---|
+| layers | 30; `full_attention` at 5, 11, 17, 23, 29, `sliding_attention` elsewhere |
+| widths | hidden 2816, dense FFN 2112, sliding window 1024 |
+| MoE | `enable_moe_block: true`, 128 experts, `top_k_experts: 8`, `moe_intermediate_size: 704` |
+| attention | 16 query heads; 8 KV heads at head_dim 256 on sliding layers, 2 KV heads at 512 on global ones |
+| RoPE | unchanged from §4/§5: sliding default θ=10000, global proportional θ=10⁶ with factor 0.25 |
+| vocab / softcap | 262144, tied head, `final_logit_softcapping: 30.0` |
+| per-layer input | `hidden_size_per_layer_input: 0`, i.e. §3's per-layer-input branch is dead |
+| KV sharing | `num_kv_shared_layers: 0` on the target |
+
+Parameter split: the experts are 761 M per layer, 22.8 B of the 26.5 B total (86 %), ≈3.6 B active per
+token at top-8. Tensor shapes and dtypes (BF16 throughout the source):
+
+| role | shape |
+|---|---|
+| `layers.N.experts.gate_up_proj` | `[128, 1408, 2816]` — gate and up fused, in that order |
+| `layers.N.experts.down_proj` | `[128, 2816, 704]` |
+| `layers.N.router.proj.weight` | `[128, 2816]` |
+| `layers.N.router.scale` | `[2816]` |
+| `layers.N.router.per_expert_scale` | `[128]` |
+| `layers.N.mlp.{gate,up}_proj` | `[2112, 2816]`, `down_proj` `[2816, 2112]` |
+| norms | six per layer, all `[2816]`: `input`, `post_attention`, `pre_feedforward`, `post_feedforward`, `pre_feedforward_layernorm_2`, `post_feedforward_layernorm_1`, `post_feedforward_layernorm_2` |
+| `layer_scalar` | `[1]` per layer, as §3 |
+
+`self_attn.v_proj` exists on sliding layers only, as in §1: the global layers are K = V.
+
+### 16.2 The decoder layer with MoE
+
+Everything outside the FFN is §3. The FFN becomes two parallel branches whose outputs are summed:
+
+```text
+residual = h
+h1 = mlp(pre_feedforward_layernorm(h))                  # dense MLP, I = 2112
+if enable_moe_block:
+    h1 = post_feedforward_layernorm_1(h1)               # norm on the DENSE branch
+    _, w, idx = router(residual)                        # router reads the PRE-FFN residual
+    h2 = pre_feedforward_layernorm_2(residual)          # experts read the PRE-FFN residual
+    h2 = experts(h2, idx, w)
+    h2 = post_feedforward_layernorm_2(h2)               # norm on the MoE branch
+    h = h1 + h2                                         # plain sum, in the output dtype
+h = post_feedforward_layernorm(h)                       # shared norm on the sum
+h = residual + h
+h *= layer_scalar
+```
+
+Router:
+
+```text
+s  = rmsnorm_weightless(x) · router.scale · H^(-1/2)     # H is hidden 2816; the exponent is a constant
+p  = softmax(router.proj(s))                             # [T, 128], no bias
+(w, idx) = topk(p, k=8);  w = w / w.sum(-1)              # renormalize BEFORE the per-expert scale
+w  = w * router.per_expert_scale[idx]
+```
+
+Experts, per expert hit by any token:
+
+```text
+gate, up = linear(x, gate_up_proj[e]).chunk(2, dim=-1)   # [0] is gate
+y = gelu_tanh(gate) * up
+y = linear(y, down_proj[e]) · w[token, slot]
+out[token] += y
+```
+
+Two details that no amount of spot-checking catches, and each needs its own oracle case:
+
+1. **The router and the experts read the pre-FFN residual**, not the normalized MLP input. The dense
+   branch's `pre_feedforward_layernorm` and the experts' `pre_feedforward_layernorm_2` are different
+   tensors applied to different values.
+2. **The top-k weights are renormalized to sum to 1 before `per_expert_scale` is applied**, so the
+   applied weights do not sum to 1 in general.
+
+The eight expert outputs are summed in the output dtype (BF16 in the checkpoint's own reference and in
+both sibling engines). FP32 accumulation is a deliberate deviation this engine may choose; it is a
+numerical-semantics boundary and needs its own criterion rather than being assumed.
+
+### 16.3 What the siblings settle
+
+Checked against transformers **v5.6.2** `modeling_gemma4.py` (the version the checkpoint declares;
+`Gemma4TextRouter` / `Gemma4TextExperts` / `Gemma4TextDecoderLayer`), llama.cpp's
+`src/models/gemma4.cpp` (its `LLM_TYPE_26B_A4B` path, 30 layers), and gewell's
+`src/models/gemma4/26b_a4b/sm120/moe.cu`:
+
+- The fused `[E, 2·I, H]` expert tensor and its gate-then-up chunk order are confirmed by all three.
+- llama.cpp's expert path uses exactly this norm structure (`ffn_norm`, `ffn_post_norm`,
+  `ffn_pre_norm_2`, `ffn_post_norm_1`, `ffn_post_norm_2`), normalizes the MoE input from the
+  post-attention residual, and computes the router as `rms_norm(residual) · (1/√n_embd) ·
+  ffn_gate_inp_s`, then softmax with `norm_topk_prob` set — the same order as §16.2.
+- llama.cpp loads the per-expert scale as `down_exps_s`, i.e. it scales the expert output rather than
+  the stored weight; that is the same arithmetic as multiplying the reduced weight.
+- gewell computes `p/sum(p) * per_expert_scale[idx]` in that order and breaks top-k ties on the
+  **lower expert index**, so the tie-break is part of the observable contract.
+- gewell's routed GEMM is a CUTLASS grouped block-scaled NVFP4 kernel at tile 128×128×128 with
+  cluster 1×1, plus a separate hand-written 16×64 tiled path for thin decode.
+- The assistant's `num_centroids` / `centroid_intermediate_top_k` / `use_ordered_embeddings` fields
+  have no consumer in either sibling's 26B drafter, consistent with `use_ordered_embeddings: false`;
+  confirm against this project's own 31B `mtp` component before landing the 26B drafter.
+
