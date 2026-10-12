@@ -53,7 +53,7 @@ ninfer_add_test(ninfer_qwen3_5_state_image_layout_test
 
 ninfer_add_test(ninfer_qwen3_5_context_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_store.cpp"
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
 set_tests_properties(
   ninfer_qwen3_5_context_store_test

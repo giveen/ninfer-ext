@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -12,6 +13,7 @@
 #include <exception>
 #include <iostream>
 #include <new>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -40,6 +42,37 @@ std::vector<std::int32_t> read_block_table(const ninfer::KVExecutionTablePool& t
     CUDA_CHECK(cudaMemcpy(values.data(), source.data, values.size() * sizeof(std::int32_t),
                           cudaMemcpyDeviceToHost));
     return values;
+}
+
+void test_resource_difference_diagnostic() {
+    const store::PhysicalResources value{
+        .device = {.active_lanes = 2, .state_slots = 3, .main_kv_pages = 9, .backend_kv_pages = 4},
+        .host   = {.state_slots = 1, .kv_bytes = 512},
+    };
+    const store::PhysicalResources removed{
+        .device = {.active_lanes = 1, .state_slots = 1, .main_kv_pages = 2, .backend_kv_pages = 4},
+        .host   = {.state_slots = 0, .kv_bytes = 12},
+    };
+    const store::PhysicalResources difference = store::checked_resource_difference(value, removed);
+    expect(difference.device.active_lanes == 1 && difference.device.main_kv_pages == 7 &&
+               difference.host.kv_bytes == 500,
+           "resource difference subtracts every field");
+
+    // An underflow must name the desynchronised field and both operands, so a production failure is
+    // diagnosable from the log alone.
+    const store::PhysicalResources over{.device = {.backend_kv_pages = 5},
+                                        .host   = {.kv_bytes = 13}};
+    try {
+        (void)store::checked_resource_difference(value, over);
+        expect(false, "resource subtraction underflow is reported");
+    } catch (const std::logic_error& error) {
+        const std::string_view message = error.what();
+        expect(message.find("device.backend_kv_pages") != std::string_view::npos,
+               "underflow names the offending field");
+        expect(message.find("value=4") != std::string_view::npos &&
+                   message.find("removed=5") != std::string_view::npos,
+               "underflow reports the value and the removal");
+    }
 }
 
 void test_state_store(ninfer::DeviceContext& device) {
@@ -853,6 +886,7 @@ int main() {
 
     try {
         ninfer::DeviceContext device(0);
+        test_resource_difference_diagnostic();
         test_state_store(device);
         test_kv_store(device);
         test_kv_demotion(device);

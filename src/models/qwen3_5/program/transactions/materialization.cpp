@@ -468,8 +468,7 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         throw std::logic_error("consumed materialization source is incomplete");
     }
 
-    const detail::PhysicalResources before = owner_exclusive_resources(source);
-    const auto retained_state              = [&](StateImageHandle handle) {
+    const auto retained_state = [&](StateImageHandle handle) {
         if (source.endpoint_valid && source.state.read == handle) { return true; }
         if (source.rewrite_state && *source.rewrite_state == handle) { return true; }
         return std::ranges::any_of(source.long_anchors, [&](const LongAnchorCheckpoint& anchor) {
@@ -597,10 +596,11 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
-
-    const detail::PhysicalResources after   = owner_exclusive_resources(source);
-    const detail::PhysicalResources removed = checked_resource_difference(before, after);
-    (void)checked_resource_difference(details.demand.final_removed, removed);
+    // The source's exclusive resource set is not a monotone measure of this consumption: a page
+    // counts only while this address is its sole referrer, and another owner releasing a reference
+    // (a completion, a checkpoint replacement, or a pressure victim's checkpoint drop) raises the
+    // count between planning and preparation. The plan's predicted removal is therefore not an
+    // invariant here; the transaction publishes the physical results of the releases above.
 }
 
 void ProgramImpl::prepare_materialization(MaterializationTransaction& transaction) {
