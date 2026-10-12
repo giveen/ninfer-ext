@@ -76,6 +76,7 @@ void gemma_moe_router(const Tensor& x, const GemmaMoeRouterWeights& weights,
     }
     if (!aligned16(weights.router.payload)) { fail("router must be 16-byte aligned"); }
     require_vector(weights.router_scale, hidden, "router_scale");
+    if (!aligned16(weights.router_scale.data)) { fail("router_scale must be 16-byte aligned"); }
     require_vector(weights.per_expert_scale, experts, "per_expert_scale");
 
     if (expert_ids.dtype != DType::I32) { fail("expert_ids must be I32"); }
