@@ -20,7 +20,7 @@
 
 namespace ninfer::ops::detail {
 
-// A BF16 bank: the stored element is the value.
+// A BF16 bank: the stored element is the value, and there is no source divisor to apply.
 struct Bf16BankReader {
     const __nv_bfloat16* values;
     int columns;
@@ -28,12 +28,15 @@ struct Bf16BankReader {
     __device__ __forceinline__ float operator()(int row, int column) const {
         return __bfloat162float(values[static_cast<std::size_t>(row) * columns + column]);
     }
+
+    __device__ __forceinline__ float row_scale(int) const { return 1.0F; }
 };
 
 // An NVFP4 bank: 4-bit e2m1 codes two per byte along the columns, one e4m3 scale per 16-element
 // block in the K16M128x4 tiling, and the weight divisor of the source matrix the row belongs to.
-// The divisor is applied exactly as the offload MoE route applies its stacked sources':
-// `value * (1 / divisors[row / divisor_rows])`.
+// The divisor is constant along a row, so `row_scale` hands it back once per row and the caller
+// multiplies the row's finished sum by it -- the same arithmetic with one load and one reciprocal
+// per row instead of per element.
 struct Nvfp4BankReader {
     const std::uint8_t* codes;
     const std::uint8_t* scales;
@@ -47,7 +50,11 @@ struct Nvfp4BankReader {
         const float2 pair        = decode_nvfp4_e2m1x2(codes[code_offset]);
         const float code         = (column & 1) == 0 ? pair.x : pair.y;
         const std::uint8_t scale = scales[nvfp4_scale_byte_runtime(row, column / 16, columns / 64)];
-        return code * decode_nvfp4_e4m3(scale) * __frcp_rn(divisors[row / divisor_rows]);
+        return code * decode_nvfp4_e4m3(scale);
+    }
+
+    __device__ __forceinline__ float row_scale(int row) const {
+        return __frcp_rn(divisors[row / divisor_rows]);
     }
 };
 
@@ -81,15 +88,39 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
         const int gate_base = expert * 2 * intermediate;
         const int up_base   = gate_base + intermediate;
         for (int i = threadIdx.x; i < intermediate; i += blockDim.x) {
-            float g = 0.0F;
-            float u = 0.0F;
-            for (int h = 0; h < hidden; ++h) {
-                const float value = activation[h];
-                g += gate_up(gate_base + i, h) * value;
-                u += gate_up(up_base + i, h) * value;
+            const int gate_row = gate_base + i;
+            const int up_row   = up_base + i;
+            // Four independent partial sums per matrix. This loop is latency-bound on scattered
+            // bank loads -- the serial chain would be a few cycles per element, and the measurement
+            // is tens
+            // -- so what fills the memory pipeline is having four loads in flight, not the
+            // arithmetic.
+            float g0 = 0.0F, g1 = 0.0F, g2 = 0.0F, g3 = 0.0F;
+            float u0 = 0.0F, u1 = 0.0F, u2 = 0.0F, u3 = 0.0F;
+            int h = 0;
+            for (; h + 4 <= hidden; h += 4) {
+                const float v0 = activation[h];
+                const float v1 = activation[h + 1];
+                const float v2 = activation[h + 2];
+                const float v3 = activation[h + 3];
+                g0 += gate_up(gate_row, h) * v0;
+                g1 += gate_up(gate_row, h + 1) * v1;
+                g2 += gate_up(gate_row, h + 2) * v2;
+                g3 += gate_up(gate_row, h + 3) * v3;
+                u0 += gate_up(up_row, h) * v0;
+                u1 += gate_up(up_row, h + 1) * v1;
+                u2 += gate_up(up_row, h + 2) * v2;
+                u3 += gate_up(up_row, h + 3) * v3;
             }
-            gate[i] = g;
-            up[i]   = u;
+            float g = (g0 + g1) + (g2 + g3);
+            float u = (u0 + u1) + (u2 + u3);
+            for (; h < hidden; ++h) {
+                const float value = activation[h];
+                g += gate_up(gate_row, h) * value;
+                u += gate_up(up_row, h) * value;
+            }
+            gate[i] = g * gate_up.row_scale(gate_row);
+            up[i]   = u * gate_up.row_scale(up_row);
         }
         __syncthreads();
         for (int i = threadIdx.x; i < intermediate; i += blockDim.x) {
@@ -100,9 +131,22 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
         // Expert e's down rows are [e*H, (e+1)*H), each of the stored intermediate width.
         const int down_base = expert * hidden;
         for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-            float acc = 0.0F;
-            for (int i = 0; i < intermediate; ++i) { acc += down(down_base + h, i) * product[i]; }
-            accumulator[h] += weight * acc;
+            const int row = down_base + h;
+            float a0 = 0.0F, a1 = 0.0F, a2 = 0.0F, a3 = 0.0F;
+            int i = 0;
+            for (; i + 4 <= intermediate; i += 4) {
+                const float p0 = product[i];
+                const float p1 = product[i + 1];
+                const float p2 = product[i + 2];
+                const float p3 = product[i + 3];
+                a0 += down(row, i) * p0;
+                a1 += down(row, i + 1) * p1;
+                a2 += down(row, i + 2) * p2;
+                a3 += down(row, i + 3) * p3;
+            }
+            float acc = (a0 + a1) + (a2 + a3);
+            for (; i < intermediate; ++i) { acc += down(row, i) * product[i]; }
+            accumulator[h] += weight * down.row_scale(row) * acc;
         }
         __syncthreads();
     }
