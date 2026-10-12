@@ -14,6 +14,7 @@
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -153,6 +154,44 @@ struct Q8Codec {
         Q8ScalarDecodeAtom::load_pair(planes.codes, planes.high, planes.scales,
                                       static_cast<std::int64_t>(row) * (K / kGroupK) + group, lane,
                                       w0, w1);
+    }
+};
+
+// q4_g32_fp16_rows in row_group_v1: a row is K/2 code bytes, element 2i in the low nibble of byte
+// i, each nibble the signed code plus 8; the scale plane holds one binary16 word per 32 elements
+// of a row. The walk takes 64 columns a group like the other codecs, so a lane's eight values lie
+// inside one 32-wide scale group, (2 * group + lane_in_group / 4). Forming 1024 + n in binary16
+// and subtracting 1032 lands exactly on the code n - 8.
+struct Q4RowsCodec {
+    static constexpr int kGroupK              = 64;
+    static constexpr bool kPackedWord8        = true;
+    static constexpr bool kSingleValuePerLane = false;
+
+    __device__ static __forceinline__ float row_coefficient(const SparseMoePlanes&, int) {
+        return 1.0F;
+    }
+
+    template <int K>
+    __device__ static __forceinline__ void load_eight(const SparseMoePlanes& planes, int row,
+                                                      int group, int lane_in_group, float,
+                                                      float (&weights)[8]) {
+        static_assert(K % 64 == 0);
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            planes.codes + static_cast<std::int64_t>(row) * (K / 2) + group * 32 +
+            lane_in_group * 4);
+        const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            planes.scales +
+            (static_cast<std::int64_t>(row) * (K / 32) + group * 2 + (lane_in_group >> 2)) * 2);
+        const float scale  = __half2float(__ushort_as_half(scale_bits));
+        const __half2 bias = __half2half2(__ushort_as_half(0x6408)); // 1032.0
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+            const __half2 decoded    = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+            const float2 values      = __half22float2(decoded);
+            weights[pair]            = values.x * scale;
+            weights[pair + 4]        = values.y * scale;
+        }
     }
 };
 

@@ -272,8 +272,8 @@ GemmaMoeExpertWeights prepare_gemma_moe_expert_weights(std::span<const WeightInp
     const auto format = gate_up_bank.weight.qtype;
     require(format == down_bank.weight.qtype,
             "gemma_moe_experts: the two banks must share one format");
-    require(format == QType::BF16 || format == QType::NVFP4,
-            "gemma_moe_experts: the banks must be BF16 or NVFP4");
+    require(format == QType::BF16 || format == QType::NVFP4 || format == QType::Q4_G32_FP16_ROWS,
+            "gemma_moe_experts: the banks must be BF16, NVFP4 or q4_g32_fp16_rows");
     return {gate_up_bank.weight, down_bank.weight};
 }
 
