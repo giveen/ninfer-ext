@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
+#include "ops/linear/q4rows/q4rows_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
@@ -104,6 +105,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::exl3_dispatch(x, w, out, policy, *workspace, stream);
         return;
     }
+    case QType::Q4_G32_FP16_ROWS:
+        detail::q4rows_dispatch(x, w, out, policy, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -156,6 +160,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
                static_cast<std::size_t>(output_rows) *
                    std::min<std::size_t>(static_cast<std::size_t>(max_tokens), 8) * sizeof(float);
     }
+    case QType::Q4_G32_FP16_ROWS:
+        if (output_rows % 64 != 0 || input_rows % 64 != 0) {
+            throw std::invalid_argument("linear workspace: q4_g32_fp16_rows needs N, K % 64 == 0");
+        }
+        return 0;
     case QType::FP32:
     case QType::INT32:
         break;
