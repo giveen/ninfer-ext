@@ -391,6 +391,44 @@ measured saturated decodes. That is P0's last bullet.
     the bank latency is the schedule, and eight tiles per expert does the opposite.
   Reverted. A future attempt should start from the schedule and from a deterministic reduction
   (per-expert partials summed in a fixed order, no atomics), not from the element count.
+- **The streamed expert route, the router rewrite and the 2816 norm route (landed).** `ninfer_bench`
+  on this card measured decode at **2.05 tok/s** before this pass, not the perplexity-derived "4×
+  behind": the per-token expert kernel runs a decode token on one SM. Three changes, each from a
+  measurement:
+  - the NVFP4 expert pair at the 26B's geometry takes the 35B decode's two-stage split (a CTA per
+    intermediate row and token with a warp per rank for gate/up + GeGLU into an FP32 workspace,
+    then a CTA per pair of hidden rows summing the ranks in ascending order). The codec and warp
+    dot products moved from the 35B's decode file into `sparse_moe_expert_dot.cuh` unchanged;
+  - the router projection read its 720 KB weight one uncoalesced thread per expert in one CTA per
+    token, 149 µs a layer and 48% of decode time; it is now a warp per expert over (4 experts × 4
+    tokens) CTAs into an FP32 [E,T] workspace, then a warp per token for the selection;
+  - RMSNorm at 2816 fell to the generic kernel (5.6 µs a row, seven a layer) and now has the
+    fixed-width route the 31B's 5376 has.
+
+  | `ninfer_bench`, bf16 KV | before | after |
+  |---|---|---|
+  | tg128 (tok/s) | 2.05 | 215.9 |
+  | pp512 (tok/s) | 189 | 2,040 |
+  | perplexity score rate, 40 KB, ctx 1024/512 (tok/s) | 111.3 | 506 |
+
+  Both MoE Ops gained a workspace in their contracts, shared by the layer (router logits, then
+  expert products). Mean NLL on that 40 KB slice (9,319 tokens): 5.500364 before, 5.471673 after,
+  bit-identical across two runs; the 0.029 difference is inside the 0.04 accumulation-order floor
+  above. The 35B is unmoved (tg128 404.6 vs 405.4; pp512 22,111 ± 421 against 22,238 ± 602 with
+  the change stashed). Prefill still runs the streamed decode route per token; the grouped route
+  is next.
+- **The QAT grid is int4 group-32, not NVFP4.** The checkpoint's README names its QAT target as
+  Q4_0, and the weights agree: in every sampled tensor (experts, dense MLP, attention, embedding)
+  every group of 32 holds at most 16 distinct values, and 94–99.5% of groups are exactly `d·k`
+  with `k` in [-8,7]. The scale is learned, not Q4_0's amax/8 rule: expert and MLP groups reach
+  their amax at 5–7 steps. NVFP4's E2M1 grid has no ±5 or ±7, so it re-quantizes these weights:
+  a best-case per-block-MSE NVFP4 encoding has 7.4–7.7% relative RMS weight error on every tensor,
+  against 0.19% (the BF16 rounding of the checkpoint itself) for int4 group-32 with the recovered
+  scale stored as FP16, at the same 4.5 bits a weight. No recovered scale is near FP16's subnormal
+  range (smallest 8.9e-4). **Decided**: the fast routes are built for an exact int4 group-32 codec,
+  experts first (streamed decode, then a grouped W4A16 prefill that dequantizes to the
+  checkpoint's own BF16 values), then the dense linears and the head, which at Q8 are about 2.4 GB
+  of the ~3.3 GB a decode token reads.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
