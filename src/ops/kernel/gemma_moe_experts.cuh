@@ -4,9 +4,14 @@
 // product and the running output row all live in shared memory, and the two banks are read in place
 // at their stored expert-major row spans. This route is correctness-first: it streams each selected
 // expert's rows exactly once and keeps no tiling or cross-token work.
+//
+// The bank format is a reader: a BF16 bank hands back its stored element, an NVFP4 bank decodes one
+// (codes, block scale, divisor), and the kernel body is the same for both. The two banks of a layer
+// share one format, so the launcher instantiates the two readers together.
 #pragma once
 
-#include "ops/kernel/gelu.cuh" // gelu_one
+#include "ops/kernel/gelu.cuh"              // gelu_one
+#include "ops/linear/nvfp4/nvfp4_codec.cuh" // decode_nvfp4_e2m1x2, decode_nvfp4_e4m3
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -15,13 +20,43 @@
 
 namespace ninfer::ops::detail {
 
-__global__ void gemma_moe_experts_kernel(const __nv_bfloat16* __restrict__ x,
-                                         const std::int32_t* __restrict__ expert_ids,
-                                         const float* __restrict__ expert_weights,
-                                         const __nv_bfloat16* __restrict__ gate_up,
-                                         const __nv_bfloat16* __restrict__ down, int hidden,
-                                         int intermediate, int top_k, int tokens,
-                                         __nv_bfloat16* __restrict__ out) {
+// A BF16 bank: the stored element is the value.
+struct Bf16BankReader {
+    const __nv_bfloat16* values;
+    int columns;
+
+    __device__ __forceinline__ float operator()(int row, int column) const {
+        return __bfloat162float(values[static_cast<std::size_t>(row) * columns + column]);
+    }
+};
+
+// An NVFP4 bank: 4-bit e2m1 codes two per byte along the columns, one e4m3 scale per 16-element
+// block in the K16M128x4 tiling, and the weight divisor of the source matrix the row belongs to.
+// The divisor is applied exactly as the offload MoE route applies its stacked sources':
+// `value * (1 / divisors[row / divisor_rows])`.
+struct Nvfp4BankReader {
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    const float* divisors;
+    int divisor_rows;
+    int columns;
+
+    __device__ __forceinline__ float operator()(int row, int column) const {
+        const std::size_t code_offset =
+            static_cast<std::size_t>(row) * (columns / 2) + static_cast<std::size_t>(column / 2);
+        const float2 pair        = decode_nvfp4_e2m1x2(codes[code_offset]);
+        const float code         = (column & 1) == 0 ? pair.x : pair.y;
+        const std::uint8_t scale = scales[nvfp4_scale_byte_runtime(row, column / 16, columns / 64)];
+        return code * decode_nvfp4_e4m3(scale) * __frcp_rn(divisors[row / divisor_rows]);
+    }
+};
+
+template <class GateUpReader, class DownReader>
+__global__ void
+gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int intermediate,
+                         int top_k, int tokens, const std::int32_t* __restrict__ expert_ids,
+                         const float* __restrict__ expert_weights,
+                         const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out) {
     extern __shared__ float shared[];
     float* activation  = shared;                 // [hidden]
     float* gate        = activation + hidden;    // [intermediate]
@@ -43,18 +78,15 @@ __global__ void gemma_moe_experts_kernel(const __nv_bfloat16* __restrict__ x,
         const float weight = expert_weights[static_cast<std::size_t>(rank) * tokens + token];
 
         // Expert e's gate rows are [e*2I, e*2I+I) and its up rows follow immediately.
-        const __nv_bfloat16* gate_rows =
-            gate_up + static_cast<std::size_t>(expert) * 2 * intermediate * hidden;
-        const __nv_bfloat16* up_rows = gate_rows + static_cast<std::size_t>(intermediate) * hidden;
+        const int gate_base = expert * 2 * intermediate;
+        const int up_base   = gate_base + intermediate;
         for (int i = threadIdx.x; i < intermediate; i += blockDim.x) {
-            const __nv_bfloat16* gate_row = gate_rows + static_cast<std::size_t>(i) * hidden;
-            const __nv_bfloat16* up_row   = up_rows + static_cast<std::size_t>(i) * hidden;
-            float g                       = 0.0F;
-            float u                       = 0.0F;
+            float g = 0.0F;
+            float u = 0.0F;
             for (int h = 0; h < hidden; ++h) {
                 const float value = activation[h];
-                g += __bfloat162float(gate_row[h]) * value;
-                u += __bfloat162float(up_row[h]) * value;
+                g += gate_up(gate_base + i, h) * value;
+                u += gate_up(up_base + i, h) * value;
             }
             gate[i] = g;
             up[i]   = u;
@@ -66,14 +98,10 @@ __global__ void gemma_moe_experts_kernel(const __nv_bfloat16* __restrict__ x,
         __syncthreads();
 
         // Expert e's down rows are [e*H, (e+1)*H), each of the stored intermediate width.
-        const __nv_bfloat16* down_rows =
-            down + static_cast<std::size_t>(expert) * hidden * intermediate;
+        const int down_base = expert * hidden;
         for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-            const __nv_bfloat16* down_row = down_rows + static_cast<std::size_t>(h) * intermediate;
-            float acc                     = 0.0F;
-            for (int i = 0; i < intermediate; ++i) {
-                acc += __bfloat162float(down_row[i]) * product[i];
-            }
+            float acc = 0.0F;
+            for (int i = 0; i < intermediate; ++i) { acc += down(down_base + h, i) * product[i]; }
             accumulator[h] += weight * acc;
         }
         __syncthreads();

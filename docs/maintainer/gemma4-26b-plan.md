@@ -204,6 +204,16 @@ measured saturated decodes. That is P0's last bullet.
   BF16-bank routes: the artifact's banks are NVFP4, so a block-scaled bank profile is the next route
   here (a BF16-expert recipe is what exercises this pair end to end today), and the layer's combine
   with the dense branch is the remaining piece of P2.
+- **Landed: the block-scaled (NVFP4) bank profile.** The kernel takes a bank *reader* policy — a BF16
+  bank hands back its stored element, an NVFP4 bank decodes `e2m1(codes) · e4m3(16-element block
+  scale) / divisor(row)` — so one kernel body covers both formats and the launcher instantiates the
+  pair. The divisor is the per-source one the stacked layout carries, read exactly as the offload MoE
+  route reads its own stacked planes (`value * __frcp_rn(divisors[row / divisor_rows])`). The test
+  reads the oracle through `tests/ops/quantized_weight.h`'s own FP64 decode rather than the Op's
+  decoder, and the fixture now writes *distinct* divisors per source, so a reader that ignored the
+  array cannot pass. `nvfp4_scale_byte` gained a runtime-tile-count form (`nvfp4_scale_byte_runtime`)
+  that the template now delegates to, because a route over several geometries cannot use a
+  compile-time tile count; the six NVFP4 suites pass unchanged after it.
 - **The block-scaled bank profile is on the critical path, not a performance nicety.** A BF16-expert
   variant — how the 35B's own `qwen3_8_flash_next_bf16` recipe exercises its pair — is not available
   to this model: 24.9 B expert parameters are 50 GB at two bytes against a 32 GB card, and even
