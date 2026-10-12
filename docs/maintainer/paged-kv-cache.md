@@ -297,12 +297,42 @@ summary 均从这一 typed plane inventory 计算，不能用 `2 * vector_bytes`
 | int8-g64 | 8.25 | +0.000847 | 未测 |
 | fp8-e4m3-r256 | 8.06 | +0.001509 | 未测 |
 | nvfp4 | 4.50 | +0.002496 | +0.002162 |
+| k8v4 | K8/V4（均 6） | +0.001612 | +0.002368 |
 
 16 bit 到 4.5 bit 的全部取值只值 0.0025 nats，且该差值随 context 增大并未放大（这与
 codec 的逐行重建误差无关：nvfp4 的重建误差是 fp8 的 3.6 倍，端到端只值 0.001 nats）。
 因此新增 6-bit KV profile（例如 e2m3 + block-32 ue8m0）没有精度依据：它只会落在现有
 int8/fp8 与 nvfp4 之间，而容量又大于 nvfp4。只有产品需要这两者之间的容量点时，该
 profile 才值得引入。
+
+低 bit 的旋转/Sinkhorn 方案（沿 head_dim 的归一化 Hadamard 旋转 + log-domain Sinkhorn 方差铺展 +
+逐行非对称 RTN 零点 + 把 RTN scale 吸收进 Sinkhorn 轴 + KIVI 方向）在逐行重建误差探针下已被否定，
+未进入实现。在等 bit 下它并不优于现有 codec：4.375 bits/元素（1120 B/token/layer）对
+nvfp4-group16 的 4.50（1152 B），无结构控制差 1-4%，channel+token 失衡打平（K p99 0.1294 对
+0.1100），只在重尾分布下好 13-17%。消融显示整个变换只值约 1% 重建误差（仅零点是 0.0999，
+旋转 + Sinkhorn + 零点 是 0.0989），而逐行对称、无零点明显更差（0.1177）。
+
+840-864 B/token/layer 的容量收益完全来自 K/V 的非对称 bit 划分，与变换无关：nvfp4 K +
+逐 token 非对称 int2 V 即达 848 B/token/layer（3.312 bits/元素），无需 tile、staging 或 Sinkhorn，
+代价是 V plane 平均 9% / p99 14% 的重建误差；int3-V（976 B/token/layer，比 fp8-e4m3-r256 低 47%）
+是更稳的备选。方法：等 bit 逐行重建误差探针，三类分布（iid 高斯控制、channel+token 失衡、重尾）。
+
+本节的自有结论同样适用于此：重建误差并不预测端到端 nats，因此 K4V2/K4V3 这类非对称划分的真实
+端到端代价仍需用上面的 harness 实测后才能引入。
+
+K8V4 本身是该方向的端到端证据，但只在短 context 上成立。它是文档化的封闭非对称 profile（K 8 bit +
+V 4 bit，402 B/head/layer）：@4096/2048 实测 +0.001612 nats，与 fp8-e4m3-r256 的 +0.001509 同级
+（差 0.0001 nats）而字节少约 21%，同时优于 nvfp4 的 +0.002496。@32768/16384 该差值升到 +0.002368，
+而 nvfp4 反而降到 +0.002162——两者在长 context 上交叉：此时 nvfp4 既更小（4.50 对 6 bits/元素、
+含 scale 开销的字节都更少）也略更准，因此 K8V4 不是 max-context 的选择，长 context 上不应把它当作
+fp8 的替代。真正未测的密度点在 nvfp4 之下（int3-V 约 976 B/token/layer），那才是非对称划分值得继续的
+方向；该划分的代价在长 context 上随 bit 预算下降而变化，必须逐点实测，不能从本节任何一点外推。
+
+廉价方案到此为止的原因：K8V4 是把 FP8-E4M3FN-row256 的 K plane 与 NVFP4-G16 的 V plane 组合起来的
+固定 profile（256 + 2 与 128 + 16，共 402 B/head），两个 plane 的格式都是 MMA 可直接读的 operand。
+V 再降到 2/3 bit 时，3 bit 不是字节对齐的，且 2/3 bit 整数没有对应的 MMA operand 类型，必须在读路径
+上先反量化——那是结构性代价，不是把一个既有 profile 组合出来。因此在没有明确容量需求（例如 1M token
+的 KV 必须压到 ~14 GB，即低于 nvfp4 的 ~1152 B/token/layer）之前，不应引入低于 nvfp4 的 V plane。
 
 ### 4.4 Logical position domain
 
