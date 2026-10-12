@@ -53,6 +53,23 @@ struct Nvfp4BankReader {
     }
 };
 
+// An int4 group-32 row bank (q4_g32_fp16_rows in row_group_v1): code + 8 in a nibble, element 2i
+// in the low nibble of byte i, and one binary16 scale per 32 elements of a row.
+struct Q4RowsBankReader {
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    int columns;
+
+    __device__ __forceinline__ float operator()(int row, int column) const {
+        const std::uint8_t byte =
+            codes[static_cast<std::size_t>(row) * (columns / 2) + static_cast<std::size_t>(column / 2)];
+        const int code = static_cast<int>((column & 1) == 0 ? (byte & 0x0F) : (byte >> 4)) - 8;
+        const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + (static_cast<std::size_t>(row) * (columns / 32) + column / 32) * 2);
+        return static_cast<float>(code) * __half2float(__ushort_as_half(scale_bits));
+    }
+};
+
 template <class GateUpReader, class DownReader>
 __global__ void
 gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int intermediate,
@@ -152,7 +169,7 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
 }
 
 // ---------------------------------------------------------------------------------------------
-// The streamed route, for an NVFP4 bank pair at a registered geometry.
+// The streamed route, for an NVFP4 or int4 group-32 row bank pair at a registered geometry.
 //
 // The same two-stage split the 35B's sparse-MoE decode takes, so every SM streams expert rows
 // instead of one SM per token. Stage one is a CTA per (stored intermediate row j, token) with one
@@ -167,7 +184,7 @@ gemma_moe_experts_kernel(GateUpReader gate_up, DownReader down, int hidden, int 
 // 256: 2816 and 768 are.
 // ---------------------------------------------------------------------------------------------
 
-template <int Hidden, int Intermediate, int TopK>
+template <class Codec, int Hidden, int Intermediate, int TopK>
 __global__ __launch_bounds__(TopK * 32) void gemma_moe_stream_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const std::int32_t* __restrict__ expert_ids,
     SparseMoePlanes gate_up, float* __restrict__ products, int tokens) {
@@ -187,7 +204,7 @@ __global__ __launch_bounds__(TopK * 32) void gemma_moe_stream_gate_up_kernel(
     const int row_base = expert * (2 * Intermediate);
     float gate = 0.0F;
     float up   = 0.0F;
-    dot_two_rows<Nvfp4Codec, Hidden, 1>(gate_up, row_base + j, row_base + Intermediate + j,
+    dot_two_rows<Codec, Hidden, 1>(gate_up, row_base + j, row_base + Intermediate + j,
                                         x_shared, 0, Hidden, gate, up);
     if ((tid & 31) == 0) {
         products[(static_cast<std::int64_t>(token) * TopK + rank) * Intermediate + j] =
@@ -195,7 +212,7 @@ __global__ __launch_bounds__(TopK * 32) void gemma_moe_stream_gate_up_kernel(
     }
 }
 
-template <int Hidden, int Intermediate, int TopK, int Rows>
+template <class Codec, int Hidden, int Intermediate, int TopK, int Rows>
 __global__ __launch_bounds__(TopK * 32) void gemma_moe_stream_down_kernel(
     const std::int32_t* __restrict__ expert_ids, const float* __restrict__ expert_weights,
     const float* __restrict__ products, SparseMoePlanes down, __nv_bfloat16* __restrict__ out,
@@ -211,10 +228,10 @@ __global__ __launch_bounds__(TopK * 32) void gemma_moe_stream_down_kernel(
     const std::int64_t slot = static_cast<std::int64_t>(rank) * tokens + token;
     const int expert        = expert_ids[slot];
     float dot[Rows];
-    dot_fp32_rows<Nvfp4Codec, Intermediate, Rows>(
+    dot_fp32_rows<Codec, Intermediate, Rows>(
         down, expert * Hidden + row_base,
         products + (static_cast<std::int64_t>(token) * TopK + rank) * Intermediate, 0,
-        Intermediate / Nvfp4Codec::kGroupK, dot);
+        Intermediate / Codec::kGroupK, dot);
     if (lane == 0) {
         const float weight = expert_weights[slot];
 #pragma unroll

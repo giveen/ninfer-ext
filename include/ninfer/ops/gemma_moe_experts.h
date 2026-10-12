@@ -43,7 +43,9 @@ namespace ninfer::ops {
  *   padded widths satisfy), and the two banks share one format. An NVFP4 bank is a stack of
  *   separately quantised source matrices, so it carries a weight divisor per source and a stored
  *   value is `e2m1(codes) * e4m3(block scale) / divisor(row)` -- the same reading the offload MoE
- *   route applies to its own stacked planes.
+ *   route applies to its own stacked planes. Or both are q4_g32_fp16_rows in row_group_v1 (K a
+ *   multiple of 64): a stored value is `code * binary16 scale` with one scale per 32 elements of
+ *   a row, the grid a quantization-aware-trained checkpoint carries exactly.
  *
  * Numeric:
  *   The activations are the represented BF16 values and the weights the exact decode of their
@@ -60,10 +62,10 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned, graph-stable transient storage of at least `gemma_moe_experts_workspace_bytes`
- *   for the call's geometry, bank format and T, carrying no state beyond the call. An NVFP4 pair
- *   at a registered geometry (the 26B-A4B's H 2816, stored I 768, K 8) streams every selected
- *   expert over the whole machine and keeps each rank's FP32 GeGLU product there; every other
- *   pair needs none. The Op allocates nothing.
+ *   for the call's geometry, bank format and T, carrying no state beyond the call. An NVFP4 or
+ *   q4_g32_fp16_rows pair at a registered geometry (the 26B-A4B's H 2816, stored I 768, K 8)
+ *   streams every selected expert over the whole machine and keeps each rank's FP32 GeGLU product
+ *   there; every other pair needs none. The Op allocates nothing.
  *
  * Execution:
  *   The caller's stream; graph-capturable (no host synchronization, no allocation). The output

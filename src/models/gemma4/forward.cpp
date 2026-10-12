@@ -47,12 +47,14 @@ ops::GemmaMoeExpertGeometry expert_geometry(const TextConfig& config) {
             static_cast<std::int32_t>(config.moe_intermediate_size)};
 }
 
-// The expert apply's share is sized for the streamed route whatever the banks' format, so the
-// layer bound does not have to know the artifact: the per-token route reads none of it.
+// The expert apply's share is the largest any bank format takes at this width, so the layer bound
+// does not have to know the artifact: the per-token route reads none of it.
 std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t tokens) {
-    return std::max(
-        ops::gemma_moe_router_workspace_bytes(router_geometry(config), tokens),
-        ops::gemma_moe_experts_workspace_bytes(expert_geometry(config), QType::NVFP4, tokens));
+    const auto experts = [&](QType format) {
+        return ops::gemma_moe_experts_workspace_bytes(expert_geometry(config), format, tokens);
+    };
+    return std::max({ops::gemma_moe_router_workspace_bytes(router_geometry(config), tokens),
+                     experts(QType::NVFP4), experts(QType::Q4_G32_FP16_ROWS)});
 }
 
 MoeScratch allocate_moe_scratch(const TextConfig& config, std::int32_t tokens, DeviceArena& arena) {

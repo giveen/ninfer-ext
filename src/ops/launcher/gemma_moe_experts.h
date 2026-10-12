@@ -1,18 +1,20 @@
 // Preconditions, all established by the wrapper: x and out are contiguous BF16 [H,T], expert_ids is
-// I32 [K,T] and expert_weights FP32 [K,T] with 1<=K<=E, and both banks carry the geometry's shapes
-// in the same format. `products` holds K * I * T FP32 values whenever the pair streams.
+// I32 [K,T] and expert_weights FP32 [K,T] with 1<=K<=E, both banks carry the geometry's shapes in
+// the same format, and `workspace` is 256-byte aligned and holds the bytes the query below names.
 #pragma once
 
 #include "core/weight.h" // QType
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 
 // One bank as the kernel reads it. A BF16 bank uses `payload`; an NVFP4 bank uses `payload`
-// (codes), `scales` and the divisor of each source matrix in `divisors` over `divisor_rows` rows.
+// (codes), `scales` and the divisor of each source matrix in `divisors` over `divisor_rows` rows;
+// an int4 group-32 row bank uses `payload` (codes) and `scales`.
 struct GemmaMoeBankLaunch {
     QType qtype               = QType::BF16;
     const void* payload       = nullptr;
@@ -22,15 +24,18 @@ struct GemmaMoeBankLaunch {
     std::int32_t columns      = 0;
 };
 
-// Whether a bank pair of this format and geometry takes the streamed route, which needs the FP32
-// products workspace of K * I * T values; every other pair takes the per-token route and reads none.
-[[nodiscard]] bool gemma_moe_experts_streams(QType qtype, std::int32_t hidden,
-                                             std::int32_t intermediate, std::int32_t top_k);
+// The workspace a call over T tokens takes for this format and geometry: the streamed route's FP32
+// products, the grouped route's route maps and BF16 intermediates, or nothing for the per-token
+// route.
+[[nodiscard]] std::size_t gemma_moe_experts_workspace(QType qtype, std::int32_t hidden,
+                                                      std::int32_t experts,
+                                                      std::int32_t intermediate,
+                                                      std::int32_t top_k, std::int32_t tokens);
 
 void gemma_moe_experts_launch(const void* x, const void* expert_ids, const void* expert_weights,
                               const GemmaMoeBankLaunch& gate_up, const GemmaMoeBankLaunch& down,
-                              std::int32_t hidden, std::int32_t intermediate, std::int32_t top_k,
-                              std::int32_t tokens, float* products, void* out,
+                              std::int32_t hidden, std::int32_t experts, std::int32_t intermediate,
+                              std::int32_t top_k, std::int32_t tokens, void* workspace, void* out,
                               cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

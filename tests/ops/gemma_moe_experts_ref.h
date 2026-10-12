@@ -27,13 +27,32 @@ inline double gelu_tanh(double value) {
     return 0.5 * value * (1.0 + std::tanh(kSqrt2Pi * (value + 0.044715 * value * value * value)));
 }
 
+// The BF16 rounding points a route declares. The grouped int4 route decodes each weight to BF16,
+// and rounds the GeGLU product and each selected expert's down output to BF16 -- where the
+// checkpoint's own reference, which runs in BF16, rounds as well. Each is modelled here exactly,
+// so a criterion qualifies the route's arithmetic rather than absorbing its declared boundaries.
+struct Boundaries {
+    bool weights_bf16    = false;
+    bool product_bf16    = false;
+    bool expert_out_bf16 = false;
+};
+
+inline double round_bf16(double value) {
+    return static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(value))));
+}
+
 // `gate_up_value(row, column)` and `down_value(row, column)` read one bank element in FP64.
 template <class GateUpValue, class DownValue>
 inline std::vector<double> run(const GateUpValue& gate_up_value, const DownValue& down_value,
                                const std::vector<std::uint16_t>& x_bits, std::int32_t hidden,
                                std::int32_t tokens, const std::vector<std::int32_t>& ids,
                                const std::vector<float>& routing, std::int32_t experts,
-                               std::int32_t intermediate, std::int32_t top_k) {
+                               std::int32_t intermediate, std::int32_t top_k,
+                               Boundaries boundaries = {},
+                               std::vector<double>* magnitude = nullptr) {
+    const auto weight_of = [&](double value) {
+        return boundaries.weights_bf16 ? round_bf16(value) : value;
+    };
     if (static_cast<std::int32_t>(x_bits.size()) != hidden * tokens ||
         static_cast<std::int32_t>(ids.size()) != top_k * tokens ||
         static_cast<std::int32_t>(routing.size()) != top_k * tokens) {
@@ -41,6 +60,9 @@ inline std::vector<double> run(const GateUpValue& gate_up_value, const DownValue
     }
 
     std::vector<double> out(static_cast<std::size_t>(hidden) * tokens, 0.0);
+    // Sum over ranks of |weight * expert output|: what a one-ulp flip at the expert-output
+    // boundary is relative to, where the outputs cancel.
+    if (magnitude != nullptr) magnitude->assign(out.size(), 0.0);
     std::vector<double> activation(static_cast<std::size_t>(hidden));
     std::vector<double> gate(static_cast<std::size_t>(intermediate));
     std::vector<double> up(static_cast<std::size_t>(intermediate));
@@ -65,8 +87,8 @@ inline std::vector<double> run(const GateUpValue& gate_up_value, const DownValue
                 double u = 0.0;
                 for (std::int32_t h = 0; h < hidden; ++h) {
                     const double value = activation[static_cast<std::size_t>(h)];
-                    g += gate_up_value(gate_base + i, h) * value;
-                    u += gate_up_value(up_base + i, h) * value;
+                    g += weight_of(gate_up_value(gate_base + i, h)) * value;
+                    u += weight_of(gate_up_value(up_base + i, h)) * value;
                 }
                 gate[static_cast<std::size_t>(i)] = g;
                 up[static_cast<std::size_t>(i)]   = u;
@@ -74,14 +96,22 @@ inline std::vector<double> run(const GateUpValue& gate_up_value, const DownValue
             for (std::int32_t i = 0; i < intermediate; ++i) {
                 product[static_cast<std::size_t>(i)] =
                     gelu_tanh(gate[static_cast<std::size_t>(i)]) * up[static_cast<std::size_t>(i)];
+                if (boundaries.product_bf16) {
+                    product[static_cast<std::size_t>(i)] =
+                        round_bf16(product[static_cast<std::size_t>(i)]);
+                }
             }
             const std::int32_t down_base = expert * hidden;
             for (std::int32_t h = 0; h < hidden; ++h) {
                 double acc = 0.0;
                 for (std::int32_t i = 0; i < intermediate; ++i) {
-                    acc += down_value(down_base + h, i) * product[static_cast<std::size_t>(i)];
+                    acc += weight_of(down_value(down_base + h, i)) * product[static_cast<std::size_t>(i)];
                 }
+                if (boundaries.expert_out_bf16) acc = round_bf16(acc);
                 out[static_cast<std::size_t>(token) * hidden + h] += weight * acc;
+                if (magnitude != nullptr) {
+                    (*magnitude)[static_cast<std::size_t>(token) * hidden + h] += std::abs(weight * acc);
+                }
             }
         }
     }

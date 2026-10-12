@@ -1,7 +1,7 @@
 // ninfer::ops - gemma_moe_experts wrapper: public api validation and launcher dispatch.
 #include "ninfer/ops/gemma_moe_experts.h"
 
-#include "ops/launcher/gemma_moe_experts.h" // detail::gemma_moe_experts_launch
+#include "ops/launcher/gemma_moe_experts.h" // detail::gemma_moe_experts_launch, _workspace
 #include "ops/linear/nvfp4/nvfp4_format.h"  // detail::validate_nvfp4_weight
 
 #include <cstdint>
@@ -49,7 +49,22 @@ detail::GemmaMoeBankLaunch prepare_bank(const Weight& weight, std::int64_t rows,
         }
         return bank;
     }
-    if (weight.qtype != QType::BF16) { fail(std::string(label) + " must be BF16 or NVFP4"); }
+    if (weight.qtype == QType::Q4_G32_FP16_ROWS) {
+        // row_group_v1: K/2 code bytes a row, then a binary16 scale plane of K/32 words a row.
+        // The streamed route loads a lane's codes as one 32-bit word.
+        if (weight.layout != QuantLayout::RowGroup || weight.scales == nullptr ||
+            columns % 64 != 0 || reinterpret_cast<std::uintptr_t>(weight.payload) % 16 != 0 ||
+            reinterpret_cast<std::uintptr_t>(weight.scales) % 2 != 0) {
+            fail(std::string(label) +
+                 " must be a row_group_v1 bank with an aligned code plane, a scale plane and K a "
+                 "multiple of 64");
+        }
+        bank.scales = weight.scales;
+        return bank;
+    }
+    if (weight.qtype != QType::BF16) {
+        fail(std::string(label) + " must be BF16, NVFP4 or q4_g32_fp16_rows");
+    }
     return bank;
 }
 
@@ -57,12 +72,12 @@ detail::GemmaMoeBankLaunch prepare_bank(const Weight& weight, std::int64_t rows,
 
 std::size_t gemma_moe_experts_workspace_bytes(const GemmaMoeExpertGeometry& geometry, QType qtype,
                                               std::int32_t tokens) {
-    if (tokens <= 0) { fail("the workspace query needs a positive token count"); }
-    if (!detail::gemma_moe_experts_streams(qtype, geometry.hidden_size, geometry.intermediate_size,
-                                           geometry.top_k)) {
-        return 0;
+    if (geometry.hidden_size <= 0 || geometry.num_experts <= 0 || geometry.intermediate_size <= 0 ||
+        geometry.top_k <= 0) {
+        fail("the geometry must be positive");
     }
-    return static_cast<std::size_t>(geometry.top_k) * geometry.intermediate_size * tokens *
+    return detail::gemma_moe_experts_workspace(qtype, geometry.hidden_size, geometry.num_experts,
+                                               geometry.intermediate_size, geometry.top_k, tokens);
            sizeof(float);
 }
 
@@ -103,8 +118,8 @@ void gemma_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& 
     }
 
     detail::gemma_moe_experts_launch(x.data, expert_ids.data, expert_weights.data, gate_up, down,
-                                     hidden, intermediate, top_k, tokens,
-                                     static_cast<float*>(workspace.data), out.data, stream);
+                                     hidden, experts, intermediate, top_k, tokens, workspace.data,
+                                     out.data, stream);
 }
 
 } // namespace ninfer::ops
