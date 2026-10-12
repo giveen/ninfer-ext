@@ -73,3 +73,43 @@ aggregate.
 
 The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results.
+
+## Reference comparison (KLD and ΔNLL)
+
+One run can record the rows it scored and another run can be measured against them. `--write-reference
+FILE` writes the selected workload's per-row reference; `--reference FILE` scores the current artifact
+against that file. Rows are matched positionally, so the reference must be written and consumed with
+the same tokenizer, text or corpus, context, and stride.
+
+```bash
+# 1. Record a reference from the full-precision artifact over a fixed text
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --text path/to/fixed.txt \
+  --write-reference path/to/fixed.ref
+
+# 2. Score a candidate against it
+./build/apps/ninfer-perplexity models/qwen3_8_27b_nvfp4.ninfer \
+  --text path/to/fixed.txt \
+  --reference path/to/fixed.ref
+```
+
+The second run adds a `reference` line and, under `report.json`, a `reference` object carrying the
+reference's own numbers alongside the model's:
+
+```text
+reference: 79 tokens | mean_nll 2.244805 | ppl_reference 9.438576 | delta_nats -0.000003
+```
+
+`delta_nats = mean_nll_model - mean_nll_reference`, so a positive value means the candidate is worse
+than the reference. The existing `mean_kl` (per-row KL divergence) answers "how differently
+distributed?"; `delta_nats` answers "how much worse in the unit published numbers use?" — for example
+a "+0.9% perplexity" claim is an NLL delta in nats, recoverable through the exponential.
+
+**Size.** A reference stores one distribution per scored row over the full vocabulary: at vocab
+248,320 a corpus-scale reference for 261,167 scored tokens is ≈129 GB, and even a 79-token one is
+≈39 MB, so references are not committable artifacts. Check in the fixed **text** (kilobytes) that both
+runs share, and regenerate the reference locally from it; do not store the reference.
+
+**Sanity check.** Scoring an artifact against a reference written by the same artifact must report
+`delta_nats ≈ 0` — bf16 reference rounding leaves on the order of 1e-6. Anything larger means the
+text, context, or stride differ between the two runs.

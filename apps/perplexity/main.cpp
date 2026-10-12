@@ -130,7 +130,8 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--write-reference") {
             out.write_reference = std::filesystem::path(value("--write-reference"));
         } else if (option == "--sample-stride") {
-            out.sample_stride = parse_integer<std::uint32_t>(value("--sample-stride"), "sample stride");
+            out.sample_stride =
+                parse_integer<std::uint32_t>(value("--sample-stride"), "sample stride");
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -214,9 +215,7 @@ json aggregate_json(const ScoreAggregate& value) {
 
 json kl_json(const KlAggregate& value) {
     if (value.rows == 0) { return json{{"rows", 0}}; }
-    return json{{"rows", value.rows},
-                {"total_kl", value.total_kl},
-                {"mean_kl", value.mean_kl()}};
+    return json{{"rows", value.rows}, {"total_kl", value.total_kl}, {"mean_kl", value.mean_kl()}};
 }
 
 struct EvaluationStream {
@@ -294,6 +293,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ScoreAggregate overall;
     std::map<std::string, ScoreAggregate> domains;
     KlAggregate overall_kl;
+    // Reference-side NLL over exactly the positions the KL reference scores, so the two runs' mean
+    // NLLs are reported in the same unit.
+    ScoreAggregate overall_reference;
     std::vector<std::uint32_t> written_positions;
     std::vector<std::uint16_t> written_logits;
     std::uint32_t written_vocab = 0;
@@ -326,48 +328,51 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             std::vector<float> logprobs;
             KlAggregate window_kl;
             const ninfer::LogitsSink logits_sink =
-                options.write_reference
-                    ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
-                          // Keep every sample_stride-th scored target: a full row is vocab * 2 B.
-                          for (std::uint32_t column = 0; column < view.columns; ++column) {
-                              const std::uint32_t local = view.first_target + column;
-                              const std::uint32_t target =
-                                  static_cast<std::uint32_t>(window.target_begin) +
-                                  (local - window.first_target);
-                              if (target % options.sample_stride != 0) { continue; }
-                              written_positions.push_back(target);
-                              const std::uint16_t* row =
-                                  view.values.data() +
-                                  static_cast<std::size_t>(column) * view.vocab_size;
-                              written_logits.insert(written_logits.end(), row,
-                                                    row + view.vocab_size);
-                              written_vocab = view.vocab_size;
-                          }
-                      })
-                : options.reference
-                    ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
-                          if (view.vocab_size != reference.vocab_size()) {
-                              throw std::runtime_error(
-                                  "kl reference vocab does not match the model head");
-                          }
-                          for (std::uint32_t column = 0; column < view.columns; ++column) {
-                              const std::uint32_t local = view.first_target + column;
-                              const std::uint32_t target =
-                                  static_cast<std::uint32_t>(window.target_begin) +
-                                  (local - window.first_target);
-                              const std::uint16_t* reference_row = reference.row(target);
-                              if (reference_row == nullptr) { continue; }
-                              window_kl.add(ninfer::perplexity::kl_divergence_row(
-                                  reference_row,
-                                  view.values.data() +
-                                      static_cast<std::size_t>(column) * view.vocab_size,
-                                  view.vocab_size));
-                          }
-                      })
-                    : ninfer::LogitsSink{};
+                options.write_reference ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
+                    // Keep every sample_stride-th scored target: a full row is vocab * 2 B.
+                    for (std::uint32_t column = 0; column < view.columns; ++column) {
+                        const std::uint32_t local = view.first_target + column;
+                        const std::uint32_t target =
+                            static_cast<std::uint32_t>(window.target_begin) +
+                            (local - window.first_target);
+                        if (target % options.sample_stride != 0) { continue; }
+                        written_positions.push_back(target);
+                        const std::uint16_t* row =
+                            view.values.data() + static_cast<std::size_t>(column) * view.vocab_size;
+                        written_logits.insert(written_logits.end(), row, row + view.vocab_size);
+                        written_vocab = view.vocab_size;
+                    }
+                })
+                : options.reference     ? ninfer::LogitsSink([&](const ninfer::ScoredLogits& view) {
+                      if (view.vocab_size != reference.vocab_size()) {
+                          throw std::runtime_error(
+                              "kl reference vocab does not match the model head");
+                      }
+                      for (std::uint32_t column = 0; column < view.columns; ++column) {
+                          const std::uint32_t local = view.first_target + column;
+                          const std::uint32_t target =
+                              static_cast<std::uint32_t>(window.target_begin) +
+                              (local - window.first_target);
+                          const std::uint16_t* reference_row = reference.row(target);
+                          if (reference_row == nullptr) { continue; }
+                          window_kl.add(ninfer::perplexity::kl_divergence_row(
+                              reference_row,
+                              view.values.data() +
+                                  static_cast<std::size_t>(column) * view.vocab_size,
+                              view.vocab_size));
+                          // `target` is a sequence position, not a vocabulary index: the scored
+                          // token is stream.tokens[target], the same token score_tokens scores
+                          // the model column against.
+                          const float reference_logprob =
+                              static_cast<float>(ninfer::perplexity::reference_logprob_row(
+                                  reference_row, view.vocab_size,
+                                  static_cast<std::uint32_t>(stream.tokens[target])));
+                          overall_reference.add(std::span<const float>(&reference_logprob, 1));
+                      }
+                  })
+                                        : ninfer::LogitsSink{};
             try {
-                logprobs =
-                    engine.score_tokens(std::move(input), window.first_target, logits_sink);
+                logprobs = engine.score_tokens(std::move(input), window.first_target, logits_sink);
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -400,8 +405,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 const double elapsed = seconds_since(scoring_started);
                 const double rate    = static_cast<double>(overall.scored_tokens) / elapsed;
                 const std::uint64_t remaining = total_scored_tokens - overall.scored_tokens;
-                const double eta = rate > 0 ? static_cast<double>(remaining) / rate : 0.0;
-                const std::string line        = std::format(
+                const double eta       = rate > 0 ? static_cast<double>(remaining) / rate : 0.0;
+                const std::string line = std::format(
                     "scoring | {}/{} tokens | {}/{} windows | PPL {:.4f} | {} | elapsed {} | ETA "
                     "{}",
                     ninfer::product::format_pretty_count(overall.scored_tokens),
@@ -466,6 +471,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         domain_reports.push_back(std::move(item));
     }
 
+    // The reference's own NLL, so the accuracy cost reads as delta_nats exactly like a published
+    // "+X% perplexity". scored_tokens states how many positions were paired with the model's own
+    // overall.scored_tokens, which differ when the reference was written with --sample-stride.
+    json reference_report = json{{"scored_tokens", 0}};
+    if (options.reference) {
+        reference_report               = aggregate_json(overall_reference);
+        reference_report["delta_nats"] = overall.mean_nll() - overall_reference.mean_nll();
+    }
+
     json report{
         {"schema_version", 2},
         {"metric",
@@ -500,6 +514,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"domains", std::move(domain_reports)},
         {"overall", aggregate_json(overall)},
         {"kl", kl_json(overall_kl)},
+        {"reference", std::move(reference_report)},
     };
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";
@@ -530,8 +545,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             if (aggregate.rows == 0) { continue; }
             std::println("{:<24}{:>16}{:>16.6f}", domain, aggregate.rows, aggregate.mean_kl());
         }
-        std::println("{:<24}{:>16}{:>16.6f}\n", "overall", overall_kl.rows,
-                     overall_kl.mean_kl());
+        std::println("{:<24}{:>16}{:>16.6f}\n", "overall", overall_kl.rows, overall_kl.mean_kl());
+        std::println("reference: {} tokens | mean_nll {:.6f} | ppl_reference {:.6f} | delta_nats "
+                     "{:.6f}\n",
+                     overall_reference.scored_tokens, overall_reference.mean_nll(),
+                     overall_reference.ppl(), overall.mean_nll() - overall_reference.mean_nll());
     }
     std::println("score rate: {:.1f} tok/s",
                  static_cast<double>(overall.scored_tokens) / scoring_seconds);

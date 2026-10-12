@@ -91,6 +91,19 @@ float bf16_to_float(std::uint16_t value) noexcept {
     return result;
 }
 
+// log(sum_v exp(row[v])) of a full BF16 logits row, with the row maximum factored out.
+double row_log_sum_exp(const std::uint16_t* row, std::uint32_t vocab) noexcept {
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (std::uint32_t v = 0; v < vocab; ++v) {
+        maximum = std::max(maximum, bf16_to_float(row[v]));
+    }
+    double sum = 0.0;
+    for (std::uint32_t v = 0; v < vocab; ++v) {
+        sum += std::exp(static_cast<double>(bf16_to_float(row[v]) - maximum));
+    }
+    return static_cast<double>(maximum) + std::log(sum);
+}
+
 } // namespace
 
 double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* model,
@@ -98,27 +111,25 @@ double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* mo
     if (reference == nullptr || model == nullptr || vocab == 0) {
         throw std::invalid_argument("kl_divergence_row needs two non-empty rows");
     }
-    float reference_max = -std::numeric_limits<float>::infinity();
-    float model_max     = -std::numeric_limits<float>::infinity();
-    for (std::uint32_t v = 0; v < vocab; ++v) {
-        reference_max = std::max(reference_max, bf16_to_float(reference[v]));
-        model_max     = std::max(model_max, bf16_to_float(model[v]));
-    }
-    double reference_sum = 0.0;
-    double model_sum     = 0.0;
-    for (std::uint32_t v = 0; v < vocab; ++v) {
-        reference_sum += std::exp(static_cast<double>(bf16_to_float(reference[v]) - reference_max));
-        model_sum += std::exp(static_cast<double>(bf16_to_float(model[v]) - model_max));
-    }
-    const double reference_lse = static_cast<double>(reference_max) + std::log(reference_sum);
-    const double model_lse     = static_cast<double>(model_max) + std::log(model_sum);
+    const double reference_lse = row_log_sum_exp(reference, vocab);
+    const double model_lse     = row_log_sum_exp(model, vocab);
     double divergence          = 0.0;
     for (std::uint32_t v = 0; v < vocab; ++v) {
-        const double reference_logprob = static_cast<double>(bf16_to_float(reference[v])) - reference_lse;
-        const double model_logprob     = static_cast<double>(bf16_to_float(model[v])) - model_lse;
+        const double reference_logprob =
+            static_cast<double>(bf16_to_float(reference[v])) - reference_lse;
+        const double model_logprob = static_cast<double>(bf16_to_float(model[v])) - model_lse;
         divergence += std::exp(reference_logprob) * (reference_logprob - model_logprob);
     }
     return divergence;
+}
+
+double reference_logprob_row(const std::uint16_t* reference, std::uint32_t vocab,
+                             std::uint32_t target) {
+    if (reference == nullptr || vocab == 0 || target >= vocab) {
+        throw std::invalid_argument("reference_logprob_row needs a row and an in-range target");
+    }
+    return static_cast<double>(bf16_to_float(reference[target])) -
+           row_log_sum_exp(reference, vocab);
 }
 
 } // namespace ninfer::perplexity

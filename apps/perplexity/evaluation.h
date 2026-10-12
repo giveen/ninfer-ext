@@ -42,4 +42,9 @@ struct KlAggregate {
 [[nodiscard]] double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* model,
                                        std::uint32_t vocab);
 
+// log P_reference(target) at one position, from a BF16 logits row of `vocab` entries, using the
+// same log-sum-exp as kl_divergence_row. `target` is a vocabulary index, not a sequence position.
+[[nodiscard]] double reference_logprob_row(const std::uint16_t* reference, std::uint32_t vocab,
+                                           std::uint32_t target);
+
 } // namespace ninfer::perplexity
