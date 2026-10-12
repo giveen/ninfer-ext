@@ -24,7 +24,10 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t column
     }
 }
 
+// The model stores a scale or a norm weight as a plain contiguous BF16 vector.
 void require_vector(const Tensor& tensor, std::int32_t extent, const char* label) {
+    if (tensor.dtype != DType::BF16) { fail(std::string(label) + " must be BF16"); }
+    if (tensor.data == nullptr) { fail(std::string(label) + " must be bound"); }
     if (tensor.ne[0] != extent || tensor.ne[1] != 1 || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
         fail(std::string(label) + " must be a contiguous vector of the geometry's size");
     }
@@ -51,30 +54,21 @@ void gemma_moe_router(const Tensor& x, const GemmaMoeRouterWeights& weights,
     // scales are vectors. The geometry is what says how big they are, so a mismatch is an error
     // rather than a read past either end.
     if (weights.router.qtype != QType::BF16) { fail("router must be BF16"); }
-    if (weights.router_scale.qtype != QType::BF16) { fail("router_scale must be BF16"); }
-    if (weights.per_expert_scale.qtype != QType::BF16) { fail("per_expert_scale must be BF16"); }
-    if (weights.router.payload == nullptr || weights.router_scale.payload == nullptr ||
-        weights.per_expert_scale.payload == nullptr) {
-        fail("every weight must be bound");
-    }
+    if (weights.router.payload == nullptr) { fail("the router must be bound"); }
     if (weights.router.ndim != 2 || weights.router.shape[0] != experts ||
         weights.router.shape[1] != hidden) {
         fail("router must be [num_experts, hidden]");
     }
-    if (weights.router_scale.ndim != 1 || weights.router_scale.shape[0] != hidden) {
-        fail("router_scale must be [hidden]");
-    }
-    if (weights.per_expert_scale.ndim != 1 || weights.per_expert_scale.shape[0] != experts) {
-        fail("per_expert_scale must be [num_experts]");
-    }
+    require_vector(weights.router_scale, hidden, "router_scale");
+    require_vector(weights.per_expert_scale, experts, "per_expert_scale");
 
     if (expert_ids.dtype != DType::I32) { fail("expert_ids must be I32"); }
     require_matrix(expert_ids, top_k, tokens, "expert_ids");
     if (expert_weights.dtype != DType::FP32) { fail("expert_weights must be FP32"); }
     require_matrix(expert_weights, top_k, tokens, "expert_weights");
 
-    detail::gemma_moe_router_launch(x.data, weights.router.payload, weights.router_scale.payload,
-                                    weights.per_expert_scale.payload, geometry.rms_norm_eps, hidden,
+    detail::gemma_moe_router_launch(x.data, weights.router.payload, weights.router_scale.data,
+                                    weights.per_expert_scale.data, geometry.rms_norm_eps, hidden,
                                     experts, top_k, tokens, expert_ids.data,
                                     static_cast<float*>(expert_weights.data), stream);
 }

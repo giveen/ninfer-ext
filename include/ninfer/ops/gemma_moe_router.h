@@ -32,8 +32,8 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   x              contiguous BF16 [H,T], semantic axes [hidden, token], no padding.
- *   router_scale   BF16 or FP32 [H], one per hidden index.
- *   per_expert_scale BF16 or FP32 [E].
+ *   router_scale   BF16 [H], one per hidden index, as a tensor.
+ *   per_expert_scale BF16 [E], as a tensor.
  *   W_router       Weight [E,H] in any registered matrix format; the decode is the format's.
  *   expert_ids     contiguous I32 [K,T]  (rank fastest axis), fully overwritten.
  *   expert_weights contiguous FP32 [K,T], fully overwritten.
@@ -60,9 +60,11 @@ namespace ninfer::ops {
  *   The caller's stream; graph-capturable (no host synchronization, no allocation).
  */
 struct GemmaMoeRouterWeights {
-    Weight router;           // [E, H]
-    Weight router_scale;     // [H], BF16 or FP32
-    Weight per_expert_scale; // [E], BF16 or FP32
+    Weight router; // [E, H]
+    // The router's two scales are plain vectors with no packed representation, so the model hands
+    // them over as tensors, exactly as it hands over a norm weight.
+    Tensor router_scale;     // BF16 [H]
+    Tensor per_expert_scale; // BF16 [E]
 };
 
 struct GemmaMoeRouterGeometry {
