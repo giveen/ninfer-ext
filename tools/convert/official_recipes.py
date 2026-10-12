@@ -636,26 +636,16 @@ def gemma4_31b_m1(model, recipe, sources):
     _gemma4_layout(model, recipe, "gemma4_31b_m1")
 
 
-def _gemma4_26b_a4b(model, recipe, assign_expert):
-    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: `assign_expert` for the routed experts, Q8
-    elsewhere.
-
-    This is the bring-up layout the Program is developed against, not a serving layout. The same
-    shape of layout scored 0.758 KLD on the 31B (plan L1: NVFP4 MLPs, FP8 rows) against the 0.419 its
-    measured serving layout reaches, and the 4-bit MLP was almost all of that error. What changes
-    here is the source: this checkpoint is QAT-trained on an int4 group-32 grid, which
-    `gemma4_26b_a4b_qat` keeps exactly and NVFP4 does not (plan P5).
-
-    Q8 rather than FP8 or NVFP4 for everything a linear route consumes, because a quantized linear
-    route resolves its geometry from a fixed registry of hand-tuned shape files: neither the FP8 nor
-    the NVFP4 registry has this model's hidden 2816, and only the row-split int8 route offers a
-    generic selector. The routed experts are the exception -- the MoE Op decodes their banks itself,
-    so no linear registry constrains them -- and they are therefore the one part of the model that
-    spends four bits on this pass.
+def _gemma4_26b_a4b(model, recipe, assign_expert, assign_dense):
+    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: `assign_expert` for the routed experts,
+    `assign_dense` for attention, the dense MLP and the head, Q8 for the token table.
 
     The MoE block's router, its two scales and the layer's norms stay at the source precision. A
     router's output is a probability that a small error moves across the top-k boundary, and the
     per-expert scale multiplies what an expert produces, so neither is a place to spend bits.
+
+    The token table is Q8 in every layout: it is a gather, not a projection, and the embedding Op's
+    gather reads the row-split int8 table, not the int4 row format.
 
     Each expert bank becomes one parent object, so an expert is a fixed row range of its bank and a
     decode round streams the top-8 experts' spans.
@@ -664,12 +654,11 @@ def _gemma4_26b_a4b(model, recipe, assign_expert):
     for name, parameter in model.parameters.items():
         if not name.startswith("text/"):
             continue
-        if name in ("text/token_embedding", "text/output_head"):
-            # Q8, not the 31B's FP8 rows: the FP8 embedding and linear kernels are hand-tuned shape
-            # files whose registries cover the Qwen and 31B geometries, and neither the table's
-            # 262144x2816 nor any of this model's attention shapes is among them. The row-split int8
-            # route has a generic selector and is what every other recipe here gives its token table.
+        if name == "text/token_embedding":
             _assign(recipe, name, Q8)
+            continue
+        if name == "text/output_head":
+            assign_dense(name)
             continue
         if "/moe/" in name and "/moe/experts/" not in name:
             continue
@@ -681,36 +670,36 @@ def _gemma4_26b_a4b(model, recipe, assign_expert):
             # carries a calibration divisor.
             assign_expert(name)
         else:
-            # Attention and the dense MLP take the generic int8 route the token table does, for the
-            # same reason: a quantized linear route resolves its geometry from a fixed registry of
-            # hand-tuned shape files, and this model's are in neither the FP8 nor the NVFP4 one. The
-            # routed experts take their own format because their decoder is the MoE Op's, so no linear
-            # registry constrains them. That difference between the two GeGLU branches is a route
-            # constraint, and P5's encoding comparison is where it is measured.
-            _assign(recipe, name, Q8)
+            assign_dense(name)
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
 
 
 def gemma4_26b_a4b_base(model, recipe, sources):
-    """The 26B with NVFP4 routed experts: the bring-up layout. NVFP4's E2M1 grid cannot hold the
-    int4 group-32 grid this checkpoint was trained on, so it re-quantizes the experts (plan P5)."""
+    """The 26B's bring-up layout: NVFP4 routed experts, Q8 projections and head.
+
+    Q8 because a quantized linear route resolves its geometry from a fixed registry of hand-tuned
+    shape files, neither the FP8 nor the NVFP4 registry has this model's hidden 2816, and the
+    row-split int8 route has a generic selector. NVFP4's E2M1 grid cannot hold the int4 group-32
+    grid this checkpoint was trained on, so it re-quantizes the experts (plan P5).
+    """
     _gemma4_26b_a4b(
         model,
         recipe,
         lambda name: recipe.assign(
             name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
         ),
+        lambda name: _assign(recipe, name, Q8),
     )
 
 
 def gemma4_26b_a4b_qat(model, recipe, sources):
-    """The 26B with its routed experts on the grid they were trained on: int4 group-32 rows whose
-    binary16 step is recovered per group (q4_rows_qat), exact up to that step's rounding."""
-    _gemma4_26b_a4b(
-        model, recipe, lambda name: recipe.assign(name, format=Q4ROWS, method=q4_rows_qat)
-    )
+    """The 26B on the grid it was trained on: every projection, the routed experts and the head as
+    int4 group-32 rows whose binary16 step is recovered per group (q4_rows_qat), exact up to that
+    step's rounding. The QAT checkpoint carries that grid in every one of them (plan P5)."""
+    on_grid = lambda name: recipe.assign(name, format=Q4ROWS, method=q4_rows_qat)  # noqa: E731
+    _gemma4_26b_a4b(model, recipe, on_grid, on_grid)
 
 
 RECIPES = {
