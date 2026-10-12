@@ -3,6 +3,7 @@ set(ninfer_op_tests
   gelu
   gelu_mul
   gemma_moe_router
+  gemma_moe_experts
   silu_mul
   residual_add
   sigmoid_mul
