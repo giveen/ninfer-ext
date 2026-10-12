@@ -20,6 +20,9 @@ struct Fp8A8Operands {
     const std::uint8_t* codes;
     const __nv_bfloat16* scales;
     int rows, k, tokens;
+    // Second E4M3 activation term of the two-term route; null for every single-term route.
+    const std::uint8_t* x_lo = nullptr;
+    const float* x_scales_lo = nullptr;
 };
 
 inline Fp8A16Operands fp8_a16_operands(const Tensor& x, const Weight& w) {
@@ -50,6 +53,14 @@ inline Fp8A8Operands fp8_a8_residual_operands(const Weight& w, Fp8A8Workspace x,
             w.n,
             w.k,
             tokens};
+}
+
+// Both terms of the two-term activation route, consumed by one fused kernel pass.
+inline Fp8A8Operands fp8_a8_pair_operands(const Weight& w, Fp8A8Workspace x, int tokens) {
+    Fp8A8Operands operands = fp8_a8_operands(w, x, tokens);
+    operands.x_lo          = x.codes_lo;
+    operands.x_scales_lo   = x.scales_lo;
+    return operands;
 }
 
 // Private template admission is independent of the public finite shape registry.

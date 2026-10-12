@@ -17,6 +17,16 @@ const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy
         if (shape->n == n && shape->k == k) return *shape;
     throw std::invalid_argument("fp8 linear: unsupported shape");
 }
+
+// The two-term route runs one fused kernel over both terms' split-K partial planes, which the
+// shape's per-T schedule only sizes for a single term.
+std::size_t fp8_a8_partial_bytes(const Fp8LinearShape& shape, LinearPolicy policy,
+                                 std::int32_t max_tokens) {
+    const std::size_t declared =
+        shape.partial_capacity_bytes ? shape.partial_capacity_bytes(max_tokens) : 0;
+    if (!allows_a8_pair(policy)) return declared;
+    return declared > kFp8A8PairPartialBytes ? declared : kFp8A8PairPartialBytes;
+}
 } // namespace
 
 std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, LinearPolicy policy,
@@ -27,9 +37,9 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     const bool routed =
         (allows_a8(policy) || allows_a8_pair(policy)) && shape.uses_a8(min_tokens, max_tokens);
     if (!routed) return 0;
-    return fp8_a8_workspace_capacity_bytes(
-        max_tokens, k, shape.partial_capacity_bytes ? shape.partial_capacity_bytes(max_tokens) : 0,
-        allows_a8_pair(policy) ? 2 : 1);
+    return fp8_a8_workspace_capacity_bytes(max_tokens, k,
+                                           fp8_a8_partial_bytes(shape, policy, max_tokens),
+                                           allows_a8_pair(policy) ? 2 : 1);
 }
 
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
@@ -44,8 +54,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         throw std::invalid_argument("fp8 A8 linear requires caller workspace");
     auto scope         = workspace->scope();
     const auto scratch = allocate_fp8_a8_workspace(
-        *workspace, x.ne[1], weight.k,
-        shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0, pair ? 2 : 1);
+        *workspace, x.ne[1], weight.k, fp8_a8_partial_bytes(shape, policy, x.ne[1]), pair ? 2 : 1);
     shape.a8(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

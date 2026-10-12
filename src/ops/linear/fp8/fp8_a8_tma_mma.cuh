@@ -18,6 +18,8 @@ namespace ninfer::ops::detail {
 
 struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation;
+    // Second E4M3 activation term of the two-term route; equal to `activation` when unused.
+    CUtensorMap activation_lo;
     CUtensorMap weight;
 };
 
@@ -83,7 +85,9 @@ __device__ __forceinline__ void fp8_tma_load(void* destination, const CUtensorMa
                  : "memory");
 }
 
-template <class Schedule, class Epilogue>
+// One activation plane per E4M3 term is staged alongside the shared weight planes; the barrier
+// region starts after all staged operands.
+template <class Schedule, class Epilogue, int Terms = 1>
 inline constexpr int fp8_tma_scratch_bytes = [] {
     constexpr int epilogue_bytes = [] {
         if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })
@@ -91,21 +95,29 @@ inline constexpr int fp8_tma_scratch_bytes = [] {
         else
             return 0;
     }();
+    constexpr int operand_bytes = Schedule::kStages *
+                                  (Terms * Schedule::kBlockTokens + Schedule::kBlockRows) *
+                                  Schedule::kBlockK;
     constexpr int bytes =
-        Schedule::kStorageBytes > epilogue_bytes ? Schedule::kStorageBytes : epilogue_bytes;
+        operand_bytes > Schedule::kStorageBytes
+            ? (operand_bytes > epilogue_bytes ? operand_bytes : epilogue_bytes)
+            : (Schedule::kStorageBytes > epilogue_bytes ? Schedule::kStorageBytes : epilogue_bytes);
     return (bytes + 127) / 128 * 128;
 }();
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue, bool SplitK = false,
-          class RowPolicy = Fp8IdentityRows>
+          class RowPolicy = Fp8IdentityRows, int Terms = 1>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
     const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands, Output output,
     Epilogue epilogue, RowPolicy row_policy, int token_offset, int count, Fp8TmaSplitKPlan plan,
     float* partials) {
+    static_assert(Terms == 1 || Terms == 2);
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
-    const int k = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
+    // Staged bytes of one E4M3 term's activation planes across every stage.
+    constexpr int activation_plane_bytes = S * BT * BK;
+    const int k                          = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
     int tile = blockIdx.x, partial = -1, k_begin = 0, tiles_k = k / BK;
     if constexpr (SplitK) {
         if (tile >= plan.full_tiles) {
@@ -130,10 +142,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 
     extern __shared__ __align__(128) unsigned char fp8_tma_shared[];
     auto* activation = fp8_tma_shared;
-    auto* weight     = activation + S * BT * BK;
-    auto* full       = reinterpret_cast<std::uint64_t*>(fp8_tma_shared +
-                                                        fp8_tma_scratch_bytes<Schedule, Epilogue>);
-    auto* empty      = full + S;
+    auto* weight     = activation + Terms * activation_plane_bytes;
+    auto* full = reinterpret_cast<std::uint64_t*>(fp8_tma_shared +
+                                                  fp8_tma_scratch_bytes<Schedule, Epilogue, Terms>);
+    auto* empty = full + S;
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
@@ -149,9 +161,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
-                cta_mbarrier_arrive_expect_tx(full + stage, (BT + BR) * BK);
+                cta_mbarrier_arrive_expect_tx(full + stage, (Terms * BT + BR) * BK);
                 fp8_tma_load(activation + stage * BT * BK, &descriptors.activation,
                              (k_begin + kt) * BK, token_begin, full + stage);
+                if constexpr (Terms > 1) {
+                    fp8_tma_load(activation + activation_plane_bytes + stage * BT * BK,
+                                 &descriptors.activation_lo, (k_begin + kt) * BK, token_begin,
+                                 full + stage);
+                }
                 if constexpr (RowPolicy::kPaired) {
                     // Each consumer warp owns both gate/up fragments. Load their contiguous
                     // weight spans into that warp's logical shared rows without repacking.
@@ -174,20 +191,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 
     const int tid  = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;
     const int warp = tid >> 5, lane = tid & 31;
-    float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
+    float accumulators[Terms * Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
     for (int kt = 0; kt < tiles_k; ++kt) {
         const int stage = kt % S;
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
-        fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
-                                        accumulators, warp, lane);
+        fp8_mma_compute_stage<Schedule, Terms>(
+            activation + stage * BT * BK,
+            Terms > 1 ? activation + activation_plane_bytes + stage * BT * BK : nullptr,
+            weight + stage * BR * BK, accumulators, warp, lane);
         // Release only after every lane in this consumer warp has finished its shared reads.
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }
     if constexpr (SplitK) {
         if (partial >= 0) {
-            // Store raw FP32 accumulators. Scales, epilogue and the final BF16 cast
-            // belong after the complete K reduction, including for fused epilogues.
+            // Store raw FP32 accumulators, one plane per E4M3 term. Scales, epilogue and the
+            // final BF16 cast belong after the complete K reduction, including for fused epilogues.
+            const std::size_t plane = std::size_t(plan.split_ctas) * BT * BR;
 #pragma unroll
             for (int mt = 0; mt < Schedule::kMmaTokens; ++mt) {
                 const int token =
@@ -196,12 +216,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
                 for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
                     const int row =
                         warp % Schedule::kWarpsRows * Schedule::kWarpRows + mr * 8 + 2 * (lane % 4);
-                    float* destination =
-                        partials + std::size_t(partial) * BT * BR + token * BR + row;
-                    *reinterpret_cast<float2*>(destination) =
+                    const std::size_t offset =
+                        std::size_t(partial) * BT * BR + std::size_t(token) * BR + row;
+                    *reinterpret_cast<float2*>(partials + offset) =
                         make_float2(accumulators[mt][mr][0], accumulators[mt][mr][1]);
-                    *reinterpret_cast<float2*>(destination + 8 * BR) =
+                    *reinterpret_cast<float2*>(partials + offset + 8 * BR) =
                         make_float2(accumulators[mt][mr][2], accumulators[mt][mr][3]);
+                    if constexpr (Terms > 1) {
+                        const std::size_t lo_offset = plane + offset;
+                        *reinterpret_cast<float2*>(partials + lo_offset) =
+                            make_float2(accumulators[Schedule::kMmaTokens + mt][mr][0],
+                                        accumulators[Schedule::kMmaTokens + mt][mr][1]);
+                        *reinterpret_cast<float2*>(partials + lo_offset + 8 * BR) =
+                            make_float2(accumulators[Schedule::kMmaTokens + mt][mr][2],
+                                        accumulators[Schedule::kMmaTokens + mt][mr][3]);
+                    }
                 }
             }
             return;
@@ -209,12 +238,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
     }
     // All consumers must finish reading staged inputs before the epilogue reuses the storage.
     __syncthreads();
-    fp8_finish_mma_tile<Schedule, FullTokens>(
+    fp8_finish_mma_tile<Schedule, FullTokens, Epilogue, Output, RowPolicy, Terms>(
         output, epilogue, row_policy, fp8_tma_shared, accumulators, operands.x_scales,
-        operands.scales, row_begin, token_begin, operands.rows, token_offset + count, warp, lane);
+        operands.scales, row_begin, token_begin, operands.rows, token_offset + count, warp, lane,
+        operands.x_scales_lo);
 }
 
-template <class Schedule, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, class Output, class Epilogue, class RowPolicy, int Terms = 1>
 __global__ void fp8_a8_tma_split_k_reduce(Fp8A8Operands p, const float* partials, Output output,
                                           Epilogue epilogue, RowPolicy row_policy,
                                           Fp8TmaSplitKPlan plan, int token_offset, int count) {
@@ -227,8 +257,9 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8Operands p, const float* partials
     fp8_mma_tile_coordinates<Schedule>(plan.full_tiles + tail, p.rows / BR, div_up(count, BT),
                                        row_tile, token_tile);
     const int first = plan.first_part(tail), parts = plan.parts(tail);
-    const int row_begin    = row_tile * stored_rows;
-    const auto tile_output = linear_output_tile<stored_rows>(output, row_begin);
+    const std::size_t plane = std::size_t(plan.split_ctas) * BT * BR;
+    const int row_begin     = row_tile * stored_rows;
+    const auto tile_output  = linear_output_tile<stored_rows>(output, row_begin);
     for (int index = chunk * chunk_elements + threadIdx.x * 2; index < (chunk + 1) * chunk_elements;
          index += blockDim.x * 2) {
         const int token_local = index / stored_rows;
@@ -238,18 +269,27 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8Operands p, const float* partials
         if (token < token_offset + count) {
             const auto sum_pair = [&](int local_row) {
                 float2 sum{};
-                for (int part = 0; part < parts; ++part) {
-                    const auto value = *reinterpret_cast<const float2*>(
-                        partials + std::size_t(first + part) * BT * BR + token_local * BR +
-                        local_row);
-                    sum.x += value.x;
-                    sum.y += value.y;
+#pragma unroll
+                for (int term = 0; term < Terms; ++term) {
+                    float2 part_sum{};
+                    const float* term_partials = partials + term * plane;
+                    for (int part = 0; part < parts; ++part) {
+                        const auto value = *reinterpret_cast<const float2*>(
+                            term_partials + std::size_t(first + part) * BT * BR + token_local * BR +
+                            local_row);
+                        part_sum.x += value.x;
+                        part_sum.y += value.y;
+                    }
+                    float scale = p.x_scales[token];
+                    if constexpr (Terms > 1) {
+                        if (term != 0) scale = p.x_scales_lo[token];
+                    }
+                    sum.x += part_sum.x * scale;
+                    sum.y += part_sum.y * scale;
                 }
-                const int parent  = row_policy.weight_row(row_begin, local_row, p.rows);
-                const float scale = p.x_scales[token];
-                sum.x             = sum.x * scale * __bfloat162float(p.scales[parent]);
-                sum.y             = sum.y * scale * __bfloat162float(p.scales[parent + 1]);
-                return sum;
+                const int parent = row_policy.weight_row(row_begin, local_row, p.rows);
+                return make_float2(sum.x * __bfloat162float(p.scales[parent]),
+                                   sum.y * __bfloat162float(p.scales[parent + 1]));
             };
             float2 value;
             if constexpr (RowPolicy::kPaired) {
@@ -274,11 +314,17 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8Operands p, const float* partials
     }
 }
 
-template <class Schedule, class Output, class Epilogue, class RowPolicy = Fp8IdentityRows>
+template <class Schedule, int Terms = 1, class Output, class Epilogue,
+          class RowPolicy = Fp8IdentityRows>
 void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
                            cudaStream_t stream, float* partials = nullptr,
-                           RowPolicy row_policy = {}) {
+                           RowPolicy row_policy = {}, int token_slice = 0) {
+    static_assert(Terms == 1 || Terms == 2);
     validate_fp8_operands<Schedule>(p);
+    if constexpr (Terms > 1) {
+        if (p.x_lo == nullptr || p.x_scales_lo == nullptr)
+            throw std::invalid_argument("FP8 TMA two-term route requires both activation planes");
+    }
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
         throw std::invalid_argument("FP8 TMA requires complete row/K tiles");
     if constexpr (RowPolicy::kPaired) {
@@ -289,22 +335,26 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const Fp8TmaDescriptors descriptors{
         fp8_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK),
+        fp8_tma_map(Terms > 1 ? p.x_lo : p.x, p.tokens, p.k, Schedule::kBlockTokens,
+                    Schedule::kBlockK),
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+    // A positive token slice bounds one launch's token extent so the caller can keep a chunk's
+    // staged operands resident in L2. Zero keeps the default grid.y-driven slicing.
+    const auto launch_slice = [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
         const auto launch = [&]<bool Full, bool Split>() {
             constexpr auto kernel =
-                fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy>;
+                fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy, Terms>;
             constexpr int bytes =
-                fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+                fp8_tma_scratch_bytes<Schedule, Epilogue, Terms> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
             kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
                 descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
             CUDA_CHECK(cudaGetLastError());
             if constexpr (Split) {
-                fp8_a8_tma_split_k_reduce<Schedule>
+                fp8_a8_tma_split_k_reduce<Schedule, Output, Epilogue, RowPolicy, Terms>
                     <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
                         p, partials, output, epilogue, row_policy, plan, offset, count);
                 CUDA_CHECK(cudaGetLastError());
@@ -329,7 +379,16 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
             launch.template operator()<true, false>();
         else
             launch.template operator()<false, false>();
-    });
+    };
+    if (token_slice <= 0) {
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, launch_slice);
+        return;
+    }
+    if (token_slice % Schedule::kBlockTokens)
+        throw std::invalid_argument("FP8 TMA token slice must cover whole token tiles");
+    for (int offset = 0; offset < p.tokens; offset += token_slice) {
+        launch_slice(offset, std::min(token_slice, p.tokens - offset));
+    }
 }
 
 } // namespace ninfer::ops::detail

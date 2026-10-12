@@ -115,7 +115,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
         __syncthreads();
 
-        fp8_mma_compute_stage<Schedule>(activation_shared + stage * BM * BK,
+        fp8_mma_compute_stage<Schedule>(activation_shared + stage * BM * BK, nullptr,
                                         weight_shared + stage * BN * BK, accumulators, warp, lane);
 
         __syncthreads();

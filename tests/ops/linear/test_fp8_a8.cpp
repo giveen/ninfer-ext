@@ -165,13 +165,20 @@ int run_fp8_a8() {
                   {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
 
     // Two-term E4M3 activation: the same eight-bit route carrying a second residual term, which
-    // must land at the A16 floor instead of the single-term A8 allowance.
+    // must land at the A16 floor instead of the single-term A8 allowance. Above T=256 the fused
+    // pair schedule replaces the sequential two-pass route, so cover its gate and both sides of a
+    // partial token tile.
     constexpr std::array pair_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA8Pair, true},
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
         Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{257, CallForm::Policy, ops::LinearPolicy::AllowA8Pair, true},
+        Invocation{385, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{513, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8Pair, true},
         Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
+        Invocation{8192, CallForm::Policy, ops::LinearPolicy::AllowA8Pair},
     };
     failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
                           {14336, 5120, 877U, Comparison::Sampled, true, pair_invocations});

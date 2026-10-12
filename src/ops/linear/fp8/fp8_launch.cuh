@@ -54,6 +54,18 @@ template <class Geometry, class Schedule>
 void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                        cudaStream_t stream) {
     launch_fp8_a8_quantize(x, w, scratch, stream);
+    if (scratch.codes_lo != nullptr && x.ne[1] > kFp8A8PairMinTokens) {
+        // Both terms' MMAs share one weight load per staged tile of the pair schedule. The token
+        // axis is consumed in L2-sized chunks so both activation planes of a chunk stay resident
+        // between its row tiles instead of being re-read from DRAM once per row tile.
+        launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Fp8A8TmaPair, Geometry::kInputRows>,
+                              kFp8A8PairTerms>(
+            fp8_a8_pair_operands(w, scratch, x.ne[1]),
+            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
+            stream, scratch.partials, Fp8IdentityRows{},
+            fp8_a8_pair_token_slice(Geometry::kInputRows));
+        return;
+    }
     launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a8_operands(w, scratch, x.ne[1]),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},

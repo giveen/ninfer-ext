@@ -55,12 +55,19 @@ fp8_mma_tile_coordinates(std::int32_t linear, std::int32_t row_tiles, std::int32
     }
 }
 
-template <class Schedule>
+// `Terms` E4M3 activation planes share one weight load: each term's A fragments feed their own
+// accumulator set, so a two-term route issues twice the MMAs per staged weight tile. Accumulators
+// are indexed `[term * kMmaTokens + mma_token]`, keeping one flat set per term.
+template <class Schedule, int Terms = 1>
 __device__ __forceinline__ void
-fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* weight_stage,
-                      float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4], int warp,
-                      int lane) {
+fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* activation_lo_stage,
+                      const std::uint8_t* weight_stage,
+                      float (&accumulators)[Terms * Schedule::kMmaTokens][Schedule::kMmaRows][4],
+                      int warp, int lane) {
+    static_assert(Terms == 1 || Terms == 2);
     constexpr int BK        = Schedule::kBlockK;
+    constexpr int Tokens    = Schedule::kMmaTokens;
+    constexpr int Rows      = Schedule::kMmaRows;
     const int warp_token    = warp / Schedule::kWarpsRows;
     const int warp_row      = warp % Schedule::kWarpsRows;
     const int a_matrix      = lane >> 3;
@@ -68,19 +75,31 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
     const int a_column_byte = (a_matrix >> 1) * 16;
     const int b_row_offset  = lane & 7;
     const int b_column_byte = ((lane >> 3) & 1) * 16;
-    auto load_fragments     = [&](int k_step, unsigned(&a_fragments)[Schedule::kMmaTokens][4],
-                              unsigned(&b_fragments)[Schedule::kMmaRows][2]) {
+    auto activation_plane   = [&](int term) {
+        if constexpr (Terms == 1) {
+            (void)term;
+            return activation_stage;
+        } else {
+            return term == 0 ? activation_stage : activation_lo_stage;
+        }
+    };
+    auto load_fragments = [&](int k_step, unsigned (&a_fragments)[Terms][Tokens][4],
+                              unsigned (&b_fragments)[Rows][2]) {
 #pragma unroll
-        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-            const int row = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
-            const int logical_byte  = k_step * 32 + a_column_byte;
-            const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-            ldmatrix_x4(a_fragments[mma_token][0], a_fragments[mma_token][1],
-                        a_fragments[mma_token][2], a_fragments[mma_token][3],
-                        smem_addr(activation_stage + row * BK + physical_byte));
+        for (int term = 0; term < Terms; ++term) {
+            const std::uint8_t* plane = activation_plane(term);
+#pragma unroll
+            for (int mma_token = 0; mma_token < Tokens; ++mma_token) {
+                const int row = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
+                const int logical_byte  = k_step * 32 + a_column_byte;
+                const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
+                ldmatrix_x4(a_fragments[term][mma_token][0], a_fragments[term][mma_token][1],
+                            a_fragments[term][mma_token][2], a_fragments[term][mma_token][3],
+                            smem_addr(plane + row * BK + physical_byte));
+            }
         }
 #pragma unroll
-        for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+        for (int mma_row = 0; mma_row < Rows; ++mma_row) {
             const int row           = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
             const int logical_byte  = k_step * 32 + b_column_byte;
             const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
@@ -90,8 +109,8 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
     };
 
     if constexpr (Schedule::kFragmentPipeline == Fp8MmaFragmentPipeline::PingPong) {
-        unsigned a_fragments[2][Schedule::kMmaTokens][4];
-        unsigned b_fragments[2][Schedule::kMmaRows][2];
+        unsigned a_fragments[2][Terms][Tokens][4];
+        unsigned b_fragments[2][Rows][2];
         load_fragments(0, a_fragments[0], b_fragments[0]);
 #pragma unroll
         for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
@@ -100,47 +119,62 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
                 load_fragments(k_step + 1, a_fragments[slot ^ 1], b_fragments[slot ^ 1]);
             }
 #pragma unroll
-            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+            for (int term = 0; term < Terms; ++term) {
 #pragma unroll
-                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                    mma_fp8_e4m3(
-                        accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
-                        accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
-                        a_fragments[slot][mma_token][0], a_fragments[slot][mma_token][1],
-                        a_fragments[slot][mma_token][2], a_fragments[slot][mma_token][3],
-                        b_fragments[slot][mma_row][0], b_fragments[slot][mma_row][1]);
+                for (int mma_token = 0; mma_token < Tokens; ++mma_token) {
+#pragma unroll
+                    for (int mma_row = 0; mma_row < Rows; ++mma_row) {
+                        const int accumulators_row = term * Tokens + mma_token;
+                        mma_fp8_e4m3(accumulators[accumulators_row][mma_row][0],
+                                     accumulators[accumulators_row][mma_row][1],
+                                     accumulators[accumulators_row][mma_row][2],
+                                     accumulators[accumulators_row][mma_row][3],
+                                     a_fragments[slot][term][mma_token][0],
+                                     a_fragments[slot][term][mma_token][1],
+                                     a_fragments[slot][term][mma_token][2],
+                                     a_fragments[slot][term][mma_token][3],
+                                     b_fragments[slot][mma_row][0], b_fragments[slot][mma_row][1]);
+                    }
                 }
             }
         }
     } else {
-        unsigned a_fragments[Schedule::kMmaTokens][4];
-        unsigned b_fragments[Schedule::kMmaRows][2];
+        unsigned a_fragments[Terms][Tokens][4];
+        unsigned b_fragments[Rows][2];
 #pragma unroll
         for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
             load_fragments(k_step, a_fragments, b_fragments);
 #pragma unroll
-            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+            for (int term = 0; term < Terms; ++term) {
 #pragma unroll
-                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                    mma_fp8_e4m3(
-                        accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
-                        accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
-                        a_fragments[mma_token][0], a_fragments[mma_token][1],
-                        a_fragments[mma_token][2], a_fragments[mma_token][3],
-                        b_fragments[mma_row][0], b_fragments[mma_row][1]);
+                for (int mma_token = 0; mma_token < Tokens; ++mma_token) {
+#pragma unroll
+                    for (int mma_row = 0; mma_row < Rows; ++mma_row) {
+                        const int accumulators_row = term * Tokens + mma_token;
+                        mma_fp8_e4m3(
+                            accumulators[accumulators_row][mma_row][0],
+                            accumulators[accumulators_row][mma_row][1],
+                            accumulators[accumulators_row][mma_row][2],
+                            accumulators[accumulators_row][mma_row][3],
+                            a_fragments[term][mma_token][0], a_fragments[term][mma_token][1],
+                            a_fragments[term][mma_token][2], a_fragments[term][mma_token][3],
+                            b_fragments[mma_row][0], b_fragments[mma_row][1]);
+                    }
                 }
             }
         }
     }
 }
 
-template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy>
+template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy,
+          int Terms = 1>
 __device__ __forceinline__ void
 fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     unsigned char* shared_raw,
-                    float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4],
+                    float (&accumulators)[Terms * Schedule::kMmaTokens][Schedule::kMmaRows][4],
                     const float* activation_scales, const __nv_bfloat16* weight_scales,
-                    int row_begin, int token_begin, int rows, int tokens, int warp, int lane) {
+                    int row_begin, int token_begin, int rows, int tokens, int warp, int lane,
+                    const float* activation_scales_lo = nullptr) {
     constexpr bool PairRows = RowPolicy::kPaired;
     constexpr int BM = Schedule::kBlockTokens, BN = Schedule::kBlockRows;
     constexpr int producers = [] {
@@ -158,6 +192,8 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                                                             row_begin, token_begin, rows, tokens);
     };
     static_assert(!PairRows || collective, "paired rows require a collective epilogue");
+    static_assert(!collective || Terms == 1,
+                  "the two-term route combines its terms before a collective epilogue");
     const int accumulator_token = lane >> 2;
     const int accumulator_row   = 2 * (lane & 3);
     constexpr int output_stride = BN + 8;
@@ -171,6 +207,13 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
             (FullTokens || token0 < tokens) ? __ldg(activation_scales + token0) : 0.0F;
         const float activation_scale1 =
             (FullTokens || token1 < tokens) ? __ldg(activation_scales + token1) : 0.0F;
+        float activation_scale0_lo = 0.0F, activation_scale1_lo = 0.0F;
+        if constexpr (Terms > 1) {
+            activation_scale0_lo =
+                (FullTokens || token0 < tokens) ? __ldg(activation_scales_lo + token0) : 0.0F;
+            activation_scale1_lo =
+                (FullTokens || token1 < tokens) ? __ldg(activation_scales_lo + token1) : 0.0F;
+        }
 #pragma unroll
         for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
             const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
@@ -185,14 +228,26 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                 return make_float2(__bfloat162float(weight_scales[parent_row0]),
                                    __bfloat162float(weight_scales[parent_row1]));
             }();
-            float value00 =
-                accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;
-            float value01 =
-                accumulators[mma_token][mma_row][1] * activation_scale0 * weight_scale.y;
-            float value10 =
-                accumulators[mma_token][mma_row][2] * activation_scale1 * weight_scale.x;
-            float value11 =
-                accumulators[mma_token][mma_row][3] * activation_scale1 * weight_scale.y;
+            // Each E4M3 term keeps its own per-token activation scale until both are summed in
+            // FP32.
+            float value00 = accumulators[mma_token][mma_row][0] * activation_scale0;
+            float value01 = accumulators[mma_token][mma_row][1] * activation_scale0;
+            float value10 = accumulators[mma_token][mma_row][2] * activation_scale1;
+            float value11 = accumulators[mma_token][mma_row][3] * activation_scale1;
+            if constexpr (Terms > 1) {
+                value00 += accumulators[Schedule::kMmaTokens + mma_token][mma_row][0] *
+                           activation_scale0_lo;
+                value01 += accumulators[Schedule::kMmaTokens + mma_token][mma_row][1] *
+                           activation_scale0_lo;
+                value10 += accumulators[Schedule::kMmaTokens + mma_token][mma_row][2] *
+                           activation_scale1_lo;
+                value11 += accumulators[Schedule::kMmaTokens + mma_token][mma_row][3] *
+                           activation_scale1_lo;
+            }
+            value00 *= weight_scale.x;
+            value01 *= weight_scale.y;
+            value10 *= weight_scale.x;
+            value11 *= weight_scale.y;
             if constexpr (collective) {
                 accumulators[mma_token][mma_row][0] = value00;
                 accumulators[mma_token][mma_row][1] = value01;

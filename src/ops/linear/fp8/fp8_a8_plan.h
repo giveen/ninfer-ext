@@ -7,12 +7,40 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+// Two-term E4M3 A8 pair route. Both terms' MMAs run against one weight load on this 128x128 tile,
+// which keeps two accumulator sets inside today's register profile, so the split-K plan holds one
+// partial plane per term. The wave count is the tuned resident grid of one CTA per SM.
+inline constexpr int kFp8A8PairTerms = 2;
+// Below this token count the pair tile's waves do not pay for themselves; short sequences keep the
+// sequential two-pass route on their tuned small-T schedules.
+inline constexpr int kFp8A8PairMinTokens   = 256;
+inline constexpr int kFp8A8PairWaveCtas    = 170;
+inline constexpr int kFp8A8PairBlockTokens = 128;
+inline constexpr int kFp8A8PairBlockRows   = 128;
+// Both terms' split-K partial planes together; the caller owns this much of the workspace.
+inline constexpr std::size_t kFp8A8PairPartialBytes = std::size_t(kFp8A8PairTerms) *
+                                                      kFp8A8PairWaveCtas * kFp8A8PairBlockTokens *
+                                                      kFp8A8PairBlockRows * sizeof(float);
+// One token chunk's pair activation planes must stay resident in L2 between row tiles, otherwise
+// every row tile re-reads both planes from DRAM; the budget leaves room for the weight stream and
+// the output on the tuned device.
+inline constexpr std::int64_t kFp8A8PairResidentBytes = 32 << 20;
+
+// Token width of one pair-route chunk: whole tiles that fit the resident budget.
+inline std::int32_t fp8_a8_pair_token_slice(std::int32_t input_rows) {
+    const std::int64_t per_tile = 2 * std::int64_t(kFp8A8PairBlockTokens) * input_rows;
+    const auto tiles =
+        static_cast<std::int32_t>(std::max<std::int64_t>(1, kFp8A8PairResidentBytes / per_tile));
+    return tiles * kFp8A8PairBlockTokens;
+}
 
 // `codes`/`scales` hold the first (high) E4M3 term. The two-term activation route adds the residual
 // E4M3 term in its own plane pair; both are null when the selected route uses a single term.

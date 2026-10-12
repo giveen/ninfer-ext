@@ -110,11 +110,16 @@ FP8 使用相同入口，例如：
 ```
 
 `--policy a8pair` 测量 two-term E4M3 activation route：同一 public 入口、同一 persistent
-weight bytes，activation 以 high 与 residual 两个 E4M3 term 连续累加。该 route 只在注册
-two-term 实现且 epilogue 为 identity 的 fp8 problem 上可达（见 [8.3](#83-新-weightactivation-compute-type)），
+weight bytes，activation 由 high 与 residual 两个 E4M3 term 组成。`T > 256` 时两个 term 在
+同一 kernel 内共享一次 weight load（128x128 tile、每个 term 一套 accumulator、各自保留
+per-term per-token scale），token 轴按 L2 驻留预算分块发射，使一个 chunk 的两个 activation
+plane 在遍历 row tile 期间保持驻留；`T <= 256` 仍走各自小 T schedule 上的两次串行累加。
+该 route 只在注册 two-term 实现且 epilogue 为 identity 的 fp8 problem 上可达
+（见 [8.3](#83-新-weightactivation-compute-type)），
 `[248320,5120]` 与其他 policy 一样保留 A16。本机 sm_120a、`--n 14336 --k 5120` 上的当前
 测量（median，20 samples）：A16 `1433.6 µs / 209.7 TFLOP/s`，A8Pair
-`776.2 µs / 387.3 TFLOP/s`（T=2048），A8 `368.6 µs / 815.6 TFLOP/s`。
+`721.9 µs / 414.7 TFLOP/s`（T=2048；同一 session 内两次串行累加为
+`777.2 µs / 386.3 TFLOP/s`），A8 `368.6 µs / 815.6 TFLOP/s`。
 
 `--execution graph` 测量 CUDA Graph 中的完整 Op；`--graph-calls N` 在一次计时的 graph 中
 放入 `1..64` 次调用，并报告每次调用的时间。默认是 eager。两种计时方式都调用相同 public Op。
