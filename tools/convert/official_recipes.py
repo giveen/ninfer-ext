@@ -636,7 +636,8 @@ def gemma4_31b_m1(model, recipe, sources):
 
 
 def gemma4_26b_a4b_base(model, recipe, sources):
-    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for both GeGLU branches, FP8 rows elsewhere.
+    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for both GeGLU branches, FP8 rows for
+    attention, Q8 for the token table.
 
     This is the bring-up layout the Program is developed against, not a serving layout. The same
     shape of layout scored 0.758 KLD on the 31B (plan L1: NVFP4 MLPs, FP8 rows) against the 0.419 its
@@ -659,7 +660,11 @@ def gemma4_26b_a4b_base(model, recipe, sources):
         if not name.startswith("text/"):
             continue
         if name == "text/token_embedding":
-            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            # Q8, not the 31B's FP8 rows: the FP8 gather is a hand-tuned kernel whose wrapper pins the
+            # table to the Qwen and 31B shapes (248320x5120, 262144x5376), and this table is
+            # 262144x2816. The row-split int8 route is shape-generic and is what every other recipe
+            # here gives its token table, which is also this model's tied head.
+            _assign(recipe, name, Q8)
             continue
         if "/moe/" in name and "/moe/experts/" not in name:
             continue

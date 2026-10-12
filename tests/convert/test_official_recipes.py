@@ -350,7 +350,10 @@ def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() 
         assert selection(name).method is nvfp4_mse
     for name in (f"{layer}/attention/query", f"{layer}/attention/output"):
         assert selection(name).method is fp8_row_maxabs
-    assert selection("text/token_embedding").method is fp8_row_maxabs
+    # The token table is Q8 rather than the 31B's FP8 rows: the FP8 gather's wrapper pins the table to
+    # the Qwen and 31B shapes (248320x5120, 262144x5376) and this table is 262144x2816, while the
+    # row-split int8 route is shape-generic and is what every other recipe here gives its token table.
+    assert selection("text/token_embedding").format == "q8_g32_fp16"
 
     # The router decides the top-k and the per-expert scale multiplies what an expert produces, so
     # both, and the three norms the block adds, stay at the source precision.
