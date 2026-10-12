@@ -55,9 +55,20 @@ detail::GemmaMoeBankLaunch prepare_bank(const Weight& weight, std::int64_t rows,
 
 } // namespace
 
+std::size_t gemma_moe_experts_workspace_bytes(const GemmaMoeExpertGeometry& geometry, QType qtype,
+                                              std::int32_t tokens) {
+    if (tokens <= 0) { fail("the workspace query needs a positive token count"); }
+    if (!detail::gemma_moe_experts_streams(qtype, geometry.hidden_size, geometry.intermediate_size,
+                                           geometry.top_k)) {
+        return 0;
+    }
+    return static_cast<std::size_t>(geometry.top_k) * geometry.intermediate_size * tokens *
+           sizeof(float);
+}
+
 void gemma_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
                        const GemmaMoeExpertWeights& weights, const GemmaMoeExpertGeometry& geometry,
-                       Tensor& out, cudaStream_t stream) {
+                       Tensor& out, Tensor& workspace, cudaStream_t stream) {
     const std::int32_t hidden       = geometry.hidden_size;
     const std::int32_t experts      = geometry.num_experts;
     const std::int32_t top_k        = geometry.top_k;
@@ -83,8 +94,17 @@ void gemma_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& 
         prepare_bank(weights.down, down_rows, intermediate, "gemma_moe_experts down");
     if (gate_up.qtype != down.qtype) { fail("the two banks must share one format"); }
 
+    const std::size_t required = gemma_moe_experts_workspace_bytes(geometry, gate_up.qtype, tokens);
+    if (required > 0 &&
+        (workspace.data == nullptr || !workspace.is_contiguous() || workspace.bytes() < required ||
+         reinterpret_cast<std::uintptr_t>(workspace.data) % 16 != 0)) {
+        fail("the workspace must be a contiguous, 16-byte aligned span of at least " +
+             std::to_string(required) + " bytes");
+    }
+
     detail::gemma_moe_experts_launch(x.data, expert_ids.data, expert_weights.data, gate_up, down,
-                                     hidden, intermediate, top_k, tokens, out.data, stream);
+                                     hidden, intermediate, top_k, tokens,
+                                     static_cast<float*>(workspace.data), out.data, stream);
 }
 
 } // namespace ninfer::ops

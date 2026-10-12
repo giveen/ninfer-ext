@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -58,10 +59,15 @@ namespace ninfer::ops {
  *   between calls.
  *
  * Workspace:
- *   None. The Op allocates nothing and needs no caller scratch.
+ *   Caller-owned, graph-stable transient storage of at least `gemma_moe_experts_workspace_bytes`
+ *   for the call's geometry, bank format and T, carrying no state beyond the call. An NVFP4 pair
+ *   at a registered geometry (the 26B-A4B's H 2816, stored I 768, K 8) streams every selected
+ *   expert over the whole machine and keeps each rank's FP32 GeGLU product there; every other
+ *   pair needs none. The Op allocates nothing.
  *
  * Execution:
- *   The caller's stream; graph-capturable (no host synchronization, no allocation).
+ *   The caller's stream; graph-capturable (no host synchronization, no allocation). The output
+ *   is bit-identical from run to run: each token's ranks are summed in ascending rank order.
  */
 struct GemmaMoeExpertWeights {
     Weight gate_up; // [num_experts * 2 * intermediate, hidden]
@@ -75,8 +81,12 @@ struct GemmaMoeExpertGeometry {
     std::int32_t intermediate_size = 0; // I, the stored width
 };
 
+// The workspace a call over T tokens needs for banks stored as `qtype`. Throws on a non-positive T.
+[[nodiscard]] std::size_t gemma_moe_experts_workspace_bytes(const GemmaMoeExpertGeometry& geometry,
+                                                            QType qtype, std::int32_t tokens);
+
 void gemma_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
                        const GemmaMoeExpertWeights& weights, const GemmaMoeExpertGeometry& geometry,
-                       Tensor& out, cudaStream_t stream);
+                       Tensor& out, Tensor& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

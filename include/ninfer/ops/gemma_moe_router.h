@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -34,12 +35,13 @@ namespace ninfer::ops {
  *   x              contiguous BF16 [H,T], semantic axes [hidden, token], no padding.
  *   router_scale   BF16 [H], one per hidden index, as a tensor.
  *   per_expert_scale BF16 [E], as a tensor.
- *   W_router       Weight [E,H] in any registered matrix format; the decode is the format's.
+ *   W_router       BF16 Weight [E,H].
  *   expert_ids     contiguous I32 [K,T]  (rank fastest axis), fully overwritten.
  *   expert_weights contiguous FP32 [K,T], fully overwritten.
  *
  * Supported domain:
- *   T >= 1, H >= 1, E >= 1, 1 <= K <= E. Any registered weight format the linear Op also accepts.
+ *   T >= 1, H >= 1 and a multiple of 8, 1 <= E <= 256, 1 <= K <= min(E, 16). W_router is BF16, and x
+ *   and W_router are 16-byte aligned.
  *   The artifact geometry this Op was admitted for is H=2816, E=128, K=8.
  *
  * Numeric:
@@ -54,7 +56,9 @@ namespace ninfer::ops {
  *   W_router and `eps` are read only. No state is kept between calls.
  *
  * Workspace:
- *   None. The Op allocates nothing and needs no caller scratch.
+ *   Caller-owned, graph-stable transient storage of at least `gemma_moe_router_workspace_bytes`,
+ *   16-byte aligned, carrying no state beyond the call: it holds the FP32 [E,T] logits between the
+ *   projection and the selection. The Op allocates nothing.
  *
  * Execution:
  *   The caller's stream; graph-capturable (no host synchronization, no allocation).
@@ -74,8 +78,12 @@ struct GemmaMoeRouterGeometry {
     float rms_norm_eps       = 0.0F;
 };
 
+// The workspace a call over T tokens needs: the FP32 [E,T] logits. Throws on a non-positive E or T.
+[[nodiscard]] std::size_t gemma_moe_router_workspace_bytes(const GemmaMoeRouterGeometry& geometry,
+                                                           std::int32_t tokens);
+
 void gemma_moe_router(const Tensor& x, const GemmaMoeRouterWeights& weights,
                       const GemmaMoeRouterGeometry& geometry, Tensor& expert_ids,
-                      Tensor& expert_weights, cudaStream_t stream);
+                      Tensor& expert_weights, Tensor& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

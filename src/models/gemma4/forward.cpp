@@ -25,6 +25,44 @@
 namespace ninfer::models::gemma4 {
 namespace {
 
+// The MoE block's storage: the router's selection and weights, and one workspace the router's
+// logits and then the expert apply's products use in turn -- the selection is the logits' last
+// reader and runs before the experts start.
+struct MoeScratch {
+    Tensor ids;       // I32 [K,T]  one chosen expert per row
+    Tensor weights;   // FP32 [K,T] the router's weights, renormalized and expert-scaled
+    Tensor workspace; // U8
+};
+
+ops::GemmaMoeRouterGeometry router_geometry(const TextConfig& config) {
+    return {static_cast<std::int32_t>(config.hidden_size),
+            static_cast<std::int32_t>(config.num_experts),
+            static_cast<std::int32_t>(config.top_k_experts), config.rms_norm_eps};
+}
+
+ops::GemmaMoeExpertGeometry expert_geometry(const TextConfig& config) {
+    return {static_cast<std::int32_t>(config.hidden_size),
+            static_cast<std::int32_t>(config.num_experts),
+            static_cast<std::int32_t>(config.top_k_experts),
+            static_cast<std::int32_t>(config.moe_intermediate_size)};
+}
+
+// The expert apply's share is sized for the streamed route whatever the banks' format, so the
+// layer bound does not have to know the artifact: the per-token route reads none of it.
+std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t tokens) {
+    return std::max(
+        ops::gemma_moe_router_workspace_bytes(router_geometry(config), tokens),
+        ops::gemma_moe_experts_workspace_bytes(expert_geometry(config), QType::NVFP4, tokens));
+}
+
+MoeScratch allocate_moe_scratch(const TextConfig& config, std::int32_t tokens, DeviceArena& arena) {
+    const std::int32_t k = static_cast<std::int32_t>(config.top_k_experts);
+    MoeScratch moe;
+    moe.ids       = arena.alloc(DType::I32, {k, tokens});
+    moe.weights   = arena.alloc(DType::FP32, {k, tokens});
+    moe.workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(moe_workspace_bytes(config, tokens))});
+    return moe;
+}
 struct Scratch {
     Tensor normed;    // [H,T]     the normed layer input, reused by both sublayers
     Tensor branch;    // [H,T]     a sublayer's normalized output before the residual add
@@ -44,9 +82,8 @@ struct Scratch {
     Tensor up;        // [I,T]     the MLP's up projection
     Tensor activated; // [I,T]
     Tensor down;      // [H,T]
-    // The MoE block's router output, allocated only when the model enables the block.
-    Tensor moe_ids;     // I32 [K,T]  one chosen expert per row
-    Tensor moe_weights; // FP32 [K,T] the router's weights, renormalized and expert-scaled
+    // The MoE block's storage, allocated only when the model enables the block.
+    MoeScratch moe;
 };
 
 // I32 [n] as BF16 [2,n], so `scatter`'s exact column copy moves whole 32-bit positions.
@@ -210,12 +247,12 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
         split = std::max(split, ops::causal_compact_attention_workspace_bytes(
                                     global_heads, global_heads.head_dim, width, 1 << 24, 1));
     }
-    // The MoE block's router output -- K expert ids and K FP32 weights per token -- plus the
-    // alignment of its two slices.
+    // The MoE block's router output -- K expert ids and K FP32 weights per token -- and the expert
+    // workspace, plus the alignment of its three slices.
     const std::size_t route = config.enable_moe_block
                                   ? 2 * static_cast<std::size_t>(config.top_k_experts) *
                                             static_cast<std::size_t>(t) * sizeof(float) +
-                                        2 * 256
+                                        moe_workspace_bytes(config, tokens) + 3 * 256
                                   : 0;
     return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 18 * 256 + t * 8) + split +
            route;
@@ -265,19 +302,6 @@ ops::GemmaMoeRouterWeights router_weights(const Model& model, const MoeWeights& 
             model.tensor(moe.router_scale), model.tensor(moe.per_expert_scale)};
 }
 
-ops::GemmaMoeRouterGeometry router_geometry(const TextConfig& config) {
-    return {static_cast<std::int32_t>(config.hidden_size),
-            static_cast<std::int32_t>(config.num_experts),
-            static_cast<std::int32_t>(config.top_k_experts), config.rms_norm_eps};
-}
-
-ops::GemmaMoeExpertGeometry expert_geometry(const TextConfig& config) {
-    return {static_cast<std::int32_t>(config.hidden_size),
-            static_cast<std::int32_t>(config.num_experts),
-            static_cast<std::int32_t>(config.top_k_experts),
-            static_cast<std::int32_t>(config.moe_intermediate_size)};
-}
-
 // The two expert banks, one part per expert per projection in bank order. The checkpoint fuses an
 // expert's gate and up into one tensor with the gate half first and the artifact keeps one parent
 // per bank, so a bank's parts are contiguous and their union is the bank the Op reads.
@@ -300,9 +324,10 @@ ops::GemmaMoeExpertWeights expert_weights(const Model& model, const MoeWeights& 
 // The MoE branch reuses `normed`, `projected` and `down` in place rather than three more [H,T]
 // buffers: the dense branch has already consumed `normed` (gate/up) and `down` (its own post-norm),
 // and `projected` held the attention output, which was normed into `branch`. Only the router's two
-// outputs are new storage, and the caller allocates them when the block is enabled.
+// outputs and the expert apply's products are new storage, and the caller allocates them when the
+// block is enabled.
 void feed_forward_sublayer(const Model& model, const LayerWeights& weights, FfnScratch s,
-                           Tensor& moe_ids, Tensor& moe_weights, Tensor& residual,
+                           const MoeScratch& moe_scratch, Tensor& residual,
                            cudaStream_t stream) {
     const TextConfig& config = model.config();
     const float eps          = config.rms_norm_eps;
@@ -329,11 +354,12 @@ void feed_forward_sublayer(const Model& model, const LayerWeights& weights, FfnS
     // h1: the dense branch through its own post-norm. The MoE branch reads the pre-FFN residual
     // directly -- the router weightlessly, the experts through their own second pre-norm.
     ops::rmsnorm(s.down, model.tensor(moe.post_feedforward_norm_1), eps, false, s.branch, stream);
-    ops::gemma_moe_router(residual, router_weights(model, moe), router_geometry(config), moe_ids,
-                          moe_weights, stream);
+    MoeScratch moe_out = moe_scratch;
+    ops::gemma_moe_router(residual, router_weights(model, moe), router_geometry(config),
+                          moe_out.ids, moe_out.weights, moe_out.workspace, stream);
     ops::rmsnorm(residual, model.tensor(moe.pre_feedforward_norm_2), eps, false, s.normed, stream);
-    ops::gemma_moe_experts(s.normed, moe_ids, moe_weights, expert_weights(model, moe),
-                           expert_geometry(config), s.projected, stream);
+    ops::gemma_moe_experts(s.normed, moe_out.ids, moe_out.weights, expert_weights(model, moe),
+                           expert_geometry(config), s.projected, moe_out.workspace, stream);
     // h2, then h = h1 + h2.
     ops::rmsnorm(s.projected, model.tensor(moe.post_feedforward_norm_2), eps, false, s.down,
                  stream);
@@ -412,11 +438,7 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     scratch.up        = arena.alloc(DType::BF16, {i, tokens});
     scratch.activated = arena.alloc(DType::BF16, {i, tokens});
     scratch.down      = arena.alloc(DType::BF16, {h, tokens});
-    if (weights.moe) {
-        const std::int32_t k = static_cast<std::int32_t>(config.top_k_experts);
-        scratch.moe_ids      = arena.alloc(DType::I32, {k, tokens});
-        scratch.moe_weights  = arena.alloc(DType::FP32, {k, tokens});
-    }
+    if (weights.moe) scratch.moe = allocate_moe_scratch(config, tokens, arena);
 
     Tensor residual = hidden_in;
     auto to_weight  = [&](WeightId id) {
@@ -535,7 +557,7 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     feed_forward_sublayer(model, weights,
                           {scratch.normed, scratch.branch, scratch.projected, scratch.down,
                            scratch.gate, scratch.up, scratch.activated},
-                          scratch.moe_ids, scratch.moe_weights, residual, stream);
+                          scratch.moe, residual, stream);
 
     // The layer's output is the residual stream itself; the next layer applies its own input norm.
     CUDA_CHECK(cudaMemcpyAsync(hidden_out.data, residual.data,
@@ -597,13 +619,7 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     Tensor gate      = arena.alloc(DType::BF16, {i, tokens});
     Tensor up        = arena.alloc(DType::BF16, {i, tokens});
     Tensor activated = arena.alloc(DType::BF16, {i, tokens});
-    Tensor moe_ids;     // I32 [K,T]  the router's selection, when the model enables the block
-    Tensor moe_weights; // FP32 [K,T] its weights
-    if (weights.moe) {
-        const std::int32_t k = static_cast<std::int32_t>(config.top_k_experts);
-        moe_ids              = arena.alloc(DType::I32, {k, tokens});
-        moe_weights          = arena.alloc(DType::FP32, {k, tokens});
-    }
+    const MoeScratch moe = weights.moe ? allocate_moe_scratch(config, tokens, arena) : MoeScratch{};
     const Tensor positions = indices.positions.view({tokens, 1, 1});
 
     Tensor residual = hidden_in;
@@ -684,7 +700,7 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
 
     // MLP sublayer: the dense branch, and the MoE block beside it when the model has one.
     feed_forward_sublayer(model, weights, {normed, branch, projected, down, gate, up, activated},
-                          moe_ids, moe_weights, residual, stream);
+                          moe, residual, stream);
 
     CUDA_CHECK(cudaMemcpyAsync(hidden_out.data, residual.data,
                                static_cast<std::size_t>(h) * static_cast<std::size_t>(tokens) *
