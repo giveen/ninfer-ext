@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -211,15 +212,45 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
     };
 }
 
+namespace {
+// Names the first field whose removal exceeds the value it is subtracted from, so a production
+// underflow identifies the desynchronised resource instead of only the operation. The message is
+// built on the failing path only.
+std::optional<std::string> resource_underflow_field(detail::PhysicalResources value,
+                                                    detail::PhysicalResources removed) {
+    const auto first = [](const char* field, auto present,
+                          auto dropped) -> std::optional<std::string> {
+        if (dropped <= present) { return std::nullopt; }
+        return std::string(field) + " value=" + std::to_string(present) +
+               " removed=" + std::to_string(dropped);
+    };
+    if (auto hit =
+            first("device.active_lanes", value.device.active_lanes, removed.device.active_lanes)) {
+        return hit;
+    }
+    if (auto hit =
+            first("device.state_slots", value.device.state_slots, removed.device.state_slots)) {
+        return hit;
+    }
+    if (auto hit = first("device.main_kv_pages", value.device.main_kv_pages,
+                         removed.device.main_kv_pages)) {
+        return hit;
+    }
+    if (auto hit = first("device.backend_kv_pages", value.device.backend_kv_pages,
+                         removed.device.backend_kv_pages)) {
+        return hit;
+    }
+    if (auto hit = first("host.state_slots", value.host.state_slots, removed.host.state_slots)) {
+        return hit;
+    }
+    return first("host.kv_bytes", value.host.kv_bytes, removed.host.kv_bytes);
+}
+} // namespace
+
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
                                                       detail::PhysicalResources removed) {
-    if (removed.device.active_lanes > value.device.active_lanes ||
-        removed.device.state_slots > value.device.state_slots ||
-        removed.device.main_kv_pages > value.device.main_kv_pages ||
-        removed.device.backend_kv_pages > value.device.backend_kv_pages ||
-        removed.host.state_slots > value.host.state_slots ||
-        removed.host.kv_bytes > value.host.kv_bytes) {
-        throw std::logic_error("Qwen3.5 resource subtraction underflow");
+    if (const std::optional<std::string> underflow = resource_underflow_field(value, removed)) {
+        throw std::logic_error("Qwen3.5 resource subtraction underflow: " + *underflow);
     }
     return detail::PhysicalResources{
         .device =
