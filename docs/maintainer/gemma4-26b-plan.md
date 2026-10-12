@@ -337,8 +337,27 @@ measured saturated decodes. That is P0's last bullet.
   select, a 4-bit conversion, a block-scale byte, an E4M3 conversion and a reciprocal multiply. The
   levers that follow are (1) the gather inversion, which cuts the element count by the average expert hit
   count, since one matrix is currently read once per token that selects it, and (2) a vectorized decode —
-  `uint4` code loads, a hoisted per-row divisor, a register LUT for E2M1. Reverted; the tree is back at
-  the measured 75.4 tok/s, and no performance claim is made until a decode measurement exists.
+  `uint4` code loads, a hoisted per-row divisor, a register LUT for E2M1. Reverted at the time, and the
+  divisor hoist was later measured to buy nothing at all (see the three-way table below); the speed came
+  from independent loads instead, which is the next bullet.
+- **The accumulation order is worth 0.04 nats; the unroll is worth 50%.** Three formulations of the same
+  expert apply, each measured twice, interleaved in one session on the same 40 KB corpus:
+
+  | expert apply | mean NLL | PPL | tok/s |
+  |---|---|---|---|
+  | serial, divisor per element (baseline) | 5.451330 | 233.068 | 75.8 / 76.7 |
+  | four partial sums, divisor per element (kept) | 5.492602 | 242.888 | 114.1 / 115.3 |
+  | four partial sums, divisor hoisted per row | 5.503557 | 245.564 | 115.5 / 115.4 |
+
+  Every row is bit-identical across its two runs, so those differences are the code and not run noise.
+  The unroll carries the whole 50% and the hoist carries none of it, so the hoist was dropped: the kept
+  variant is the middle row, which is also the one whose reader contract is unchanged. Its cost is
+  +0.041 nats, from reordered FP32 accumulation alone — the same mathematics, a different summation
+  tree. A fourth formulation moved the same metric the other way (5.436548 for the reverted
+  warp-cooperative rewrite), so this is a noise floor of roughly 0.04 nats rather than a bias, and it is
+  10% of the 0.419 drift budget Gemma is held to. Consequence: a KLD or perplexity comparison must fix
+  the accumulation order across the variants it compares, and the P2 decision that accumulation is a
+  private execution choice now has a number attached.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
