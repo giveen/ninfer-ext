@@ -752,6 +752,14 @@ token at top-8. Tensor shapes and dtypes (BF16 throughout the source):
 
 `self_attn.v_proj` exists on sliding layers only, as in §1: the global layers are K = V.
 
+**Stored widths.** Neither of the 26B's FFN widths suits the block-scaled NVFP4 layout as stored, which
+needs its output rows in multiples of 128, so both are padded in the artifact and the padding is exact:
+the dense MLP is 2112 → **2176** and the routed expert MLP 704 → **768**, with zero gate and up rows
+and matching zero down columns, because GeGLU maps a zero gate and up to an exact zero. The artifact's
+own `intermediate_size` and `moe_intermediate_size` are therefore the *stored* widths rather than the
+checkpoint's — the 31B's 21504 already divides 128, which is why its artifact needs no padding at all.
+The vision tower's 4304-wide MLP is stored padded to 4352 for the same reason.
+
 ### 16.2 The decoder layer with MoE
 
 Everything outside the FFN is §3. The FFN becomes two parallel branches whose outputs are summed:

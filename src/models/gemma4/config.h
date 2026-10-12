@@ -48,7 +48,9 @@ struct TextConfig {
     // The MoE block (Gemma 4 26B-A4B, section 16 of the model reference): a router over
     // `num_experts` that selects `top_k_experts` per token, whose routed expert MLP of width
     // `moe_intermediate_size` runs in parallel with the dense MLP above. Every one of them is zero
-    // on the 31B, whose artifacts carry none of the members at all.
+    // on the 31B, whose artifacts carry none of the members at all. `moe_intermediate_size` is the
+    // stored width, not the checkpoint's: the expert MLP is zero-padded so that the block-scaled
+    // weight layout sees its 128-row multiples (§16.1).
     bool enable_moe_block               = false;
     std::uint32_t num_experts           = 0;
     std::uint32_t top_k_experts         = 0;

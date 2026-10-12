@@ -7,7 +7,7 @@
   ],
   "model_type": "gemma4_text",
   "hidden_size": 2816,
-  "intermediate_size": 2112,
+  "intermediate_size": 2176,
   "num_hidden_layers": 30,
   "vocab_size": 262144,
   "max_position_embeddings": 262144,
@@ -63,7 +63,7 @@
   "enable_moe_block": true,
   "num_experts": 128,
   "top_k_experts": 8,
-  "moe_intermediate_size": 704,
+  "moe_intermediate_size": 768,
   "rope_parameters": {
    "sliding_attention": {
     "rope_type": "default",
