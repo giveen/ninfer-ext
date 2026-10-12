@@ -204,6 +204,17 @@ measured saturated decodes. That is P0's last bullet.
   BF16-bank routes: the artifact's banks are NVFP4, so a block-scaled bank profile is the next route
   here (a BF16-expert recipe is what exercises this pair end to end today), and the layer's combine
   with the dense branch is the remaining piece of P2.
+- **The block-scaled bank profile is on the critical path, not a performance nicety.** A BF16-expert
+  variant — how the 35B's own `qwen3_8_flash_next_bf16` recipe exercises its pair — is not available
+  to this model: 24.9 B expert parameters are 50 GB at two bytes against a 32 GB card, and even
+  8-bit experts would leave no room for KV. So the artifact's NVFP4 banks are what the Op must read.
+- Its enablers, located rather than searched for: the decode is `nvfp4_codec.cuh`
+  (`decode_nvfp4_e2m1x2`, `decode_nvfp4_e4m3`, `nvfp4_scale_byte<ScaleTilesPerRow>`) with the per-row
+  access in `nvfp4_gemv.cuh`; a bank is a **stack of per-expert planes** (`require_nvfp4`: "every
+  expert matrix was quantised on its own, so each of these planes is a stack"); the expert shapes are
+  now registered in `nvfp4_geometry.h` (`Nvfp4N768K2816`, `Nvfp4N2816K768`, which the converted
+  artifact already contains); and `tests/ops/quantized_weight.h` builds NVFP4 fixtures at the same
+  N/128 and K/64 constraints.
 - **DECIDE**: a Gemma-specific MoE op, or generalizing `ops/wrapper/sparse_moe.cpp`. That op is
   specialized to Qwen4Exp's geometry by `constexpr` (`kHidden = 2048`, `kExperts = 256`,
   `kExpertRows = 1024`, `kIntermediate = 512`, a shared-expert bias row), and Gemma's layer is a
