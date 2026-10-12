@@ -275,9 +275,24 @@ measured saturated decodes. That is P0's last bullet.
   itself and computes in the represented activations. They are `A16Only` now, the NVFP4 permission
   guard skips routed-expert banks for the same reason, and the artifact predating the change was
   rebuilt.
-- **Evidence so far**: P2's op oracles, plus the 31B's `ninfer_gemma4_forward_test` and
-  `ninfer_gemma4_layer_test` passing against the refactored sublayer — the dense execution path is
-  unchanged.
+- **Finding the first run produced**: every quantized linear route resolves its geometry from a fixed
+  registry of hand-tuned shape files, and the FP8, NVFP4, Q4–Q6 and BF16 registries hold only the
+  Qwen and 31B geometries, so hidden 2816 failed at the first attention projection. The row-split int8
+  registry is the only one with a generic selector, so the 26B's ten `linear` shapes are registered
+  there and the recipe gives the attention, the dense MLP, the token table and the head Q8. The routed
+  experts keep NVFP4 because no linear route sees them. Registering the two dense-MLP shapes for NVFP4
+  is what would restore one layout across both branches, and that is P5's precision comparison rather
+  than a bring-up step.
+- **Evidence so far**: P2's op oracles; the 31B's `ninfer_gemma4_forward_test` and
+  `ninfer_gemma4_layer_test` passing against the refactored sublayer, so the dense execution path is
+  unchanged; the ten new Q8 geometries passing `ninfer_linear_q8_a16_test`'s T sweep against the FP64
+  oracle; and the 26B itself loading (12118 parameters over 30 layers, 5 global) and generating the
+  correct greedy continuation.
+- **Note on the 31B-shaped engine tests**: `ninfer_gemma4_model_test` and `ninfer_gemma4_forward_test`
+  assert 31B facts (60 layers, 833 bound weights, hidden 5376, layer 59) and fail when pointed at the
+  26B artifact. They are artifact-gated and nothing registers the 26B with them, so CI is unaffected;
+  giving the 26B its own artifact-derived versions is a follow-up, the same way `test_load.cpp` was
+  made to derive from the artifact's config in P1.
 - **Remaining**: logits agreement against the HF reference at the §11 protocol, then greedy output
   equality on the standard prompt set, then concurrency 1..8 and the KV/state checks the 31B already
   has.
@@ -299,6 +314,19 @@ measured saturated decodes. That is P0's last bullet.
 - **QAT caveat**: the source is QAT-trained but we do not know which 4-bit grid it was trained against.
   If our G16/E4M3 NVFP4 grid harvests nothing measurable, the fallback is FP8 for the experts. Measure
   before claiming the QAT benefit.
+- **First measurement (this pass)**: `ninfer-perplexity --text <40 KB> --context 1024 --stride 512
+  --kv-dtype bf16` scores the 26B at 75.4 tok/s against the 31B's 473.9 over the same 9,104 scored
+  tokens, text and protocol; both are correctness-first numbers, not tuned ones. The expert apply is
+  one CTA per token that reads each of its top-8 experts' three banks with scalar loads, so a
+  1024-token chunk moves roughly 590 GB of expert weights in 13.6 s — 43 GB/s, about 2.4% of this
+  card's bandwidth. The lever list below begins with the expert-major layout; the measurement says the
+  gather comes first, because a chunk's 8 × 1024 slots address only 128 matrices, so the same bytes
+  are re-read tens of times before any layout question is even reachable.
+- **Absolute perplexity is not a defect signal on `profiles/kld/quick-concat.txt`**: that corpus was
+  chosen for quantization sensitivity, not for a low number. On the same 40 KB and protocol the 26B
+  scores 233 against the 31B's 1414, and llama.cpp's own 26B (Q5_K_S, its own chunking) scores 27,641
+  on it. The 26B is therefore in the right range by the coarsest available comparison; the HF logits
+  agreement of P3's remaining list is still what establishes correctness.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
