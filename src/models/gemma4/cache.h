@@ -77,12 +77,9 @@ public:
     // Makes every stale row of sliding `layer` at a position from `from` on invisible.
     void forget_stale(std::size_t layer, std::int32_t from, cudaStream_t stream);
 
-    // The slot a token at `position` occupies in `layer`'s storage.
+    // The slot a token at `position` occupies in `layer`'s storage. A pass writes its rows and their
+    // positions into these slots on the device (forward.h `PassIndices`).
     [[nodiscard]] std::int32_t slot(std::size_t layer, std::int32_t position) const;
-
-    // Records that the `tokens` positions from `first_position` on occupy their slots.
-    void mark_range(std::size_t layer, std::int32_t first_position, std::int32_t tokens,
-                    cudaStream_t stream);
 
     [[nodiscard]] std::int32_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }

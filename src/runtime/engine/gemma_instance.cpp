@@ -189,9 +189,10 @@ ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandl
 GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity,
                            std::int32_t lanes, std::uint32_t prefill_chunk,
                            std::uint32_t idle_prefill_chunk, std::int32_t draft_tokens,
-                           bool adaptive_draft, DeviceContext& device)
+                           bool adaptive_draft, bool cuda_graphs, DeviceContext& device)
     : model_(model), device_(device), execution_(device.execution_view()),
-      program_(model, capacity, lanes, device, draft_tokens), lanes_(static_cast<std::size_t>(lanes)),
+      program_(model, capacity, lanes, device, draft_tokens, cuda_graphs),
+      lanes_(static_cast<std::size_t>(lanes)),
       prefill_chunk_(prefill_chunk), idle_chunk_(idle_prefill_chunk) {
     if (prefill_chunk_ == 0 || idle_chunk_ == 0) {
         throw std::invalid_argument("gemma4 Program: prefill chunks must be positive");
@@ -496,17 +497,19 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
     PendingBatch pending;
     pending.transaction_ = next_pending_++;
     pending.row_stride_  = static_cast<std::uint32_t>(program_.draft_tokens()) + 1;
-    // Each lane runs its own pass: the rows share the weights' reads only through the cache, which is
-    // the measured cost of not batching lanes into one pass yet.
+    // Every speculative row joins one batched MTP round and every plain row one batched pass: the
+    // lanes share the weights' reads, and each attends to its own cache.
+    std::vector<std::size_t> plain_rows, speculative_rows;
+    std::vector<std::int32_t> plain_lanes, plain_ids;
+    std::vector<std::int32_t> speculative_lanes, speculative_anchors, speculative_drafts;
+    std::vector<bool> full_rung;
     for (std::size_t row = 0; row < sequences.size(); ++row) {
         Lane* lane = valid_lane(sequences[row]);
         if (lane == nullptr || lane->phase != Phase::Active || lane->pending ||
             lane->next_input < 0 || budgets[row].generated_tokens_remaining == 0) {
             throw std::logic_error("decode round row is not an active sequence");
         }
-        const auto started            = Clock::now();
         const std::int32_t lane_index = static_cast<std::int32_t>(sequences[row].lane_);
-        TokenId* out = pending.tokens_.data() + row * pending.row_stride_;
         // A round drafts no more than the output budget can keep beyond its own token, and no more
         // than the lane's capacity holds; with nothing to draft it is one plain token.
         const std::int64_t room = static_cast<std::int64_t>(program_.capacity()) -
@@ -521,33 +524,60 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
             0, std::min<std::int64_t>({length, budgets[row].generated_tokens_remaining - 1LL,
                                        room})));
         if (drafts > 0) {
-            timing.begin_wait();
-            const auto round_started = Clock::now();
-            const auto round = program_.speculate(lane_index, lane->next_input, drafts, execution_);
-            // A clipped round is not the rung's round, so only full ones refine its time.
-            if (drafts == length) draft_policy_->observe_round(lane->rung, seconds_since(round_started));
-            lane->acceptance.observe(static_cast<std::uint32_t>(drafts),
-                                     static_cast<std::uint32_t>(round.accepted_drafts));
-            timing.end_wait();
-            timing.resume_submit();
-            std::copy(round.tokens.begin(), round.tokens.end(), out);
-            pending.counts_[row]      = static_cast<std::int32_t>(round.tokens.size());
-            pending.speculative_[row] = true;
-            pending.drafted_[row]     = drafts;
-            pending.accepted_[row]    = round.accepted_drafts;
+            speculative_rows.push_back(row);
+            speculative_lanes.push_back(lane_index);
+            speculative_anchors.push_back(lane->next_input);
+            speculative_drafts.push_back(drafts);
+            full_rung.push_back(drafts == length);
         } else {
-            program_.decode(lane_index, lane->next_input, execution_);
-            timing.begin_wait();
-            out[0] = program_.sample(lane_index, execution_);
-            timing.end_wait();
-            timing.resume_submit();
+            plain_rows.push_back(row);
+            plain_lanes.push_back(lane_index);
+            plain_ids.push_back(lane->next_input);
             pending.counts_[row]      = 1;
             pending.speculative_[row] = false;
             if (lane->speculative.enabled) ++lane->speculative.fallback_steps;
         }
         pending.rows_[row] = sequences[row];
         lane->pending      = true;
-        lane->timings.decode_seconds += seconds_since(started);
+    }
+    if (!speculative_rows.empty()) {
+        // Every lane of the round spends the round's whole time in its decode.
+        const auto started = Clock::now();
+        timing.begin_wait();
+        const auto rounds = program_.speculate(speculative_lanes, speculative_anchors,
+                                               speculative_drafts, execution_);
+        timing.end_wait();
+        timing.resume_submit();
+        const double seconds = seconds_since(started);
+        for (std::size_t i = 0; i < speculative_rows.size(); ++i) {
+            const std::size_t row = speculative_rows[i];
+            Lane* lane            = valid_lane(sequences[row]);
+            const auto& round     = rounds[i];
+            // A clipped round is not the rung's round, so only full ones refine its time.
+            if (full_rung[i]) draft_policy_->observe_round(lane->rung, seconds);
+            lane->acceptance.observe(static_cast<std::uint32_t>(speculative_drafts[i]),
+                                     static_cast<std::uint32_t>(round.accepted_drafts));
+            std::copy(round.tokens.begin(), round.tokens.end(),
+                      pending.tokens_.data() + row * pending.row_stride_);
+            pending.counts_[row]      = static_cast<std::int32_t>(round.tokens.size());
+            pending.speculative_[row] = true;
+            pending.drafted_[row]     = speculative_drafts[i];
+            pending.accepted_[row]    = round.accepted_drafts;
+            lane->timings.decode_seconds += seconds;
+        }
+    }
+    if (!plain_rows.empty()) {
+        const auto started = Clock::now();
+        program_.decode(plain_lanes, plain_ids, execution_);
+        timing.begin_wait();
+        const std::vector<std::int32_t> drawn = program_.sample(plain_lanes, execution_);
+        timing.end_wait();
+        timing.resume_submit();
+        const double seconds = seconds_since(started);
+        for (std::size_t i = 0; i < plain_rows.size(); ++i) {
+            pending.tokens_[plain_rows[i] * pending.row_stride_] = drawn[i];
+            valid_lane(sequences[plain_rows[i]])->timings.decode_seconds += seconds;
+        }
     }
     pending.row_count_ = sequences.size();
     open_pending_      = pending.transaction_;
@@ -745,7 +775,7 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     program = std::make_unique<gemma_contract::GemmaProgram>(
         *model, static_cast<std::int32_t>(capacity), lanes, options.prefill_chunk.value(),
         options.idle_prefill_chunk.value(), draft_tokens, mtp && !options.speculative.fixed_draft,
-        device);
+        options.use_cuda_graph, device);
     std::size_t after_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&after_bytes, &total_bytes));
     kv_capacity_resolution.mode                          = KvCapacityMode::Explicit;

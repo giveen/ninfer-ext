@@ -116,12 +116,17 @@ int main() {
             Tensor embedded(state[0].data, DType::BF16, {h, tokens});
             ops::embedding(id_tensor, table, config.embedding_scale, embedded, stream);
             int in = 0;
-            for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
-                Tensor hidden_in(state[in].data, DType::BF16, {h, tokens});
-                Tensor hidden_out(state[1 - in].data, DType::BF16, {h, tokens});
-                gemma::forward_layer(*model, layer, hidden_in, first, tokens, cache, arena,
-                                     hidden_out, device.execution_view());
-                in = 1 - in;
+            {
+                DeviceArena::Scope scope = arena.scope();
+                const gemma::PassIndices indices =
+                    gemma::write_pass_indices(cache, first, tokens, arena, stream);
+                for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+                    Tensor hidden_in(state[in].data, DType::BF16, {h, tokens});
+                    Tensor hidden_out(state[1 - in].data, DType::BF16, {h, tokens});
+                    gemma::forward_layer(*model, layer, hidden_in, first, tokens, indices, cache,
+                                         arena, hidden_out, device.execution_view());
+                    in = 1 - in;
+                }
             }
             last = tokens;
             if (first + tokens == p) {

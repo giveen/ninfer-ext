@@ -13,6 +13,14 @@ void launch_q6_a16_simt_r4_t8_w2_g16(const Tensor& x, const Weight& weight, Tens
                                      cudaStream_t stream);
 void launch_q6_a16_gemv_r4_w2_g16(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream);
+void launch_q6_a16_direct_r1_t1_w4_k5376(const Tensor& x, const Weight& weight, Tensor& out,
+                                         cudaStream_t stream);
+void launch_q6_a16_direct_r1_t1_w4_k8192(const Tensor& x, const Weight& weight, Tensor& out,
+                                         cudaStream_t stream);
+void launch_q6_a16_direct_r1_t1_w4_k16384(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
+void launch_q6_a16_direct_r1_t1_w4_k21504(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
 void launch_q6_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
 void launch_q6_a16_sliced_r32_t16_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,

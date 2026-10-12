@@ -11,6 +11,11 @@ using SimtR4T4W2G16 = Q6A16SimtSchedule<4, 4, 2, 16, 2, Cache::ca, 1>;
 using SimtR4T8W2G16 = Q6A16SimtSchedule<4, 8, 2, 16, 2, Cache::ca, 1>;
 
 using GemvR4W2G16      = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
+// Single-token Gemma 4 text projections, one row a block, unrolled over the static K.
+using DirectR1T1W4K5376  = Q6A16DirectSimtSchedule<1, 1, 4, 4, 10, 5376>;
+using DirectR1T1W4K8192  = Q6A16DirectSimtSchedule<1, 1, 4, 4, 10, 8192>;
+using DirectR1T1W4K16384 = Q6A16DirectSimtSchedule<1, 1, 4, 4, 10, 16384>;
+using DirectR1T1W4K21504 = Q6A16DirectSimtSchedule<1, 1, 4, 4, 10, 21504>;
 using SlicedR16T8W4S2  = Q6A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T16W4S2 = Q6A16SlicedKMmaSchedule<32, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S1 = Q6A16SlicedKMmaSchedule<32, 32, 4, 1, Cache::cg, Cache::ca, 2>;

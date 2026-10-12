@@ -9,12 +9,14 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scale_columns.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/soft_cap.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sliding_causal_attention.h"
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
@@ -39,8 +41,49 @@ struct Scratch {
     Tensor up;          // [I,T]     the MLP's up projection
     Tensor activated;   // [I,T]
     Tensor down;        // [H,T]
-    Tensor positions;   // I32 [T]
 };
+
+// I32 [n] as BF16 [2,n], so `scatter`'s exact column copy moves whole 32-bit positions.
+Tensor positions_as_pairs(const Tensor& positions) {
+    return Tensor(positions.data, DType::BF16, {2, static_cast<std::int32_t>(positions.ne[0])});
+}
+
+// Writes the `kept` trailing tokens' rows of `rows` (BF16 [width,tokens]) and their `positions`
+// (I32 [tokens]) into a cache layer whose slot for each token `slots` names: rows into `cache_rows`
+// (BF16 [width,slots]), positions into `cache_positions` (I32 [slots]). Every index is on the device.
+void write_cache_rows(const Tensor& rows, const Tensor& positions, const Tensor& slots,
+                      std::int32_t kept, const Tensor& cache_rows, const Tensor& cache_positions,
+                      cudaStream_t stream) {
+    const std::int32_t tokens = static_cast<std::int32_t>(rows.ne[1]);
+    const std::int32_t skip   = tokens - kept;
+    const Tensor index        = slots.slice(0, skip, kept);
+    Tensor destination        = cache_rows;
+    ops::scatter(rows.slice(1, skip, kept), index, destination, stream);
+    Tensor position_destination = positions_as_pairs(cache_positions);
+    ops::scatter(positions_as_pairs(positions).slice(1, skip, kept), index, position_destination,
+                 stream);
+}
+
+// The first byte of column `column` of a column-major tensor whose columns are `column_bytes` apart.
+std::uint8_t* column_data(const Tensor& tensor, std::size_t column_bytes, std::int32_t column) {
+    return static_cast<std::uint8_t*>(tensor.data) + static_cast<std::size_t>(column) * column_bytes;
+}
+
+// A pass's segments must tile its columns in order, each over one lane's cache.
+void check_segments(std::span<const PassSegment> segments, std::int32_t columns, const char* where) {
+    std::int32_t next = 0;
+    for (const PassSegment& segment : segments) {
+        if (segment.cache == nullptr || segment.tokens < 1 || segment.column != next ||
+            segment.first_position < 0) {
+            throw std::invalid_argument(std::string(where) +
+                                        ": segments must tile the columns in order, each with a cache");
+        }
+        next += segment.tokens;
+    }
+    if (segments.empty() || next != columns) {
+        throw std::invalid_argument(std::string(where) + ": segments must cover every column");
+    }
+}
 
 // The key-norm weight of a target global layer, which a query attending its compact rows carries.
 WeightId target_layer_key_norm(const Model& model, std::size_t layer) {
@@ -128,7 +171,7 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
     //   query-sized:         q, q_normed, attended
     //   key/value-sized:     k, value, k_normed
     //   compact (global):    the R + 2P by Hkv compact row
-    // plus one position vector per token. Every buffer scales with the batch. Sliding layers add a v
+    // plus the pass's two index vectors. Every buffer scales with the batch. Sliding layers add a v
     // projection on top of the key/value buffers.
     // The arena aligns every allocation to 256 bytes, so the bound carries that per slice, and an
     // undercount makes the arena refuse an allocation rather than overrun.
@@ -154,13 +197,47 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
         split = std::max(split, ops::causal_compact_attention_workspace_bytes(
                                     global_heads, global_heads.head_dim, width, 1 << 24, 1));
     }
-    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 17 * 256 + t * 4) + split;
+    return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 18 * 256 + t * 8) + split;
 }
 
+PassIndices write_pass_indices(const KvCache& cache, std::int32_t first_position,
+                               std::int32_t tokens, DeviceArena& arena, cudaStream_t stream) {
+    if (tokens < 1) throw std::invalid_argument("write_pass_indices: tokens must be positive");
+    const PassSegment segment{const_cast<KvCache*>(&cache), first_position, 0, tokens};
+    return write_pass_indices(std::span(&segment, 1), arena, stream);
+}
+
+PassIndices write_pass_indices(std::span<const PassSegment> segments, DeviceArena& arena,
+                               cudaStream_t stream) {
+    std::int32_t tokens = 0;
+    for (const PassSegment& segment : segments) tokens += segment.tokens;
+    check_segments(segments, tokens, "write_pass_indices");
+    PassIndices indices;
+    indices.positions  = arena.alloc(DType::I32, {tokens});
+    indices.ring_slots = arena.alloc(DType::I32, {tokens});
+    std::vector<std::int32_t> host(2 * static_cast<std::size_t>(tokens));
+    for (const PassSegment& segment : segments) {
+        const std::int32_t ring = segment.cache->ring_tokens();
+        for (std::int32_t token = 0; token < segment.tokens; ++token) {
+            const std::int32_t position = segment.first_position + token;
+            const std::size_t column    = static_cast<std::size_t>(segment.column + token);
+            host[column]                = position;
+            host[static_cast<std::size_t>(tokens) + column] = position % ring;
+        }
+    }
+    const std::size_t bytes = static_cast<std::size_t>(tokens) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(indices.positions.data, host.data(), bytes, cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(indices.ring_slots.data, host.data() + tokens, bytes,
+                               cudaMemcpyHostToDevice, stream));
+    return indices;
+}
+
+// `tokens` is the pass's column count over every segment.
 void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                           std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                           DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                           const Tensor& position_high) {
+                           std::span<const PassSegment> segments, std::int32_t tokens,
+                           const PassIndices& indices, DeviceArena& arena, Tensor& hidden_out,
+                           DeviceExecutionView execution, const Tensor& position_high) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -220,15 +297,6 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     scratch.up        = arena.alloc(DType::BF16, {i, tokens});
     scratch.activated = arena.alloc(DType::BF16, {i, tokens});
     scratch.down      = arena.alloc(DType::BF16, {h, tokens});
-    scratch.positions = arena.alloc(DType::I32, {tokens, 1, 1});
-
-    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        host_positions[static_cast<std::size_t>(token)] = first_position + token;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(scratch.positions.data, host_positions.data(),
-                               static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
 
     Tensor residual = hidden_in;
     auto to_weight  = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)).weight; };
@@ -257,8 +325,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
 
     // RoPE rotates in place over the head dimension; the sliding layers rotate the whole head, so
     // the pair count is half of it.
-    ops::rope(scratch.positions, d, d / 2, config.sliding.rope_theta, scratch.q_normed,
-              scratch.k_normed, execution);
+    ops::rope(indices.positions.view({tokens, 1, 1}), d, d / 2, config.sliding.rope_theta,
+              scratch.q_normed, scratch.k_normed, execution);
 
     // The ring holds the last window plus slack of tokens at position modulo the ring; a slot no token
     // has written carries an invisible position. A pass's keys enter the ring as its last `kept`
@@ -266,59 +334,63 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     // it replaces are a window older than its first query, and the key set stays one. A wider pass
     // attends to the ring as it was plus its own keys as the Op's second key set, and writes
     // afterwards, so no write replaces a key one of its own queries still sees; the stale rows a
-    // rolled-back speculation left at its positions are forgotten first.
-    Tensor cache_keys   = cache.keys(layer);
-    Tensor cache_values = cache.values(layer);
-    Tensor cache_pos    = cache.positions(layer);
-    const std::int32_t ring = cache.ring_tokens();
-    const bool write_first  = tokens <= cache.ring_slack() + 1;
-    if (!write_first) cache.forget_stale(layer, first_position, stream);
+    // rolled-back speculation left at its positions are forgotten first. All of that is decided per
+    // segment, against the segment's own lane: a decode round's segments are one token each.
+    const std::int32_t row = d * hkv;
+    for (const PassSegment& segment : segments) {
+        // Each segment's split workspace is released before the next one takes its own.
+        DeviceArena::Scope attention_scope = arena.scope();
+        KvCache& cache            = *segment.cache;
+        const std::int32_t n      = segment.tokens;
+        const std::int32_t column = segment.column;
+        Tensor cache_keys         = cache.keys(layer);
+        Tensor cache_values       = cache.values(layer);
+        Tensor cache_pos          = cache.positions(layer);
+        const std::int32_t ring   = cache.ring_tokens();
+        const bool write_first    = n <= cache.ring_slack() + 1;
+        if (!write_first) cache.forget_stale(layer, segment.first_position, stream);
 
-    const std::int32_t kept  = std::min(tokens, ring);
-    const std::int32_t first = first_position + tokens - kept;
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(d) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
-    // The kept rows are adjacent in the ring unless the run wraps, which splits it into two copies.
-    const auto write_kept = [&] {
-        const std::int32_t first_slot = cache.slot(layer, first);
-        const std::int32_t head_run   = std::min(kept, ring - first_slot);
-        const auto copy_run = [&](std::int32_t slot, std::int32_t from, std::int32_t count) {
-            const std::size_t source = static_cast<std::size_t>(tokens - kept + from) * row_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_keys.data) +
-                                           static_cast<std::size_t>(slot) * row_bytes,
-                                       static_cast<std::uint8_t*>(scratch.k_normed.data) + source,
-                                       static_cast<std::size_t>(count) * row_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_values.data) +
-                                           static_cast<std::size_t>(slot) * row_bytes,
-                                       static_cast<std::uint8_t*>(scratch.v_normed.data) + source,
-                                       static_cast<std::size_t>(count) * row_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
+        // The segment's columns of the pass-wide tensors.
+        const Tensor positions = indices.positions.slice(0, column, n);
+        const Tensor slots     = indices.ring_slots.slice(0, column, n);
+        const Tensor k_rows(column_data(scratch.k_normed, row * sizeof(std::uint16_t), column),
+                            DType::BF16, {row, n});
+        const Tensor v_rows(column_data(scratch.v_normed, row * sizeof(std::uint16_t), column),
+                            DType::BF16, {row, n});
+
+        // The kept rows go to the slots `indices` names, so the writes carry no host offset; the last
+        // ring of a pass has distinct slots.
+        const std::int32_t kept = std::min(n, ring);
+        const auto write_kept   = [&] {
+            const Tensor key_rows(cache_keys.data, DType::BF16, {row, ring});
+            const Tensor value_rows(cache_values.data, DType::BF16, {row, ring});
+            write_cache_rows(k_rows, positions, slots, kept, key_rows, cache_pos, stream);
+            Tensor value_destination = value_rows;
+            ops::scatter(v_rows.slice(1, n - kept, kept), slots.slice(0, n - kept, kept),
+                         value_destination, stream);
         };
-        copy_run(first_slot, 0, head_run);
-        if (head_run < kept) copy_run(0, head_run, kept - head_run);
-        cache.mark_range(layer, first, kept, stream);
-    };
-    if (write_first) write_kept();
+        if (write_first) write_kept();
 
-    {
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
-        Tensor q_batch = scratch.q_normed.view({d, hq, tokens, 1});
-        // Until the ring first wraps, only its leading slots hold tokens, and the Op scans every key
-        // it is given. An empty ring is passed as one unwritten slot.
+        const std::size_t q_column = static_cast<std::size_t>(q_width) * sizeof(std::uint16_t);
+        Tensor q_batch(column_data(scratch.q_normed, q_column, column), DType::BF16, {d, hq, n, 1});
+        // A narrow pass attends to the whole ring, whose unwritten slots are invisible, so its
+        // launches are the same at every position. A wide pass runs eagerly and passes only the
+        // leading slots the ring has filled before it (one unwritten slot when it is empty).
         const std::int32_t filled =
-            std::clamp(first_position + (write_first ? tokens : 0), 1, ring);
+            write_first ? ring : std::clamp(segment.first_position, 1, ring);
         Tensor k_ring(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16, {d, hkv, filled, 1});
         Tensor v_ring(static_cast<std::uint8_t*>(cache_values.data), DType::BF16, {d, hkv, filled, 1});
         Tensor position_ring(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
-        Tensor position_pass  = scratch.positions.view({tokens, 1});
-        Tensor attended_batch = scratch.attended.view({d, hq, tokens, 1});
+        Tensor position_pass = positions.view({n, 1});
+        Tensor attended_batch(column_data(scratch.attended, q_column, column), DType::BF16,
+                              {d, hq, n, 1});
         const Tensor none;
-        const Tensor k_pass = write_first ? none : scratch.k_normed.view({d, hkv, tokens, 1});
-        const Tensor v_pass = write_first ? none : scratch.v_normed.view({d, hkv, tokens, 1});
+        const Tensor k_pass = write_first ? none : Tensor(k_rows.data, DType::BF16, {d, hkv, n, 1});
+        const Tensor v_pass = write_first ? none : Tensor(v_rows.data, DType::BF16, {d, hkv, n, 1});
         const Tensor position_extra = write_first ? none : position_pass;
         const std::size_t split = ops::sliding_causal_attention_workspace_bytes(
-            geometry, tokens, filled + (write_first ? 0 : tokens), 1);
+            geometry, n, filled + (write_first ? 0 : n), 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
         // An image's later keys are part of this pass, in the ring (written first) or in the pass's
@@ -326,9 +398,9 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         ops::sliding_causal_attention(q_batch, k_ring, v_ring, position_pass, position_high,
                                       position_ring, k_pass, v_pass, position_extra, geometry,
                                       config.sliding_window, config.attention_scale, attended_batch,
-                                      workspace, stream);
+                                      workspace, execution);
+        if (!write_first) write_kept();
     }
-    if (!write_first) write_kept();
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
     ops::rmsnorm(scratch.projected, model.tensor(weights.post_attention_norm), eps, false,
                  scratch.branch, stream);
@@ -353,9 +425,11 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
                                cudaMemcpyDeviceToDevice, stream));
 }
 
+// `tokens` is the pass's column count over every segment.
 void forward_global_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                          std::int32_t first_position, std::int32_t tokens, KvCache& cache,
-                          DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution) {
+                          std::span<const PassSegment> segments, std::int32_t tokens,
+                          const PassIndices& indices, DeviceArena& arena, Tensor& hidden_out,
+                          DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& config  = model.config();
     if (layer >= model.weights().text.layers.size()) {
@@ -366,9 +440,11 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
         throw std::invalid_argument("forward_global_layer: layer is not a global layer");
     }
     if (tokens < 1) { throw std::invalid_argument("forward_global_layer: tokens must be positive"); }
-    // These layers keep one row per token at the token's own position, so the batch must fit.
-    if (first_position + tokens > cache.capacity()) {
-        throw std::invalid_argument("forward_global_layer: the batch exceeds the cache capacity");
+    // These layers keep one row per token at the token's own position, so each lane's tokens must fit.
+    for (const PassSegment& segment : segments) {
+        if (segment.first_position + segment.tokens > segment.cache->capacity()) {
+            throw std::invalid_argument("forward_global_layer: the batch exceeds the cache capacity");
+        }
     }
 
     // The scratch is a per-call frame, exactly as in the sliding path.
@@ -398,15 +474,7 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     Tensor gate      = arena.alloc(DType::BF16, {i, tokens});
     Tensor up        = arena.alloc(DType::BF16, {i, tokens});
     Tensor activated = arena.alloc(DType::BF16, {i, tokens});
-    Tensor positions = arena.alloc(DType::I32, {tokens, 1, 1});
-
-    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        host_positions[static_cast<std::size_t>(token)] = first_position + token;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_positions.data(),
-                               static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
+    const Tensor positions = indices.positions.view({tokens, 1, 1});
 
     Tensor residual = hidden_in;
     auto to_weight  = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)).weight; };
@@ -436,40 +504,46 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
 
     ops::compact_kv_rows(value, k_normed, compact, d, pairs, stream);
 
-    // The compact row is written at the token's own position and read back causally, so a slot no
-    // token has written carries an invisible position and the whole cache can be handed to the Op.
-    Tensor cache_rows = cache.keys(layer);
-    Tensor cache_pos  = cache.positions(layer);
-    const std::int32_t capacity  = cache.capacity();
-    const std::int32_t row_index = cache.slot(layer, first_position);
-    const std::size_t row_bytes =
+    // The compact row is written at the token's own position, the slot the positions themselves
+    // name, and read back causally, so a slot no token has written carries an invisible position and
+    // the whole cache can be handed to the Op. Each segment writes and attends within its own lane.
+    const std::size_t compact_column =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(hkv) * sizeof(std::uint16_t);
-    // A batch occupies consecutive positions, so its rows are consecutive too.
-    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(cache_rows.data) +
-                                   static_cast<std::size_t>(row_index) * row_bytes,
-                               compact.data, static_cast<std::size_t>(tokens) * row_bytes,
-                               cudaMemcpyDeviceToDevice, stream));
-    cache.mark_range(layer, first_position, tokens, stream);
+    const std::size_t q_column =
+        static_cast<std::size_t>(hq) * static_cast<std::size_t>(d) * sizeof(std::uint16_t);
+    for (const PassSegment& segment : segments) {
+        // Each segment's split workspace is released before the next one takes its own.
+        DeviceArena::Scope attention_scope = arena.scope();
+        KvCache& cache              = *segment.cache;
+        const std::int32_t n        = segment.tokens;
+        const std::int32_t column   = segment.column;
+        Tensor cache_rows           = cache.keys(layer);
+        Tensor cache_pos            = cache.positions(layer);
+        const std::int32_t capacity = cache.capacity();
+        const Tensor segment_positions = indices.positions.slice(0, column, n);
+        write_cache_rows(Tensor(column_data(compact, compact_column, column), DType::BF16,
+                                {width * hkv, n}),
+                         segment_positions, segment_positions, n,
+                         Tensor(cache_rows.data, DType::BF16, {width * hkv, capacity}), cache_pos,
+                         stream);
 
-    {
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
-        Tensor q_batch        = q_normed.view({d, hq, tokens, 1});
-        // Rows sit at their own positions, so the written ones are exactly the leading `filled`, and
-        // the Op scans every key it is given.
-        const std::int32_t filled = first_position + tokens;
+        Tensor q_batch(column_data(q_normed, q_column, column), DType::BF16, {d, hq, n, 1});
+        // The Op is handed the whole capacity: with `indexed_keys` it stops at the latest query's
+        // position on the device, so the launches do not depend on how much of the cache is filled.
         Tensor kv_batch(static_cast<std::uint8_t*>(cache_rows.data), DType::BF16,
-                        {width, hkv, filled, 1});
-        Tensor attended_batch = attended.view({d, hq, tokens, 1});
-        Tensor position_q     = positions.view({tokens, 1});
-        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
+                        {width, hkv, capacity, 1});
+        Tensor attended_batch(column_data(attended, q_column, column), DType::BF16, {d, hq, n, 1});
+        Tensor position_q = segment_positions.view({n, 1});
+        Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {capacity, 1});
         const std::size_t split =
-            ops::causal_compact_attention_workspace_bytes(heads, d, tokens, filled, 1);
+            ops::causal_compact_attention_workspace_bytes(heads, d, n, capacity, 1);
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
         // Rows sit at their own positions, which is what `indexed_keys` states.
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
                                       config.attention_scale, true, attended_batch, workspace,
-                                      stream);
+                                      execution);
     }
     ops::linear(attended, to_weight(weights.attention.output), projected, stream);
     ops::rmsnorm(projected, model.tensor(weights.post_attention_norm), eps, false, branch, stream);
@@ -511,6 +585,13 @@ void forward_head(const Model& model, const Tensor& hidden_in, std::int32_t toke
 void forward_draft(const Model& model, const Tensor& input, std::int32_t position,
                    const KvCache& cache, DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
                    DeviceExecutionView execution) {
+    const DraftLane lane{&cache, position};
+    forward_draft(model, input, std::span(&lane, 1), arena, logits, hidden_out, execution);
+}
+
+void forward_draft(const Model& model, const Tensor& input, std::span<const DraftLane> lanes,
+                   DeviceArena& arena, Tensor& logits, Tensor& hidden_out,
+                   DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const TextConfig& target  = model.config();
     if (!model.draft_config() || !model.weights().draft) {
@@ -518,9 +599,15 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
     }
     const DraftConfig& draft    = *model.draft_config();
     const DraftWeights& weights = *model.weights().draft;
+    const std::int32_t count    = static_cast<std::int32_t>(lanes.size());
+    if (count < 1 || input.ne[1] != count) {
+        throw std::invalid_argument("forward_draft: one input column per lane");
+    }
     // The drafter reads keys strictly before its token, so a token at position 0 has none.
-    if (position < 1 || position > cache.capacity()) {
-        throw std::invalid_argument("forward_draft: position must be in [1, capacity]");
+    for (const DraftLane& lane : lanes) {
+        if (lane.cache == nullptr || lane.position < 1 || lane.position > lane.cache->capacity()) {
+            throw std::invalid_argument("forward_draft: position must be in [1, capacity]");
+        }
     }
 
     DeviceArena::Scope scope = arena.scope();
@@ -533,28 +620,36 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
     // Two position vectors: RoPE rotates at the token's own position, while visibility is that of the
     // previous position, which admits exactly the keys before the token. A row the target wrote at or
     // past the token (a rejected draft's, or none at all) stays invisible either way.
-    Tensor positions = arena.alloc(DType::I32, {2, 1, 1});
-    const std::int32_t host_positions[2] = {position, position - 1};
-    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_positions, sizeof(host_positions),
+    Tensor positions = arena.alloc(DType::I32, {2 * count});
+    std::vector<std::int32_t> host_positions(2 * static_cast<std::size_t>(count));
+    for (std::int32_t column = 0; column < count; ++column) {
+        host_positions[static_cast<std::size_t>(column)] = lanes[column].position;
+        host_positions[static_cast<std::size_t>(count + column)] = lanes[column].position - 1;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(positions.data, host_positions.data(),
+                               host_positions.size() * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
-    // The pageable source is staged before the call returns, so the stack array may go.
-    const Tensor rope_position(positions.data, DType::I32, {1, 1, 1});
-    const Tensor visible_position(static_cast<std::uint8_t*>(positions.data) + sizeof(std::int32_t),
-                                  DType::I32, {1, 1});
+    // The pageable source is staged before the call returns.
+    const Tensor rope_position(positions.data, DType::I32, {count, 1, 1});
+    const auto visible_position = [&](std::int32_t column) {
+        return Tensor(static_cast<std::uint8_t*>(positions.data) +
+                          static_cast<std::size_t>(count + column) * sizeof(std::int32_t),
+                      DType::I32, {1, 1});
+    };
 
-    Tensor residual  = arena.alloc(DType::BF16, {h, 1});
-    Tensor normed    = arena.alloc(DType::BF16, {h, 1});
-    Tensor branch    = arena.alloc(DType::BF16, {h, 1});
-    Tensor projected = arena.alloc(DType::BF16, {h, 1});
-    Tensor gate      = arena.alloc(DType::BF16, {i, 1});
-    Tensor up        = arena.alloc(DType::BF16, {i, 1});
-    Tensor activated = arena.alloc(DType::BF16, {i, 1});
-    Tensor down      = arena.alloc(DType::BF16, {h, 1});
+    Tensor residual  = arena.alloc(DType::BF16, {h, count});
+    Tensor normed    = arena.alloc(DType::BF16, {h, count});
+    Tensor branch    = arena.alloc(DType::BF16, {h, count});
+    Tensor projected = arena.alloc(DType::BF16, {h, count});
+    Tensor gate      = arena.alloc(DType::BF16, {i, count});
+    Tensor up        = arena.alloc(DType::BF16, {i, count});
+    Tensor activated = arena.alloc(DType::BF16, {i, count});
+    Tensor down      = arena.alloc(DType::BF16, {h, count});
     const std::int32_t widest_q = hq * static_cast<std::int32_t>(
         std::max(target.sliding.head_dim, target.global.shared.head_dim));
-    Tensor q_storage        = arena.alloc(DType::BF16, {widest_q, 1});
-    Tensor q_normed_storage = arena.alloc(DType::BF16, {widest_q, 1});
-    Tensor attended_storage = arena.alloc(DType::BF16, {widest_q, 1});
+    Tensor q_storage        = arena.alloc(DType::BF16, {widest_q, count});
+    Tensor q_normed_storage = arena.alloc(DType::BF16, {widest_q, count});
+    Tensor attended_storage = arena.alloc(DType::BF16, {widest_q, count});
 
     ops::linear(input, to_weight(weights.pre_projection), residual, stream);
 
@@ -564,58 +659,68 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
         const std::int32_t d   = static_cast<std::int32_t>(geometry.head_dim);
         const std::int32_t hkv = static_cast<std::int32_t>(geometry.num_key_value_heads);
         // The buffers are sized for the wider global head; a sliding layer uses their prefix.
-        Tensor q(q_storage.data, DType::BF16, {hq * d, 1});
-        Tensor q_normed(q_normed_storage.data, DType::BF16, {d, hq, 1});
-        Tensor attended(attended_storage.data, DType::BF16, {hq * d, 1});
+        Tensor q(q_storage.data, DType::BF16, {hq * d, count});
+        Tensor q_normed(q_normed_storage.data, DType::BF16, {d, hq, count});
+        Tensor attended(attended_storage.data, DType::BF16, {hq * d, count});
+        const std::size_t q_column =
+            static_cast<std::size_t>(hq) * static_cast<std::size_t>(d) * sizeof(std::uint16_t);
 
         ops::rmsnorm(residual, model.tensor(layer.input_norm), eps, false, normed, stream);
         ops::linear(normed, to_weight(layer.query), q, stream);
-        ops::rmsnorm(q.view({d, hq, 1}), model.tensor(layer.query_norm), eps, false, q_normed,
+        ops::rmsnorm(q.view({d, hq, count}), model.tensor(layer.query_norm), eps, false, q_normed,
                      stream);
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
+        const std::int32_t pairs = static_cast<std::int32_t>(target.global.rope_angles);
         if (sliding) {
-            const std::size_t source = draft.target_sliding_layer;
             ops::rope(rope_position, d, d / 2, geometry.rope_theta, q_normed, execution);
-            const Tensor keys      = cache.keys(source);
-            const Tensor values    = cache.values(source);
-            const Tensor key_pos   = cache.positions(source);
-            const std::int32_t ring = cache.ring_tokens();
-            const Tensor k_ring(keys.data, DType::BF16, {d, hkv, ring, 1});
-            const Tensor v_ring(values.data, DType::BF16, {d, hkv, ring, 1});
-            const Tensor p_ring(key_pos.data, DType::I32, {ring, 1});
-            const Tensor none;
-            Tensor out = attended.view({d, hq, 1, 1});
-            const std::size_t split =
-                ops::sliding_causal_attention_workspace_bytes(heads, 1, ring, 1);
-            Tensor workspace;
-            if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
-            ops::sliding_causal_attention(q_normed.view({d, hq, 1, 1}), k_ring, v_ring,
-                                          visible_position, none, p_ring, none, none, none, heads,
-                                          target.sliding_window, target.attention_scale, out,
-                                          workspace, stream);
         } else {
-            const std::size_t source = draft.target_global_layer;
-            const std::int32_t pairs = static_cast<std::int32_t>(target.global.rope_angles);
-            const std::int32_t width = d + 2 * pairs;
             ops::rope(rope_position, d, pairs, geometry.rope_theta, q_normed, execution);
             // The compact rows hold the weightless value and the rotated key; on the dims that do not
             // rotate, the key the target scores against is the value times the source layer's key-norm
             // weight, which the query carries instead, exactly as in the target's own global layer.
-            const Tensor& w_kn = model.tensor(target_layer_key_norm(model, source));
+            const Tensor& w_kn = model.tensor(target_layer_key_norm(model, draft.target_global_layer));
             ops::scale_columns(w_kn, q_normed, pairs, d / 2, stream);
             ops::scale_columns(w_kn, q_normed, d / 2 + pairs, d, stream);
-            const Tensor rows    = cache.keys(source);
-            const Tensor row_pos = cache.positions(source);
-            const Tensor kv(rows.data, DType::BF16, {width, hkv, position, 1});
-            const Tensor p_rows(row_pos.data, DType::I32, {position, 1});
-            Tensor out = attended.view({d, hq, 1, 1});
-            const std::size_t split =
-                ops::causal_compact_attention_workspace_bytes(heads, d, 1, position, 1);
-            Tensor workspace;
-            if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
-            ops::causal_compact_attention(q_normed.view({d, hq, 1, 1}), kv, visible_position, p_rows,
-                                          heads, d, pairs, target.attention_scale, true, out,
-                                          workspace, stream);
+        }
+        // Each lane attends to its own cache, in its own scope for the split workspace.
+        for (std::int32_t column = 0; column < count; ++column) {
+            DeviceArena::Scope attention_scope = arena.scope();
+            const KvCache& cache               = *lanes[column].cache;
+            const Tensor q_lane(column_data(q_normed, q_column, column), DType::BF16, {d, hq, 1, 1});
+            Tensor out(column_data(attended, q_column, column), DType::BF16, {d, hq, 1, 1});
+            if (sliding) {
+                const std::size_t source = draft.target_sliding_layer;
+                const Tensor keys        = cache.keys(source);
+                const Tensor values      = cache.values(source);
+                const Tensor key_pos     = cache.positions(source);
+                const std::int32_t ring  = cache.ring_tokens();
+                const Tensor k_ring(keys.data, DType::BF16, {d, hkv, ring, 1});
+                const Tensor v_ring(values.data, DType::BF16, {d, hkv, ring, 1});
+                const Tensor p_ring(key_pos.data, DType::I32, {ring, 1});
+                const Tensor none;
+                const std::size_t split =
+                    ops::sliding_causal_attention_workspace_bytes(heads, 1, ring, 1);
+                Tensor workspace;
+                if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+                ops::sliding_causal_attention(q_lane, k_ring, v_ring, visible_position(column), none,
+                                              p_ring, none, none, none, heads, target.sliding_window,
+                                              target.attention_scale, out, workspace, execution);
+            } else {
+                const std::size_t source    = draft.target_global_layer;
+                const std::int32_t width    = d + 2 * pairs;
+                const std::int32_t position = lanes[column].position;
+                const Tensor rows           = cache.keys(source);
+                const Tensor row_pos        = cache.positions(source);
+                const Tensor kv(rows.data, DType::BF16, {width, hkv, position, 1});
+                const Tensor p_rows(row_pos.data, DType::I32, {position, 1});
+                const std::size_t split =
+                    ops::causal_compact_attention_workspace_bytes(heads, d, 1, position, 1);
+                Tensor workspace;
+                if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+                ops::causal_compact_attention(q_lane, kv, visible_position(column), p_rows, heads, d,
+                                              pairs, target.attention_scale, true, out, workspace,
+                                              execution);
+            }
         }
         ops::linear(attended, to_weight(layer.output), projected, stream);
         ops::rmsnorm(projected, model.tensor(layer.post_attention_norm), eps, false, branch, stream);
@@ -637,19 +742,35 @@ void forward_draft(const Model& model, const Tensor& input, std::int32_t positio
 }
 
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
-                   std::int32_t first_position, std::int32_t tokens, KvCache& cache,
+                   std::int32_t first_position, std::int32_t tokens, const PassIndices& indices,
+                   KvCache& cache, DeviceArena& arena, Tensor& hidden_out,
+                   DeviceExecutionView execution, const Tensor& position_high) {
+    const PassSegment segment{&cache, first_position, 0, tokens};
+    forward_layer(model, layer, hidden_in, std::span(&segment, 1), indices, arena, hidden_out,
+                  execution, position_high);
+}
+
+void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
+                   std::span<const PassSegment> segments, const PassIndices& indices,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
                    const Tensor& position_high) {
+    const std::int32_t tokens = static_cast<std::int32_t>(indices.positions.ne[0]);
+    check_segments(segments, tokens, "forward_layer");
+    if (indices.positions.dtype != DType::I32 || indices.ring_slots.dtype != DType::I32 ||
+        indices.ring_slots.ne[0] != tokens) {
+        throw std::invalid_argument("forward_layer: indices must be I32 [tokens]");
+    }
     if (position_high.data != nullptr &&
-        (position_high.dtype != DType::I32 || position_high.ne[0] != tokens ||
-         position_high.ne[1] != 1)) {
-        throw std::invalid_argument("forward_layer: position_high must be I32 [tokens,1]");
+        (segments.size() != 1 || position_high.dtype != DType::I32 ||
+         position_high.ne[0] != tokens || position_high.ne[1] != 1)) {
+        throw std::invalid_argument(
+            "forward_layer: position_high must be I32 [tokens,1] over a single segment");
     }
     if (model.config().sliding_attention(layer)) {
-        forward_sliding_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
+        forward_sliding_layer(model, layer, hidden_in, segments, tokens, indices, arena,
                               hidden_out, execution, position_high);
     } else {
-        forward_global_layer(model, layer, hidden_in, first_position, tokens, cache, arena,
+        forward_global_layer(model, layer, hidden_in, segments, tokens, indices, arena,
                              hidden_out, execution);
     }
 }

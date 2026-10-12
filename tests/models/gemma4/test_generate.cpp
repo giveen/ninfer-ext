@@ -1,6 +1,7 @@
 // Generates greedily through the model's own Program, so the whole pipeline runs end to end: the
 // embedding, sixty cached decoder layers, the head, and an argmax. Tokenizing and detokenizing happen
-// outside, so this needs no tokenizer.
+// outside, so this needs no tokenizer. The decode steps run twice, eagerly and replayed from the
+// lane's CUDA Graph, and the two greedy sequences must be identical.
 //
 //   NINFER_GEMMA_ARTIFACT  the artifact
 //   NINFER_GEMMA_PROMPT    a file of int32 little-endian token ids
@@ -71,39 +72,60 @@ int main() {
         }
         const std::int32_t prompt_length = static_cast<std::int32_t>(ids.size());
 
-        gemma::Program program(*model, prompt_length + steps + 8, 1, device);
-        program.prefill(0, ids, device.execution_view());
-
-        // Greedy: the model produces logits and sampling is the caller's business.
-        const auto sample = [&] {
-            std::vector<std::uint16_t> host(static_cast<std::size_t>(vocabulary));
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaMemcpy(host.data(), program.logits().data,
-                                  static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t),
-                                  cudaMemcpyDeviceToHost));
-            float best          = -1.0e30F;
-            std::int32_t winner = 0;
-            for (std::int32_t id = 0; id < vocabulary; ++id) {
-                const float value = decode_bf16(host[static_cast<std::size_t>(id)]);
-                if (value > best) {
-                    best   = value;
-                    winner = id;
+        // Greedy: the model produces logits and sampling is the caller's business. The decode steps
+        // run once eagerly and once replayed from the lane's CUDA Graph; the graph replays the same
+        // launches at every position, so the two token sequences must be identical.
+        std::vector<std::int32_t> eager;
+        for (const bool graphs : {false, true}) {
+            gemma::Program program(*model, prompt_length + steps + 8, 1, device, 0, graphs);
+            program.prefill(0, ids, device.execution_view());
+            const auto sample = [&] {
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(vocabulary));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(host.data(), program.logits().data,
+                                      static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t),
+                                      cudaMemcpyDeviceToHost));
+                float best          = -1.0e30F;
+                std::int32_t winner = 0;
+                for (std::int32_t id = 0; id < vocabulary; ++id) {
+                    const float value = decode_bf16(host[static_cast<std::size_t>(id)]);
+                    if (value > best) {
+                        best   = value;
+                        winner = id;
+                    }
+                }
+                if (!graphs) std::cout << "  token " << winner << " (greedy logit " << best << ")\n";
+                return winner;
+            };
+            std::vector<std::int32_t> generated;
+            for (std::int32_t step = 0; step < steps; ++step) {
+                const std::int32_t winner = sample();
+                generated.push_back(winner);
+                program.decode(0, winner, device.execution_view());
+            }
+            if (program.position(0) != prompt_length + steps) {
+                std::cerr << "gemma4 generate: the Program consumed " << program.position(0)
+                          << " tokens, expected " << prompt_length + steps << '\n';
+                return 1;
+            }
+            if (!graphs) {
+                eager = generated;
+                continue;
+            }
+            for (std::int32_t step = 0; step < steps; ++step) {
+                if (generated[static_cast<std::size_t>(step)] !=
+                    eager[static_cast<std::size_t>(step)]) {
+                    std::cerr << "gemma4 generate: the graph decode diverges from the eager one at "
+                                 "step "
+                              << step << ": " << generated[static_cast<std::size_t>(step)]
+                              << " against " << eager[static_cast<std::size_t>(step)] << '\n';
+                    return 1;
                 }
             }
-            std::cout << "  token " << winner << " (greedy logit " << best << ")\n";
-            return winner;
-        };
-
-        for (std::int32_t step = 0; step < steps; ++step) {
-            const std::int32_t winner = sample();
-            ids.push_back(winner);
-            program.decode(0, winner, device.execution_view());
+            std::cout << "gemma4 generate: " << steps
+                      << " graph-replayed decode steps match the eager ones\n";
         }
-        if (program.position(0) != prompt_length + steps) {
-            std::cerr << "gemma4 generate: the Program consumed " << program.position(0)
-                      << " tokens, expected " << prompt_length + steps << '\n';
-            return 1;
-        }
+        ids.insert(ids.end(), eager.begin(), eager.end());
 
         std::ofstream output("/tmp/gemma_gen.out.i32", std::ios::binary);
         output.write(reinterpret_cast<const char*>(ids.data()),

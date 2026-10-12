@@ -4,6 +4,9 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ops/kernel/rope.cuh"
 
+#include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -173,17 +176,64 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, int r
     return false;
 }
 
+// The per-pair frequencies of one generic geometry. A Program issues the same few geometries on
+// every step, so each launching thread keeps the last tables it evaluated.
+const RopeGenericFrequencies& generic_frequencies(int axes, int head_dim, int rotary_dim,
+                                                  int rotary_pairs, float theta) {
+    struct Entry {
+        int axes;
+        int head_dim;
+        int rotary_dim;
+        int rotary_pairs;
+        float theta;
+        RopeGenericFrequencies table;
+    };
+    constexpr std::size_t kEntries = 4;
+    thread_local std::array<Entry, kEntries> entries{};
+    thread_local std::size_t filled = 0;
+    thread_local std::size_t next   = 0;
+    for (std::size_t i = 0; i < filled; ++i) {
+        const Entry& e = entries[i];
+        if (e.axes == axes && e.head_dim == head_dim && e.rotary_dim == rotary_dim &&
+            e.rotary_pairs == rotary_pairs && e.theta == theta) {
+            return e.table;
+        }
+    }
+    Entry& e       = entries[next];
+    next           = (next + 1) % kEntries;
+    filled         = filled < kEntries ? filled + 1 : filled;
+    e.axes         = axes;
+    e.head_dim     = head_dim;
+    e.rotary_dim   = rotary_dim;
+    e.rotary_pairs = rotary_pairs;
+    e.theta        = theta;
+    e.table        = {};
+    for (int pair = 0; pair < rotary_pairs; ++pair) {
+        int axis        = 0;
+        double exponent = 0.0;
+        generic_axis_exponent(axes, head_dim, rotary_dim, pair, &axis, &exponent);
+        e.table.inv_frequency[pair] = std::pow(static_cast<double>(theta), exponent);
+    }
+    return e.table;
+}
+
 void launch_generic(const Tensor& positions, int rotary_dim, int rotary_pairs, float theta,
                     Tensor* q, Tensor* k, cudaStream_t stream) {
-    constexpr int block = 128;
+    constexpr int block = kRopeGenericHeadsPerBlock * 32;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
-    rope_generic_kernel<<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), positions.ne[1],
+    const int heads     = (q == nullptr ? 0 : q->ne[1]) + (k == nullptr ? 0 : k->ne[1]);
+    const int axes      = positions.ne[1];
+    const dim3 grid(static_cast<unsigned>(tokens),
+                    static_cast<unsigned>((heads + kRopeGenericHeadsPerBlock - 1) /
+                                          kRopeGenericHeadsPerBlock));
+    rope_generic_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), axes,
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
         rotary_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
-        token_stride(q), token_stride(k));
+        token_stride(q), token_stride(k),
+        generic_frequencies(axes, sample.ne[0], rotary_dim, rotary_pairs, theta));
 }
 
 } // namespace

@@ -39,7 +39,8 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_k, const Tensor& k_extra,
                               const Tensor& v_extra, const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, const Tensor& workspace, cudaStream_t stream) {
+                              Tensor& out, const Tensor& workspace,
+                              DeviceExecutionView execution) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
     }
@@ -114,7 +115,7 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     detail::sliding_causal_attention_launch(
         q, k, v, position_q, has_high ? position_q_high : none, position_k,
         has_extra ? k_extra : none, has_extra ? v_extra : none, has_extra ? position_extra : none,
-        head_dim, geometry.query_heads, geometry.kv_heads, window, scale, out, workspace, stream);
+        head_dim, geometry.query_heads, geometry.kv_heads, window, scale, out, workspace, execution);
 }
 
 std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geometry,

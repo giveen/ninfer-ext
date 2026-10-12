@@ -15,7 +15,8 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
                                      const Tensor& v_extra, const Tensor& position_extra,
                                      std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
-                                     Tensor& out, const Tensor& workspace, cudaStream_t stream) {
+                                     Tensor& out, const Tensor& workspace,
+                                     DeviceExecutionView execution) {
     const std::int32_t query_tokens = q.ne[2];
     const std::int32_t key_tokens   = k.ne[2];
     const std::int32_t batch        = q.ne[3];
@@ -50,10 +51,10 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
         params.extra_tokens   = position_extra.ne[0];
     }
     switch (head_dim) {
-    case 32: launch_gemma_flash_attention<32, 32, false>(params, batch, workspace, stream); break;
-    case 64: launch_gemma_flash_attention<64, 64, false>(params, batch, workspace, stream); break;
-    case 128: launch_gemma_flash_attention<128, 128, false>(params, batch, workspace, stream); break;
-    case 256: launch_gemma_flash_attention<256, 256, false>(params, batch, workspace, stream); break;
+    case 32: launch_gemma_flash_attention<32, 32, false>(params, batch, workspace, execution); break;
+    case 64: launch_gemma_flash_attention<64, 64, false>(params, batch, workspace, execution); break;
+    case 128: launch_gemma_flash_attention<128, 128, false>(params, batch, workspace, execution); break;
+    case 256: launch_gemma_flash_attention<256, 256, false>(params, batch, workspace, execution); break;
     default:
         throw std::invalid_argument(
             "sliding_causal_attention: head_dim must be 32, 64, 128 or 256");

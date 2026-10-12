@@ -276,9 +276,11 @@ class GemmaProgram {
 public:
     // `draft_tokens` > 0 runs MTP rounds of up to that many drafts: exactly that many when
     // `adaptive_draft` is false, otherwise a per-lane choice among the MTP ladder's lengths.
+    // `cuda_graphs` replays each lane's one-token decode step from a captured CUDA Graph.
     GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity, std::int32_t lanes,
                  std::uint32_t prefill_chunk, std::uint32_t idle_prefill_chunk,
-                 std::int32_t draft_tokens, bool adaptive_draft, DeviceContext& device);
+                 std::int32_t draft_tokens, bool adaptive_draft, bool cuda_graphs,
+                 DeviceContext& device);
 
     // Scoring.
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,

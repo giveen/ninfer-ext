@@ -1,9 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/attention_geometry.h"
-
-#include <cuda_runtime.h> // cudaStream_t
 
 #include <cstddef>
 #include <cstdint>
@@ -49,7 +48,8 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_k, const Tensor& k_extra,
                               const Tensor& v_extra, const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, const Tensor& workspace, cudaStream_t stream);
+                              Tensor& out, const Tensor& workspace,
+                              DeviceExecutionView execution);
 
 // Workspace bytes the key split needs for these extents (`key_tokens` counts both key sets); zero
 // when the route does not split.

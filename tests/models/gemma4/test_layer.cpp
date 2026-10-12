@@ -127,8 +127,11 @@ int main() {
             CUDA_CHECK(cudaMemcpy(in, state.data(), bytes, cudaMemcpyHostToDevice));
             Tensor hidden_in(static_cast<std::uint8_t*>(in), DType::BF16, {hidden, 1});
             Tensor hidden_out(static_cast<std::uint8_t*>(out), DType::BF16, {hidden, 1});
-            gemma::forward_layer(*model, layer, hidden_in, position, 1, cache, arena, hidden_out,
-                                 device.execution_view());
+            DeviceArena::Scope scope = arena.scope();
+            const gemma::PassIndices indices = gemma::write_pass_indices(
+                cache, position, 1, arena, device.execution_view().stream);
+            gemma::forward_layer(*model, layer, hidden_in, position, 1, indices, cache, arena,
+                                 hidden_out, device.execution_view());
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<std::uint16_t> produced(hidden);
             CUDA_CHECK(cudaMemcpy(produced.data(), out, bytes, cudaMemcpyDeviceToHost));

@@ -44,6 +44,27 @@ template <int BlockRows, int WarpsPerRow, int GroupsPerWarpStage, int Stages, Ca
 using Q6A16GemvSchedule = Q6A16SimtSchedule<BlockRows, 1, WarpsPerRow, GroupsPerWarpStage, Stages,
                                             CodeCache, MinBlocksPerSm>;
 
+// Unstaged single-pass SIMT: each warp loads its own weights straight from global memory.
+template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpTile,
+          int MinBlocksPerSm, int StaticK = 0>
+struct Q6A16DirectSimtSchedule {
+    static_assert(BlockRows > 0 && BlockTokens > 0 && BlockTokens <= 32);
+    static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
+    static_assert(GroupsPerWarpTile > 0 && GroupsPerWarpTile % 4 == 0);
+    static_assert(MinBlocksPerSm > 0 && (StaticK == 0 || (StaticK > 0 && StaticK % 64 == 0)));
+    static constexpr int kBlockRows         = BlockRows;
+    static constexpr int kBlockTokens       = BlockTokens;
+    static constexpr int kWarpsPerRow       = WarpsPerRow;
+    static constexpr int kGroupsPerWarpTile = GroupsPerWarpTile;
+    static constexpr int kPhasesPerWarp     = GroupsPerWarpTile / 4;
+    static constexpr int kBlockK            = WarpsPerRow * GroupsPerWarpTile * 64;
+    static constexpr int kStaticK           = StaticK;
+    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
+    static constexpr int kWarps             = BlockRows * WarpsPerRow;
+    static constexpr int kThreads           = kWarps * 32;
+    static_assert(kThreads <= 1024);
+};
+
 enum class Q6MmaFragmentPipeline {
     Serial,
     PingPong,

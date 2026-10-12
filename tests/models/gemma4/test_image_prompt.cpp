@@ -196,11 +196,14 @@ int main() {
             const Tensor bound =
                 bidirectional ? Tensor(high_buffer, DType::I32, {prefix, 1}) : Tensor{};
             int in = 0;
+            DeviceArena::Scope scope = arena.scope();
+            const gemma::PassIndices indices =
+                gemma::write_pass_indices(cache, 0, prefix, arena, execution.stream);
             for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
                 Tensor hidden_in(state[in].data, DType::BF16, {h, prefix});
                 Tensor hidden_out(state[1 - in].data, DType::BF16, {h, prefix});
-                gemma::forward_layer(*model, layer, hidden_in, 0, prefix, cache, arena, hidden_out,
-                                     execution, bound);
+                gemma::forward_layer(*model, layer, hidden_in, 0, prefix, indices, cache, arena,
+                                     hidden_out, execution, bound);
                 in = 1 - in;
             }
             std::vector<std::uint16_t> column_logits;
