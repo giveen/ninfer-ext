@@ -154,6 +154,68 @@ __global__ void gemma_moe_router_logits_kernel(const __nv_bfloat16* __restrict__
 }
 
 /**
+ * The few-token projection: grid (E, T), kRouterExpertsPerBlock warps. A CTA is one expert of one
+ * token, and its warps split the row's K, so a decode token spreads over E CTAs rather than
+ * E / kRouterExpertsPerBlock. Each CTA takes its token's weightless RMS itself.
+ */
+__global__ void gemma_moe_router_logits_split_kernel(const __nv_bfloat16* __restrict__ x,
+                                                     const __nv_bfloat16* __restrict__ router,
+                                                     const __nv_bfloat16* __restrict__ router_scale,
+                                                     float eps, int hidden, int tokens,
+                                                     float* __restrict__ logits) {
+    __shared__ float partial[2][kRouterExpertsPerBlock];
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int lane   = tid & 31;
+    const int warp   = tid >> 5;
+    const int expert = static_cast<int>(blockIdx.x);
+    const int token  = static_cast<int>(blockIdx.y);
+    const __nv_bfloat16* row         = x + static_cast<std::int64_t>(token) * hidden;
+    const __nv_bfloat16* weights_row = router + static_cast<std::int64_t>(expert) * hidden;
+
+    // One pass over the CTA's share of the row: the sum of squares for the RMS, and the dot of the
+    // scaled activation, which the RMS factor multiplies once at the end.
+    float squares = 0.0F;
+    float dot     = 0.0F;
+    for (int k = tid * 8; k < hidden; k += kRouterExpertsPerBlock * 32 * 8) {
+        const uint4 xv    = load_vec<uint4>(row + k);
+        const uint4 wv    = load_vec<uint4>(weights_row + k);
+        const uint4 sv    = load_vec<uint4>(router_scale + k);
+        const auto* xp    = reinterpret_cast<const __nv_bfloat162*>(&xv);
+        const auto* wp    = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        const auto* sp    = reinterpret_cast<const __nv_bfloat162*>(&sv);
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const float2 xf = __bfloat1622float2(xp[p]);
+            const float2 wf = __bfloat1622float2(wp[p]);
+            const float2 sf = __bfloat1622float2(sp[p]);
+            squares         = fmaf(xf.x, xf.x, squares);
+            squares         = fmaf(xf.y, xf.y, squares);
+            dot             = fmaf(wf.x, xf.x * sf.x, dot);
+            dot             = fmaf(wf.y, xf.y * sf.y, dot);
+        }
+    }
+    squares = router_warp_sum(squares);
+    dot     = router_warp_sum(dot);
+    if (lane == 0) {
+        partial[0][warp] = squares;
+        partial[1][warp] = dot;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total_squares = 0.0F;
+        float total_dot     = 0.0F;
+#pragma unroll
+        for (int w = 0; w < kRouterExpertsPerBlock; ++w) {
+            total_squares += partial[0][w];
+            total_dot += partial[1][w];
+        }
+        const float inverse = rsqrtf(total_squares / static_cast<float>(hidden) + eps) *
+                              rsqrtf(static_cast<float>(hidden));
+        logits[static_cast<std::int64_t>(expert) * tokens + token] = total_dot * inverse;
+    }
+}
+
+/**
  * One warp per token over logits FP32 [E,T]; E <= kRouterMaxExperts and K <= kRouterMaxRanks.
  */
 __global__ void gemma_moe_router_select_kernel(const float* __restrict__ logits,

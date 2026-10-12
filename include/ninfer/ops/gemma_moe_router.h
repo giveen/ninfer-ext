@@ -40,8 +40,8 @@ namespace ninfer::ops {
  *   expert_weights contiguous FP32 [K,T], fully overwritten.
  *
  * Supported domain:
- *   T >= 1, H >= 1 and a multiple of 8, 1 <= E <= 256, 1 <= K <= min(E, 16). W_router is BF16, and x
- *   and W_router are 16-byte aligned.
+ *   T >= 1, H >= 1 and a multiple of 8, 1 <= E <= 256, 1 <= K <= min(E, 16). W_router is BF16,
+ *   and x, W_router and router_scale are 16-byte aligned.
  *   The artifact geometry this Op was admitted for is H=2816, E=128, K=8.
  *
  * Numeric:
