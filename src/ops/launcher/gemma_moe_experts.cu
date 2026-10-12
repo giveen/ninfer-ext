@@ -1,7 +1,8 @@
 // Implements: include/ninfer/ops/gemma_moe_experts.h
 //
-// One CTA per token, with the token's activation row, one selected expert's gate and up vectors,
-// the product and the running output row in shared memory. The bank format is a reader, so the
+// An NVFP4 pair at a registered geometry streams over every SM in two stages (see the kernel
+// header). Any other pair takes one CTA per token, with the token's activation row, one selected
+// expert's gate and up vectors, the product and the running output row in shared memory. The bank format is a reader, so the
 // kernel body is instantiated once per format rather than duplicated; a wider geometry only needs
 // the dynamic shared opt-in below.
 #include "ops/launcher/gemma_moe_experts.h"
@@ -44,13 +45,57 @@ void launch_route(const GateUpReader& gate_up, const DownReader& down, const voi
     CUDA_CHECK(cudaGetLastError());
 }
 
+SparseMoePlanes stream_planes(const GemmaMoeBankLaunch& bank) {
+    return {static_cast<const std::uint8_t*>(bank.payload), nullptr,
+            static_cast<const std::uint8_t*>(bank.scales), bank.divisors, bank.divisor_rows};
+}
+
+// Two hidden rows a stage-two CTA: NVFP4 interleaves rows r and r+1 inside one 32-byte sector of
+// its scale tile, which is why the 35B's decode takes the same pair.
+constexpr int kStreamDownRows = 2;
+
+template <int Hidden, int Intermediate, int TopK>
+void launch_stream_route(const void* x, const void* expert_ids, const void* expert_weights,
+                         const GemmaMoeBankLaunch& gate_up, const GemmaMoeBankLaunch& down,
+                         std::int32_t tokens, float* products, void* out, cudaStream_t stream) {
+    const auto* ids = static_cast<const std::int32_t*>(expert_ids);
+    gemma_moe_stream_gate_up_kernel<Hidden, Intermediate, TopK>
+        <<<dim3(Intermediate, tokens), TopK * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x), ids, stream_planes(gate_up), products, tokens);
+    CUDA_CHECK(cudaGetLastError());
+    gemma_moe_stream_down_kernel<Hidden, Intermediate, TopK, kStreamDownRows>
+        <<<dim3(Hidden / kStreamDownRows, tokens), TopK * 32, 0, stream>>>(
+            ids, static_cast<const float*>(expert_weights), products, stream_planes(down),
+            static_cast<__nv_bfloat16*>(out), tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The geometries the streamed route is instantiated for: the 26B-A4B's hidden 2816, stored
+// intermediate 768 and top-8.
+bool is_gemma_26b_geometry(std::int32_t hidden, std::int32_t intermediate, std::int32_t top_k) {
+    return hidden == 2816 && intermediate == 768 && top_k == 8;
+}
+
 } // namespace
+
+bool gemma_moe_experts_streams(QType qtype, std::int32_t hidden, std::int32_t intermediate,
+                               std::int32_t top_k) {
+    return qtype == QType::NVFP4 && is_gemma_26b_geometry(hidden, intermediate, top_k);
+}
 
 void gemma_moe_experts_launch(const void* x, const void* expert_ids, const void* expert_weights,
                               const GemmaMoeBankLaunch& gate_up, const GemmaMoeBankLaunch& down,
                               std::int32_t hidden, std::int32_t intermediate, std::int32_t top_k,
-                              std::int32_t tokens, void* out, cudaStream_t stream) {
+                              std::int32_t tokens, float* products, void* out,
+                              cudaStream_t stream) {
     if (tokens <= 0) { return; }
+
+    if (gate_up.qtype == down.qtype &&
+        gemma_moe_experts_streams(gate_up.qtype, hidden, intermediate, top_k)) {
+        launch_stream_route<2816, 768, 8>(x, expert_ids, expert_weights, gate_up, down, tokens,
+                                          products, out, stream);
+        return;
+    }
 
     if (gate_up.qtype == QType::BF16 && down.qtype == QType::BF16) {
         const Bf16BankReader gate_up_reader{static_cast<const __nv_bfloat16*>(gate_up.payload),

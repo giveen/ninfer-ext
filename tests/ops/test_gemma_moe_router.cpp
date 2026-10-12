@@ -79,7 +79,11 @@ int run_case(const char* label, direct_bf16_weight::HostWeight router,
     weights.per_expert_scale = Tensor(expert_scale_device.data(), DType::BF16, {experts});
     const ops::GemmaMoeRouterGeometry geometry{hidden, experts, top_k, kEps};
 
-    ops::gemma_moe_router(x_tensor, weights, geometry, ids_tensor, weights_tensor, nullptr);
+    GuardedDeviceBuffer workspace_device(ops::gemma_moe_router_workspace_bytes(geometry, tokens));
+    Tensor workspace(workspace_device.data(), DType::U8,
+                     {static_cast<std::int32_t>(workspace_device.bytes())});
+    ops::gemma_moe_router(x_tensor, weights, geometry, ids_tensor, weights_tensor, workspace,
+                          nullptr);
     cuda_synchronize();
 
     int failures   = 0;
@@ -105,18 +109,19 @@ int run_case(const char* label, direct_bf16_weight::HostWeight router,
     return failures;
 }
 
-// The geometry the artifact stores: 128 experts over 2816 hidden, top-8.
-int run_real_geometry_case() {
+// The geometry the artifact stores: 128 experts over 2816 hidden, top-8. One token, a token count
+// that leaves a partial tile of the projection's token tiling, and a prefill-sized pass.
+int run_real_geometry_case(std::int32_t tokens) {
     constexpr std::int32_t kHidden  = 2816;
     constexpr std::int32_t kExperts = 128;
     constexpr std::int32_t kTopK    = 8;
-    constexpr std::int32_t kTokens  = 8;
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * kTokens);
+    std::vector<float> x(static_cast<std::size_t>(kHidden) * tokens);
     fill_uniform(x, 11, -3.0F, 3.0F);
     round_to_bf16(x);
-    return run_case("real geometry", direct_bf16_weight::make_patterned(kExperts, kHidden, 7),
+    return run_case(("real geometry T=" + std::to_string(tokens)).c_str(),
+                    direct_bf16_weight::make_patterned(kExperts, kHidden, 7),
                     scale_bits(kHidden, 12, 0.8F, 1.2F), scale_bits(kExperts, 13, 0.5F, 1.5F),
-                    encode(x), kHidden, kTopK, kTokens);
+                    encode(x), kHidden, kTopK, tokens);
 }
 
 // Two experts tie for the largest probability and one rank is available, so the lower id must win.
@@ -164,7 +169,7 @@ int run_scale_order_case() {
 int main() {
     int failures = 0;
     try {
-        failures += run_real_geometry_case();
+        for (const std::int32_t tokens : {1, 5, 8, 300}) { failures += run_real_geometry_case(tokens); }
         failures += run_tie_case();
         failures += run_scale_order_case();
     } catch (const std::exception& error) {

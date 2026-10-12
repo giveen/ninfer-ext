@@ -1,13 +1,18 @@
 // Implements: include/ninfer/ops/gemma_moe_router.h
 //
-// One CTA per token. The scoring, the selection and the weights are one pass because the CTA holds
-// the whole hidden row and the whole expert logit vector in shared memory: the admitted geometry is
-// H=2816 and E=128, so the row is 11 KB and the logits are 512 B.
+// Two kernels. The projection spreads the router's rows over the machine: a CTA owns a few experts
+// for a tile of tokens, recomputes those tokens' weightless RMS scale itself (a row is a few KB,
+// far cheaper than a round trip), stages the scaled rows in shared memory and gives each expert a
+// warp that streams its weight row in 16-byte vectors. The logits land in the caller's workspace.
+// The selection is one warp per token over those logits: the softmax, the K-pass masked argmax and
+// the renormalize-then-scale weights.
 //
-// The selection is a K-pass argmax over the expert probabilities with the already-selected experts
-// masked out. Ties compare equal floats exactly and resolve to the lower expert id, which is what
-// scanning every pass in ascending id order with a strict `>` gives.
+// Ties compare equal floats exactly and resolve to the lower expert id, which is what the
+// (value, id) order in `router_better` gives whatever the reduction tree.
 #pragma once
+
+#include "ops/common/memory.cuh" // load_vec
+#include "ops/common/warp.cuh"   // warp_reduce_sum
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -17,7 +22,12 @@
 
 namespace ninfer::ops::detail {
 
-// The (value, id) pair a pass reduces to. The comparison is the whole tie-break contract.
+inline constexpr int kRouterExpertsPerBlock = 4;  // one warp each
+inline constexpr int kRouterTokensPerBlock  = 4;  // the scaled rows staged per CTA
+inline constexpr int kRouterMaxExperts      = 256; // eight logits a lane in the selection warp
+inline constexpr int kRouterMaxRanks        = 16;
+
+// The (value, id) pair a selection pass reduces to. The comparison is the whole tie-break contract.
 struct RouterBest {
     float value;
     int id;
@@ -29,128 +39,187 @@ __device__ __forceinline__ RouterBest router_better(RouterBest a, RouterBest b) 
     return b.id < a.id ? b : a;
 }
 
-// Reduces one (value, id) pair per thread into every thread's copy of the block's best.
-__device__ __forceinline__ RouterBest router_block_argmax(RouterBest mine, RouterBest* scratch) {
-    scratch[threadIdx.x] = mine;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (static_cast<int>(threadIdx.x) < stride) {
-            scratch[threadIdx.x] =
-                router_better(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
-        }
-        __syncthreads();
+__device__ __forceinline__ RouterBest router_warp_argmax(RouterBest mine) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        RouterBest other;
+        other.value = __shfl_xor_sync(0xffffffffu, mine.value, offset);
+        other.id    = __shfl_xor_sync(0xffffffffu, mine.id, offset);
+        mine        = router_better(mine, other);
     }
-    return scratch[0];
+    return mine;
 }
 
-__device__ __forceinline__ float router_block_sum(float mine, float* scratch) {
-    scratch[threadIdx.x] = mine;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (static_cast<int>(threadIdx.x) < stride) {
-            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        }
-        __syncthreads();
+// Every lane gets the total, which `warp_reduce_sum` leaves in lane 0 only.
+__device__ __forceinline__ float router_warp_sum(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
     }
-    return scratch[0];
+    return value;
+}
+
+__device__ __forceinline__ float router_warp_max(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    }
+    return value;
 }
 
 /**
- * `shared` holds, in order: [hidden] scaled activations, [experts] probabilities, [experts]
- * selection flags, one RouterBest per thread, then one float per thread of reduction scratch.
- *
- * blockDim.x must be a power of two, at least `top_k`, and at most the launch's thread count.
+ * Grid (ceil(E / kRouterExpertsPerBlock), ceil(T / kRouterTokensPerBlock)), kRouterExpertsPerBlock
+ * warps. `shared` holds kRouterTokensPerBlock rows of `hidden` FP32 scaled activations. `hidden` is
+ * a multiple of 8 and every row is 16-byte aligned. logits is FP32 [E,T], token fastest.
  */
-__global__ void gemma_moe_router_kernel(const __nv_bfloat16* __restrict__ x,
-                                        const __nv_bfloat16* __restrict__ router,
-                                        const __nv_bfloat16* __restrict__ router_scale,
-                                        const __nv_bfloat16* __restrict__ per_expert_scale,
-                                        float eps, int hidden, int experts, int top_k, int tokens,
-                                        std::int32_t* __restrict__ ids,
-                                        float* __restrict__ weights) {
-    extern __shared__ float shared[];
-    float* scaled          = shared;
-    float* probabilities   = scaled + hidden;
-    std::uint8_t* selected = reinterpret_cast<std::uint8_t*>(probabilities + experts);
-    RouterBest* ranks      = reinterpret_cast<RouterBest*>(selected + experts);
-    float* scratch         = reinterpret_cast<float*>(ranks + blockDim.x);
+__global__ void gemma_moe_router_logits_kernel(const __nv_bfloat16* __restrict__ x,
+                                               const __nv_bfloat16* __restrict__ router,
+                                               const __nv_bfloat16* __restrict__ router_scale,
+                                               float eps, int hidden, int experts, int tokens,
+                                               float* __restrict__ logits) {
+    extern __shared__ __align__(16) float scaled[];
+    __shared__ float inverse[kRouterTokensPerBlock];
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
+    const int token_base = static_cast<int>(blockIdx.y) * kRouterTokensPerBlock;
+    const int live       = min(kRouterTokensPerBlock, tokens - token_base);
 
-    const int token = blockIdx.x;
-    if (token >= tokens) { return; }
-    const __nv_bfloat16* row = x + static_cast<std::size_t>(token) * hidden;
-
-    // 1. The weightless RMS: the unit-RMS row, then router_scale and H^-1/2. The norm carries no
-    //    weight and no gain of its own, which is why it is not the learned-weight rmsnorm form.
-    float squares = 0.0F;
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        const float value = __bfloat162float(row[h]);
-        squares += value * value;
-    }
-    const float mean    = router_block_sum(squares, scratch) / static_cast<float>(hidden);
-    const float inverse = rsqrtf(mean + eps);
-    const float root    = rsqrtf(static_cast<float>(hidden));
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        scaled[h] = __bfloat162float(row[h]) * inverse * __bfloat162float(router_scale[h]) * root;
-    }
-    __syncthreads();
-
-    // 2. The router projection: one expert per thread, accumulated in FP32 over the whole row.
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        const __nv_bfloat16* weights_row = router + static_cast<std::size_t>(e) * hidden;
-        float accumulator                = 0.0F;
-        for (int h = 0; h < hidden; ++h) {
-            accumulator += __bfloat162float(weights_row[h]) * scaled[h];
+    // 1. The weightless RMS of each staged token, a warp per token: the unit-RMS row, then
+    //    router_scale and H^-1/2. The norm carries no weight and no gain of its own.
+    if (warp < live) {
+        const __nv_bfloat16* row = x + static_cast<std::int64_t>(token_base + warp) * hidden;
+        float squares            = 0.0F;
+        for (int h = lane; h < hidden; h += 32) {
+            const float value = __bfloat162float(row[h]);
+            squares += value * value;
         }
-        probabilities[e] = accumulator;
+        squares = warp_reduce_sum(squares);
+        if (lane == 0) {
+            inverse[warp] = rsqrtf(squares / static_cast<float>(hidden) + eps) *
+                            rsqrtf(static_cast<float>(hidden));
+        }
+    }
+    __syncthreads();
+    for (int index = tid; index < live * hidden; index += blockDim.x) {
+        const int t = index / hidden;
+        const int h = index - t * hidden;
+        scaled[index] =
+            __bfloat162float(x[static_cast<std::int64_t>(token_base + t) * hidden + h]) *
+            inverse[t] * __bfloat162float(router_scale[h]);
     }
     __syncthreads();
 
-    // 3. Softmax over the expert axis.
+    // 2. The projection: a warp per expert, eight weights a lane a step, every staged token at
+    //    once, accumulated in FP32.
+    const int expert = static_cast<int>(blockIdx.x) * kRouterExpertsPerBlock + warp;
+    if (expert >= experts) { return; }
+    const __nv_bfloat16* weights_row = router + static_cast<std::int64_t>(expert) * hidden;
+    float accumulator[kRouterTokensPerBlock] = {};
+    for (int k = lane * 8; k < hidden; k += 32 * 8) {
+        const uint4 packed = load_vec<uint4>(weights_row + k);
+        const auto* pairs  = reinterpret_cast<const __nv_bfloat162*>(&packed);
+        float w[8];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 value = __bfloat1622float2(pairs[pair]);
+            w[2 * pair]        = value.x;
+            w[2 * pair + 1]    = value.y;
+        }
+#pragma unroll
+        for (int t = 0; t < kRouterTokensPerBlock; ++t) {
+            if (t < live) {
+                const float4 s0 = *reinterpret_cast<const float4*>(scaled + t * hidden + k);
+                const float4 s1 = *reinterpret_cast<const float4*>(scaled + t * hidden + k + 4);
+                float sum       = accumulator[t];
+                sum             = fmaf(w[0], s0.x, sum);
+                sum             = fmaf(w[1], s0.y, sum);
+                sum             = fmaf(w[2], s0.z, sum);
+                sum             = fmaf(w[3], s0.w, sum);
+                sum             = fmaf(w[4], s1.x, sum);
+                sum             = fmaf(w[5], s1.y, sum);
+                sum             = fmaf(w[6], s1.z, sum);
+                sum             = fmaf(w[7], s1.w, sum);
+                accumulator[t]  = sum;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < kRouterTokensPerBlock; ++t) {
+        const float total = warp_reduce_sum(accumulator[t]);
+        if (lane == 0 && t < live) {
+            logits[static_cast<std::int64_t>(expert) * tokens + token_base + t] = total;
+        }
+    }
+}
+
+/**
+ * One warp per token over logits FP32 [E,T]; E <= kRouterMaxExperts and K <= kRouterMaxRanks.
+ */
+__global__ void gemma_moe_router_select_kernel(const float* __restrict__ logits,
+                                               const __nv_bfloat16* __restrict__ per_expert_scale,
+                                               int experts, int top_k, int tokens,
+                                               std::int32_t* __restrict__ ids,
+                                               float* __restrict__ weights) {
+    constexpr int kPerLane = kRouterMaxExperts / 32;
+    const int lane         = static_cast<int>(threadIdx.x) & 31;
+    const int token =
+        static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) >> 5) +
+        (static_cast<int>(threadIdx.x) >> 5);
+    if (token >= tokens) { return; }
+
+    // Lane l holds experts l, l + 32, ...: ascending ids within a lane, so a slot's id is its own.
+    float p[kPerLane];
     float maximum = -CUDART_INF_F;
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        maximum = fmaxf(maximum, probabilities[e]);
+#pragma unroll
+    for (int slot = 0; slot < kPerLane; ++slot) {
+        const int e = lane + 32 * slot;
+        p[slot]     = e < experts ? logits[static_cast<std::int64_t>(e) * tokens + token]
+                                  : -CUDART_INF_F;
+        maximum     = fmaxf(maximum, p[slot]);
     }
-    maximum     = router_block_argmax(RouterBest{maximum, 0}, ranks).value;
+    maximum     = router_warp_max(maximum);
     float total = 0.0F;
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        const float value = __expf(probabilities[e] - maximum);
-        probabilities[e]  = value;
-        total += value;
+#pragma unroll
+    for (int slot = 0; slot < kPerLane; ++slot) {
+        const int e = lane + 32 * slot;
+        p[slot]     = e < experts ? __expf(p[slot] - maximum) : 0.0F;
+        total += p[slot];
     }
-    total = router_block_sum(total, scratch);
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) { probabilities[e] /= total; }
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) { selected[e] = 0; }
-    __syncthreads();
+    total = router_warp_sum(total);
+#pragma unroll
+    for (int slot = 0; slot < kPerLane; ++slot) { p[slot] /= total; }
 
-    // 4. The K ranks, each a masked argmax over the probabilities. `ranks` is the reduction's own
-    //    scratch and the next pass overwrites it, so the chosen ranks are kept out of it: only
-    //    thread 0 needs them and it holds them locally. top_k <= 16 is a launch precondition.
-    RouterBest chosen_ranks[16];
+    // The K ranks, each a masked argmax over the probabilities. A taken slot drops to -inf, below
+    // every probability, so it cannot win again; an absent expert never could.
+    RouterBest chosen[kRouterMaxRanks];
     for (int rank = 0; rank < top_k; ++rank) {
         RouterBest mine{-CUDART_INF_F, experts};
-        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-            if (selected[e] == 0) { mine = router_better(mine, RouterBest{probabilities[e], e}); }
+#pragma unroll
+        for (int slot = 0; slot < kPerLane; ++slot) {
+            const int e = lane + 32 * slot;
+            if (e < experts) { mine = router_better(mine, RouterBest{p[slot], e}); }
         }
-        const RouterBest chosen = router_block_argmax(mine, ranks);
-        if (threadIdx.x == 0) {
-            selected[chosen.id] = 1;
-            chosen_ranks[rank]  = chosen;
+        chosen[rank] = router_warp_argmax(mine);
+        if ((chosen[rank].id & 31) == lane) {
+#pragma unroll
+            for (int slot = 0; slot < kPerLane; ++slot) {
+                if (lane + 32 * slot == chosen[rank].id) { p[slot] = -CUDART_INF_F; }
+            }
         }
-        __syncthreads();
     }
 
-    // 5. Renormalize the selected probabilities to sum to one, then apply the per-expert scale. The
-    //    order is the contract: the scale multiplies an already-normalized weight, so the applied
-    //    weights do not sum to one when the scales differ.
-    if (threadIdx.x == 0) {
+    // Renormalize the selected probabilities to sum to one, then apply the per-expert scale. The
+    // order is the contract: the scale multiplies an already-normalized weight.
+    if (lane == 0) {
         float sum = 0.0F;
-        for (int rank = 0; rank < top_k; ++rank) { sum += chosen_ranks[rank].value; }
+        for (int rank = 0; rank < top_k; ++rank) { sum += chosen[rank].value; }
         const float inverse_sum = sum > 0.0F ? 1.0F / sum : 0.0F;
         for (int rank = 0; rank < top_k; ++rank) {
-            const int expert                                     = chosen_ranks[rank].id;
-            ids[static_cast<std::size_t>(rank) * tokens + token] = expert;
-            weights[static_cast<std::size_t>(rank) * tokens + token] =
-                chosen_ranks[rank].value * inverse_sum * __bfloat162float(per_expert_scale[expert]);
+            const int expert                                       = chosen[rank].id;
+            ids[static_cast<std::int64_t>(rank) * tokens + token] = expert;
+            weights[static_cast<std::int64_t>(rank) * tokens + token] =
+                chosen[rank].value * inverse_sum * __bfloat162float(per_expert_scale[expert]);
         }
     }
 }

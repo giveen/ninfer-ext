@@ -11,6 +11,7 @@
 #include "ops/gemma_moe_experts_ref.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -115,8 +116,9 @@ int run_case(const char* label, std::int32_t hidden, std::int32_t experts, std::
     // The output buffer starts as a poisoned pattern, so a region the Op fails to write shows up.
     std::vector<std::uint16_t> poison(x_bits.size(), f32_to_bf16(-12345.0F));
     out_device.copy_from_host(poison.data(), out_device.bytes());
+    Tensor no_workspace;
     ops::gemma_moe_experts(x_tensor, ids_tensor, routing_tensor, weights, geometry, out_tensor,
-                           nullptr);
+                           no_workspace, nullptr);
     cuda_synchronize();
 
     const auto got = from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
@@ -181,42 +183,39 @@ int run_padding_case() {
 
 // The artifact's own bank format. Each expert is a separately quantised source with its own
 // divisor, and the fixture writes distinct divisors per source, so a reader that ignored the
-// divisor array would disagree here.
-int run_nvfp4_case() {
-    constexpr std::int32_t kHidden       = 256;
-    constexpr std::int32_t kExperts      = 4;
-    constexpr std::int32_t kTopK         = 2;
-    constexpr std::int32_t kIntermediate = 128;
-    constexpr std::int32_t kTokens       = 4;
-
+// divisor array would disagree here. At the 26B's own H, stored I and K the Op takes its streamed
+// route, which is also run twice and must reproduce itself exactly.
+int run_nvfp4_case(const char* label, std::int32_t hidden, std::int32_t experts, std::int32_t top_k,
+                   std::int32_t intermediate, std::int32_t tokens) {
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 2.0F;
     options.input_scale_divisor  = 1.0F;
-    // One divisor per expert: an expert's gate and up rows together, then its down rows.
-    options.weight_divisor_rows = 2 * kIntermediate;
+    // One divisor per source matrix: an expert's gate rows, its up rows, then its down rows.
+    options.weight_divisor_rows = intermediate;
     const auto gate_up          = quantized_weight::make_patterned_weight(
-        QType::NVFP4, kExperts * 2 * kIntermediate, kHidden, 31, options);
-    options.weight_divisor_rows = kHidden;
-    const auto down = quantized_weight::make_patterned_weight(QType::NVFP4, kExperts * kHidden,
-                                                              kIntermediate, 32, options);
+        QType::NVFP4, experts * 2 * intermediate, hidden, 31, options);
+    options.weight_divisor_rows = hidden;
+    const auto down = quantized_weight::make_patterned_weight(QType::NVFP4, experts * hidden,
+                                                              intermediate, 32, options);
 
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * kTokens);
+    std::vector<float> x(static_cast<std::size_t>(hidden) * tokens);
     fill_uniform(x, 41, -2.0F, 2.0F);
     round_to_bf16(x);
     const auto x_bits = encode(x);
 
-    std::vector<std::int32_t> ids(static_cast<std::size_t>(kTopK) * kTokens);
-    std::vector<float> routing(static_cast<std::size_t>(kTopK) * kTokens);
-    for (std::int32_t token = 0; token < kTokens; ++token) {
-        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
-            const std::size_t at = static_cast<std::size_t>(rank) * kTokens + token;
-            ids[at]              = (rank + 2 * token) % kExperts;
-            routing[at]          = 0.3F + 0.2F * static_cast<float>(rank);
+    // Distinct experts within a token, and weights that do not sum to one.
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * tokens);
+    std::vector<float> routing(static_cast<std::size_t>(top_k) * tokens);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t rank = 0; rank < top_k; ++rank) {
+            const std::size_t at = static_cast<std::size_t>(rank) * tokens + token;
+            ids[at]              = (rank * 3 + 2 * token) % experts;
+            routing[at]          = 0.3F + 0.2F * static_cast<float>(rank % 3);
         }
     }
 
-    const auto reference = gemma_moe_experts_ref::run(x_bits, kHidden, kTokens, ids, routing,
-                                                      gate_up, down, kIntermediate, kTopK);
+    const auto reference = gemma_moe_experts_ref::run(x_bits, hidden, tokens, ids, routing,
+                                                      gate_up, down, intermediate, top_k);
 
     GuardedDeviceBuffer gate_up_device(gate_up.payload.size());
     GuardedDeviceBuffer down_device(down.payload.size());
@@ -230,33 +229,50 @@ int run_nvfp4_case() {
     ids_device.copy_from_host(ids.data(), ids_device.bytes());
     routing_device.copy_from_host(routing.data(), routing_device.bytes());
 
-    Tensor x_tensor(x_device.data(), DType::BF16, {kHidden, kTokens});
-    Tensor ids_tensor(ids_device.data(), DType::I32, {kTopK, kTokens});
-    Tensor routing_tensor(routing_device.data(), DType::FP32, {kTopK, kTokens});
-    Tensor out_tensor(out_device.data(), DType::BF16, {kHidden, kTokens});
+    Tensor x_tensor(x_device.data(), DType::BF16, {hidden, tokens});
+    Tensor ids_tensor(ids_device.data(), DType::I32, {top_k, tokens});
+    Tensor routing_tensor(routing_device.data(), DType::FP32, {top_k, tokens});
+    Tensor out_tensor(out_device.data(), DType::BF16, {hidden, tokens});
 
     ops::GemmaMoeExpertWeights weights;
     weights.gate_up = gate_up.device_weight(gate_up_device.data());
     weights.down    = down.device_weight(down_device.data());
-    const ops::GemmaMoeExpertGeometry geometry{kHidden, kExperts, kTopK, kIntermediate};
+    const ops::GemmaMoeExpertGeometry geometry{hidden, experts, top_k, intermediate};
+
+    const std::size_t workspace_bytes =
+        ops::gemma_moe_experts_workspace_bytes(geometry, QType::NVFP4, tokens);
+    GuardedDeviceBuffer workspace_device(std::max<std::size_t>(workspace_bytes, 1));
+    Tensor workspace(workspace_bytes > 0 ? workspace_device.data() : nullptr, DType::U8,
+                     {static_cast<std::int32_t>(std::max<std::size_t>(workspace_bytes, 1))});
 
     std::vector<std::uint16_t> poison(x_bits.size(), f32_to_bf16(-12345.0F));
     out_device.copy_from_host(poison.data(), out_device.bytes());
     ops::gemma_moe_experts(x_tensor, ids_tensor, routing_tensor, weights, geometry, out_tensor,
-                           nullptr);
+                           workspace, nullptr);
     cuda_synchronize();
 
     const auto got = from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
-    int failures   = verify_pointwise("nvfp4 bank out", std::vector<double>(got.begin(), got.end()),
-                                      reference, kCriterion);
+    int failures   = verify_pointwise(std::string(label) + " out",
+                                      std::vector<double>(got.begin(), got.end()), reference,
+                                      kCriterion);
+
+    // The same call again over a re-poisoned output: the route has no order the scheduler picks.
+    out_device.copy_from_host(poison.data(), out_device.bytes());
+    ops::gemma_moe_experts(x_tensor, ids_tensor, routing_tensor, weights, geometry, out_tensor,
+                           workspace, nullptr);
+    cuda_synchronize();
+    const auto again =
+        from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
+    failures += verify_exact((std::string(label) + " run-to-run").c_str(), again, got);
+
     // Read only: the codes, scales and divisor planes come back exactly as they went in.
     failures +=
-        verify_exact("nvfp4 gate_up preserved",
+        verify_exact((std::string(label) + " gate_up preserved").c_str(),
                      from_device<std::uint8_t>(gate_up_device.data(),
                                                static_cast<std::int64_t>(gate_up_device.bytes())),
                      gate_up.payload);
     failures +=
-        verify_exact("nvfp4 down preserved",
+        verify_exact((std::string(label) + " down preserved").c_str(),
                      from_device<std::uint8_t>(down_device.data(),
                                                static_cast<std::int64_t>(down_device.bytes())),
                      down.payload);
@@ -270,15 +286,21 @@ int main() {
     try {
         failures += run_medium_case();
         failures += run_padding_case();
-        failures += run_nvfp4_case();
+        failures += run_nvfp4_case("nvfp4 per-token", 256, 4, 2, 128, 4);
+        // The 26B's H, stored I and K over a 16-expert bank: the streamed route, at one token, at
+        // a batched-decode width and at an MTP verify width.
+        for (const std::int32_t tokens : {1, 3, 8}) {
+            failures += run_nvfp4_case(("nvfp4 streamed T=" + std::to_string(tokens)).c_str(), 2816,
+                                       16, 8, 768, tokens);
+        }
     } catch (const std::exception& error) {
         std::cerr << "gemma_moe_experts: " << error.what() << '\n';
         return 1;
     }
     if (failures == 0) {
         std::cout << "OK: gemma_moe_experts matches its oracle over a BF16 bank, over the stored "
-                     "width with inert padding, and over a stacked NVFP4 bank whose per-source "
-                     "divisors matter\n";
+                     "width with inert padding, and over stacked NVFP4 banks whose per-source "
+                     "divisors matter, on both routes, and the streamed route reproduces itself\n";
     }
     return failures == 0 ? 0 : 1;
 }
