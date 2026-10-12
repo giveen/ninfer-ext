@@ -327,6 +327,18 @@ measured saturated decodes. That is P0's last bullet.
   scores 233 against the 31B's 1414, and llama.cpp's own 26B (Q5_K_S, its own chunking) scores 27,641
   on it. The 26B is therefore in the right range by the coarsest available comparison; the HF logits
   agreement of P3's remaining list is still what establishes correctness.
+- **A negative result worth keeping**: rewriting the expert apply's inner loops so that a warp walks one
+  output row together — 32 lanes over consecutive columns, one warp-shuffle reduction per row — made the
+  same corpus *slower*: 41.7 tok/s against 75.4, with the perplexity unmoved (229.6 against 233.1, which
+  is the reduction-order difference alone, so the rewrite was numerically clean). The 43 GB/s figure is
+  real, but attributing it to uncoalesced sectors was wrong: every row a warp issues is consumed by the
+  same pass, so no sector is wasted end to end, and the pattern costs load/store-unit throughput rather
+  than DRAM traffic. The kernel is decode-bound instead: each NVFP4 element pays a byte load, a nibble
+  select, a 4-bit conversion, a block-scale byte, an E4M3 conversion and a reciprocal multiply. The
+  levers that follow are (1) the gather inversion, which cuts the element count by the average expert hit
+  count, since one matrix is currently read once per token that selects it, and (2) a vectorized decode —
+  `uint4` code loads, a hoisted per-row divisor, a register LUT for E2M1. Reverted; the tree is back at
+  the measured 75.4 tok/s, and no performance claim is made until a decode measurement exists.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
