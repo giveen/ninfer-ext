@@ -286,6 +286,24 @@ K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group s
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
 summary 均从这一 typed plane inventory 计算，不能用 `2 * vector_bytes` 代替 K8V4 的非对称字节数。
 
+### 4.3.1 KV codec 精度实测
+
+真实 27B artifact 上固定权重、只改变 `--kv-dtype`（`ninfer-perplexity`，语料
+`ninfer-ppl-1m-v1` / quick，261,167 tokens）测得 overall mean NLL：
+
+| kv-dtype | bits/元素 | nats @4096/2048 | nats @32768/16384 |
+|---|---:|---:|---:|
+| bf16 | 16 | 1.470119（参考） | 1.422800（参考） |
+| int8-g64 | 8.25 | +0.000847 | 未测 |
+| fp8-e4m3-r256 | 8.06 | +0.001509 | 未测 |
+| nvfp4 | 4.50 | +0.002496 | +0.002162 |
+
+16 bit 到 4.5 bit 的全部取值只值 0.0025 nats，且该差值随 context 增大并未放大（这与
+codec 的逐行重建误差无关：nvfp4 的重建误差是 fp8 的 3.6 倍，端到端只值 0.001 nats）。
+因此新增 6-bit KV profile（例如 e2m3 + block-32 ue8m0）没有精度依据：它只会落在现有
+int8/fp8 与 nvfp4 之间，而容量又大于 nvfp4。只有产品需要这两者之间的容量点时，该
+profile 才值得引入。
+
 ### 4.4 Logical position domain
 
 Block table 使用 autoregressive cache ordinal：
