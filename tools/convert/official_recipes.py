@@ -8,6 +8,7 @@ from .methods import (
     grouped_absmax,
     import_encoded,
     q4_rows_maxabs,
+    q4_rows_qat,
     nvfp4_absmax,
     nvfp4_mse,
 )
@@ -635,15 +636,15 @@ def gemma4_31b_m1(model, recipe, sources):
     _gemma4_layout(model, recipe, "gemma4_31b_m1")
 
 
-def gemma4_26b_a4b_base(model, recipe, sources):
-    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for the routed experts, Q8 elsewhere.
+def _gemma4_26b_a4b(model, recipe, assign_expert):
+    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: `assign_expert` for the routed experts, Q8
+    elsewhere.
 
     This is the bring-up layout the Program is developed against, not a serving layout. The same
     shape of layout scored 0.758 KLD on the 31B (plan L1: NVFP4 MLPs, FP8 rows) against the 0.419 its
     measured serving layout reaches, and the 4-bit MLP was almost all of that error. What changes
-    here is the source: this checkpoint is QAT-trained for four bits, which is the whole reason to
-    expect the experts to hold up where a plain BF16 checkpoint did not. That is a measurement, not
-    an assumption (plan P5), with FP8 for the experts as the fallback if the grid harvests nothing.
+    here is the source: this checkpoint is QAT-trained on an int4 group-32 grid, which
+    `gemma4_26b_a4b_qat` keeps exactly and NVFP4 does not (plan P5).
 
     Q8 rather than FP8 or NVFP4 for everything a linear route consumes, because a quantized linear
     route resolves its geometry from a fixed registry of hand-tuned shape files: neither the FP8 nor
@@ -678,18 +679,38 @@ def gemma4_26b_a4b_base(model, recipe, sources):
             # The experts are read by the MoE Op's own decoder, which computes in the represented
             # activations: no linear route consumes them, so nothing grants A4 and none of them
             # carries a calibration divisor.
-            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+            assign_expert(name)
         else:
             # Attention and the dense MLP take the generic int8 route the token table does, for the
             # same reason: a quantized linear route resolves its geometry from a fixed registry of
             # hand-tuned shape files, and this model's are in neither the FP8 nor the NVFP4 one. The
-            # routed experts keep NVFP4 because their decoder is the MoE Op's, so no linear registry
-            # constrains them. That difference between the two GeGLU branches is a route constraint
-            # rather than a brightness choice, and P5's encoding comparison is where it is measured.
+            # routed experts take their own format because their decoder is the MoE Op's, so no linear
+            # registry constrains them. That difference between the two GeGLU branches is a route
+            # constraint, and P5's encoding comparison is where it is measured.
             _assign(recipe, name, Q8)
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
+
+
+def gemma4_26b_a4b_base(model, recipe, sources):
+    """The 26B with NVFP4 routed experts: the bring-up layout. NVFP4's E2M1 grid cannot hold the
+    int4 group-32 grid this checkpoint was trained on, so it re-quantizes the experts (plan P5)."""
+    _gemma4_26b_a4b(
+        model,
+        recipe,
+        lambda name: recipe.assign(
+            name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
+        ),
+    )
+
+
+def gemma4_26b_a4b_qat(model, recipe, sources):
+    """The 26B with its routed experts on the grid they were trained on: int4 group-32 rows whose
+    binary16 step is recovered per group (q4_rows_qat), exact up to that step's rounding."""
+    _gemma4_26b_a4b(
+        model, recipe, lambda name: recipe.assign(name, format=Q4ROWS, method=q4_rows_qat)
+    )
 
 
 RECIPES = {
@@ -709,4 +730,5 @@ RECIPES = {
     "gemma4_31b_g0": gemma4_31b_g0,
     "gemma4_31b_m1": gemma4_31b_m1,
     "gemma4_26b_a4b_base": gemma4_26b_a4b_base,
+    "gemma4_26b_a4b_qat": gemma4_26b_a4b_qat,
 }

@@ -28,6 +28,7 @@ from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix
 from .quantization.nvfp4 import divisor_for, quantize_rows as quantize_nvfp4_rows
 from .quantization.row_group import quantize_rows as quantize_row_groups
+from .quantization.row_group import quantize_rows_on_grid
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -272,25 +273,42 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 # Rows per pass of q4_rows_maxabs: the n-gram table has hundreds of millions of rows, so the
 # per-recipe chunk (sized for projections) would make millions of tiny passes.
 _ROW_GROUP_CHUNK_ROWS = 1 << 20
+# Rows per pass of q4_rows_qat: projection-wide rows, sized to keep the grid search on the device.
+_QAT_CHUNK_ROWS = 8192
 
 
-def q4_rows_maxabs(request: PrepareRequest) -> PreparedMethod:
+def _q4_rows(request: PrepareRequest, method: str, quantize, chunk_rows: int) -> PreparedMethod:
     """Quantize rows to signed 4-bit group codes with binary16 group scales (row_group_v1)."""
     if request.target.format != "q4_g32_fp16_rows" or len(request.target.shape) != 2:
-        raise ValueError("q4_rows_maxabs requires the row-grouped 4-bit matrix format")
+        raise ValueError(f"{method} requires the row-grouped 4-bit matrix format")
     _preflight(request)
     n, k = request.target.shape
 
     def produce(output):
-        for begin in range(0, n, _ROW_GROUP_CHUNK_ROWS):
-            end = min(n, begin + _ROW_GROUP_CHUNK_ROWS)
+        for begin in range(0, n, chunk_rows):
+            end = min(n, begin + chunk_rows)
             values = request.values(begin * k, end * k).reshape(end - begin, k)
             if not values.dtype.is_floating_point:
-                raise TypeError("q4_rows_maxabs source must provide floating-point values")
-            encoded = quantize_row_groups(values, request.target.format, device=request.device)
+                raise TypeError(f"{method} source must provide floating-point values")
+            encoded = quantize(values, request.target.format, device=request.device)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
+
+
+def q4_rows_maxabs(request: PrepareRequest) -> PreparedMethod:
+    """Row groups with scale max|x| / 7: the n-gram table's method."""
+    return _q4_rows(request, "q4_rows_maxabs", quantize_row_groups, _ROW_GROUP_CHUNK_ROWS)
+
+
+def q4_rows_qat(request: PrepareRequest) -> PreparedMethod:
+    """Row groups on the integer grid a quantization-aware-trained source was trained on.
+
+    Recovers each group's learned step rather than imposing max|x| / 7, so a source trained for
+    int4 group-32 is represented exactly up to the binary16 rounding of the step. Projection-sized
+    rows, so a chunk of its own rather than the n-gram table's million rows.
+    """
+    return _q4_rows(request, "q4_rows_qat", quantize_rows_on_grid, _QAT_CHUNK_ROWS)
 
 
 def _nvfp4_weight(request: PrepareRequest, scale_search: str) -> PreparedMethod:
@@ -446,6 +464,7 @@ METHODS: dict[str, Method] = {
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
     "q4_rows_maxabs": q4_rows_maxabs,
+    "q4_rows_qat": q4_rows_qat,
     "import_encoded": import_encoded,
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse": nvfp4_mse,

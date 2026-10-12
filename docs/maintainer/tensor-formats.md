@@ -327,8 +327,12 @@ w_hat[n,k] = binary32(c[n,k] * binary16_to_binary32(s[n, floor(k / 32)]))
 
 The format does not define how a floating-point source is assigned scales or codes. The converter
 method `q4_rows_maxabs` uses scale `max|x| / 7` rounded to binary16 and codes `round(x / scale)`
-clamped to `[-7,7]`. Unlike `q4_g64_fp16` the format has no K padding; it exists for wide row tables
-(the Qwen4Exp n-gram table, `K = 160`) that `row_split_k128_v1` would pad by more than half.
+clamped to `[-7,7]`. The method `q4_rows_qat` instead recovers the step a quantization-aware-trained
+source was trained on: per group, the coarsest `max|x| / q` that puts every value on an integer
+multiple to BF16 precision (the least-squares step for a group on no such grid), rounded to
+binary16, with codes in `[-8,7]`. Unlike `q4_g64_fp16` the format has no K padding; it exists for
+wide row tables (the Qwen4Exp n-gram table, `K = 160`) that `row_split_k128_v1` would pad by more
+than half, and it is the Gemma 4 26B-A4B's routed-expert format, the grid its QAT checkpoint carries.
 
 ### 3.5 `exl3_mul1`
 
