@@ -429,6 +429,33 @@ measured saturated decodes. That is P0's last bullet.
   experts first (streamed decode, then a grouped W4A16 prefill that dequantizes to the
   checkpoint's own BF16 values), then the dense linears and the head, which at Q8 are about 2.4 GB
   of the ~3.3 GB a decode token reads.
+- **The QAT experts and the grouped prefill route (landed).** Recipe `gemma4_26b_a4b_qat` stores the
+  routed experts as `q4_g32_fp16_rows` (row_group_v1) through the new converter method
+  `q4_rows_qat`, which recovers each group's learned step (the coarsest `max|x| / q` that puts every
+  value on an integer multiple, falling back to the least-squares step for a group on no grid)
+  instead of `q4_rows_maxabs`'s `max|x| / 7`; a converted value is the checkpoint's BF16 word to
+  within one ulp. The conversion of `out/gemma4_26b_a4b_qat.ninfer` takes 4 minutes. The expert Op
+  reads the format on all three routes: the per-token reader, the streamed route (a `Q4RowsCodec`
+  beside the NVFP4 one, below 16 tokens) and a new grouped route from 16 tokens up: a
+  deterministic per-expert placement (count, plan, place, no atomics), a BF16 m16n8k16 gate/up
+  GEMM over each expert's gathered tokens with the GeGLU in its epilogue, the same GEMM for down,
+  and a rank-ordered FP32 combine, in slices of at most 1024 tokens. That route decodes weights to
+  BF16 and rounds the GeGLU product and each expert's output to BF16, where the checkpoint's own
+  reference rounds; the oracle models those three boundaries, and the grouped cases (T = 16, 37,
+  300, 1030 at the real H/I/K) bound the error by `1e-3 + 1e-2·|ref| + 2^-7·Σ|w·y|`, the last term
+  being a one-ulp flip at the expert-output boundary where outputs cancel. Worst case 0.44 of that
+  bound.
+
+  | `ninfer_bench`, bf16 KV | NVFP4 experts | QAT int4 g32 experts |
+  |---|---|---|
+  | pp512 (tok/s) | 2,040 | 8,246 |
+  | pp2048 (tok/s) | — | 8,030 |
+  | tg128 (tok/s) | 215.9 | 219.4 |
+
+  Mean NLL on the 40 KB slice: 5.425723 (QAT) against 5.471673 (NVFP4), each bit-identical across
+  two runs. The 0.046 difference is just outside the 0.04 accumulation-order floor, so it points the
+  expected way but is not a quality measurement; KLD against the BF16 reference is. Greedy output on
+  a short prompt is coherent for both. The NVFP4 bring-up recipe stays until that comparison.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
