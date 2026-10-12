@@ -41,10 +41,11 @@ AttentionGeometry geometry(const artifact::Json& rope, AttentionGeometry sliding
     if (!rope.is_object()) { fail("rope_parameters entries must be objects"); }
     const std::string expect = global ? "proportional" : "default";
     if (rope.value("rope_type", std::string{}) != expect) {
-        fail("rope_parameters must be 'default' for sliding attention and 'proportional' for global");
+        fail("rope_parameters must be 'default' for sliding attention and 'proportional' for "
+             "global");
     }
-    sliding.rope_theta  = rope.contains("rope_theta") ? rope.at("rope_theta").get<float>() : 0.0F;
-    sliding.rotary_dim  = positive(rope, "rotary_dim");
+    sliding.rope_theta = rope.contains("rope_theta") ? rope.at("rope_theta").get<float>() : 0.0F;
+    sliding.rotary_dim = positive(rope, "rotary_dim");
     if (sliding.rotary_dim % 2 != 0) { fail("rope_parameters.rotary_dim must be even"); }
     return sliding;
 }
@@ -53,14 +54,36 @@ AttentionGeometry geometry(const artifact::Json& rope, AttentionGeometry sliding
 
 TextConfig parse_text_config(const artifact::Json& value) {
     if (!value.is_object()) { fail("config must be an object"); }
-    static constexpr const char* kMembers[] = {
-        "architectures", "model_type", "hidden_act", "hidden_size", "intermediate_size",
-        "vocab_size", "num_hidden_layers", "max_position_embeddings", "num_attention_heads",
-        "num_key_value_heads", "num_global_key_value_heads", "head_dim", "global_head_dim",
-        "sliding_window", "attention_k_eq_v", "attention_bias", "attention_scale",
-        "final_logit_softcapping", "rms_norm_eps", "norm_unit_offset", "embedding_scale",
-        "tie_word_embeddings", "layer_scalar", "layer_types", "global_layer_count",
-        "rope_parameters"};
+    static constexpr const char* kMembers[] = {"architectures",
+                                               "model_type",
+                                               "hidden_act",
+                                               "hidden_size",
+                                               "intermediate_size",
+                                               "vocab_size",
+                                               "num_hidden_layers",
+                                               "max_position_embeddings",
+                                               "num_attention_heads",
+                                               "num_key_value_heads",
+                                               "num_global_key_value_heads",
+                                               "head_dim",
+                                               "global_head_dim",
+                                               "sliding_window",
+                                               "attention_k_eq_v",
+                                               "attention_bias",
+                                               "attention_scale",
+                                               "final_logit_softcapping",
+                                               "rms_norm_eps",
+                                               "norm_unit_offset",
+                                               "embedding_scale",
+                                               "tie_word_embeddings",
+                                               "layer_scalar",
+                                               "layer_types",
+                                               "global_layer_count",
+                                               "enable_moe_block",
+                                               "num_experts",
+                                               "top_k_experts",
+                                               "moe_intermediate_size",
+                                               "rope_parameters"};
     for (const auto& member : value.items()) {
         bool known = false;
         for (const char* allowed : kMembers) { known = known || member.key() == allowed; }
@@ -100,11 +123,30 @@ TextConfig parse_text_config(const artifact::Json& value) {
         fail("norm_unit_offset must be false: Gemma 4 norms carry no 1 + w offset");
     }
     if (!boolean(value, "layer_scalar")) { fail("layer_scalar must be true"); }
-    if (!out.tie_word_embeddings) { fail("tie_word_embeddings must be true: the head is the embedding"); }
+    if (!out.tie_word_embeddings) {
+        fail("tie_word_embeddings must be true: the head is the embedding");
+    }
     if (out.attention_scale != 1.0F) { fail("attention_scale must be exactly 1.0"); }
     const float expected_embed = std::sqrt(static_cast<float>(out.hidden_size));
     if (std::fabs(out.embedding_scale - expected_embed) > 1e-3F * expected_embed) {
         fail("embedding_scale must be sqrt(hidden_size)");
+    }
+
+    // The MoE block (section 16). These members are optional so that a 31B artifact, which the
+    // converter writes without them, keeps parsing: absence means the dense-only layer of
+    // section 3. A flag with no widths, or widths with no flag, is a partial emission and refused.
+    out.enable_moe_block = value.contains("enable_moe_block") && boolean(value, "enable_moe_block");
+    const bool has_moe_widths = value.contains("num_experts") || value.contains("top_k_experts") ||
+                                value.contains("moe_intermediate_size");
+    if (out.enable_moe_block) {
+        out.num_experts           = positive(value, "num_experts");
+        out.top_k_experts         = positive(value, "top_k_experts");
+        out.moe_intermediate_size = positive(value, "moe_intermediate_size");
+        if (out.top_k_experts > out.num_experts) {
+            fail("top_k_experts must not exceed num_experts");
+        }
+    } else if (has_moe_widths) {
+        fail("the MoE widths require enable_moe_block");
     }
 
     const std::uint32_t heads = positive(value, "num_attention_heads");
@@ -114,8 +156,8 @@ TextConfig parse_text_config(const artifact::Json& value) {
     if (heads % kv != 0 || heads % gkv != 0) {
         fail("query heads must divide into both KV head counts");
     }
-    out.sliding.num_key_value_heads = kv;
-    out.sliding.head_dim            = positive(value, "head_dim");
+    out.sliding.num_key_value_heads       = kv;
+    out.sliding.head_dim                  = positive(value, "head_dim");
     out.global.shared.num_key_value_heads = gkv;
     out.global.shared.head_dim            = positive(value, "global_head_dim");
 
@@ -126,7 +168,7 @@ TextConfig parse_text_config(const artifact::Json& value) {
         fail("layer_types must cover every layer");
     }
     for (std::size_t index = 0; index < layers.size(); ++index) {
-        const bool global = (index + 1) % 6 == 0;
+        const bool global      = (index + 1) % 6 == 0;
         const std::string want = global ? "full_attention" : "sliding_attention";
         if (layers.at(index) != want) {
             fail("layer_types must place global attention on every sixth layer, last included");
@@ -139,16 +181,17 @@ TextConfig parse_text_config(const artifact::Json& value) {
     }
 
     const auto& rope = value.at("rope_parameters");
-    if (!rope.is_object() || !rope.contains("sliding_attention") || !rope.contains("full_attention")) {
+    if (!rope.is_object() || !rope.contains("sliding_attention") ||
+        !rope.contains("full_attention")) {
         fail("rope_parameters must describe both layer kinds");
     }
     out.sliding = geometry(rope.at("sliding_attention"), out.sliding, false);
     if (out.sliding.rotary_dim != out.sliding.head_dim) {
         fail("sliding RoPE must rotate the whole head");
     }
-    out.global.shared = geometry(rope.at("full_attention"), out.global.shared, true);
-    const auto& full  = rope.at("full_attention");
-    out.global.rope_angles = positive(full, "rope_angles");
+    out.global.shared               = geometry(rope.at("full_attention"), out.global.shared, true);
+    const auto& full                = rope.at("full_attention");
+    out.global.rope_angles          = positive(full, "rope_angles");
     out.global.denominator_head_dim = positive(full, "denominator_head_dim");
     if (out.global.shared.rotary_dim != 2 * out.global.rope_angles) {
         fail("proportional RoPE rotates two dims per angle");
@@ -239,9 +282,9 @@ DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& ta
     };
     if (!value.is_object()) draft_fail("config must be an object");
     static constexpr const char* kMembers[] = {
-        "architectures", "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
-        "backbone_hidden_size", "vocab_size", "rms_norm_eps", "hidden_act", "layer_types",
-        "tie_word_embeddings"};
+        "architectures",     "model_type",           "hidden_size",        "intermediate_size",
+        "num_hidden_layers", "backbone_hidden_size", "vocab_size",         "rms_norm_eps",
+        "hidden_act",        "layer_types",          "tie_word_embeddings"};
     for (const auto& member : value.items()) {
         bool known = false;
         for (const char* allowed : kMembers) { known = known || member.key() == allowed; }
@@ -265,8 +308,10 @@ DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& ta
     if (positive(value, "vocab_size") != target.vocab_size) {
         draft_fail("vocab_size must be the target's");
     }
-    if (value.at("hidden_act") != "gelu_pytorch_tanh") draft_fail("hidden_act must be gelu_pytorch_tanh");
-    if (!boolean(value, "tie_word_embeddings")) draft_fail("the drafter's head is its tied embedding");
+    if (value.at("hidden_act") != "gelu_pytorch_tanh")
+        draft_fail("hidden_act must be gelu_pytorch_tanh");
+    if (!boolean(value, "tie_word_embeddings"))
+        draft_fail("the drafter's head is its tied embedding");
     const auto& layers = value.at("layer_types");
     if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
         draft_fail("layer_types must cover every layer");

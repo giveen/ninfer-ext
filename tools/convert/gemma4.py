@@ -40,9 +40,10 @@ from .resources import load_resources
 
 ARCHITECTURES = ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM")
 
-# The structural constants of this checkpoint family. A source that disagrees is refused rather
-# than silently mapped, because every one of them changes the mathematics.
-_TEXT = {
+# The structural constants of each checkpoint family in this architecture. A source that disagrees is
+# refused rather than silently mapped, because every one of them changes the mathematics.
+_TEXT_31B = {
+    "name": "Gemma 4 31B",
     "hidden_size": 5376,
     "intermediate_size": 21504,
     "num_hidden_layers": 60,
@@ -58,8 +59,44 @@ _TEXT = {
     "global_rope_theta": 1_000_000.0,
     "max_position_embeddings": 262_144,
     "final_logit_softcapping": 30.0,
+    "enable_moe_block": False,
 }
-_GLOBAL_EVERY = 6  # global layers at 5, 11, ..., 59 (the last layer is forced global)
+
+# The MoE variant (gemma4-model.md section 16). The dense MLP is kept and runs in parallel with the
+# routed experts, so only the widths and the MoE block itself differ from the 31B.
+_TEXT_26B = {
+    "name": "Gemma 4 26B-A4B",
+    "hidden_size": 2816,
+    "intermediate_size": 2112,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 16,
+    "sliding_num_key_value_heads": 8,
+    "sliding_head_dim": 256,
+    "sliding_window": 1024,
+    "global_num_key_value_heads": 2,
+    "global_head_dim": 512,
+    "global_rotary_dim": 128,
+    "global_rope_angles": 64,
+    "sliding_rope_theta": 10_000.0,
+    "global_rope_theta": 1_000_000.0,
+    "max_position_embeddings": 262_144,
+    "final_logit_softcapping": 30.0,
+    "enable_moe_block": True,
+    "num_experts": 128,
+    "top_k_experts": 8,
+    "moe_intermediate_size": 704,
+}
+_GLOBAL_EVERY = 6  # global layers at 5, 11, ... (the last layer is forced global)
+
+
+def _text_profile(raw: dict) -> dict:
+    """The profile `raw` belongs to, selected by the layer count it declares."""
+    layers = raw.get("num_hidden_layers")
+    for profile in (_TEXT_31B, _TEXT_26B):
+        if layers == profile["num_hidden_layers"]:
+            return profile
+    raise ValueError(f"unsupported Gemma 4 text layer count {layers!r}")
+
 _FULL_ATTENTION = "full_attention"
 _SLIDING_ATTENTION = "sliding_attention"
 
@@ -81,43 +118,56 @@ def text_config(source: dict) -> dict:
     if not isinstance(architectures, list) or len(architectures) != 1 or not is_gemma4(source):
         raise ValueError(f"unsupported Gemma 4 architecture {architectures!r}")
     raw = source.get("text_config", source)
+    profile = _text_profile(raw)
 
     result: dict = {"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4_text"}
     for key in ("hidden_size", "intermediate_size", "num_hidden_layers", "vocab_size",
                 "max_position_embeddings", "num_attention_heads"):
         result[key] = _positive(raw.get(key), "text." + key)
     for key, expected in (
-        ("hidden_size", _TEXT["hidden_size"]),
-        ("intermediate_size", _TEXT["intermediate_size"]),
-        ("num_hidden_layers", _TEXT["num_hidden_layers"]),
-        ("num_attention_heads", _TEXT["num_attention_heads"]),
-        ("max_position_embeddings", _TEXT["max_position_embeddings"]),
+        ("hidden_size", profile["hidden_size"]),
+        ("intermediate_size", profile["intermediate_size"]),
+        ("num_hidden_layers", profile["num_hidden_layers"]),
+        ("num_attention_heads", profile["num_attention_heads"]),
+        ("max_position_embeddings", profile["max_position_embeddings"]),
     ):
         if result[key] != expected:
-            raise ValueError(f"Gemma 4 31B expects text.{key} {expected}, got {result[key]}")
+            raise ValueError(
+                f"{profile['name']} expects text.{key} {expected}, got {result[key]}"
+            )
 
     _fixed(raw, "hidden_activation", "gelu_pytorch_tanh", "text")
     _fixed(raw, "attention_bias", False, "text")
     _fixed(raw, "attention_k_eq_v", True, "text")
-    _fixed(raw, "enable_moe_block", False, "text")
-    _fixed(raw, "head_dim", _TEXT["sliding_head_dim"], "text")
-    _fixed(raw, "global_head_dim", _TEXT["global_head_dim"], "text")
-    _fixed(raw, "sliding_window", _TEXT["sliding_window"], "text")
-    _fixed(raw, "final_logit_softcapping", _TEXT["final_logit_softcapping"], "text")
+    # The MoE block is a property of the checkpoint family, not a free choice: a 26B source declares
+    # it and a 31B source does not.
+    if bool(raw.get("enable_moe_block", False)) != profile["enable_moe_block"]:
+        raise ValueError(
+            f"{profile['name']} expects text.enable_moe_block "
+            f"{profile['enable_moe_block']}, got {raw.get('enable_moe_block')!r}"
+        )
+    _fixed(raw, "head_dim", profile["sliding_head_dim"], "text")
+    _fixed(raw, "global_head_dim", profile["global_head_dim"], "text")
+    _fixed(raw, "sliding_window", profile["sliding_window"], "text")
+    _fixed(raw, "final_logit_softcapping", profile["final_logit_softcapping"], "text")
 
-    result["head_dim"] = _TEXT["sliding_head_dim"]
+    result["head_dim"] = profile["sliding_head_dim"]
     result["num_key_value_heads"] = _positive(raw.get("num_key_value_heads"),
                                               "text.num_key_value_heads")
-    if result["num_key_value_heads"] != _TEXT["sliding_num_key_value_heads"]:
-        raise ValueError("Gemma 4 31B expects 16 sliding KV heads")
+    if result["num_key_value_heads"] != profile["sliding_num_key_value_heads"]:
+        raise ValueError(
+            f"{profile['name']} expects {profile['sliding_num_key_value_heads']} sliding KV heads"
+        )
     result["num_global_key_value_heads"] = _positive(
         raw.get("num_global_key_value_heads"), "text.num_global_key_value_heads")
-    if result["num_global_key_value_heads"] != _TEXT["global_num_key_value_heads"]:
-        raise ValueError("Gemma 4 31B expects 4 global KV heads")
-    result["global_head_dim"] = _TEXT["global_head_dim"]
-    result["sliding_window"] = _TEXT["sliding_window"]
+    if result["num_global_key_value_heads"] != profile["global_num_key_value_heads"]:
+        raise ValueError(
+            f"{profile['name']} expects {profile['global_num_key_value_heads']} global KV heads"
+        )
+    result["global_head_dim"] = profile["global_head_dim"]
+    result["sliding_window"] = profile["sliding_window"]
     result["attention_k_eq_v"] = True
-    result["final_logit_softcapping"] = _TEXT["final_logit_softcapping"]
+    result["final_logit_softcapping"] = profile["final_logit_softcapping"]
     result["hidden_act"] = "gelu_pytorch_tanh"
     result["attention_bias"] = False
 
@@ -133,9 +183,24 @@ def text_config(source: dict) -> dict:
     layers = raw.get("layer_types")
     expected = _expected_layer_types(result["num_hidden_layers"])
     if not isinstance(layers, list) or list(layers) != expected:
-        raise ValueError("Gemma 4 31B expects global attention on every sixth layer, last included")
+        raise ValueError(
+            f"{profile['name']} expects global attention on every sixth layer, last included"
+        )
     result["layer_types"] = list(layers)
     result["global_layer_count"] = expected.count(_FULL_ATTENTION)
+
+    # The MoE block (model reference section 16). The router and the experts read the pre-FFN
+    # residual and the dense MLP still runs, so only these widths are new. Emitted for the 26B alone:
+    # a 31B config stays byte-identical to the one already shipped, and the loader reads its absence
+    # as the dense-only layer of section 3.
+    if profile["enable_moe_block"]:
+        result["enable_moe_block"] = True
+        for key in ("num_experts", "top_k_experts", "moe_intermediate_size"):
+            result[key] = _positive(raw.get(key), "text." + key)
+            if result[key] != profile[key]:
+                raise ValueError(
+                    f"{profile['name']} expects text.{key} {profile[key]}, got {result[key]}"
+                )
 
     # RoPE differs by layer kind: sliding rotates the full 256 dims at theta 10k; global is
     # proportional at theta 1e6 with 64 angles over a 512-wide denominator, so only dims
@@ -150,20 +215,23 @@ def text_config(source: dict) -> dict:
                          "text.rope_parameters.sliding_attention.rope_theta")
     global_theta = _f32(rope[_FULL_ATTENTION].get("rope_theta"),
                         "text.rope_parameters.full_attention.rope_theta")
-    if sliding_theta != _TEXT["sliding_rope_theta"] or global_theta != _TEXT["global_rope_theta"]:
-        raise ValueError("Gemma 4 31B expects theta 10000 sliding and 1000000 global")
+    if sliding_theta != profile["sliding_rope_theta"] or global_theta != profile["global_rope_theta"]:
+        raise ValueError(
+            f"{profile['name']} expects theta {profile['sliding_rope_theta']:.0f} sliding and "
+            f"{profile['global_rope_theta']:.0f} global"
+        )
     result["rope_parameters"] = {
         _SLIDING_ATTENTION: {
             "rope_type": "default",
             "rope_theta": sliding_theta,
-            "rotary_dim": _TEXT["sliding_head_dim"],
+            "rotary_dim": profile["sliding_head_dim"],
         },
         _FULL_ATTENTION: {
             "rope_type": "proportional",
             "rope_theta": global_theta,
-            "rotary_dim": _TEXT["global_rotary_dim"],
-            "rope_angles": _TEXT["global_rope_angles"],
-            "denominator_head_dim": _TEXT["global_head_dim"],
+            "rotary_dim": profile["global_rotary_dim"],
+            "rope_angles": profile["global_rope_angles"],
+            "denominator_head_dim": profile["global_head_dim"],
         },
     }
     return result
@@ -415,6 +483,47 @@ class _Gemma4Builder(_Builder):
                  "model.embed_vision.embedding_projection.weight",
                  (vision["output_hidden_size"], h), inputs=("vision/soft_tokens",))
 
+    def moe(self, prefix, source_prefix, store, config):
+        """The routed-expert block (model reference section 16).
+
+        Each bank is one fused tensor -- `gate_up_proj` `[E, 2*I_moe, H]` with the gate half first,
+        `down_proj` `[E, H, I_moe]` -- so an expert is a row range of it, exactly as Qwen4Exp reads
+        its own banks. There is no shared expert: Gemma's dense MLP runs in parallel instead and
+        `block` maps it independently.
+        """
+        h, e, ir = config["hidden_size"], config["num_experts"], config["moe_intermediate_size"]
+        sp, p = source_prefix + "router.", prefix + "moe/"
+        # The router normalizes the pre-FFN residual without a weight, scales it by `router.scale`
+        # and 1/sqrt(H), and projects; the routing weights are renormalized before per_expert_scale.
+        self.add(p + "router", store, sp + "proj.weight", (e, h),
+                 inputs=(prefix + "ffn_residual",))
+        self.add(p + "router_scale", store, sp + "scale", (h,), direct="bf16")
+        self.add(p + "per_expert_scale", store, sp + "per_expert_scale", (e,), direct="bf16")
+        # Three FFN norms beyond the four `block` maps: one on the dense branch's output, and one on
+        # either side of the MoE branch.
+        self.weight_vector(prefix + "post_feedforward_norm_1", store,
+                           source_prefix + "post_feedforward_layernorm_1.weight", h)
+        self.weight_vector(prefix + "pre_feedforward_norm_2", store,
+                           source_prefix + "pre_feedforward_layernorm_2.weight", h)
+        self.weight_vector(prefix + "post_feedforward_norm_2", store,
+                           source_prefix + "post_feedforward_layernorm_2.weight", h)
+        # The experts read the pre-FFN residual through their own norm, not the dense MLP's input.
+        expert_input = p + "expert_input"
+        gate_up, downs = [], []
+        for expert in range(e):
+            ep = p + f"experts/{expert}/"
+            for index, role in enumerate(("gate", "up")):
+                self.add(ep + role, store, source_prefix + "experts.gate_up_proj", (ir, h),
+                         source_shape=(e, 2 * ir, h), offset=(expert * 2 + index) * ir * h,
+                         inputs=(expert_input,))
+                gate_up.append(ep + role)
+            self.add(ep + "down", store, source_prefix + "experts.down_proj", (h, ir),
+                     source_shape=(e, h, ir), offset=expert * h * ir,
+                     inputs=(ep + "product",))
+            downs.append(ep + "down")
+        self.group(*gate_up)
+        self.group(*downs)
+
     def draft_block(self, prefix, source_prefix, store, draft, target, kind):
         """One drafter layer: the target layer's body without key and value projections."""
         h = draft["hidden_size"]
@@ -498,6 +607,9 @@ class _Gemma4Builder(_Builder):
         # cannot re-derive the swizzled scale plane it shares with its sibling, so no consumer could
         # execute it. Separate objects are also what the reference engine's converter produces, and
         # each half then carries its own per-tensor scale.
+
+        if config["enable_moe_block"]:
+            self.moe(prefix, source_prefix, store, config)
 
 
 def build_model(
