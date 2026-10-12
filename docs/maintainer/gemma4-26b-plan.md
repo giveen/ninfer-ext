@@ -358,6 +358,20 @@ measured saturated decodes. That is P0's last bullet.
   10% of the 0.419 drift budget Gemma is held to. Consequence: a KLD or perplexity comparison must fix
   the accumulation order across the variants it compares, and the P2 decision that accumulation is a
   private execution choice now has a number attached.
+- **The gather inversion's design (next)**: the element count is the target, not the access pattern. Per
+  layer and 1024-token chunk the apply reads 8,192 slot-hits × 6.49 M elements = 53.2 G elements, while
+  those slots address only 128 distinct expert matrices — 0.83 G elements, a 64× reduction. Inverting the
+  loop also makes the reuse *cacheable*: one expert's three matrices are about 3.6 MB in NVFP4, so an
+  expert that a block works through stays resident in L2 (which is far larger than that on this card)
+  while its hits are served, which is where the multiple comes from rather than from DRAM traffic.
+  Shape: (1) a compaction pass writing, per expert, its list of (token, weight) slots — deliberately a
+  fixed per-expert region scanned in a fixed (rank, token) order rather than a global atomic cursor,
+  because a nondeterministic order would poison exactly the comparisons P5 depends on; (2) a per-expert
+  block computing gate/up, GeGLU and down over its hits and accumulating into an FP32 `[H,T]` buffer,
+  which the op's contract must now declare as workspace along with a workspace-size function; (3) a
+  convert pass to the BF16 output, with the accumulator cleared per call. The wrapper and the model's
+  scratch follow (`layer_workspace_bytes`), as do the oracle at the model's shapes and an interleaved
+  A/B against the kept variant's 114.1 tok/s and 5.492602 mean NLL.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
