@@ -261,9 +261,26 @@ measured saturated decodes. That is P0's last bullet.
   points in §2 each covered by a case.
 
 ### P3 — Execution and end-to-end correctness
-- Wire the MoE branch into `forward.cpp` / `program.cpp`; no graph or scheduler change expected.
-- Evidence: logits agreement against the HF reference at the §11 protocol, then greedy output equality
-  on the standard prompt set, then concurrency 1..8 and the KV/state checks the 31B already has.
+- **Landed**: `feed_forward_sublayer` in `src/models/gemma4/forward.cpp` now carries the layer's
+  feed-forward sublayer for both layer kinds. A dense model takes the branch it always took; a model
+  whose config enables the MoE block runs the router and the experts beside it, sums the two branches
+  and applies the shared post-norm. `prepare_gemma_moe_expert_weights` unites each bank into one
+  contiguous `Weight` through the same `single(...)` the 35B's `prepare_sparse_moe_weights` uses, so
+  an expert is a row range of its bank and nothing is unpacked per expert.
+- **Landed**: the MoE branch adds no large scratch. It reuses the dense branch's `[H,T]` buffers in
+  place — `normed`, `down` and the attention's `projected`, each after its last reader — so the only
+  new storage is the router's `K`-per-token output, which `layer_workspace_bytes` counts.
+- **Correction the bridge forced**: the 26B recipe had granted the routed experts `AllowA4` with no
+  activation divisor — a permission no route honours, since the expert apply decodes the stored codes
+  itself and computes in the represented activations. They are `A16Only` now, the NVFP4 permission
+  guard skips routed-expert banks for the same reason, and the artifact predating the change was
+  rebuilt.
+- **Evidence so far**: P2's op oracles, plus the 31B's `ninfer_gemma4_forward_test` and
+  `ninfer_gemma4_layer_test` passing against the refactored sublayer — the dense execution path is
+  unchanged.
+- **Remaining**: logits agreement against the HF reference at the §11 protocol, then greedy output
+  equality on the standard prompt set, then concurrency 1..8 and the KV/state checks the 31B already
+  has.
 
 ### P4 — Speculation
 - Support `assist/` after P0's config diff; reuse the shipped 31B assistant machinery (target-cache
