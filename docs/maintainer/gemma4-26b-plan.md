@@ -456,6 +456,26 @@ measured saturated decodes. That is P0's last bullet.
   two runs. The 0.046 difference is just outside the 0.04 accumulation-order floor, so it points the
   expected way but is not a quality measurement; KLD against the BF16 reference is. Greedy output on
   a short prompt is coherent for both. The NVFP4 bring-up recipe stays until that comparison.
+- **Dense projections and head on the QAT grid (landed).** `gemma4_26b_a4b_qat` now stores attention,
+  the dense MLP and the head as `q4_g32_fp16_rows` too (the token table stays Q8: the embedding
+  gather reads row-split int8); the artifact is 16.2 GB against 17.4. The linear Op reads the format
+  with no shape registry: up to 8 tokens a warp per four rows streams 16-byte groups, above that the
+  64×64 tile the grouped expert route uses (now shared in `ops/common/q4_rows_mma.cuh`). Up to 8
+  tokens the router splits each expert's row over one CTA (13.9 → 2.1 µs a layer at decode).
+
+  | QAT artifact, `ninfer_bench` | experts only | + projections and head | + GEMV and router |
+  |---|---|---|---|
+  | tg128 (tok/s) | 219.4 | 264.5 | 309.7 |
+  | pp512 (tok/s) | 8,246 | 8,277 | 8,246 |
+
+  Mean NLL on the 40 KB slice: 5.398731, bit-identical twice (experts only 5.425723, NVFP4 experts
+  5.471673). A rejected GEMV variant (eight rows a CTA, items spread over threads, shared-memory
+  reduction) was slower on every shape (tg128 241) and is gone. What decode time remains, per token
+  from an nsys trace (`--trace=cuda --sample=none`, which avoids the hang the default options hit
+  on this box): GEMVs 1.24 ms (the head at 1.70 TB/s, the per-layer ones at 0.8–1.2 TB/s, which is
+  about 2 µs of fixed cost each over ~200 launches), expert stream 0.63 ms, rmsnorm 0.2 ms (211
+  launches), router selection 0.17 ms, attention ~0.2 ms. Fewer, fused launches are the next lever;
+  prefill (8.2k against the 35B's 22k) has not been attributed yet.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
