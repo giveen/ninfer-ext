@@ -358,7 +358,8 @@ measured saturated decodes. That is P0's last bullet.
   10% of the 0.419 drift budget Gemma is held to. Consequence: a KLD or perplexity comparison must fix
   the accumulation order across the variants it compares, and the P2 decision that accumulation is a
   private execution choice now has a number attached.
-- **The gather inversion's design (next)**: the element count is the target, not the access pattern. Per
+- **The gather inversion's design (built, measured, rejected — see below)**: the element count is the
+  target, not the access pattern. Per
   layer and 1024-token chunk the apply reads 8,192 slot-hits × 6.49 M elements = 53.2 G elements, while
   those slots address only 128 distinct expert matrices — 0.83 G elements, a 64× reduction. Inverting the
   loop also makes the reuse *cacheable*: one expert's three matrices are about 3.6 MB in NVFP4, so an
@@ -372,6 +373,24 @@ measured saturated decodes. That is P0's last bullet.
   convert pass to the BF16 output, with the accumulator cleared per call. The wrapper and the model's
   scratch follow (`layer_workspace_bytes`), as do the oracle at the model's shapes and an interleaved
   A/B against the kept variant's 114.1 tok/s and 5.492602 mean NLL.
+- **The gather inversion, implemented and rejected**: the full route was built — a fixed slot region per
+  expert written by one thread per expert in a fixed (rank, token) order, one block per (expert, hit
+  tile) computing gate/up, GeGLU and down over the hits it owns, an FP32 [H,T] accumulator, a narrowing
+  pass, and the workspace declared in the Op's contract and counted in the layer bound. It is correct:
+  the FP64 oracles pass every case. It is worse on both axes.
+  - **Nondeterministic.** Two runs of the same command gave mean NLL 5.464852 and 5.520692, where every
+    earlier formulation was bit-identical run to run. The compaction order is fixed, but the accumulator
+    is filled by `atomicAdd` from blocks whose relative order the scheduler picks, so the sum's
+    association varies — the one property P5's comparisons cannot tolerate, and the reason the design
+    note above calls for a fixed order.
+  - **Slower.** 51.9 and 52.2 tok/s against the kept variant's 114.1 and 115.3, although it reads each
+    expert's matrices about once per pass instead of once per hit. The element-count argument was
+    necessary but not sufficient: with eight blocks per expert, the blocks resident on one SM are
+    working on different experts, so the reuse the inversion exists to create is spread across the
+    machine instead of captured per SM. Keeping an expert on an SM and giving it enough warps to hide
+    the bank latency is the schedule, and eight tiles per expert does the opposite.
+  Reverted. A future attempt should start from the schedule and from a deterministic reduction
+  (per-expert partials summed in a fixed order, no atomics), not from the element count.
 - **Claim discipline for "faster"**: only against the P0 baseline, on this card, the same checkpoint,
   greedy, thinking mode stated, saturated completions, at C=1..8, with per-round accounting. A dense
   NVFP4 advantage (1246 against 1092 TFLOP/s) does not transfer to the grouped thin-M shape by itself;
