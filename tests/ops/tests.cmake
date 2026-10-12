@@ -2,6 +2,7 @@ set(ninfer_op_tests
   add_bias
   gelu
   gelu_mul
+  gemma_moe_router
   silu_mul
   residual_add
   sigmoid_mul
