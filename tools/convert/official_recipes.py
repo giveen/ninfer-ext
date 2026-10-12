@@ -635,6 +635,45 @@ def gemma4_31b_m1(model, recipe, sources):
     _gemma4_layout(model, recipe, "gemma4_31b_m1")
 
 
+def gemma4_26b_a4b_base(model, recipe, sources):
+    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for both GeGLU branches, FP8 rows elsewhere.
+
+    This is the bring-up layout the Program is developed against, not a serving layout. The same
+    shape of layout scored 0.758 KLD on the 31B (plan L1: NVFP4 MLPs, FP8 rows) against the 0.419 its
+    measured serving layout reaches, and the 4-bit MLP was almost all of that error. What changes
+    here is the source: this checkpoint is QAT-trained for four bits, which is the whole reason to
+    expect the experts to hold up where a plain BF16 checkpoint did not. That is a measurement, not
+    an assumption (plan P5), with FP8 for the experts as the fallback if the grid harvests nothing.
+
+    The MoE block's router, its two scales and the layer's norms stay at the source precision. A
+    router's output is a probability that a small error moves across the top-k boundary, and the
+    per-expert scale multiplies what an expert produces, so neither is a place to spend bits.
+
+    The dense MLP and the routed experts take one layout: both are GeGLU projections over the same
+    residual, so a difference between them would read as a branch imbalance rather than as uniform
+    loss. Each expert bank becomes one parent object, so an expert is a fixed row range of its bank
+    and a decode round streams the top-8 experts' spans.
+    """
+    _optional(model, recipe)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name == "text/token_embedding":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+            continue
+        if "/moe/" in name and "/moe/experts/" not in name:
+            continue
+        if not parameter.projection:
+            continue
+        if "/moe/experts/" in name or "/mlp/" in name:
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
+        elif "/attention/" in name:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -651,4 +690,5 @@ RECIPES = {
     "gemma4_31b_base": gemma4_31b_base,
     "gemma4_31b_g0": gemma4_31b_g0,
     "gemma4_31b_m1": gemma4_31b_m1,
+    "gemma4_26b_a4b_base": gemma4_26b_a4b_base,
 }

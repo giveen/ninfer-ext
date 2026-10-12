@@ -4,10 +4,11 @@ import torch
 
 from dataclasses import replace
 
-from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax
+from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax, nvfp4_mse
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
+    gemma4_26b_a4b_base,
     qwen3_6_27b,
     qwen3_8_27b,
     qwen3_8_27b_bf16,
@@ -286,3 +287,78 @@ def test_35b_nvfp4_recipe_reads_a_modelopt_expert_prefix(tmp_path) -> None:
                   0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0]]
             ),
         )
+
+
+def _gemma4_26b_model() -> Model:
+    """One 26B-A4B layer: the dense MLP, the router with its two scales, and two experts of a bank."""
+    model = Model({"text": {"config": {"model_type": "gemma4_text"}}})
+    layer = "text/layers/0/"
+
+    def add(name: str, shape: tuple[int, ...], inputs: tuple[str, ...]) -> None:
+        source = array_source(torch.ones(shape, dtype=torch.bfloat16), name)
+        model.add(Parameter(name, shape, source, inputs=inputs))
+
+    add("text/token_embedding", (8, 4), ())
+    add("text/output_head", (8, 4), ("hidden",))
+    for role in ("input_norm", "post_attention_norm", "pre_feedforward_norm",
+                 "post_feedforward_norm", "post_feedforward_norm_1", "pre_feedforward_norm_2",
+                 "post_feedforward_norm_2"):
+        add(layer + role, (4,), ())
+    add(layer + "layer_scalar", (1,), ())
+    for role in ("query", "key", "value"):
+        add(layer + "attention/" + role, (4, 4), ("normed",))
+    add(layer + "attention/output", (4, 4), ("attended",))
+    for role in ("gate", "up"):
+        add(layer + "mlp/" + role, (4, 4), ("mlp_input",))
+    add(layer + "mlp/down", (4, 4), ("mlp_product",))
+    add(layer + "moe/router", (2, 4), ("residual",))
+    add(layer + "moe/router_scale", (4,), ())
+    add(layer + "moe/per_expert_scale", (2,), ())
+    gate_up, downs = [], []
+    for expert in range(2):
+        prefix = layer + f"moe/experts/{expert}/"
+        for role in ("gate", "up"):
+            add(prefix + role, (4, 4), ("expert_input",))
+            gate_up.append(prefix + role)
+        add(prefix + "down", (4, 4), (prefix + "product",))
+        downs.append(prefix + "down")
+    # One bank per projection, declared exactly as the gemma4 mapping declares them.
+    model.packing_groups.append(tuple(gate_up))
+    model.packing_groups.append(tuple(downs))
+    return model
+
+
+def test_gemma4_26b_recipe_is_registered() -> None:
+    assert RECIPES["gemma4_26b_a4b_base"] is gemma4_26b_a4b_base
+
+
+def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() -> None:
+    model = _gemma4_26b_model()
+    recipe = Recipe(model)
+    gemma4_26b_a4b_base(model, recipe, {})
+    layer = "text/layers/0"
+
+    def selection(name: str):
+        selections = recipe.selections.get(name, [])
+        assert len(selections) == 1, f"{name} has {len(selections)} selections"
+        return selections[0]
+
+    # Both GeGLU branches take one layout, so neither can absorb a branch imbalance.
+    for name in (f"{layer}/mlp/gate", f"{layer}/mlp/down", f"{layer}/moe/experts/0/gate",
+                 f"{layer}/moe/experts/1/up", f"{layer}/moe/experts/1/down"):
+        assert selection(name).format == "nvfp4"
+        assert selection(name).method is nvfp4_mse
+    for name in (f"{layer}/attention/query", f"{layer}/attention/output"):
+        assert selection(name).method is fp8_row_maxabs
+    assert selection("text/token_embedding").method is fp8_row_maxabs
+
+    # The router decides the top-k and the per-expert scale multiplies what an expert produces, so
+    # both, and the three norms the block adds, stay at the source precision.
+    for name in (f"{layer}/moe/router", f"{layer}/moe/router_scale",
+                 f"{layer}/moe/per_expert_scale", f"{layer}/post_feedforward_norm_1",
+                 f"{layer}/pre_feedforward_norm_2", f"{layer}/post_feedforward_norm_2"):
+        assert selection(name).format == "bf16", f"{name} must stay at the source precision"
+
+    # Every expert bank becomes one parent, so an expert is a fixed row range of its bank.
+    grouped = {name for names, _ in recipe.explicit_groups for name in names}
+    assert grouped == {name for name in model.parameters if "/moe/experts/" in name}

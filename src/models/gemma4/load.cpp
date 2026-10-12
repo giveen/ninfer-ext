@@ -16,8 +16,8 @@ namespace ninfer::models::gemma4 {
 namespace {
 
 // The formats the artifact stores, checked by the binder on every request.
-constexpr QType kNormFormat       = QType::BF16;
-constexpr QType kScalarFormat     = QType::FP32;
+constexpr QType kNormFormat   = QType::BF16;
+constexpr QType kScalarFormat = QType::FP32;
 
 struct PendingWeight {
     artifact::ParameterReference reference;
@@ -27,11 +27,11 @@ class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
 
-    // A null format declares no representation constraint, which is what a parameter whose layout the
-    // converter is free to choose needs: the Ops dispatch on what the weight actually is.
+    // A null format declares no representation constraint, which is what a parameter whose layout
+    // the converter is free to choose needs: the Ops dispatch on what the weight actually is.
     WeightId parameter(const std::string& name, artifact::Shape shape,
-                       std::optional<QType> format          = {},
-                       artifact::Residency residency        = artifact::Residency::Device) {
+                       std::optional<QType> format   = {},
+                       artifact::Residency residency = artifact::Residency::Device) {
         PendingWeight pending;
         pending.reference = binder_.parameter(name, std::move(shape), residency, format);
         weights_.push_back(std::move(pending));
@@ -45,9 +45,7 @@ private:
     std::vector<PendingWeight> weights_;
 };
 
-std::string layer_prefix(std::size_t layer) {
-    return "text/layers/" + std::to_string(layer) + "/";
-}
+std::string layer_prefix(std::size_t layer) { return "text/layers/" + std::to_string(layer) + "/"; }
 
 TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
     const std::uint64_t hidden       = config.hidden_size;
@@ -60,13 +58,13 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
     // and the 262K-row table then takes no device memory, so a layout can keep it exact (BF16).
     out.token_embedding = bindings.parameter("text/token_embedding", {vocabulary, hidden}, {},
                                              artifact::Residency::HostPinned);
-    out.output_head = bindings.parameter("text/output_head", {vocabulary, hidden});
-    out.final_norm  = bindings.parameter("text/final_norm", {hidden}, kNormFormat);
+    out.output_head     = bindings.parameter("text/output_head", {vocabulary, hidden});
+    out.final_norm      = bindings.parameter("text/final_norm", {hidden}, kNormFormat);
 
     out.layers.reserve(config.num_hidden_layers);
     for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
-        const bool sliding   = config.sliding_attention(layer);
-        const auto& geometry = config.geometry(layer);
+        const bool sliding       = config.sliding_attention(layer);
+        const auto& geometry     = config.geometry(layer);
         const std::string prefix = layer_prefix(layer);
         const std::uint64_t query_rows =
             static_cast<std::uint64_t>(config.num_attention_heads) * geometry.head_dim;
@@ -74,13 +72,12 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
             static_cast<std::uint64_t>(geometry.num_key_value_heads) * geometry.head_dim;
 
         LayerWeights weights;
-        weights.mixer = sliding ? MixerKind::SlidingAttention : MixerKind::FullAttention;
-        weights.input_norm           = bindings.parameter(prefix + "input_norm", {hidden},
-                                                          kNormFormat);
-        weights.post_attention_norm  = bindings.parameter(prefix + "post_attention_norm", {hidden},
-                                                          kNormFormat);
-        weights.pre_feedforward_norm = bindings.parameter(prefix + "pre_feedforward_norm", {hidden},
-                                                          kNormFormat);
+        weights.mixer      = sliding ? MixerKind::SlidingAttention : MixerKind::FullAttention;
+        weights.input_norm = bindings.parameter(prefix + "input_norm", {hidden}, kNormFormat);
+        weights.post_attention_norm =
+            bindings.parameter(prefix + "post_attention_norm", {hidden}, kNormFormat);
+        weights.pre_feedforward_norm =
+            bindings.parameter(prefix + "pre_feedforward_norm", {hidden}, kNormFormat);
         weights.post_feedforward_norm =
             bindings.parameter(prefix + "post_feedforward_norm", {hidden}, kNormFormat);
         weights.layer_scalar = bindings.parameter(prefix + "layer_scalar", {1}, kScalarFormat);
@@ -89,24 +86,59 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
         // slice's own shape is what makes the artifact resolve its row offset.
         weights.attention.query =
             bindings.parameter(prefix + "attention/query", {query_rows, hidden});
-        weights.attention.key =
-            bindings.parameter(prefix + "attention/key", {key_rows, hidden});
+        weights.attention.key = bindings.parameter(prefix + "attention/key", {key_rows, hidden});
         if (sliding) {
-            weights.attention.value = bindings.parameter(prefix + "attention/value",
-                                                         {key_rows, hidden});
+            weights.attention.value =
+                bindings.parameter(prefix + "attention/value", {key_rows, hidden});
         }
         // Projection formats are the precision layout's choice; the linear Op dispatches on them.
         weights.attention.output =
             bindings.parameter(prefix + "attention/output", {hidden, query_rows});
-        weights.attention.query_norm = bindings.parameter(prefix + "attention/query_norm",
-                                                          {geometry.head_dim}, kNormFormat);
-        weights.attention.key_norm = bindings.parameter(prefix + "attention/key_norm",
-                                                        {geometry.head_dim}, kNormFormat);
+        weights.attention.query_norm =
+            bindings.parameter(prefix + "attention/query_norm", {geometry.head_dim}, kNormFormat);
+        weights.attention.key_norm =
+            bindings.parameter(prefix + "attention/key_norm", {geometry.head_dim}, kNormFormat);
 
-        weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden},
-                                             std::optional<QType>{});
-        weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden}, std::optional<QType>{});
-        weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate}, std::optional<QType>{});
+        weights.mlp.gate =
+            bindings.parameter(prefix + "mlp/gate", {intermediate, hidden}, std::optional<QType>{});
+        weights.mlp.up =
+            bindings.parameter(prefix + "mlp/up", {intermediate, hidden}, std::optional<QType>{});
+        weights.mlp.down =
+            bindings.parameter(prefix + "mlp/down", {hidden, intermediate}, std::optional<QType>{});
+
+        // The routed-expert block (model reference section 16). Each bank is stored fused, so an
+        // expert's matrix is a slice of one object and the slice's own shape is what makes the
+        // artifact resolve its row offset -- the same contract as the attention projections above.
+        if (config.enable_moe_block) {
+            const std::uint64_t experts             = config.num_experts;
+            const std::uint64_t expert_intermediate = config.moe_intermediate_size;
+            MoeWeights moe;
+            moe.router = bindings.parameter(prefix + "moe/router", {experts, hidden},
+                                            std::optional<QType>{});
+            // Both scales are plain BF16 vectors, like a norm weight.
+            moe.router_scale =
+                bindings.parameter(prefix + "moe/router_scale", {hidden}, kNormFormat);
+            moe.per_expert_scale =
+                bindings.parameter(prefix + "moe/per_expert_scale", {experts}, kNormFormat);
+            moe.experts.resize(experts);
+            for (std::uint64_t expert = 0; expert < experts; ++expert) {
+                const std::string expert_prefix =
+                    prefix + "moe/experts/" + std::to_string(expert) + "/";
+                moe.experts[expert].gate = bindings.parameter(
+                    expert_prefix + "gate", {expert_intermediate, hidden}, std::optional<QType>{});
+                moe.experts[expert].up = bindings.parameter(
+                    expert_prefix + "up", {expert_intermediate, hidden}, std::optional<QType>{});
+                moe.experts[expert].down = bindings.parameter(
+                    expert_prefix + "down", {hidden, expert_intermediate}, std::optional<QType>{});
+            }
+            moe.post_feedforward_norm_1 =
+                bindings.parameter(prefix + "post_feedforward_norm_1", {hidden}, kNormFormat);
+            moe.pre_feedforward_norm_2 =
+                bindings.parameter(prefix + "pre_feedforward_norm_2", {hidden}, kNormFormat);
+            moe.post_feedforward_norm_2 =
+                bindings.parameter(prefix + "post_feedforward_norm_2", {hidden}, kNormFormat);
+            weights.moe = std::move(moe);
+        }
 
         out.layers.push_back(weights);
     }
@@ -130,7 +162,7 @@ DraftWeights bind_draft(Bindings& bindings, const TextConfig& target, const Draf
         const std::uint64_t query_rows =
             static_cast<std::uint64_t>(target.num_attention_heads) * geometry.head_dim;
         DraftLayerWeights weights;
-        weights.mixer = draft.layer_types[layer];
+        weights.mixer      = draft.layer_types[layer];
         weights.input_norm = bindings.parameter(prefix + "input_norm", {hidden}, kNormFormat);
         weights.post_attention_norm =
             bindings.parameter(prefix + "post_attention_norm", {hidden}, kNormFormat);
@@ -139,10 +171,10 @@ DraftWeights bind_draft(Bindings& bindings, const TextConfig& target, const Draf
         weights.post_feedforward_norm =
             bindings.parameter(prefix + "post_feedforward_norm", {hidden}, kNormFormat);
         weights.layer_scalar = bindings.parameter(prefix + "layer_scalar", {1}, kScalarFormat);
-        weights.query  = bindings.parameter(prefix + "attention/query", {query_rows, hidden});
+        weights.query        = bindings.parameter(prefix + "attention/query", {query_rows, hidden});
         weights.query_norm =
             bindings.parameter(prefix + "attention/query_norm", {geometry.head_dim}, kNormFormat);
-        weights.output = bindings.parameter(prefix + "attention/output", {hidden, query_rows});
+        weights.output   = bindings.parameter(prefix + "attention/output", {hidden, query_rows});
         weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden});
         weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden});
         weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate});
@@ -205,10 +237,11 @@ struct LoadPlan::Impl {
     explicit Impl(const artifact::Reader& reader) : binder(reader) {}
 };
 
-// Every Gemma parameter is Device-resident, so unlike the Qwen loader there is no file-mapped branch
-// here: a plan's reference always resolves to a view over the materialized bytes.
-std::vector<BoundWeight> resolve_weights(const std::vector<artifact::ParameterReference>& references,
-                                        const artifact::MaterializedArtifact& materialized) {
+// Every Gemma parameter is Device-resident, so unlike the Qwen loader there is no file-mapped
+// branch here: a plan's reference always resolves to a view over the materialized bytes.
+std::vector<BoundWeight>
+resolve_weights(const std::vector<artifact::ParameterReference>& references,
+                const artifact::MaterializedArtifact& materialized) {
     std::vector<BoundWeight> out;
     out.reserve(references.size());
     for (const auto& reference : references) {
@@ -241,9 +274,7 @@ const TextResources& LoadPlan::resources() const { return impl_->resources; }
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
-const artifact::MaterializationPlan& LoadPlan::materialization() const {
-    return impl_->plan;
-}
+const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->plan; }
 
 std::size_t LoadPlan::parameter_count() const { return impl_->references.size(); }
 
@@ -254,11 +285,12 @@ const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>(reader);
     out->options = options;
-    // Both purposes bind the same parameters: the head the scoring route reads is the head generation
-    // samples from, and what differs between the two is how a Program is driven, not what is loaded.
+    // Both purposes bind the same parameters: the head the scoring route reads is the head
+    // generation samples from, and what differs between the two is how a Program is driven, not
+    // what is loaded.
     out->config = parse_text_config(reader.directory().component("text").config);
-    // The tokenizer's files are artifact resources rather than weights, and this is where the frontend
-    // will read them. The Binder must still be alive, so this comes before it is finished.
+    // The tokenizer's files are artifact resources rather than weights, and this is where the
+    // frontend will read them. The Binder must still be alive, so this comes before it is finished.
     const auto resource = [&](std::string_view role) {
         const auto bytes = out->binder.host_object(out->binder.resource("text", role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -326,11 +358,12 @@ ops::WeightInput Model::input(WeightId id) const {
 float Model::layer_scalar(WeightId id) const { return layer_scalars_.at(id.index); }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
-                                        const StartupObserver* observer) {
+                                         const StartupObserver* observer) {
     if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
-    auto data    = std::move(plan.impl_);
-    auto backing = artifact::materialize(*data->plan.source, std::move(data->plan), device, observer);
-    auto bound   = resolve_weights(data->references, backing);
+    auto data = std::move(plan.impl_);
+    auto backing =
+        artifact::materialize(*data->plan.source, std::move(data->plan), device, observer);
+    auto bound = resolve_weights(data->references, backing);
 
     // The layer scalars are consumed as host floats, so read the sixty 4-byte values once here
     // rather than syncing a device copy on every layer of every token.
