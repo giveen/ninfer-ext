@@ -36,7 +36,14 @@ constexpr std::array kGeometries{
     // The Gemma 4 assistant drafter (hidden 1024).
     Geometry{1024, 10752, 523U}, Geometry{8192, 1024, 541U}, Geometry{16384, 1024, 547U},
     Geometry{1024, 8192, 557U}, Geometry{1024, 16384, 563U}, Geometry{262144, 1024, 569U},
-    Geometry{5376, 1024, 571U}};
+    Geometry{5376, 1024, 571U},
+    // Gemma 4 26B-A4B (hidden 2816): the fused qkv parent and its query/key/value slices at both
+    // head widths, the attention output at both, the dense MLP's gate/up and down, and the tied
+    // head.
+    Geometry{8192, 2816, 577U}, Geometry{4096, 2816, 587U}, Geometry{2048, 2816, 593U},
+    Geometry{9216, 2816, 599U}, Geometry{1024, 2816, 601U}, Geometry{2816, 4096, 607U},
+    Geometry{2816, 8192, 613U}, Geometry{2176, 2816, 617U}, Geometry{2816, 2176, 619U},
+    Geometry{262144, 2816, 631U}};
 
 int q8_a16_conformance() {
     int failures = 0;

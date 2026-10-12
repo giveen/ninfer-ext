@@ -636,8 +636,7 @@ def gemma4_31b_m1(model, recipe, sources):
 
 
 def gemma4_26b_a4b_base(model, recipe, sources):
-    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for both GeGLU branches, FP8 rows for
-    attention, Q8 for the token table.
+    """Gemma 4 26B-A4B from the QAT BF16 checkpoint: NVFP4 for the routed experts, Q8 elsewhere.
 
     This is the bring-up layout the Program is developed against, not a serving layout. The same
     shape of layout scored 0.758 KLD on the 31B (plan L1: NVFP4 MLPs, FP8 rows) against the 0.419 its
@@ -646,24 +645,29 @@ def gemma4_26b_a4b_base(model, recipe, sources):
     expect the experts to hold up where a plain BF16 checkpoint did not. That is a measurement, not
     an assumption (plan P5), with FP8 for the experts as the fallback if the grid harvests nothing.
 
+    Q8 rather than FP8 or NVFP4 for everything a linear route consumes, because a quantized linear
+    route resolves its geometry from a fixed registry of hand-tuned shape files: neither the FP8 nor
+    the NVFP4 registry has this model's hidden 2816, and only the row-split int8 route offers a
+    generic selector. The routed experts are the exception -- the MoE Op decodes their banks itself,
+    so no linear registry constrains them -- and they are therefore the one part of the model that
+    spends four bits on this pass.
+
     The MoE block's router, its two scales and the layer's norms stay at the source precision. A
     router's output is a probability that a small error moves across the top-k boundary, and the
     per-expert scale multiplies what an expert produces, so neither is a place to spend bits.
 
-    The dense MLP and the routed experts take one layout: both are GeGLU projections over the same
-    residual, so a difference between them would read as a branch imbalance rather than as uniform
-    loss. Each expert bank becomes one parent object, so an expert is a fixed row range of its bank
-    and a decode round streams the top-8 experts' spans.
+    Each expert bank becomes one parent object, so an expert is a fixed row range of its bank and a
+    decode round streams the top-8 experts' spans.
     """
     _optional(model, recipe)
     for name, parameter in model.parameters.items():
         if not name.startswith("text/"):
             continue
-        if name == "text/token_embedding":
-            # Q8, not the 31B's FP8 rows: the FP8 gather is a hand-tuned kernel whose wrapper pins the
-            # table to the Qwen and 31B shapes (248320x5120, 262144x5376), and this table is
-            # 262144x2816. The row-split int8 route is shape-generic and is what every other recipe
-            # here gives its token table, which is also this model's tied head.
+        if name in ("text/token_embedding", "text/output_head"):
+            # Q8, not the 31B's FP8 rows: the FP8 embedding and linear kernels are hand-tuned shape
+            # files whose registries cover the Qwen and 31B geometries, and neither the table's
+            # 262144x2816 nor any of this model's attention shapes is among them. The row-split int8
+            # route has a generic selector and is what every other recipe here gives its token table.
             _assign(recipe, name, Q8)
             continue
         if "/moe/" in name and "/moe/experts/" not in name:
@@ -675,10 +679,14 @@ def gemma4_26b_a4b_base(model, recipe, sources):
             # activations: no linear route consumes them, so nothing grants A4 and none of them
             # carries a calibration divisor.
             recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
-        elif "/mlp/" in name:
-            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="AllowA4")
-        elif "/attention/" in name:
-            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+        else:
+            # Attention and the dense MLP take the generic int8 route the token table does, for the
+            # same reason: a quantized linear route resolves its geometry from a fixed registry of
+            # hand-tuned shape files, and this model's are in neither the FP8 nor the NVFP4 one. The
+            # routed experts keep NVFP4 because their decoder is the MoE Op's, so no linear registry
+            # constrains them. That difference between the two GeGLU branches is a route constraint
+            # rather than a brightness choice, and P5's encoding comparison is where it is measured.
+            _assign(recipe, name, Q8)
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
