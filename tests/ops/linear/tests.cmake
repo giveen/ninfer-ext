@@ -47,3 +47,7 @@ ninfer_add_op_test(ninfer_linear_exl3_a16_test
 ninfer_add_op_test(ninfer_linear_exl3_consumers_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_consumers.cpp"
   LIBRARIES ninfer_ops ninfer_artifact)
+
+ninfer_add_op_test(ninfer_linear_q4rows_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4rows_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
