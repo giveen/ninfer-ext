@@ -29,7 +29,7 @@ reflected in those two tables; [versus stock](docs/vs-stock-ninfer.md) carries t
 
 One figure per model, drawn by [`tools/bench/plot_master.py`](tools/bench/plot_master.py) from the runs
 in `profiles/bench/all_models/`. Each has four panels: prefill and decode against context (a line per
-concurrency) and the same two against concurrency (a line per context). Six models have one;
+concurrency) and the same two against concurrency (a line per context). Seven models have one;
 Qwen3.6-27B is quoted under [serving throughput](#serving-throughput) instead, because its campaign
 was run separately and is not in that root. The decode panels carry the same-session MTP run as a
 dashed line labelled with its mode, so plain and speculative decode sit in one chart.
@@ -64,6 +64,13 @@ reach the contexts its KV window fits — 262,144 tokens at one lane, 32,768 at 
 **Qwen3.8-27B `nvfp4`** — prefill 4,034–9,795 tok/s, decode 76–545.
 
 ![Qwen3.8-27B nvfp4 prefill and decode against context and concurrency](screenshots/qwen3_8_27b_nvfp4_master.png)
+
+**Qwen3.8-Flash-Next `nvfp4`** — prefill 3,319–5,232 tok/s, and the only model here that runs the
+260k-token fixture; decode 69.7 → 252.5 tok/s plain from one lane to eight, 93.4 → 265.5 with MTP. Its
+numbers are **host-bound**: the routed experts live in pinned host RAM and stream over PCIe, so the
+host and the link matter as much as the GPU.
+
+![Qwen3.8-Flash-Next nvfp4 prefill and decode against context and concurrency](screenshots/qwen3.8-flash-next_master.png)
 
 <details>
 <summary>MTP against plain decode, same session, both modes in one invocation</summary>

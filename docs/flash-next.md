@@ -197,6 +197,30 @@ Not re-measured at `fc305acd`: at `7fbabfbc`, prefill reached 3,411 tok/s for a 
 3,350 for 16,384 and 431 for 512, and FP8 KV decoded 3% faster than BF16 KV after a 2,048-token
 prompt.
 
+### Reasoning-load numbers (decode saturation)
+
+One RTX 5090, BF16 KV, a 300-token AIME prompt and 1,024-token generations per request — the same
+protocol as the other models' master charts ([figure](../README.md#master-charts)). Aggregate decode
+over intervals whose decode batch equals C, plain against MTP (K=3, full proposal head):
+
+| C | plain | MTP | gain |
+|---|---:|---:|---:|
+| 1 | 69.7 | 93.4 | 1.34x |
+| 2 | 116.1 | 231.3 | 1.99x |
+| 4 | 169.2 | 194.7 | 1.15x |
+| 8 | 252.5 | 265.5 | 1.05x |
+
+Prefill over the same protocol: 4,861 / 5,232 / 4,468 / **3,319** tok/s at 7,680 / 64,512 / 130,048 /
+260,096 tokens. It is the only model here that runs that last prompt — its 262,144-token window fits
+where the others' do not.
+
+**MTP wins here and loses on the essays above**, which is the lesson every model in this repository
+teaches: the mode that wins is a property of the load, not of the model. On 512-token essays plain
+decode beat MTP (98.5 against 82.2 at C=1); these 1,024-token reasoning generations gain 1.05–1.99x.
+The two are not a like-for-like contrast in another way either — the essays ran `--lm-head-draft`, the
+optimized proposal head, while these ran the full head — so treat the sign of the difference as
+load-dependent rather than as a ranking of the two heads.
+
 ### Try it yourself
 
 Build with `cmake --preset dev` (it includes the benchmarks), download the artifact
