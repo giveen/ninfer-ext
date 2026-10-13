@@ -16,6 +16,13 @@ sides, including the two cases where stock is ahead.
 Measured on one RTX 5090; the [test system](#test-system) and [conditions](#benchmark-conditions) are
 below. Every model runs through the same `ninfer-serve`, CLI and Engine.
 
+The numbers come from different builds, and each section says which: the master charts, the MTP
+comparison and the Qwen3.6-27B quotes are from the current tree, while the serving and single-request
+tables are from fork commits `19f38b77` and `f8106aa9` (same Engine; only benchmark sizing changed) and
+the Flash-Next rows from `fc305acd` and `7fbabfbc` (CUDA 13.3 and 13.4). Two later commits — a
+tensor-core A16 kernel for NVFP4 MLP projections and the adaptive-MTP batch draft length — are not
+reflected in those two tables; [versus stock](docs/vs-stock-ninfer.md) carries the same caveat.
+
 ### Master charts
 
 One figure per model, drawn by [`tools/bench/plot_master.py`](tools/bench/plot_master.py) from the runs
