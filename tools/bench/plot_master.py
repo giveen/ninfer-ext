@@ -76,6 +76,11 @@ def decode_series(readings: list[dict[str, Any]]) -> dict[tuple[int, int, str], 
 
     The plain path keeps an empty mode string -- it is the baseline a chart reads against -- and any
     speculative run keeps its mode name, which is also what makes the line dashed.
+
+    First reading wins per cell. Two runs measure the same plain cells (the decode pass and the
+    speculative A/B's own plain arm, which exist to make the ratio), and they differ by one to three
+    percent on this clock-sensitive box; pass the decode pass first so a chart plots the run the prose
+    quotes, and let the A/B contribute only its speculative series.
     """
     out: dict[tuple[int, int, str], float] = {}
     for reading in readings:
@@ -86,7 +91,7 @@ def decode_series(readings: list[dict[str, Any]]) -> dict[tuple[int, int, str], 
             continue
         mode = reading.get("mode") or ""
         plain = "" if mode in ("mtp0", "none", "None") else str(mode)
-        out[(reading["concurrency"], reading["context"], plain)] = float(value)
+        out.setdefault((reading["concurrency"], reading["context"], plain), float(value))
     return out
 
 
