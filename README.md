@@ -3,7 +3,7 @@
 ninfer-ext is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer), a
 from-scratch C++/CUDA inference engine for Qwen models on one NVIDIA GeForce RTX 5090.
 
-The fork adds four things on top of upstream's engine:
+The fork adds these things on top of upstream's engine:
 
 - **Qwen3.8-Flash-Next on one 32 GB GPU.** A ~180B-parameter MoE model whose routed experts live in
   pinned Host memory behind a device expert cache. Stock NInfer cannot load it.
@@ -26,6 +26,9 @@ The fork adds four things on top of upstream's engine:
   27B artifacts are the smallest of this fork's Qwen3.8-27B builds and the best on both perplexity
   and KL divergence; the Flash-Next ones are about 20–26% smaller than its NVFP4 artifact.
   Nothing upstream can produce or run them.
+- **Gemma 4 text and vision.** Gemma 4 31B and 26B-A4B run through the same Engine, CLI and server as
+  the Qwen models, with their own artifacts, KV storage options and MTP drafters. Measured numbers and
+  per-model charts are in [Master charts](#master-charts).
 
 It is **not** faster than stock everywhere. Qwen3.8-27B `nvfp4` and Qwen3.6-35B-A3B tie with stock,
 and stock is ahead in two cases. [Versus stock NInfer](#versus-stock-ninfer) has both sides.
@@ -88,6 +91,7 @@ Upstream's official v3 artifacts work unchanged:
 | Qwen3.8-Flash-Next | `exl3` 4.0 bpw | `qwen3.8-flash-next-exl3-4bpw/qwen3_8_flash_next_exl3_4bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-4bpw) |
 | Qwen3.8-Flash-Next | `exl3` 3.5 bpw | `qwen3.8-flash-next-exl3-3p5bpw/qwen3_8_flash_next_exl3_3p5bpw.ninfer` (+ 2 `.part` files) | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/qwen3.8-flash-next-exl3-3p5bpw) |
 | Gemma 4 31B | `M1` (Q6/Q5 g64) | `gemma4-31b-it-m1/gemma4_31b_it_m1.ninfer` | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-31b-it-m1) |
+| Gemma 4 26B-A4B | QAT int4 experts + Q8 | `gemma4-26b-a4b-qat/gemma4_26b_a4b_qat.ninfer` | [jabbatheduck/ninfer-ext-models](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-26b-a4b-qat) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
@@ -727,6 +731,74 @@ fork commits `19f38b77` and `f8106aa9` (same Engine; only benchmark sizing chang
 serving rows are from `fc305acd`, built with CUDA 13.3; its single-request row is from `7fbabfbc`,
 built with CUDA 13.4.
 
+### Master charts
+
+One figure per model, drawn by [`tools/bench/plot_master.py`](tools/bench/plot_master.py) from the runs
+in `profiles/bench/all_models/`. Each has four panels: prefill and decode against context (a line per
+concurrency) and the same two against concurrency (a line per context).
+
+Prefill is the per-request rate at c1 and the point aggregate at c2–c8 (prompt tokens over the whole
+makespan, so it includes each request's decode); decode is the steady rate over complete intervals
+whose decode batch equals the concurrency. Panels are sparse on purpose, because a concurrency can only
+reach the contexts its KV window fits — 262,144 tokens at one lane, 32,768 at eight on this card.
+
+**Gemma 4 26B-A4B QAT** — decode at one lane 330.5 → 320.0 → 291.0 → **212.5** tok/s across 300 / 8k /
+31k / 123k tokens of context, 674.9 at eight lanes; mean NLL 5.039971 (PPL 154.466) over
+`ninfer-ppl-1m-v1` full.
+
+![Gemma 4 26B-A4B prefill and decode against context and concurrency](screenshots/gemma4_26b_a4b_qat_master.png)
+
+**Gemma 4 31B IT M1** — decode 53–155 tok/s.
+
+![Gemma 4 31B prefill and decode against context and concurrency](screenshots/gemma4_31b_it_m1_master.png)
+
+**Qwen3.6-35B-A3B** — prefill 5,310–16,723 tok/s, decode 257–1,376.
+
+![Qwen3.6-35B-A3B prefill and decode against context and concurrency](screenshots/qwen3_6_35b_a3b_master.png)
+
+**Qwen3.6-35B-A3B `nvfp4`** — prefill 5,838–23,343 tok/s, decode 253–1,338.
+
+![Qwen3.6-35B-A3B nvfp4 prefill and decode against context and concurrency](screenshots/qwen3_6_35b_a3b_nvfp4_master.png)
+
+**Qwen3.8-27B `groupwise-int`** — prefill 2,255–3,264 tok/s, decode 80–422.
+
+![Qwen3.8-27B prefill and decode against context and concurrency](screenshots/qwen3_8_27b_master.png)
+
+**Qwen3.8-27B `nvfp4`** — prefill 4,034–9,795 tok/s, decode 76–545.
+
+![Qwen3.8-27B nvfp4 prefill and decode against context and concurrency](screenshots/qwen3_8_27b_nvfp4_master.png)
+
+<details>
+<summary>MTP against plain decode, same session, both modes in one invocation</summary>
+
+Decode at a ~300-token context, gain at two / four / eight lanes. Speculation pays where decode is
+weight-bound and stops paying once the engine already has a full batch: the dense 27B models gain
+about 2x at every concurrency, while on Gemma 4 26B-A4B at four lanes MTP is *slower* than plain
+decode (606 → 409 tok/s) because the draft passes cost more than the tokens they commit.
+
+| Model | c2 | c4 | c8 | acceptance |
+|---|---|---|---|---|
+| Gemma 4 26B-A4B QAT | 1.39x | **0.67x** | 1.03x | 0.82–0.85 |
+| Qwen3.6-35B-A3B | 1.46x | 1.12x | 0.98x | 0.72–0.75 |
+| Qwen3.6-35B-A3B `nvfp4` | 1.43x | 1.42x | 1.57x | 0.71–0.74 |
+| Qwen3.8-27B `groupwise-int` | 2.21x | 2.03x | 1.78x | 0.81–0.82 |
+| Qwen3.8-27B `nvfp4` | 2.10x | 1.98x | 1.87x | 0.59–0.63 |
+
+Gemma 4 runs MTP on the full proposal head only (1–7 draft tokens) and refuses the optimized one, so
+`--lm-head-draft` must not be passed for it.
+
+![Gemma 4 26B-A4B decode with and without MTP](screenshots/gemma4_26b_a4b_qat_pp_tg_vs_context_mtp.png)
+
+![Qwen3.6-35B-A3B decode with and without MTP](screenshots/qwen3_6_35b_a3b_pp_tg_vs_context_mtp.png)
+
+![Qwen3.6-35B-A3B nvfp4 decode with and without MTP](screenshots/qwen3_6_35b_a3b_nvfp4_pp_tg_vs_context_mtp.png)
+
+![Qwen3.8-27B decode with and without MTP](screenshots/qwen3_8_27b_pp_tg_vs_context_mtp.png)
+
+![Qwen3.8-27B nvfp4 decode with and without MTP](screenshots/qwen3_8_27b_nvfp4_pp_tg_vs_context_mtp.png)
+
+</details>
+
 ### Serving throughput
 
 Aggregate decode tok/s from `ninfer-serve`, with C concurrent requests each writing a 512-token
@@ -936,6 +1008,16 @@ describes the planner.
 
   See [the Gemma 4 reference](docs/maintainer/gemma4-model.md) for the layout comparison and the
   full verification record.
+
+  Gemma 4 26B-A4B (`Gemma4ForCausalLM`, 128 routed experts with top-8 routing) generates, scores and
+  serves with the same surface, and differs from the 31B in three ways: it keeps prefix reuse and all
+  five KV storages (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, costing 0.02–0.06 nats of mean NLL on a
+  40,960-byte slice); its KV window is reserved **per lane**, so context and concurrency trade against
+  device memory (262,144 tokens at one lane down to 32,768 at eight); and its MTP runs on the full
+  proposal head only, so `--lm-head-draft` must not be passed. The QAT artifact is published
+  ([download](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-26b-a4b-qat)),
+  with measured numbers in [Master charts](#master-charts) and its model card in
+  `model-cards/Gemma4-26B-A4B-QAT-NInfer/`.
 
 ## Documentation
 
