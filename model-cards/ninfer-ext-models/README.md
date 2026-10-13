@@ -10,6 +10,8 @@ base_model:
   - Qwen/Qwen3.8-27B
   - Qwen/Qwen3.8-Flash-Next
   - nvidia/Qwen3.8-Flash-Next-NVFP4
+  - google/gemma-4-31B-it
+  - google/gemma-4-26B-A4B-it
 tags:
   - exl3
   - trellis
@@ -23,6 +25,8 @@ tags:
   - text-generation
   - vision
   - speculative-decoding
+  - gemma4
+  - qat
 ---
 
 # NInfer models
@@ -61,6 +65,25 @@ per byte, but it does not carry that advantage into divergence.
 
 Converted from the ModelOpt [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 checkpoint; measured numbers are in [Qwen3.8-Flash-Next](#qwen38-flash-next).
+
+### Gemma 4 26B-A4B IT QAT
+
+| Folder | Size | Notes |
+|---|---|---|
+| [`gemma4-26b-a4b-qat/`](./gemma4-26b-a4b-qat/) | 15.99 GiB | Text + Vision + MTP, QAT int4 routed experts (128 per layer, top-8), Q8 elsewhere |
+
+Converted from [`google/gemma-4-26B-A4B-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) with the
+`gemma4_26b_a4b_qat` recipe. The folder's card carries the measured numbers, the representation and the
+limits.
+
+### Gemma 4 31B IT M1
+
+| Folder | Size | Notes |
+|---|---|---|
+| [`gemma4-31b-it-m1/`](./gemma4-31b-it-m1/) | 24.4 GiB | Text + Vision + MTP, Q6/Q5 g64 body — card, checksums and conversion report; the artifact itself is not hosted here |
+
+Converted from [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) with the
+`gemma4_31b_m1` recipe.
 
 More NInfer artifacts will be added to this repository over time.
 
