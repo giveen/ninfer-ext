@@ -43,7 +43,7 @@ constexpr std::size_t kRoundLaneInts = kRoundInts + Program::kMaximumDraftTokens
 
 std::size_t sampling_bytes(const TextConfig& config, std::int32_t draft_tokens) {
     const auto vocabulary = static_cast<std::int32_t>(config.vocab_size);
-    std::size_t bytes = ops::sampling_workspace_capacity_bytes(vocabulary, 1, 1);
+    std::size_t bytes     = ops::sampling_workspace_capacity_bytes(vocabulary, 1, 1);
     if (draft_tokens > 0) {
         bytes = std::max(bytes, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                                     vocabulary, 1, draft_tokens, 1, 1));
@@ -52,8 +52,9 @@ std::size_t sampling_bytes(const TextConfig& config, std::int32_t draft_tokens) 
 }
 
 // The pass scratch: one layer of a full pass, or one image's encoder when the tower is bound.
-std::size_t arena_bytes(const TextConfig& config, const VisionConfig* vision) {
-    std::size_t bytes = layer_workspace_bytes(config, Program::kPass);
+std::size_t arena_bytes(const TextConfig& config, const VisionConfig* vision,
+                        KvCacheStorage storage, std::int32_t ring_slack) {
+    std::size_t bytes = layer_workspace_bytes(config, Program::kPass, storage, ring_slack);
     if (vision != nullptr) {
         bytes = std::max(bytes, vision_workspace_bytes(
                                     *vision, static_cast<std::int32_t>(vision->max_patches())));
@@ -62,15 +63,15 @@ std::size_t arena_bytes(const TextConfig& config, const VisionConfig* vision) {
 }
 
 std::size_t shared_bytes(const TextConfig& config, std::int32_t draft_tokens,
-                         const VisionConfig* vision) {
+                         const VisionConfig* vision, KvCacheStorage storage) {
     const std::size_t pass       = static_cast<std::size_t>(Program::kPass);
     const std::size_t hidden     = config.hidden_size;
     const std::size_t vocabulary = config.vocab_size;
     const std::size_t score      = static_cast<std::size_t>(Program::kScorePass);
-    std::size_t bytes = arena_bytes(config, vision) + sampling_bytes(config, draft_tokens) +
-                        pass * sizeof(std::int32_t) + 2 * hidden * pass * sizeof(std::uint16_t) +
-                        vocabulary * score * sizeof(std::uint16_t) +
-                        hidden * score * sizeof(std::uint16_t);
+    std::size_t bytes =
+        arena_bytes(config, vision, storage, draft_tokens) + sampling_bytes(config, draft_tokens) +
+        pass * sizeof(std::int32_t) + 2 * hidden * pass * sizeof(std::uint16_t) +
+        vocabulary * score * sizeof(std::uint16_t) + hidden * score * sizeof(std::uint16_t);
     if (vision != nullptr) bytes += pass * sizeof(std::int32_t);
     return bytes;
 }
@@ -81,7 +82,8 @@ std::size_t draft_lane_bytes(const TextConfig& config, std::int32_t draft_tokens
     if (draft_tokens <= 0) return 0;
     const std::size_t hidden     = config.hidden_size;
     const std::size_t vocabulary = config.vocab_size;
-    return (3 * hidden + vocabulary + hidden + (static_cast<std::size_t>(draft_tokens) + 1) * hidden) *
+    return (3 * hidden + vocabulary + hidden +
+            (static_cast<std::size_t>(draft_tokens) + 1) * hidden) *
                sizeof(std::uint16_t) +
            kRoundLaneInts * sizeof(std::int32_t);
 }
@@ -90,22 +92,26 @@ std::size_t draft_lane_bytes(const TextConfig& config, std::int32_t draft_tokens
 
 std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacity,
                                   std::int32_t lanes, std::int32_t draft_tokens,
-                                  const VisionConfig* vision) {
-    const std::size_t lane = KvCache::device_bytes(config, capacity, draft_tokens) +
+                                  const VisionConfig* vision, KvCacheStorage storage) {
+    const std::size_t lane = KvCache::device_bytes(config, capacity, draft_tokens, storage) +
                              token_count_bytes(config) + draft_lane_bytes(config, draft_tokens);
-    return shared_bytes(config, draft_tokens, vision) + static_cast<std::size_t>(lanes) * lane;
+    return shared_bytes(config, draft_tokens, vision, storage) +
+           static_cast<std::size_t>(lanes) * lane;
 }
 
 Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
-                 DeviceContext& device, std::int32_t draft_tokens, bool cuda_graphs)
+                 DeviceContext& device, std::int32_t draft_tokens, bool cuda_graphs,
+                 KvCacheStorage storage)
     : model_(&model),
-      arena_(
-          arena_bytes(model.config(), model.vision_config() ? &*model.vision_config() : nullptr)),
+      arena_(arena_bytes(model.config(), model.vision_config() ? &*model.vision_config() : nullptr,
+                         storage, draft_tokens)),
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
-      draft_tokens_(draft_tokens), capacity_(capacity), cuda_graphs_(cuda_graphs) {
+      draft_tokens_(draft_tokens), capacity_(capacity), cuda_graphs_(cuda_graphs),
+      kv_storage_(storage) {
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
     // A decode round names its lanes by a bit each (decode_graphs_).
-    if (lanes < 1 || lanes > 64) throw std::invalid_argument("gemma4 Program: lanes must be in [1, 64]");
+    if (lanes < 1 || lanes > 64)
+        throw std::invalid_argument("gemma4 Program: lanes must be in [1, 64]");
     if (draft_tokens < 0 || draft_tokens > kMaximumDraftTokens) {
         throw std::invalid_argument("gemma4 Program: draft tokens must be in [0, 7]");
     }
@@ -119,7 +125,7 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
 
     lanes_.resize(static_cast<std::size_t>(lanes));
     for (Lane& lane : lanes_) {
-        lane.cache.configure(config, capacity, draft_tokens);
+        lane.cache.configure(config, capacity, draft_tokens, storage);
         lane.cache.allocate();
         allocated_bytes_ += lane.cache.bytes();
         lane.token_counts = device_alloc(token_count_bytes(config), allocated_bytes_);
@@ -128,8 +134,8 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
             lane.hidden = device_alloc(static_cast<std::size_t>(hidden) * sizeof(std::uint16_t),
                                        allocated_bytes_);
             lane.round_hidden =
-                device_alloc(static_cast<std::size_t>(draft_tokens + 1) * static_cast<std::size_t>(hidden) *
-                                 sizeof(std::uint16_t),
+                device_alloc(static_cast<std::size_t>(draft_tokens + 1) *
+                                 static_cast<std::size_t>(hidden) * sizeof(std::uint16_t),
                              allocated_bytes_);
         }
     }
@@ -142,10 +148,10 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
     }
     sampling_[0] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(ops::SamplingConfig),
                                 allocated_bytes_);
-    sampling_[1] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
-                                allocated_bytes_);
-    sampling_[2] = device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
-                                allocated_bytes_);
+    sampling_[1] =
+        device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t), allocated_bytes_);
+    sampling_[2] =
+        device_alloc(static_cast<std::size_t>(lanes) * sizeof(std::int32_t), allocated_bytes_);
     sampled_host_.resize(static_cast<std::size_t>(lanes));
     // The head's output lives outside the layer arena because it outlives a call: it is what the
     // caller reads.
@@ -153,10 +159,10 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
                                     static_cast<std::size_t>(kScorePass) * sizeof(std::uint16_t),
                                 allocated_bytes_);
     logits_ = Tensor(static_cast<std::uint8_t*>(logits), DType::BF16, {vocabulary, kScorePass});
-    void* head_hidden = device_alloc(static_cast<std::size_t>(hidden) * kScorePass *
-                                         sizeof(std::uint16_t),
-                                     allocated_bytes_);
-    head_hidden_ = Tensor(static_cast<std::uint8_t*>(head_hidden), DType::BF16, {hidden, kScorePass});
+    void* head_hidden = device_alloc(
+        static_cast<std::size_t>(hidden) * kScorePass * sizeof(std::uint16_t), allocated_bytes_);
+    head_hidden_ =
+        Tensor(static_cast<std::uint8_t*>(head_hidden), DType::BF16, {hidden, kScorePass});
     if (draft_tokens > 0) {
         const auto bf16 = [&](std::int32_t rows) {
             return Tensor(static_cast<std::uint8_t*>(device_alloc(
@@ -168,8 +174,9 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
         draft_input_  = bf16(2 * hidden);
         draft_hidden_ = bf16(hidden);
         draft_logits_ = bf16(vocabulary);
-        round_ints_   = device_alloc(kRoundLaneInts * static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
-                                     allocated_bytes_);
+        round_ints_ =
+            device_alloc(kRoundLaneInts * static_cast<std::size_t>(lanes) * sizeof(std::int32_t),
+                         allocated_bytes_);
         round_host_.resize(kRoundLaneInts * static_cast<std::size_t>(lanes));
     }
     id_host_.resize(static_cast<std::size_t>(kPass));
@@ -202,8 +209,8 @@ Program::~Program() {
         if (lane.hidden != nullptr) (void)cudaFree(lane.hidden);
         if (lane.round_hidden != nullptr) (void)cudaFree(lane.round_hidden);
     }
-    for (const Tensor* tensor : {&logits_, &head_hidden_, &draft_input_, &draft_hidden_,
-                                 &draft_logits_}) {
+    for (const Tensor* tensor :
+         {&logits_, &head_hidden_, &draft_input_, &draft_hidden_, &draft_logits_}) {
         if (tensor->data != nullptr) (void)cudaFree(tensor->data);
     }
     if (round_ints_ != nullptr) (void)cudaFree(round_ints_);
@@ -242,8 +249,8 @@ void Program::run_batch(KvCache& cache, const std::int32_t* ids, std::int32_t to
     const TextConfig& config  = model_->config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
 
-    // The host staging is reused by the next pass, so the copy must have left it before this returns;
-    // a pageable source makes cudaMemcpyAsync stage it before returning.
+    // The host staging is reused by the next pass, so the copy must have left it before this
+    // returns; a pageable source makes cudaMemcpyAsync stage it before returning.
     std::memcpy(id_host_.data(), ids, static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpyAsync(id_buffer_, id_host_.data(),
                                static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
@@ -256,8 +263,7 @@ void Program::embed(std::int32_t tokens, cudaStream_t stream) {
     Tensor id_tensor(static_cast<std::uint8_t*>(id_buffer_), DType::I32, {tokens});
     Tensor embedded(static_cast<std::uint8_t*>(state_[0]), DType::BF16, {hidden, tokens});
     // The embedding scale the converter derives: the square root of the hidden size.
-    const Weight table =
-        native_weight(model_->weight(model_->weights().text.token_embedding).view);
+    const Weight table = native_weight(model_->weight(model_->weights().text.token_embedding).view);
     ops::embedding(id_tensor, table, std::sqrt(static_cast<float>(hidden)), embedded, stream);
 }
 
@@ -305,7 +311,7 @@ void Program::run_pass(KvCache& cache, std::int32_t tokens, std::int32_t first_p
         position_high = Tensor(static_cast<std::uint8_t*>(high_buffer_), DType::I32, {tokens, 1});
     }
 
-    DeviceArena::Scope scope  = arena_.scope();
+    DeviceArena::Scope scope = arena_.scope();
     const PassSegment segment{&cache, first_position, 0, tokens};
     const PassIndices indices = write_pass_indices(std::span(&segment, 1), arena_, stream);
     run_layers(std::span(&segment, 1), indices, every_column, execution, position_high);
@@ -327,9 +333,9 @@ void Program::run_layers(std::span<const PassSegment> segments, const PassIndice
         std::swap(in, out);
     }
 
-    // The head's linear expects an output of exactly [N,T], so a pass narrower than the buffer writes
-    // into its first columns, which are contiguous. Without every column, only the last token's hidden
-    // state reaches the head.
+    // The head's linear expects an output of exactly [N,T], so a pass narrower than the buffer
+    // writes into its first columns, which are contiguous. Without every column, only the last
+    // token's hidden state reaches the head.
     const std::int32_t columns = every_column ? tokens : 1;
     Tensor head_in(static_cast<std::uint8_t*>(in) + static_cast<std::size_t>(tokens - columns) *
                                                         static_cast<std::size_t>(hidden) *
@@ -343,8 +349,8 @@ void Program::run_layers(std::span<const PassSegment> segments, const PassIndice
 
 void Program::keep_hidden(Lane& lane, std::int32_t column, cudaStream_t stream) {
     if (lane.hidden == nullptr) return;
-    const std::size_t bytes = static_cast<std::size_t>(model_->config().hidden_size) *
-                              sizeof(std::uint16_t);
+    const std::size_t bytes =
+        static_cast<std::size_t>(model_->config().hidden_size) * sizeof(std::uint16_t);
     CUDA_CHECK(cudaMemcpyAsync(lane.hidden,
                                static_cast<std::uint8_t*>(head_hidden_.data) +
                                    static_cast<std::size_t>(column) * bytes,
@@ -432,8 +438,8 @@ void Program::decode(std::span<const std::int32_t> lanes, std::span<const std::i
     if (count < 1 || ids.size() != lanes.size() || count > kScorePass) {
         throw std::invalid_argument("gemma4 Program: a decode round needs one id per lane");
     }
-    // The columns follow the lanes in ascending order, so a set of lanes always lays its pass out the
-    // same way and its captured graph matches whatever order the caller named them in.
+    // The columns follow the lanes in ascending order, so a set of lanes always lays its pass out
+    // the same way and its captured graph matches whatever order the caller named them in.
     std::vector<std::int32_t> order(lanes.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<std::int32_t>(i);
     std::sort(order.begin(), order.end(),
@@ -445,7 +451,8 @@ void Program::decode(std::span<const std::int32_t> lanes, std::span<const std::i
         const std::int32_t index = order[static_cast<std::size_t>(column)];
         Lane& lane               = lane_at(lanes[index]);
         const std::uint64_t bit  = std::uint64_t{1} << lanes[index];
-        if ((set & bit) != 0) throw std::invalid_argument("gemma4 Program: a lane decodes once a round");
+        if ((set & bit) != 0)
+            throw std::invalid_argument("gemma4 Program: a lane decodes once a round");
         set |= bit;
         if (lane.position >= capacity_) {
             throw std::invalid_argument("gemma4 Program: the sequence exceeds the cache capacity");
@@ -473,11 +480,10 @@ void Program::decode(std::span<const std::int32_t> lanes, std::span<const std::i
         auto found = decode_graphs_.find(set);
         if (found == decode_graphs_.end()) {
             if (decode_graphs_.size() >= kDecodeGraphs) {
-                decode_graphs_.erase(std::min_element(decode_graphs_.begin(), decode_graphs_.end(),
-                                                      [](const auto& a, const auto& b) {
-                                                          return a.second.last_used <
-                                                                 b.second.last_used;
-                                                      }));
+                decode_graphs_.erase(std::min_element(
+                    decode_graphs_.begin(), decode_graphs_.end(), [](const auto& a, const auto& b) {
+                        return a.second.last_used < b.second.last_used;
+                    }));
             }
             DecodeGraphDefinition definition;
             definition.capture(stream, pass);
@@ -514,7 +520,8 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
     const std::int32_t count = static_cast<std::int32_t>(lanes.size());
     if (count < 1 || anchors.size() != lanes.size() || drafts.size() != lanes.size() ||
         count > this->lanes()) {
-        throw std::invalid_argument("gemma4 Program: a round needs one anchor and draft count per lane");
+        throw std::invalid_argument(
+            "gemma4 Program: a round needs one anchor and draft count per lane");
     }
     // The lanes run in descending draft count, so the lanes still drafting at any step are a prefix
     // of the batch and every step's columns stay contiguous.
@@ -527,10 +534,12 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         const Lane& lane        = lane_at(lanes[i]);
         const std::uint64_t bit = std::uint64_t{1} << lanes[i];
-        if ((set & bit) != 0) throw std::invalid_argument("gemma4 Program: a lane drafts once a round");
+        if ((set & bit) != 0)
+            throw std::invalid_argument("gemma4 Program: a lane drafts once a round");
         set |= bit;
         if (drafts[i] < 1 || drafts[i] > draft_tokens_) {
-            throw std::invalid_argument("gemma4 Program: a round drafts one to draft_tokens() tokens");
+            throw std::invalid_argument(
+                "gemma4 Program: a round drafts one to draft_tokens() tokens");
         }
         if (lane.position < 1 || lane.position + drafts[i] + 1 > capacity_) {
             throw std::invalid_argument("gemma4 Program: the round does not fit the lane");
@@ -540,10 +549,10 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
     if (columns > kScorePass) {
         throw std::invalid_argument("gemma4 Program: the round's verify pass exceeds its buffers");
     }
-    const cudaStream_t stream     = execution.stream;
-    const TextConfig& config      = model_->config();
-    const std::int32_t hidden     = static_cast<std::int32_t>(config.hidden_size);
-    const std::int32_t vocabulary = static_cast<std::int32_t>(config.vocab_size);
+    const cudaStream_t stream      = execution.stream;
+    const TextConfig& config       = model_->config();
+    const std::int32_t hidden      = static_cast<std::int32_t>(config.hidden_size);
+    const std::int32_t vocabulary  = static_cast<std::int32_t>(config.vocab_size);
     const std::size_t hidden_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
     const std::size_t i32          = sizeof(std::int32_t);
     const std::int32_t width       = kMaximumDraftTokens + 1;
@@ -551,16 +560,20 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
     // The I32 area: one kRoundInts block per batch slot, laid out as kRoundInts says, then the step
     // tokens [kMaximumDraftTokens + 1, count]: row 0 the anchors, row s the drafts of step s - 1.
     auto* ints       = static_cast<std::int32_t*>(round_ints_);
-    const auto block = [&](std::int32_t slot) { return ints + static_cast<std::size_t>(slot) * kRoundInts; };
+    const auto block = [&](std::int32_t slot) {
+        return ints + static_cast<std::size_t>(slot) * kRoundInts;
+    };
     std::int32_t* steps = ints + static_cast<std::size_t>(this->lanes()) * kRoundInts;
     std::fill(round_host_.begin(), round_host_.end(), 0);
-    std::int32_t* step_host = round_host_.data() + static_cast<std::size_t>(this->lanes()) * kRoundInts;
+    std::int32_t* step_host =
+        round_host_.data() + static_cast<std::size_t>(this->lanes()) * kRoundInts;
     for (std::int32_t slot = 0; slot < count; ++slot) {
         const std::int32_t i = order[static_cast<std::size_t>(slot)];
-        std::int32_t* scalars = round_host_.data() + static_cast<std::size_t>(slot) * kRoundInts + 3 * width;
-        scalars[0]      = anchors[i];
-        scalars[1]      = lane_at(lanes[i]).position + 1; // the position the first licensed token takes
-        scalars[2]      = drafts[i];
+        std::int32_t* scalars =
+            round_host_.data() + static_cast<std::size_t>(slot) * kRoundInts + 3 * width;
+        scalars[0] = anchors[i];
+        scalars[1] = lane_at(lanes[i]).position + 1; // the position the first licensed token takes
+        scalars[2] = drafts[i];
         step_host[slot] = anchors[i];
     }
     // Pageable sources are staged before cudaMemcpyAsync returns.
@@ -581,7 +594,7 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
         const Lane& lane  = lane_at(lanes[order[static_cast<std::size_t>(slot)]]);
         draft_lanes[slot] = {&lane.cache, lane.position};
     }
-    auto* input = static_cast<std::uint8_t*>(draft_input_.data);
+    auto* input                     = static_cast<std::uint8_t*>(draft_input_.data);
     const std::int32_t steps_needed = drafts[order.front()];
     for (std::int32_t step = 0; step < steps_needed; ++step) {
         std::int32_t active = 0;
@@ -590,19 +603,20 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
                            DType::I32, {active});
         Tensor embedded_active(embedded.data, DType::BF16, {hidden, active});
         ops::embedding(token, table, config.embedding_scale, embedded_active, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(input, 2 * hidden_bytes, embedded.data, hidden_bytes, hidden_bytes,
-                                     static_cast<std::size_t>(active), cudaMemcpyDeviceToDevice,
-                                     stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(input, 2 * hidden_bytes, embedded.data, hidden_bytes,
+                                     hidden_bytes, static_cast<std::size_t>(active),
+                                     cudaMemcpyDeviceToDevice, stream));
         if (step == 0) {
             for (std::int32_t slot = 0; slot < active; ++slot) {
-                CUDA_CHECK(cudaMemcpyAsync(input + (2 * static_cast<std::size_t>(slot) + 1) * hidden_bytes,
-                                           lane_at(lanes[order[static_cast<std::size_t>(slot)]]).hidden,
-                                           hidden_bytes, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(input + (2 * static_cast<std::size_t>(slot) + 1) * hidden_bytes,
+                                    lane_at(lanes[order[static_cast<std::size_t>(slot)]]).hidden,
+                                    hidden_bytes, cudaMemcpyDeviceToDevice, stream));
             }
         } else {
-            CUDA_CHECK(cudaMemcpy2DAsync(input + hidden_bytes, 2 * hidden_bytes, draft_hidden_.data,
-                                         hidden_bytes, hidden_bytes, static_cast<std::size_t>(active),
-                                         cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                input + hidden_bytes, 2 * hidden_bytes, draft_hidden_.data, hidden_bytes,
+                hidden_bytes, static_cast<std::size_t>(active), cudaMemcpyDeviceToDevice, stream));
         }
         const Tensor input_active(input, DType::BF16, {2 * hidden, active});
         Tensor logits_active(draft_logits_.data, DType::BF16, {vocabulary, active});
@@ -624,9 +638,9 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
         const std::int32_t i = order[static_cast<std::size_t>(slot)];
         Lane& lane           = lane_at(lanes[i]);
         // Column `slot` of the step rows, down the anchor and drafts.
-        CUDA_CHECK(cudaMemcpy2DAsync(ids + column, i32, steps + slot, static_cast<std::size_t>(count) * i32,
-                                     i32, static_cast<std::size_t>(drafts[i]) + 1,
-                                     cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            ids + column, i32, steps + slot, static_cast<std::size_t>(count) * i32, i32,
+            static_cast<std::size_t>(drafts[i]) + 1, cudaMemcpyDeviceToDevice, stream));
         segments.push_back({&lane.cache, lane.position, column, drafts[i] + 1});
         column += drafts[i] + 1;
     }
@@ -640,19 +654,19 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
     // Accept by each lane's sampler, against its own columns.
     const std::size_t logit_bytes = static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t);
     for (std::int32_t slot = 0; slot < count; ++slot) {
-        const std::int32_t i          = order[static_cast<std::size_t>(slot)];
-        const std::int32_t n          = drafts[i];
-        const PassSegment& segment    = segments[static_cast<std::size_t>(slot)];
-        std::int32_t* lane_ints       = block(slot);
-        std::int32_t* argmaxes        = lane_ints + width;
-        std::int32_t* licensed        = lane_ints + 2 * width;
-        std::int32_t* scalars         = lane_ints + 3 * width; // anchor, length, extent, count, accepted
-        auto* first_logit = static_cast<std::uint8_t*>(logits_.data) +
-                            static_cast<std::size_t>(segment.column) * logit_bytes;
+        const std::int32_t i       = order[static_cast<std::size_t>(slot)];
+        const std::int32_t n       = drafts[i];
+        const PassSegment& segment = segments[static_cast<std::size_t>(slot)];
+        std::int32_t* lane_ints    = block(slot);
+        std::int32_t* argmaxes     = lane_ints + width;
+        std::int32_t* licensed     = lane_ints + 2 * width;
+        std::int32_t* scalars = lane_ints + 3 * width; // anchor, length, extent, count, accepted
+        auto* first_logit     = static_cast<std::uint8_t*>(logits_.data) +
+                                static_cast<std::size_t>(segment.column) * logit_bytes;
         const Tensor lane_logits(first_logit, DType::BF16, {vocabulary, n + 1, 1});
         Tensor target_tokens(static_cast<void*>(argmaxes), DType::I32, {n + 1, 1});
-        ops::argmax(Tensor(first_logit, DType::BF16, {vocabulary, n + 1}), target_tokens, vocabulary,
-                    stream);
+        ops::argmax(Tensor(first_logit, DType::BF16, {vocabulary, n + 1}), target_tokens,
+                    vocabulary, stream);
         const Tensor draft_tensor(static_cast<void*>(ids + segment.column + 1), DType::I32, {n, 1});
         const Tensor extents(static_cast<void*>(scalars + 2), DType::I32, {1});
         Tensor lengths(static_cast<void*>(scalars + 1), DType::I32, {1});
@@ -675,17 +689,18 @@ std::vector<Program::Round> Program::speculate(std::span<const std::int32_t> lan
                                    static_cast<std::size_t>(n + 1) * hidden_bytes,
                                    cudaMemcpyDeviceToDevice, stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(round_host_.data(), ints, static_cast<std::size_t>(count) * kRoundInts * i32,
+    CUDA_CHECK(cudaMemcpyAsync(round_host_.data(), ints,
+                               static_cast<std::size_t>(count) * kRoundInts * i32,
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<Round> rounds(lanes.size());
     for (std::int32_t slot = 0; slot < count; ++slot) {
-        const std::int32_t i = order[static_cast<std::size_t>(slot)];
+        const std::int32_t i     = order[static_cast<std::size_t>(slot)];
         const std::int32_t* host = round_host_.data() + static_cast<std::size_t>(slot) * kRoundInts;
         const std::int32_t licensed_count = host[3 * width + 3];
-        Round& round          = rounds[static_cast<std::size_t>(i)];
-        round.accepted_drafts = host[3 * width + 4];
+        Round& round                      = rounds[static_cast<std::size_t>(i)];
+        round.accepted_drafts             = host[3 * width + 4];
         if (licensed_count < 1 || licensed_count > drafts[i] + 1 ||
             round.accepted_drafts != licensed_count - 1) {
             throw std::runtime_error("gemma4 Program: the accept Op returned an invalid round");
@@ -706,9 +721,9 @@ void Program::commit_round(std::int32_t lane_index, std::int32_t kept,
     }
     // The verify pass consumed p..p+drafts; the anchor and kept-1 tokens stay, and column kept-1 is
     // the state that produced the last kept token, the next anchor.
-    lane.position             = lane.round_position + kept;
-    const std::size_t bytes = static_cast<std::size_t>(model_->config().hidden_size) *
-                              sizeof(std::uint16_t);
+    lane.position = lane.round_position + kept;
+    const std::size_t bytes =
+        static_cast<std::size_t>(model_->config().hidden_size) * sizeof(std::uint16_t);
     CUDA_CHECK(cudaMemcpyAsync(lane.hidden,
                                static_cast<std::uint8_t*>(lane.round_hidden) +
                                    static_cast<std::size_t>(kept - 1) * bytes,
@@ -726,12 +741,11 @@ std::vector<std::int32_t> Program::sample(std::span<const std::int32_t> lanes,
     if (lanes.empty() || lanes.size() > lanes_.size()) {
         throw std::invalid_argument("gemma4 Program: sample takes one to lanes() lanes");
     }
-    const cudaStream_t stream     = execution.stream;
-    const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
-    const std::size_t column_bytes =
-        static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t);
-    auto* drawn     = static_cast<std::int32_t*>(sampling_[1]);
-    auto* positions = static_cast<std::int32_t*>(sampling_[2]);
+    const cudaStream_t stream      = execution.stream;
+    const std::int32_t vocabulary  = static_cast<std::int32_t>(model_->config().vocab_size);
+    const std::size_t column_bytes = static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t);
+    auto* drawn                    = static_cast<std::int32_t*>(sampling_[1]);
+    auto* positions                = static_cast<std::int32_t*>(sampling_[2]);
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         const Lane& lane = lane_at(lanes[i]);
         // A pageable source is staged before cudaMemcpyAsync returns.
@@ -751,7 +765,8 @@ std::vector<std::int32_t> Program::sample(std::span<const std::int32_t> lanes,
     CUDA_CHECK(cudaMemcpyAsync(sampled_host_.data(), drawn, lanes.size() * sizeof(std::int32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return {sampled_host_.begin(), sampled_host_.begin() + static_cast<std::ptrdiff_t>(lanes.size())};
+    return {sampled_host_.begin(),
+            sampled_host_.begin() + static_cast<std::ptrdiff_t>(lanes.size())};
 }
 
 std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
@@ -767,14 +782,16 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     reset(0);
     KvCache& cache                = lanes_.front().cache;
     const std::int32_t vocabulary = static_cast<std::int32_t>(model_->config().vocab_size);
-    logits_host_.resize(static_cast<std::size_t>(vocabulary) * static_cast<std::size_t>(kScorePass));
+    logits_host_.resize(static_cast<std::size_t>(vocabulary) *
+                        static_cast<std::size_t>(kScorePass));
 
     std::vector<float> scores;
     scores.reserve(ids.size() - static_cast<std::size_t>(first_target));
-    // The sink sees the soft-capped logits the distribution is taken from, one row per scored target,
-    // side by side and each `vocabulary` wide, which is the layout the KLD route reads. It is handed a
-    // view of the staging buffer, so it must return before the next batch overwrites it.
-    LogitsSink sink = std::move(sink_in);
+    // The sink sees the soft-capped logits the distribution is taken from, one row per scored
+    // target, side by side and each `vocabulary` wide, which is the layout the KLD route reads. It
+    // is handed a view of the staging buffer, so it must return before the next batch overwrites
+    // it.
+    LogitsSink sink          = std::move(sink_in);
     const std::int32_t count = static_cast<std::int32_t>(ids.size());
     std::int32_t position    = 0;
     while (position < count) {
@@ -793,9 +810,8 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
             CUDA_CHECK(cudaStreamSynchronize(execution.stream));
             for (std::int32_t target = first; target <= last; ++target) {
                 const std::uint16_t* column =
-                    logits_host_.data() +
-                    static_cast<std::size_t>(target - position - 1) *
-                        static_cast<std::size_t>(vocabulary);
+                    logits_host_.data() + static_cast<std::size_t>(target - position - 1) *
+                                              static_cast<std::size_t>(vocabulary);
                 double largest = -std::numeric_limits<double>::infinity();
                 for (std::int32_t id = 0; id < vocabulary; ++id) {
                     largest = std::max(largest, static_cast<double>(decode_bf16(column[id])));
@@ -809,13 +825,12 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
                 scores.push_back(static_cast<float>(chosen - largest - std::log(total)));
             }
             if (sink) {
-                const std::size_t offset = static_cast<std::size_t>(first - position - 1) *
-                                           static_cast<std::size_t>(vocabulary);
+                const std::size_t offset  = static_cast<std::size_t>(first - position - 1) *
+                                            static_cast<std::size_t>(vocabulary);
                 const std::size_t columns = static_cast<std::size_t>(last - first + 1);
                 ScoredLogits view;
-                view.values       = std::span<const std::uint16_t>(logits_host_.data() + offset,
-                                                                   columns *
-                                                                       static_cast<std::size_t>(vocabulary));
+                view.values = std::span<const std::uint16_t>(
+                    logits_host_.data() + offset, columns * static_cast<std::size_t>(vocabulary));
                 view.vocab_size   = static_cast<std::uint32_t>(vocabulary);
                 view.columns      = static_cast<std::uint32_t>(columns);
                 view.first_target = static_cast<std::uint32_t>(first);

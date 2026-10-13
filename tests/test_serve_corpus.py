@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import http.server
+import threading
 from pathlib import Path
 from argparse import Namespace
 import json
@@ -113,6 +116,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
             concurrency=[1],
             sampling="greedy",
             kv_dtype="fp8",
+            block_fixtures="auto",
         ),
     )
     assert [(point.target, point.speculative_backend) for point in points] == [
@@ -130,6 +134,29 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     assert len({point.key for point in points}) == len(points)
     for point in points:
         (tmp_path / f"{point.key}.json").write_text("{}")
+
+
+def test_block_fixtures_override_puts_both_backends_on_the_same_prompts() -> None:
+    """An A/B is only comparable if both sides run the same requests.
+
+    The per-backend default is deliberately disjoint -- the plain path gets the long-context NIAH
+    fixtures, a speculative backend the long-decode and scenario prompts -- so a plain-vs-MTP
+    comparison without an override measures the workload change, not the speculation.
+    """
+    fixtures = corpus.load_fixtures()
+
+    def names(backend: str, override: str) -> set[str]:
+        point = concurrency.Point(
+            target="t", model_id="t", artifact=Path("a.ninfer"), speculative_mode="m",
+            speculative_backend=backend, draft_tokens=0, sampling_mode="greedy",
+            kv_dtype="bf16", suite="corpus-makespan", concurrency=1, block_fixtures=override,
+        )
+        return {job.fixture.name for job in concurrency.build_jobs(point, fixtures, 128, 0)}
+
+    plain, speculative = names("none", "auto"), names("mtp", "auto")
+    assert plain and speculative and not (plain & speculative)
+    assert names("none", "decode") == names("mtp", "decode")
+    assert names("none", "long") == set(corpus.LONG_DECODE_FIXTURES)
 
 
 def test_request_logs_of_upstream_and_this_tree_are_accepted() -> None:
@@ -261,3 +288,193 @@ def test_resume_rejects_different_kv_dtype(tmp_path):
     path.write_text(json.dumps(record) + "\n")
     with pytest.raises(corpus.CampaignError, match="KV dtype differs"):
         corpus.load_existing_records(path, {spec.key: spec})
+
+
+CONTEXT_LENGTH_BODY = (
+    '{"error":{"code":"context_length_exceeded","message":'
+    '"prepared prompt has 67412 tokens, exceeding Engine max_context 8192"}}'
+)
+SKIP_MESSAGE = "prepared prompt has 67412 tokens, exceeding Engine max_context 8192"
+
+
+def skip_point() -> concurrency.Point:
+    return concurrency.Point(
+        target="model",
+        model_id="model",
+        artifact=Path("/tmp/model.ninfer"),
+        speculative_mode="mtp0",
+        speculative_backend="none",
+        draft_tokens=0,
+        sampling_mode="greedy",
+        kv_dtype="fp8",
+        suite="corpus-makespan",
+        concurrency=1,
+    )
+
+
+def skip_fixture(name: str, index: int) -> concurrency.SkippedFixture:
+    return concurrency.SkippedFixture(
+        job=concurrency.Job(
+            index=index,
+            case_index=index,
+            fixture=Fixture(name, [], False, 8, "long_niah"),
+            seed=7,
+            max_tokens=8,
+        ),
+        message=SKIP_MESSAGE,
+    )
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        (f"HTTP 400 Bad Request: {CONTEXT_LENGTH_BODY}", SKIP_MESSAGE),
+        ('HTTP 400 Bad Request: {"error":{"code":"invalid_request_error","message":"bad"}}', None),
+        ('HTTP 429 Too Many Requests: {"error":{"code":"server_overloaded"}}', None),
+        ('HTTP 500 Internal Server Error: {"error":{"code":"context_length_exceeded"}}', None),
+        ("HTTP 400 Bad Request: not json", None),
+        ("HTTP request failed: timed out", None),
+        ("invalid Chat Completions response: 'usage'", None),
+    ],
+)
+def test_only_the_context_length_refusal_is_a_skip(failure: str, expected: str | None) -> None:
+    assert concurrency.context_length_exceeded_message(corpus.CampaignError(failure)) == expected
+
+
+def measured_result() -> concurrency.ClientResult:
+    return concurrency.ClientResult(
+        job=concurrency.Job(
+            index=0, case_index=0, fixture=Fixture("long_niah_8k", [], False, 8, "long_niah"),
+            seed=7, max_tokens=8,
+        ),
+        started_at=1.0, finished_at=2.0, prompt_tokens=7000, completion_tokens=1,
+        finish_reason="stop",
+    )
+
+
+def measured_events() -> list[dict]:
+    return [
+        {
+            "event": "request_done",
+            "result": {
+                "prompt_tokens": 7000,
+                "completion_tokens": 1,
+                "computed_prefill_tokens": 7000,
+            },
+            "speculative": {
+                "rounds": 0, "drafted_tokens": 0, "accepted_tokens": 0, "fallback_steps": 0,
+            },
+        },
+        {
+            "event": "throughput",
+            "tokens": {"computed_prefill": 7000, "committed_decode": 0},
+            "decode_batch": {"rounds": 0, "row_rounds": 0},
+        },
+    ]
+
+
+def test_analyze_point_records_skipped_fixtures() -> None:
+    events = measured_events() + [
+        {
+            "event": "request_rejected",
+            "error": {"code": "context_length_exceeded", "message": SKIP_MESSAGE},
+        }
+    ]
+    report = concurrency.analyze_point(
+        skip_point(), ["serve"], Path("log"), {}, "bindings", events, [measured_result()],
+        [skip_fixture("long_niah_64k", 1)], 0.0, 1.0,
+    )
+    assert report["request_count"] == 1
+    assert report["fixture_count"] == 1 and report["suite_fixture_count"] == 4
+    assert report["skipped_fixtures"] == [
+        {"fixture": "long_niah_64k", "seed": 7, "message": SKIP_MESSAGE}
+    ]
+    row = concurrency.summary_row(report)
+    assert row["fixture_count"] == 1 and row["suite_fixture_count"] == 4
+    assert row["skipped_fixtures"] == "long_niah_64k"
+
+
+def test_other_request_errors_stay_fatal_and_all_skips_fail() -> None:
+    point = skip_point()
+    other = {"event": "request_error", "error": {"message": "decode stopped"}}
+    with pytest.raises(corpus.CampaignError, match="serving request failed: decode stopped"):
+        concurrency.analyze_point(
+            point, ["serve"], Path("log"), {}, "bindings", [other], [], [], 0.0, 1.0
+        )
+    with pytest.raises(corpus.CampaignError, match="every fixture was refused"):
+        concurrency.analyze_point(
+            point, ["serve"], Path("log"), {}, "bindings", [], [],
+            [skip_fixture("long_niah_64k", 0)], 0.0, 0.0,
+        )
+    # A skip the server never logged as a context-length refusal is inconsistent, not a result.
+    with pytest.raises(corpus.CampaignError, match="do not match the skipped fixtures"):
+        concurrency.analyze_point(
+            point, ["serve"], Path("log"), {}, "bindings", measured_events(), [measured_result()],
+            [skip_fixture("long_niah_64k", 1)], 0.0, 1.0,
+        )
+
+
+@contextlib.contextmanager
+def http_stub(status: int, body: bytes):
+    """A loopback server that answers every request with one fixed response."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def client_jobs(count: int) -> list[concurrency.Job]:
+    return [
+        concurrency.Job(
+            index=index,
+            case_index=index,
+            fixture=Fixture("long_niah_64k", [], False, 8, "long_niah"),
+            seed=7,
+            max_tokens=8,
+        )
+        for index in range(count)
+    ]
+
+
+def test_run_clients_skips_only_the_context_length_refusal() -> None:
+    point = skip_point()
+    jobs = client_jobs(3)
+    with http_stub(400, CONTEXT_LENGTH_BODY.encode("utf-8")) as port:
+        results, skips, start, end = concurrency.run_clients(point, jobs, port)
+    assert results == [] and [skip.message for skip in skips] == [SKIP_MESSAGE] * len(jobs)
+    assert [skip.job.index for skip in skips] == [0, 1, 2]
+    assert end == start
+    # With every request refused there is nothing measured, so the point fails instead of
+    # reporting an empty one.
+    with pytest.raises(corpus.CampaignError, match="every fixture was refused"):
+        concurrency.analyze_point(
+            point, ["serve"], Path("log"), {}, "bindings", [], results, skips, start, end
+        )
+    # Any other refusal is still fatal, exactly as it was before the skip existed.
+    for status, body in (
+        (400, b'{"error":{"code":"invalid_request_error","message":"bad field"}}'),
+        (429, b'{"error":{"code":"server_overloaded","message":"busy"}}'),
+        (500, b'{"error":{"code":"context_length_exceeded","message":"too long"}}'),
+        (400, b"not json"),
+    ):
+        with http_stub(status, body) as port:
+            with pytest.raises(corpus.CampaignError):
+                concurrency.run_clients(point, jobs, port)

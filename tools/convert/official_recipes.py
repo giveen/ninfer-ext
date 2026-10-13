@@ -651,6 +651,32 @@ def _gemma4_26b_a4b(model, recipe, assign_expert, assign_dense):
     decode round streams the top-8 experts' spans.
     """
     _optional(model, recipe)
+    # The assistant drafter, when the artifact carries it, is Q6 throughout, head included -- the
+    # choice the 31B's layout makes, and for the same measured reason (against BF16, adaptive MTP ran
+    # 4.3% faster where Q8 ran 3.9%, worst -1.9%, and the drafter shrinks from 0.94 to ~0.4 GB). Q8
+    # is the fallback `_optional` gives it, so this override is deliberate. It is also why the
+    # drafter's shapes need their own Q6 registry entries: a quantized linear route resolves its
+    # geometry from a fixed table, and this drafter's attention is the 26B's 16 heads, not the 31B's
+    # 32, so its widths are geometry the 31B's entries do not cover.
+    for name, parameter in model.parameters.items():
+        if name.startswith("mtp/") and parameter.projection:
+            _assign(recipe, name, Q6)
+    # The vision tower is the 31B's, at the same geometry, so it takes the 31B's measured formats
+    # with the linear route one step finer: Q8 for every layer's linears and BF16 for the patch and
+    # output projections. The tower amplifies weight error -- against its FP32 output, Q4/Q5 (the
+    # formats the generic fallback would assign here) leave a 0.956 mean token cosine on a photo,
+    # Q6 0.989 (the BF16 tower's own level) and Q8 0.999 -- and the tower is only about 0.42 B
+    # parameters, so Q8 costs roughly 0.1 GB more than Q6 on a 16.5 GB artifact. Q8 also needs no
+    # per-geometry registration: its row-split int8 route resolves any shape through its generic
+    # selector, where Q6 would need a registry entry for each one. The patch and output projections
+    # stay at the source precision the 31B measured them at, and together they are about 8 MB.
+    for name, parameter in model.parameters.items():
+        if not name.startswith("vision/") or not parameter.projection:
+            continue
+        if name in ("vision/patch_embedding", "vision/embedding_projection"):
+            recipe.assign(name, format="bf16", method=cast_direct)
+        else:
+            _assign(recipe, name, Q8)
     for name, parameter in model.parameters.items():
         if not name.startswith("text/"):
             continue
@@ -700,6 +726,19 @@ def gemma4_26b_a4b_qat(model, recipe, sources):
     step's rounding. The QAT checkpoint carries that grid in every one of them (plan P5)."""
     on_grid = lambda name: recipe.assign(name, format=Q4ROWS, method=q4_rows_qat)  # noqa: E731
     _gemma4_26b_a4b(model, recipe, on_grid, on_grid)
+    # A layer's gate and up become one parent, so a decode runs them as one launch. The mapping
+    # leaves them apart because a BlockScale parent has a plane a row slice cannot address
+    # (gemma4.py's `block`); a row-grouped parent has none, so the group is declared here rather
+    # than in the block, where it would reach the layouts that cannot read a slice. The sweep is
+    # restricted to the text layers: the vision tower keeps its gate and up apart, which is the
+    # layout the 31B converts with, and the fusion is a decode-scheduling choice that was never
+    # measured on the tower. Without the `text/` test it also catches `vision/layers/N/mlp/gate`.
+    for name in model.parameters:
+        if not name.startswith("text/") or not name.endswith("/mlp/gate"):
+            continue
+        pair = (name, name[: -len("gate")] + "up")
+        if pair[1] in model.parameters:
+            recipe.group(pair)
 
 
 RECIPES = {

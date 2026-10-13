@@ -12,6 +12,7 @@ import math
 import os
 import queue
 import random
+import re
 import shlex
 import sys
 import threading
@@ -25,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.bench import make_bench_corpus  # noqa: E402
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
 
 
@@ -32,6 +34,9 @@ SUITES = ("decode-saturation", "corpus-makespan")
 STATS_INTERVAL_MS = 1000
 PENDING_TIMEOUT_MS = 24 * 60 * 60 * 1000
 SATURATION_FIXTURE = "long_decode_aime26_15"
+# --pad-tokens converts tokens to characters with this ratio. The curated prose is mixed
+# English/Chinese/code, so it is approximate, and the point's recorded prompt_tokens is authoritative.
+PAD_CHARS_PER_TOKEN = 3.0
 SATURATION_SEEDS = (
     7632647173703958409,
     7968175640111700217,
@@ -45,7 +50,8 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 4
+# 5: points and summaries disclose the fixtures the engine refused for context length.
+SCHEMA_VERSION = 5
 # --kv-dtype values and the kv_cache name server_start records for each.
 KV_CACHE_NAMES = {
     "bf16": "bf16",
@@ -54,6 +60,13 @@ KV_CACHE_NAMES = {
     "nvfp4": "nvfp4",
     "k8v4": "k8v4",
 }
+# A fixture whose prompt is longer than the engine's window is a recorded skip, not a campaign
+# failure. Only the engine's own context-length refusal qualifies: HTTP 400 whose error body's
+# `code` is this value. Every other status, transport error or body stays fatal.
+CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
+# corpus.receive_json() renders any non-2xx as "HTTP <status> <reason>: <body>"; nothing else in
+# this file depends on that shape, and anything it does not match stays fatal.
+HTTP_ERROR_PATTERN = re.compile(r"^HTTP (?P<status>\d{3}) [^:]*: (?P<body>.*)\Z", re.DOTALL)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,6 +81,7 @@ class Point:
     kv_dtype: str
     suite: str
     concurrency: int
+    block_fixtures: str = "auto"
 
     @property
     def key(self) -> str:
@@ -98,6 +112,17 @@ class ClientResult:
     @property
     def elapsed_seconds(self) -> float:
         return self.finished_at - self.started_at
+
+
+@dataclasses.dataclass(frozen=True)
+class SkippedFixture:
+    """One request the engine refused because its prompt exceeds the campaign's window.
+
+    `message` is the server's own error message, carried from the HTTP response body to the point.
+    """
+
+    job: Job
+    message: str
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -147,6 +172,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=8192,
         help="per-request output budget for decode-saturation (default: 8192)",
+    )
+    parser.add_argument(
+        "--pad-tokens",
+        type=int,
+        default=0,
+        help="decode-saturation only: prefix the prompt with this many tokens of in-distribution "
+             "prose, to measure steady decode at a long context (default 0, off). Approximate -- the "
+             "point records the real prompt_tokens.",
+    )
+    parser.add_argument(
+        "--block-fixtures",
+        choices=("auto", "niah", "decode", "long"),
+        default="auto",
+        help="override the corpus fixture set: 'auto' keeps the per-backend default, 'decode' runs the "
+             "long-decode and scenario prompts (long outputs), 'niah' the long-context ones. Needed to "
+             "compare two speculative backends on the same requests.",
     )
     parser.add_argument("--max-context", type=int, default=262144)
     parser.add_argument(
@@ -226,16 +267,60 @@ def build_points(
                             kv_dtype=args.kv_dtype,
                             suite=suite,
                             concurrency=concurrency,
+                            block_fixtures=args.block_fixtures,
                         )
                     )
     return points
 
 
+def padded_fixture(fixture: corpus.Fixture, tokens: int) -> corpus.Fixture:
+    """Prefix the fixture's prompt with in-distribution prose, to move its context.
+
+    decode-saturation pins one short reasoning prompt, and the long NIAH fixtures answer in about
+    seventeen tokens, so no available fixture pairs a long context with a long output. The filler is
+    the same curated prose the prefill corpus is baked from. `tokens` is approximate -- the ratio
+    depends on the text -- and the point records the real `prompt_tokens`, which is the value to plot.
+    """
+    if tokens <= 0:
+        return fixture
+    filler = make_bench_corpus.build_text(make_bench_corpus.PARAGRAPHS)
+    wanted = int(tokens * PAD_CHARS_PER_TOKEN)
+    text = (filler * (wanted // len(filler) + 1))[:wanted]
+    messages = [dict(message) for message in fixture.messages]
+    if not messages or not isinstance(messages[0].get("content"), str):
+        raise corpus.CampaignError("--pad-tokens needs a text prompt to prefix")
+    messages[0]["content"] = f"{text}\n\n{messages[0]['content']}"
+    return dataclasses.replace(fixture, messages=messages)
+
+
+def fixture_names(point: Point) -> tuple[str, ...]:
+    """The prompts a corpus point runs.
+
+    The backend default splits the suites -- the plain path gets the long-context NIAH fixtures, a
+    speculative backend the long-decode and scenario prompts -- which leaves two backends with zero
+    shared requests and makes their rates incomparable. `--block-fixtures` overrides it so both sides
+    of an A/B run the same prompts.
+    """
+    if point.block_fixtures == "niah":
+        return corpus.NIAH_FIXTURES
+    if point.block_fixtures == "decode":
+        return (*corpus.LONG_DECODE_FIXTURES,
+                *(name for names in corpus.SCENARIO_FIXTURES.values() for name in names))
+    if point.block_fixtures == "long":
+        # The long-decode prompts alone: the right workload for a speculation A/B (long outputs),
+        # and 3 fixtures x 5 seeds instead of 15, which keeps a matched run to minutes.
+        return corpus.LONG_DECODE_FIXTURES
+    return corpus.block_fixture_names(point.speculative_backend)
+
+
 def build_jobs(
-    point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int
+    point: Point,
+    fixtures: dict[str, corpus.Fixture],
+    decode_tokens: int,
+    pad_tokens: int = 0,
 ) -> list[Job]:
     if point.suite == "decode-saturation":
-        fixture = fixtures[SATURATION_FIXTURE]
+        fixture = padded_fixture(fixtures[SATURATION_FIXTURE], pad_tokens)
         return [
             Job(
                 index=index,
@@ -247,7 +332,7 @@ def build_jobs(
             for index in range(point.concurrency)
         ]
 
-    names = corpus.block_fixture_names(point.speculative_backend)
+    names = fixture_names(point)
     cases = [
         (fixture_index * len(corpus.SEEDS) + seed_index, name, seed)
         for fixture_index, name in enumerate(names)
@@ -264,6 +349,14 @@ def build_jobs(
         )
         for index, (case_index, name, seed) in enumerate(cases)
     ]
+
+
+def suite_fixture_names(point: Point) -> tuple[str, ...]:
+    """The fixture set the point's suite defines, independent of its concurrency."""
+    if point.suite == "decode-saturation":
+        # build_jobs() fans the one saturation fixture out over the workers.
+        return (SATURATION_FIXTURE,)
+    return fixture_names(point)
 
 
 def workload_order(point: Point) -> dict[str, Any]:
@@ -342,7 +435,10 @@ def server_command(
             # draft length like MTP.
             command.extend(corpus.draft_policy_flags(serve, point.speculative_mode))
         else:
-            command.append("--lm-head-draft")
+            # The optimized proposal head is a Qwen-family option. Gemma 4 refuses it outright and
+            # runs MTP on the full head, so a *_full mode must not ask for it.
+            if point.speculative_mode not in corpus.FULL_HEAD_MODES:
+                command.append("--lm-head-draft")
             if point.speculative_backend == "mtp":
                 command.extend(corpus.draft_policy_flags(serve, point.speculative_mode))
     if point.sampling_mode == "greedy":
@@ -387,9 +483,12 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        # EAGLE3 carries its own draft head, so the optimized proposal head is never loaded.
+        # EAGLE3 carries its own draft head and a *_full mode deliberately skips the optimized one,
+        # so neither loads it.
         "proposal_head": "full"
-        if point.speculative_backend == "eagle3" or not point.draft_tokens
+        if point.speculative_backend == "eagle3"
+        or point.speculative_mode in corpus.FULL_HEAD_MODES
+        or not point.draft_tokens
         else "optimized",
     }
     if args.prefill_chunk is None:
@@ -414,6 +513,27 @@ def validate_server_start(
     if not isinstance(prefill_signature, str) or not prefill_signature:
         raise corpus.CampaignError("server_start has no canonical prefill_signature")
     return server_instance_id, prefill_signature
+
+
+def context_length_exceeded_message(error: corpus.CampaignError) -> str | None:
+    """The server's own message when `error` is the engine's context-length refusal, else None.
+
+    Deliberately narrow: only HTTP 400 whose body's `error.code` is `context_length_exceeded` is a
+    recordable skip. A 400 for any other reason, any other status, a malformed body and a transport
+    error all return None, which leaves them as fatal as they are without this function.
+    """
+    match = HTTP_ERROR_PATTERN.match(str(error))
+    if match is None or match.group("status") != "400":
+        return None
+    try:
+        body = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return None
+    error_object = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error_object, dict) or error_object.get("code") != CONTEXT_LENGTH_ERROR_CODE:
+        return None
+    message = error_object.get("message")
+    return message if isinstance(message, str) and message else None
 
 
 def parse_client_response(
@@ -442,7 +562,7 @@ def run_clients(
     jobs: Sequence[Job],
     port: int,
     on_result: Callable[[ClientResult, dict[str, Any]], None] | None = None,
-) -> tuple[list[ClientResult], float, float]:
+) -> tuple[list[ClientResult], list[SkippedFixture], float, float]:
     pending: queue.Queue[Job] = queue.Queue()
     for job in jobs:
         pending.put(job)
@@ -455,6 +575,7 @@ def run_clients(
     dispatch_condition = threading.Condition()
     next_dispatch_index = 0
     results: list[ClientResult] = []
+    skips: list[SkippedFixture] = []
     errors: list[Exception] = []
 
     def record_failure(error: Exception) -> None:
@@ -509,6 +630,20 @@ def run_clients(
                     result = parse_client_response(job, response, started_at, finished_at)
                     if on_result is not None:
                         on_result(result, response)
+                except corpus.CampaignError as exc:
+                    message = context_length_exceeded_message(exc)
+                    if message is None:
+                        record_failure(exc)
+                        return
+                    # The engine refused this fixture's prompt: record it and take the next job.
+                    with result_lock:
+                        skips.append(SkippedFixture(job=job, message=message))
+                    print(
+                        f"skip {job.index + 1}/{len(jobs)} {job.fixture.name} "
+                        f"seed={job.seed} | {message}",
+                        flush=True,
+                    )
+                    continue
                 except Exception as exc:
                     record_failure(exc)
                     return
@@ -542,12 +677,20 @@ def run_clients(
         if isinstance(error, corpus.CampaignError):
             raise error
         raise corpus.CampaignError(f"concurrent request failed: {error}") from error
-    if len(results) != len(jobs):
+    if len(results) + len(skips) != len(jobs):
         raise corpus.CampaignError(
-            f"completed {len(results)} client request(s), expected {len(jobs)}"
+            f"completed {len(results)} client request(s) and skipped {len(skips)}, "
+            f"expected {len(jobs)}"
         )
-    campaign_end = max(result.finished_at for result in results)
-    return sorted(results, key=lambda result: result.job.index), campaign_start, campaign_end
+    # analyze_point() reports an all-skipped point as the failure it is; the campaign has no
+    # measured end in that case, so the span is left empty here.
+    campaign_end = max((result.finished_at for result in results), default=campaign_start)
+    return (
+        sorted(results, key=lambda result: result.job.index),
+        sorted(skips, key=lambda skip: skip.job.index),
+        campaign_start,
+        campaign_end,
+    )
 
 
 def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, Any]]:
@@ -708,13 +851,33 @@ def analyze_point(
     prefill_signature: str,
     events: Sequence[dict[str, Any]],
     results: Sequence[ClientResult],
+    skips: Sequence[SkippedFixture],
     campaign_start: float,
     campaign_end: float,
 ) -> dict[str, Any]:
+    if skips and not results:
+        raise corpus.CampaignError(
+            "every fixture was refused by the engine context limit ("
+            + ", ".join(sorted({skip.job.fixture.name for skip in skips}))
+            + "); the point measured nothing"
+        )
     errors = [event for event in events if event.get("event") == "request_error"]
     if errors:
         message = errors[0].get("error", {}).get("message", "unknown request error")
         raise corpus.CampaignError(f"serving request failed: {message}")
+    # A skip is only sound if the server logged the same refusal: the engine records one
+    # request_rejected per refused prompt, carrying the code and the message the client saw.
+    refusals = sorted(
+        event.get("error", {}).get("message")
+        for event in events
+        if event.get("event") == "request_rejected"
+        and event.get("error", {}).get("code") == CONTEXT_LENGTH_ERROR_CODE
+    )
+    if refusals != sorted(skip.message for skip in skips):
+        raise corpus.CampaignError(
+            "the engine's recorded context-length refusals do not match the skipped fixtures: "
+            f"{refusals!r} != {[skip.message for skip in skips]!r}"
+        )
     request_done = [event for event in events if event.get("event") == "request_done"]
     throughput = [event for event in events if event.get("event") == "throughput"]
     if len(request_done) != len(results):
@@ -777,6 +940,16 @@ def analyze_point(
         "workload_order": workload_order(point),
         "concurrency": point.concurrency,
         "request_count": len(results),
+        "suite_fixture_count": len(suite_fixture_names(point)),
+        "fixture_count": len({result.job.fixture.name for result in results}),
+        "skipped_fixtures": [
+            {
+                "fixture": skip.job.fixture.name,
+                "seed": skip.job.seed,
+                "message": skip.message,
+            }
+            for skip in skips
+        ],
         "command": list(command),
         "server_log": str(server_log),
         "engine": server_start.get("engine", {}),
@@ -800,7 +973,7 @@ def run_point(
     output_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    jobs = build_jobs(point, fixtures, args.decode_tokens)
+    jobs = build_jobs(point, fixtures, args.decode_tokens, args.pad_tokens)
     server_log = output_dir / "server" / f"{point.key}.jsonl"
     command = server_command(serve, point, server_log, args)
     print(
@@ -859,15 +1032,28 @@ def run_point(
                         pending_records[-1].result()
                     pending_records.append(collector.submit(save, result, response))
 
-                results, campaign_start, campaign_end = run_clients(point, jobs, args.port, enqueue)
+                results, skips, campaign_start, campaign_end = run_clients(
+                    point, jobs, args.port, enqueue
+                )
                 for future in pending_records:
                     future.result()
-            rows = corpus.build_summary_rows(
-                records, (point.target,), (point.speculative_mode,), point.sampling_mode
-            )
-            corpus.write_summaries(rows, detail_dir)
+            if skips:
+                # corpus.build_summary_rows() needs a record for every fixture the suite defines,
+                # and the corpus tool itself refuses to summarise a run with requests missing; the
+                # refused fixtures have no record to summarise. results.jsonl keeps the measured
+                # ones, and the point records what was skipped and why.
+                print(
+                    f"detail summary skipped: {len(skips)} request(s) refused by the engine "
+                    f"context limit; measured records are in {detail_dir / 'results.jsonl'}",
+                    flush=True,
+                )
+            else:
+                rows = corpus.build_summary_rows(
+                    records, (point.target,), (point.speculative_mode,), point.sampling_mode
+                )
+                corpus.write_summaries(rows, detail_dir)
         else:
-            results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
+            results, skips, campaign_start, campaign_end = run_clients(point, jobs, args.port)
 
     events = load_server_events(server_log, server_instance_id)
     report = analyze_point(
@@ -878,6 +1064,7 @@ def run_point(
         prefill_signature,
         events,
         results,
+        skips,
         campaign_start,
         campaign_end,
     )
@@ -957,6 +1144,9 @@ SUMMARY_FIELDS = (
     "workload_prefill_tokens_per_second",
     "workload_decode_tokens_per_second",
     "speedup_vs_c1",
+    "suite_fixture_count",
+    "fixture_count",
+    "skipped_fixtures",
 )
 
 
@@ -982,6 +1172,11 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "workload_prefill_tokens_per_second": None,
         "workload_decode_tokens_per_second": None,
         "speedup_vs_c1": report.get("speedup_vs_c1"),
+        "suite_fixture_count": report["suite_fixture_count"],
+        "fixture_count": report["fixture_count"],
+        "skipped_fixtures": "; ".join(
+            sorted({skip["fixture"] for skip in report["skipped_fixtures"]})
+        ),
     }
     if report["suite"] == "decode-saturation":
         row["average_decode_batch"] = report["metrics"]["steady"]["average_decode_batch"]
@@ -1058,7 +1253,16 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         title = f"## {target} / {prefill_signature} / {kv_dtype} / {mode} / {suite}"
         if suite == "decode-saturation":
             table = markdown_table(
-                ("C", "Requests", "Steady s", "Avg batch", "Decode tok/s", "Speedup"),
+                (
+                    "C",
+                    "Requests",
+                    "Steady s",
+                    "Avg batch",
+                    "Decode tok/s",
+                    "Speedup",
+                    "Fixtures",
+                    "Skipped",
+                ),
                 [
                     (
                         str(row["concurrency"]),
@@ -1067,6 +1271,8 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
                         format_number(row["average_decode_batch"]),
                         format_number(row["steady_decode_tokens_per_second"], 1),
                         format_number(row["speedup_vs_c1"]),
+                        f"{row['fixture_count']}/{row['suite_fixture_count']}",
+                        row["skipped_fixtures"] or "—",
                     )
                     for row in group
                 ],
@@ -1082,6 +1288,8 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
                     "Decode tok/s",
                     "Avg batch",
                     "Speedup",
+                    "Fixtures",
+                    "Skipped",
                 ),
                 [
                     (
@@ -1093,6 +1301,8 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
                         format_number(row["workload_decode_tokens_per_second"], 1),
                         format_number(row["average_decode_batch"]),
                         format_number(row["speedup_vs_c1"]),
+                        f"{row['fixture_count']}/{row['suite_fixture_count']}",
+                        row["skipped_fixtures"] or "—",
                     )
                     for row in group
                 ],
@@ -1108,7 +1318,10 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
         "configured concurrency. Corpus makespan spans simultaneous client release through the "
-        f"last complete HTTP response.{corpus_order_note}\n\n"
+        "last complete HTTP response. A fixture whose prompt exceeds the campaign's --max-context "
+        "is a recorded skip rather than a failure: it contributes no tokens, and its request is "
+        "inside the makespan window. Fixtures is measured/defined for the point, and Skipped names "
+        f"the fixtures the engine refused.{corpus_order_note}\n\n"
         + "\n\n".join(sections)
         + "\n"
     )
@@ -1135,7 +1348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
-            jobs = build_jobs(point, fixtures, args.decode_tokens)
+            jobs = build_jobs(point, fixtures, args.decode_tokens, args.pad_tokens)
             print(
                 f"# {point.key}: {len(jobs)} request(s), "
                 f"order={workload_order_label(point)}"

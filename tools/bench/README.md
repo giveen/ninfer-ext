@@ -189,10 +189,12 @@ records the actual Engine configuration, automatic KV capacity, shuffle seed whe
 dispatch method, and per-request positions. Servers use int8 KV unless `--kv-dtype` selects
 another storage; Qwen4Exp artifacts need `--kv-dtype bf16` or `fp8`.
 
-Schema-v4 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
-`summary.md`. C=1 corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
-per-request phase summaries in that directory; older campaigns may have only point reports and
-server logs. Historical model pages identify the report directory associated with each table.
+Schema-v5 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+`summary.md`. A fixture whose prompt exceeds `--max-context` is recorded as skipped in the point and
+in every summary rather than failing the campaign. C=1 corpus runs also write complete responses in
+`corpus/<point>/results.jsonl` and per-request phase summaries in that directory, which are omitted
+when a fixture was refused; older campaigns may have only point reports and server logs. Historical
+model pages identify the report directory associated with each table.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
@@ -227,3 +229,36 @@ corpus rows compare makespan.
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+### Whole-model sweep and figures
+
+`run_bench_sweep.py` drives the runner above over every local artifact at a chain of context levels
+and the four concurrencies, then hands the campaigns to `plot_concurrency.py` for the figures. Both
+are orchestration, not measurement: the runner owns the server, the workload and the point files, and
+the plotter only reads what exists.
+
+A campaign admits one `--max-context`, so a fixture longer than that window is skipped rather than
+failing the sweep, and the driver reports which levels a model could not reach. `--dry-run` prints
+every campaign without running one. The plotter draws prefill and decode against context, one line
+per concurrency, as PNG and SVG; it reads the runner's per-request `corpus/<point>/results.jsonl`
+where those exist (C=1, which is where a curve against context is meaningful) in preference to the
+point metrics, which for a `corpus-makespan` point describe its whole fixture set at once. It also
+reads `ninfer_bench --output-file` JSON, whose rows are single-request points and the only way to get
+a prefill-against-context curve without a server.
+
+```bash
+# Print every campaign (seven artifacts, contexts 8192..262144, C 1/2/4/8) without running one.
+python3 tools/bench/run_bench_sweep.py --dry-run
+
+# Drive one model for real.
+python3 tools/bench/run_bench_sweep.py --only gemma4_26b_a4b_qat
+
+# Figures from whatever has been measured; needs matplotlib (here: /usr/bin/python3).
+python3 tools/bench/plot_concurrency.py \
+  --run profiles/bench/all_models/gemma4_26b_a4b_qat_ctx131072 \
+  --bench /tmp/bench_26b.json --out /tmp/figs
+```
+
+Measurement on one card is clock-sensitive: run one campaign at a time, and do not benchmark beside
+another GPU job — a contended run produced a non-monotonic decode series for the same model whose
+uncontended decode is flat.

@@ -1,20 +1,23 @@
 #include "models/gemma4/forward.h"
 
 #include "core/device.h"
+#include "models/gemma4/cache.h"
 #include "ninfer/ops/causal_compact_attention.h"
 #include "ninfer/ops/compact_kv_rows.h"
+#include "ninfer/ops/dense_kv_ring.h"
 #include "ninfer/ops/gelu_mul.h"
 #include "ninfer/ops/gemma_moe_experts.h"
 #include "ninfer/ops/gemma_moe_router.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/mul_scalar.h"
 #include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/residual_add_norm.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scale_columns.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/sliding_causal_attention.h"
 #include "ninfer/ops/soft_cap.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/sliding_causal_attention.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
@@ -60,11 +63,13 @@ std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t tokens) {
 MoeScratch allocate_moe_scratch(const TextConfig& config, std::int32_t tokens, DeviceArena& arena) {
     const std::int32_t k = static_cast<std::int32_t>(config.top_k_experts);
     MoeScratch moe;
-    moe.ids       = arena.alloc(DType::I32, {k, tokens});
-    moe.weights   = arena.alloc(DType::FP32, {k, tokens});
-    moe.workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(moe_workspace_bytes(config, tokens))});
+    moe.ids     = arena.alloc(DType::I32, {k, tokens});
+    moe.weights = arena.alloc(DType::FP32, {k, tokens});
+    moe.workspace =
+        arena.alloc(DType::U8, {static_cast<std::int32_t>(moe_workspace_bytes(config, tokens))});
     return moe;
 }
+
 struct Scratch {
     Tensor normed;    // [H,T]     the normed layer input, reused by both sublayers
     Tensor branch;    // [H,T]     a sublayer's normalized output before the residual add
@@ -82,6 +87,7 @@ struct Scratch {
     Tensor projected; // [H,T]     the attention output projection
     Tensor gate;      // [I,T]     the MLP's gate projection
     Tensor up;        // [I,T]     the MLP's up projection
+    Tensor gate_up;   // the one frame gate and up are row views of when decode fuses them
     Tensor activated; // [I,T]
     Tensor down;      // [H,T]
     // The MoE block's storage, allocated only when the model enables the block.
@@ -93,6 +99,18 @@ Tensor positions_as_pairs(const Tensor& positions) {
     return Tensor(positions.data, DType::BF16, {2, static_cast<std::int32_t>(positions.ne[0])});
 }
 
+// Writes the `kept` trailing tokens' positions (I32 [tokens]) into the cache slots `slots` names,
+// which is the half of a ring write a quantized ring keeps in common with the BF16 one: the rows
+// themselves take that ring's own encoder.
+void write_cache_positions(const Tensor& positions, const Tensor& slots, std::int32_t kept,
+                           const Tensor& cache_positions, cudaStream_t stream) {
+    const std::int32_t tokens   = static_cast<std::int32_t>(positions.ne[0]);
+    const std::int32_t skip     = tokens - kept;
+    Tensor position_destination = positions_as_pairs(cache_positions);
+    ops::scatter(positions_as_pairs(positions).slice(1, skip, kept), slots.slice(0, skip, kept),
+                 position_destination, stream);
+}
+
 // Writes the `kept` trailing tokens' rows of `rows` (BF16 [width,tokens]) and their `positions`
 // (I32 [tokens]) into a cache layer whose slot for each token `slots` names: rows into `cache_rows`
 // (BF16 [width,slots]), positions into `cache_positions` (I32 [slots]). Every index is on the
@@ -102,12 +120,9 @@ void write_cache_rows(const Tensor& rows, const Tensor& positions, const Tensor&
                       cudaStream_t stream) {
     const std::int32_t tokens = static_cast<std::int32_t>(rows.ne[1]);
     const std::int32_t skip   = tokens - kept;
-    const Tensor index        = slots.slice(0, skip, kept);
     Tensor destination        = cache_rows;
-    ops::scatter(rows.slice(1, skip, kept), index, destination, stream);
-    Tensor position_destination = positions_as_pairs(cache_positions);
-    ops::scatter(positions_as_pairs(positions).slice(1, skip, kept), index, position_destination,
-                 stream);
+    ops::scatter(rows.slice(1, skip, kept), slots.slice(0, skip, kept), destination, stream);
+    write_cache_positions(positions, slots, kept, cache_positions, stream);
 }
 
 // The first byte of column `column` of a column-major tensor whose columns are `column_bytes`
@@ -140,67 +155,89 @@ WeightId target_layer_key_norm(const Model& model, std::size_t layer) {
     return model.weights().text.layers.at(layer).attention.key_norm;
 }
 
-// The attention input projections are declared as one group by the converter
-// (tools/convert/gemma4.py `group(query, key, value)`) and bound as row slices of a single packed
-// object. When those slices are contiguous from the object's first row, one Linear over the union
-// runs exactly the rows the three separate launches run, through the same route: a Q6 GEMV splits a
-// row's K range from K and the split index alone, so which block computes a row does not change its
-// reduction order. The three results are bit-identical -- the generated token ids of a greedy
-// decode match the unfused build exactly -- so this trades 150 launches a token for 50 without
-// touching arithmetic.
+// A group of projections the converter stores as one packed parent is bound as row slices of it
+// (tools/convert/gemma4.py `group(...)` for the attention inputs, and for a layer's gate and up).
+// When those slices are contiguous from the object's first row, one Linear over the union runs
+// exactly the rows the separate launches run, through the same route: every linear route fixes an
+// output row's reduction order from that row alone, never from the block that happens to cover it.
+// A Q6 GEMV splits a row's K range from K and the split index alone; the int4 row-group GEMV gives
+// a warp whole rows and reduces each with its own per-lane serial FMA chain and one fixed log-step
+// shuffle; and the int4 row-group MMA tile accumulates each output element in one thread over the
+// tile's K blocks. So the union's results are bit-identical to the separate launches' -- the
+// generated token ids of a greedy decode match the unfused build exactly -- and it is free to trade
+// launches for one.
 //
-// The check below is by plane offset and covers the row-split Q6 layout only; any other format,
-// a differing quantisation, or a slice that is not exactly where it should be keeps the three
-// separate launches. `prepare_linear_weight` returns a copy of the stored weight, so the addresses
-// compared here are the artifact's own slice addresses.
-bool qkv_slices_are_contiguous(const Weight& query, const Weight& key, const Weight& value) {
-    if (query.qtype != QType::Q6_G64_FP16 || query.layout != QuantLayout::RowSplit ||
-        query.group != 64) {
+// The check below is by plane offset and covers the two layouts a grouped parent is written in: the
+// 31B's row-split Q6 and the 26B-A4B's row-grouped int4 rows. Any other format, a differing
+// quantisation, or a slice that is not exactly where it should be refuses the union, so a wrong
+// width here can only decline to fuse, never fuse wrongly. `prepare_linear_weight` returns a copy
+// of the stored weight, so the addresses compared here are the artifact's own slice addresses.
+bool row_slices_are_contiguous(const Weight* const* members, int count) {
+    if (count < 2) { return false; }
+    const Weight& first = *members[0];
+    // Each layout's per-row plane widths, so a member's planes have to begin exactly where the
+    // previous member's rows end: the row split advances a row's group index by padded_k/64 in a
+    // 32-byte code plane, a 16-byte high plane and a 2-byte scale plane (q6_a16_simt.cuh), and a
+    // row-grouped int4 row carries no padding at all -- K/2 code bytes and K/32 binary16 scale
+    // words (docs/maintainer/tensor-formats.md section 3.4.1).
+    std::uint64_t code_per_row  = 0;
+    std::uint64_t high_per_row  = 0;
+    std::uint64_t scale_per_row = 0;
+    if (first.layout == QuantLayout::RowSplit && first.qtype == QType::Q6_G64_FP16) {
+        const auto groups = static_cast<std::uint64_t>(first.padded_shape[1]) / 64;
+        code_per_row      = groups * 32;
+        high_per_row      = groups * 16;
+        scale_per_row     = groups * 2;
+    } else if (first.layout == QuantLayout::RowGroup && first.qtype == QType::Q4_G32_FP16_ROWS) {
+        code_per_row  = static_cast<std::uint64_t>(first.k) / 2;
+        scale_per_row = static_cast<std::uint64_t>(first.k) / 32 * 2;
+    } else {
         return false;
     }
-    const Weight* members[] = {&query, &key, &value};
-    for (const Weight* member : members) {
-        if (member->qtype != query.qtype || member->layout != query.layout ||
-            member->group != query.group || member->scale_dtype != query.scale_dtype ||
-            member->k != query.k || member->padded_shape[1] != query.padded_shape[1] ||
-            member->weight_scale_divisor != query.weight_scale_divisor ||
-            member->input_scale_divisor != query.input_scale_divisor) {
+    for (int index = 0; index < count; ++index) {
+        const Weight& member = *members[index];
+        if (member.qtype != first.qtype || member.layout != first.layout ||
+            member.group != first.group || member.scale_dtype != first.scale_dtype ||
+            member.k != first.k || member.padded_shape[1] != first.padded_shape[1] ||
+            member.weight_scale_divisor != first.weight_scale_divisor ||
+            member.input_scale_divisor != first.input_scale_divisor) {
             return false;
         }
-        if (member->qdata == nullptr || member->qhigh == nullptr || member->scales == nullptr) {
+        if (member.qdata == nullptr || member.scales == nullptr) { return false; }
+        if (high_per_row != 0 && member.qhigh == nullptr) { return false; }
+    }
+    const auto is_at = [](const void* base, std::uint64_t rows_ahead, std::uint64_t per_row,
+                          const void* expected) {
+        return static_cast<const void*>(static_cast<const std::uint8_t*>(base) +
+                                        rows_ahead * per_row) == expected;
+    };
+    for (int index = 1; index < count; ++index) {
+        const Weight& previous   = *members[index - 1];
+        const Weight& member     = *members[index];
+        const std::uint64_t rows = static_cast<std::uint64_t>(previous.n);
+        if (!is_at(previous.qdata, rows, code_per_row, member.qdata) ||
+            !is_at(previous.scales, rows, scale_per_row, member.scales)) {
+            return false;
+        }
+        if (high_per_row != 0 && !is_at(previous.qhigh, rows, high_per_row, member.qhigh)) {
             return false;
         }
     }
-    // Per-group plane widths of the row-split Q6 layout, from q6_a16_simt.cuh: a row's group
-    // index advances by padded_k/64 in a 32-byte code plane, a 16-byte high plane and a 2-byte
-    // scale plane.
-    const std::uint64_t groups = static_cast<std::uint64_t>(query.padded_shape[1]) / 64;
-    const std::uint64_t rows_q = static_cast<std::uint64_t>(query.n);
-    const std::uint64_t rows_k = static_cast<std::uint64_t>(key.n);
-    const auto is_at = [](const void* base, std::uint64_t groups_ahead, std::uint64_t per_group,
-                          const void* expected) {
-        return static_cast<const void*>(static_cast<const std::uint8_t*>(base) +
-                                        groups_ahead * per_group) == expected;
-    };
-    return is_at(query.qdata, rows_q * groups, 32, key.qdata) &&
-           is_at(query.qhigh, rows_q * groups, 16, key.qhigh) &&
-           is_at(query.scales, rows_q * groups, 2, key.scales) &&
-           is_at(key.qdata, rows_k * groups, 32, value.qdata) &&
-           is_at(key.qhigh, rows_k * groups, 16, value.qhigh) &&
-           is_at(key.scales, rows_k * groups, 2, value.scales);
+    return true;
 }
 
-// The same weight with the union row count. `query`'s planes begin at the object's first row once
-// `qkv_slices_are_contiguous` holds, so only `n` changes.
-Weight fused_qkv_weight(const Weight& query, std::int32_t rows) {
-    Weight fused = query;
+// The same weight with the union row count. The group's planes begin at the object's first row and
+// run to the union's last once `row_slices_are_contiguous` holds, so only `n` changes.
+Weight fused_row_weight(const Weight& first, std::int32_t rows) {
+    Weight fused = first;
     fused.n      = rows;
     return fused;
 }
 
 } // namespace
 
-std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens) {
+std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens,
+                                  KvCacheStorage storage, std::int32_t ring_slack) {
     const std::uint64_t h = config.hidden_size;
     const std::uint64_t i = config.intermediate_size;
     const std::uint64_t slide_q =
@@ -256,8 +293,18 @@ std::size_t layer_workspace_bytes(const TextConfig& config, std::int32_t tokens)
                                             static_cast<std::size_t>(t) * sizeof(float) +
                                         moe_workspace_bytes(config, tokens) + 3 * 256
                                   : 0;
+    // A quantized sliding ring is decoded into BF16 scratch before the layer attends: one ring for
+    // the keys and one for the values, over the window plus the slack the cache is configured with.
+    // Nothing else in the frame scales with the ring rather than with the pass.
+    const std::size_t decode =
+        storage == KvCacheStorage::BFloat16
+            ? 0
+            : 2 * static_cast<std::size_t>(config.sliding.head_dim) *
+                      static_cast<std::size_t>(config.sliding.num_key_value_heads) *
+                      (config.sliding_window + static_cast<std::size_t>(ring_slack)) * 2 +
+                  512;
     return static_cast<std::size_t>(std::max(sliding, global) * t * 2 + 18 * 256 + t * 8) + split +
-           route;
+           route + decode;
 }
 
 PassIndices write_pass_indices(const KvCache& cache, std::int32_t first_position,
@@ -297,6 +344,10 @@ PassIndices write_pass_indices(std::span<const PassSegment> segments, DeviceAren
 // A Tensor is a view, so this is a handful of pointers whichever way it is passed.
 struct FfnScratch {
     Tensor normed, branch, projected, down, gate, up, activated;
+    // Set when gate and up are row views of one frame, so the sublayer runs one Linear over the
+    // union instead of two. `gate_up` is that frame; `gate` and `up` are its halves.
+    Tensor gate_up;
+    bool gate_up_fused = false;
 };
 
 ops::GemmaMoeRouterWeights router_weights(const Model& model, const MoeWeights& moe) {
@@ -323,14 +374,20 @@ ops::GemmaMoeExpertWeights expert_weights(const Model& model, const MoeWeights& 
 // the layer scalar. A model whose config enables the MoE block runs the experts beside the dense
 // MLP and sums the two branches, each through its own post-norm, before the shared one.
 //
-// The MoE branch reuses `normed`, `projected` and `down` in place rather than three more [H,T]
-// buffers: the dense branch has already consumed `normed` (gate/up) and `down` (its own post-norm),
-// and `projected` held the attention output, which was normed into `branch`. Only the router's two
-// outputs and the expert apply's products are new storage, and the caller allocates them when the
-// block is enabled.
+// Every post-norm whose only reader is the residual accumulate -- the shared one here, and each
+// sublayer's own -- is folded into `ops::residual_add_norm` with the accumulate and the layer
+// scalar, so the tail is one launch an accumulate instead of a norm, an add and a scale.
+//
+// The MoE branch reuses `normed` and `projected` in place rather than two more [H,T] buffers: by
+// the time each is rewritten its last reader has run. The dense branch consumes `normed` (gate/up);
+// `projected` holds the attention output, which the fused accumulate into the residual consumes;
+// and the second post-norm's output is accumulated into `branch` directly rather than into `down`.
+// Only the router's two outputs and the expert apply's products are new storage, and the caller
+// allocates them when the block is enabled. `branch` is the h1 accumulator the MoE block needs; a
+// dense model's sublayer still has it allocated, because the frame is one size for both kinds, and
+// the bound counts it for both.
 void feed_forward_sublayer(const Model& model, const LayerWeights& weights, FfnScratch s,
-                           const MoeScratch& moe_scratch, Tensor& residual,
-                           cudaStream_t stream) {
+                           const MoeScratch& moe_scratch, Tensor& residual, cudaStream_t stream) {
     const TextConfig& config = model.config();
     const float eps          = config.rms_norm_eps;
     auto to_weight           = [&](WeightId id) {
@@ -339,16 +396,21 @@ void feed_forward_sublayer(const Model& model, const LayerWeights& weights, FfnS
 
     ops::rmsnorm(residual, model.tensor(weights.pre_feedforward_norm), eps, false, s.normed,
                  stream);
-    ops::linear(s.normed, to_weight(weights.mlp.gate), s.gate, stream);
-    ops::linear(s.normed, to_weight(weights.mlp.up), s.up, stream);
+    if (s.gate_up_fused) {
+        ops::linear(s.normed,
+                    fused_row_weight(to_weight(weights.mlp.gate),
+                                     2 * static_cast<std::int32_t>(config.intermediate_size)),
+                    s.gate_up, stream);
+    } else {
+        ops::linear(s.normed, to_weight(weights.mlp.gate), s.gate, stream);
+        ops::linear(s.normed, to_weight(weights.mlp.up), s.up, stream);
+    }
     ops::gelu_mul(s.gate, s.up, s.activated, stream);
     ops::linear(s.activated, to_weight(weights.mlp.down), s.down, stream);
 
     if (!weights.moe) {
-        ops::rmsnorm(s.down, model.tensor(weights.post_feedforward_norm), eps, false, s.branch,
-                     stream);
-        ops::residual_add(s.branch, residual, stream);
-        ops::mul_scalar(residual, model.layer_scalar(weights.layer_scalar), stream);
+        ops::residual_add_norm(s.down, model.tensor(weights.post_feedforward_norm), eps, residual,
+                               model.layer_scalar(weights.layer_scalar), stream);
         return;
     }
 
@@ -363,14 +425,11 @@ void feed_forward_sublayer(const Model& model, const LayerWeights& weights, FfnS
     ops::gemma_moe_experts(s.normed, moe_out.ids, moe_out.weights, expert_weights(model, moe),
                            expert_geometry(config), s.projected, moe_out.workspace, stream);
     // h2, then h = h1 + h2.
-    ops::rmsnorm(s.projected, model.tensor(moe.post_feedforward_norm_2), eps, false, s.down,
-                 stream);
-    ops::residual_add(s.down, s.branch, stream);
+    ops::residual_add_norm(s.projected, model.tensor(moe.post_feedforward_norm_2), eps, s.branch,
+                           1.0F, stream);
     // The shared post-norm, the residual add and the scalar, exactly as the dense path ends.
-    ops::rmsnorm(s.branch, model.tensor(weights.post_feedforward_norm), eps, false, s.normed,
-                 stream);
-    ops::residual_add(s.normed, residual, stream);
-    ops::mul_scalar(residual, model.layer_scalar(weights.layer_scalar), stream);
+    ops::residual_add_norm(s.branch, model.tensor(weights.post_feedforward_norm), eps, residual,
+                           model.layer_scalar(weights.layer_scalar), stream);
 }
 
 // `tokens` is the pass's column count over every segment.
@@ -406,21 +465,27 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     const float eps             = config.rms_norm_eps;
 
     Scratch scratch;
-    // The union is one frame the three can be viewed from only at T=1, which is why decode fuses
-    // and every wider pass keeps the three launches: tensors are column-major with dim 0 fastest,
-    // so a
-    // row slice of a [Q+2KV,T] frame carries that frame's token stride and is not contiguous for
-    // T>1 -- which rmsnorm requires. At T=1 the frame's row 0 is byte 0, so a [rows,1] slice is
-    // exactly a standalone [rows,1] tensor. See qkv_slices_are_contiguous for the weight side.
+    // The union is one frame the group can be viewed from only at T=1, which is why decode fuses
+    // and every wider pass keeps the separate launches: tensors are column-major with dim 0
+    // fastest, so a row slice of a [Q+2KV,T] frame carries that frame's token stride and is not
+    // contiguous for T>1 -- which rmsnorm requires. At T=1 the frame's row 0 is byte 0, so a
+    // [rows,1] slice is exactly a standalone [rows,1] tensor. See row_slices_are_contiguous for the
+    // weight side.
     const Weight query_weight =
         ops::prepare_linear_weight(model.input(weights.attention.query)).weight;
     const Weight key_weight = ops::prepare_linear_weight(model.input(weights.attention.key)).weight;
     const Weight value_weight =
         ops::prepare_linear_weight(model.input(weights.attention.value)).weight;
-    const bool fuse_qkv =
-        tokens == 1 && qkv_slices_are_contiguous(query_weight, key_weight, value_weight);
-    scratch.normed = arena.alloc(DType::BF16, {h, tokens});
-    scratch.branch = arena.alloc(DType::BF16, {h, tokens});
+    const Weight* qkv_weights[] = {&query_weight, &key_weight, &value_weight};
+    const bool fuse_qkv         = tokens == 1 && row_slices_are_contiguous(qkv_weights, 3);
+    // The same union for the layer's gate and up, which the converter groups for the layouts whose
+    // parent a slice can be read from.
+    const Weight gate_weight = ops::prepare_linear_weight(model.input(weights.mlp.gate)).weight;
+    const Weight up_weight   = ops::prepare_linear_weight(model.input(weights.mlp.up)).weight;
+    const Weight* gate_up_weights[] = {&gate_weight, &up_weight};
+    const bool fuse_gate_up         = tokens == 1 && row_slices_are_contiguous(gate_up_weights, 2);
+    scratch.normed                  = arena.alloc(DType::BF16, {h, tokens});
+    scratch.branch                  = arena.alloc(DType::BF16, {h, tokens});
     if (fuse_qkv) {
         scratch.qkv = arena.alloc(DType::BF16, {q_width + 2 * kv_width, tokens});
         scratch.q   = scratch.qkv.slice(0, 0, q_width);
@@ -436,8 +501,14 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     scratch.v_normed  = arena.alloc(DType::BF16, {d, hkv, tokens});
     scratch.attended  = arena.alloc(DType::BF16, {q_width, tokens});
     scratch.projected = arena.alloc(DType::BF16, {h, tokens});
-    scratch.gate      = arena.alloc(DType::BF16, {i, tokens});
-    scratch.up        = arena.alloc(DType::BF16, {i, tokens});
+    if (fuse_gate_up) {
+        scratch.gate_up = arena.alloc(DType::BF16, {2 * i, tokens});
+        scratch.gate    = scratch.gate_up.slice(0, 0, i);
+        scratch.up      = scratch.gate_up.slice(0, i, i);
+    } else {
+        scratch.gate = arena.alloc(DType::BF16, {i, tokens});
+        scratch.up   = arena.alloc(DType::BF16, {i, tokens});
+    }
     scratch.activated = arena.alloc(DType::BF16, {i, tokens});
     scratch.down      = arena.alloc(DType::BF16, {h, tokens});
     if (weights.moe) scratch.moe = allocate_moe_scratch(config, tokens, arena);
@@ -451,7 +522,7 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
     // serves both sides of the causal window.
     ops::rmsnorm(residual, model.tensor(weights.input_norm), eps, false, scratch.normed, stream);
     if (fuse_qkv) {
-        ops::linear(scratch.normed, fused_qkv_weight(query_weight, q_width + 2 * kv_width),
+        ops::linear(scratch.normed, fused_row_weight(query_weight, q_width + 2 * kv_width),
                     scratch.qkv, stream);
     } else {
         ops::linear(scratch.normed, query_weight, scratch.q, stream);
@@ -490,11 +561,14 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         KvCache& cache                     = *segment.cache;
         const std::int32_t n               = segment.tokens;
         const std::int32_t column          = segment.column;
-        Tensor cache_keys                  = cache.keys(layer);
-        Tensor cache_values                = cache.values(layer);
-        Tensor cache_pos                   = cache.positions(layer);
-        const std::int32_t ring            = cache.ring_tokens();
-        const bool write_first             = n <= cache.ring_slack() + 1;
+        // A BF16 ring hands its rows to the attention directly; a quantized one is written through
+        // its format's encoder and decoded back into BF16 scratch below.
+        const bool quantized    = cache.quantized(layer);
+        Tensor cache_keys       = quantized ? Tensor{} : cache.keys(layer);
+        Tensor cache_values     = quantized ? Tensor{} : cache.values(layer);
+        Tensor cache_pos        = cache.positions(layer);
+        const std::int32_t ring = cache.ring_tokens();
+        const bool write_first  = n <= cache.ring_slack() + 1;
         if (!write_first) cache.forget_stale(layer, segment.first_position, stream);
 
         // The segment's columns of the pass-wide tensors.
@@ -509,6 +583,21 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         // last ring of a pass has distinct slots.
         const std::int32_t kept = std::min(n, ring);
         const auto write_kept   = [&] {
+            if (quantized) {
+                const std::int32_t skipped = n - kept;
+                const Tensor key_segment   = scratch.k_normed.slice(2, column, n);
+                const Tensor value_segment = scratch.v_normed.slice(2, column, n);
+                Tensor key_codes           = cache.key_codes(layer);
+                Tensor key_scales          = cache.key_scales(layer);
+                Tensor value_codes         = cache.value_codes(layer);
+                Tensor value_scales        = cache.value_scales(layer);
+                ops::dense_kv_ring_encode(key_segment.slice(2, skipped, kept),
+                                          value_segment.slice(2, skipped, kept),
+                                          slots.slice(0, skipped, kept), cache.storage(), key_codes,
+                                          key_scales, value_codes, value_scales, stream);
+                write_cache_positions(positions, slots, kept, cache_pos, stream);
+                return;
+            }
             const Tensor key_rows(cache_keys.data, DType::BF16, {row, ring});
             const Tensor value_rows(cache_values.data, DType::BF16, {row, ring});
             write_cache_rows(k_rows, positions, slots, kept, key_rows, cache_pos, stream);
@@ -518,6 +607,18 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         };
         if (write_first) write_kept();
 
+        // A quantized ring decodes into BF16 scratch, which is what the sliding Op takes: every
+        // slot comes back in the basis its encoder read, so nothing downstream changes.
+        Tensor ring_keys   = cache_keys;
+        Tensor ring_values = cache_values;
+        if (quantized) {
+            ring_keys   = arena.alloc(DType::BF16, {d, hkv, ring});
+            ring_values = arena.alloc(DType::BF16, {d, hkv, ring});
+            ops::dense_kv_ring_decode(cache.key_codes(layer), cache.key_scales(layer),
+                                      cache.value_codes(layer), cache.value_scales(layer),
+                                      cache.storage(), ring_keys, ring_values, stream);
+        }
+
         const ops::AttentionHeadGeometry geometry{d, hq, hkv};
         const std::size_t q_column = static_cast<std::size_t>(q_width) * sizeof(std::uint16_t);
         Tensor q_batch(column_data(scratch.q_normed, q_column, column), DType::BF16, {d, hq, n, 1});
@@ -526,9 +627,8 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         // leading slots the ring has filled before it (one unwritten slot when it is empty).
         const std::int32_t filled =
             write_first ? ring : std::clamp(segment.first_position, 1, ring);
-        Tensor k_ring(static_cast<std::uint8_t*>(cache_keys.data), DType::BF16,
-                      {d, hkv, filled, 1});
-        Tensor v_ring(static_cast<std::uint8_t*>(cache_values.data), DType::BF16,
+        Tensor k_ring(static_cast<std::uint8_t*>(ring_keys.data), DType::BF16, {d, hkv, filled, 1});
+        Tensor v_ring(static_cast<std::uint8_t*>(ring_values.data), DType::BF16,
                       {d, hkv, filled, 1});
         Tensor position_ring(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {filled, 1});
         Tensor position_pass = positions.view({n, 1});
@@ -551,14 +651,14 @@ void forward_sliding_layer(const Model& model, std::size_t layer, const Tensor& 
         if (!write_first) write_kept();
     }
     ops::linear(scratch.attended, to_weight(weights.attention.output), scratch.projected, stream);
-    ops::rmsnorm(scratch.projected, model.tensor(weights.post_attention_norm), eps, false,
-                 scratch.branch, stream);
-    ops::residual_add(scratch.branch, residual, stream);
+    ops::residual_add_norm(scratch.projected, model.tensor(weights.post_attention_norm), eps,
+                           residual, 1.0F, stream);
 
     // MLP sublayer: the dense branch, and the MoE block beside it when the model has one.
     feed_forward_sublayer(model, weights,
                           {scratch.normed, scratch.branch, scratch.projected, scratch.down,
-                           scratch.gate, scratch.up, scratch.activated},
+                           scratch.gate, scratch.up, scratch.activated, scratch.gate_up,
+                           static_cast<bool>(fuse_gate_up)},
                           scratch.moe, residual, stream);
 
     // The layer's output is the residual stream itself; the next layer applies its own input norm.
@@ -618,9 +718,23 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
     Tensor value     = arena.alloc(DType::BF16, {d, hkv, tokens});
     Tensor k_normed  = arena.alloc(DType::BF16, {d, hkv, tokens});
     Tensor compact   = arena.alloc(DType::BF16, {width, hkv, tokens});
-    Tensor gate      = arena.alloc(DType::BF16, {i, tokens});
-    Tensor up        = arena.alloc(DType::BF16, {i, tokens});
-    Tensor activated = arena.alloc(DType::BF16, {i, tokens});
+    const Weight global_gate_weight =
+        ops::prepare_linear_weight(model.input(weights.mlp.gate)).weight;
+    const Weight global_up_weight  = ops::prepare_linear_weight(model.input(weights.mlp.up)).weight;
+    const Weight* global_gate_up[] = {&global_gate_weight, &global_up_weight};
+    const bool fuse_gate_up        = tokens == 1 && row_slices_are_contiguous(global_gate_up, 2);
+    Tensor gate_up;
+    Tensor gate;
+    Tensor up;
+    if (fuse_gate_up) {
+        gate_up = arena.alloc(DType::BF16, {2 * i, tokens});
+        gate    = gate_up.slice(0, 0, i);
+        up      = gate_up.slice(0, i, i);
+    } else {
+        gate = arena.alloc(DType::BF16, {i, tokens});
+        up   = arena.alloc(DType::BF16, {i, tokens});
+    }
+    Tensor activated     = arena.alloc(DType::BF16, {i, tokens});
     const MoeScratch moe = weights.moe ? allocate_moe_scratch(config, tokens, arena) : MoeScratch{};
     const Tensor positions = indices.positions.view({tokens, 1, 1});
 
@@ -697,12 +811,14 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
                                       execution);
     }
     ops::linear(attended, to_weight(weights.attention.output), projected, stream);
-    ops::rmsnorm(projected, model.tensor(weights.post_attention_norm), eps, false, branch, stream);
-    ops::residual_add(branch, residual, stream);
+    ops::residual_add_norm(projected, model.tensor(weights.post_attention_norm), eps, residual,
+                           1.0F, stream);
 
     // MLP sublayer: the dense branch, and the MoE block beside it when the model has one.
-    feed_forward_sublayer(model, weights, {normed, branch, projected, down, gate, up, activated},
-                          moe, residual, stream);
+    feed_forward_sublayer(
+        model, weights,
+        {normed, branch, projected, down, gate, up, activated, gate_up, fuse_gate_up}, moe,
+        residual, stream);
 
     CUDA_CHECK(cudaMemcpyAsync(hidden_out.data, residual.data,
                                static_cast<std::size_t>(h) * static_cast<std::size_t>(tokens) *
@@ -843,12 +959,24 @@ void forward_draft(const Model& model, const Tensor& input, std::span<const Draf
             Tensor out(column_data(attended, q_column, column), DType::BF16, {d, hq, 1, 1});
             if (sliding) {
                 const std::size_t source = draft.target_sliding_layer;
-                const Tensor keys        = cache.keys(source);
-                const Tensor values      = cache.values(source);
+                const bool quantized     = cache.quantized(source);
+                const Tensor keys        = quantized ? Tensor{} : cache.keys(source);
+                const Tensor values      = quantized ? Tensor{} : cache.values(source);
                 const Tensor key_pos     = cache.positions(source);
                 const std::int32_t ring  = cache.ring_tokens();
-                const Tensor k_ring(keys.data, DType::BF16, {d, hkv, ring, 1});
-                const Tensor v_ring(values.data, DType::BF16, {d, hkv, ring, 1});
+                // A quantized ring is decoded here too: the drafter reads the same rows the target
+                // wrote, in the same basis.
+                Tensor ring_keys   = keys;
+                Tensor ring_values = values;
+                if (quantized) {
+                    ring_keys   = arena.alloc(DType::BF16, {d, hkv, ring});
+                    ring_values = arena.alloc(DType::BF16, {d, hkv, ring});
+                    ops::dense_kv_ring_decode(cache.key_codes(source), cache.key_scales(source),
+                                              cache.value_codes(source), cache.value_scales(source),
+                                              cache.storage(), ring_keys, ring_values, stream);
+                }
+                const Tensor k_ring(ring_keys.data, DType::BF16, {d, hkv, ring, 1});
+                const Tensor v_ring(ring_values.data, DType::BF16, {d, hkv, ring, 1});
                 const Tensor p_ring(key_pos.data, DType::I32, {ring, 1});
                 const Tensor none;
                 const std::size_t split =
