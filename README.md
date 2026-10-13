@@ -1,5 +1,7 @@
 # ninfer-ext
 
+<img src="screenshots/nx.jpeg" alt="ninfer-ext" width="440">
+
 ninfer-ext is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch
 C++/CUDA inference engine for maximum single-GPU performance on one NVIDIA GeForce RTX 5090.
 
