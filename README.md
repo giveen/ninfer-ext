@@ -106,8 +106,10 @@ Gemma 4 runs MTP on the full proposal head only (1–7 draft tokens) and refuses
 
 ### Serving throughput
 
-Aggregate decode tok/s from `ninfer-serve`, with C concurrent requests each writing a 512-token
-essay (mean of two runs). Bold marks the faster mode at each concurrency.
+Aggregate decode tok/s from `ninfer-serve`: C concurrent requests, mean of two runs. Every row writes
+512-token essays **except Qwen3.8-Flash-Next**, whose rows are 1,024-token reasoning generations —
+the protocol the [master charts](#master-charts) use. Its essay measurement was taken on an older
+build and is superseded; `docs/flash-next.md` keeps it with its commit.
 
 | Artifact | Mode | C=1 | C=2 | C=4 | C=8 |
 |---|---|---:|---:|---:|---:|
@@ -118,14 +120,13 @@ essay (mean of two runs). Bold marks the faster mode at each concurrency.
 | Qwen3.6-35B-A3B `groupwise-int` | plain | 386.6 | 619.8 | **972.3** | **1,324.4** |
 | | `--spec mtp` | **491.9** | **663.5** | 850.9 | 1,001.0 |
 | | `--spec dflash --draft-tokens 7` | 355.4 | 452.1 | 507.7 | 898.9 |
-| Qwen3.8-Flash-Next `nvfp4` | plain | **98.5** | **141.6** | **180.6** | **185.3** |
-| | `--spec mtp` | 82.2 | 136.8 | 165.0 | 182.1 |
+| Qwen3.8-Flash-Next `nvfp4` | plain | 69.7 | 116.1 | 169.2 | 252.5 |
+| | `--spec mtp --draft-tokens 3` | **93.4** | **231.3** | **194.7** | **265.5** |
 
-Every row above writes 512-token essays, which favours plain decode on the two MoE artifacts: 35B-A3B
-and Flash-Next have plain in bold at the top concurrency. The load decides, and two other protocols in
-this README measure it. On the 1,024-token reasoning generations of the [master charts](#master-charts),
-35B-A3B gains 1.46x at two lanes and 1.12x at four while tying at eight, and Flash-Next gains at every
-concurrency (quantified in its paragraph below). On the 4,096-token AIME load of
+The 35B-A3B rows above write 512-token essays, which favours plain decode on that artifact: it has plain
+in bold at the top concurrency. The load decides, and two other protocols in this README measure it. On
+the 1,024-token reasoning generations of the [master charts](#master-charts), 35B-A3B gains 1.46x at two
+lanes and 1.12x at four while tying at eight. On the 4,096-token AIME load of
 [versus stock](docs/vs-stock-ninfer.md), MTP K=3 beats plain at C=4 and DFlash7 is fastest at C=8.
 [Recommended settings](docs/speculative-decoding.md#recommended-settings) answers it per model.
 
@@ -138,11 +139,11 @@ tabulated above: **185.8 / 247.0 / 309.5 / 535.0** tok/s aggregate decode at C=1
 acceptance by scenario, the AIME runs, TTFT and the evaluation scores — and the
 [`nvfp4` card](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) its own set.
 
-**Flash-Next is where the load changes the verdict most.** The essay rows above are from an older build
-(`fc305acd`) and show plain decode winning. On the reasoning load — the protocol the master charts use —
-the **current** build decodes **69.7 → 252.5 tok/s plain and 93.4 → 265.5 with MTP** from one lane to
-eight, a gain at every concurrency, at **4,861 / 5,232 / 4,468 / 3,319** tok/s prefill for 7.7k / 64.5k /
-130k / **260k**-token prompts. It is the only model here that runs that last one.
+**Flash-Next's rows are the reasoning load**, and they are the current build. Its decode gains from MTP
+at every concurrency — 1.34x at one lane, 1.99x at two, 1.15x at four, 1.05x at eight — and its prefill
+reaches **4,861 / 5,232 / 4,468 / 3,319** tok/s for 7.7k / 64.5k / 130k / **260k**-token prompts, the
+last of which no other model here can run. Its numbers are **host-bound**: the routed experts live in
+pinned host RAM and stream over PCIe, so the host and the link matter as much as the GPU.
 ([detail](docs/flash-next.md#reasoning-load-numbers-decode-saturation))
 
 ### Single-request benchmark
