@@ -13,6 +13,13 @@ run the CLI or HTTP server.
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Optimizer](optimizer.md) | use-case runbooks and a designed-experiment sweep that picks the fastest/balanced/max-context configuration for a machine |
+| [Qwen3.8-Flash-Next](flash-next.md) | the ~180B MoE with pinned-host experts: requirements, download, EXL3 variants, and speed |
+| [Speculative decoding](speculative-decoding.md) | MTP, DFlash, DFlash2, EAGLE3, the prompt-lookup drafter, adaptive draft lengths, and the per-model recommended settings |
+| [EXL3 quantization](quantization.md) | the trellis format at 4.0 and 3.5 bpw: quality, size, and single-request speed |
+| [KV streaming and context cache](kv-and-context.md) | contexts beyond GPU memory, salvage, anchors, the Host-tier budget, and the serving extras |
+| [Gemma 4](gemma4.md) | Gemma 4 31B and 26B-A4B: representation, measured numbers, and limits |
+| [Versus stock NInfer](vs-stock-ninfer.md) | like-for-like comparison against upstream, and stock's numbers beside the fork's latest |
+| [Engineering notes](engineering.md) | conversion throughput, C++23, and the upstream PRs merged ahead |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
@@ -28,6 +35,8 @@ The executable `--help` output is the exact source for command-line option spell
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
 | Qwen3.8-27B | `exl3` 4.0 bpw | [Hugging Face](https://huggingface.co/jabbatheduck/ninfer-ext-models) | [model card](../model-cards/ninfer-ext-models/README.md) |
 | Qwen3.8-27B | `exl3` 3.5 bpw | [Hugging Face](https://huggingface.co/jabbatheduck/ninfer-ext-models) | [model card](../model-cards/ninfer-ext-models/README.md) |
+| Gemma 4 31B IT | `M1` (Q6/Q5 g64) | [Hugging Face](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-31b-it-m1) | [HF card](https://huggingface.co/jabbatheduck/ninfer-ext-models/blob/main/gemma4-31b-it-m1/README.md) |
+| Gemma 4 26B-A4B IT | QAT int4 experts + Q8 | [Hugging Face](https://huggingface.co/jabbatheduck/ninfer-ext-models/tree/main/gemma4-26b-a4b-qat) | [model card](../model-cards/Gemma4-26B-A4B-QAT-NInfer/README.md) |
 
 ## Repository-local guides
 
