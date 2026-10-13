@@ -26,10 +26,14 @@ using MmaR128T80 = Q8A16MmaSchedule<128, 80, 64, 64, 16, 2, 2>;
 using MmaR64x16T48K128A1 = Q8A16MmaSchedule<64, 48, 128, 16, 24, 1, 2>;
 using MmaR64x32T64K128A1 = Q8A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>;
 
-using SimtR8T4         = Q8A16SimtSchedule<8, 4, 1, 32, 2, Cache::cg, 1>;
-using SimtR8T8         = Q8A16SimtSchedule<8, 8, 1, 32, 2, Cache::cg, 1>;
-using GemvR4W1K16384   = Q8A16GemvSchedule<4, 1, 2, 16384>;
-using SimtR4T4W2G16S2  = Q8A16SimtSchedule<4, 4, 2, 16, 2, Cache::cg, 1>;
+using SimtR8T4        = Q8A16SimtSchedule<8, 4, 1, 32, 2, Cache::cg, 1>;
+using SimtR8T8        = Q8A16SimtSchedule<8, 8, 1, 32, 2, Cache::cg, 1>;
+using GemvR4W1K16384  = Q8A16GemvSchedule<4, 1, 2, 16384>;
+using SimtR4T4W2G16S2 = Q8A16SimtSchedule<4, 4, 2, 16, 2, Cache::cg, 1>;
+// Decode widths on shapes with few output rows (the hyper-connection projections are 320-324 rows):
+// eight warps share each row, so such a problem launches about a full wave instead of a quarter of
+// one.
+using SimtR2T4W8G16S2  = Q8A16SimtSchedule<2, 4, 8, 16, 2, Cache::cg, 1>;
 using SlicedR16T16W8S2 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared>;
 using SlicedR16T16W4S2 = Q8A16SlicedKMmaSchedule<16, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca,
                                                  Cache::cg, Q8ActivationStage::PaddedZero>;

@@ -101,6 +101,15 @@ machine (RTX 5090, i9-285K, MTP K=3, fp8 KV, `--expert-cache auto`):
   investigated.
 - Next-layer expert prefetch (the next router applied to this layer's input, fetching its predicted
   misses early) cost 4–8% decode here and is not in the tree.
+- Computing the cache-missed routed experts on the host instead of fetching them (a host lane beside
+  the resident experts' device work, `--host-expert-lane`) measured **34.35 tok/s against 81.73** for
+  the fetch path in one session, and is not in the tree. The reason is arithmetic, not the kernel: an
+  expert is 4.9 M weights in 2.76 MB, 1.8 MACs per byte, so the 50 GB/s fetch delivers about
+  90 GMAC/s while eight cores without AVX-512 deliver 24–48 GMAC/s of decode-limited work on 4-bit
+  codes. A scalar host kernel ran 11.09 tok/s; an AVX2 kernel with a table-decoded E4M3 block scale,
+  checked against the FP64 oracle by the offload-MoE op test, reached 34.35, which is this box's
+  ceiling. `bench/ops/expert_fetch_bench.cu` measures the pieces: SM-issued reads reach 35 GB/s from
+  the pinned 2 MiB-page bank while the copy engine moves the same bytes at 47 GB/s.
 - Frequency-protected cache admission (LFRU, scoring slots `freq / (age + 1)` instead of by age)
   cost 3.9–4.0% **more** misses than the LRU key and is not in the tree: 32,862 and 32,907 misses
   under LRU against 34,132 (per-expert counts) and 34,173 (sticky frame counts), on one
@@ -140,6 +149,13 @@ Adaptive MTP (`--spec mtp` alone) chooses its draft length from timing and accep
 same binary can settle on different lengths from run to run: one master run took 66 verify rounds
 (126.5 tok/s) and every other run 36. At 36 rounds it measured 143.1 tok/s on `31fcfd74` and
 150.8–156.9 on `fc305acd`.
+
+Decode-width (`T <= 4`) q8 routes are chosen per shape, measured 2026-10-13 on the same box with
+`ninfer_linear_bench --qtype Q8 --t 1` (cold L2, one window, an unpatched shape as the drift
+control): the 320/324-row, 10,240-wide hyper-connection pair drops from 10.24 to 8.19 us per call
+with eight warps per row, and the 1,280-row MoE shared gate from 10.24 to 8.19 us with two. More
+warps per row is right only where K is wide — on a 320-wide K it regresses up to 5.2x, because each
+warp is left with too little of the reduction — so the remaining shapes keep the generic route.
 
 Serving 512-token essays with `ninfer-serve`, aggregate decode tok/s over C concurrent requests
 (mean of two runs):

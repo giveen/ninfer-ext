@@ -38,12 +38,14 @@ constexpr std::array kShapes{
     shape<Q8N34816K5120>(select_q8_n34816_k5120),
     shape<Q8N248320K5120>(select_q8_n248320_k5120),
     // Qwen4Exp: attention q/k/gate/v, indexer q/k, mixer outputs, GDN q/k/v/z, shared expert,
-    // hyper-connection mixers, PLE key/value, MTP stems and the Vision merger output.
+    // hyper-connection mixers, PLE key/value, MTP stems and the Vision merger output. The 1280-row
+    // MoE shared gate takes the few-row route and the 10240-wide hyper-connection pair the wide-k
+    // one; the rest keep the generic route, which measured better than either on them.
     ShapeEntry{13312, 2560, select_q8_qwen4_exp},
     ShapeEntry{640, 2560, select_q8_qwen4_exp},
     ShapeEntry{2560, 6144, select_q8_qwen4_exp},
     ShapeEntry{16384, 2560, select_q8_qwen4_exp},
-    ShapeEntry{1280, 2560, select_q8_qwen4_exp},
+    ShapeEntry{1280, 2560, select_q8_qwen4_exp_few_rows},
     ShapeEntry{2560, 640, select_q8_qwen4_exp},
     ShapeEntry{324, 10240, select_q8_qwen4_exp_wide_k},
     ShapeEntry{320, 10240, select_q8_qwen4_exp_wide_k},

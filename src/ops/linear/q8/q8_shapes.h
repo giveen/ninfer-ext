@@ -43,6 +43,7 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
 // Shared selector of the Qwen4Exp (hidden 2560) problems.
 [[nodiscard]] Q8Launch select_q8_qwen4_exp(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_exp_few_rows(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_qwen4_exp_wide_k(std::int32_t tokens);
 // Generic T selection for problems that use the untuned routes: the EAGLE3 draft's projections.
 [[nodiscard]] Q8Launch select_q8_generic(std::int32_t tokens);
