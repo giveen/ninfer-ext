@@ -45,7 +45,12 @@ ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("qwen3_6_35b_a3b_nvfp4", "models/qwen3_6_35b_a3b_nvfp4.ninfer"),
     ("gemma4_31b_it_m1", "models/gemma4_31b_it_m1.ninfer"),
     ("gemma4_26b_a4b_qat", "out/gemma4_26b_a4b_qat.ninfer"),
+    ("qwen3.8-flash-next", "models/qwen3.8-flash-next/qwen3_8_flash_next_nvfp4.ninfer"),
 )
+
+# Models that take `--kv-capacity auto`: an explicit capacity would take their KV headroom out of a
+# device expert cache that is on their critical path, which costs far more than the window is worth.
+AUTO_CAPACITY: frozenset[str] = frozenset({"qwen3.8-flash-next"})
 
 # Tokens of KV the card holds across all lanes. Every lane reserves a *full* window --
 # gemma_engine_options forces kv_capacity = max_context and Program::device_bytes sizes the KV per
@@ -128,9 +133,10 @@ def command(campaign: Campaign, args) -> list[str]:
         "--kv-dtype",
         args.kv_dtype,
         # Gemma forces an explicit capacity of max_context and reports it as explicit; `auto` makes
-        # the runner's engine-block check disagree with it, so every campaign states it.
+        # the runner's engine-block check disagree with it, so those campaigns state it. A model in
+        # AUTO_CAPACITY wants `auto` instead; see the constant.
         "--kv-capacity",
-        str(campaign.context),
+        "auto" if campaign.model in AUTO_CAPACITY else str(campaign.context),
         "--max-context",
         str(campaign.context),
         "--prefill-chunk",

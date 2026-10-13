@@ -71,41 +71,67 @@ def prefill_series(runs: list[Path], readings: list[dict[str, Any]], model: str)
     return out
 
 
+def decode_series(readings: list[dict[str, Any]]) -> dict[tuple[int, int, str], float]:
+    """Decode rate keyed by (concurrency, context, mode), so a chart can carry MTP beside plain.
+
+    The plain path keeps an empty mode string -- it is the baseline a chart reads against -- and any
+    speculative run keeps its mode name, which is also what makes the line dashed.
+    """
+    out: dict[tuple[int, int, str], float] = {}
+    for reading in readings:
+        if reading.get("suite") != "decode-saturation":
+            continue
+        value = reading.get("decode")
+        if not isinstance(value, (int, float)) or value <= 0:
+            continue
+        mode = reading.get("mode") or ""
+        plain = "" if mode in ("mtp0", "none", "None") else str(mode)
+        out[(reading["concurrency"], reading["context"], plain)] = float(value)
+    return out
+
+
 def human_context(tokens: int) -> str:
     return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
 
 
 def draw(model: str, readings: list[dict[str, Any]], runs: list[Path], out: Path) -> list[Path]:
     prefill = prefill_series(runs, readings, model)
-    decode = series(readings, "decode-saturation", "decode")
+    decode = decode_series(readings)
     if not prefill and not decode:
         return []
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8.5), constrained_layout=True)
 
     def against_context(axis, data, title, ylabel) -> None:
-        grouped: dict[int, list[tuple[int, float]]] = collections.defaultdict(list)
-        for (concurrency, context), value in data.items():
-            grouped[concurrency].append((context, value))
-        for concurrency in sorted(grouped):
-            points = sorted(grouped[concurrency])
-            axis.plot([p[0] for p in points], [p[1] for p in points], marker="o", label=f"c{concurrency}")
+        grouped: dict[tuple[int, str], list[tuple[int, float]]] = collections.defaultdict(list)
+        for key, value in data.items():
+            concurrency, context = int(key[0]), int(key[1])
+            mode = str(key[2]) if len(key) > 2 else ""
+            grouped[(concurrency, mode)].append((context, value))
+        for (concurrency, mode) in sorted(grouped):
+            points = sorted(grouped[(concurrency, mode)])
+            label = f"c{concurrency}" + (f" {mode}" if mode else "")
+            axis.plot([p[0] for p in points], [p[1] for p in points], marker="o",
+                      linestyle="--" if mode else "-", label=label)
         axis.set_xscale("log", base=2)
         axis.set_xlabel("context (prompt tokens)")
         axis.set_ylabel(ylabel)
         axis.set_title(title)
         axis.grid(True, which="both", alpha=0.3)
         if grouped:
-            axis.legend(title="concurrency", fontsize=8)
+            axis.legend(title="concurrency / mode", fontsize=8)
 
     def against_concurrency(axis, data, title, ylabel) -> None:
-        grouped: dict[int, list[tuple[int, float]]] = collections.defaultdict(list)
-        for (concurrency, context), value in data.items():
-            grouped[context].append((concurrency, value))
-        for context in sorted(grouped):
-            points = sorted(grouped[context])
+        grouped: dict[tuple[int, str], list[tuple[int, float]]] = collections.defaultdict(list)
+        for key, value in data.items():
+            concurrency, context = int(key[0]), int(key[1])
+            mode = str(key[2]) if len(key) > 2 else ""
+            grouped[(context, mode)].append((concurrency, value))
+        for (context, mode) in sorted(grouped):
+            points = sorted(grouped[(context, mode)])
+            label = human_context(context) + (f" {mode}" if mode else "")
             axis.plot([p[0] for p in points], [p[1] for p in points], marker="o",
-                      label=human_context(context))
+                      linestyle="--" if mode else "-", label=label)
         axis.set_xscale("log", base=2)
         axis.set_xticks([1, 2, 4, 8])
         axis.set_xticklabels(["1", "2", "4", "8"])
@@ -114,7 +140,7 @@ def draw(model: str, readings: list[dict[str, Any]], runs: list[Path], out: Path
         axis.set_title(title)
         axis.grid(True, which="both", alpha=0.3)
         if grouped:
-            axis.legend(title="context", fontsize=8)
+            axis.legend(title="context / mode", fontsize=8)
 
     against_context(axes[0][0], prefill, "prefill against context", "prefill tok/s")
     against_context(axes[0][1], decode, "decode against context (steady)", "decode tok/s")
