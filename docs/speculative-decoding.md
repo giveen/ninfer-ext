@@ -18,7 +18,7 @@ is used or not. Where a cell says the workload decides, the numbers behind it ar
 | Qwen3.8-27B `groupwise-int` (official artifact) | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` | `--spec mtp --lm-head-draft` | `--spec mtp --draft-tokens 5 --fixed-draft --lm-head-draft` |
 | Qwen3.8-27B `exl3` 4.0 / 3.5 bpw | `--spec mtp --draft-tokens 3 --fixed-draft` | not measured | not measured |
 | Qwen3.6-35B-A3B | `--spec mtp --lm-head-draft` | same at 2; at 4, same for long reasoning and no `--spec` for short prose | `--spec dflash --draft-tokens 7 --lm-head-draft` for long reasoning; no `--spec` for short prose |
-| Qwen3.6-27B (both) | not measured; start from the Qwen3.8-27B row of the same weights | | |
+| Qwen3.6-27B (both) | `--spec mtp --draft-tokens 3` (measured: 73–79% acceptance on long reasoning, 38–89% by scenario — [card](../model-cards/Qwen3.6-27B-NInfer/README.md)) | not measured | not measured |
 | Qwen3.8-Flash-Next | `--spec mtp --draft-tokens 15 --fixed-draft --lookup-drafts auto` | same | same |
 | Gemma 4 31B / 26B-A4B | `--spec mtp` (full proposal head; `--lm-head-draft` is refused) | draft length decides: see [Gemma 4](gemma4.md) | | 
 

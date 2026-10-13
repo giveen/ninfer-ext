@@ -20,7 +20,9 @@ below. Every model runs through the same `ninfer-serve`, CLI and Engine.
 
 One figure per model, drawn by [`tools/bench/plot_master.py`](tools/bench/plot_master.py) from the runs
 in `profiles/bench/all_models/`. Each has four panels: prefill and decode against context (a line per
-concurrency) and the same two against concurrency (a line per context).
+concurrency) and the same two against concurrency (a line per context). Six models have one;
+Qwen3.6-27B is quoted under [serving throughput](#serving-throughput) instead, because its campaign
+was run separately and is not in that root.
 
 Prefill is the per-request rate at c1 and the point aggregate at c2–c8 (prompt tokens over the whole
 makespan, so it includes each request's decode); decode is the steady rate over complete intervals
@@ -106,6 +108,15 @@ MTP K=3 beats plain at C=4 and DFlash7 is fastest at C=8. Which mode wins depend
 [recommended settings](docs/speculative-decoding.md#recommended-settings) has the per-model answer, and
 [versus stock](docs/vs-stock-ninfer.md) the same load measured against upstream.
 
+Qwen3.6-27B was measured in its own campaign rather than this one — a 293-token prompt, an
+8,192-token generation per request, INT8 group-64 KV and MTP=3 — so its numbers are quoted, not
+tabulated above: **185.8 / 247.0 / 309.5 / 535.0** tok/s aggregate decode at C=1/2/4/8, with MTP=3 and
+73–79% acceptance on long reasoning. With MTP off it decodes 77.6 / 70.7 / 64.5 / 54.8 tok/s at
+7.7k / 64.5k / 130k / 260k tokens of context, at 3,218 / 2,656 / 2,185 / 1,615 tok/s prefill. The
+[`groupwise-int` card](model-cards/Qwen3.6-27B-NInfer/README.md) carries the full tables — MTP
+acceptance by scenario, the AIME runs, TTFT and the evaluation scores — and the
+[`nvfp4` card](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) its own set.
+
 On the long-reasoning load, Flash-Next's prefill reaches 1,090 / 3,666 / 3,498 / 2,908 / 2,218 tok/s at
 1.5k / 8k / 64k / 128k / 256k tokens, and its decode is 81 tok/s with MTP K=3
 ([detail](docs/flash-next.md#speed)).
@@ -155,7 +166,13 @@ NVMe drive.
 - **Master charts.** `run_bench_sweep.py` drives each artifact through `corpus-makespan` (prefill
   against context) and `decode-saturation` (steady decode, at the fixture's context and at padded
   contexts); see [serving benchmarks](tools/bench/README.md).
-- **Not yet measured.** The Qwen3.6-27B artifacts.
+- **Qwen3.6-27B.** Measured in its own campaign — a 293-token prompt, an 8,192-token generation per
+  request, INT8 group-64 KV, CUDA Graphs and MTP=3 — and recorded in the
+  [`groupwise-int`](model-cards/Qwen3.6-27B-NInfer/README.md) and
+  [`nvfp4`](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) model cards, with the numbers quoted under
+  [serving throughput](#serving-throughput). It has no master chart: those are drawn from the runs in
+  `profiles/bench/all_models/`, and the sweep skips a model whose artifact is absent from the
+  benchmark root.
 - **Raw reports** are kept locally under `profiles/bench/`, and the methodology upstream publishes is
   in the [performance index](docs/performance.md).
 
