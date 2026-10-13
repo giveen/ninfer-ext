@@ -31,7 +31,8 @@ One figure per model, drawn by [`tools/bench/plot_master.py`](tools/bench/plot_m
 in `profiles/bench/all_models/`. Each has four panels: prefill and decode against context (a line per
 concurrency) and the same two against concurrency (a line per context). Six models have one;
 Qwen3.6-27B is quoted under [serving throughput](#serving-throughput) instead, because its campaign
-was run separately and is not in that root.
+was run separately and is not in that root. The decode panels carry the same-session MTP run as a
+dashed line labelled with its mode, so plain and speculative decode sit in one chart.
 
 Prefill is the per-request rate at c1 and the point aggregate at c2–c8 (prompt tokens over the whole
 makespan, so it includes each request's decode); decode is the steady rate over complete intervals
@@ -67,7 +68,8 @@ reach the contexts its KV window fits — 262,144 tokens at one lane, 32,768 at 
 <details>
 <summary>MTP against plain decode, same session, both modes in one invocation</summary>
 
-Decode at a ~300-token context, gain at two / four / eight lanes. Speculation pays where decode is
+The runs the dashed lines in the decode panels come from, in detail: decode at a ~300-token context,
+gain at two / four / eight lanes. Speculation pays where decode is
 weight-bound and stops paying once the engine already has a full batch: the dense 27B models gain
 about 2x at every concurrency, while on Gemma 4 26B-A4B at four lanes MTP is *slower* than plain
 decode (606 → 409 tok/s) because the draft passes cost more than the tokens they commit.
