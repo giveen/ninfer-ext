@@ -184,8 +184,12 @@ NVMe drive.
   [serving throughput](#serving-throughput). It has no master chart: those are drawn from the runs in
   `profiles/bench/all_models/`, and the sweep skips a model whose artifact is absent from the
   benchmark root.
-- **Raw reports** are kept locally under `profiles/bench/`, and the methodology upstream publishes is
-  in the [performance index](docs/performance.md).
+- **Raw reports.** The chart, MTP and Qwen3.6-27B numbers resolve to runs under `profiles/bench/`
+  (`all_models/`, `mtp_decode/`) or to the model cards; the Flash-Next single-request reports are in
+  `profiles/bench/readme_20260926b/`. The serving table's own campaign is **not on this disk**, so
+  those numbers are inherited from the measurement whose commits are named above rather than
+  re-derivable here. Upstream's published methodology is in the
+  [performance index](docs/performance.md).
 
 ## Quick start
 
