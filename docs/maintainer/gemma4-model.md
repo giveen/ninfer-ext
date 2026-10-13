@@ -310,10 +310,12 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   types this model never constructs are the Qwen contract's pure-data types; moving them into
   `runtime/contract` is the plan's D1-b extraction and is not done.
 - **Refused options**: speculative backends other than MTP (and MTP's optimized proposal head,
-  prompt-lookup drafts and draft trees), a KV format other than BF16, KV streaming, and an
-  explicit KV capacity below `max_context`. Video, images in tool results and images in causal scoring
-  are refused per request. `ninfer-perplexity` defaults to FP8 KV, so it needs
-  `--kv-dtype bf16` for this model.
+  prompt-lookup drafts and draft trees), KV streaming, and an explicit KV capacity below
+  `max_context`. Every `--kv-dtype` the engine exposes is wired: the four quantized formats
+  quantize the 25 sliding rings and the five global layers stay BF16 (plan §7). Video, images in
+  tool results and images in causal scoring are refused per request. `ninfer-perplexity` defaults
+  to FP8 KV, which this model now accepts; the documented scoring numbers below are the BF16 ones,
+  so a comparison against them wants `--kv-dtype bf16`.
 - **CUDA Graphs** (`use_cuda_graph`, on by default): the decode pass of each set of lanes is
   captured once, on its first round after the Program's first (eager) decode, and replayed for every
   later round of that set; the 16 most recently used sets are kept. The lanes are laid out in
@@ -441,10 +443,9 @@ where every lane ran its own pass:
 | 4 | 165.8 | 41.8 | 56.5 | 14.2 |
 | 8 | 291.0 | 37.1 | 56.2 | 7.1 |
 
-The repository's serving harness (`tools/bench/run_serve_concurrency.py`) does not run this model
-(it requires a `prefill_signature` in the server's start log), so these come from a scratch client
-with the same request shape. Attention is still per lane (60 layers x C launches a round); its
-share of a C=8 round was not measured.
+These come from a scratch client with the same request shape (the serving harness required a
+`prefill_signature` in its start log at the time; this model's path now emits one). Attention is
+still per lane (60 layers x C launches a round); its share of a C=8 round was not measured.
 
 MTP rounds batch the same way (section 10). Same requests with `--spec mtp --draft-tokens 7`,
 against the commit where every lane drafted and verified alone:
@@ -689,7 +690,8 @@ table and this one should not be differenced across sessions.
 | Global decode attention at long context | one key tile in flight per block, one block per SM (68 KB shared): 25% of DRAM peak at 8K | tried and dropped (2026-10-11): 16-key tiles through three cp.async stages (88 KB), scoring split over two halves of the dims, took the global kernel from 86.2 to 67.2 us under ncu's base clocks at 8K, but the bench was level at 8K and 32K and 1.1-1.5% slower after a 64K prompt. Per-tile fixed costs (a position round trip and four barriers) double with 16-key tiles; a next attempt should keep 32-key tiles, e.g. 8 query rows instead of 16 in shared memory to fit two stages |
 | Fewer decode kernels | a decode token is ~1,370 kernels; graphs removed the host side of the launch cost (section 12) but not the per-kernel latency | fusing the per-sublayer norm, residual add and layer scalar; a first attempt failed the numerics (section 15) |
 | Output constraints | refused | token-mask consumption in the Program |
-| FP8 KV | refused | the codecs of plan row 7 |
+| Quantized KV on the global layers | the five global layers stay BF16, so a quantized run still keeps 5 of 30 layers' KV at two bytes an element | step 2 of plan §7: D512 rows with two KV heads, K = V, 640 stored values, which no existing codec covers |
+| Quantized KV elsewhere | wired: `--kv-dtype int8|fp8|nvfp4|k8v4` quantize the 25 sliding rings (plan §7 step 1), each qualified by `ninfer_gemma4_kv_quant_test` and scored below | wider formats, a finer NVFP4 block, or a codec for the global rows |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
 | JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
 | MTP at eight lanes, a cheaper drafter step | an MTP server with eight lanes fails its KV allocation at max context 1024 and 2048; drafting is 3-7 ms of a 7-draft round | the device budget of eight MTP lanes. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
@@ -714,9 +716,11 @@ Checked against llama.cpp (MIT) `src/models/gemma4.cpp` and `common/parsers/gemm
 
 ## 16. Gemma 4 26B-A4B (the MoE variant)
 
-**Status.** Planned, not executed: the work is on branch `gemma4-26b` and its phases are in
-`docs/maintainer/gemma4-26b-plan.md`. Sections 1–15 remain the 31B authority and this section is the
-26B one; where they differ, this section wins for the 26B.
+**Status.** Executed: the model runs, serves and speculates, and the phase record with each measured
+step is in `docs/maintainer/gemma4-26b-plan.md`. Sections 1–15 remain the 31B authority and this
+section is the 26B one; where they differ, this section wins for the 26B. §16.5 covers the assistant
+drafter as it landed; the artifact's layout and its decode and prefill measurements still move in
+from the plan when that plan's P5 closes.
 
 ### 16.1 Configuration
 
@@ -850,21 +854,127 @@ their own `MoeWeights`.
   its dense MLP.
 - **A quantized linear route resolves its geometry from a fixed registry of hand-tuned shape files**
   (`src/ops/linear/<format>/<format>_dispatch.cpp`), and the FP8, NVFP4, Q4–Q6 and BF16 registries
-  hold only the Qwen and 31B geometries. The row-split int8 route is the only one whose registry
+  hold only the Qwen, 31B and (since §16.5) 26B-drafter geometries. Two layouts have been built on
+  this: the bring-up recipe (`gemma4_26b_a4b_base`, NVFP4 experts) puts every 26B projection a linear
+  route touches on `q8_g32_fp16`, because the row-split int8 route is the only one whose registry
   carries a generic selector (`select_q8_generic`, already used by the EAGLE3 drafter and the vision
-  tower), so every 26B projection a linear route touches is `q8_g32_fp16`: the fused qkv parent and
-  its query/key/value slices at both head widths, the attention output at both, the dense MLP's
-  gate/up and down, and the tied head. The same ten shapes are in `test_q8_a16.cpp`'s geometry table,
-  where the T sweep meets the FP64 oracle. The routed experts are again the exception, because no
-  linear route sees them: they keep NVFP4, and they are the only part of this model that spends four
-  bits on this pass. Registering NVFP4 shapes for the dense MLP is what closes that difference, and
-  it is a P5 item rather than a P3 one.
+  tower) — the fused qkv parent and its query/key/value slices at both head widths, the attention
+  output at both, the dense MLP's gate/up and down, and the tied head, with the same ten shapes in
+  `test_q8_a16.cpp`'s geometry table where the T sweep meets the FP64 oracle. The shipping recipe
+  (`gemma4_26b_a4b_qat`, the plan's P5) instead takes the row-grouped int4 grid on all of them plus
+  Q6 for the drafter, so those shapes are registered in Q4 rows and Q6. The routed experts are the
+  exception every time, because no linear route sees them: they are decoded by the MoE Op itself.
 - **The padded width is inert**: the zero gate/up rows and matching zero down columns of §16.1 cannot
   contribute, because GeGLU maps zero to zero. The expert test pins this rather than assuming it.
 - **The MoE branch adds no large scratch.** It reuses the dense branch's `[H,T]` buffers in place —
   `normed` once the gate/up projections have read it, `down` once the dense branch's post-norm has
   read it, and the attention's `projected` once its post-norm has — so the only new storage is the
   router's output, `2·K·T·4` bytes per layer per pass.
-- The 26B's assistant is dense (`enable_moe_block: false`, four layers), so the drafter path is
-  unchanged by the block.
+- The 26B's assistant is dense (`enable_moe_block: false`, four layers), so the MoE block does not
+  reach the drafter.
+
+### 16.5 The assistant drafter (MTP speculation)
+
+The sibling `26b-full/assist` (`Gemma4AssistantForCausalLM`, 839 MB, 48 tensors) is the 31B's
+assistant at the 26B's geometry, and §12a's machinery carries it unchanged. Its config is
+structurally the 31B's — hidden 1024, four layers (three sliding, one global), intermediate 8192,
+`num_kv_shared_layers` 4, the same `layer_types` and RoPE, and no key or value projections — and what
+differs is only what a drafter inherits from its target: `backbone_hidden_size` 2816,
+`num_attention_heads` 16, `num_key_value_heads` 8, `num_global_key_value_heads` 2. The converter
+already reads each of those from the target (`tools/convert/gemma4.py`'s `draft_config` checks every
+one against it), so the conversion is `--components text,mtp --source mtp=<assist>` with no code
+change. Both configs also carry `num_centroids: 2048`, `centroid_intermediate_top_k: 32` and
+`use_ordered_embeddings: false`, which settles §16.3's open check: the ordered (centroid) head is off
+in both, so the centroid path stays unimplemented and nothing else in the drafter is missing.
+
+**The artifact carries the drafter inside it**, as the 31B's does — 44 more objects (621 against
+577), about 0.4 GB, bound only under `--spec mtp`. It is Q6 g64 throughout, head included: the
+31B's measured choice, for the same reason (the target verifies every draft, so the format moves only
+acceptance and the drafter's step cost).
+
+**Four entries were needed in the Q6 registry.** A quantized linear route resolves its geometry from a
+fixed table, and the drafter's attention widths are its *target's* head count times the head width, so
+none of the 31B drafter's seven entries fits this one: `pre_projection` [1024, 5632] (2 · 2816),
+`post_projection` [2816, 1024], the sliding `attention/query` [4096, 1024] with its `attention/output`
+[1024, 4096] (16 · 256), and the global layer's query and output. The global query is [8192, 1024] and
+its output [1024, 8192] — the 31B drafter's *sliding* widths — so only four entries are new, and they
+reuse the 31B drafter's selectors, whose single-token branch is a GEMV and whose narrow branches are
+`sliced` kernels that divide any width the drafter has. Covered by the recipe test (both 26B layouts
+put every `mtp/` projection on Q6) and by `test_q6_a16.cpp`'s sweep, which now carries the four shapes
+at T = 1, 2 and 8 against the FP64 oracle.
+
+**Measured** (RTX 5090, `out/gemma4_26b_a4b_qat.ninfer`, greedy, 384 output tokens, one request,
+`ninfer` CLI decode speed, `--spec mtp --draft-tokens 7` adaptive):
+
+| Prompt | No MTP | adaptive ≤ 7 | acceptance | accepted per round | rounds by length |
+|---|---:|---:|---:|---:|---|
+| code | 340.9 | 528.7 | 81.0% | 3.65 | K2 46, K3 15, K4 34, K7 10 |
+| story | 341.9 | 388.5 | 53.5% | 2.08 | K2 183, K4 1 |
+| explain | 340.3 | 439.4 | 64.8% | 2.47 | K1 1, K2 115, K3 38, K7 1 |
+| math | 342.1 | 580.2 | 88.9% | 4.35 | K2 24, K3 41, K7 23 |
+| translate | 340.7 | 508.0 | 74.7% | 3.46 | K2 10, K4 13, K7 1 |
+
++13.6% (story) to +69.6% (math), and +43.3% on the mean of 341.2 to 489.0 tok/s. The ladder is doing
+real work: it takes K7 on the two prompts where acceptance holds (code, math) and stays at K2 on
+prose, which is where the accepted-by-position histogram dies — the 31B's did the same.
+
+**A round costs 2.9 ms plus 1.2 ms per draft step.** From fixed-draft runs on the math prompt
+(K=1 → 467.5 tok/s at 1.94 accepted per round, K=3 → 550.4 at 3.65, K=7 → 577.1 at 6.49), the round
+cost is 4.15, 6.63 and 11.25 ms: each extra pair of drafts costs 2.48 and 4.62 ms, so a step is
+1.16-1.24 ms, and the residual — the target's verify pass over 2, 4 and 8 columns — is 2.9 ms flat,
+the same as a single-token decode (341 tok/s). The drafter's 0.4 GB a step imply 0.22 ms at the
+card's bandwidth, so its step is 5x off the transfer bound: the 31B drafter's selectors are noted
+"untuned beyond that" at hidden 1024, and the drafter's own launch count is the same order as the
+target's. That is the lever a further MTP pass would take, not the acceptance rate: at 1.2 ms a step
+the ladder is already right to stop drafting, because a rung only pays when its extra drafts convert.
+The verify pass being flat to eight columns is what makes the whole thing work at all — before the
+2-8 token Q6 route the same run lost on prose (the 31B's §12a finding, unchanged here).
+
+Correctness: `ninfer_gemma4_mtp_test` against this artifact (1,100-token prompt, 384 greedy tokens,
+seven drafts) passes — 62 rounds with 322 of 428 drafts accepted, every sliding ring and global row
+holding exactly its committed position, and MTP disagreeing with one fresh scoring pass on 9 of 384
+tokens against plain decode's 8, so the verify and single-token passes round the same way here (the
+counts differ by a token or two run to run, which is why the test compares ratios and not a count).
+The drafter's step is separately exercised by `ninfer_gemma4_draft_test`, and the added component
+leaves the target untouched: mean NLL on the 40 KB slice is `5.398730771493524`, bit-identical to the
+artifact without it.
+
+### 16.6 The vision tower
+
+The checkpoint is `Gemma4ForConditionalGeneration`, and its `vision_config` is the 31B's field for
+field -- hidden 1152, 27 layers, 16 heads, head_dim 72, patch 16, intermediate 4304 stored as 4352,
+`position_embedding_size` 10240, pooling 3, RoPE theta 100, `standardize`, `gelu_pytorch_tanh` -- so
+the tower needs no new geometry beyond its text width: the soft-token projection writes 2816 where
+the 31B's writes 5376. The intermediate width is stored as 4352 for the same block-scale reason as
+the text MLP (N % 128 == 0), and it is exact because GeGLU maps a zero gate and up to a zero.
+
+Its formats follow the 31B's measured layout one step finer: **Q8 for the tower's linears and BF16 for
+`vision/patch_embedding` and `vision/embedding_projection`**. Q8 because the row-split int8 route
+resolves any shape through its generic selector, where Q6 would need a registry entry per geometry,
+and because the tower is only about 0.42 B parameters; BF16 for the two projections for the reason
+the 31B keeps them there, and together they are about 8 MB.
+
+Converting with `--components text,vision,mtp` adds 306 objects (927 in all). One C++ entry was
+needed: the `bf16` linear table already had `{1152, 768}` for the patch embedding, and
+`{2816, 1152}` was added beside the 31B's `{5376, 1152}` for the 26B's soft-token projection
+(`src/ops/linear/bf16/shapes/gemma4_vision.cu`). The QAT recipe's gate/up grouping sweep is
+restricted to `text/` layers, because without that test it also matches
+`vision/layers/N/mlp/gate` and regroups the tower's gate and up -- which the 31B converts apart.
+
+Qualified against transformers' own tower (`tools/verify/gemma4_vision_reference`, run under the
+system Python 3.14, which carries transformers 5.14 and `Gemma4Config`; the project venv's 4.57
+predates Gemma 4). Mean cosine of NInfer's soft tokens against the FP32 tower, over two images: this
+model's tower reads 0.997972 (276 tokens) and 0.998385 (264 tokens), while transformers' own BF16
+tower against that same reference reads 0.998139 and 0.996017 -- the Q8 tower is level with, and on
+one image above, the BF16 floor. `worst NInfer mean token cosine 0.997972`. Per-token minima run
+lower (0.761, 0.937) exactly as the BF16 tower's do (0.918, 0.785), which is pooling at tokens whose
+pooled feature is nearly null, not a systematic difference. The same harness simulates formats alone
+(`--gate-up/--rest`): against the FP32 tower Q8 reads 0.999883 and 0.997430 where Q6 reads 0.997497
+and 0.995134, so Q8 is measurably the better choice here. Preprocessing is checked separately by
+`ninfer_gemma4_image_processor_test` against the processor's own resize rule over 22 sizes and
+`ninfer_gemma4_vision_test` encodes the patches. The product surface is `--vision`, which enables
+media and loads the fixed vision allocations. The 26B inherits the family's refused options (§13),
+now including quantized KV for the sliding rings (plan §7 step 1, all four formats) while the five
+global layers stay BF16; `ninfer-perplexity` defaults to FP8 KV, so a comparison against the BF16
+numbers below wants `--kv-dtype bf16`.
 

@@ -3,6 +3,19 @@ ninfer_add_test(ninfer_gemma4_config_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_config.cpp"
   LIBRARIES ninfer_model_loading)
 
+# The 26B's quantized sliding ring: the codec's own oracle at the model's geometry, plus the append
+# round trip. No artifact, so it runs everywhere a device does.
+ninfer_add_op_test(ninfer_gemma4_kv_quant_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_kv_quant.cpp"
+  LIBRARIES ninfer_ops)
+
+# The sizes: a quantized sliding ring must cost less than BF16 at the same capacity and must not
+# scale with the capacity at all. Host-only, so it runs beside a busy device.
+ninfer_add_test(ninfer_gemma4_kv_quant_footprint_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_kv_quant_footprint.cpp"
+  LIBRARIES ninfer_model_loading)
+
 # Opt-in real-model artifacts, selected by explicit path so a run never depends
 # on glob order or modification time. Configure the ones you have and run
 # `ctest -L real`; an artifact variable left empty makes its test skip (77).
@@ -125,7 +138,7 @@ set_tests_properties(ninfer_gemma4_load_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_gemma4_model_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_model.cpp"
-  LIBRARIES ninfer_model_loading)
+  LIBRARIES ninfer_model_loading ninfer_model_runtime)
 set_tests_properties(ninfer_gemma4_model_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_gemma4_forward_test
@@ -137,6 +150,11 @@ ninfer_add_test(ninfer_gemma4_draft_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_draft.cpp"
   LIBRARIES ninfer_model_loading)
 set_tests_properties(ninfer_gemma4_draft_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_pass_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_pass.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_gemma4_pass_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_gemma4_mtp_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_mtp.cpp"

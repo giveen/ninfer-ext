@@ -2,8 +2,8 @@
 
 // The Gemma side of the Engine's instance boundary.
 //
-// EngineCore, CausalScoreCore and the ResourceManager under them are templated on an instance and its
-// ModelContract. runtime::ModelInstance is the Qwen implementation; this is the second one, for
+// EngineCore, CausalScoreCore and the ResourceManager under them are templated on an instance and
+// its ModelContract. runtime::ModelInstance is the Qwen implementation; this is the second one, for
 // models::gemma4. Its scope is deliberate and stated by its types:
 //
 //  - Admission is root-only. The Engine runs this model with the context cache disabled, so every
@@ -14,9 +14,9 @@
 //    refused at submission. Forced control spans (the thinking budget's channel close) are appended
 //    through append_forced_tokens.
 //  - The prefix-cache machinery the ResourceManager can reach in principle (pressure planning,
-//    captures, checkpoint recovery, continuations) has no Gemma implementation. Its entry points exist
-//    because the common controller is compiled against them, and each refuses by name; with the cache
-//    disabled none of them is reached.
+//    captures, checkpoint recovery, continuations) has no Gemma implementation. Its entry points
+//    exist because the common controller is compiled against them, and each refuses by name; with
+//    the cache disabled none of them is reached.
 //
 // Contract types this model never constructs (continuations, shared prefixes, capture offers and
 // their assessments, the result aggregates of commit/finish/abort) are the Qwen contract's own
@@ -68,9 +68,9 @@ private:
     SequenceHandle(const void* owner, std::uint32_t lane, std::uint64_t epoch) noexcept
         : owner_(owner), lane_(lane), epoch_(epoch) {}
 
-    const void* owner_    = nullptr;
-    std::uint32_t lane_   = 0;
-    std::uint64_t epoch_  = 0;
+    const void* owner_   = nullptr;
+    std::uint32_t lane_  = 0;
+    std::uint64_t epoch_ = 0;
 
     friend class GemmaProgram;
 };
@@ -83,13 +83,16 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&)     = delete;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return summary_; }
+
     [[nodiscard]] const qwen::PreparedContextCache& context_cache() const noexcept {
         return context_cache_;
     }
+
     [[nodiscard]] std::optional<qwen::PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t) const noexcept {
         return std::nullopt;
     }
+
     [[nodiscard]] std::optional<PrefillWork>
     shared_candidate_rebuild_work(std::uint32_t) const noexcept {
         return std::nullopt;
@@ -114,6 +117,7 @@ public:
     AdmissionCandidate& operator=(const AdmissionCandidate&)     = delete;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return summary_; }
+
     [[nodiscard]] const IdentityMaterializationAssessment& identity_assessment() const noexcept {
         return identity_;
     }
@@ -139,7 +143,9 @@ public:
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept {
         return admission_.summary();
     }
+
     [[nodiscard]] bool needs_transfer() const noexcept { return false; }
+
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
 
 private:
@@ -167,11 +173,13 @@ public:
     [[noreturn]] qwen::PressureTargetHandle root_maximal_target(PlanningCandidateId);
     [[noreturn]] qwen::PressureTargetHandle maximal_target(PlanningCandidateId);
     [[noreturn]] qwen::PressureTargetHandle
-    recency_maximal_target(PlanningCandidateId, std::uint32_t,
-                           std::span<const std::uint32_t> = {}, bool = true);
+    recency_maximal_target(PlanningCandidateId, std::uint32_t, std::span<const std::uint32_t> = {},
+                           bool = true);
     [[noreturn]] std::uint32_t ranked_owner_count() const;
     [[noreturn]] void set_eviction_licence(std::uint32_t, std::span<const std::uint32_t> = {});
+
     [[nodiscard]] std::uint32_t optional_targets_remaining() const noexcept { return 0; }
+
     [[noreturn]] qwen::PressureConstructionCursor begin_construction(qwen::PressureTargetHandle,
                                                                      bool = false);
     [[noreturn]] PressureConstructionStep
@@ -186,14 +194,19 @@ public:
     prepare_expansion(qwen::PressureTargetHandle,
                       std::uint32_t = std::numeric_limits<std::uint32_t>::max());
     [[noreturn]] qwen::PressureExpansionView commit_expansion(qwen::PreparedPressureExpansion&&);
+
     void discard_expansion(qwen::PreparedPressureExpansion&&) noexcept {}
-    [[noreturn]] PrefillWork shared_capture_split_prefill_work(const qwen::AssessedPressureTarget&,
-                                                               const PreparedPrompt&,
-                                                               std::span<const std::uint32_t>) const;
+
+    [[noreturn]] PrefillWork
+    shared_capture_split_prefill_work(const qwen::AssessedPressureTarget&, const PreparedPrompt&,
+                                      std::span<const std::uint32_t>) const;
     [[noreturn]] std::optional<ResourcePlan> seal(qwen::AssessedPressureTarget&&,
                                                   const PreparedPrompt&, FinalScheduleIntent);
-    [[noreturn]] std::optional<qwen::CapturePressurePlan> seal_capture(qwen::AssessedPressureTarget&&);
+    [[noreturn]] std::optional<qwen::CapturePressurePlan>
+    seal_capture(qwen::AssessedPressureTarget&&);
+
     [[nodiscard]] bool try_claim_seal_window() noexcept { return false; }
+
     void release_seal_window() noexcept {}
 
 private:
@@ -210,21 +223,27 @@ public:
     PendingBatch& operator=(const PendingBatch&)     = delete;
 
     [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
+
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept {
         return std::span<const TokenId>(tokens_.data(), row_count_ * row_stride_);
     }
+
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept {
         return std::span<const std::int32_t>(counts_.data(), row_count_);
     }
+
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
+
     [[nodiscard]] bool constraint_failed(std::size_t row) const {
         if (row >= row_count_) throw std::out_of_range("pending row out of range");
         return false;
     }
+
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
-    static constexpr std::size_t kMaximumRowStride = models::gemma4::Program::kMaximumDraftTokens + 1;
+    static constexpr std::size_t kMaximumRowStride =
+        models::gemma4::Program::kMaximumDraftTokens + 1;
 
     std::uint64_t transaction_ = 0;
     std::array<SequenceHandle, kMaximumConcurrency> rows_{};
@@ -280,16 +299,18 @@ public:
     GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity, std::int32_t lanes,
                  std::uint32_t prefill_chunk, std::uint32_t idle_prefill_chunk,
                  std::int32_t draft_tokens, bool adaptive_draft, bool cuda_graphs,
-                 DeviceContext& device);
+                 KvCacheStorage storage, DeviceContext& device);
 
     // Scoring.
-    [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
-                                                  const LogitsSink& logits);
+    [[nodiscard]] std::vector<float>
+    causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const LogitsSink& logits);
     [[nodiscard]] MemorySummary memory_summary() const;
+
     void reset_memory_peaks() noexcept {}
 
     // Generation.
     [[nodiscard]] bool consumes_token_masks() const noexcept { return false; }
+
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
                                                const ResolvedExecutionOptions& options);
     [[nodiscard]] std::optional<AdmissionCandidate>
@@ -300,30 +321,32 @@ public:
     [[nodiscard]] std::optional<ResourcePlan> seal_identity(const AdmissionCandidate& candidate,
                                                             const PreparedPrompt& prompt,
                                                             FinalScheduleIntent intent);
-    [[noreturn]] PressurePlanningSession
-    begin_pressure_planning(std::span<const AdmissionCandidate* const>,
-                            std::span<const PlanningCandidateId>,
-                            std::span<const qwen::ContinuationHandle* const>,
-                            std::span<const PlanningOwnerId>,
-                            std::span<const qwen::SharedPrefixHandle* const>,
-                            std::span<const PlanningOwnerId>, std::span<const PlanningOwnerId>);
+    [[noreturn]] PressurePlanningSession begin_pressure_planning(
+        std::span<const AdmissionCandidate* const>, std::span<const PlanningCandidateId>,
+        std::span<const qwen::ContinuationHandle* const>, std::span<const PlanningOwnerId>,
+        std::span<const qwen::SharedPrefixHandle* const>, std::span<const PlanningOwnerId>,
+        std::span<const PlanningOwnerId>);
     [[nodiscard]] PrefillWork shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
                                                                 const PreparedPrompt& prompt,
                                                                 std::span<const std::uint32_t>);
     [[nodiscard]] ContextTransactionReserveStatus
     start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt,
                                CancellationFlagView cancellation);
+
     [[nodiscard]] std::optional<qwen::PersistentBackfillProof>
     prove_persistent_backfill(const RequestBasePlan&, const ResourcePlan&,
                               std::span<const SequenceHandle>) const {
         return std::nullopt;
     }
+
     [[nodiscard]] ContextTransactionProgress
     progress_context_transaction(CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
+
     [[nodiscard]] bool has_context_transaction() const noexcept { return transaction_.has_value(); }
+
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  PrefillPace pace             = PrefillPace::Idle,
+                                                  PrefillPace pace = PrefillPace::Idle,
                                                   ExecutionTiming* failed_timing = nullptr,
                                                   TokenMaskProvider* masks       = nullptr);
     [[noreturn]] qwen::CaptureAssessment inspect_capture(const qwen::CaptureOffer&,
@@ -334,13 +357,10 @@ public:
     checkpoint_recovery_work(const qwen::ContinuationHandle&, CheckpointRef) const;
     [[noreturn]] std::vector<CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const qwen::SharedPrefixHandle&, CheckpointRef) const;
-    [[noreturn]] qwen::CapturePressurePlanningSession
-    begin_capture_pressure_planning(const qwen::CaptureAssessment&,
-                                    std::span<const qwen::ContinuationHandle* const>,
-                                    std::span<const PlanningOwnerId>,
-                                    std::span<const qwen::SharedPrefixHandle* const>,
-                                    std::span<const PlanningOwnerId>,
-                                    std::span<const PlanningOwnerId>);
+    [[noreturn]] qwen::CapturePressurePlanningSession begin_capture_pressure_planning(
+        const qwen::CaptureAssessment&, std::span<const qwen::ContinuationHandle* const>,
+        std::span<const PlanningOwnerId>, std::span<const qwen::SharedPrefixHandle* const>,
+        std::span<const PlanningOwnerId>, std::span<const PlanningOwnerId>);
     [[noreturn]] bool shared_capture_matches(const qwen::CaptureOffer&,
                                              const qwen::SharedPrefixHandle&) const;
     [[noreturn]] void skip_capture(qwen::CaptureOffer&&);
@@ -348,49 +368,52 @@ public:
     reserve_active_capture(qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*,
                            const qwen::SharedPrefixHandle*, std::optional<CheckpointRef>, bool,
                            CancellationFlagView);
-    [[noreturn]] ContextTransactionReserveStatus
-    reserve_active_capture_with_pressure(qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*,
-                                         const qwen::SharedPrefixHandle*,
-                                         std::optional<CheckpointRef>, bool,
-                                         qwen::CapturePressurePlan&&, CancellationFlagView);
+    [[noreturn]] ContextTransactionReserveStatus reserve_active_capture_with_pressure(
+        qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*, const qwen::SharedPrefixHandle*,
+        std::optional<CheckpointRef>, bool, qwen::CapturePressurePlan&&, CancellationFlagView);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const RoundBudget> budgets,
                                       ExecutionTiming* failed_timing = nullptr,
                                       TokenMaskProvider* masks       = nullptr);
-    [[nodiscard]] ExecutionTiming append_forced_tokens(std::span<const SequenceHandle>,
-                                                      std::span<const TokenId>, std::uint32_t,
-                                                      std::span<const std::optional<std::uint32_t>>,
-                                                      ExecutionTiming* = nullptr);
-    [[nodiscard]] qwen::CommitResult commit(PendingBatch&& pending,
-                                            std::span<const CommitDecision> decisions,
-                                            CommitObservation observation = CommitObservation::AllRows,
-                                            ExecutionTiming* failed_timing = nullptr);
+    [[nodiscard]] ExecutionTiming
+    append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t,
+                         std::span<const std::optional<std::uint32_t>>, ExecutionTiming* = nullptr);
+    [[nodiscard]] qwen::CommitResult
+    commit(PendingBatch&& pending, std::span<const CommitDecision> decisions,
+           CommitObservation observation  = CommitObservation::AllRows,
+           ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] qwen::DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] qwen::FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] qwen::AbortResult abort(SequenceHandle sequence) noexcept;
+
     [[nodiscard]] std::optional<std::uint32_t>
     device_kv_lease_settlement_tokens(SequenceHandle, std::uint32_t) const noexcept {
         return std::nullopt;
     }
+
     [[nodiscard]] qwen::ReleaseResult release_continuation(qwen::ContinuationHandle&&) noexcept {
         return {};
     }
+
     [[nodiscard]] qwen::ReleaseResult release_shared_prefix(qwen::SharedPrefixHandle&&) noexcept {
         return {};
     }
+
     void fail_all_cleanup() noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept {
         return ProgramResourceRevision{revision_};
     }
+
     [[nodiscard]] qwen::PhysicalUsageSnapshot physical_usage() const noexcept;
 
 private:
     enum class Phase : std::uint8_t { Free, Prefill, Active, Finishable };
 
     struct Lane {
-        Phase phase          = Phase::Free;
-        std::uint64_t epoch  = 0;
+        Phase phase         = Phase::Free;
+        std::uint64_t epoch = 0;
         std::vector<TokenId> prompt;
         // The prompt's images, ascending; a prefill call never ends inside one.
         std::vector<models::gemma4::PromptImageInput> images;
@@ -413,6 +436,7 @@ private:
 
     [[nodiscard]] Lane* valid_lane(SequenceHandle sequence) noexcept;
     void release(std::uint32_t lane) noexcept;
+
     void bump_revision() noexcept { ++revision_; }
 
     const models::gemma4::Model& model_;
@@ -421,12 +445,12 @@ private:
     models::gemma4::Program program_;
     std::vector<Lane> lanes_;
     std::optional<Transaction> transaction_;
-    std::uint64_t revision_        = 1;
-    std::uint64_t next_epoch_      = 1;
-    std::uint64_t next_pending_    = 1;
-    std::uint64_t open_pending_    = 0;
-    std::uint32_t prefill_chunk_   = 0;
-    std::uint32_t idle_chunk_      = 0;
+    std::uint64_t revision_      = 1;
+    std::uint64_t next_epoch_    = 1;
+    std::uint64_t next_pending_  = 1;
+    std::uint64_t open_pending_  = 0;
+    std::uint32_t prefill_chunk_ = 0;
+    std::uint32_t idle_chunk_    = 0;
     // The draft-length policy, with speculation: the shared MTP ladder and acceptance model, with
     // round times measured at startup and refined as rounds run.
     std::optional<qwen::MtpDraftPolicy> draft_policy_;

@@ -25,8 +25,8 @@ namespace ninfer::models::gemma4 {
 
 class LoadPlan;
 
-// One materialized parameter: its logical name and the resident view the Ops receive. The activation
-// policies the artifact declares per input are not bound yet.
+// One materialized parameter: its logical name and the resident view the Ops receive. The
+// activation policies the artifact declares per input are not bound yet.
 struct BoundWeight {
     std::string name;
     WeightView view;
@@ -87,10 +87,10 @@ private:
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                        const StartupObserver* observer = nullptr);
 
-// Plan and materialize in one step. The Reader lives for this call only, which is enough because the
-// returned Model holds the materialized bytes rather than the artifact.
-[[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
-                                                DeviceContext& device,
+// Plan and materialize in one step. The Reader lives for this call only, which is enough because
+// the returned Model holds the materialized bytes rather than the artifact.
+[[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
+                                                LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
 
 } // namespace ninfer::models::gemma4

@@ -5,6 +5,7 @@ import torch
 from dataclasses import replace
 
 from tools.convert.methods import (
+    cast_direct,
     fp8_row_maxabs,
     import_encoded,
     nvfp4_absmax,
@@ -296,40 +297,85 @@ def test_35b_nvfp4_recipe_reads_a_modelopt_expert_prefix(tmp_path) -> None:
         )
 
 
-def _gemma4_26b_model() -> Model:
-    """One 26B-A4B layer: the dense MLP, the router with its two scales, and two experts of a bank."""
-    model = Model({"text": {"config": {"model_type": "gemma4_text"}}})
+def _gemma4_26b_model(w: int = 4, *, drafter: bool = False, vision: bool = False) -> Model:
+    """One 26B-A4B layer: the dense MLP, the router with its two scales, and two experts of a bank.
+
+    `w` is the hidden width every projection contracts over. The row-grouped 4-bit format needs K to
+    be a multiple of 32, so a caller that wants to prepare the QAT recipe asks for 32.
+
+    `drafter` adds the assistant's own projections -- the input and output projections, the tied head
+    and one drafter layer -- under the names the mapping declares them.
+
+    `vision` adds one image-tower layer with the tower's patch and output projections. It is a flag
+    rather than part of the default model: the QAT layout's gate/up sweep matches any layer name
+    ending in `/mlp/gate`, so a tower MLP would join that layout's explicit groups, which its own
+    test pins.
+    """
+    components = {"text": {"config": {"model_type": "gemma4_text"}}}
+    if drafter:
+        components["mtp"] = {"config": {"model_type": "gemma4_assistant"}}
+    model = Model(components)
     layer = "text/layers/0/"
 
     def add(name: str, shape: tuple[int, ...], inputs: tuple[str, ...]) -> None:
         source = array_source(torch.ones(shape, dtype=torch.bfloat16), name)
         model.add(Parameter(name, shape, source, inputs=inputs))
 
-    add("text/token_embedding", (8, 4), ())
-    add("text/output_head", (8, 4), ("hidden",))
+    add("text/token_embedding", (8, w), ())
+    add("text/output_head", (8, w), ("hidden",))
     for role in ("input_norm", "post_attention_norm", "pre_feedforward_norm",
                  "post_feedforward_norm", "post_feedforward_norm_1", "pre_feedforward_norm_2",
                  "post_feedforward_norm_2"):
-        add(layer + role, (4,), ())
+        add(layer + role, (w,), ())
     add(layer + "layer_scalar", (1,), ())
     for role in ("query", "key", "value"):
-        add(layer + "attention/" + role, (4, 4), ("normed",))
-    add(layer + "attention/output", (4, 4), ("attended",))
+        add(layer + "attention/" + role, (w, w), ("normed",))
+    add(layer + "attention/output", (w, w), ("attended",))
     for role in ("gate", "up"):
-        add(layer + "mlp/" + role, (4, 4), ("mlp_input",))
-    add(layer + "mlp/down", (4, 4), ("mlp_product",))
-    add(layer + "moe/router", (2, 4), ("residual",))
-    add(layer + "moe/router_scale", (4,), ())
+        add(layer + "mlp/" + role, (w, w), ("mlp_input",))
+    add(layer + "mlp/down", (w, w), ("mlp_product",))
+    add(layer + "moe/router", (2, w), ("residual",))
+    add(layer + "moe/router_scale", (w,), ())
     add(layer + "moe/per_expert_scale", (2,), ())
     gate_up, downs = [], []
     for expert in range(2):
         prefix = layer + f"moe/experts/{expert}/"
         for role in ("gate", "up"):
-            add(prefix + role, (4, 4), ("expert_input",))
+            add(prefix + role, (w, w), ("expert_input",))
             gate_up.append(prefix + role)
-        add(prefix + "down", (4, 4), (prefix + "product",))
+        add(prefix + "down", (w, w), (prefix + "product",))
         downs.append(prefix + "down")
-    # One bank per projection, declared exactly as the gemma4 mapping declares them.
+    if drafter:
+        # The assistant's own projections, at the shapes its own config gives: an input projection
+        # over the target's hidden appended twice, an output projection back to the target's hidden,
+        # the tied head, and one layer whose attention width is the target's head count.
+        add("mtp/pre_projection", (4, 2 * w), ())
+        add("mtp/post_projection", (w, 4), ("mtp/final_hidden",))
+        add("mtp/output_head", (8, 4), ("mtp/final_hidden",))
+        draft = "mtp/layers/0/"
+        add(draft + "attention/query", (4, 4), (draft + "mixer_input",))
+        add(draft + "attention/output", (4, 4), (draft + "attention/gated_output",))
+        for role in ("gate", "up"):
+            add(draft + "mlp/" + role, (4, 4), (draft + "mlp_input",))
+        add(draft + "mlp/down", (4, 8), (draft + "mlp/product",))
+    # The image tower's own projections, under the names the mapping gives them: the patch
+    # embedding reads a patch's pixels, the output projection returns the soft tokens to the text
+    # width, and one layer carries the attention and MLP linears the layout quantizes.
+    if vision:
+        add("vision/patch_embedding", (w, 3 * 16 * 16), ("vision/patch_input",))
+        add("vision/embedding_projection", (w, w), ("vision/soft_tokens",))
+        tower = "vision/layers/0/"
+        for role in ("query", "key", "value"):
+            add(tower + "attention/" + role, (w, w), (tower + "attention_input",))
+        add(tower + "attention/output", (w, w), (tower + "attended",))
+        for role in ("gate", "up"):
+            add(tower + "mlp/" + role, (w, w), (tower + "mlp_input",))
+        add(tower + "mlp/down", (w, w), (tower + "mlp/product",))
+    # One bank per projection, declared exactly as the gemma4 mapping declares them, and the
+    # attention input projections as one group, which is what the mapping's `group(query, key,
+    # value)` call produces.
+    model.packing_groups.append(tuple(layer + "attention/" + role
+                                      for role in ("query", "key", "value")))
     model.packing_groups.append(tuple(gate_up))
     model.packing_groups.append(tuple(downs))
     return model
@@ -378,7 +424,7 @@ def test_gemma4_26b_recipe_quantizes_both_branches_and_keeps_the_router_exact() 
 
 
 def test_gemma4_26b_qat_recipe_puts_every_projection_on_its_trained_grid() -> None:
-    model = _gemma4_26b_model()
+    model = _gemma4_26b_model(32)
     recipe = Recipe(model)
     gemma4_26b_a4b_qat(model, recipe, {})
     layer = "text/layers/0"
@@ -397,4 +443,69 @@ def test_gemma4_26b_qat_recipe_puts_every_projection_on_its_trained_grid() -> No
     (router,) = recipe.selections[f"{layer}/moe/router"]
     assert router.format == "bf16"
     grouped = {name for names, _ in recipe.explicit_groups for name in names}
-    assert grouped == {name for name in model.parameters if "/moe/experts/" in name}
+    assert grouped == ({name for name in model.parameters if "/moe/experts/" in name} |
+                       {f"{layer}/mlp/gate", f"{layer}/mlp/up"})
+    # The attention input projections must land in one stored parent: the model runs the union in a
+    # single launch whenever their planes are contiguous (gemma4 forward's
+    # `row_slices_are_contiguous`), and only a grouped parent makes them contiguous. A quantizing
+    # method missing from the recipe's `standard` tuple silently emits three objects instead, which
+    # is how the QAT artifact lost the fusion until `q4_rows_qat` was listed. A layer's gate and up
+    # are grouped explicitly for the same launch.
+    parents = [job.parameters for job in recipe.prepare(device="cpu").weights]
+    assert (f"{layer}/attention/query", f"{layer}/attention/key",
+            f"{layer}/attention/value") in parents
+    assert (f"{layer}/mlp/gate", f"{layer}/mlp/up") in parents
+
+
+def test_gemma4_26b_recipes_put_the_drafter_on_the_31b_grid() -> None:
+    """The assistant drafter is Q6 throughout, head included, in both 26B layouts.
+
+    The choice the 31B's layout makes, and for the same measured reason: against BF16, adaptive MTP
+    ran 4.3% faster where Q8 ran 3.9%, worst -1.9%, and the drafter shrinks to about 0.4 GB. Q8 is
+    what `_optional` gives an `mtp/` projection, so the override is what this checks. It is also why
+    the artifact needs the drafter's shapes in the Q6 registry rather than the Q8 one: the 26B's
+    drafter has 16 heads where the 31B's has 32, so its attention widths are new geometry.
+    """
+    model = _gemma4_26b_model(32, drafter=True)
+    drafter = [name for name, parameter in model.parameters.items()
+               if name.startswith("mtp/") and parameter.projection]
+    assert drafter, "the fixture must carry the drafter's projections"
+    for build in (gemma4_26b_a4b_base, gemma4_26b_a4b_qat):
+        recipe = Recipe(model)
+        build(model, recipe, {})
+        for name in drafter:
+            (selection,) = recipe.selections[name]
+            assert selection.format == "q6_g64_fp16", f"{build.__name__}: {name}"
+
+
+def test_gemma4_26b_recipes_put_the_vision_tower_on_the_int8_route() -> None:
+    """The tower's linears are Q8 and its patch and output projections BF16, in both 26B layouts.
+
+    The 31B's tower at the same geometry, with its linear route one step finer: the tower amplifies
+    weight error -- against its FP32 output, Q4/Q5 (what `_optional` would leave here) score a 0.956
+    mean token cosine on a photo, Q6 0.989 and Q8 0.999 -- and the tower is only about 0.42 B
+    parameters. Q8 also needs no per-geometry registration: its row-split int8 route resolves any
+    shape through its generic selector, where Q6 needs a registry entry for each one.
+    """
+    model = _gemma4_26b_model(32, vision=True)
+    vision = [name for name, parameter in model.parameters.items()
+              if name.startswith("vision/") and parameter.projection]
+    assert vision, "the fixture must carry the tower's projections"
+    cast = {"vision/patch_embedding", "vision/embedding_projection"}
+    assert cast <= set(vision), "the fixture must carry both unquantized projections"
+    for build in (gemma4_26b_a4b_base, gemma4_26b_a4b_qat):
+        recipe = Recipe(model)
+        build(model, recipe, {})
+        for name in vision:
+            (selection,) = recipe.selections[name]
+            if name in cast:
+                assert selection.format == "bf16", f"{build.__name__}: {name}"
+                assert selection.method is cast_direct, f"{build.__name__}: {name}"
+            else:
+                assert selection.format == "q8_g32_fp16", f"{build.__name__}: {name}"
+        # The tower's gate and up stay two parents: the 31B converts the tower that way, and the
+        # one-launch fusion is a decode-scheduling choice measured on the text layers only. The QAT
+        # layout's gate/up sweep is text-only for that reason; a wider sweep regroups them quietly.
+        grouped = {name for names, _ in recipe.explicit_groups for name in names}
+        assert not {name for name in grouped if name.startswith("vision/")}, \
+            f"{build.__name__}: the tower's linears must not be grouped"

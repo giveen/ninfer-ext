@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "models/gemma4/load.h"
+#include "models/gemma4/measurement.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -35,13 +36,21 @@ int main() {
         auto model = gemma::load_model(path, models::LoadOptions{}, device);
         check(model != nullptr, "load_model returned nothing");
 
+        // The serving path's measurement-applicability identity: the same artifact answers the same
+        // SHA-256 every time, and an empty one would be refused by the serving harness.
+        const std::string signature = gemma::prefill_signature(*model);
+        check(signature.size() == 64, "prefill signature is a 64-character SHA-256 digest");
+        check(signature.find_first_not_of("0123456789abcdef") == std::string::npos,
+              "prefill signature is lowercase hexadecimal");
+        check(gemma::prefill_signature(*model) == signature, "prefill signature is deterministic");
+
         const auto& weights = model->weights();
         check(model->config().num_hidden_layers == 60, "layer count");
         check(model->weight_data().size() == 833,
               "bound weight count is " + std::to_string(model->weight_data().size()));
 
-        // A materialized view is a non-empty region list over the backing store; a view with no parts
-        // would mean a parameter resolved to nothing.
+        // A materialized view is a non-empty region list over the backing store; a view with no
+        // parts would mean a parameter resolved to nothing.
         std::size_t resident = 0;
         for (const auto& bound : model->weight_data()) {
             if (bound.view.parts.empty()) {
@@ -63,18 +72,20 @@ int main() {
         const auto projection = model->input(weights.text.layers[0].attention.query);
         check(projection.policy == ops::LinearPolicy::A16Only, "query projection policy");
 
-        // The three attention input projections are slices of one fused FP8 parent. A row slice of a
-        // RowScale parent is a whole operand, so each prepares to its own shape.
+        // The three attention input projections are slices of one fused FP8 parent. A row slice of
+        // a RowScale parent is a whole operand, so each prepares to its own shape.
         {
             const auto& attention = weights.text.layers[0].attention;
-            const auto query = ops::prepare_linear_weight(model->input(attention.query));
-            const auto key   = ops::prepare_linear_weight(model->input(attention.key));
-            const auto value = ops::prepare_linear_weight(model->input(attention.value));
-            check(query.weight.n == 8192 && query.weight.k == 5376, "sliced query projection shape");
+            const auto query      = ops::prepare_linear_weight(model->input(attention.query));
+            const auto key        = ops::prepare_linear_weight(model->input(attention.key));
+            const auto value      = ops::prepare_linear_weight(model->input(attention.value));
+            check(query.weight.n == 8192 && query.weight.k == 5376,
+                  "sliced query projection shape");
             check(key.weight.n == 4096 && key.weight.k == 5376, "sliced key projection shape");
-            check(value.weight.n == 4096 && value.weight.k == 5376, "sliced value projection shape");
+            check(value.weight.n == 4096 && value.weight.k == 5376,
+                  "sliced value projection shape");
             // The global layers slice a 18432-row parent at 16384 and 2048.
-            const auto& global = weights.text.layers[59].attention;
+            const auto& global      = weights.text.layers[59].attention;
             const auto global_query = ops::prepare_linear_weight(model->input(global.query));
             const auto global_key   = ops::prepare_linear_weight(model->input(global.key));
             check(global_query.weight.n == 16384, "sliced global query projection shape");

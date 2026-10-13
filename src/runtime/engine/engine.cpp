@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/gemma4/measurement.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
@@ -167,13 +168,13 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
-    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+    using GenerationCore      = runtime::EngineCore<runtime::ModelInstance>;
+    using ScoringCore         = runtime::CausalScoreCore<runtime::ModelInstance>;
     using GemmaGenerationCore = runtime::EngineCore<runtime::GemmaInstance>;
     using GemmaScoringCore    = runtime::CausalScoreCore<runtime::GemmaInstance>;
-    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<ScoringCore>, std::unique_ptr<GemmaGenerationCore>,
-                              std::unique_ptr<GemmaScoringCore>>;
+    using Core =
+        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
+                     std::unique_ptr<GemmaGenerationCore>, std::unique_ptr<GemmaScoringCore>>;
     using Active = std::variant<std::unique_ptr<runtime::ModelInstance>,
                                 std::unique_ptr<runtime::GemmaInstance>>;
 
@@ -185,10 +186,13 @@ public:
         if (runtime::artifact_is_gemma(options.artifact_path)) {
             // This model runs root-only, without speculation or Vision; the options say so rather
             // than carrying settings the Engine would silently ignore.
-            options       = runtime::gemma_engine_options(std::move(options));
-            auto instance = runtime::load_gemma_instance(options, device);
+            options           = runtime::gemma_engine_options(std::move(options));
+            auto instance     = runtime::load_gemma_instance(options, device);
             load.architecture = "gemma4";
-            const auto& text  = instance->model->config();
+            // This model keeps no context cache and resolves no prefill cost identity, so the
+            // signature is reported as measurement applicability alone.
+            load.prefill_signature        = models::gemma4::prefill_signature(*instance->model);
+            const auto& text              = instance->model->config();
             model_metadata.model_id       = options.artifact_path.stem().string();
             model_metadata.vocab_size     = text.vocab_size;
             model_metadata.embedding_size = text.hidden_size;
@@ -196,11 +200,11 @@ public:
             load.model_name               = model_metadata.model_id;
             active.emplace<std::unique_ptr<runtime::GemmaInstance>>(std::move(instance));
         } else {
-            auto constructed  = runtime::construct_model(options, device);
-            // construct_model returns the resolved options for this instance. Anything the model had
-            // to derive (the single host RAM budget's Host split and long-anchor count) is only known
-            // after planning, so the Engine adopts the resolved copy here — before the core that
-            // sizes its admission capacity from it exists — and reports it through options().
+            auto constructed = runtime::construct_model(options, device);
+            // construct_model returns the resolved options for this instance. Anything the model
+            // had to derive (the single host RAM budget's Host split and long-anchor count) is only
+            // known after planning, so the Engine adopts the resolved copy here — before the core
+            // that sizes its admission capacity from it exists — and reports it through options().
             options        = std::move(constructed.options);
             load           = std::move(constructed.load);
             model_metadata = std::move(constructed.model_metadata);
@@ -248,6 +252,7 @@ public:
     [[nodiscard]] std::uint32_t active_capacity() const {
         return std::visit([](const auto& instance) { return instance->capacity; }, active);
     }
+
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -285,7 +290,8 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
                 const SamplingMode sampling_mode =
                     info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
                 if (info.prompt_tokens > instance->capacity) {
-                    throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+                    throw std::logic_error(
+                        "target Frontend admitted a prompt beyond Engine capacity");
                 }
                 const PromptPreparationStats preparation = prepared.preparation_stats();
                 return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -307,8 +313,8 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     return std::visit(
         [&](auto& instance) -> PreparedPrompt {
             using Backend = typename std::remove_cvref_t<decltype(instance)>::element_type;
-            auto prepared = instance->frontend.prepare_tokens(std::move(token_ids),
-                                                              allow_prefix_identity);
+            auto prepared =
+                instance->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > instance->capacity) {
                 throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
@@ -323,7 +329,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit([&](const auto& instance) { return instance->frontend.tokenize_text(text); },
-                       impl_->active);
+                      impl_->active);
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
@@ -368,7 +374,9 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
-        [&](const auto& instance) { return instance->frontend.count_tokens(std::move(input), control); },
+        [&](const auto& instance) {
+            return instance->frontend.count_tokens(std::move(input), control);
+        },
         impl_->active);
 }
 
@@ -450,9 +458,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission = core->submit(
                     std::get<models::qwen3_5::PreparedPrompt>(std::move(prompt.impl_->value)),
-                    prompt_summary,
-                                               prepare_seconds, std::move(resolved_options),
-                                               consumer_mode, observation, pending_deadline);
+                    prompt_summary, prepare_seconds, std::move(resolved_options), consumer_mode,
+                    observation, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -500,7 +507,7 @@ MemorySummary Engine::memory_summary() const {
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit([](const auto& instance) { return instance->frontend.media_cache_summary(); },
-                       impl_->active);
+                      impl_->active);
 }
 
 RuntimeStats Engine::runtime_stats() const {

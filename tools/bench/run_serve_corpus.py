@@ -29,6 +29,10 @@ SPECULATIVE_MODES = {
     "mtp3": ("mtp", 3),
     "mtp5": ("mtp", 5),
     "mtp_adaptive": ("mtp", 7),
+    # Gemma 4 runs MTP on the full proposal head only (1-7 draft tokens) and refuses the optimized
+    # one, so it needs modes that do not ask for that head.
+    "mtp3_full": ("mtp", 3),
+    "mtp5_full": ("mtp", 5),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
     "eagle3_3": ("eagle3", 3),
@@ -37,6 +41,8 @@ SPECULATIVE_MODES = {
 }
 # Speculative modes whose draft length the server chooses per round, up to the mode's draft tokens.
 ADAPTIVE_MODES = frozenset({"mtp_adaptive", "eagle3_adaptive"})
+# Modes that use the full proposal head. See SPECULATIVE_MODES: Gemma 4 refuses the optimized head.
+FULL_HEAD_MODES = frozenset({"mtp3_full", "mtp5_full"})
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
 KV_CACHE_NAMES = {

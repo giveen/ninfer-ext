@@ -19,10 +19,10 @@ namespace ninfer::models::gemma4 {
 
 // Cold load plan. Every declared parameter is resolved against the artifact while planning, so a
 // name, shape or stored format the artifact does not carry is refused here rather than at
-// execution. The plan borrows its Reader until materialization, which is not part of this class yet.
-// The artifact's text resources, which is where the tokenizer lives. The views point into the
-// reader's mapped files, so they are valid only while that reader lives: a consumer that outlives the
-// load must copy them, as a Model holds materialized weights rather than the artifact.
+// execution. The plan borrows its Reader until materialization, which is not part of this class
+// yet. The artifact's text resources, which is where the tokenizer lives. The views point into the
+// reader's mapped files, so they are valid only while that reader lives: a consumer that outlives
+// the load must copy them, as a Model holds materialized weights rather than the artifact.
 struct TextResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;

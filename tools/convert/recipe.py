@@ -35,6 +35,7 @@ from .methods import (
     nvfp4_absmax,
     nvfp4_mse,
     q4_rows_maxabs,
+    q4_rows_qat,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -533,6 +534,7 @@ class Recipe:
             nvfp4_absmax,
             nvfp4_mse,
             q4_rows_maxabs,
+            q4_rows_qat,
         )
         for names in self.model.packing_groups:
             if any(

@@ -46,60 +46,80 @@ ops::SamplingConfig translate(const ResolvedSamplingParameters& source) {
 qwen::PressureTargetHandle PressurePlanningSession::identity_target(PlanningCandidateId) const {
     unsupported("pressure planning");
 }
+
 qwen::PressureTargetHandle PressurePlanningSession::root_maximal_target(PlanningCandidateId) {
     unsupported("pressure planning");
 }
+
 qwen::PressureTargetHandle PressurePlanningSession::maximal_target(PlanningCandidateId) {
     unsupported("pressure planning");
 }
+
 qwen::PressureTargetHandle
 PressurePlanningSession::recency_maximal_target(PlanningCandidateId, std::uint32_t,
                                                 std::span<const std::uint32_t>, bool) {
     unsupported("pressure planning");
 }
-std::uint32_t PressurePlanningSession::ranked_owner_count() const { unsupported("pressure planning"); }
+
+std::uint32_t PressurePlanningSession::ranked_owner_count() const {
+    unsupported("pressure planning");
+}
+
 void PressurePlanningSession::set_eviction_licence(std::uint32_t, std::span<const std::uint32_t>) {
     unsupported("pressure planning");
 }
+
 qwen::PressureConstructionCursor
 PressurePlanningSession::begin_construction(qwen::PressureTargetHandle, bool) {
     unsupported("pressure planning");
 }
+
 PressureConstructionStep
 PressurePlanningSession::next_construction_option(qwen::PressureConstructionCursor&) {
     unsupported("pressure planning");
 }
+
 void PressurePlanningSession::choose_construction(qwen::PressureConstructionCursor&,
                                                   PressureConstructionOptionId) {
     unsupported("pressure planning");
 }
+
 std::optional<qwen::PressureTargetHandle>
 PressurePlanningSession::construction_target(const qwen::PressureConstructionCursor&) {
     unsupported("pressure planning");
 }
+
 PressureTargetGuidance PressurePlanningSession::guidance(qwen::PressureTargetHandle) {
     unsupported("pressure planning");
 }
+
 qwen::AssessedPressureTarget PressurePlanningSession::assess(qwen::PressureTargetHandle) {
     unsupported("pressure planning");
 }
+
 qwen::PreparedPressureExpansion
 PressurePlanningSession::prepare_expansion(qwen::PressureTargetHandle, std::uint32_t) {
     unsupported("pressure planning");
 }
+
 qwen::PressureExpansionView
 PressurePlanningSession::commit_expansion(qwen::PreparedPressureExpansion&&) {
     unsupported("pressure planning");
 }
-PrefillWork PressurePlanningSession::shared_capture_split_prefill_work(
-    const qwen::AssessedPressureTarget&, const PreparedPrompt&, std::span<const std::uint32_t>) const {
+
+PrefillWork
+PressurePlanningSession::shared_capture_split_prefill_work(const qwen::AssessedPressureTarget&,
+                                                           const PreparedPrompt&,
+                                                           std::span<const std::uint32_t>) const {
     unsupported("pressure planning");
 }
+
 std::optional<ResourcePlan> PressurePlanningSession::seal(qwen::AssessedPressureTarget&&,
                                                           const PreparedPrompt&,
                                                           FinalScheduleIntent) {
     unsupported("pressure planning");
 }
+
 std::optional<qwen::CapturePressurePlan>
 PressurePlanningSession::seal_capture(qwen::AssessedPressureTarget&&) {
     unsupported("pressure planning");
@@ -112,42 +132,51 @@ PressurePlanningSession GemmaProgram::begin_pressure_planning(
     std::span<const PlanningOwnerId>) {
     unsupported("pressure planning");
 }
+
 qwen::CaptureAssessment GemmaProgram::inspect_capture(const qwen::CaptureOffer&,
                                                       const qwen::SharedPrefixHandle*,
                                                       const qwen::SharedPrefixHandle*,
                                                       std::optional<CheckpointRef>, bool) const {
     unsupported("prefix capture");
 }
+
 std::vector<CheckpointRecoveryAlternativeWork>
 GemmaProgram::checkpoint_recovery_work(const qwen::ContinuationHandle&, CheckpointRef) const {
     unsupported("checkpoint recovery");
 }
+
 std::vector<CheckpointRecoveryAlternativeWork>
 GemmaProgram::checkpoint_recovery_work(const qwen::SharedPrefixHandle&, CheckpointRef) const {
     unsupported("checkpoint recovery");
 }
+
 qwen::CapturePressurePlanningSession GemmaProgram::begin_capture_pressure_planning(
     const qwen::CaptureAssessment&, std::span<const qwen::ContinuationHandle* const>,
     std::span<const PlanningOwnerId>, std::span<const qwen::SharedPrefixHandle* const>,
     std::span<const PlanningOwnerId>, std::span<const PlanningOwnerId>) {
     unsupported("prefix capture");
 }
+
 bool GemmaProgram::shared_capture_matches(const qwen::CaptureOffer&,
                                           const qwen::SharedPrefixHandle&) const {
     unsupported("prefix capture");
 }
+
 void GemmaProgram::skip_capture(qwen::CaptureOffer&&) { unsupported("prefix capture"); }
+
 ContextTransactionReserveStatus
 GemmaProgram::reserve_active_capture(qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*,
                                      const qwen::SharedPrefixHandle*, std::optional<CheckpointRef>,
                                      bool, CancellationFlagView) {
     unsupported("prefix capture");
 }
+
 ContextTransactionReserveStatus GemmaProgram::reserve_active_capture_with_pressure(
     qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*, const qwen::SharedPrefixHandle*,
     std::optional<CheckpointRef>, bool, qwen::CapturePressurePlan&&, CancellationFlagView) {
     unsupported("prefix capture");
 }
+
 // The forced span (the thinking budget's channel close) follows the last accepted token, which no
 // pass has consumed yet: that token and every forced token but the last run now, and the last one
 // becomes the next decode's input, exactly as a sampled token would.
@@ -163,12 +192,15 @@ ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandl
     std::vector<TokenId> span(row_stride);
     for (std::size_t row = 0; row < sequences.size(); ++row) {
         Lane* lane = valid_lane(sequences[row]);
-        if (lane == nullptr || lane->phase != Phase::Active || lane->pending || lane->next_input < 0) {
+        if (lane == nullptr || lane->phase != Phase::Active || lane->pending ||
+            lane->next_input < 0) {
             throw std::logic_error("forced tokens reached a sequence that is not decoding");
         }
         const auto row_tokens = tokens.subspan(row * row_stride, row_stride);
-        if (static_cast<std::int64_t>(program_.position(static_cast<std::int32_t>(sequences[row].lane_))) +
-                row_stride + 1 > program_.capacity()) {
+        if (static_cast<std::int64_t>(
+                program_.position(static_cast<std::int32_t>(sequences[row].lane_))) +
+                row_stride + 1 >
+            program_.capacity()) {
             throw std::logic_error("forced tokens exceed the sequence's context capacity");
         }
         span[0] = lane->next_input;
@@ -189,11 +221,12 @@ ExecutionTiming GemmaProgram::append_forced_tokens(std::span<const SequenceHandl
 GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capacity,
                            std::int32_t lanes, std::uint32_t prefill_chunk,
                            std::uint32_t idle_prefill_chunk, std::int32_t draft_tokens,
-                           bool adaptive_draft, bool cuda_graphs, DeviceContext& device)
+                           bool adaptive_draft, bool cuda_graphs, KvCacheStorage storage,
+                           DeviceContext& device)
     : model_(model), device_(device), execution_(device.execution_view()),
-      program_(model, capacity, lanes, device, draft_tokens, cuda_graphs),
-      lanes_(static_cast<std::size_t>(lanes)),
-      prefill_chunk_(prefill_chunk), idle_chunk_(idle_prefill_chunk) {
+      program_(model, capacity, lanes, device, draft_tokens, cuda_graphs, storage),
+      lanes_(static_cast<std::size_t>(lanes)), prefill_chunk_(prefill_chunk),
+      idle_chunk_(idle_prefill_chunk) {
     if (prefill_chunk_ == 0 || idle_chunk_ == 0) {
         throw std::invalid_argument("gemma4 Program: prefill chunks must be positive");
     }
@@ -204,8 +237,8 @@ GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capa
     // Each rung's round is timed on lane 0 over a short synthetic context: a verify pass's cost is
     // fixed by its width, and what a long context adds the policy learns from the rounds it runs.
     constexpr std::int32_t kContext = 64, kWarm = 2, kTimed = 5;
-    const std::int32_t needed = kContext + static_cast<std::int32_t>(ladder.size()) *
-                                               (kWarm + kTimed) + draft_tokens + 2;
+    const std::int32_t needed =
+        kContext + static_cast<std::int32_t>(ladder.size()) * (kWarm + kTimed) + draft_tokens + 2;
     if (ladder.size() > 1 && program_.capacity() >= needed) {
         std::vector<TokenId> context(kContext);
         for (std::int32_t i = 0; i < kContext; ++i) context[static_cast<std::size_t>(i)] = 1000 + i;
@@ -215,9 +248,8 @@ GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capa
             std::vector<double> samples;
             for (std::int32_t round = 0; round < kWarm + kTimed; ++round) {
                 const auto started = Clock::now();
-                const auto result  = program_.speculate(0, context.back(),
-                                                        static_cast<std::int32_t>(ladder[rung]),
-                                                        execution_);
+                const auto result  = program_.speculate(
+                    0, context.back(), static_cast<std::int32_t>(ladder[rung]), execution_);
                 program_.commit_round(0, 1, execution_);
                 (void)result;
                 if (round >= kWarm) samples.push_back(seconds_since(started));
@@ -243,18 +275,18 @@ std::vector<float> GemmaProgram::causal_score(PreparedPrompt&& prompt, std::uint
 
 MemorySummary GemmaProgram::memory_summary() const {
     MemorySummary summary{};
-    summary.device                     = device_.device;
-    summary.max_context                = static_cast<std::uint32_t>(program_.capacity());
-    summary.kv_capacity                = static_cast<std::uint32_t>(program_.capacity());
-    summary.kv_cache                   = KvCacheStorage::BFloat16;
-    summary.sequence.capacity_bytes    = program_.allocated_bytes();
-    summary.sequence.used_bytes        = program_.allocated_bytes();
-    summary.sequence.peak_used_bytes   = program_.allocated_bytes();
-    summary.weights.capacity_bytes     = model_.storage_stats().h2d_bytes;
-    summary.weights.used_bytes         = model_.storage_stats().h2d_bytes;
-    summary.weights.peak_used_bytes    = model_.storage_stats().h2d_bytes;
-    summary.prefill_chunk              = prefill_chunk_;
-    summary.idle_prefill_chunk         = idle_chunk_;
+    summary.device                   = device_.device;
+    summary.max_context              = static_cast<std::uint32_t>(program_.capacity());
+    summary.kv_capacity              = static_cast<std::uint32_t>(program_.capacity());
+    summary.kv_cache                 = program_.storage();
+    summary.sequence.capacity_bytes  = program_.allocated_bytes();
+    summary.sequence.used_bytes      = program_.allocated_bytes();
+    summary.sequence.peak_used_bytes = program_.allocated_bytes();
+    summary.weights.capacity_bytes   = model_.storage_stats().h2d_bytes;
+    summary.weights.used_bytes       = model_.storage_stats().h2d_bytes;
+    summary.weights.peak_used_bytes  = model_.storage_stats().h2d_bytes;
+    summary.prefill_chunk            = prefill_chunk_;
+    summary.idle_prefill_chunk       = idle_chunk_;
     return summary;
 }
 
@@ -266,7 +298,7 @@ GemmaProgram::Lane* GemmaProgram::valid_lane(SequenceHandle sequence) noexcept {
 }
 
 void GemmaProgram::release(std::uint32_t lane) noexcept {
-    Lane& entry = lanes_[lane];
+    Lane& entry      = lanes_[lane];
     entry.phase      = Phase::Free;
     entry.prompt     = {};
     entry.cursor     = 0;
@@ -331,15 +363,16 @@ GemmaProgram::inspect_admission(const PreparedPrompt&, const RequestBasePlan& ba
     if (source != nullptr || shared_source != nullptr || checkpoint) return std::nullopt;
     if (destination.value >= lanes_.size()) return std::nullopt;
     AdmissionCandidate candidate;
-    candidate.summary_  = base.summary();
-    candidate.sampling_ = base.sampling_;
-    candidate.lane_     = destination.value;
+    candidate.summary_                          = base.summary();
+    candidate.sampling_                         = base.sampling_;
+    candidate.lane_                             = destination.value;
     IdentityMaterializationAssessment& identity = candidate.identity_;
-    identity.physical_status = lanes_[destination.value].phase == Phase::Free
-                                   ? MaterializationPhysicalStatus::Feasible
-                                   : MaterializationPhysicalStatus::Infeasible;
-    // A root has no source to retain; the controller reads Retain as "keep a source" and refuses it.
-    identity.source_mode                     = PrivateSourceMode::ConsumeToActive;
+    identity.physical_status                    = lanes_[destination.value].phase == Phase::Free
+                                                      ? MaterializationPhysicalStatus::Feasible
+                                                      : MaterializationPhysicalStatus::Infeasible;
+    // A root has no source to retain; the controller reads Retain as "keep a source" and refuses
+    // it.
+    identity.source_mode                         = PrivateSourceMode::ConsumeToActive;
     identity.machine_work.remaining_prefill_work = base.prefill_work_;
     identity.machine_work.reused_prompt_tokens   = 0;
     identity.pressure_may_change_machine_work    = false;
@@ -350,7 +383,8 @@ GemmaProgram::inspect_admission(const PreparedPrompt&, const RequestBasePlan& ba
 }
 
 std::optional<ResourcePlan> GemmaProgram::seal_identity(const AdmissionCandidate& candidate,
-                                                        const PreparedPrompt&, FinalScheduleIntent) {
+                                                        const PreparedPrompt&,
+                                                        FinalScheduleIntent) {
     if (candidate.identity_.physical_status != MaterializationPhysicalStatus::Feasible ||
         lanes_[candidate.lane_].phase != Phase::Free) {
         return std::nullopt;
@@ -369,9 +403,9 @@ PrefillWork GemmaProgram::shared_capture_split_prefill_work(const AdmissionCandi
     return candidate.identity_.machine_work.remaining_prefill_work;
 }
 
-ContextTransactionReserveStatus
-GemmaProgram::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt,
-                                         CancellationFlagView) {
+ContextTransactionReserveStatus GemmaProgram::start_resource_transaction(ResourcePlan&& plan,
+                                                                         PreparedPrompt&& prompt,
+                                                                         CancellationFlagView) {
     if (transaction_ || plan.revision_ != resource_revision() ||
         lanes_[plan.admission_.lane_].phase != Phase::Free) {
         return ContextTransactionReserveStatus::Aborted;
@@ -389,14 +423,14 @@ ContextTransactionProgress GemmaProgram::progress_context_transaction(Cancellati
     // A root materialization is an empty lane: the cache forgets its rows and the sampler starts
     // over, which is all the state this model has.
     program_.reset(static_cast<std::int32_t>(transaction.lane), translate(transaction.sampling));
-    lane.phase      = Phase::Prefill;
-    lane.epoch      = next_epoch_++;
-    lane.prompt     = std::move(transaction.prompt.ids);
+    lane.phase       = Phase::Prefill;
+    lane.epoch       = next_epoch_++;
+    lane.prompt      = std::move(transaction.prompt.ids);
     lane.images      = std::move(transaction.prompt.images);
-    lane.cursor     = 0;
-    lane.next_input = -1;
-    lane.pending    = false;
-    lane.timings    = {};
+    lane.cursor      = 0;
+    lane.next_input  = -1;
+    lane.pending     = false;
+    lane.timings     = {};
     lane.speculative = {};
     lane.acceptance.reset();
     lane.rung = draft_policy_ ? draft_policy_->initial_rung() : 0;
@@ -423,10 +457,10 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
         throw std::logic_error("prefill advanced on a sequence that is not prefilling");
     }
     ExecutionTimingRecorder timing(ExecutionTimingPhase::Submit, failed_timing);
-    const auto started            = Clock::now();
-    const std::uint32_t total     = static_cast<std::uint32_t>(lane->prompt.size());
-    const std::uint32_t width     = pace == PrefillPace::BesideDecode ? prefill_chunk_ : idle_chunk_;
-    std::uint32_t step            = std::min(width, total - lane->cursor);
+    const auto started        = Clock::now();
+    const std::uint32_t total = static_cast<std::uint32_t>(lane->prompt.size());
+    const std::uint32_t width = pace == PrefillPace::BesideDecode ? prefill_chunk_ : idle_chunk_;
+    std::uint32_t step        = std::min(width, total - lane->cursor);
     const std::int32_t lane_index = static_cast<std::int32_t>(sequence.lane_);
     // An image is attended as one block, so a chunk that would end inside one ends before it, or,
     // when the image starts the chunk, takes the whole image.
@@ -452,9 +486,9 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
     lane->cursor += step;
 
     PrefillProgress progress;
-    progress.summary = BeginSummary{.prompt_tokens        = total,
-                                    .reused_prompt_tokens = 0,
-                                    .prefix_reuse_path    = PrefixReusePath::Root};
+    progress.summary                 = BeginSummary{.prompt_tokens        = total,
+                                                    .reused_prompt_tokens = 0,
+                                                    .prefix_reuse_path    = PrefixReusePath::Root};
     progress.processed_prompt_tokens = step;
     progress.service_units = static_cast<std::uint32_t>(1U + (step - 1U) / prefill_chunk_);
     progress.complete      = lane->cursor == total;
@@ -466,13 +500,13 @@ PrefillProgress GemmaProgram::advance_prefill(SequenceHandle sequence, PrefillPa
         const TokenId token = program_.sample(lane_index, execution_);
         timing.end_wait();
         PendingBatch pending;
-        pending.transaction_ = next_pending_++;
-        pending.rows_[0]     = sequence;
-        pending.tokens_[0]   = token;
-        pending.counts_[0]   = 1;
-        pending.row_count_   = 1;
-        lane->pending        = true;
-        open_pending_        = pending.transaction_;
+        pending.transaction_              = next_pending_++;
+        pending.rows_[0]                  = sequence;
+        pending.tokens_[0]                = token;
+        pending.counts_[0]                = 1;
+        pending.row_count_                = 1;
+        lane->pending                     = true;
+        open_pending_                     = pending.transaction_;
         lane->timings.first_token_seconds = lane->timings.prefill_seconds + seconds_since(started);
         progress.pending.emplace(std::move(pending));
     } else {
@@ -512,8 +546,8 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
         const std::int32_t lane_index = static_cast<std::int32_t>(sequences[row].lane_);
         // A round drafts no more than the output budget can keep beyond its own token, and no more
         // than the lane's capacity holds; with nothing to draft it is one plain token.
-        const std::int64_t room = static_cast<std::int64_t>(program_.capacity()) -
-                                  program_.position(lane_index) - 1;
+        const std::int64_t room =
+            static_cast<std::int64_t>(program_.capacity()) - program_.position(lane_index) - 1;
         std::int32_t length = 0;
         if (draft_policy_) {
             const qwen::MtpAcceptanceEstimate* estimate = &lane->acceptance;
@@ -521,8 +555,8 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
             length     = static_cast<std::int32_t>(draft_policy_->ladder()[lane->rung]);
         }
         const std::int32_t drafts = static_cast<std::int32_t>(std::max<std::int64_t>(
-            0, std::min<std::int64_t>({length, budgets[row].generated_tokens_remaining - 1LL,
-                                       room})));
+            0,
+            std::min<std::int64_t>({length, budgets[row].generated_tokens_remaining - 1LL, room})));
         if (drafts > 0) {
             speculative_rows.push_back(row);
             speculative_lanes.push_back(lane_index);
@@ -606,12 +640,12 @@ qwen::CommitResult GemmaProgram::commit(PendingBatch&& pending,
               decision.accepted_tokens > static_cast<std::uint32_t>(pending.counts_[row])))) {
             throw std::logic_error("pending transaction decision is invalid");
         }
-        // The split marks a prefix-identity boundary for the context cache, which this model does not
-        // keep, and Gemma's frontend never sets one.
+        // The split marks a prefix-identity boundary for the context cache, which this model does
+        // not keep, and Gemma's frontend never sets one.
         if (decision.prefix_execution_split_after) {
             throw std::logic_error("Gemma keeps no prefix identity to split");
         }
-        lane->pending = false;
+        lane->pending                  = false;
         const std::uint32_t lane_index = pending.rows_[row].lane_;
         if (decision.cancelled || decision.failed) {
             out.rows[row].disposition = decision.cancelled ? CommitDisposition::CancelledReleased
@@ -624,7 +658,7 @@ qwen::CommitResult GemmaProgram::commit(PendingBatch&& pending,
         const auto kept = static_cast<std::int32_t>(decision.accepted_tokens);
         if (pending.speculative_[row]) {
             program_.commit_round(static_cast<std::int32_t>(lane_index), kept, execution_);
-            SpeculativeStats& stats = lane->speculative;
+            SpeculativeStats& stats    = lane->speculative;
             const std::int32_t drafted = pending.drafted_[row];
             const std::int32_t used    = std::min(pending.accepted_[row], kept);
             ++stats.rounds;
@@ -731,7 +765,19 @@ EngineOptions gemma_engine_options(EngineOptions options) {
         if (speculative.lookup_drafts != LookupDraftMode::Off) refuse("prompt-lookup drafts");
         if (speculative.tree_width != 1) refuse("draft trees");
     }
-    if (options.kv_cache != KvCacheStorage::BFloat16) refuse("a KV cache format other than BF16");
+    // The four quantized formats are the D256 codecs, and this model's sliding rings are 256 wide,
+    // so all four are wired for them; the five global layers stay BF16 whatever this says, because
+    // their 640-wide rows have no codec. Each format is qualified at this model's geometry by
+    // `tests/models/gemma4/test_kv_quant.cpp` and against the documented scoring protocol, and a
+    // storage this model has not been wired for is refused by name rather than run as if it had
+    // been asked for.
+    if (options.kv_cache != KvCacheStorage::BFloat16 &&
+        options.kv_cache != KvCacheStorage::Int8Group64 &&
+        options.kv_cache != KvCacheStorage::Fp8E4M3Row256 &&
+        options.kv_cache != KvCacheStorage::Nvfp4Group16 &&
+        options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value) {
+        refuse("a KV cache format other than BF16, int8, fp8, nvfp4 or k8v4");
+    }
     if (options.kv_stream) refuse("KV streaming");
     // Every lane holds max_context tokens of global KV, so an explicit capacity below one request's
     // window cannot be honoured; a larger one is simply not needed.
@@ -754,28 +800,29 @@ GemmaInstance::GemmaInstance(std::unique_ptr<models::gemma4::Model> source,
     : model(std::move(source)), frontend(resources, options.max_context), program(nullptr),
       capacity(options.max_context) {
     const std::int32_t lanes = static_cast<std::int32_t>(options.max_concurrency);
-    const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+    const bool mtp           = options.speculative.backend == SpeculativeBackend::Mtp;
     const std::int32_t draft_tokens =
         mtp ? static_cast<std::int32_t>(options.speculative.draft_tokens) : 0;
     const std::size_t needed = models::gemma4::Program::device_bytes(
         model->config(), static_cast<std::int32_t>(capacity), lanes, draft_tokens,
-        model->vision_config() ? &*model->vision_config() : nullptr);
+        model->vision_config() ? &*model->vision_config() : nullptr, options.kv_cache);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    // The KV cache, the rings and the scratch are allocated up front, so a configuration that does not
-    // fit is refused here with the numbers rather than by an allocation failure mid-request.
+    // The KV cache, the rings and the scratch are allocated up front, so a configuration that does
+    // not fit is refused here with the numbers rather than by an allocation failure mid-request.
     if (needed > free_bytes) {
-        throw std::invalid_argument(
-            "Gemma needs " + std::to_string(needed >> 20) + " MiB for " + std::to_string(lanes) +
-            " lane(s) of " + std::to_string(capacity) + " tokens, but only " +
-            std::to_string(free_bytes >> 20) +
-            " MiB of device memory is free after the weights; lower --max-ctx or --max-concurrency");
+        throw std::invalid_argument("Gemma needs " + std::to_string(needed >> 20) + " MiB for " +
+                                    std::to_string(lanes) + " lane(s) of " +
+                                    std::to_string(capacity) + " tokens, but only " +
+                                    std::to_string(free_bytes >> 20) +
+                                    " MiB of device memory is free after the weights; lower "
+                                    "--max-ctx or --max-concurrency");
     }
     program = std::make_unique<gemma_contract::GemmaProgram>(
         *model, static_cast<std::int32_t>(capacity), lanes, options.prefill_chunk.value(),
         options.idle_prefill_chunk.value(), draft_tokens, mtp && !options.speculative.fixed_draft,
-        options.use_cuda_graph, device);
+        options.use_cuda_graph, options.kv_cache, device);
     std::size_t after_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&after_bytes, &total_bytes));
     kv_capacity_resolution.mode                          = KvCapacityMode::Explicit;
@@ -809,8 +856,8 @@ std::unique_ptr<GemmaInstance> load_gemma_instance(const EngineOptions& options,
         }
         resources.chat_template_jinja.assign(std::istreambuf_iterator<char>(file), {});
     }
-    auto model = models::gemma4::materialize_model(std::move(plan), device,
-                                                   &options.startup_observer);
+    auto model =
+        models::gemma4::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     return std::make_unique<GemmaInstance>(std::move(model), resources, options, device);
 }
