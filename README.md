@@ -121,10 +121,13 @@ essay (mean of two runs). Bold marks the faster mode at each concurrency.
 | Qwen3.8-Flash-Next `nvfp4` | plain | **98.5** | **141.6** | **180.6** | **185.3** |
 | | `--spec mtp` | 82.2 | 136.8 | 165.0 | 182.1 |
 
-On this prose load, 35B-A3B speculation loses from C=4 up. On the long-reasoning load it wins instead:
-MTP K=3 beats plain at C=4 and DFlash7 is fastest at C=8. Which mode wins depends on the workload —
-[recommended settings](docs/speculative-decoding.md#recommended-settings) has the per-model answer, and
-[versus stock](docs/vs-stock-ninfer.md) the same load measured against upstream.
+Every row above writes 512-token essays, which favours plain decode on the two MoE artifacts: 35B-A3B
+and Flash-Next have plain in bold at the top concurrency. The load decides, and two other protocols in
+this README measure it. On the 1,024-token reasoning generations of the [master charts](#master-charts),
+35B-A3B gains 1.46x at two lanes and 1.12x at four while tying at eight, and Flash-Next gains at every
+concurrency (quantified in its paragraph below). On the 4,096-token AIME load of
+[versus stock](docs/vs-stock-ninfer.md), MTP K=3 beats plain at C=4 and DFlash7 is fastest at C=8.
+[Recommended settings](docs/speculative-decoding.md#recommended-settings) answers it per model.
 
 Qwen3.6-27B was measured in its own campaign rather than this one — a 293-token prompt, an
 8,192-token generation per request, INT8 group-64 KV and MTP=3 — so its numbers are quoted, not
@@ -135,9 +138,12 @@ tabulated above: **185.8 / 247.0 / 309.5 / 535.0** tok/s aggregate decode at C=1
 acceptance by scenario, the AIME runs, TTFT and the evaluation scores — and the
 [`nvfp4` card](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) its own set.
 
-On the long-reasoning load, Flash-Next's prefill reaches 1,090 / 3,666 / 3,498 / 2,908 / 2,218 tok/s at
-1.5k / 8k / 64k / 128k / 256k tokens, and its decode is 81 tok/s with MTP K=3
-([detail](docs/flash-next.md#speed)).
+**Flash-Next is where the load changes the verdict most.** The essay rows above are from an older build
+(`fc305acd`) and show plain decode winning. On the reasoning load — the protocol the master charts use —
+the **current** build decodes **69.7 → 252.5 tok/s plain and 93.4 → 265.5 with MTP** from one lane to
+eight, a gain at every concurrency, at **4,861 / 5,232 / 4,468 / 3,319** tok/s prefill for 7.7k / 64.5k /
+130k / **260k**-token prompts. It is the only model here that runs that last one.
+([detail](docs/flash-next.md#reasoning-load-numbers-decode-saturation))
 
 ### Single-request benchmark
 
