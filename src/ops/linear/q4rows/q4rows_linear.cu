@@ -5,8 +5,8 @@
 // nothing about a geometry needs hand tuning to be correct, and the converter's QAT grid recovery
 // is what makes the format worth reading at all.
 //
-//   * up to kQ4RowsSimtMaxTokens tokens, a warp per four output rows streams the rows once and
-//     applies each decoded group to every token's activations, accumulating in FP32;
+//   * up to kQ4RowsSimtMaxTokens tokens, a warp per output row streams the row's groups once and
+//     applies each decoded group to the activations, accumulating in FP32;
 //   * above that, the 64 x 64 BF16 tensor-core tile of q4_rows_mma.cuh, one CTA per (64 rows,
 //     64 tokens), with the weights decoded to BF16 in shared memory.
 #include "ops/linear/q4rows/q4rows_dispatch.h"
@@ -23,9 +23,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// Output rows a warp owns. Each lane takes whole 32-value scale groups as one 16-byte load a row,
-// so four rows keep four independent loads in flight a lane per group.
-constexpr int kSimtRows       = 4;
+// Output rows a warp owns: one. A decode GEMV's grid is then one CTA per kSimtWarps rows, so the
+// machine fills with warps instead of a few hundred CTAs: the 26B's projections have 64-512 CTAs
+// at four rows a warp, which leaves one CTA on an SM and the kernel latency-bound, and one row a
+// warp measures 4.8% of end-to-end decode on this card. A row's arithmetic does not depend on which
+// block covers it, so the two forms are bit-identical. Each lane takes whole 32-value scale groups
+// as one 16-byte load a row, and a lane's strided group range keeps several of the row's loads in
+// flight; the warp's 32 lanes cover 32 of the row's groups at a time.
+constexpr int kSimtRows       = 1;
 constexpr int kSimtWarps      = 4;
 constexpr int kSimtRowsPerCta = kSimtRows * kSimtWarps;
 
@@ -119,9 +124,9 @@ __global__ __launch_bounds__(kQ4RowsTileThreads) void q4rows_mma_kernel(
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out, int n, int k,
     int tokens) {
     __shared__ __align__(16) __nv_bfloat16 smem[kQ4RowsTileSmemElements];
-    const int tid   = static_cast<int>(threadIdx.x);
-    const int row0  = static_cast<int>(blockIdx.x) * kQ4RowsTileM;
-    const int col0  = static_cast<int>(blockIdx.y) * kQ4RowsTileN;
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int row0         = static_cast<int>(blockIdx.x) * kQ4RowsTileM;
+    const int col0         = static_cast<int>(blockIdx.y) * kQ4RowsTileN;
     const std::int64_t row = row0 + (tid >> 1);
 
     const __nv_bfloat16* b_rows[4];
@@ -154,8 +159,9 @@ __global__ __launch_bounds__(kQ4RowsTileThreads) void q4rows_mma_kernel(
 template <int Tokens>
 void launch_simt(const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* scales,
                  __nv_bfloat16* out, int n, int k, cudaStream_t stream) {
-    q4rows_simt_kernel<Tokens><<<(n + kSimtRowsPerCta - 1) / kSimtRowsPerCta, kSimtWarps * 32, 0,
-                                 stream>>>(x, codes, scales, out, n, k);
+    q4rows_simt_kernel<Tokens>
+        <<<(n + kSimtRowsPerCta - 1) / kSimtRowsPerCta, kSimtWarps * 32, 0, stream>>>(
+            x, codes, scales, out, n, k);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -165,19 +171,35 @@ void q4rows_launch(const __nv_bfloat16* x, const std::uint8_t* codes, const std:
                    __nv_bfloat16* out, std::int32_t n, std::int32_t k, std::int32_t tokens,
                    cudaStream_t stream) {
     switch (tokens) {
-    case 1: launch_simt<1>(x, codes, scales, out, n, k, stream); return;
-    case 2: launch_simt<2>(x, codes, scales, out, n, k, stream); return;
-    case 3: launch_simt<3>(x, codes, scales, out, n, k, stream); return;
-    case 4: launch_simt<4>(x, codes, scales, out, n, k, stream); return;
-    case 5: launch_simt<5>(x, codes, scales, out, n, k, stream); return;
-    case 6: launch_simt<6>(x, codes, scales, out, n, k, stream); return;
-    case 7: launch_simt<7>(x, codes, scales, out, n, k, stream); return;
-    case 8: launch_simt<8>(x, codes, scales, out, n, k, stream); return;
-    default: break;
+    case 1:
+        launch_simt<1>(x, codes, scales, out, n, k, stream);
+        return;
+    case 2:
+        launch_simt<2>(x, codes, scales, out, n, k, stream);
+        return;
+    case 3:
+        launch_simt<3>(x, codes, scales, out, n, k, stream);
+        return;
+    case 4:
+        launch_simt<4>(x, codes, scales, out, n, k, stream);
+        return;
+    case 5:
+        launch_simt<5>(x, codes, scales, out, n, k, stream);
+        return;
+    case 6:
+        launch_simt<6>(x, codes, scales, out, n, k, stream);
+        return;
+    case 7:
+        launch_simt<7>(x, codes, scales, out, n, k, stream);
+        return;
+    case 8:
+        launch_simt<8>(x, codes, scales, out, n, k, stream);
+        return;
+    default:
+        break;
     }
     const dim3 grid(n / kQ4RowsTileM, (tokens + kQ4RowsTileN - 1) / kQ4RowsTileN);
-    q4rows_mma_kernel<<<grid, kQ4RowsTileThreads, 0, stream>>>(x, codes, scales, out, n, k,
-                                                               tokens);
+    q4rows_mma_kernel<<<grid, kQ4RowsTileThreads, 0, stream>>>(x, codes, scales, out, n, k, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
