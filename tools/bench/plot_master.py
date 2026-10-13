@@ -159,9 +159,11 @@ def draw(model: str, readings: list[dict[str, Any]], runs: list[Path], out: Path
              "decode: steady intervals whose decode batch equals the concurrency",
              fontsize=7, ha="left", va="bottom")
     written: list[Path] = []
+    # Not Path.with_suffix: a model name may carry a dot itself (qwen3.8-flash-next), and with_suffix
+    # would take everything after it as the suffix and write qwen3.png.
     stem = out / f"{model.replace('/', '_')}_master"
     for suffix in (".png", ".svg"):
-        path = stem.with_suffix(suffix)
+        path = Path(f"{stem}{suffix}")
         fig.savefig(path, dpi=140)
         written.append(path)
     plt.close(fig)

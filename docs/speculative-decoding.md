@@ -42,7 +42,9 @@ Why these:
   columns and touches more experts than the accepted drafts save: on 512-token essays plain decode
   was 20% faster than MTP for a single request and 2% faster at C=8. The lookup window is the
   exception — it only runs a wide verify where the text repeats earlier context — so use it for
-  copy-heavy work and plain decode otherwise.
+  copy-heavy work and plain decode otherwise. On reasoning loads the sign flips: 1,024-token
+  generations gain 1.05–1.99x from MTP K=3 with the full head
+  ([numbers](flash-next.md#reasoning-load-numbers-decode-saturation)).
 - **The adaptive default (`--spec mtp` alone)** is a reasonable choice when the workload is unknown
   or mixed; see [Adaptive MTP draft length](#adaptive-mtp-draft-length).
 
