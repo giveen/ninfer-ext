@@ -5,15 +5,18 @@
 # fails with "nvcc fatal : Value 'c++23' is not defined for option 'std'" on the first .cu file.
 FROM nvidia/cuda:13.3.1-devel-ubuntu24.04 AS build
 
-# Ubuntu 24.04 defaults to gcc 13, whose libstdc++ has neither <flat_map> nor <print>; the tree uses
-# both (docs/engineering.md). The default c++/cc are pointed at 14 rather than relying on CMake's
-# compiler variables, because CMake's CUDA dyndep scan runs /usr/bin/c++ directly and ignores
-# CMAKE_CUDA_HOST_COMPILER -- which is where flat_map was still coming from gcc 13.
+# Two toolchain constraints, both from the tree's C++23 use (docs/engineering.md):
+#  * <flat_map> is libstdc++ 15 -- Ubuntu 24.04 ships 13, and 14 at newest -- so g++-15 comes from the
+#    ubuntu-toolchain-r PPA. It becomes the *default* c++/cc, not just CMake's compiler variables,
+#    because CMake's CUDA dyndep scan runs /usr/bin/c++ directly and ignores CMAKE_CUDA_HOST_COMPILER.
+#  * CMake 3.28 and newer scan C++23 sources for modules by default, and gcc's -fmodules-ts scan
+#    cannot see <flat_map> either, so the scan is switched off at configure time.
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        ca-certificates \
         cmake \
-        g++-14 \
+        gnupg \
         libavcodec-dev \
         libavformat-dev \
         libavutil-dev \
@@ -21,23 +24,23 @@ RUN apt-get update \
         libswscale-dev \
         ninja-build \
         pkg-config \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 200 \
-    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 200 \
+        software-properties-common \
+    && add-apt-repository --yes ppa:ubuntu-toolchain-r/test \
+    && apt-get install --yes --no-install-recommends g++-15 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 200 \
+    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-15 200 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CC=gcc-14 CXX=g++-14
+ENV CC=gcc-15 CXX=g++-15
 
 WORKDIR /src
 COPY . .
 
-# CMAKE_CXX_SCAN_FOR_MODULES=OFF: CMake 3.28 and newer scan C++23 sources for modules by default, and
-# gcc-14's -fmodules-ts scan cannot see libstdc++'s <flat_map> either. The tree uses C++23 library
-# features, not modules.
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CXX_COMPILER=g++-14 \
-        -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
-        -DCMAKE_CUDA_FLAGS="-ccbin g++-14" \
+        -DCMAKE_CXX_COMPILER=g++-15 \
+        -DCMAKE_CUDA_HOST_COMPILER=g++-15 \
+        -DCMAKE_CUDA_FLAGS="-ccbin g++-15" \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
