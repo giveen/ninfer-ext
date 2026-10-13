@@ -5,6 +5,7 @@
 // one 16-byte pack per thread; BF16x2 and scalar routes preserve correctness for
 // smaller alignments and odd tails.
 
+#include "ops/common/bf16_combine.cuh"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/memory.cuh"
 
@@ -15,12 +16,6 @@
 namespace ninfer::ops {
 
 inline constexpr int kResidualAddPairsPerThread = 4;
-
-__device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __nv_bfloat162 x) {
-    const float r0 = __low2float(x) + __low2float(y);
-    const float r1 = __high2float(x) + __high2float(y);
-    return __floats2bfloat162_rn(r0, r1);
-}
 
 __global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16* x,
                                            std::int64_t n) {

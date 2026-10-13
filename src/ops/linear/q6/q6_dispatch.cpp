@@ -52,6 +52,13 @@ constexpr std::array kShapes{
     ShapeEntry{1024, 16384, select_q6_gemma4_drafter_wide_k},
     ShapeEntry{262144, 1024, select_q6_gemma4_drafter_n262144_k1024},
     ShapeEntry{5376, 1024, select_q6_gemma4_drafter_small},
+    // The same drafter retargeted at the 26B-A4B, whose attention has 16 heads to the 31B's 32 and
+    // whose backbone is 2816: the input projection contracts over 2*2816, the attention widths are
+    // the target's head count times the head width, and the output projection returns to 2816.
+    ShapeEntry{1024, 5632, select_q6_gemma4_drafter_wide_k},
+    ShapeEntry{1024, 4096, select_q6_gemma4_drafter_wide_k},
+    ShapeEntry{4096, 1024, select_q6_gemma4_drafter_small},
+    ShapeEntry{2816, 1024, select_q6_gemma4_drafter_small},
 };
 } // namespace
 

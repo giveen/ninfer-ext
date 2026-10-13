@@ -6,6 +6,7 @@ set(ninfer_op_tests
   gemma_moe_experts
   silu_mul
   residual_add
+  residual_add_norm
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail

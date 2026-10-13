@@ -63,12 +63,23 @@ int q6_a16_conformance() {
 
     // Qwen4Exp (Flash-Next) dense projections: single-token decode, MTP verify widths, and prefill.
     constexpr std::array kFlash{
-        a16(1),  a16(2),  a16(3),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),   a16(9),
-        a16(16), a16(17), a16(33), a16(64), a16(97), a16(129), a16(2048), graph(1), graph(3), graph(8),
+        a16(1),   a16(2),    a16(3),   a16(4),   a16(5),   a16(6),  a16(7),
+        a16(8),   a16(9),    a16(16),  a16(17),  a16(33),  a16(64), a16(97),
+        a16(129), a16(2048), graph(1), graph(3), graph(8),
     };
     constexpr std::array<std::array<std::int32_t, 2>, 12> kFlashShapes{{
-        {324, 10240}, {320, 10240}, {96, 2560},   {640, 2560},   {1280, 2560},  {2560, 640},
-        {2560, 2560}, {2560, 4608}, {2560, 6144}, {13312, 2560}, {16384, 2560}, {12800, 2560},
+        {324, 10240},
+        {320, 10240},
+        {96, 2560},
+        {640, 2560},
+        {1280, 2560},
+        {2560, 640},
+        {2560, 2560},
+        {2560, 4608},
+        {2560, 6144},
+        {13312, 2560},
+        {16384, 2560},
+        {12800, 2560},
     }};
     for (const auto& [n, k] : kFlashShapes) {
         failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
@@ -76,11 +87,18 @@ int q6_a16_conformance() {
     }
 
     // Gemma 4 31B: decode, the 128-token pass and an odd prefill width.
-    constexpr std::array kGemma{a16(1), a16(2), a16(5), a16(17), a16(64), a16(128), a16(1000),
-                                graph(1)};
+    constexpr std::array kGemma{a16(1),  a16(2),   a16(5),    a16(17),
+                                a16(64), a16(128), a16(1000), graph(1)};
     constexpr std::array<std::array<std::int32_t, 2>, 9> kGemmaShapes{{
-        {8192, 5376}, {4096, 5376}, {16384, 5376}, {2048, 5376}, {5376, 8192}, {5376, 16384},
-        {21504, 5376}, {5376, 21504}, {262144, 5376},
+        {8192, 5376},
+        {4096, 5376},
+        {16384, 5376},
+        {2048, 5376},
+        {5376, 8192},
+        {5376, 16384},
+        {21504, 5376},
+        {5376, 21504},
+        {262144, 5376},
     }};
     for (const auto& [n, k] : kGemmaShapes) {
         failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
@@ -94,15 +112,21 @@ int q6_a16_conformance() {
         failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                               {n, k, 227U, Comparison::Sampled, false, kVisionGemma});
     }
-    // The Gemma 4 assistant drafter, one token per step, eager and replayed.
-    constexpr std::array kDraft{a16(1), graph(1)};
-    for (const auto& [n, k] : std::array<std::array<std::int32_t, 2>, 7>{{{1024, 10752},
-                                                                          {8192, 1024},
-                                                                          {16384, 1024},
-                                                                          {1024, 8192},
-                                                                          {1024, 16384},
-                                                                          {262144, 1024},
-                                                                          {5376, 1024}}}) {
+    // The Gemma 4 assistant drafter: one token per step per concurrent request, eager and replayed.
+    // The last four shapes are the same drafter retargeted at the 26B-A4B (16 heads to the 31B's 32
+    // and a backbone of 2816), which is the geometry their own registry entries exist for.
+    constexpr std::array kDraft{a16(1), a16(2), a16(8), graph(1)};
+    for (const auto& [n, k] : std::array<std::array<std::int32_t, 2>, 11>{{{1024, 10752},
+                                                                           {8192, 1024},
+                                                                           {16384, 1024},
+                                                                           {1024, 8192},
+                                                                           {1024, 16384},
+                                                                           {262144, 1024},
+                                                                           {5376, 1024},
+                                                                           {1024, 5632},
+                                                                           {1024, 4096},
+                                                                           {4096, 1024},
+                                                                           {2816, 1024}}}) {
         failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                               {n, k, 229U, Comparison::Sampled, false, kDraft});
     }
