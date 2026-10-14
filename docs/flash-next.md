@@ -12,7 +12,8 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   the device memory left after the KV floor.
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
   a double-buffered staging bank, copying experts already in the cache device-to-device instead.
-  Staged experts run on a W4A4 tensor-core route. Between long chunks the staging banks serve as
+  Staged experts run on a W4A4 tensor-core route when the artifact stores the layer's NVFP4 input
+  divisors, and on the same route's SIMT A16 branch otherwise. Between long chunks the staging banks serve as
   1024 more cache slots. The prefill chunk beside decode defaults to 4,096 tokens; with no decode
   waiting the idle step widens up to 16,384 as memory allows, borrowing the expert cache's top slots
   for its arena and returning them afterwards, so a long prompt streams each layer fewer times at no
