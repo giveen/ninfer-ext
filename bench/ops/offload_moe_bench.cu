@@ -1,11 +1,16 @@
 // Routed-expert decode benchmark for the public moe_experts contract (Qwen4Exp geometry).
 //
-// A bank of 512 random experts in either layout (NVFP4 or EXL3 at a chosen rate) is read through the
-// staged route (slot = expert id) with fresh random top-10 routing per call and the L2 flushed
+// A bank of 512 random experts in either layout (NVFP4 or EXL3 at a chosen rate) is read through
+// the staged route (slot = expert id) with fresh random top-10 routing per call and the L2 flushed
 // between calls, so every call streams its experts from DRAM as a decode round does. Timing is the
 // median GPU time of the whole moe_experts call (job build, gate/up, down, merge).
 //
-//   ninfer_offload_moe_bench [--format nvfp4|exl3] [--half-bits N] [--tokens 1,4,8] [--iters N]
+//   ninfer_offload_moe_bench [--format nvfp4|exl3] [--a4] [--half-bits N] [--tokens 1,4,8]
+//                            [--iters N]
+//
+// Without --a4 the call runs the tiled SIMT kernels, which is what a stored bank with no A4 input
+// divisor selects (the shipped Qwen4Exp artifact does); --a4 sets the bank's activation divisors
+// and runs the mxf4nvf4 staged route instead. Both use the same bank, tensors and flush.
 #include "ninfer/ops/offload_moe.h"
 
 #include "core/arena.h"
@@ -52,7 +57,7 @@ std::vector<std::int32_t> parse_list(const std::string& text) {
     return out;
 }
 
-ops::ExpertWeights make_bank(bool exl3, int half_bits, std::mt19937_64& rng,
+ops::ExpertWeights make_bank(bool exl3, bool a4, int half_bits, std::mt19937_64& rng,
                              std::size_t* bank_bytes) {
     ops::ExpertWeights bank;
     bank.layout = exl3 ? ops::exl3_expert_layout(half_bits, half_bits) : ops::nvfp4_expert_layout();
@@ -63,7 +68,9 @@ ops::ExpertWeights make_bank(bool exl3, int half_bits, std::mt19937_64& rng,
         const bool scale_plane = exl3 ? (p == 1 || p == 2 || p == 4 || p == 5) : (p == 1 || p == 3);
         if (scale_plane && exl3) {
             auto* f = reinterpret_cast<float*>(bytes.data());
-            for (std::size_t i = 0; i < bytes.size() / 4; ++i) { f[i] = (rng() & 1) ? 1.0F : -1.0F; }
+            for (std::size_t i = 0; i < bytes.size() / 4; ++i) {
+                f[i] = (rng() & 1) ? 1.0F : -1.0F;
+            }
         } else if (scale_plane) {
             std::fill(bytes.begin(), bytes.end(), 0x38); // E4M3 1.0
         } else {
@@ -84,6 +91,12 @@ ops::ExpertWeights make_bank(bool exl3, int half_bits, std::mt19937_64& rng,
         bank.gate_up_divisor_rows = ops::kOffloadMoeIntermediate;
         bank.down_divisors        = device_copy(std::vector<float>(E, 1.0F));
         bank.down_divisor_rows    = H;
+        if (a4) {
+            // The A4 route only requires these positive; the value scales the quantized activations
+            // and does not change the work, so the bench does not need a calibrated one.
+            bank.gate_up_input_divisor = 1.0F;
+            bank.down_input_divisor    = 1.0F;
+        }
     }
     return bank;
 }
@@ -91,19 +104,27 @@ ops::ExpertWeights make_bank(bool exl3, int half_bits, std::mt19937_64& rng,
 } // namespace
 
 int main(int argc, char** argv) {
-    bool exl3 = false;
+    bool exl3 = false, a4 = false;
     int half_bits = 8, iters = 100;
     std::vector<std::int32_t> tokens = {1, 4, 8};
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         const auto next          = [&]() -> std::string {
-            if (++i >= argc) { std::fprintf(stderr, "%s needs a value\n", argv[i - 1]); std::exit(2); }
+            if (++i >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", argv[i - 1]);
+                std::exit(2);
+            }
             return argv[i];
         };
         if (a == "--format") {
             const std::string v = next();
-            if (v != "nvfp4" && v != "exl3") { std::fprintf(stderr, "format is nvfp4 or exl3\n"); return 2; }
+            if (v != "nvfp4" && v != "exl3") {
+                std::fprintf(stderr, "format is nvfp4 or exl3\n");
+                return 2;
+            }
             exl3 = v == "exl3";
+        } else if (a == "--a4") {
+            a4 = true;
         } else if (a == "--half-bits") {
             half_bits = std::stoi(next());
         } else if (a == "--tokens") {
@@ -115,12 +136,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (a4 && exl3) {
+        std::fprintf(stderr, "--a4 executes NVFP4 expert banks only\n");
+        return 2;
+    }
     std::mt19937_64 rng(0xBE7C4U);
-    std::size_t bank_bytes = 0;
-    const ops::ExpertWeights bank = make_bank(exl3, half_bits, rng, &bank_bytes);
+    std::size_t bank_bytes        = 0;
+    const ops::ExpertWeights bank = make_bank(exl3, a4, half_bits, rng, &bank_bytes);
     const double expert_bytes     = static_cast<double>(bank.layout.slot_bytes);
 
-    void* flush = nullptr;
+    void* flush                       = nullptr;
     constexpr std::size_t kFlushBytes = 256ULL << 20;
     CUDA_CHECK(cudaMalloc(&flush, kFlushBytes));
     cudaStream_t stream = nullptr;
@@ -129,11 +154,13 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&begin));
     CUDA_CHECK(cudaEventCreate(&end));
 
-    std::printf("format %s%s, expert slot %.0f B\n", exl3 ? "exl3 half-bits " : "nvfp4",
-                exl3 ? std::to_string(half_bits).c_str() : "", expert_bytes);
+    std::printf("format %s%s, %s route, expert slot %.0f B\n", exl3 ? "exl3 half-bits " : "nvfp4",
+                exl3 ? std::to_string(half_bits).c_str() : "", a4 ? "W4A4 tensor-core" : "SIMT A16",
+                expert_bytes);
     std::printf("%6s %12s %14s %12s\n", "T", "median us", "distinct exp", "GB/s (touched)");
     for (const std::int32_t t : tokens) {
-        WorkspaceArena workspace(ops::moe_experts_workspace_bytes(t, E, bank.layout));
+        WorkspaceArena workspace(a4 ? ops::moe_experts_a4_workspace_bytes(t)
+                                    : ops::moe_experts_workspace_bytes(t, E, bank.layout));
         std::vector<float> x(static_cast<std::size_t>(H) * t);
         std::vector<std::uint16_t> xb(x.size()), shared(x.size());
         for (auto& v : xb) {
@@ -143,11 +170,11 @@ int main(int argc, char** argv) {
             v = static_cast<std::uint16_t>(u >> 16);
         }
         std::fill(shared.begin(), shared.end(), 0);
-        auto* dx = device_copy(xb);
+        auto* dx      = device_copy(xb);
         auto* dshared = device_copy(shared);
-        auto* dsg = device_copy(std::vector<float>(t, 0.5F));
-        auto* dw  = device_copy(std::vector<float>(static_cast<std::size_t>(K) * t, 0.1F));
-        void* dy = nullptr;
+        auto* dsg     = device_copy(std::vector<float>(t, 0.5F));
+        auto* dw      = device_copy(std::vector<float>(static_cast<std::size_t>(K) * t, 0.1F));
+        void* dy      = nullptr;
         CUDA_CHECK(cudaMalloc(&dy, static_cast<std::size_t>(H) * t * 2));
         std::vector<float> times;
         double distinct_sum = 0;
@@ -157,7 +184,9 @@ int main(int argc, char** argv) {
             for (std::int32_t col = 0; col < t; ++col) {
                 std::iota(pool.begin(), pool.end(), 0);
                 std::shuffle(pool.begin(), pool.end(), rng);
-                for (int k = 0; k < K; ++k) { ids[static_cast<std::size_t>(col) * K + k] = pool[k]; }
+                for (int k = 0; k < K; ++k) {
+                    ids[static_cast<std::size_t>(col) * K + k] = pool[k];
+                }
             }
             std::vector<std::int32_t> uniq(ids);
             std::sort(uniq.begin(), uniq.end());
@@ -171,7 +200,11 @@ int main(int argc, char** argv) {
             Tensor ty(dy, DType::BF16, {H, t});
             CUDA_CHECK(cudaMemsetAsync(flush, it & 0xFF, kFlushBytes, stream));
             CUDA_CHECK(cudaEventRecord(begin, stream));
-            ops::moe_experts(tx, tids, tids, tw, tsg, tshared, bank, E, workspace, ty, stream);
+            if (a4) {
+                ops::moe_experts_a4(tx, tids, tw, tsg, tshared, bank, workspace, ty, stream);
+            } else {
+                ops::moe_experts(tx, tids, tids, tw, tsg, tshared, bank, E, workspace, ty, stream);
+            }
             CUDA_CHECK(cudaEventRecord(end, stream));
             CUDA_CHECK(cudaEventSynchronize(end));
             float ms = 0;
