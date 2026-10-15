@@ -73,12 +73,15 @@ scaling, no other state.
 
 ## What this costs
 
-Nothing here is reused from the existing families. New: a selective-scan SSM op with an fp32 state
-cache, the gated grouped norm, `relu2`, a non-gated expert bank, the latent projections, the
-sigmoid/group router, and a config whose layer types and expert shapes are **per layer**. Reusable:
-the linear-attention/recurrent-state machinery (GDN is the same family of problem, not the same
-mathematics), MoE routing infrastructure, GQA attention, KV paging, and the host-offload expert cache
-that Flash-Next already uses for a model whose weights exceed the device.
+Less is new than that first estimate suggested, and one piece costs nothing:
+
+| Piece | Verdict |
+|---|---|
+| Recurrent state | **Reused unchanged.** `LinearAttentionStatePoolSpec` is parametric in exactly what Mamba-2 needs — heads, head_dim, state size, conv channels and conv width — and the state is O(1) in context. 4 MiB per layer, so 160 MiB per sequence, plus 2.34 MiB of convolution history: 162.34 MiB per sequence, 2.67x the documented 35B-A3B image. |
+| Depthwise convolution | `causal_conv1d_silu` is already depthwise, kernel-4, causal, SiLU-fused, T-any, with per-slot state, and C=10240 is a production width. It lacks only the **bias**, and the bias cannot be added from outside it: the SiLU is fused, and `silu(conv)+bias` is not `silu(conv+bias)`. So that op gains a bias-then-SiLU form. (`dynamic_grouped_conv` is not this op — it is a round-level, channel-mixing, two-tap dynamic convolution, which is closer to the draft model's grouped convolution than to Mamba's.) |
+| Chunked scan | The SSD skeleton exists **twice**, in GDN and KDA, with fp32 state. Mamba-2 sits between them: KDA supplies the `A_log`/`dt_bias`/gate production and the chunk packet, GDN the *scalar* per-head decay cumsum (Mamba-2's A is per-head scalar), and the 8-groups-to-128-heads B/C mapping is the existing `qk_heads < value_heads` mechanism. Genuinely new: a distinct value extent (64 rather than the hardcoded 128), no delta rule, softplus dt, an unscaled readout and the `D*x` skip. |
+| Gated grouped norm | **Wholly new.** The gated RMSNorm here normalises the whole row and applies the gate after; this one gates first and normalises within groups. |
+| Everything else | `relu2`, the non-gated expert bank with its latent round trip, the sigmoid router, and a config whose block types and expert shapes are per layer. |
 
 Memory: NVIDIA's own 24GB variant is the only size evidence there is, and it is aggressive — see
 [the serving footprint](#serving-footprint-and-what-it-implies) below, which records their per-tensor
@@ -98,6 +101,12 @@ Per the decision taken when this was raised: **that is the intended configuratio
 This model is served the way Flash-Next is — routed experts in pinned Host memory behind a Program-owned
 device cache — using this repository's own quantization routes rather than NVIDIA's 2-bit recipe, which
 is a note about what they accepted rather than a target to match. No low-bit expert codec is needed.
+
+Phase 1 targets this repository's **NVFP4** route rather than EXL3, for a reason that is not about size:
+the LiLiCorr draft's own checkpoint is W4A16 NVFP4, so an NVFP4 target is the precision family the draft
+was trained against. Pairing it with an EXL3 target is exactly the mismatch that made the Gemma 4
+drafter accept almost nothing while every mechanism still tested clean. EXL3 becomes a second route
+afterwards, and the BF16 checkpoint is the conversion source for both.
 
 The host-offload cache does **not** survive heterogeneous banks as written: `slot_of` is `layers × E`,
 the owner→layer decode is a division by `E`, the staged bank is `2E`, and the pool stride is one global
