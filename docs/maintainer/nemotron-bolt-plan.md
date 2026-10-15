@@ -485,6 +485,16 @@ against an FP64 oracle plus — where one exists — the reference dump or the r
 | Mamba-2 selective scan | sequential in registers rather than chunked, so there is no chunk-boundary tolerance question; 0.54 us/token at T=4096, about 88 ms across the 40 Mamba layers of a 4096-token prefill. A swapped state extent is rejected at 15492x, an unscaled readout at 3299x, and a BF16 state image fails the fp32 criterion by 12x |
 | MoE router | the correction bias selects experts while the emitted weights stay uncorrected — 130 of 130 tokens change their expert set with it — and the group mask can exclude the bank's largest score outright |
 | Latent expert dispatch and `relu2` | non-gated `down(relu2(up(x)))` in the 1024-wide latent space, with `E` and `I` as runtime arguments because the banks differ per layer; fp32 accumulation per expert and per token in rank order, one BF16 rounding, and a single shared definition of the activation so the two ops cannot drift |
+| Composition | `src/models/nemotron_h/forward.cpp` composes the three mixers and the block. The tiny model is walked block by block against the dump: 37 stages compared with a per-stage rel L2, everything at the 0.0016–0.008 BF16-operand floor and the logits at 0.00633, five refusal cases, and coverage asserted (37 compared, 3 reported but not in the dump). Its loosest stage, block 1's `fc2_latent_proj` at 0.0498, is explained by a measured near-tie: 2 of 130 tokens sit where the reference's K-th and (K+1)-th corrected scores differ by 0.002x the BF16 logit perturbation, so their expert pair moves while the other 128 ids match exactly and block 3 moves not at all. Two runs agreed to every printed digit. |
+
+Two Op contracts were wrong about their own payload order, and both are now reconciled — worth recording because
+both were shape-valid to get wrong. `causal_conv1d_silu` documents `[C,4]` while its kernels read tap-major
+(`j*C + c`), which cost the composition 1.4055 rel L2 when the binder followed the documentation; and
+`nemotron_h_moe_router` writes its ids, weights and logits with the token innermost, while the shapes it declares
+read as the transpose under this tree's axes convention. Each header now gives the flat index rather than a
+shape alone, and names the checkpoint's own order as the transpose a binder must take. Where a wrong payload
+genuinely cannot be detected the headers say so rather than implying a check exists: for the convolution the two
+orders coincide at `C == 4`, and the router only ever writes those tensors, so nothing can inspect their order.
 
 The config parse is verified against the released checkpoint's own tensors, and the reference dump carries
 the operands an op consumes as well as its outputs, which every remaining op needs.
