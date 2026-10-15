@@ -1194,6 +1194,19 @@ must select one schedule regardless of `t`, which costs the throughput the shape
 The Op oracle at 8 against 12 columns is the gate, and the widened MoE oracles from this session make
 the rest verifiable.
 
+One more disproof, and the shape of what remains. Giving both lanes the same prompt — equal row
+lengths, equal positions — leaves lane 0 failing at the same token, so the key-split partition's
+dependence on a row's live length is not the trigger; and the original unequal-length case fails the
+same way, so the trigger is the pass width itself. The Q8 linear's schedule is identical at 8 and 12
+columns (`select_q8_generic` gives 5..16 one schedule), so the width dependence is inside a layer-0
+Op whose *kernel* rounds differently with more columns — a partial-tile or split interaction in the
+attention, whose split policy is shape-driven, being the most likely candidate.
+
+What is left is mechanical rather than open-ended: an Op-level test that runs one Op at 8 and 12
+columns with identical per-column inputs and asserts bit-identity, iterating the layer-0 Ops until it
+fails. That finds the Op the same way the widened MoE oracles cleared theirs, and it is the gate for
+making the reduction shape-independent, which is the fix chosen for this defect.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
