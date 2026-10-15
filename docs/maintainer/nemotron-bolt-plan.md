@@ -221,3 +221,21 @@ already opaque.
   correctness one.
 - Vision (RADIO/InternVL tower, projector 20480, video) and MTP (`num_nextn_predict_layers` is 0 in this
   release) are out of phase 1.
+
+## Progress
+
+Each of these is landed, and each is verified by its own test running under the build lock, qualified
+against an FP64 oracle plus — where one exists — the reference dump or the reference module itself:
+
+| Op | Evidence |
+|---|---|
+| Gated grouped RMSNorm | the FP64 oracle matches the reference module to 6.8e-8; a whole-row implementation lands 160x outside the criterion on data whose group means differ, so the test discriminates |
+| Conv bias | the bias-free path is bit-identical (the biased entry with a null or all-zero bias must match byte for byte); `SiLU(conv+bias)` is separated from `SiLU(conv)+bias` by about 240x the criterion |
+| Mamba-2 selective scan | sequential in registers rather than chunked, so there is no chunk-boundary tolerance question; 0.54 us/token at T=4096, about 88 ms across the 40 Mamba layers of a 4096-token prefill. A swapped state extent is rejected at 15492x, an unscaled readout at 3299x, and a BF16 state image fails the fp32 criterion by 12x |
+| MoE router | the correction bias selects experts while the emitted weights stay uncorrected — 130 of 130 tokens change their expert set with it — and the group mask can exclude the bank's largest score outright |
+
+The config parse is verified against the released checkpoint's own tensors, and the reference dump carries
+the operands an op consumes as well as its outputs, which every remaining op needs.
+
+Remaining: the non-gated experts and the latent round trip (a new latent-MoE op), attention (largely
+reuse), the block and the 88-block forward, the converter, the host-offload cache work, and then the draft.
