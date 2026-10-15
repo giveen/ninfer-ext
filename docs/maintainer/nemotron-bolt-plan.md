@@ -212,6 +212,47 @@ unverified: a *heterogeneous* staged fill end to end, which no pool can exercise
 and Program exist, and the Engine-level Flash-Next path, which needs its ~70 GB artifact. No artifact-format
 change.
 
+## The official recipe, and what it changes
+
+NVIDIA publishes a ModelOpt recipe for exactly this architecture, and it is the authority to follow rather
+than to approximate: `modelopt_recipes/models/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/ptq/nvfp4-mse.yaml`
+(the PTQ stage `nvfp4-mse`, updated 2026-10-15 for the Super VL checkpoint), with its
+`examples/megatron_bridge/tutorials/NemotronH-Omni-W4A4-QAD` walkthrough and the released
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`. The recipe states that its rules are not specific to
+that release and "apply to NemotronH hybrids generally", which is what makes it ours. Its assignment is
+ordered with the last match winning, so everything not named below is left at BF16:
+
+| Component | Official format |
+|---|---|
+| MoE **routed and shared** experts | NVFP4 **W4A4**, block 16, MSE-selected static weight scales, dynamic activations |
+| attention `q`/`k`/`v`/`o` (Megatron `linear_qkv`/`linear_proj`) | **FP8 W8A8** per-tensor |
+| Mamba `mixer.in_proj` / `mixer.out_proj` | **FP8 W8A8** per-tensor |
+| `lm_head` (Megatron `output_layer`) | **FP8 W8A8** |
+| KV cache | **FP8** at a fixed range for the backbone, so no `k_scale`/`v_scale` is exported |
+| latent MoE, routers, embeddings, norms, vision tower | **BF16** |
+
+Three corrections to the route this document planned. The dense projections and the head are **FP8**, not
+Q8/Q6 — this repository already has a W8A8 FP8 linear and an FP8 KV, so that is a recipe change rather than
+new work. The **latent projections, the router and the token embedding stay BF16** rather than quantized,
+which matters here because the router's mathematics is a place this document already refuses to approximate.
+And the experts' *weights* use MSE-selected static scales while their *inputs* are dynamically quantized, so
+the official route is W4A4 — reached with a calibrated `input_quantizer` that a full-precision source does not
+carry, which is why a conversion from the BF16 checkpoint gives W4A16, and why that is the draft's own
+precision family. W4A4 becomes available with an encoded source, or with an activation-calibration path this
+converter does not have; the plan is W4A16 first, measured, then W4A4 if the numbers ask for it.
+
+The checkpoint inventory decides how we get there. Our own Bolt 74B has **no official NVFP4 release** — what
+exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 GB quant whose experts are 2-bit,
+which is precisely the LiLiCorr draft's base and confirms it. So the NVFP4 conversion for this checkpoint is
+ours to make, from `…-Bolt-74B-A9B-BF16`, using the recipe above.
+
+But `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` does exist: the **same architecture at 30B**, an
+encoded ModelOpt checkpoint with calibrated divisors, around 18 GB. That fits this machine, where the 74B's
+~48 GB artifact and 37 GB of pinned experts do not, and it exercises the whole family path end to end —
+conversion through `import_encoded`, the Engine, the decode loop, and W4A4 rather than W4A16 — which the real
+target cannot do until it has a 64 GB host. Verification on the sibling is how the family gets tested before
+the target is affordable.
+
 ## What the layout work actually is
 
 The artifact container is layer-blind and already carries the variation: a bank is one binding of parts
