@@ -52,9 +52,17 @@ jobs:
           )
           foreach ($path in $unused) {
             if (-not (Test-Path $path)) { continue }
+            $start = (Get-PSDrive C).Free
             robocopy $empty $path /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+            # robocopy reports 0-7 for success - 1 means it copied (that is, deleted) files, which is
+            # the point - and 8 or above for a real failure.
+            if ($LASTEXITCODE -ge 8) { throw "robocopy could not empty $path" }
             Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue
+            Write-Host ("freed {0:N1} GiB from {1}" -f (((Get-PSDrive C).Free - $start) / 1GB), $path)
           }
+          # The harness ends the step with `exit $LASTEXITCODE`, and every robocopy success code is
+          # non-zero, so it is cleared rather than leaking out as a step failure.
+          $LASTEXITCODE = 0
           Get-PSDrive C | Select-Object Used, Free
 
       # The image ships the Visual Studio toolset but does not put cl.exe, link.exe or Ninja on the
