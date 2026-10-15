@@ -97,17 +97,23 @@ def changed_sources(base: str) -> list[pathlib.Path]:
             if pathlib.Path(name).suffix in (".cpp", ".cu") and (REPO / name).exists()]
 
 
-def resolve_database() -> pathlib.Path:
-    """The compile database to borrow flags from.
+def resolve_databases() -> list[pathlib.Path]:
+    """Compile databases to borrow flags from, most specific first.
 
-    A directory dedicated to this check is preferred when it exists: it is configured so the tool can
-    see files this branch adds, without disturbing a working build tree.
+    A directory dedicated to this check is preferred, because it is configured so the tool can see
+    files this branch adds without disturbing a working build tree. The regular build directory is
+    consulted after it, because a product-only configure carries no entries for the tests.
     """
-    for candidate in ("build-wincheck/compile_commands.json", "build/compile_commands.json"):
-        path = REPO / candidate
-        if path.exists():
-            return path
-    return REPO / "build" / "compile_commands.json"
+    candidates = ("build-wincheck/compile_commands.json", "build/compile_commands.json")
+    return [REPO / name for name in candidates if (REPO / name).exists()]
+
+
+def flags_for_any(databases: list[list[dict]], source: pathlib.Path) -> list[str] | None:
+    for database in databases:
+        flags = flags_for(database, source)
+        if flags is not None:
+            return flags
+    return None
 
 
 def main() -> int:
@@ -119,7 +125,9 @@ def main() -> int:
     if shutil.which(CXX) is None:
         print(f"{CXX} not found. Install mingw-w64 to check the Windows code paths locally.", file=sys.stderr)
         return 2
-    database = load_database(resolve_database())
+    databases = [load_database(path) for path in resolve_databases()]
+    if not databases:
+        sys.exit("no compile database found; configure a Linux build first (see the docstring)")
     sources = arguments.paths or changed_sources(arguments.base)
     if not sources:
         print("nothing to check", file=sys.stderr)
@@ -134,7 +142,7 @@ def main() -> int:
         if source.suffix in (".h", ".cuh"):
             print(f"skip  {relative}: check a translation unit that includes it")
             continue
-        flags = flags_for(database, relative)
+        flags = flags_for_any(databases, relative)
         if flags is None:
             print(f"skip  {relative}: no compile_commands entry")
             continue
