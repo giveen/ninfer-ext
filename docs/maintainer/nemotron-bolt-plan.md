@@ -236,10 +236,24 @@ Q8/Q6 — this repository already has a W8A8 FP8 linear and an FP8 KV, so that i
 new work. The **latent projections, the router and the token embedding stay BF16** rather than quantized,
 which matters here because the router's mathematics is a place this document already refuses to approximate.
 And the experts' *weights* use MSE-selected static scales while their *inputs* are dynamically quantized, so
-the official route is W4A4 — reached with a calibrated `input_quantizer` that a full-precision source does not
-carry, which is why a conversion from the BF16 checkpoint gives W4A16, and why that is the draft's own
-precision family. W4A4 becomes available with an encoded source, or with an activation-calibration path this
-converter does not have; the plan is W4A16 first, measured, then W4A4 if the numbers ask for it.
+the recipe's expert route is W4A4 — reached with a calibrated `input_quantizer` that a full-precision source
+does not carry, which is why a conversion from the BF16 checkpoint gives W4A16.
+
+The **released** artifacts do not all follow the recipe, though, and the difference is the useful part. Their
+own `hf_quant_config.json` descriptors say: `…-Super-VL-120B-A12B-NVFP4` (the QAD one) reports plain `NVFP4`
+for 41,043 tensors, i.e. W4A4 as the recipe specifies, while `…-Lightning-30B-A3B-NVFP4` reports
+**`W4A16_NVFP4`** for 5,935 tensors — weight-only. Both are `MIXED_PRECISION` with an `FP8` KV and FP8
+projections. So W4A16 is a **published** configuration rather than a fallback we invented, and it is precisely
+what a full-precision source produces: our conversion from the BF16 checkpoint reproduces the Lightning
+release's precision assignment, not a degraded one. W4A4 then becomes available the same way it was for them —
+from an encoded source, or with an activation-calibration path this converter does not have — and their QAD
+stage is training rather than conversion, so it is out of scope here.
+
+That descriptor is also the converter's input format, and it is now known rather than guessed:
+`hf_quant_config.json` with `quant_algo: MIXED_PRECISION`, `kv_cache_quant_algo: FP8`, and a
+`quantized_layers` map naming every tensor as `backbone.layers.N.mixer.{in_proj,out_proj}`,
+`…mixer.experts.E.{up,down}_proj` or `mixer.shared_experts.*` with its own `quant_algo` and `group_size: 16` —
+the same per-tensor shape our `import_encoded` path already consumes for Flash-Next.
 
 The checkpoint inventory decides how we get there. Our own Bolt 74B has **no official NVFP4 release** — what
 exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 GB quant whose experts are 2-bit,
