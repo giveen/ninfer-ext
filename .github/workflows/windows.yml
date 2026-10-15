@@ -86,6 +86,19 @@ jobs:
           cuda: '13.3.0'
           method: 'local'
 
+      - name: Prepare vcpkg
+        shell: pwsh
+        run: |
+          # Two things the first successful run taught us, both of which fail configure outright:
+          #  * msvc-dev-cmd exports the Visual Studio-bundled vcpkg in VCPKG_ROOT, which disagrees with
+          #    the toolchain file below. One root, so the toolchain, the cache and any direct vcpkg
+          #    invocation agree.
+          #  * vcpkg refuses a binary-cache directory that does not exist, and actions/cache does not
+          #    create one, so the very first run failed before building anything.
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Add-Content $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+          Write-Host "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+
       - name: vcpkg binary cache
         uses: actions/cache@v4
         with:
