@@ -94,10 +94,10 @@ projections at NVFP4 group 16, the head at Q8_0 — 24.12 GB in total. So 74B fi
 
 This repository's routes are larger. EXL3 at 3.5 bpw puts the expert banks alone near 25 GB, and with the
 dense, attention, embedding and projection parts the artifact lands around 33 GB — over a 5090's 32 GB.
-The serving configuration is therefore **host offload**, the route Flash-Next already uses: experts in
-pinned Host memory behind a Program-owned device cache. That corrects an assumption earlier in this
-document, that the weights would be device-resident and only KV would need the paged machinery. A ~2-bit
-expert route is the alternative, and it is a quality experiment rather than a phase-1 dependency.
+Per the decision taken when this was raised: **that is the intended configuration, not a compromise.**
+This model is served the way Flash-Next is — routed experts in pinned Host memory behind a Program-owned
+device cache — using this repository's own quantization routes rather than NVIDIA's 2-bit recipe, which
+is a note about what they accepted rather than a target to match. No low-bit expert codec is needed.
 
 The host-offload cache does **not** survive heterogeneous banks as written: `slot_of` is `layers × E`,
 the owner→layer decode is a division by `E`, the staged bank is `2E`, and the pool stride is one global
@@ -145,5 +145,10 @@ already opaque.
 - Whether the released checkpoint's expert banks are one fused tensor per layer or one per expert; the
   reference's expert weights are 3-D `(num_experts, out, in)` while llama.cpp derives the count from the
   router width.
+- The host-offload cache pins the expert set, so the maintenance machine's 32 GiB of RAM is itself a
+  constraint: the pinned experts at EXL3 3.5 are roughly 25 GB, which leaves little for the host KV
+  arena, the state images and the OS. Flash-Next's guide asks for about 65 GiB for a larger model; this
+  one sits under that only because the model is smaller. Reducing the pinned set, or a smaller expert
+  route, is the escape if it does not fit — neither is needed to start.
 - Vision (RADIO/InternVL tower, projector 20480, video) and MTP (`num_nextn_predict_layers` is 0 in this
   release) are out of phase 1.
