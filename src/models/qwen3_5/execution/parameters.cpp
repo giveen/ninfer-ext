@@ -160,10 +160,11 @@ public:
         // A fused parent is not built through linear(), so register it for the sensitivity probe
         // exactly as the main attention path does.
         register_projection(model_.weight(a.query).name, out.projection.packed);
-        // The dense incremental path projects K/V and Q/gate independently through ops::linear_pair,
-        // which only implements Q8. Every other format runs the complete packed parent through
-        // ops::attn_input_proj instead, so it leaves `rows` empty. Ask the packed parent, not an
-        // individual projection: a row slice of an EXL3 parent is not a valid native Weight.
+        // The dense incremental path projects K/V and Q/gate independently through
+        // ops::linear_pair, which only implements Q8. Every other format runs the complete packed
+        // parent through ops::attn_input_proj instead, so it leaves `rows` empty. Ask the packed
+        // parent, not an individual projection: a row slice of an EXL3 parent is not a valid native
+        // Weight.
         if (model_.config().text.architecture == Architecture::Qwen3_5 &&
             out.projection.packed.weight.qtype == QType::Q8_G32_FP16) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
@@ -557,10 +558,11 @@ Parameters::Parameters(const Model& source) : model(source) {
                 return prepare.qwen4_block(w.qwen4->layers[i]);
             }));
         }
-        // The pager, cache and planner size everything from one layout, so every bank must use it.
-        q.experts = q.layers.front().moe.bank.layout;
+        // The pager, cache and planner size everything from the pool, so every bank must use one
+        // layout; a checkpoint whose banks differ is a different pool and is refused here.
+        const ops::ExpertLayout experts = q.layers.front().moe.bank.layout;
         for (std::size_t i = 0; i < q.layers.size(); ++i) {
-            if (q.layers[i].moe.bank.layout != q.experts) {
+            if (q.layers[i].moe.bank.layout != experts) {
                 throw std::invalid_argument("text/layers/" + std::to_string(i) +
                                             ": routed experts use a different bank layout");
             }
@@ -574,10 +576,32 @@ Parameters::Parameters(const Model& source) : model(source) {
                     prepare.linear(m.embedding_projection), prepare.linear(m.hidden_projection),
                     prepare.hyper_connection(m.head),       prepare.qwen4_block(m.layer)};
             });
-            if (qwen4_mtp->layer.moe.bank.layout != qwen4->experts) {
+            if (qwen4_mtp->layer.moe.bank.layout != experts) {
                 throw std::invalid_argument("mtp: routed experts use a different bank layout");
             }
         }
+        // One bank per cache layer: every MoE layer, then the MTP block when the model has one. The
+        // model's own bank is the shape -- its layout and the expert count the loader bound -- so
+        // the pool's stride, offsets and staged sizes are this family's, not a second table's.
+        const auto bank_shape = [&]() -> ops::ExpertBankShape {
+            ops::ExpertBankShape shape;
+            shape.experts = ops::kOffloadMoeExperts;
+            shape.layout  = experts;
+            if (experts.format != ops::ExpertFormat::Nvfp4) {
+                // EXL3 keeps its per-expert scale sets in planes, so its staged layer has no
+                // divisor tail and none of the divisor geometry is consulted.
+                return shape;
+            }
+            const ops::ExpertBankShape nvfp4 = ops::nvfp4_expert_bank(
+                ops::kOffloadMoeExperts, ops::kOffloadMoeHidden, ops::kOffloadMoeIntermediate, 2);
+            if (nvfp4.layout != experts) {
+                throw std::invalid_argument("offloaded NVFP4 experts must use the Qwen4Exp layout");
+            }
+            return nvfp4;
+        }();
+        const std::vector<ops::ExpertBankShape> banks(
+            w.qwen4->layers.size() + (w.qwen4_mtp ? 1U : 0U), bank_shape);
+        qwen4->expert_pool = ops::ExpertPoolGeometry(banks);
         if (w.vision) {
             vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
         }

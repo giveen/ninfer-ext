@@ -27,8 +27,6 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // job sort holds 1024 assignments) while routing already touches most of each layer's experts:
 // cold on the RTX 5090, 60 tokens take 1.2 s cached vs 1.6 s staged, 111 take 2.0 s vs 1.6 s.
 inline constexpr std::int32_t kQwen4StagedColumns = 103;
-// Expert-cache slots that also hold the two staged layer banks (two whole routed layers).
-inline constexpr std::int32_t kQwen4StagedBankSlots = 2 * ops::kOffloadMoeExperts;
 // Default text-prefill chunks when EngineOptions leaves them open. A prefill step runs the idle
 // width when no decode work is waiting and the ordinary chunk beside it: on the RTX 5090 a 4096
 // chunk lifts prefill 2-7 % on dense NVFP4 and 19-21 % on the MoE over 1024, while a concurrent
@@ -40,8 +38,8 @@ inline constexpr std::uint32_t kDefaultIdlePrefillChunk = 4096;
 inline constexpr std::uint32_t kQwen4PrefillChunk       = 4096;
 // Host-resident routed experts keep that chunk beside decode but let the idle step widen with the
 // prompt: a 30,627-token prompt read at 4096 streams each expert layer eight times and at 16384
-// twice, measured on the RTX 5090 at 2,095 vs 3,146 tok/s. The wide step's arena is borrowed from the
-// expert cache's top slots and returned between wide steps, so widening costs almost no decode
+// twice, measured on the RTX 5090 at 2,095 vs 3,146 tok/s. The wide step's arena is borrowed from
+// the expert cache's top slots and returned between wide steps, so widening costs almost no decode
 // residency. 16384 rather than 32768: the wider step adds only 1-5 % prefill but widens the lend
 // enough to cost the cache ~3 % (K7 C8 decode -7 %). --max-context caps it as well.
 inline constexpr std::uint32_t kQwen4MaxIdlePrefillChunk = 16384;
@@ -66,18 +64,18 @@ struct Eagle3PrefillLayout {
 
 // Qwen4Exp Program resources: the routed-expert cache, the prefill layer bank and PLE buffers.
 struct Qwen4PersistentLayout {
-    TensorLayout slot_of;  // I32 [cache_layers * experts]
-    TensorLayout owner;    // I32 [slots]
+    TensorLayout slot_of;  // I32 [the pool's experts], -1 when a layer's expert is not resident
+    TensorLayout owner;    // I32 [slots], an index into slot_of or -1
     TensorLayout stamp;    // I64 [slots]
     TensorLayout counters; // I64 [3]: clock, hits, misses
-    // slots * the expert layout's slot bytes, plus the tails of two staged layers. The last
-    // kQwen4StagedBankSlots slots double as the two staged layer banks: staged forwards reclaim
-    // them, cache-route calls use them as ordinary slots in between.
+    // slots * the pool's slot stride, plus the divisor tails of two staged layers. The last
+    // two-banks-worth of slots double as the two staged layer banks: staged forwards reclaim them,
+    // cache-route calls use them as ordinary slots in between.
     LayoutRegion pool;
     std::optional<TensorLayout> ple_record; // BF16 [residual, draft_window + 1, max_concurrency]
     std::optional<TensorLayout> ple_input;  // BF16 [ple_width, (draft_window + 1) * max_concurrency]
     std::int32_t slots        = 0;
-    std::int32_t cache_layers = 0;
+    std::int32_t cache_layers = 0; // the pool's banks, in the pool's own layer order
     // P1 lend: when the idle prefill width exceeds the ordinary chunk, the top `slots - base_slots`
     // cache slots double as the wide prefill workspace. They are cache during decode and a borrowed
     // arena during a wide idle step. `wide_offset`/`wide_bytes` locate that arena in the pool;

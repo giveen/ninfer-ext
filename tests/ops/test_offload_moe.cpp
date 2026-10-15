@@ -299,6 +299,7 @@ DeviceBank upload(const HostBank& host) {
 
 struct DeviceCache {
     DeviceBuffer slot_of, owner, stamp, counters, pool;
+    ops::ExpertPoolGeometry geometry;
     ops::ExpertCacheState state;
 
     DeviceCache(std::int32_t slots, std::int32_t layers)
@@ -307,7 +308,9 @@ struct DeviceCache {
           stamp(to_device(std::vector<unsigned long long>(slots, 0))),
           counters(to_device(std::vector<unsigned long long>(3, 0))),
           pool(to_device(std::vector<std::uint8_t>(
-              static_cast<std::size_t>(slots) * ops::kExpertSlotBytes, 0))) {
+              static_cast<std::size_t>(slots) * ops::kExpertSlotBytes, 0))),
+          geometry(std::vector<ops::ExpertBankShape>(static_cast<std::size_t>(layers),
+                                                     ops::kQwen4ExpertBank)) {
         state =
             ops::ExpertCacheState{.slot_of    = static_cast<std::int32_t*>(slot_of.p),
                                   .owner      = static_cast<std::int32_t*>(owner.p),
@@ -316,6 +319,8 @@ struct DeviceCache {
                                   .statistics = static_cast<unsigned long long*>(counters.p) + 1,
                                   .slots      = slots,
                                   .layers     = layers,
+                                  .slot_entries = geometry.slot_entries(),
+                                  .pool_stride  = geometry.pool_stride(),
                                   .pool       = static_cast<std::byte*>(pool.p)};
     }
 
@@ -334,7 +339,7 @@ std::vector<int> resolve(DeviceCache& cache, const DeviceBank& bank, std::int32_
     Tensor ti(ids.p, DType::I32, {K, columns});
     Tensor ts(slots.p, DType::I32, {K, columns});
     Tensor tm(misses.p, DType::I32, {static_cast<std::int32_t>(2 * experts.size() + 1)});
-    ops::expert_cache_resolve(ti, layer, cache.state, ts, tm, nullptr);
+    ops::expert_cache_resolve(ti, cache.geometry.span(layer), cache.state, ts, tm, nullptr);
     ops::expert_cache_fetch(bank.weights, tm, static_cast<std::int32_t>(experts.size()),
                             cache.state, nullptr);
     cuda_synchronize();
@@ -507,7 +512,7 @@ int stage_case(const HostBank& host, const DeviceBank& bank) {
         staged.base[p] = static_cast<const std::byte*>(staged_bytes.p) + offset;
         offset += sizes[p] * E;
     }
-    ops::expert_cache_stage(cache.state, kLayer, static_cast<const std::int32_t*>(resident.p),
+    ops::expert_cache_stage(cache.state, cache.geometry.span(kLayer), static_cast<const std::int32_t*>(resident.p),
                             bank.weights, staged, nullptr);
     cuda_synchronize();
     const auto out = from_device<std::uint8_t>(staged_bytes,
@@ -666,7 +671,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
         CUDA_CHECK(cudaEventCreateWithFlags(&resolved, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&fetched, cudaEventDisableTiming));
         WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
-        ops::expert_cache_resolve(tids, 0, pending_cache.state, tpending_slots, tpending_misses,
+        ops::expert_cache_resolve(tids, pending_cache.geometry.span(0), pending_cache.state, tpending_slots, tpending_misses,
                                   main);
         CUDA_CHECK(cudaEventRecord(resolved, main));
         CUDA_CHECK(cudaStreamWaitEvent(fetch, resolved));

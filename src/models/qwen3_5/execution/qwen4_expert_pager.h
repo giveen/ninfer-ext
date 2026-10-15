@@ -23,8 +23,14 @@ namespace ninfer::models::qwen3_5::execution {
  *   Experts the cache holds are copied device-to-device instead of from the Host. Staged calls do
  *   not change the cache.
  *
+ * Every per-layer number the pager needs comes from the pool's `ExpertPoolGeometry`: how many
+ * experts a layer's bank holds, how one expert of it is sized, where its experts sit in the cache's
+ * expert space, and how large one staged layer of it is. A pool whose layers differ in expert count
+ * and width is therefore the same code as a uniform one — the geometry is the only thing that
+ * differs, and a uniform pool's entries are equal.
+ *
  * The banks overlay the top of the cache pool's slots: the constructor requires
- * `bank_slot + kBankSlots == cache.slots`, so a decode-time cache-route `resolve` can evict into
+ * `bank_slot + bank_slots == cache.slots`, so a decode-time cache-route `resolve` can evict into
  * the slot range `[bank_slot, cache.slots)`, and the staged route reclaims the bank slots on its
  * first fill of a forward (`forward_start`). When the idle prefill width exceeds the ordinary
  * chunk, the top `base_slots_..decode_slots_` cache slots are a lend region: `lend` reclaims them
@@ -39,13 +45,19 @@ namespace ninfer::models::qwen3_5::execution {
  */
 class Qwen4ExpertPager {
 public:
-    static constexpr std::int32_t kBankSlots      = 2 * ops::kOffloadMoeExperts;
+    /** Staged device banks: one layer being read while the next one is being filled. */
+    static constexpr std::int32_t kBankCount      = 2;
 
-    // `cache.pool` holds the decode cache slots (cache plus the lent range), then two layers' weight
-    // divisors; the banks begin at `bank_slot`. `base_slots` is the cache size while the wide idle
-    // prefill borrows the lend range, `cache.slots` the decode-time size.
-    Qwen4ExpertPager(const ops::ExpertLayout& layout, const ops::ExpertCacheState& cache,
-                     std::int32_t staged_columns,
+    /** Slots the staged banks overlay: two layers, each as wide as the pool's widest bank. */
+    [[nodiscard]] static constexpr std::int32_t bank_slots(const ops::ExpertPoolGeometry& pool) {
+        return kBankCount * pool.max_experts();
+    }
+
+    // `cache.pool` holds the decode cache slots (cache plus the lent range), then two layers'
+    // weight divisors; the banks begin at `bank_slot`. `base_slots` is the cache size while the
+    // wide idle prefill borrows the lend range, `cache.slots` the decode-time size.
+    Qwen4ExpertPager(const ops::ExpertPoolGeometry& pool, const ops::ExpertCacheState& cache,
+                     std::int32_t staged_columns, std::int32_t top_k,
                      std::int32_t bank_slot, std::int32_t base_slots);
     ~Qwen4ExpertPager();
 
@@ -53,6 +65,8 @@ public:
     Qwen4ExpertPager& operator=(const Qwen4ExpertPager&) = delete;
 
     [[nodiscard]] const ops::ExpertCacheState& cache() const noexcept { return cache_; }
+
+    [[nodiscard]] const ops::ExpertPoolGeometry& pool() const noexcept { return pool_; }
 
     // P1 lend: reclaim the lend range for the wide prefill arena, then make the cache again.
     void lend(cudaStream_t stream);
@@ -101,12 +115,13 @@ private:
     void snapshot_residency(cudaStream_t stream);
     void fill(std::int32_t layer, const ops::ExpertWeights& source);
     [[nodiscard]] ops::ExpertWeights staged_weights(int bank,
+                                                    const ops::ExpertBankShape& shape,
                                                     const ops::ExpertWeights& source) const;
 
-    ops::ExpertLayout layout_;
-    std::size_t staged_bank_bytes_ = 0; // one staged layer: its experts, then the layout tail
+    const ops::ExpertPoolGeometry& pool_;
     ops::ExpertCacheState cache_;
     std::int32_t staged_columns_ = 0;
+    std::int32_t top_k_          = 0;
 
     // Staged route: bank b holds (or is being filled with) layer_[b] within the current staged
     // forward. A fill waits for `released_[b]` of the bank's previous reader and records

@@ -1,5 +1,6 @@
 set(ninfer_op_tests
   add_bias
+  expert_pool_geometry
   gelu
   gelu_mul
   gemma_moe_router

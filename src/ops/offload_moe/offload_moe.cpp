@@ -14,8 +14,8 @@ namespace {
 
 // Token columns per internal pass; bounds the per-assignment intermediate and partial buffers.
 constexpr std::int32_t kChunkColumns = 1024;
-// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment). Per-token cost
-// stops falling at about 2048 columns, where an expert has ~40 rows per row tile.
+// EXL3 prefill keeps the FP16 rotated gate/up inputs of a pass (10 KB per assignment). Per-token
+// cost stops falling at about 2048 columns, where an expert has ~40 rows per row tile.
 constexpr std::int32_t kExl3ChunkColumns = 2048;
 
 std::int32_t chunk_columns(const ExpertLayout& layout) {
@@ -117,6 +117,64 @@ A4Layout a4_layout(std::int32_t columns) {
 
 } // namespace
 
+ExpertPoolGeometry::ExpertPoolGeometry(std::span<const ExpertBankShape> banks) {
+    if (banks.empty()) { throw std::invalid_argument("an expert pool needs at least one bank"); }
+    banks_.assign(banks.begin(), banks.end());
+    slot_base_.reserve(banks_.size() + 1);
+    slot_base_.push_back(0);
+    std::int64_t entries = 0;
+    for (const ExpertBankShape& bank : banks_) {
+        if (bank.experts <= 0 || bank.experts > kMaxBankExperts) {
+            throw std::invalid_argument("an expert bank holds 1 to " +
+                                        std::to_string(kMaxBankExperts) + " experts");
+        }
+        require_expert_planes(bank.layout, "ExpertPoolGeometry");
+        if (bank.layout.slot_bytes <= 0) {
+            throw std::invalid_argument("an expert bank needs a non-empty expert layout");
+        }
+        const std::int64_t staged = bank.layout.staged_layer_bytes(bank.experts);
+        // Two staged layers are back to back, so every one of them starts where the previous one
+        // ended: a layer whose staged size is not a multiple of the alignment its planes are read
+        // at would put its successor's planes off that alignment.
+        if (staged % 16 != 0) {
+            throw std::invalid_argument("a staged expert layer must stay 16-byte aligned");
+        }
+        entries += bank.experts;
+        if (entries > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument("an expert pool holds at most 2^31-1 experts");
+        }
+        slot_base_.push_back(static_cast<std::int32_t>(entries));
+        max_experts_      = std::max(max_experts_, bank.experts);
+        pool_stride_      = std::max(pool_stride_, bank.layout.slot_bytes);
+        max_staged_bytes_ = std::max(max_staged_bytes_, staged);
+        max_tail_bytes_   = std::max(max_tail_bytes_, bank.layout.tail_bytes);
+    }
+}
+
+const ExpertBankShape& ExpertPoolGeometry::bank(std::int32_t layer) const {
+    if (layer < 0 || layer >= layers()) {
+        throw std::invalid_argument("layer outside the expert pool");
+    }
+    return banks_[static_cast<std::size_t>(layer)];
+}
+
+std::int32_t ExpertPoolGeometry::slot_base(std::int32_t layer) const {
+    if (layer < 0 || layer >= layers()) {
+        throw std::invalid_argument("layer outside the expert pool");
+    }
+    return slot_base_[static_cast<std::size_t>(layer)];
+}
+
+std::int32_t ExpertPoolGeometry::owner_layer(std::int32_t owner) const {
+    if (owner < 0 || owner >= slot_entries()) {
+        throw std::invalid_argument("owner outside the expert pool's experts");
+    }
+    // The prefix sums are ascending, so the layer holding `owner` is the last one whose base is not
+    // past it -- a search rather than the uniform pool's division, which is this on two entries.
+    const auto it = std::upper_bound(slot_base_.begin(), slot_base_.end(), owner);
+    return static_cast<std::int32_t>(it - slot_base_.begin()) - 1;
+}
+
 std::size_t moe_route_workspace_bytes(std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("moe_route_workspace_bytes: T <= 0"); }
     return align(static_cast<std::size_t>(tokens) * (kOffloadMoeExperts + 1) * sizeof(float)) + 256;
@@ -155,19 +213,20 @@ void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int3
     detail::moe_route_share_padding_launch(ids, valid_columns, width, stream);
 }
 
-void expert_cache_resolve(const Tensor& ids, std::int32_t layer, const ExpertCacheState& cache,
+void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCacheState& cache,
                           Tensor& slot_ids, Tensor& misses, cudaStream_t stream) {
     constexpr const char* op = "expert_cache_resolve";
     require_routed(ids, DType::I32, ids.ne[1], op, "ids");
     require_routed(slot_ids, DType::I32, ids.ne[1], op, "slot ids");
     require_dense(misses, DType::I32, op, "misses");
     require(misses.numel() >= 2 * ids.numel() + 1, op, "misses must hold 2*(10*T)+1 words");
-    require(layer >= 0 && layer < cache.layers, op, "layer outside the cache");
+    require(bank.first_expert >= 0 && bank.experts > 0 && bank.experts <= kMaxBankExperts &&
+                bank.first_expert + bank.experts <= cache.slot_entries, op, "bank span outside the pool's experts");
     require(cache.slots >= ids.numel(), op, "the cache must hold every assignment of one call");
     require(cache.slot_of && cache.owner && cache.stamp && cache.clock && cache.statistics &&
                 cache.pool,
             op, "cache state is incomplete");
-    detail::expert_cache_resolve_launch(ids, layer, cache, slot_ids, misses, stream);
+    detail::expert_cache_resolve_launch(ids, bank, cache, slot_ids, misses, stream);
 }
 
 void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::int32_t max_misses,
@@ -180,30 +239,33 @@ void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::in
         require(bank.base[p] != nullptr, op, "bank planes are required");
     }
     require(cache.pool != nullptr, op, "cache pool is required");
+    require(cache.pool_stride > 0 && bank.layout.slot_bytes <= cache.pool_stride, op,
+            "the pool's stride must hold the bank's expert");
     detail::expert_cache_fetch_launch(bank, misses, max_misses, cache, stream);
 }
 
-void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
-                        const std::int32_t* resident, const ExpertWeights& bank,
+void expert_cache_stage(const ExpertCacheState& cache, ExpertBankSpan bank,
+                        const std::int32_t* resident, const ExpertWeights& weights,
                         const ExpertWeights& staged, cudaStream_t stream) {
     constexpr const char* op = "expert_cache_stage";
     require(cache.slot_of != nullptr && cache.pool != nullptr && resident != nullptr, op,
             "cache state and residency snapshot are required");
-    require(layer >= 0 && layer < cache.layers, op, "layer is outside the cache");
-    const ExpertLayout& layout = bank.layout;
+    require(bank.first_expert >= 0 && bank.experts > 0 && bank.experts <= kMaxBankExperts &&
+                bank.first_expert + bank.experts <= cache.slot_entries, op, "bank span outside the pool's experts");
+    const ExpertLayout& layout = weights.layout;
     require(layout.format == staged.layout.format && layout.planes == staged.layout.planes &&
                 layout.slot_bytes == staged.layout.slot_bytes,
             op, "bank and staged bank must share one expert layout");
     require_expert_planes(layout, op);
     for (std::int32_t p = 0; p < layout.planes; ++p) {
-        require(bank.base[p] != nullptr && staged.base[p] != nullptr, op,
+        require(weights.base[p] != nullptr && staged.base[p] != nullptr, op,
                 "bank and staged planes are required");
-        require(bank.stride[p] >= layout.plane_bytes[p] &&
-                    staged.stride[p] >= layout.plane_bytes[p] && bank.stride[p] % 16 == 0 &&
+        require(weights.stride[p] >= layout.plane_bytes[p] &&
+                    staged.stride[p] >= layout.plane_bytes[p] && weights.stride[p] % 16 == 0 &&
                     staged.stride[p] % 16 == 0,
                 op, "plane strides must hold one 16-byte-aligned expert");
     }
-    detail::expert_cache_stage_launch(cache, layer, resident, bank, staged, stream);
+    detail::expert_cache_stage_launch(cache, bank, resident, weights, staged, stream);
 }
 
 void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot,
@@ -218,10 +280,13 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
 ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
     constexpr const char* op = "expert_cache_weights";
     require_expert_planes(bank.layout, op);
+    require(cache.pool != nullptr && cache.pool_stride > 0, op, "cache pool is required");
+    require(bank.layout.slot_bytes <= cache.pool_stride, op,
+            "the pool's stride must hold the bank's expert");
     ExpertWeights out = bank;
     for (std::int32_t p = 0; p < bank.layout.planes; ++p) {
         out.base[p]   = cache.pool + bank.layout.plane_offset(p);
-        out.stride[p] = bank.layout.slot_bytes;
+        out.stride[p] = cache.pool_stride;
     }
     return out;
 }

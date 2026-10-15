@@ -7,31 +7,32 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertLayout& layout,
+Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertPoolGeometry& pool,
                                    const ops::ExpertCacheState& cache,
-                                   std::int32_t staged_columns, std::int32_t bank_slot,
+                                   std::int32_t staged_columns, std::int32_t top_k, std::int32_t bank_slot,
                                    std::int32_t base_slots)
-    : layout_(layout),
-      staged_bank_bytes_(static_cast<std::size_t>(layout.staged_layer_bytes(ops::kOffloadMoeExperts))),
-      cache_(cache), staged_columns_(staged_columns), bank_slot_(bank_slot),
+    : pool_(pool),
+      cache_(cache), staged_columns_(staged_columns), top_k_(top_k), bank_slot_(bank_slot),
       base_slots_(base_slots), decode_slots_(cache.slots) {
-    // Every route still needs room for one call's assignments, and the banks must sit past the cache
-    // (and, when the idle prefill is wider than the chunk, past its lent top range).
-    if (cache_.slots < ops::kOffloadMoeTopK || base_slots_ < ops::kOffloadMoeTopK) {
+    // Every route still needs room for one call's assignments, and the banks must sit past the
+    // cache (and, when the idle prefill is wider than the chunk, past its lent top range).
+    if (cache_.slots < top_k_ || base_slots_ < top_k_) {
         throw std::logic_error("expert cache is too small for one resolve");
     }
-    if (base_slots_ > bank_slot_ || bank_slot_ + kBankSlots != cache_.slots) {
+    if (base_slots_ > bank_slot_ || bank_slot_ + bank_slots(pool_) != cache_.slots) {
         throw std::logic_error("staged banks must be the top of the expert cache slots");
     }
-    if (staged_bank_bytes_ % 256 != 0) {
-        throw std::logic_error("staged banks must stay 256-byte aligned");
+    if (static_cast<std::int32_t>(pool_.layers()) != cache_.layers ||
+        pool_.slot_entries() != cache_.slot_entries || pool_.pool_stride() != cache_.pool_stride) {
+        throw std::logic_error("the cache state does not describe the pool it serves");
     }
-    banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * layout_.slot_bytes;
-    banks_[1]  = banks_[0] + staged_bank_bytes_;
-    CUDA_CHECK(cudaMallocHost(&resident_, static_cast<std::size_t>(cache_.layers) *
-                                              ops::kOffloadMoeExperts * sizeof(std::int32_t)));
+    // The pool's slots are its widest bank's, and the banks are the top of them, so one bank's byte
+    // range is `bank_slot_` slots on plus the two layers' divisor tails past the slot region.
+    banks_[0]  = cache_.pool + static_cast<std::size_t>(bank_slot_) * cache_.pool_stride;
+    banks_[1]  = banks_[0] + static_cast<std::size_t>(pool_.max_staged_bytes());
+    CUDA_CHECK(cudaMallocHost(&resident_, static_cast<std::size_t>(cache_.slot_entries) * sizeof(std::int32_t)));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < kBankCount; ++b) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ready_[b], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&released_[b], cudaEventDisableTiming));
     }
@@ -43,7 +44,7 @@ Qwen4ExpertPager::Qwen4ExpertPager(const ops::ExpertLayout& layout,
 Qwen4ExpertPager::~Qwen4ExpertPager() {
     // A fill may still be in flight into Program-owned memory.
     if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < kBankCount; ++b) {
         if (ready_[b] != nullptr) { (void)cudaEventDestroy(ready_[b]); }
         if (released_[b] != nullptr) { (void)cudaEventDestroy(released_[b]); }
     }
@@ -55,19 +56,21 @@ Qwen4ExpertPager::~Qwen4ExpertPager() {
 }
 
 // Staged-bank addressing of `source`: its planes back to back, then the layout tail (NVFP4: its
-// weight divisors).
-ops::ExpertWeights Qwen4ExpertPager::staged_weights(int bank,
+// weight divisors). Both the per-plane stride and the tail's split into the layer's two divisor
+// arrays follow the layer's own bank, so a layer that is narrower than the pool's widest, or holds
+// a different number of experts, lands where its own contract says.
+ops::ExpertWeights Qwen4ExpertPager::staged_weights(int bank, const ops::ExpertBankShape& shape,
                                                     const ops::ExpertWeights& source) const {
     ops::ExpertWeights staged = source;
     std::byte* cursor         = banks_[bank];
-    for (int plane = 0; plane < layout_.planes; ++plane) {
+    for (int plane = 0; plane < shape.layout.planes; ++plane) {
         staged.base[plane] = cursor;
-        cursor += static_cast<std::size_t>(source.stride[plane]) * ops::kOffloadMoeExperts;
+        cursor += static_cast<std::size_t>(source.stride[plane]) * shape.experts;
     }
-    if (layout_.format != ops::ExpertFormat::Nvfp4) { return staged; }
+    if (shape.layout.format != ops::ExpertFormat::Nvfp4) { return staged; }
     auto* divisors          = reinterpret_cast<float*>(cursor);
     staged.gate_up_divisors = divisors;
-    staged.down_divisors    = divisors + 2 * ops::kOffloadMoeExperts;
+    staged.down_divisors    = divisors + shape.gate_up_divisors;
     return staged;
 }
 
@@ -83,7 +86,7 @@ void Qwen4ExpertPager::snapshot_residency(cudaStream_t stream) {
     // Earlier fills may still read the previous snapshot.
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     CUDA_CHECK(cudaMemcpyAsync(resident_, cache_.slot_of,
-                               static_cast<std::size_t>(cache_.layers) * ops::kOffloadMoeExperts *
+                               static_cast<std::size_t>(cache_.slot_entries) *
                                    sizeof(std::int32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -97,23 +100,25 @@ void Qwen4ExpertPager::fill(std::int32_t layer, const ops::ExpertWeights& source
     const int b = layer & 1;
     if (layer_[b] == layer) { return; }
     CUDA_CHECK(cudaStreamWaitEvent(stream_, released_[b]));
-    const ops::ExpertWeights staged = staged_weights(b, source);
+    const ops::ExpertBankShape& shape = pool_.bank(layer);
+    const ops::ExpertBankSpan span    = pool_.span(layer);
+    const ops::ExpertWeights staged = staged_weights(b, shape, source);
     const std::int32_t* resident =
-        resident_valid_ ? resident_ + static_cast<std::ptrdiff_t>(layer) * ops::kOffloadMoeExperts
+        resident_valid_ ? resident_ + static_cast<std::ptrdiff_t>(span.first_expert)
                         : nullptr;
     if (resident != nullptr) {
-        ops::expert_cache_stage(cache_, layer, resident_, source, staged, stream_);
+        ops::expert_cache_stage(cache_, span, resident_, source, staged, stream_);
     }
-    for (int plane = 0; plane < layout_.planes; ++plane) {
+    for (int plane = 0; plane < shape.layout.planes; ++plane) {
         const auto stride = static_cast<std::size_t>(source.stride[plane]);
         auto* target      = const_cast<std::byte*>(staged.base[plane]);
-        for (int first = 0; first < ops::kOffloadMoeExperts;) {
+        for (int first = 0; first < span.experts;) {
             if (resident != nullptr && resident[first] >= 0) {
                 ++first;
                 continue;
             }
             int last = first + 1;
-            while (last < ops::kOffloadMoeExperts && (resident == nullptr || resident[last] < 0)) {
+            while (last < span.experts && (resident == nullptr || resident[last] < 0)) {
                 ++last;
             }
             CUDA_CHECK(cudaMemcpyAsync(target + first * stride, source.base[plane] + first * stride,
@@ -121,25 +126,22 @@ void Qwen4ExpertPager::fill(std::int32_t layer, const ops::ExpertWeights& source
             first = last;
         }
     }
-    if (layout_.format == ops::ExpertFormat::Nvfp4) {
+    if (shape.layout.format == ops::ExpertFormat::Nvfp4) {
         // A bank stores one weight divisor per `divisor_rows` rows: per expert matrix, or as few as
-        // one per bank (the MTP layer's banks).
+        // one per bank (the MTP layer's banks). The staged tail reserves one per expert and matrix
+        // of the layer's own bank, so a bank whose divisors do not fit its layer is refused.
         const auto divisors = [](std::int64_t rows, std::int32_t divisor_rows, std::int64_t room) {
             if (divisor_rows <= 0 || rows % divisor_rows != 0 || rows / divisor_rows > room) {
                 throw std::logic_error("Qwen4Exp staged bank cannot hold the layer's weight divisors");
             }
             return static_cast<std::size_t>(rows / divisor_rows) * sizeof(float);
         };
-        constexpr std::int64_t kGateUpRows =
-            std::int64_t(ops::kOffloadMoeExperts) * 2 * ops::kOffloadMoeIntermediate;
-        constexpr std::int64_t kDownRows = std::int64_t(ops::kOffloadMoeExperts) * ops::kOffloadMoeHidden;
         CUDA_CHECK(cudaMemcpyAsync(
             const_cast<float*>(staged.gate_up_divisors), source.gate_up_divisors,
-            divisors(kGateUpRows, source.gate_up_divisor_rows, 2 * ops::kOffloadMoeExperts),
+            divisors(shape.gate_up_rows, source.gate_up_divisor_rows, shape.gate_up_divisors),
             cudaMemcpyDefault, stream_));
         CUDA_CHECK(cudaMemcpyAsync(const_cast<float*>(staged.down_divisors), source.down_divisors,
-                                   divisors(kDownRows, source.down_divisor_rows,
-                                            ops::kOffloadMoeExperts),
+                                   divisors(shape.down_rows, source.down_divisor_rows, shape.down_divisors),
                                    cudaMemcpyDefault, stream_));
     }
     CUDA_CHECK(cudaEventRecord(ready_[b], stream_));
@@ -168,17 +170,17 @@ ops::ExpertWeights Qwen4ExpertPager::acquire_staged(std::int32_t layer,
     fill(layer, bank);
     if (next_bank != nullptr) { fill(next_layer, *next_bank); }
     CUDA_CHECK(cudaStreamWaitEvent(stream, ready_[b]));
-    return staged_weights(b, bank);
+    return staged_weights(b, pool_.bank(layer), bank);
 }
 
 void Qwen4ExpertPager::release_staged(std::int32_t layer, cudaStream_t stream) {
     CUDA_CHECK(cudaEventRecord(released_[layer & 1], stream));
 }
 
-// P1 lend: the wide idle prefill borrows the top cache slots' bytes as its arena. Invalidate them so
-// a later resolve cannot trust a slot whose bytes the arena overwrote, then shrink the cache to the
-// base count. `expert_cache_reclaim` reads `cache_.slots` at launch, so it covers the full lend range
-// before the shrink.
+// P1 lend: the wide idle prefill borrows the top cache slots' bytes as its arena. Invalidate them
+// so a later resolve cannot trust a slot whose bytes the arena overwrote, then shrink the cache to
+// the base count. `expert_cache_reclaim` reads `cache_.slots` at launch, so it covers the full lend
+// range before the shrink.
 void Qwen4ExpertPager::lend(cudaStream_t stream) {
     if (cache_.slots == base_slots_) { return; }
     ops::expert_cache_reclaim(cache_, base_slots_, stream);
@@ -186,7 +188,7 @@ void Qwen4ExpertPager::lend(cudaStream_t stream) {
 }
 
 std::int32_t Qwen4ExpertPager::max_resolve_columns() const noexcept {
-    return std::min(cache_.slots / ops::kOffloadMoeTopK, ops::moe_experts_max_columns(cache_.slots));
+    return std::min(cache_.slots / top_k_, ops::moe_experts_max_columns(cache_.slots));
 }
 
 cudaEvent_t Qwen4ExpertPager::resolve(const Tensor& ids, std::int32_t layer,
@@ -196,11 +198,12 @@ cudaEvent_t Qwen4ExpertPager::resolve(const Tensor& ids, std::int32_t layer,
     if (columns > max_resolve_columns()) {
         throw std::logic_error("Qwen4Exp resolve exceeds the expert cache's column capacity");
     }
-    ops::expert_cache_resolve(ids, layer, cache_, slot_ids, misses, stream);
+    const ops::ExpertBankSpan span = pool_.span(layer);
+    ops::expert_cache_resolve(ids, span, cache_, slot_ids, misses, stream);
     // The fetch writes only the slots it lists, which resident-slot work on `stream` never reads.
     CUDA_CHECK(cudaEventRecord(resolved_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(stream_, resolved_));
-    ops::expert_cache_fetch(bank, misses, columns * ops::kOffloadMoeTopK, cache_, stream_);
+    ops::expert_cache_fetch(bank, misses, columns * top_k_, cache_, stream_);
     CUDA_CHECK(cudaEventRecord(fetched_, stream_));
     return fetched_;
 }
