@@ -6,8 +6,9 @@
 #include "models/gemma4/weights.h"
 #include "models/load_options.h"
 
-#include <filesystem>
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace ninfer::artifact {

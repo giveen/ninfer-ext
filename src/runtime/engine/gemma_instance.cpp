@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cmath>
 #include <fstream>
 #include <iterator>

@@ -12,8 +12,7 @@
 #include "runtime/engine/gemma_instance.h"
 #include "runtime/engine/model_instance.h"
 
-#include <algorithm>
-#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>

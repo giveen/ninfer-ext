@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <type_traits>
 #include <stdexcept>
 

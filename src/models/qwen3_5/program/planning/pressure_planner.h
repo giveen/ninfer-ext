@@ -2,8 +2,10 @@
 
 #include "models/qwen3_5/program/program_impl.h"
 
-#include <array>
+#include <cstdint>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <tuple>
 
 namespace ninfer::models::qwen3_5::detail {

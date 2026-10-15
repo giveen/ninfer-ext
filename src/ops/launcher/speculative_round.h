@@ -5,8 +5,12 @@
 // validated shapes/contiguity and device residency. `workspace` is device memory sized for the
 // `token_domain`/`columns` configuration. The launches are asynchronous on `stream`.
 
+#include "core/arena.h"
+
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
+
+#include <cstdint>
 
 #include <cuda_runtime.h>
 

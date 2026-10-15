@@ -12,8 +12,6 @@
 #include "models/gemma4/config.h"
 #include "models/gemma4/weights.h"
 #include "models/load_options.h"
-
-#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>

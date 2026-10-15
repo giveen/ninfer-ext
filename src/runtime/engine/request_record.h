@@ -3,7 +3,9 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/request.h"
 #include "runtime/contract/resources.h"
+#include "runtime/contract/timing.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/generation_budget.h"
 

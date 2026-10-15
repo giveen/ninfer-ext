@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace ninfer::product {

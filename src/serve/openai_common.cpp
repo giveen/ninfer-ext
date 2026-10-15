@@ -4,11 +4,13 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <format>
 #include <random>
-#include <vector>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 

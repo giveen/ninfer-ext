@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -49,6 +50,8 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
+
+    [[nodiscard]]
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
@@ -102,6 +105,8 @@ public:
            OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,
            GenerationObservationOptions observation               = {},
            std::chrono::steady_clock::time_point pending_deadline = {});
+
+    [[nodiscard]]
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,

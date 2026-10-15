@@ -2,6 +2,8 @@
 
 #include "ninfer/ops/kv_cache_append.h"
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,

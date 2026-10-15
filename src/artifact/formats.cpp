@@ -3,6 +3,8 @@
 #include "artifact/schema.h"
 
 #include <array>
+#include <string>
+#include <utility>
 
 namespace ninfer::artifact {
 namespace {

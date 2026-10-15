@@ -65,7 +65,7 @@ struct Bf16AttentionSmallTProductionSchedule {
     static constexpr Bf16PhaseOrder kPhaseOrder =
         kSequential ? Bf16PhaseOrder::Sequential : Bf16PhaseOrder::RowSwizzled;
     using Type = Bf16SimtSchedule<4, 1, kRowsPerWarp, 8, 1, 4, kActivationAccess, kWeightCache,
-                                  kPhaseOrder, 1, kUnroll2 ? 2 : 1, 1, 2>;
+                                  kPhaseOrder, 1, 1, kUnroll2 ? 2 : 1, 2>;
 };
 
 template <int ActiveTokens>

@@ -21,6 +21,8 @@
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
 
+#include <cstddef>
+
 #include <cstdint>
 #include <memory>
 #include <optional>

@@ -5,7 +5,7 @@
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
-#include <memory>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <stdexcept>

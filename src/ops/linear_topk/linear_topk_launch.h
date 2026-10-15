@@ -4,6 +4,8 @@
 #include "core/tensor.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {

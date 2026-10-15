@@ -144,8 +144,8 @@ struct ExpertWeights {
 
 /** Device-resident mutable state of the expert cache; owned by one Program. */
 struct ExpertCacheState {
-    std::int32_t* slot_of          = nullptr; // [layers*512], -1 when absent
-    std::int32_t* owner            = nullptr; // [slots], layer*512+expert or -1
+    std::int32_t* slot_of          = nullptr; // [layers*kOffloadMoeExperts], -1 when absent
+    std::int32_t* owner            = nullptr; // [slots], layer*kOffloadMoeExperts+expert or -1
     unsigned long long* stamp      = nullptr; // [slots], last use
     unsigned long long* clock      = nullptr; // [1]
     unsigned long long* statistics = nullptr; // [2]: hits, misses

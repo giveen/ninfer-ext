@@ -1,6 +1,4 @@
 #pragma once
-
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -28,6 +26,8 @@ public:
 
     HostWorkerPool(const HostWorkerPool&)            = delete;
     HostWorkerPool& operator=(const HostWorkerPool&) = delete;
+    HostWorkerPool(HostWorkerPool&&)                 = delete;
+    HostWorkerPool& operator=(HostWorkerPool&&) = delete;
 
     // Runs `function` on a worker once the queue has room, and returns its future. `enqueue`
     // blocks while the queue is at capacity (reporting progress through `checkpoint`), so submit

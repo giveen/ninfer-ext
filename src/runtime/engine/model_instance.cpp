@@ -7,9 +7,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::runtime {
 namespace {

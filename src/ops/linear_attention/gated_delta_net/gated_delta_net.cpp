@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <stdexcept>
 #include <string>
 

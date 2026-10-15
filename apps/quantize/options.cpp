@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
-#include <vector>
 
 namespace ninfer::quantize::app {
 namespace {

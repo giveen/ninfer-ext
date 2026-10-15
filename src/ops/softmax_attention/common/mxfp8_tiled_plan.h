@@ -3,6 +3,8 @@
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 

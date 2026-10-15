@@ -1,6 +1,10 @@
 #pragma once
 
+#include "models/qwen3_5/frontend/prepared_prompt.h"
+
 #include "models/qwen3_5/frontend/processor.h"
+
+#include <ninfer/types.h>
 
 #include <array>
 #include <cstddef>

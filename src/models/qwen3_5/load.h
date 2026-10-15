@@ -1,5 +1,7 @@
 #pragma once
 
+#include "artifact/materializer.h"
+
 #include "models/qwen3_5/model.h"
 
 #include <filesystem>

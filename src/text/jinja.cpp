@@ -5,9 +5,13 @@
 #include <jinja/parser.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace ninfer::text {

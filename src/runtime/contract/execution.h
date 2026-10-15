@@ -3,6 +3,9 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
 #include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {

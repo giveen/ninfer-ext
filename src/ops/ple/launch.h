@@ -3,7 +3,8 @@
 // ninfer::ops::detail - private launch prototypes for the Qwen4Exp PLE family.
 
 #include "core/tensor.h"
-#include "ninfer/ops/ple.h"
+
+#include <cstdint>
 
 #include <cuda_runtime.h>
 

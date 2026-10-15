@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <list>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>

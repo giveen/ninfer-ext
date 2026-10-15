@@ -1,6 +1,9 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_operands.h"
 
+#include <cstdint>
+#include <cuda_fp16.h>
+
 namespace ninfer::ops::detail {
 template <bool Writable>
 using Int8KvCacheView = QuantizedCausalCacheView<std::int8_t, __half, __half, Writable>;

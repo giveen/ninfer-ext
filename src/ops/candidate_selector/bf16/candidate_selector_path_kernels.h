@@ -1,5 +1,9 @@
 #pragma once
+#include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+
+#include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
 // Requires: `configs` holds candidate_ids.ne[2] entries and is not null, steps and batch are

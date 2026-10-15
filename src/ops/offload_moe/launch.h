@@ -4,6 +4,8 @@
 
 #include "ninfer/ops/offload_moe.h"
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 

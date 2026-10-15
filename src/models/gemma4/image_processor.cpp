@@ -3,9 +3,9 @@
 #include "media/decode/resize.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
-#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::models::gemma4 {

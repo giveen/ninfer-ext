@@ -1,5 +1,9 @@
 #pragma once
 #include "models/qwen3_5/program/program.h"
+#include "ninfer/types.h"
+
+#include <cstdint>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 

@@ -4,6 +4,7 @@
 #include "ops/launcher/scatter.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops {

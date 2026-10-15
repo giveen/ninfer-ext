@@ -10,6 +10,9 @@ constexpr std::string_view kStart       = "<|im_start|>";
 constexpr std::string_view kEnd         = "<|im_end|>";
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
+// Reasoning channel opener: the tag the messages above reserve a boundary after, and the tag the
+// channel probe below tests. Both take their length from this one constant.
+constexpr std::string_view kReasoningOpenTag = "<think>";
 
 bool template_bytes(const text::TemplateOutput& output, std::size_t begin, std::size_t end) {
     return !text::overlaps(output.literal_spans, begin, end);
@@ -105,9 +108,9 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
             if (!closed && next == std::string::npos) {
                 // Only the final assistant prefix controls the initial output channel.
                 const auto open_end =
-                    body.starts_with("<think>") &&
-                            template_bytes(output, header_end + 1, header_end + 1 + 7)
-                        ? header_end + 1 + 7
+                    body.starts_with(kReasoningOpenTag) &&
+                            template_bytes(output, header_end + 1, header_end + 1 + kReasoningOpenTag.size())
+                        ? header_end + 1 + kReasoningOpenTag.size()
                         : std::string::npos;
                 const auto close_think = open_end == std::string::npos
                                              ? std::string::npos

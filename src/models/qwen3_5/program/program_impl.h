@@ -46,7 +46,7 @@ using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    return kv_stream_pages (tokens);
 }
 
 [[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {

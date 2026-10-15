@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/weight.h"
+
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sparse_moe.h"

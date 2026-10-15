@@ -408,7 +408,7 @@ std::uint64_t ContextMachineCostModel::transfer_batches_ns(
     std::span<const TransferBatchWork> batches) const noexcept {
     constexpr std::size_t kPhaseCount =
         static_cast<std::size_t>(MaterializationCopyPhase::Candidate) + 1U;
-    constexpr std::size_t kDirectionCount = 3;
+    constexpr std::size_t kDirectionCount = kContextTransferDirectionCount;
     std::array<TransferWork, kPhaseCount * kDirectionCount> coalesced{};
     for (const TransferBatchWork& batch : batches) {
         const std::size_t phase     = static_cast<std::size_t>(batch.phase);

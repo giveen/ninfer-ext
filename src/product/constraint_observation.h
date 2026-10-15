@@ -3,6 +3,8 @@
 #include "ninfer/types.h"
 #include <nlohmann/json.hpp>
 
+#include <optional>
+
 namespace ninfer::product {
 
 inline nlohmann::ordered_json

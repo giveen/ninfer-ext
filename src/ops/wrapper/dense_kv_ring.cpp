@@ -12,7 +12,7 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 256;
+constexpr std::int32_t kHeadDim = ninfer::kD256KVCacheHeadDim;
 
 PagedKVStorageLayout ring_layout(KvCacheStorage storage, const char* op) {
     if (storage == KvCacheStorage::BFloat16) {

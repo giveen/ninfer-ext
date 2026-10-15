@@ -4,6 +4,8 @@
 #include "runtime/contract/execution.h"
 #include "runtime/engine/admission_policy.h"
 
+#include <algorithm>
+
 #include <array>
 #include <bit>
 #include <cstddef>

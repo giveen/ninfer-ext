@@ -3,6 +3,8 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 
+#include <cstddef>
+
 namespace ninfer::ops::detail {
 
 enum class K8V4KvFamily { Grouped, ParallelGrouped, Tiled };

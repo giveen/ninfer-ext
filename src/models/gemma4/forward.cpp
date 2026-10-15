@@ -21,6 +21,9 @@
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>

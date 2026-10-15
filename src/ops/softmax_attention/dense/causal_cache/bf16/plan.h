@@ -4,6 +4,8 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 
+#include <cstddef>
+
 namespace ninfer::ops::detail {
 
 struct Bf16KvCausalPlan {

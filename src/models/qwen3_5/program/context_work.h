@@ -2,6 +2,10 @@
 
 #include "models/qwen3_5/program/program_impl.h"
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
 
 namespace ninfer::models::qwen3_5::execution {
 struct MtpCausalAttentionEnvelopes;

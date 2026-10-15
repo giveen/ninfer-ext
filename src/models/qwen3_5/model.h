@@ -10,6 +10,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 

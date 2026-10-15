@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {

@@ -605,7 +605,7 @@ constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
 }
 
 [[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
-                                                           SharedCandidateEvidence evidence) {
+                                                           SharedCandidateEvidence evidence) noexcept {
     return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
 }
 

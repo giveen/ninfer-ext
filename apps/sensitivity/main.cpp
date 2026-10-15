@@ -18,14 +18,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {

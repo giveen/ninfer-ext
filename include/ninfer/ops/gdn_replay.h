@@ -11,9 +11,9 @@
 namespace ninfer::ops {
 
 struct GdnReplayFoldRow {
-    std::int32_t source_state_slot;
-    std::int32_t destination_state_slot;
-    std::int32_t commit_columns;
+    std::int32_t source_state_slot      = 0;
+    std::int32_t destination_state_slot = 0;
+    std::int32_t commit_columns         = 0;
 };
 
 /**

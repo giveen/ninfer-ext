@@ -6,7 +6,8 @@ inline constexpr int kCausalHeadDim = 256;
 
 template <int HeadDim, int QueryHeads, int KVHeads>
 struct CausalGeometry : AttentionHeadMapping<QueryHeads, KVHeads> {
-    static_assert(HeadDim > 0 && HeadDim % 64 == 0);
+    static_assert(HeadDim == kCausalHeadDim,
+                  "Causal templates require HeadDim == kCausalHeadDim (256)");
     static constexpr int kHeadDim = HeadDim;
 };
 

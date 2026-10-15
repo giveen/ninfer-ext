@@ -39,11 +39,11 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
                          Bf16WeightCache::Default,
                          (ActiveTokens <= 9 || ActiveTokens >= 17) ? Bf16PhaseOrder::Sequential
                                                                    : Bf16PhaseOrder::RowSwizzled,
-                         1,
+                         1, 1,
                          ((ActiveTokens >= 2 && ActiveTokens <= 8) ||
                           (ActiveTokens >= 10 && ActiveTokens <= 19) || ActiveTokens >= 27)
                              ? 2
-                             : 1,
+                             :
                          1, 2>;
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 

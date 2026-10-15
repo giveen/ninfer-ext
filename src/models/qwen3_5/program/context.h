@@ -19,7 +19,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <span>
 
@@ -28,7 +27,6 @@ namespace ninfer::models::qwen3_5::execution {
 using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
 using detail::Eagle3PrefillState;
-using qwen3_5::PromptModality;
 
 struct ExecutionCore {
     DeviceContext& device;

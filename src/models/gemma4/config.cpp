@@ -4,7 +4,6 @@
 #include "models/registry.h"
 
 #include <cmath>
-#include <set>
 #include <string>
 
 namespace ninfer::models::gemma4 {

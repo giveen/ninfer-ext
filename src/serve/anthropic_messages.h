@@ -8,6 +8,8 @@
 // itself, so request lowering restores it from the returned block. A signature without the NInfer
 // marker stays non-semantic transport metadata.
 
+#include "ninfer/types.h"
+
 #include "serve/request.h"
 #include "serve/request_json.h"
 

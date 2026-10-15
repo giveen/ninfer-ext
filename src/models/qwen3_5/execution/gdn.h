@@ -1,7 +1,12 @@
 #pragma once
 
+#include "models/qwen3_5/config.h"
+
 #include "models/qwen3_5/execution/parameters.h"
 #include "core/device.h"
+
+#include <cstddef>
+#include <cstdint>
 
 namespace ninfer::models::qwen3_5::execution {
 

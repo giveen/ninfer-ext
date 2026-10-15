@@ -1,6 +1,14 @@
 #pragma once
 
+#include "core/arena.h"
+#include "core/tensor.h"
+#include "models/qwen3_5/config.h"
+
 #include "models/qwen3_5/execution/parameters.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
 
 namespace ninfer::models::qwen3_5::execution {
 

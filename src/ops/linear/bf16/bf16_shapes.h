@@ -2,6 +2,8 @@
 
 #include "ops/linear/bf16/bf16_launch.h"
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 [[nodiscard]] Bf16Launch select_bf16_n14336_k5120(std::int32_t tokens);

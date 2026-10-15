@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/tensor.h"
+
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/q5/q5_launch.h"

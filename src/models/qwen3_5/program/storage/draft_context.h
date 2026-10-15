@@ -3,10 +3,12 @@
 
 #include "core/cyclic_kv_cache.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/state/decoder_state.h"
 
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::models::qwen3_5::detail {
 

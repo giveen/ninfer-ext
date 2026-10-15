@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 /**

@@ -2,7 +2,9 @@
 #include "ops/linear/q8/q8_shapes.h"
 
 #include <array>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {

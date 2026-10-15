@@ -3,6 +3,8 @@
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 
+#include <cstdint>
+
 #include <memory>
 #include <string_view>
 

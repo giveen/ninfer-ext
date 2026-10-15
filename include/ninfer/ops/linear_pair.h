@@ -5,6 +5,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <cstdint>
+
 namespace ninfer::ops {
 
 // Validates the native weight pair and inclusive T interval. Existing routes use no scratch.

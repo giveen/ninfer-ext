@@ -807,7 +807,7 @@ std::vector<float> Program::causal_score(std::span<const std::int32_t> ids,
     // target, side by side and each `vocabulary` wide, which is the layout the KLD route reads. It
     // is handed a view of the staging buffer, so it must return before the next batch overwrites
     // it.
-    LogitsSink sink          = std::move(sink_in);
+    LogitsSink sink          =sink_in;
     const std::int32_t count = static_cast<std::int32_t>(ids.size());
     std::int32_t position    = 0;
     while (position < count) {

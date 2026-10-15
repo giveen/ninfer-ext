@@ -60,12 +60,12 @@ xgrammar::Grammar build(const Contract& contract, const std::optional<OutputCons
     std::vector<int32_t> choices;
     std::optional<int32_t> basic_arguments;
     for (const auto& tool : contract.tools) {
-        const auto body = !tool.strict && basic_arguments
+        const auto arguments_rule = !tool.strict && basic_arguments
                               ? *basic_arguments
                               : xgrammar::SubGrammarAdder::Apply(&builder, arguments(tool));
-        if (!tool.strict) basic_arguments = body;
+        if (!tool.strict) basic_arguments = arguments_rule;
         choices.push_back(builder.AddSequence(
-            {builder.AddByteString("\n<function=" + tool.name + ">\n"), builder.AddRuleRef(body),
+            {builder.AddByteString("\n<function=" + tool.name + ">\n"), builder.AddRuleRef(arguments_rule),
              builder.AddByteString("</function>\n</tool_call>")}));
     }
     const auto call_body = builder.AddRuleWithHint("call_body", builder.AddChoices(choices));

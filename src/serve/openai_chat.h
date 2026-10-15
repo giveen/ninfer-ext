@@ -3,6 +3,8 @@
 // OpenAI Chat Completions wire adapter. Parsing produces one protocol envelope plus an executable
 // GenerationRequest; response builders consume protocol-neutral GenerationOutcome values.
 
+#include "ninfer/types.h"
+
 #include "serve/request.h"
 #include "serve/request_json.h"
 

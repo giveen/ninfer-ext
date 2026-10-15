@@ -12,14 +12,14 @@ enum class SlidingWindowAttentionRoute {
 };
 
 struct SlidingWindowAttentionPlan {
-    SlidingWindowAttentionRoute route;
-    std::int32_t tokens;
-    std::int32_t warps;
-    std::int32_t key_block;
-    std::int32_t reduce_warps;
-    std::int32_t split_capacity;
-    std::int32_t max_context;
-    std::int32_t window;
+    SlidingWindowAttentionRoute route = SlidingWindowAttentionRoute::Direct;
+    std::int32_t tokens               = 0;
+    std::int32_t warps                = 0;
+    std::int32_t key_block            = 0;
+    std::int32_t reduce_warps         = 0;
+    std::int32_t split_capacity       = 0;
+    std::int32_t max_context          = 0;
+    std::int32_t window               = 0;
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan

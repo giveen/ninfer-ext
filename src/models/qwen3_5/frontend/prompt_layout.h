@@ -2,6 +2,12 @@
 
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
 namespace ninfer::models::qwen3_5::frontend {
 
 struct MessageLayout {
