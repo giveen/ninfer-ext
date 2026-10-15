@@ -5,6 +5,12 @@
 #include <system_error>
 
 #if defined(_WIN32)
+// windows.h defines min and max as macros, which would swallow any std::min/std::max in this file
+// or in anything it includes; this file uses neither today, and the guard is what keeps that from
+// mattering.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
 #    include <windows.h>
 #else
 #    include <fcntl.h>

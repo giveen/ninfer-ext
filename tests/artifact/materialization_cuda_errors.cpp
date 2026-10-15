@@ -4,6 +4,11 @@
 #include <cuda_runtime.h>
 
 #if defined(_WIN32)
+// windows.h defines min and max as macros; the headers above are already parsed, and this keeps a
+// later include or call site from silently losing std::min/std::max.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
 #    include <windows.h>
 #endif
 
