@@ -37,6 +37,25 @@ this repository's own quantization routes, with the
 | norms | `layer_norm_epsilon` 1e-5 | |
 | `rescale_prenorm_residual` | true | **initialisation only** (`_init_weights`, the GPT-2/Megatron 1/√N scheme). The checkpoint carries it; there is no runtime residual rule to implement. |
 
+## The checkpoint's tensors
+
+Verified against the released BF16 checkpoint (63 shards, 149.8 GB, 28,725 tensors), which is also where
+the loader's names will come from:
+
+- `language_model.backbone.layers.N.mixer.in_proj.weight` is `[18560, 4096]` — the projection width the
+  config derives, confirmed rather than inferred;
+- `mixer.conv1d.weight` is `[10240, 1, 4]` (depthwise, kernel 4) with `mixer.conv1d.bias` `[10240]`;
+- `mixer.A_log`, `mixer.D` and `mixer.dt_bias` are `[128]` per layer, `mixer.norm.weight` is `[8192]`;
+- **the experts are one tensor per expert per matrix** — `mixer.experts.E.{up,down}_proj.weight` — 13,824
+  experts and 27,648 tensors in total, `[1024, 2560]` for a 496-expert layer's down projection;
+- `mixer.gate.weight` and `mixer.gate.e_score_correction_bias` are per layer, the bias **F32** and sized
+  to that layer's bank;
+- `language_model.backbone.embeddings.weight` and `language_model.lm_head.weight`, plus (phase 2)
+  `vision_model.*` with a three-tensor `mlp1` projector.
+
+The config's block list and its per-layer expert counts match the tensors exactly: 40 mamba, 40 moe and 8
+attention in the same order, with 240/304/368/432/496 experts in 12/6/9/10/3 layers.
+
 ## The mathematics, with citations
 
 **Block** (`modeling_nemotron_h.py:922`). Pre-norm RMSNorm → mixer → `residual + mixer_out`. No
@@ -78,7 +97,7 @@ Less is new than that first estimate suggested, and one piece costs nothing:
 | Piece | Verdict |
 |---|---|
 | Recurrent state | **Reused unchanged.** `LinearAttentionStatePoolSpec` is parametric in exactly what Mamba-2 needs — heads, head_dim, state size, conv channels and conv width — and the state is O(1) in context. 4 MiB per layer, so 160 MiB per sequence, plus 2.34 MiB of convolution history: 162.34 MiB per sequence, 2.67x the documented 35B-A3B image. |
-| Depthwise convolution | `causal_conv1d_silu` is already depthwise, kernel-4, causal, SiLU-fused, T-any, with per-slot state, and C=10240 is a production width. It lacks only the **bias**, and the bias cannot be added from outside it: the SiLU is fused, and `silu(conv)+bias` is not `silu(conv+bias)`. So that op gains a bias-then-SiLU form. (`dynamic_grouped_conv` is not this op — it is a round-level, channel-mixing, two-tap dynamic convolution, which is closer to the draft model's grouped convolution than to Mamba's.) |
+| Depthwise convolution | **Done.** `causal_conv1d_silu` was already depthwise, kernel-4, causal, SiLU-fused, T-any, with per-slot state, and C=10240 is a production width. It lacked only the **bias**, which is now a `const Tensor* bias` argument on every entry (null = the bias-free op). It could not be added from outside the op: the SiLU is fused, and `silu(conv)+bias` is not `silu(conv+bias)`. (`dynamic_grouped_conv` is not this op — it is a round-level, channel-mixing, two-tap dynamic convolution, which is closer to the draft model's grouped convolution than to Mamba's.) |
 | Chunked scan | The SSD skeleton exists **twice**, in GDN and KDA, with fp32 state. Mamba-2 sits between them: KDA supplies the `A_log`/`dt_bias`/gate production and the chunk packet, GDN the *scalar* per-head decay cumsum (Mamba-2's A is per-head scalar), and the 8-groups-to-128-heads B/C mapping is the existing `qk_heads < value_heads` mechanism. Genuinely new: a distinct value extent (64 rather than the hardcoded 128), no delta rule, softplus dt, an unscaled readout and the `D*x` skip. |
 | Gated grouped norm | **Wholly new.** The gated RMSNorm here normalises the whole row and applies the gate after; this one gates first and normalises within groups. |
 | Everything else | `relu2`, the non-gated expert bank with its latent round trip, the sigmoid router, and a config whose block types and expert shapes are per layer. |
