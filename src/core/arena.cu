@@ -1,11 +1,10 @@
 #include "core/arena.h"
 
+#include "core/host_memory.h"
+
 #include <cuda_runtime.h>
 
-#include <sys/mman.h>
-
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -63,7 +62,9 @@ void free_pinned(void*& ptr, bool registered) noexcept {
     if (ptr == nullptr) { return; }
     if (registered) {
         log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
-        std::free(ptr);
+        // The registered path allocated this through core::aligned_host_alloc, whose release on
+        // Windows is _aligned_free; a registered buffer never came from another allocator.
+        core::aligned_host_free(ptr);
     } else {
         log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
     }
@@ -269,16 +270,16 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, PinnedHostPages pages
         }
         const std::size_t reserved =
             (size_bytes + kPinnedHugePageBytes - 1) / kPinnedHugePageBytes * kPinnedHugePageBytes;
-        void* ptr = std::aligned_alloc(kPinnedHugePageBytes, reserved);
+        void* ptr = core::aligned_host_alloc(reserved, kPinnedHugePageBytes);
         if (ptr == nullptr) { throw std::bad_alloc(); }
         // Advisory: without transparent huge pages the buffer is still correct, only slower.
         // Populate every page before registration, so the pinned mapping is built once over its
         // final (huge) pages rather than faulted in piecewise by the registration itself.
-        (void)madvise(ptr, reserved, MADV_HUGEPAGE);
-        if (madvise(ptr, reserved, MADV_POPULATE_WRITE) != 0) { std::memset(ptr, 0, reserved); }
+        core::advise_large_pages(ptr, reserved);
+        core::prefault_host_pages(ptr, reserved);
         const cudaError_t err = cudaHostRegister(ptr, reserved, cudaHostRegisterDefault);
         if (err != cudaSuccess) {
-            std::free(ptr);
+            core::aligned_host_free(ptr);
             throw std::runtime_error(cuda_error_message("cudaHostRegister failed", err));
         }
         data_       = ptr;
