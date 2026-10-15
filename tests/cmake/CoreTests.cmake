@@ -36,6 +36,12 @@ ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_checked_math_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_checked_math.cpp"
   LIBRARIES ninfer_core)
 
+# The portable 128-bit arithmetic is never compiled on this platform (it is the native type here), so
+# this unit holds the two-word implementation against the native one as its oracle. It selects the
+# portable path itself, which is why the define is not a build option.
+ninfer_add_test(ninfer_uint128_test     SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_uint128.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_layout_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_layout.cpp"
   LIBRARIES ninfer_core)
 

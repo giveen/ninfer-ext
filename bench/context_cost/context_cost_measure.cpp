@@ -10,6 +10,15 @@
 namespace ninfer::bench::context_cost {
 namespace {
 
+// Precision of the calibration arithmetic in this file, named so that the choice is explicit
+// rather than implied by `long double`. On x86-64 Linux long double is 80-bit extended precision;
+// MSVC maps long double to 64-bit double, so the Windows calibration accumulates and rounds in
+// double. Every value this file publishes is a double, so the difference is confined to the last
+// bits of a fitted coefficient: rounding a coefficient into its stored encoding stays exact in
+// either precision until the scaled value passes 2^53, which needs 2^21 nanoseconds per unit and is
+// far outside the range a hardware calibration produces.
+using OracleReal = long double;
+
 double median_of(std::vector<double> values) {
     if (values.empty()) { return 0.0; }
     const std::size_t middle = values.size() / 2;
@@ -164,10 +173,10 @@ std::uint64_t quantize(double coefficient, CoefficientEncoding encoding) {
     if (!(coefficient >= 0.0) || !std::isfinite(coefficient)) {
         throw std::invalid_argument("cost coefficient must be finite and nonnegative");
     }
-    const long double scale =
-        encoding == CoefficientEncoding::Q32Nanoseconds ? static_cast<long double>(kQ32One) : 1.0L;
-    const long double value = std::round(static_cast<long double>(coefficient) * scale);
-    if (value > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+    const OracleReal scale =
+        encoding == CoefficientEncoding::Q32Nanoseconds ? static_cast<OracleReal>(kQ32One) : 1.0L;
+    const OracleReal value = std::round(static_cast<OracleReal>(coefficient) * scale);
+    if (value > static_cast<OracleReal>(std::numeric_limits<std::uint64_t>::max())) {
         throw std::overflow_error("cost coefficient exceeds uint64");
     }
     return static_cast<std::uint64_t>(value);
@@ -184,11 +193,11 @@ double quantized_transfer_prediction(const TransferRegressionPoint& point,
     if (coefficients.size() != 3) {
         throw std::invalid_argument("transfer roofline requires three coefficients");
     }
-    const long double operation_limited =
-        static_cast<long double>(coefficients[0]) +
-        static_cast<long double>(coefficients[1]) * point.copy_operations;
-    const long double bandwidth_limited = static_cast<long double>(coefficients[2]) *
-                                          point.payload_bytes / static_cast<long double>(kQ32One);
+    const OracleReal operation_limited =
+        static_cast<OracleReal>(coefficients[0]) +
+        static_cast<OracleReal>(coefficients[1]) * point.copy_operations;
+    const OracleReal bandwidth_limited = static_cast<OracleReal>(coefficients[2]) *
+                                          point.payload_bytes / static_cast<OracleReal>(kQ32One);
     return static_cast<double>(std::max(operation_limited, bandwidth_limited));
 }
 
@@ -261,13 +270,13 @@ double predict_quantized(const RegressionPoint& point,
     if (coefficients.size() != encodings.size() || coefficients.size() > point.features.size()) {
         throw std::invalid_argument("cost model quantized shape is inconsistent");
     }
-    long double result = 0.0L;
+    OracleReal result = 0.0L;
     for (std::size_t index = 0; index < coefficients.size(); ++index) {
-        const long double scale = encodings[index] == CoefficientEncoding::Q32Nanoseconds
-                                      ? static_cast<long double>(kQ32One)
+        const OracleReal scale = encodings[index] == CoefficientEncoding::Q32Nanoseconds
+                                      ? static_cast<OracleReal>(kQ32One)
                                       : 1.0L;
-        result += static_cast<long double>(coefficients[index]) *
-                  static_cast<long double>(point.features[index]) / scale;
+        result += static_cast<OracleReal>(coefficients[index]) *
+                  static_cast<OracleReal>(point.features[index]) / scale;
     }
     return static_cast<double>(result);
 }

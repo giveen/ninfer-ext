@@ -2,13 +2,23 @@
 
 #include "artifact/framing.h"
 #include "artifact/reader.h"
+#include "core/native_file.h"
 #include "core/startup.h"
 
 #include <cuda_runtime.h>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#if defined(_WIN32)
+// windows.h defines min/max as macros, which would swallow every std::min/std::max below.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <system_error>
+#    include <windows.h>
+#else
+#    include <fcntl.h>
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -137,12 +147,62 @@ void parallel_read(const Reader& reader, std::uint64_t offset, std::span<std::by
     for (auto& task : tasks) { task.get(); }
 }
 
+#if defined(_WIN32)
+// A failing Windows call reports through GetLastError(), which any intervening runtime call may
+// overwrite, so the text is captured at the failing call and carried into the exception.
+std::string windows_error_text() {
+    return std::system_category().message(static_cast<int>(::GetLastError()));
+}
+#endif
+
 } // namespace
 
 // Read-only shared mapping of one file range; the page cache owns residency.
 class FileMapping {
 public:
     FileMapping(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t bytes) {
+#if defined(_WIN32)
+        // A view of no bytes is not a view: MapViewOfFile would map everything from the offset to
+        // the end of the file rather than failing, so an empty range is refused up front.
+        // Reader::segments never emits an empty segment.
+        if (bytes == 0) {
+            throw ArtifactError(path.string() + ": cannot map a zero-length range");
+        }
+        // A view offset must be a multiple of the allocation granularity, which is coarser than the
+        // page size mmap aligns to; data() skips the same extra prefix either way.
+        SYSTEM_INFO information{};
+        ::GetSystemInfo(&information);
+        const auto page = static_cast<std::uint64_t>(information.dwAllocationGranularity);
+        const std::uint64_t aligned = offset / page * page;
+        length_                     = static_cast<std::size_t>(offset - aligned + bytes);
+        const HANDLE file =
+            ::CreateFileW(path.c_str(), GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            throw ArtifactError(path.string() + ": cannot open for mapping: " +
+                                windows_error_text());
+        }
+        // The section covers the whole file; only the view below starts at `aligned`.
+        const HANDLE section = ::CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (section == nullptr) {
+            const auto error = windows_error_text();
+            (void)::CloseHandle(file);
+            throw ArtifactError(path.string() + ": mmap failed: " + error);
+        }
+        // The section holds its own reference to the file, so the file handle is done with.
+        (void)::CloseHandle(file);
+        base_ = ::MapViewOfFile(section, FILE_MAP_READ, static_cast<DWORD>(aligned >> 32),
+                                static_cast<DWORD>(aligned & 0xFFFFFFFFU), length_);
+        if (base_ == nullptr) {
+            const auto error = windows_error_text();
+            (void)::CloseHandle(section);
+            throw ArtifactError(path.string() + ": mmap failed: " + error);
+        }
+        mapping_ = section;
+        core::advise_random_access(base_, length_);
+        data_ = static_cast<const std::byte*>(base_) + (offset - aligned);
+#else
         const long page_size = sysconf(_SC_PAGESIZE);
         if (page_size <= 0) {
             throw ArtifactError(path.string() + ": cannot determine the host page size");
@@ -160,10 +220,17 @@ public:
         }
         (void)::madvise(base_, length_, MADV_RANDOM);
         data_ = static_cast<const std::byte*>(base_) + (offset - aligned);
+#endif
     }
 
     ~FileMapping() {
+#if defined(_WIN32)
+        // UnmapViewOfFile releases the view only; the section is a second object to close.
+        if (base_ != nullptr) { (void)::UnmapViewOfFile(base_); }
+        if (mapping_ != nullptr) { (void)::CloseHandle(mapping_); }
+#else
         if (base_ != nullptr) { ::munmap(base_, length_); }
+#endif
     }
 
     FileMapping(const FileMapping&)            = delete;
@@ -175,6 +242,9 @@ private:
     void* base_            = nullptr;
     std::size_t length_    = 0;
     const std::byte* data_ = nullptr;
+#if defined(_WIN32)
+    HANDLE mapping_ = nullptr;
+#endif
 };
 
 MaterializedArtifact::MaterializedArtifact()                                           = default;

@@ -18,7 +18,11 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
+#if defined(_WIN32)
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -36,10 +40,20 @@ std::uint64_t unix_time_ms() {
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+// The process id keeps the instance id unique across restarts of the same build. Windows spells it
+// _getpid and declares it in <process.h>; the value is the same process id.
+long long process_id() noexcept {
+#if defined(_WIN32)
+    return static_cast<long long>(::_getpid());
+#else
+    return static_cast<long long>(::getpid());
+#endif
+}
+
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
+    return "serve-" + std::to_string(process_id()) + '-' +
            std::to_string(micros);
 }
 

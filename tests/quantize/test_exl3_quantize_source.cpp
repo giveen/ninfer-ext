@@ -9,6 +9,8 @@
 
 #include "artifact/exl3_trellis.h"
 
+#include "test_platform.h"
+
 #include <nlohmann/json.hpp>
 
 #include <array>
@@ -21,7 +23,6 @@
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -52,12 +53,7 @@ app::QuantizeOptions parse(std::vector<std::string> arguments) {
 }
 
 std::filesystem::path scratch(const char* name) {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     (std::string("ninfer-exl3-quantize-") + name + "-" +
-                      std::to_string(::getpid()));
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
-    return dir;
+    return ninfer::test::temporary_directory(std::string("ninfer-exl3-quantize-") + name);
 }
 
 void test_options() {

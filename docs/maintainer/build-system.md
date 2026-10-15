@@ -13,11 +13,16 @@ composition. Architecture selection and validation happen before `project()` det
 The default configuration is Release. Ninja links and archives share the single-slot
 `ninfer_link` pool; compilation uses the build command's parallelism.
 
-The language standard is C++23 for host and CUDA code. CMake (through 4.3) has no CUDA23 dialect
-for nvcc, so the root file requests `CMAKE_CUDA_STANDARD 20`, blanks CMake's own
-`-std=c++20` option (`CMAKE_CUDA20_STANDARD_COMPILE_OPTION` and `..._EXTENSION_...`) and adds
-`-std=c++23` to CUDA compilation. Once CMake supports CUDA23, this reduces to
-`CMAKE_CUDA_STANDARD 23`.
+The language standard is C++23 for host code and C++20 for device code. CMake (through 4.3) has no
+CUDA23 dialect for nvcc, whose own `--std` accepts at most `c++20`, so the root file requests
+`CMAKE_CUDA_STANDARD 20`, blanks CMake's own `-std=c++20` option (`CMAKE_CUDA20_STANDARD_COMPILE_OPTION`
+and `..._EXTENSION_...`) and adds the newest dialect the *host* compiler accepts: `-std=c++23` for
+GCC/Clang, `-std=c++20` under MSVC, which nvcc forwards to `cl.exe`. Without an explicit flag those
+units would fall to nvcc's older default rather than the C++20 they are written against. Once CMake
+supports CUDA23, this reduces to `CMAKE_CUDA_STANDARD 23`.
+
+Device units therefore compile below the host standard, which is only safe while no `.cu` includes a
+C++23 library header ([Windows port](windows-port.md) records why).
 
 | Cache option | Default | Scope |
 |---|---|---|
@@ -31,11 +36,19 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.3 and Python 3.11 describe the maintained environment, not configuration version gates.
-CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
-is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
-media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
-[that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
+CUDA 13.3 and Python 3.11 describe the maintained environment, not configuration version gates, with
+one exception: MSVC must be 1951 or newer (Visual Studio 2026 18.x), because `<flat_map>` arrived in
+MSVC 14.51 and the artifact schema includes it. The root file enforces that floor at configure time.
+
+Library discovery is platform-dependent. On Linux FFmpeg and libcurl come from `pkg-config`; on Windows
+neither has a system package, so `vcpkg.json` pins them (and their `builtin-baseline`) and both are
+reached through `find_package`. Either way the consuming targets link one interface target each
+(`ninfer::ffmpeg`, `ninfer::curl`) and carry no platform branch of their own. CMake discovers FFmpeg
+without imposing library version floors. Actual language/API support is exercised by compilation and
+tests. The libcurl 7.85 minimum has a concrete API basis: media acquisition uses
+`CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
+[that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html), and the constraint travels with
+both discoveries.
 
 The checked-in `CMakePresets.json` provides:
 

@@ -14,6 +14,15 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# <flat_map>, which the artifact schema uses, shipped in MSVC 14.51 (Visual Studio 2026 18.x); the
+# Visual Studio 2022 toolset is 193x and cannot compile this tree at all. Fail here, with the reason,
+# instead of deep inside the artifact schema.
+if(MSVC AND MSVC_VERSION LESS 1951)
+  message(FATAL_ERROR
+    "NInfer needs MSVC 1951 or newer (Visual Studio 2026 18.x): <flat_map> is C++23 and the artifact "
+    "schema depends on it. Found MSVC_VERSION=${MSVC_VERSION}.")
+endif()
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
@@ -21,12 +30,21 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# CMake (through 4.3) has no CUDA23 dialect for nvcc. Request CUDA20 so CMake
-# accepts the targets, blank its -std=c++20 and pass -std=c++23 directly.
+# Device code is compiled below the host standard, because nvcc's own --std accepts at most c++20
+# (CUDA 13.3 documents --std=c++03..20). That split is safe only because no .cu translation unit
+# includes a C++23 library header; keep it that way. CMake (through 4.3) has no CUDA23 dialect, so
+# request CUDA20 to make CMake accept the targets, blank its standard flag and pass the newest one
+# nvcc does accept directly: c++23 for a GCC/Clang host, c++20 under MSVC, which nvcc forwards as
+# /std:c++20 to cl.exe for the host pass of a .cu. Without the explicit flag those units would fall
+# to nvcc's default, which is older than the C++20 the device and host code is written against.
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "")
 set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "")
-add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++23>)
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>)
+else()
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++23>)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)

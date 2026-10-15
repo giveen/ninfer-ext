@@ -7,11 +7,14 @@
 //   NINFER_GEMMA_PROMPT    a file of int32 little-endian token ids
 //   NINFER_GEMMA_STEPS     how many tokens to generate (default 8)
 //
-// Writes the prompt followed by the generated ids to /tmp/gemma_gen.out.i32.
+// Writes the prompt followed by the generated ids to /tmp/gemma_gen.out.i32, or to the process
+// temporary directory on Windows where there is no /tmp; see test_platform.h.
 
 #include "core/device.h"
 #include "models/gemma4/load.h"
 #include "models/gemma4/program.h"
+
+#include "test_platform.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -127,11 +130,12 @@ int main() {
         }
         ids.insert(ids.end(), eager.begin(), eager.end());
 
-        std::ofstream output("/tmp/gemma_gen.out.i32", std::ios::binary);
+        const std::filesystem::path dump = ninfer::test::dump_directory() / "gemma_gen.out.i32";
+        std::ofstream output(dump, std::ios::binary);
         output.write(reinterpret_cast<const char*>(ids.data()),
                      static_cast<std::streamsize>(ids.size() * sizeof(std::int32_t)));
         std::cout << "gemma4 generate: " << prompt_length << " prompt tokens, " << steps
-                  << " generated through the Program, wrote /tmp/gemma_gen.out.i32\n";
+                  << " generated through the Program, wrote " << dump.string() << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "gemma4 generate: " << error.what() << '\n';

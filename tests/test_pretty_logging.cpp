@@ -2,9 +2,16 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 
+#include "test_platform.h"
+
 #include <spdlog/logger.h>
 
-#include <unistd.h>
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#else
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -21,41 +28,82 @@ namespace {
 class StderrCapture {
 public:
     StderrCapture() {
-        if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+#if defined(_WIN32)
+        // The CRT's descriptor calls carry the underscore prefix, and _pipe takes a buffer size and
+        // a text mode: binary mode keeps the captured bytes unmangled. STDERR_FILENO is not
+        // portable, so the stream's own descriptor is asked for instead.
+        if (::_pipe(pipe_, 4096, _O_BINARY) != 0) {
+            throw std::runtime_error(ninfer::test::errno_message(errno));
+        }
+        saved_ = ::_dup(::_fileno(stderr));
+        if (saved_ < 0 || ::_dup2(pipe_[1], ::_fileno(stderr)) < 0) {
+            throw std::runtime_error(ninfer::test::errno_message(errno));
+        }
+        ::_close(pipe_[1]);
+#else
+        if (::pipe(pipe_) != 0) { throw std::runtime_error(ninfer::test::errno_message(errno)); }
         saved_ = ::dup(STDERR_FILENO);
         if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
-            throw std::runtime_error(std::strerror(errno));
+            throw std::runtime_error(ninfer::test::errno_message(errno));
         }
         ::close(pipe_[1]);
+#endif
         pipe_[1] = -1;
     }
 
     ~StderrCapture() {
         if (saved_ >= 0) {
+#if defined(_WIN32)
+            (void)::_dup2(saved_, ::_fileno(stderr));
+            ::_close(saved_);
+#else
             (void)::dup2(saved_, STDERR_FILENO);
             ::close(saved_);
+#endif
         }
+#if defined(_WIN32)
+        if (pipe_[0] >= 0) { ::_close(pipe_[0]); }
+#else
         if (pipe_[0] >= 0) { ::close(pipe_[0]); }
+#endif
     }
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
+#if defined(_WIN32)
+        if (::_dup2(saved_, ::_fileno(stderr)) < 0) {
+            throw std::runtime_error(ninfer::test::errno_message(errno));
+        }
+        ::_close(saved_);
+#else
+        if (::dup2(saved_, STDERR_FILENO) < 0) {
+            throw std::runtime_error(ninfer::test::errno_message(errno));
+        }
         ::close(saved_);
+#endif
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
+#if defined(_WIN32)
+            // _read returns an int and has no ssize_t; nothing else about the loop differs.
+            const int count = ::_read(pipe_[0], buffer.data(), static_cast<unsigned>(buffer.size()));
+#else
             const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+#endif
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
-                throw std::runtime_error(std::strerror(errno));
+                throw std::runtime_error(ninfer::test::errno_message(errno));
             }
             output.append(buffer.data(), static_cast<std::size_t>(count));
         }
+#if defined(_WIN32)
+        ::_close(pipe_[0]);
+#else
         ::close(pipe_[0]);
+#endif
         pipe_[0] = -1;
         return output;
     }
