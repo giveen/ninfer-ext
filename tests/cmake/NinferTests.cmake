@@ -51,6 +51,12 @@ function(ninfer_op_oracle_options target)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+  elseif(MSVC)
+    # The oracle needs no contraction between multiply and add, so calibration is not perturbed.
+    # /fp:precise is MSVC's default and has not generated contractions by default since Visual Studio
+    # 2022 17.0; it is stated here so a future change of default cannot silently reintroduce them.
+    # /fp:strict would be wrong here: it changes the program's floating-point environment handling.
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>)
   endif()
 endfunction()
 
