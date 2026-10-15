@@ -28,6 +28,10 @@
 //   models
 //     it: the checkpoint already carries the rescaled weights.
 
+namespace ninfer::artifact {
+struct Directory;
+}
+
 namespace ninfer::models::nemotron_h {
 
 enum class BlockKind { Mamba, Moe, Attention };
@@ -58,7 +62,7 @@ struct MambaConfig {
     // so the projection is exactly these three, and that is asserted at parse time rather than
     // assumed here.
     [[nodiscard]] std::uint64_t in_projection_size() const noexcept {
-        return 2ULL * inner_size() + conv_channels() + num_heads;
+        return inner_size() + conv_channels() + num_heads;
     }
 };
 
@@ -145,5 +149,10 @@ struct TextConfig {
 struct Config {
     TextConfig text;
 };
+
+// Parses the artifact's own text component. Every field this family needs is required or implied by
+// what is present, and any input the family cannot represent exactly is refused rather than
+// defaulted: a wrong-but-plausible shape would load and compute the wrong model.
+[[nodiscard]] Config parse_config(const artifact::Directory& directory);
 
 } // namespace ninfer::models::nemotron_h
