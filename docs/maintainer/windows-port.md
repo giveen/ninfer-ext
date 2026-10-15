@@ -20,7 +20,7 @@ in the same project and share the same platform layer, but the gate does not bui
 
 | Requirement | Why it is a floor |
 |---|---|
-| **MSVC 1951+ (Visual Studio 2026 18.x)** | `<flat_map>`, which `src/artifact/schema.h` includes, shipped in MSVC 14.51. The Visual Studio 2022 toolset is 193x and cannot compile this tree at all. `CMakeLists.txt` rejects it at configure time with that reason. |
+| **MSVC 1951+ (Visual Studio 2026 18.x)** | `<flat_map>`, which `src/artifact/schema.h` includes, shipped in MSVC 14.51. The Visual Studio 2022 toolset is 193x and cannot compile this tree at all. `CMakeLists.txt` rejects it at configure time with that reason. Confirmed on the CI runner, whose toolset reports `14.51.36231`, by a probe that compiles and runs a program using `<flat_map>` and `<print>`. |
 | **CUDA 13.3** | `sm_120a` is the only supported target. The CUDA 13.3 Windows installation guide lists MSVC 195x / Visual Studio 2026 18.x as supported, which is the same window `<flat_map>` needs. |
 | **CMake 3.28+ and Ninja** | Unchanged from Linux; Ninja keeps the single-slot link pool that the device link needs. |
 | **vcpkg (`vcpkg.json`)** | FFmpeg and libcurl have no system packages on Windows. The manifest pins a `builtin-baseline`, so the versions are fixed by the repository rather than by the runner's vcpkg checkout. |
@@ -79,11 +79,11 @@ directories and CRT calls.
 ## The compile gate
 
 `.github/workflows/windows.yml` runs on `windows-2025-vs2026` (Visual Studio 2026 18.x, MSVC 195x),
-installs CUDA 13.3, solves FFmpeg and libcurl through vcpkg, configures with Ninja, builds `ninfer` and
-`ninfer-serve`, and uploads a **runnable package**: the executables plus the CUDA runtime and the vcpkg
-DLLs they load. It runs no tests. GitHub-hosted runners have no GPU, and the hosted GPU runners are T4
-(`sm_75`), which this engine does not support — so the gate can only prove compilation, and it says so
-in its header.
+installs CUDA 13.3, solves FFmpeg and libcurl through vcpkg, configures with Ninja, builds `ninfer`,
+`ninfer-serve` and `ninfer-probe`, and uploads a **runnable package**: the executables plus the CUDA
+runtime and the vcpkg DLLs they load. It runs no tests. GitHub-hosted runners have no GPU, and the
+hosted GPU runners are T4 (`sm_75`), which this engine does not support — so the gate can only prove
+compilation, and it says so in its header.
 
 Anyone editing the Windows code paths locally should run
 `tools/verify/win32_syntax_check.py <paths>`: it compiles the same translation units with mingw-w64,
@@ -133,3 +133,10 @@ Running the suite on Windows needs two things the command line on Linux gets for
 The real-model subset is unchanged: it reads its artifact and inputs from the environment
 ([real-model tests](real-model-tests.md)), and the tests that need inputs the repository does not carry
 skip themselves when those variables are unset.
+
+One test needs a linker trick on Linux and a different one on Windows: the artifact fault-injection case
+intercepted `cudaMalloc` with GNU's link-time `--wrap`, which link.exe does not have, and
+`/alternatename` cannot replace (it redirects a symbol the linker is looking for and cannot find, while
+cudart's import library defines these). It interposes the CUDA runtime's import address table at runtime
+on Windows instead, so every assertion survives and a statically linked cudart fails loudly rather than
+running uninstrumented.
