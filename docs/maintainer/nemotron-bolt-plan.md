@@ -151,6 +151,15 @@ was trained against. Pairing it with an EXL3 target is exactly the mismatch that
 drafter accept almost nothing while every mechanism still tested clean. EXL3 becomes a second route
 afterwards, and the BF16 checkpoint is the conversion source for both.
 
+A correction from the draft's own tensors, because this argument was overstated: the draft's stated base is
+the *24GB* variant, whose mixer projections are NVFP4 but whose 27,728 expert tensors are `IQ2_XXS` at
+2.06 bits. The target it was qualified against therefore has **2-bit experts**, which our NVFP4 experts at
+4.5 bits do not match. Higher precision should not be worse, but the pairing is unproven in both
+directions, so the rank diagnostic decides it rather than an assumption. Worth watching in the same
+breath: an elastic (nested) Bolt checkpoint would be device-resident on a 5090 and would remove the
+host-offload requirement entirely, and the converter would take it unchanged -- the architecture is the
+same.
+
 The host-offload cache does **not** survive heterogeneous banks as written: `slot_of` is `layers × E`,
 the owner→layer decode is a division by `E`, the staged bank is `2E`, and the pool stride is one global
 `slot_bytes`. Four sites fix it — sum the per-layer `E` (`startup.cpp:1451`), replace `slot_of` with a
