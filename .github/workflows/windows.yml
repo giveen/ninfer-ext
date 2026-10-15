@@ -36,19 +36,24 @@ jobs:
       - name: Free disk space
         shell: pwsh
         run: |
+          Get-PSDrive C | Select-Object Used, Free
           # A CUDA install plus a CUDA C++ build does not otherwise fit the runner's system drive.
-          # Nothing listed here is used by the build.
+          # Two things make this step fast rather than the slowest part of the job: the on-access
+          # scanner (which otherwise inspects every file as it is deleted) is off for this job, and
+          # robocopy empties each tree in bulk instead of one path at a time. Nothing removed here is
+          # used by the build.
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          $empty = Join-Path $env:RUNNER_TEMP 'empty'
+          New-Item -ItemType Directory -Force -Path $empty | Out-Null
           $unused = @(
             'C:\Android',
             'C:\Program Files (x86)\Android',
-            'C:\Program Files\dotnet',
-            'C:\Program Files\Microsoft SQL Server',
-            'C:\Program Files (x86)\Microsoft SQL Server',
-            'C:\Program Files\Microsoft Visual Studio\2019',
-            'C:\Program Files (x86)\Microsoft Visual Studio\2019'
+            'C:\Program Files\dotnet'
           )
           foreach ($path in $unused) {
-            if (Test-Path $path) { Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue }
+            if (-not (Test-Path $path)) { continue }
+            robocopy $empty $path /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+            Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue
           }
           Get-PSDrive C | Select-Object Used, Free
 
