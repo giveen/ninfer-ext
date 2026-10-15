@@ -931,7 +931,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, int layer, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, int layer) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1205,7 +1205,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, static_cast<int>(layer), ph);
+                    attn_mix(block, x, compact, static_cast<int>(layer));
                 } else {
                     gdn_mix(block, x, compact, static_cast<int>(layer), ph);
                 }
@@ -1299,7 +1299,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
     int t0 = 0;
-    for (; t0 < T;) {
+    // One chunk per call: the caller drives the split, so this processes at most one chunk.
+    if ( t0 < T) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
         work_.reset();
@@ -1307,9 +1308,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
         if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
             vision_chunk =
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
@@ -1322,7 +1320,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             std::vector<std::int32_t> local_scatter_indices;
             std::int32_t visual_begin = 0;
             if (!vision_chunk.scatter.empty()) {
-                const auto scatter =
+                const auto& scatter =
                     vision_chunk.scatter;
                 const auto begin = std::ranges::lower_bound(scatter, prompt_t0);
                 const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
@@ -1526,7 +1524,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         }
 
         t0 += len;
-        break;
     }
 
     prefill_split_frontier_ = -1;

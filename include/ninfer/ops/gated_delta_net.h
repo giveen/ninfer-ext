@@ -70,7 +70,9 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * [128,128,Hv,Slots], and both selector tensors are contiguous device I32 [B]. B is in [1,8].
  * Row b reads source_state_slots[b] and publishes the transition to
  * destination_state_slots[b]; selectors may be equal for an in-place row. Destination slots are
- * distinct across active rows. This form uses no arena allocation.
+ * distinct across active rows. `scale` is 1/sqrt(128) (a violation throws), and normalize_qk
+ * applies the same per-row x / sqrt(sum(x^2) + 1e-6) normalization as the recurrent form. Inputs
+ * and out must not overlap `ssm_states` or one another. This form uses no arena allocation.
  */
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,

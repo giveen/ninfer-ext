@@ -13,6 +13,10 @@ namespace {
 
 using Json = nlohmann::ordered_json;
 
+// The wrapper prompt_layout.cpp validates around every media placeholder. It must stay in sync with
+// that file's kVisionEnd; the cache boundary below is published after it.
+constexpr std::string_view kVisionEndWrapper = "<|vision_end|>";
+
 std::string_view role_name(ChatRole role) {
     switch (role) {
     case ChatRole::System:
@@ -411,7 +415,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                                        : RewriteCheckpointKind::TurnClosure,
             .offset = *generation_begin};
     }
-    if (!continuation && !retain_open_turn && first_tail_assistant) {
+    if (!retain_open_turn && first_tail_assistant) {
         const auto begin = layout.messages[*first_tail_assistant].begin;
         if (begin > 0)
             result.rewrite_checkpoint = RewriteCheckpointByteSpec{
@@ -455,7 +459,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                     } else if (origin.part_media[part]) {
                         result.cache_boundaries[i] =
                             layout.media_placeholders[*origin.part_media[part]].bytes.end +
-                            std::string_view("<|vision_end|>").size();
+                            kVisionEndWrapper.size();
                     }
                 }
             }

@@ -1,13 +1,14 @@
 // Offline quantization sensitivity measurement for the EXL3 bit allocation.
 //
-// Scores a packed trace clean, then perturbs one EXL3 projection at a time with seeded Gaussian noise
-// of a known relative Frobenius norm and re-scores. The loss is the token NLL from
-// `Engine::score_tokens`, which is the cross-entropy H(data, model); its increase over the clean model
-// is exactly the KLD increase, because the data entropy is constant. That is the quantity the
+// Scores a packed trace clean, then perturbs one EXL3 projection at a time with seeded Gaussian
+// noise of a known relative Frobenius norm and re-scores. The loss is the token NLL from
+// `Engine::score_tokens`, which is the cross-entropy H(data, model); its increase over the clean
+// model is exactly the KLD increase, because the data entropy is constant. That is the quantity the
 // reference measures over the full logits, and it needs no logits API here.
 //
-// The weight's per-element rms is read from the unquantized source: the noise is added to the decoded
-// (rotated) values, so `sigma = rfn * rms` makes the perturbation's relative norm exactly `rfn`.
+// The noise anchor is the codebook's per-element rms (see `Options`): the noise is added to the
+// decoded (rotated) values, so `sigma = rfn * rms` makes the perturbation's relative norm exactly
+// `rfn`.
 
 #include "models/qwen3_5/execution/probe_registry.h"
 #include "ninfer/engine.h"
@@ -30,6 +31,14 @@
 namespace {
 
 namespace app = ninfer::quantize::app;
+
+// Clears the global EXL3 probe when it leaves scope, so a throwing score_nll cannot leave the
+// perturbation armed for a later forward that runs in the same process.
+struct ProbeGuard {
+    ninfer::ops::detail::Exl3WeightProbe& probe;
+
+    ~ProbeGuard() { probe = {}; }
+};
 
 struct Options {
     std::filesystem::path artifact;
@@ -156,8 +165,8 @@ int main(int argc, char** argv) {
             probe.rfn          = options.rfn;
             probe.rms          = options.codebook_rms;
             probe.seed         = 0x5eed1234U;
+            ProbeGuard guard{probe};
             const double perturbed = score_nll(engine, trace, rows);
-            probe              = {};
             const double kld   = perturbed - clean;
             report["targets"].push_back({
                 {"name", target.name},
@@ -177,6 +186,8 @@ int main(int argc, char** argv) {
         std::ofstream out(options.output, std::ios::trunc);
         if (!out) { throw std::runtime_error("cannot write " + options.output.string()); }
         out << report.dump(2) << "\n";
+        out.flush();
+        if (!out) { throw std::runtime_error("cannot write " + options.output.string()); }
         std::fprintf(stderr, "wrote %s\n", options.output.string().c_str());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer-sensitivity: %s\n", error.what());

@@ -118,8 +118,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         constexpr std::int32_t kRows   = kQRows + kKvRows + kQRows + kKvRows;
         const std::int32_t columns     = x.ne[1];
         if (columns <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        if (weight.n != kRows || weight.k != kHidden || workspace == nullptr) {
+        if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("exl3 attn_input_proj: unsupported weight shape");
+        }
+        if ( workspace == nullptr) {
+            throw std::invalid_argument("exl3 attn_input_proj requires caller workspace");
         }
         require_matrix(x, kHidden, columns, "x");
         require_matrix(q, kQRows, columns, "q");

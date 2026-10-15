@@ -71,11 +71,7 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
     cudaGraph_t graph = nullptr;
 
-    cudaError_t err = cudaStreamEndCapture(stream, &graph);
-    if (err != cudaSuccess) {
-        destroy_graph(graph);
-        CUDA_CHECK(err);
-    }
+    CUDA_CHECK( cudaStreamEndCapture(stream, &graph));
 
     graph_ = graph;
 }
@@ -108,11 +104,7 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     reset();
 
     cudaGraphExec_t exec  = nullptr;
-    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
-    if (err != cudaSuccess) {
-        destroy_graph_exec(exec);
-        CUDA_CHECK(err);
-    }
+    CUDA_CHECK( cudaGraphInstantiate(&exec, definition.graph_, 0));
     exec_ = exec;
 }
 
@@ -126,8 +118,10 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
         throw std::runtime_error(
-            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+            "CUDA Graph executable update failed: " +
+            (err != cudaSuccess
+                 ? std::string(cudaGetErrorName(err)) + ": " + cudaGetErrorString(err)
+                 : "update result " + std::to_string(static_cast<int>(result.result))));
     }
 }
 
@@ -140,7 +134,8 @@ bool DecodeGraphExecutable::try_update(const DecodeGraphDefinition& definition) 
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err == cudaSuccess && result.result == cudaGraphExecUpdateSuccess) { return true; }
-    if (err != cudaErrorGraphExecUpdateFailure) { CUDA_CHECK(err); }
+    if (err != cudaErrorGraphExecUpdateFailure) {
+        cuda_check(err, "cudaGraphExecUpdate", __FILE__, __LINE__); }
     // The rejected update is an expected outcome, not a sticky device error.
     (void)cudaGetLastError();
     return false;

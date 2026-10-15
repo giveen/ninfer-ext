@@ -79,8 +79,8 @@ std::string prefill_signature(const Model& model) {
                               geometry.padded_columns, geometry.group_size, weight->mapped.size()};
         }
         for (const auto& part : weight->view.parts) {
-            const auto [it, inserted] = parents.emplace(part.parent, parents.size());
-            const auto& geometry      = part.parent->geometry;
+            const auto it        = parents.try_emplace(part.parent, parents.size()).first;
+            const auto& geometry = part.parent->geometry;
             item["parts"].push_back({it->second, part.begin, part.end, geometry.format,
                                      geometry.layout, geometry.shape, geometry.padded_columns,
                                      geometry.group_size});

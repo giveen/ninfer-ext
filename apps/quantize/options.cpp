@@ -1,5 +1,7 @@
 #include "options.h"
 
+#include <cerrno>
+
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -23,8 +25,9 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     if (text == nullptr || *text == '\0' || *text == '-') {
         throw std::invalid_argument(std::string("invalid ") + label);
     }
+    errno                          = 0;
     const unsigned long long value = std::strtoull(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (end == text || *end != '\0' || errno == ERANGE) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
@@ -53,6 +56,8 @@ std::string quantize_usage_text(const char* argv0) {
            "       --hessians DIR          per-parameter Hessian files; also their output dir\n"
            "       --trace FILE            packed calibration trace to build Hessians from\n"
            "       --activation-model PATH servable artifact whose activations are observed\n"
+           "       --calibration-rows N    cap calibration rows, 0 selects every trace row "
+           "(default 0)\n"
            "       --bits N                projection rate in half bits, 2..16 (default 8)\n"
            "       --head-bits N           output-head rate in half bits (default 12)\n"
            "       --hq                    promote attention and GDN control projections by 1 bit\n"

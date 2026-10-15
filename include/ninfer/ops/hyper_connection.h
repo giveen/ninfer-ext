@@ -33,7 +33,7 @@ void grouped_offset_rmsnorm(const Tensor& x, const Tensor& weight, std::int32_t 
  *   lowrank[r,t] = silu(projection[r,t] / streams)
  *   inject[s,t]  = 2 * sigmoid(projection[R+s,t] / streams).
  *
- * The oracle is FP64 from represented inputs.
+ * The oracle is FP64 from represented inputs. `projection` must not overlap `lowrank` or `inject`.
  */
 void hyper_connection_gates(const Tensor& projection, std::int32_t streams, Tensor& lowrank,
                             Tensor* inject, cudaStream_t stream);
@@ -44,6 +44,8 @@ void hyper_connection_gates(const Tensor& projection, std::int32_t streams, Tens
  * `up` and `normalized` are contiguous BF16 `[S*H,T]`; `mixed` is contiguous BF16 `[H,T]`:
  *
  *   mixed[h,t] = (1/S) * sum_s sigmoid(up[s*H+h,t]) * normalized[s*H+h,t].
+ *
+ * `up` and `normalized` must not overlap `mixed`.
  */
 void hyper_connection_collapse(const Tensor& up, const Tensor& normalized, std::int32_t streams,
                                Tensor& mixed, cudaStream_t stream);
@@ -56,12 +58,13 @@ void hyper_connection_collapse(const Tensor& up, const Tensor& normalized, std::
  *
  *   residual[s*H+h,t] += inject[s,t] * y[h,t].
  *
- * The oracle adds in FP64; the BF16 update rounding belongs to the numerical criterion.
+ * The oracle adds in FP64; the BF16 update rounding belongs to the numerical criterion. `y` and
+ * `inject` must not overlap `residual`.
  */
 void hyper_connection_combine(const Tensor& y, const Tensor& inject, Tensor& residual,
                               cudaStream_t stream);
 
-/** Repeat `x [H,T]` into every stream of `residual [S*H,T]`. */
+/** Repeat `x [H,T]` into every stream of `residual [S*H,T]`; `x` must not overlap `residual`. */
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
                              cudaStream_t stream);
 

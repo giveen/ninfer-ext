@@ -1,5 +1,7 @@
 #pragma once
 
+#include "serve/generation_service.h"
+
 #include "serve/request_events.h"
 
 #include <cstdint>

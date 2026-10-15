@@ -66,6 +66,11 @@ struct ContextKVMaterializeExecutionEnvelope {
  * mutually non-overlapping. Raw K has no semantic storage cast. Reduction association, projection
  * staging precision, and intermediate arithmetic are implementation details. The Op is safe for
  * CUDA Graph capture and replay over the complete envelope.
+ *
+ * Workspace: caller-owned call-scoped transient storage sized by
+ * context_kv_materialize_workspace_capacity_bytes() for the accepted envelope; the Op allocates no
+ * device memory. Execution: every step is enqueued on `stream` and the Op performs no host
+ * synchronization, so the caller orders it against other work on that stream.
  */
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,

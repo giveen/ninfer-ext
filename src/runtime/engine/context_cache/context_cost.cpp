@@ -181,8 +181,15 @@ std::string read_text_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         throw std::runtime_error("failed to open context-cost preset file: " + path.string());
+    } std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    // The iterator reads the streambuf directly, so a short read leaves no stream state to check;
+    // compare against the file size instead of letting a truncated preset fail as a JSON error.
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+    if (!error && text.size() != size) {
+        throw std::runtime_error("failed to read context-cost preset file: " + path.string());
     }
-    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    return text;
 }
 
 Json parse_document(std::string_view text, std::string_view source_name) {
@@ -249,6 +256,73 @@ void validate_presets(const std::vector<ContextCostMachinePreset>& presets,
     }
 }
 
+// Builds the preset list from an already-parsed document, so a caller that needs the document
+// itself parses the text only once.
+std::vector<ContextCostMachinePreset>
+deserialize_context_cost_presets(const Json& document, std::string_view source_name) {
+    require_exact_members(document, {"schema_version", "artifact_type", "machines"}, {},
+                          source_name);
+    if (require_u64(document.at("schema_version"), std::string(source_name) + ".schema_version") !=
+        3) {
+        throw std::invalid_argument("unsupported context-cost preset schema_version in " +
+                                    std::string(source_name));
+    }
+    if (require_nonempty_string(document.at("artifact_type"),
+                                std::string(source_name) + ".artifact_type") !=
+        "ninfer_context_cost_presets") {
+        throw std::invalid_argument("invalid context-cost artifact_type in " +
+                                    std::string(source_name));
+    }
+    const Json& machines = document.at("machines");
+    if (!machines.is_array()) {
+        throw std::invalid_argument(std::string(source_name) + ".machines must be an array");
+    }
+
+    std::vector<ContextCostMachinePreset> result;
+    result.reserve(machines.size());
+    for (std::size_t machine_index = 0; machine_index < machines.size(); ++machine_index) {
+        const Json& machine = machines[machine_index];
+        const std::string context =
+            std::string(source_name) + ".machines[" + std::to_string(machine_index) + "]";
+        require_exact_members(machine, {"hardware_class", "transfer", "prefill"},
+                              {"transfer_provenance"}, context);
+        if (machine.contains("transfer_provenance") &&
+            !machine.at("transfer_provenance").is_object()) {
+            throw std::invalid_argument(context + ".transfer_provenance must be an object");
+        }
+        ContextCostMachinePreset parsed{
+            .hardware_class =
+                require_nonempty_string(machine.at("hardware_class"), context + ".hardware_class"),
+        };
+        if (!machine.at("transfer").is_null()) {
+            parsed.transfer = parse_transfer(machine.at("transfer"), context + ".transfer");
+        }
+        const Json& prefill = machine.at("prefill");
+        if (!prefill.is_array()) {
+            throw std::invalid_argument(context + ".prefill must be an array");
+        }
+        parsed.prefill.reserve(prefill.size());
+        for (std::size_t prefill_index = 0; prefill_index < prefill.size(); ++prefill_index) {
+            const Json& value = prefill[prefill_index];
+            const std::string prefill_context =
+                context + ".prefill[" + std::to_string(prefill_index) + "]";
+            require_exact_members(value, {"prefill_signature", "coefficients"}, {"provenance"},
+                                  prefill_context);
+            if (value.contains("provenance") && !value.at("provenance").is_object()) {
+                throw std::invalid_argument(prefill_context + ".provenance must be an object");
+            }
+            parsed.prefill.push_back(ContextPrefillPreset{
+                .prefill_signature = require_nonempty_string(
+                    value.at("prefill_signature"), prefill_context + ".prefill_signature"),
+                .cost = parse_prefill(value.at("coefficients"), prefill_context + ".coefficients"),
+            });
+        }
+        result.push_back(std::move(parsed));
+    }
+    validate_presets(result, source_name);
+    return result;
+}
+
 Json parse_provenance(std::string_view provenance_json) {
     Json provenance;
     try {
@@ -270,8 +344,8 @@ Json load_or_create_document(const std::filesystem::path& path) {
                     {"machines", Json::array()}};
     }
     const std::string text = read_text_file(path);
-    (void)parse_context_cost_presets(text, path.string());
-    return parse_document(text, path.string());
+    const Json document    = parse_document(text, path.string());(void)deserialize_context_cost_presets(document, path.string());
+    return document;
 }
 
 Json& find_or_append_machine(Json& document, std::string_view hardware_class) {
@@ -302,6 +376,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
                                          temporary.string());
             }
             output.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+            output.flush();
             if (!output) {
                 throw std::runtime_error("failed to write temporary context-cost preset: " +
                                          temporary.string());
@@ -479,68 +554,8 @@ ContextMachineCostModel generic_context_machine_cost_model() {
 
 std::vector<ContextCostMachinePreset> parse_context_cost_presets(std::string_view json,
                                                                  std::string_view source_name) {
-    const Json document = parse_document(json, source_name);
-    require_exact_members(document, {"schema_version", "artifact_type", "machines"}, {},
+    return deserialize_context_cost_presets( parse_document(json, source_name),
                           source_name);
-    if (require_u64(document.at("schema_version"), std::string(source_name) + ".schema_version") !=
-        3) {
-        throw std::invalid_argument("unsupported context-cost preset schema_version in " +
-                                    std::string(source_name));
-    }
-    if (require_nonempty_string(document.at("artifact_type"),
-                                std::string(source_name) + ".artifact_type") !=
-        "ninfer_context_cost_presets") {
-        throw std::invalid_argument("invalid context-cost artifact_type in " +
-                                    std::string(source_name));
-    }
-    const Json& machines = document.at("machines");
-    if (!machines.is_array()) {
-        throw std::invalid_argument(std::string(source_name) + ".machines must be an array");
-    }
-
-    std::vector<ContextCostMachinePreset> result;
-    result.reserve(machines.size());
-    for (std::size_t machine_index = 0; machine_index < machines.size(); ++machine_index) {
-        const Json& machine = machines[machine_index];
-        const std::string context =
-            std::string(source_name) + ".machines[" + std::to_string(machine_index) + "]";
-        require_exact_members(machine, {"hardware_class", "transfer", "prefill"},
-                              {"transfer_provenance"}, context);
-        if (machine.contains("transfer_provenance") &&
-            !machine.at("transfer_provenance").is_object()) {
-            throw std::invalid_argument(context + ".transfer_provenance must be an object");
-        }
-        ContextCostMachinePreset parsed{
-            .hardware_class =
-                require_nonempty_string(machine.at("hardware_class"), context + ".hardware_class"),
-        };
-        if (!machine.at("transfer").is_null()) {
-            parsed.transfer = parse_transfer(machine.at("transfer"), context + ".transfer");
-        }
-        const Json& prefill = machine.at("prefill");
-        if (!prefill.is_array()) {
-            throw std::invalid_argument(context + ".prefill must be an array");
-        }
-        parsed.prefill.reserve(prefill.size());
-        for (std::size_t prefill_index = 0; prefill_index < prefill.size(); ++prefill_index) {
-            const Json& value = prefill[prefill_index];
-            const std::string prefill_context =
-                context + ".prefill[" + std::to_string(prefill_index) + "]";
-            require_exact_members(value, {"prefill_signature", "coefficients"}, {"provenance"},
-                                  prefill_context);
-            if (value.contains("provenance") && !value.at("provenance").is_object()) {
-                throw std::invalid_argument(prefill_context + ".provenance must be an object");
-            }
-            parsed.prefill.push_back(ContextPrefillPreset{
-                .prefill_signature = require_nonempty_string(
-                    value.at("prefill_signature"), prefill_context + ".prefill_signature"),
-                .cost = parse_prefill(value.at("coefficients"), prefill_context + ".coefficients"),
-            });
-        }
-        result.push_back(std::move(parsed));
-    }
-    validate_presets(result, source_name);
-    return result;
 }
 
 ResolvedContextMachineCost

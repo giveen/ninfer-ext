@@ -33,7 +33,7 @@ InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
     fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) { fail(path_, "open"); }
 
-    struct stat status {};
+    struct stat status{};
 
     if (::fstat(fd_, &status) != 0) {
         const auto error = errno;
@@ -73,6 +73,13 @@ void InputFile::read_exact(std::uint64_t offset, std::span<std::byte> destinatio
 }
 
 std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> destination) const {
+    // A direct window is a whole number of kPayloadAlignment blocks, so the file's final block may
+    // be requested past its end: the caller rounds its last request up and consumes the short
+    // count.
+    if (offset > bytes_ ||
+        destination.size() > align_up(bytes_ - offset, kPayloadAlignment, "direct read bytes")) {
+        throw ArtifactError(path_.string() + ": direct read exceeds file length");
+    }
     if (offset % kPayloadAlignment || destination.size() % kPayloadAlignment ||
         reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment ||
         destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {

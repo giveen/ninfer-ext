@@ -6,9 +6,13 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <cstdint>
+
 namespace ninfer::ops {
 
-// Capacity for every K/B pair in the inclusive intervals, K=1..15 and B=1..8.
+// Peak capacity over every K/B pair in the inclusive intervals, K=1..15 and B=1..8; the caller must
+// over-provision the arena to this value. Invalid or reversed intervals throw.
 [[nodiscard]] std::size_t candidate_selector_path_workspace_capacity_bytes(std::int32_t min_steps,
                                                                            std::int32_t max_steps,
                                                                            std::int32_t min_batch,
@@ -41,7 +45,8 @@ namespace ninfer::ops {
  * drafts is contiguous I32 [K,B] and proposal_q is contiguous FP32 [16,K,B]. Both outputs are
  * completely overwritten. Inputs, outputs, codebooks, and the config array must be pairwise
  * non-overlapping. The Op has no persistent state or internal allocation. Caller workspace is
- * transient and must not overlap any input or output.
+ * transient, must be at least candidate_selector_path_workspace_capacity_bytes() bytes for the
+ * routed (K,B) interval, and must not overlap any input or output.
  */
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,

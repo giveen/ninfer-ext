@@ -22,6 +22,14 @@ std::int64_t checked_numel(const Tensor& t) {
     return n;
 }
 
+// The contract excludes any shared storage, not just identical base pointers.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
@@ -40,6 +48,7 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     if (bias.data == nullptr || x.data == nullptr) {
         throw std::invalid_argument("add_bias: bias/x data must be non-null");
     }
+    if (overlaps(bias, x)) { throw std::invalid_argument("add_bias: bias and x must not overlap"); }
     detail::add_bias_launch(bias, x, stream);
 }
 

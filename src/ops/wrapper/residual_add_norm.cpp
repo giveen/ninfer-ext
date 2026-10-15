@@ -33,6 +33,14 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
+// The contract excludes pairwise shared storage: accumulator is written where x/weight are read.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void residual_add_norm(const Tensor& x, const Tensor& weight, float eps, Tensor& accumulator,
@@ -60,6 +68,10 @@ void residual_add_norm(const Tensor& x, const Tensor& weight, float eps, Tensor&
     }
     if (x.data == nullptr || weight.data == nullptr || accumulator.data == nullptr) {
         throw std::invalid_argument("residual_add_norm: tensors must be non-null");
+    }
+    if (overlaps(x, weight) || overlaps(x, accumulator) || overlaps(weight, accumulator)) {
+        throw std::invalid_argument(
+            "residual_add_norm: x, weight and accumulator must not overlap");
     }
     // A row is read and written as whole BF16 pairs, so the base addresses must be pair-aligned.
     // A pair is four bytes, which is what std::uint32_t's alignment states without a CUDA header.

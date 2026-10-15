@@ -14,6 +14,9 @@
 
 namespace ninfer::ops {
 
+// Upper bound on `max_visible_keys` in CausalAttentionExecutionEnvelope, and so on the causal
+// attention span a capture may declare; a larger envelope is rejected as an invalid profile.
+
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
 
 struct CausalAttentionExecutionEnvelope {
@@ -67,7 +70,8 @@ struct ContextAttentionExecutionEnvelope {
  * with contiguous feature and head dimensions; their token stride may be padded. out is contiguous
  * BF16 [72,16,T]. Every query attends all T keys. q/k/v/out are mutually non-overlapping, inputs
  * are unchanged, out is completely overwritten, and the Op has no persistent state side effect.
- * The single segment needs no transient workspace.
+ * The single segment needs no transient workspace; the arena is accepted for interface uniformity
+ * with the packed forms and is left untouched.
  */
 void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                        AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,

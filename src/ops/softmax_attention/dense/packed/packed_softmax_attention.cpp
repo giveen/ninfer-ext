@@ -101,7 +101,8 @@ void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                        AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,
                        Tensor& out, cudaStream_t stream) {
     const std::int32_t tokens = validate_qkv(q, k, v, out, geometry, scale, "softmax_attention");
-    auto scope                = workspace.scope();
+    // The single-segment route allocates nothing, so the caller's arena is left untouched.
+    (void) workspace;
     detail::packed_attention_uniform_launch(q, k, v, tokens, scale, out, stream);
 }
 

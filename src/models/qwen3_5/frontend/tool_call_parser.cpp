@@ -255,7 +255,9 @@ bool admits_value(TypeSet types, JsonValueKind kind) {
 // strict dump would throw out of the recovery path that exists for malformed calls and fail the
 // whole request; the replacement handler keeps the emitted JSON well formed instead.
 
-std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(-1, ' ', false, Json::error_handler_t::replace); }
+std::string encode_json_string(std::string_view value) {
+    return Json(std::string(value)).dump(-1, ' ', false, Json::error_handler_t::replace);
+}
 
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);
@@ -302,6 +304,7 @@ public:
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
     }
+
     [[nodiscard]] bool tolerant_recovered() const noexcept { return tolerant_recovered_; }
 
     FallbackReason parse(std::vector<RawToolCall>& calls) {
@@ -363,7 +366,8 @@ private:
         if (!valid_function_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
-        if (contract_.enforce_declared_names && find_tool_contract(contract_, call.name) == nullptr) {
+        if (contract_.enforce_declared_names &&
+            find_tool_contract(contract_, call.name) == nullptr) {
             return FallbackReason::UndeclaredTool;
         }
         pos = name_end + 1;
@@ -384,9 +388,9 @@ private:
             return FallbackReason::MalformedStructure;
         }
         const std::string_view name = text_.substr(name_begin, name_end - name_begin);
-        const auto existing         = std::find_if(
-            call.parameters.begin(), call.parameters.end(),
-            [&](const RawParameter& parameter) { return parameter.name == name; });
+        const auto existing =
+            std::find_if(call.parameters.begin(), call.parameters.end(),
+                         [&](const RawParameter& parameter) { return parameter.name == name; });
 
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
@@ -404,42 +408,56 @@ private:
         return FallbackReason::None;
     }
 
-    bool find_parameter_open_before(std::size_t scan, std::size_t limit,
-                                    std::size_t& open_end) const {
-        std::size_t candidate = text_.find(kParamOpen, scan);
-        while (candidate != std::string_view::npos && candidate < limit) {
-            const std::size_t name_begin = candidate + kParamOpen.size();
-            const std::size_t name_end   = text_.find('>', name_begin);
-            if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin) {
-                open_end = name_end + 1;
-                return true;
-            }
-            candidate = text_.find(kParamOpen, candidate + 1);
-        }
-        return false;
-    }
+    // The region is lexical rather than JSON, so a marker inside a quoted value would otherwise end
+    // the parameter early. Skip balanced double-quoted spans the way the constrained parser's
+    // json_value() does, so a value such as {"s": "</parameter>"} survives both parsers. A quote
+    // without a partner stays ordinary data, so an unbalanced value is still read as written.
 
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
-        for (;;) {
-            const std::size_t close = text_.find(kParamClose, scan);
-            if (close == std::string_view::npos) { return false; }
-
-            std::size_t nested_open_end = 0;
-            if (find_parameter_open_before(scan, close, nested_open_end)) {
-                ++depth;
-                scan = nested_open_end;
+        while (scan < text_.size()) {
+            if (text_[scan] == '"') {
+                const std::size_t closing = unescaped_quote_after(scan + 1);
+                scan = closing == std::string_view::npos ? scan + 1 : closing + 1;
                 continue;
             }
-
-            --depth;
-            if (depth == 0) {
-                value_end = close;
-                return true;
+            if (text_.compare(scan, kParamClose.size(), kParamClose) == 0) {
+                --depth;
+                if (depth == 0) {
+                    value_end = scan;
+                    return true;
+                }
+                scan += kParamClose.size();
+                continue;
             }
-            scan = close + kParamClose.size();
+            if (text_.compare(scan, kParamOpen.size(), kParamOpen) == 0) {
+                const std::size_t name_begin = scan + kParamOpen.size();
+                const std::size_t name_end   = text_.find('>', name_begin);
+                const std::size_t next_close = text_.find(kParamClose, scan);
+                if (name_end != std::string_view::npos && name_end != name_begin &&
+                    (next_close == std::string_view::npos || name_end < next_close)) {
+                    ++depth;
+                    scan = name_end + 1;
+                    continue;
+                }
+            }
+            ++scan;
         }
+        return false;
+    }
+
+    // The first double quote at or after `from` that is not backslash-escaped, or npos.
+    std::size_t unescaped_quote_after(std::size_t from) const {
+        for (std::size_t pos = from; pos < text_.size(); ++pos) {
+            if (text_[pos] != '"') { continue; }
+            std::size_t escapes = 0;
+            for (std::size_t back = pos; back > from && text_[back - 1] == '\\'; --back) {
+                ++escapes;
+            }
+            if (escapes % 2 == 0) { return pos; }
+        }
+        return std::string_view::npos;
     }
 
     std::string_view text_;
@@ -650,20 +668,20 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     // stay ordinary content.
     const std::string_view source(text);
     std::vector<RawToolCall> raw_calls;
-    std::size_t accepted               = std::string::npos;
-    std::uint32_t repaired             = 0;
-    bool tolerant_recovered            = false;
-    FallbackReason first_failure       = FallbackReason::MalformedStructure;
-    bool first_failure_recorded        = false;
+    std::size_t accepted         = std::string::npos;
+    std::uint32_t repaired       = 0;
+    bool tolerant_recovered      = false;
+    FallbackReason first_failure = FallbackReason::MalformedStructure;
+    bool first_failure_recorded  = false;
     while (candidate != std::string::npos) {
         std::vector<RawToolCall> calls;
         QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract);
         const FallbackReason failure = parser.parse(calls);
         if (failure == FallbackReason::None) {
-            accepted                      = candidate;
-            raw_calls                     = std::move(calls);
-            repaired                      = parser.duplicate_parameters_repaired();
-            tolerant_recovered            = parser.tolerant_recovered();
+            accepted           = candidate;
+            raw_calls          = std::move(calls);
+            repaired           = parser.duplicate_parameters_repaired();
+            tolerant_recovered = parser.tolerant_recovered();
             break;
         }
         if (!first_failure_recorded) {
@@ -683,7 +701,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
 
-    out.diagnostics.structured_call_count         = static_cast<std::uint32_t>(out.tool_calls.size());
+    out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.diagnostics.duplicate_parameters_repaired = repaired;
     out.diagnostics.tolerant_recovered            = tolerant_recovered;
     out.is_tool_call_response                     = true;
@@ -775,8 +793,8 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         result.diagnostics.marker_seen = true;
         auto region                    = std::string_view(tool_region_);
         region.remove_prefix(region.find(kToolOpen));
-        const auto status = ConstrainedToolRegionParser(region, *contract_)
-                                .parse(result.tool_calls, result.diagnostics);
+        const auto status      = ConstrainedToolRegionParser(region, *contract_)
+                                     .parse(result.tool_calls, result.diagnostics);
         const bool interrupted = reason == FinishReason::OutputLimit ||
                                  reason == FinishReason::ContextCapacity ||
                                  reason == FinishReason::Cancelled;

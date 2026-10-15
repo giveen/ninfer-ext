@@ -4,7 +4,6 @@
 namespace ninfer::ops::detail {
 template <bool Writable>
 struct Bf16KvCacheView {
-    static constexpr bool kWritable = Writable;
     using Key   = std::conditional_t<Writable, __nv_bfloat16, const __nv_bfloat16>;
     using Value = std::conditional_t<Writable, __half, const __half>;
     Key* keys;
@@ -21,7 +20,6 @@ struct Bf16KvCacheView {
 };
 
 using Bf16KvReadView  = Bf16KvCacheView<false>;
-using Bf16KvWriteView = Bf16KvCacheView<true>;
 
 template <bool Writable>
 Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,

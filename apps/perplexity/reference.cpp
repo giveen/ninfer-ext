@@ -1,10 +1,12 @@
 #include "reference.h"
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::perplexity {
 namespace {
@@ -20,6 +22,28 @@ std::uint32_t le_u32(const unsigned char* bytes) {
 
 std::string reject(const std::filesystem::path& path, std::string_view why) {
     return "reference " + path.string() + ": " + std::string(why);
+}
+
+// The layout is little-endian throughout, which every host this tree targets already is; a
+// big-endian host swaps instead of writing its native order.
+template <typename T>
+void to_little_endian(std::span<T> values) noexcept {
+    if constexpr (std::endian::native == std::endian::big) {
+        for (T& value : values) { value = std::byteswap(value); }
+    }
+}
+
+template <typename T>
+void write_little_endian(std::ofstream& file, std::span<const T> values) {
+    if constexpr (std::endian::native == std::endian::little) {
+        file.write(reinterpret_cast<const char*>(values.data()),
+                   static_cast<std::streamsize>(values.size_bytes()));
+    } else {
+        std::vector<T> swapped(values.begin(), values.end());
+        to_little_endian(std::span<T>(swapped));
+        file.write(reinterpret_cast<const char*>(swapped.data()),
+                   static_cast<std::streamsize>(swapped.size() * sizeof(T)));
+    }
 }
 
 } // namespace
@@ -60,6 +84,11 @@ void Reference::load(const std::filesystem::path& path) {
     file.read(reinterpret_cast<char*>(logits_.data()),
               static_cast<std::streamsize>(entries * sizeof(std::uint16_t)));
     if (!file) { throw std::runtime_error(reject(path, "logits payload is truncated")); }
+    to_little_endian(std::span<std::uint16_t>(logits_));
+
+    // A second load() on this object must not keep the previous file's keys: a stale index would
+    // reject a repeated position and could leave row() pointing past the new logits_.
+    index_.clear();
 
     index_.reserve(rows);
     for (std::uint32_t row = 0; row < rows; ++row) {
@@ -111,10 +140,10 @@ void write_reference(const std::filesystem::path& path, std::uint32_t vocab_size
     if (!file) { throw std::runtime_error(reject(path, "cannot create")); }
     file.write(reinterpret_cast<const char*>(header.data()),
                static_cast<std::streamsize>(header.size()));
-    file.write(reinterpret_cast<const char*>(positions.data()),
-               static_cast<std::streamsize>(positions.size_bytes()));
-    file.write(reinterpret_cast<const char*>(logits.data()),
-               static_cast<std::streamsize>(logits.size_bytes()));
+    write_little_endian(
+    file,positions);
+    write_little_endian(
+    file,logits);
     if (!file) { throw std::runtime_error(reject(path, "write failed")); }
 }
 

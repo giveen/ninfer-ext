@@ -8,6 +8,11 @@
 
 namespace ninfer {
 
+// Every field must be positive, record_capacity is capped at eight rows, value_heads must be
+// divisible by qk_heads, and layers * record_capacity must fit in int32_t. A spec that violates
+// one of these fails in plan_gdn_replay_records with std::invalid_argument or
+// std::overflow_error.
+
 struct GdnReplayRecordSpec {
     std::int32_t layers          = 0;
     std::int32_t record_capacity = 0;
@@ -55,13 +60,19 @@ struct GdnReplayRecords {
     GdnReplayRecords() = default;
     GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout);
 
-    [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer, std::int32_t rows) const;
+    // Preconditions (validated with the spec first, then the indices): 0 <= layer_index <
+    // spec.layers and 0 < rows <= spec.record_capacity. Throws std::invalid_argument for an
+    // invalid spec and std::out_of_range for either index outside its range.
+
+    [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer_index, std::int32_t rows) const;
 
     /**
      * The same planes over the same memory at a narrower width. Each plane is reinterpreted as
      * its contiguous prefix with the width extent replaced, so a round that verifies fewer columns
      * than the layout was planned for records and folds a tighter layout. Writers and the fold
      * must use the same view for a round.
+     *
+     * Requires 2 <= width <= spec.width; throws std::out_of_range otherwise.
      */
     [[nodiscard]] GdnReplayRecords with_width(std::int32_t width) const;
 };

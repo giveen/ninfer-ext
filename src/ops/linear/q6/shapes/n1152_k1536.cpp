@@ -4,7 +4,7 @@
 namespace ninfer::ops::detail {
 
 Q6Launch select_q6_n1152_k1536(std::int32_t tokens) {
-    if (tokens > 131072 || tokens % 4 != 0) {
+    if (tokens < 4 ||tokens > 131072 || tokens % 4 != 0) {
         throw std::invalid_argument("q6 linear: T must be a multiple of 4 in [4,131072]");
     }
     if (tokens <= 4) return launch_q6_a16_simt_r8_t4;

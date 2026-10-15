@@ -14,6 +14,11 @@ inline constexpr std::int32_t kBf16LinearAddSmallTMaxTokens   = 32;
 inline constexpr std::int32_t kBf16LinearAddSmallTDispatchEnd = 4;
 inline constexpr std::int32_t kBf16LinearAddAggregateMmaEnd   = 48;
 
+// The SmallT launcher table holds one entry per token count in [MinTokens,MaxTokens]; routing must
+// not reach past its end.
+static_assert(kBf16LinearAddSmallTDispatchEnd <= kBf16LinearAddSmallTMaxTokens,
+              "SmallT dispatch range must not exceed the compiled SmallT kernel capacity");
+
 enum class Bf16LinearAddScheduleId : std::uint8_t {
     Decode,
     SmallT,
@@ -23,6 +28,8 @@ enum class Bf16LinearAddScheduleId : std::uint8_t {
 
 bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
                             std::int32_t tokens) noexcept;
+// Returns the schedule for a problem bf16_linear_add_admits accepts; throws std::invalid_argument
+// for any shape or token count it does not admit.
 Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::int32_t input_rows,
                                                std::int32_t tokens);
 const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noexcept;

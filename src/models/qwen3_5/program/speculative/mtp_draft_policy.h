@@ -60,8 +60,9 @@ public:
     // `extent` drafts were verified this round and the first `accepted` of them were accepted.
     void observe(std::uint32_t extent, std::uint32_t accepted) noexcept;
     // Expected tokens committed by a round that verifies `k` drafts: one target token plus each
-    // draft whose whole prefix is accepted. Positions never tested inherit the deepest measured
-    // conditional acceptance.
+    // draft whose whole prefix is accepted. Each position's conditional acceptance is shrunk
+    // toward a pool of every position's evidence, so a position with few or no tests of its own
+    // stays near the pooled acceptance instead of falling to zero.
     [[nodiscard]] double expected_tokens(std::uint32_t k) const noexcept;
 
 private:
@@ -72,6 +73,9 @@ private:
 class MtpDraftPolicy {
 public:
     // `round_seconds[r]` is the measured time of a single-request round on ladder rung r.
+    // A default-constructed policy is unconfigured: it has no ladder (rung_count() == 0), so
+    // initial_rung(), ladder(), select() and round_seconds() must not be used until a configured
+    // policy is assigned.
     MtpDraftPolicy() = default;
     MtpDraftPolicy(std::vector<std::uint32_t> ladder, std::vector<double> round_seconds);
 

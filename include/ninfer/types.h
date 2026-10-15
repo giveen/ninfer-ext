@@ -808,8 +808,9 @@ private:
     std::function<bool()> requested_;
 };
 
-// Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
-// unbounded preparation.
+// Deadline and cancellation apply to all host-side prompt preparation work. A default-constructed
+// (`time_point{}`, i.e. the clock epoch) deadline means unbounded preparation; any other value that
+// has already passed aborts preparation.
 struct PreparationControl {
     std::chrono::steady_clock::time_point deadline;
     CancellationView cancellation;

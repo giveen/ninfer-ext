@@ -5,9 +5,22 @@
 
 #include "ops/launcher/silu_and_mul.h" // detail::silu_and_mul_launch
 
+#include <cstdint>
+
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
+
+// The contract excludes shared storage: the kernel reads gate/up while writing out.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
+} // namespace
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
@@ -19,9 +32,11 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         }
     }
     if (!out.is_contiguous()) { throw std::invalid_argument("silu_mul: out must be contiguous"); }
-    if (out.numel() == 0) { return; }
     if (gate.data == nullptr || up.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("silu_mul: gate/up/out data must be non-null");
+    }
+    if (overlaps(out, gate) || overlaps(out, up)) {
+        throw std::invalid_argument("silu_mul: out must not overlap gate or up");
     }
 
     detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch

@@ -39,7 +39,10 @@ namespace ninfer::models::gemma4 {
 // One lane's share of a pass: `tokens` consecutive columns from `column`, the lane's tokens at the
 // positions from `first_position`, attending to and written into `cache`. A prefill or a verify
 // pass is one segment; a decode round over several lanes is one single-token segment per lane, so
-// the lanes share every weight read while each attends to its own cache.
+// the lanes share every weight read while each attends to its own cache. `first_position` and
+// `tokens` must agree with the pass's `indices` (`write_pass_indices` derives both from them): the
+// ring fill and stale marking read the segment's fields while RoPE and the cache writes read
+// `indices`.
 struct PassSegment {
     KvCache* cache              = nullptr;
     std::int32_t first_position = 0;
@@ -91,10 +94,11 @@ void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_i
                    DeviceExecutionView execution, const Tensor& position_high = {});
 
 // The same layer over several lanes' `segments` at once, `hidden_in`/`hidden_out` [hidden_size,
-// columns] with the segments tiling the columns in order. Every column-wise step (norms,
-// projections, RoPE, the MLP) runs once over all columns; each segment's cache writes and attention
-// run against its own cache, exactly as the one-lane call would run them. `position_high` needs a
-// single segment.
+// columns] with the segments tiling the columns in order. `hidden_in` and `hidden_out` must not
+// overlap, and `indices` must be the I32 [columns] vectors `write_pass_indices` wrote for these
+// `segments`. Every column-wise step (norms, projections, RoPE, the MLP) runs once over all
+// columns; each segment's cache writes and attention run against its own cache, exactly as the
+// one-lane call would run them. `position_high` needs a single segment.
 void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    std::span<const PassSegment> segments, const PassIndices& indices,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
@@ -108,6 +112,10 @@ void forward_layer(const Model& model, std::size_t layer, const Tensor& hidden_i
  * is the final norm, then the projection through the embedding matrix, which is tied to the token
  * embedding, and then the logit soft cap. The cap is applied here because it is part of the model's
  * logits; every consumer that must see uncapped values is the caller's business.
+ *
+ * `normed_out`, when given, receives the same pass's post-final-norm state; its storage is
+ * reinterpreted as contiguous BF16 [hidden_size,tokens] (the declared shape and dtype are ignored),
+ * so it must hold hidden_size * tokens BF16 elements and must not alias `hidden_in` or `logits`.
  */
 void forward_head(const Model& model, const Tensor& hidden_in, std::int32_t tokens,
                   DeviceArena& arena, Tensor& logits, DeviceExecutionView execution,

@@ -40,6 +40,11 @@ namespace ninfer::ops {
  * addresses are 2-byte aligned (the FP16 scale planes), and that the `slots[i]` of one call are
  * distinct: two tokens addressing one slot would have two warps write the same row in an
  * indeterminate order. The Op owns no workspace and no persistent state.
+ *
+ * Every argument is validated on the host: an unsupported storage or plane dtype/shape, a
+ * non-contiguous or null tensor, a non-positive head or row count, keys/values outside
+ * [256,Hkv,rows], or planes that disagree on the head or slot count throws
+ * `std::invalid_argument` and no device work is enqueued.
  */
 void dense_kv_ring_encode(const Tensor& keys, const Tensor& values, const Tensor& slots,
                           KvCacheStorage storage, Tensor& key_codes, Tensor& key_scales,
@@ -67,6 +72,10 @@ void dense_kv_ring_encode(const Tensor& keys, const Tensor& values, const Tensor
  * Effects: writes every element of `keys` and `values`; the planes are read-only and no input is
  * modified. The caller guarantees the planes never alias the destinations. The Op owns no
  * workspace and no persistent state.
+ *
+ * Every argument is validated on the host: an unsupported storage or plane dtype/shape, a
+ * non-contiguous or null tensor, a non-positive head or slot count, or destinations outside
+ * [256,Hkv,slots] throws `std::invalid_argument` and no device work is enqueued.
  */
 void dense_kv_ring_decode(const Tensor& key_codes, const Tensor& key_scales,
                           const Tensor& value_codes, const Tensor& value_scales,

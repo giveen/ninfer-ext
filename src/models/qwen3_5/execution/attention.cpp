@@ -72,13 +72,6 @@ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
               config.rope_theta, query, execution);
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               DeviceExecutionView execution) {
-    require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), dimension(config.rotary_dim) / 2,
-              config.rope_theta, query, key, execution);
-}
-
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,

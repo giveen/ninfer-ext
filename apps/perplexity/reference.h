@@ -13,11 +13,12 @@ namespace ninfer::perplexity {
 
 // KL reference produced by an external BF16 run over the same text and window protocol.
 //
-// Layout is little-endian throughout: a fixed 96-byte header (8-byte magic "NINFKL1\0", u32 version,
-// u32 vocab, u32 row count, u32 context, u32 stride, u32 reserved, 64-byte lowercase hex text
-// sha256), then `rows` u32 scored global target indices, then `rows` rows of BF16 logits with the
-// vocab contiguous per row. Loading validates every field, so a text or protocol mismatch is refused
-// instead of silently mis-aligning rows.
+// Layout is little-endian throughout: a fixed 96-byte header (8-byte magic "NINFKL1\0", u32
+// version, u32 vocab, u32 row count, u32 context, u32 stride, u32 reserved, 64-byte lowercase hex
+// text sha256), then `rows` u32 scored global target indices, then `rows` rows of BF16 logits with
+// the vocab contiguous per row. Loading validates the magic, version, vocab and row count and
+// *stores* the text digest without comparing it; a caller that needs the text to match must compare
+// text_digest() itself (see the context()/stride() check in apps/perplexity/main.cpp).
 class Reference {
 public:
     static constexpr std::uint32_t kVersion   = 1;

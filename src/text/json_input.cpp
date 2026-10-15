@@ -85,8 +85,12 @@ public:
         return dom_.end_array();
     }
 
+    // Templated so the forwarding call deduces nlohmann's concrete exception type; taking the
+    // base `nlohmann::detail::exception` would slice it and JSON_THROW a base copy.
+    template <class Exception>
+
     bool parse_error(std::size_t position, const std::string& token,
-                     const nlohmann::detail::exception& error) {
+                     const Exception& error) {
         return dom_.parse_error(position, token, error);
     }
 

@@ -54,6 +54,22 @@ bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
     return true;
 }
 
+// Generated prefix positions grow monotonically with the token index, so validating the two
+// extremes proves the whole span. Checking before any mutation keeps a rejected append from
+// leaving the identity partially extended.
+void check_generated_span(std::size_t begin, std::size_t count, std::int32_t rope_delta,
+                          const char* label) {
+    if (count == 0) { return; }
+    const std::size_t last            = begin + count - 1U;
+    const std::int64_t first_position = static_cast<std::int64_t>(begin) + rope_delta;
+    const std::int64_t last_position  = static_cast<std::int64_t>(last) + rope_delta;
+    if (last > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+        first_position < std::numeric_limits<std::int32_t>::min() ||
+        last_position > std::numeric_limits<std::int32_t>::max()) {
+        throw std::overflow_error(label);
+    }
+}
+
 using DigestPair = std::array<std::uint64_t, 2>;
 
 constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
@@ -149,13 +165,21 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
     }
+    // Build the whole identity off to the side and commit it with swap, so an allocation failure
+    // mid-way cannot leave new token types paired with old positions.
+    ResidentPrefixIdentity staged;
+    staged.
     token_types_ = prompt.token_types;
-    for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
+    for (std::size_t axis = 0; axis < staged. positions_.size(); ++axis) {
         const auto begin = prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * tokens);
+        staged.
         positions_[axis].assign(begin, begin + static_cast<std::ptrdiff_t>(tokens));
     }
+    staged.
     vision_items_                = prompt.vision_items;
+    staged.
     rewrite_execution_frontiers_ = prompt.identity.rewrite_execution_frontiers;
+    swap(staged);
 }
 
 void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
@@ -183,16 +207,11 @@ void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t ro
             throw std::logic_error("generated execution split is not a new ordered frontier");
         }
     }
+    // Validate the whole span before touching token_types_/positions_, so a rejected append leaves
+    // the identity unchanged.
+    check_generated_span(begin, count, rope_delta, "generated MRoPE position exceeds int32");
     for (std::size_t offset = 0; offset < count; ++offset) {
-        const std::size_t index = begin + offset;
-        if (index > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-            throw std::overflow_error("generated prefix position exceeds int32");
-        }
-        const std::int64_t position = static_cast<std::int64_t>(index) + rope_delta;
-        if (position < std::numeric_limits<std::int32_t>::min() ||
-            position > std::numeric_limits<std::int32_t>::max()) {
-            throw std::overflow_error("generated MRoPE position exceeds int32");
-        }
+        const std::int64_t position = static_cast<std::int64_t>(begin + offset) + rope_delta;
         token_types_.push_back(0);
         for (auto& axis : positions_) { axis.push_back(static_cast<std::int32_t>(position)); }
     }
@@ -252,10 +271,6 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
                std::distance(rewrite_execution_frontiers_.begin(), resident_end) &&
            std::equal(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end,
                       rewrite_execution_frontiers_.begin());
-}
-
-bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {
-    return size() == other.size() && prefix_equals(other, size());
 }
 
 bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
@@ -368,17 +383,11 @@ void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,
         execution_frontier[0] = static_cast<std::uint32_t>(begin) + *execution_split_after;
         rewrite_frontiers     = execution_frontier;
     }
+    check_generated_span(begin, tokens.size(), rope_delta,
+                         "generated shortlist MRoPE position exceeds int32");
     std::size_t next_rewrite = 0;
     for (std::size_t offset = 0; offset < tokens.size(); ++offset) {
-        const std::size_t index = begin + offset;
-        if (index > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-            throw std::overflow_error("generated shortlist position exceeds int32");
-        }
-        const std::int64_t position = static_cast<std::int64_t>(index) + rope_delta;
-        if (position < std::numeric_limits<std::int32_t>::min() ||
-            position > std::numeric_limits<std::int32_t>::max()) {
-            throw std::overflow_error("generated shortlist MRoPE position exceeds int32");
-        }
+        const std::int64_t position = static_cast<std::int64_t>(begin + offset) + rope_delta;
         const std::int32_t value = static_cast<std::int32_t>(position);
         append_digest(digests_, tokens[offset], 0, {value, value, value}, rewrite_frontiers,
                       next_rewrite);

@@ -43,6 +43,14 @@ void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t
     }
 }
 
+// The contract requires distinct storage: the kernel reads verify_ids while writing alignment_ids.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
@@ -80,6 +88,10 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
         ar_valid_columns.nb[1] != ar_positions.nb[1]) {
         throw std::invalid_argument(
             "mtp_prepare_next_round: AR outputs must share one step stride");
+    }
+    if (overlaps(verify_ids, alignment_ids)) {
+        throw std::invalid_argument(
+            "mtp_prepare_next_round: verify_ids and alignment_ids must not alias");
     }
     detail::mtp_prepare_next_round_launch(verify_ids, next_anchors, accepted, updated_frontiers,
                                           remaining_budgets, licensed_counts, rope_deltas,

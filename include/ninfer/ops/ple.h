@@ -9,8 +9,9 @@
 namespace ninfer::ops {
 
 /**
- * PLE stream gate. `key` and `query` are grouped-normalized contiguous BF16 `[S*H, T]`, `value`
- * contiguous BF16 `[H, T]`, `gated` contiguous BF16 `[S*H, T]`:
+ * PLE stream gate. `key` and `query` are grouped-normalized contiguous BF16 `[S*H, T]`, `gated` is
+ * contiguous BF16 `[S*H, T]`, and `value` is contiguous BF16 `[H, T]`, where `streams` is the group
+ * count `S` in [1,16] and `H = value.ne[0]`:
  *
  *   g[s,t]         = sum_h key[s*H+h,t] * query[s*H+h,t] / sqrt(H)
  *   g'[s,t]        = sign(g) * sqrt(max(|g|, 1e-6))
@@ -22,8 +23,9 @@ void ple_gate(const Tensor& key, const Tensor& query, const Tensor& value, std::
 /**
  * Causal dilated depthwise convolution with SiLU, added to the residual with the gated values.
  *
- * `normed` and `gated` are contiguous BF16 `[C, W, B]`; `weight` is contiguous BF16 `[K, C]` (tap
- * major, tap K-1 multiplies the current column); `states` is contiguous BF16 `[(K-1)*dilation*C,
+ * `normed` and `gated` are contiguous BF16 `[C, W, B]`; `weight` is contiguous BF16 `[K, C]`
+ * (stored as `ne={C,K}`, tap major, tap K-1 multiplies the current column); `states` is contiguous
+ * BF16 `[(K-1)*dilation*C,
  * S]`, slot s holding the (K-1)*dilation previous `normed` columns oldest first. Lane b reads slot
  * `source_slots[b]`. For every valid column w:
  *
@@ -37,8 +39,10 @@ void ple_dilated_conv(const Tensor& normed, const Tensor& gated, const Tensor& w
                       Tensor& residual, cudaStream_t stream);
 
 /**
- * Advance convolution history: slot `destination_slots[b]` receives the
- * last (K-1)*dilation columns of `[states(source_slots[b]) ; normed[:, 0:count_b, b]]`.
+ * Advance convolution history: slot `destination_slots[b]` receives the last `history` columns of
+ * `[states(source_slots[b]) ; normed[:, 0:count_b, b]]`, where `history == (K-1)*dilation` of the
+ * matching ple_dilated_conv. `valid_columns` may be null, in which case all `W` columns count
+ * (`count_b = W`); otherwise `count_b = min(W, valid_columns[b])`.
  */
 void ple_conv_advance(const Tensor& normed, const Tensor* valid_columns, std::int32_t history,
                       Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,

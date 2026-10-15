@@ -25,6 +25,10 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     const auto& shape = resolve_shape(n, k, policy);
+    // uses_a4(min_tokens, max_tokens) must report whether any token count in the closed interval
+    // routes to A4, and the reserved bytes cover the largest such count, so every dispatch
+    // performed for a T inside the interval finds a workspace large enough for it. The registered
+    // shapes are monotonic in max_tokens and ignore min_tokens, so an interval query is sound.
     return allows_a4(policy) && shape.uses_a4(min_tokens, max_tokens)
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, k)
                : 0;

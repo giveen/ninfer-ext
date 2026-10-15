@@ -47,8 +47,11 @@ xgrammar::Grammar arguments(const Contract::Tool& tool) {
 }
 
 xgrammar::Grammar build(const Contract& contract, const std::optional<OutputConstraint>& body) {
+    // A caller-required tool contract selects `calls` alone, so a body grammar would be compiled
+    // and thrown away; only build it when the tail of this function can actually return it.
+    const bool json_reachable = !(contract.required && !contract.tools.empty());
     std::optional<xgrammar::Grammar> json;
-    if (body) json = text::build_json_grammar(*body);
+    if (body && json_reachable) json = text::build_json_grammar(*body);
     if (json && contract.tools.empty()) return *json;
     xgrammar::GrammarBuilder builder;
     if (contract.tools.empty())

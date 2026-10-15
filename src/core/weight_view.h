@@ -6,12 +6,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer {
 
 // Existing dense Op ABI uses Weight axes directly; callers establish BF16/FP32 and layout.
+// A quantized or otherwise packed Weight is rejected rather than reinterpreted as BF16.
 inline Tensor as_dense(const Weight& weight) {
+    if (weight.qtype != QType::FP32 && weight.qtype != QType::BF16) {
+        throw std::invalid_argument("as_dense requires a BF16 or FP32 Weight");
+    }
     const auto dtype = weight.qtype == QType::FP32 ? DType::FP32 : DType::BF16;
     auto* data       = const_cast<void*>(weight.qdata);
     switch (weight.ndim) {
@@ -21,9 +26,11 @@ inline Tensor as_dense(const Weight& weight) {
         return Tensor(data, dtype, {weight.shape[0], weight.shape[1]});
     case 3:
         return Tensor(data, dtype, {weight.shape[0], weight.shape[1], weight.shape[2]});
-    default:
+    case 4:
         return Tensor(data, dtype,
                       {weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]});
+    default:
+        throw std::invalid_argument("as_dense requires a Weight of rank 1 to 4");
     }
 }
 

@@ -43,7 +43,6 @@ struct Q8LinearAddProblem {
 };
 
 const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept;
-bool q8_linear_add_schedule_uses_mma(Q8LinearAddScheduleId schedule) noexcept;
 bool q8_linear_add_admits(const Q8LinearAddProblem& problem) noexcept;
 Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem);
 

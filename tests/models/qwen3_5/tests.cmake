@@ -16,6 +16,12 @@ ninfer_add_test(ninfer_gemma4_kv_quant_footprint_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_kv_quant_footprint.cpp"
   LIBRARIES ninfer_model_loading)
 
+# The frontend digest: FIPS vectors, the padding boundaries at 55/56/63/64/119/120 bytes, and the
+# checkpoint cadence. Host-only, no artifact.
+ninfer_add_test(ninfer_qwen3_5_digest_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_digest.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # Opt-in real-model artifacts, selected by explicit path so a run never depends
 # on glob order or modification time. Configure the ones you have and run
 # `ctest -L real`; an artifact variable left empty makes its test skip (77).

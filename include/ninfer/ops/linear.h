@@ -99,8 +99,10 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
- * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
- * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
+ * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights,
+ * EXL3_MUL1 trellis weights (`TrellisT16`, whose route always needs the caller-owned workspace),
+ * and q4_g32_fp16_rows row_group_v1 weights (N and K multiples of 64), plus registered contiguous
+ * BF16 problems. Each format owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4

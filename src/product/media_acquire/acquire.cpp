@@ -271,7 +271,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
             check_control(policy);
             return buffer.bytes;
         }
-        if (status < 300 || status >= 400 || redirect == policy.max_redirects) {
+        if (status < 300 || status >= 400) {
             throw Error(ErrorKind::RemoteUnavailable,
                         "media URL returned HTTP " + std::to_string(status));
         }
@@ -295,7 +295,10 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // Compare the first path component rather than a ".." string prefix: a legitimate file
+        // named
+        // "..hidden" directly under the root would trip the prefix test.
+        if (ec || relative.empty() || * relative.begin() == std::filesystem::path("..")) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

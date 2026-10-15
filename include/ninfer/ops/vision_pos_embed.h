@@ -18,8 +18,7 @@ namespace ninfer::ops {
  * result; output storage rounding belongs to the Op's numerical criterion, not the oracle.
  * Production routes may choose their natural accumulator and staging precision. Inputs must not
  * overlap x. The Op updates all of x in place and uses no workspace or other persistent state.
- * D=1152 with aligned table/x storage selects the optimized small-P warp or large-P CTA route;
- * other contiguous dimensions use the scalar route.
+ * Route selection is a private implementation choice and does not change the result.
  */
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream);

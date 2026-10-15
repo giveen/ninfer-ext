@@ -1,8 +1,21 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
+
+// The wrapper's overlap test (src/ops/wrapper/candidate_selector.cpp) refuses a byte range that
+// would wrap the address space before comparing it; the same checked end is used here.
+std::uintptr_t range_end(std::uintptr_t begin, std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin)
+        throw std::overflow_error("candidate_selector_path: operand range overflows");
+    return begin + bytes;
+}
+
+} // namespace
 SelectorRoute candidate_selector_path_route(int steps, int batch) {
     if (steps < 1 || steps > 15 || batch < 1 || batch > 8)
         throw std::invalid_argument("invalid selector K/B");
@@ -11,10 +24,6 @@ SelectorRoute candidate_selector_path_route(int steps, int batch) {
 
 const char* selector_route_name(SelectorRoute route) {
     return route == SelectorRoute::Direct ? "direct.t512" : "lattice.t512";
-}
-
-const char* candidate_selector_path_route_name(int steps, int batch) {
-    return selector_route_name(candidate_selector_path_route(steps, batch));
 }
 
 void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor& unary_scores,
@@ -33,15 +42,16 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
         &successor_codebook, &base_positions, &drafts,           &proposal_q};
     for (const auto* work : {&scratch.edges}) {
         if (!work->data) continue;
-        const auto begin = reinterpret_cast<std::uintptr_t>(work->data),
-                   end   = begin + work->bytes();
+        const auto begin = reinterpret_cast<std::uintptr_t>(work->data);
+        const auto
+                   end   = range_end( begin, work->bytes());
         for (const auto* tensor : live) {
             const auto tb = reinterpret_cast<std::uintptr_t>(tensor->data);
-            if (begin < tb + tensor->bytes() && tb < end)
+            if (begin < range_end( tb, tensor->bytes()) && tb < end)
                 throw std::invalid_argument("selector workspace overlaps operand");
         }
         const auto cb = reinterpret_cast<std::uintptr_t>(configs);
-        if (begin < cb + candidate_ids.ne[2] * sizeof(SamplingConfig) && cb < end)
+        if (begin < range_end( cb, candidate_ids.ne[2] * sizeof(SamplingConfig)) && cb < end)
             throw std::invalid_argument("selector workspace overlaps configs");
     }
     candidate_selector_path_launch(route, candidate_ids, unary_scores, projected_hidden, anchors,

@@ -28,8 +28,8 @@ enum class SparseMoeEpilogue : std::uint8_t {
  *
  * next_weight_prefetch names a weight span the next decode-step consumer will stream; the decode
  * D4 epilogue issues fire-and-forget L2 prefetches over its first bytes. The span is caller-owned
- * and read once, inside the call: the Op keeps no state between calls, and no hidden channel
- * carries it.
+ * and must stay valid (and unmodified) until the work enqueued on execution.stream completes: the
+ * Op keeps no state between calls, and no hidden channel carries it.
  */
 struct SparseMoeHints {
     const void* next_weight_prefetch       = nullptr;
@@ -63,9 +63,10 @@ struct SparseMoeHints {
  *
  * The five weights have the exact registered shapes: BF16 router/shared gate [257,2048], routed
  * gate/up [256*1024,2048], routed down [256*2048,512], shared gate/up [1024,2048], and shared down
- * [2048,512]. Admitted codec profiles are Q4+Q5, Q4+Q6, and Q8+Q8 for the two routed banks; both
- * shared banks are Q8. Expert e directly selects its stored row spans; no selected-weight gather
- * or repack occurs.
+ * [2048,512]. Admitted codec profiles are Q4+Q5, Q4+Q6, and Q8+Q8 for the two routed banks with
+ * Q8 shared banks, plus the all-NVFP4 profile (all four expert matrices NVFP4; mixing NVFP4 with
+ * the groupwise codecs is rejected). Expert e directly selects its stored row spans; no
+ * selected-weight gather or repack occurs.
  *
  * Every positive T is supported.
  *

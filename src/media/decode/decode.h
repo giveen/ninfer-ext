@@ -33,12 +33,16 @@ struct Policy {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
+    // Invoked once at each entry point and again per decoded frame, so a caller can cancel a long
+    // decode. If one Policy is shared between threads the callable must be thread-safe; throwing
+    // from it aborts decoding and propagates the exception to the caller.
     std::function<void()> checkpoint;
 };
 
 struct Image {
     int width  = 0;
     int height = 0;
+    // Packed RGB8, row-major, no padding: size() == static_cast<std::size_t>(width) * height * 3.
     std::vector<std::uint8_t> rgb;
 };
 
@@ -53,6 +57,10 @@ struct Video {
     int total_frames = 0;
     double fps       = 0.0;
     double duration  = 0.0;
+    // indices is the sampling plan: the source frame index each retained frame came from. frames[i]
+    // is the frame decoded at indices[i], so frames is a strict prefix of indices when the decoder
+    // yields fewer frames than planned but at least the requested minimum. Nothing indexes frames
+    // by an arbitrary entry of indices.
     std::vector<int> indices;
     std::vector<Image> frames;
 };

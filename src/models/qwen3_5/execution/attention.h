@@ -14,8 +14,6 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                DeviceExecutionView execution);
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               DeviceExecutionView execution);
 
 // Normalize q and k and rotate them. Where the fused Op covers the geometry this is one graph node
 // instead of three; everywhere else it is the three calls it replaces. The fused kernel carries

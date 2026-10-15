@@ -79,7 +79,6 @@ std::size_t gemma_moe_experts_workspace_bytes(const GemmaMoeExpertGeometry& geom
     if (tokens <= 0) { fail("T must be positive"); }
     return detail::gemma_moe_experts_workspace(qtype, geometry.hidden_size, geometry.num_experts,
                                                geometry.intermediate_size, geometry.top_k, tokens);
-           sizeof(float);
 }
 
 void gemma_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,

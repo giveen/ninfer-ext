@@ -76,6 +76,17 @@ inline void validate_fp8_operands(const Operands& p) {
         if (!aligned(p.x_scales, 4) || !aligned(p.scales, 4))
             throw std::invalid_argument("FP8 A8 requires scales aligned to four bytes");
     }
+    if constexpr (requires { p.x_lo; }) {
+        // Both low planes are null on every single-term route and are supplied together by the pair
+        // route, whose TMA descriptor and epilogue read them.
+        if ((p.x_lo == nullptr) != (p.x_scales_lo == nullptr))
+            throw std::invalid_argument("FP8 A8 low activation planes must be supplied together");
+        if (p.x_lo != nullptr && !aligned(p.x_lo, 16))
+            throw std::invalid_argument(
+                "FP8 A8 low activation plane requires sixteen-byte alignment");
+        if (p.x_scales_lo != nullptr && !aligned(p.x_scales_lo, 4))
+            throw std::invalid_argument("FP8 A8 low scales require four-byte alignment");
+    }
     if constexpr (Schedule::kStaticK > 0) {
         if (p.k != Schedule::kStaticK)
             throw std::invalid_argument("FP8 template static K does not match operands");

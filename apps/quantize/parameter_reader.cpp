@@ -71,7 +71,6 @@ std::vector<LinearParent> enumerate_linear_parents(const artifact::Reader& reade
 
     std::vector<LinearParent> out;
     for (auto& [object, list] : members) {
-        if (list.empty()) { continue; }
         std::sort(list.begin(), list.end());
         const artifact::ObjectHandle handle{object};
         const auto& geometry = reader.geometry(handle);
@@ -83,7 +82,7 @@ std::vector<LinearParent> enumerate_linear_parents(const artifact::Reader& reade
         bool contiguous = true;
         for (const auto& [begin, name] : list) {
             const auto& binding = reader.directory().bindings.at(name);
-            if (binding.parts.size() != 1 || binding.parts.front().begin != cursor) {
+            if ( binding.parts.front().begin != cursor) {
                 contiguous = false;
                 break;
             }

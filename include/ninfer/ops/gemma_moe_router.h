@@ -27,8 +27,8 @@ namespace ninfer::ops {
  *   one when the scales differ. The ranking is by `p`, i.e. by the pre-scale probability: the
  *   per-expert scale multiplies a selected weight and never changes the selection.
  *
- *   H^(-1/2) is a host-computed constant, not a learned value; it is folded into the scale above,
- *   so no separate scalar Op is needed. The norm is weightless: the unit-RMS vector is used
+ *   H^(-1/2) is a geometry-derived constant, not a learned value; it is folded into the scale
+ * above, so no separate scalar Op is needed. The norm is weightless: the unit-RMS vector is used
  *   directly, which is the reason the router's own norm is not `rmsnorm`'s learned-weight form.
  *
  * Logical shapes:
@@ -81,6 +81,11 @@ struct GemmaMoeRouterGeometry {
 // The workspace a call over T tokens needs: the FP32 [E,T] logits. Throws on a non-positive E or T.
 [[nodiscard]] std::size_t gemma_moe_router_workspace_bytes(const GemmaMoeRouterGeometry& geometry,
                                                            std::int32_t tokens);
+
+// Applies the router to the T = x.ne[1] tokens (T is not a parameter). Throws std::invalid_argument
+// for a non-positive geometry, a hidden_size that is not a multiple of 8, num_experts > 256, top_k
+// outside [1,min(E,16)], a negative rms_norm_eps, mis-typed, mis-shaped, unbound or unaligned
+// x/router_scale/router tensors, mis-shaped outputs, and an undersized or unaligned workspace.
 
 void gemma_moe_router(const Tensor& x, const GemmaMoeRouterWeights& weights,
                       const GemmaMoeRouterGeometry& geometry, Tensor& expert_ids,

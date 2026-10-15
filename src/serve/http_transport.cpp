@@ -176,7 +176,12 @@ void HttpServer::stream_generation(httplib::Response& res,
                         transport.write(render([&] { return encoder->on_progress(progress); }));
                     };
                     output.on_timing = [&](const ninfer::GenerationTimingObservation& timing) {
+                        // on_timing emits no event of its own, but it still goes through `render`
+                        // so a throw is classified as a render failure like every other callback.
+                        (void)render([&] {
                         encoder->on_timing(timing);
+                            return std::vector<std::string>{};
+                        });
                     };
                     output.on_reasoning = [&](const std::string& text) {
                         transport.write(render([&] { return encoder->reasoning_delta(text); }));
@@ -209,6 +214,11 @@ void HttpServer::stream_generation(httplib::Response& res,
                 SseStreamClose closing;
                 try {
                     closing = encoder->close(outcome);
+                } catch (const ClientDisconnected&) {
+                    // The socket is already gone: report the disconnect rather than a render 500.
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));

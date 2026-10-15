@@ -21,7 +21,13 @@ constexpr const char* kTypeNames[] = {"null",   "boolean", "string", "integer",
 
 std::string child(const std::string& path, const std::string& key) {
     std::string result = path + '/';
-    for (char c : key) result += c == '~' ? "~0" : c == '/' ? "~1" : std::string(1, c);
+    for (char c : key) {
+        if (c == '~')
+            result += "~0";
+        else if (c == '/')
+            result += "~1";
+        else result += c;
+    }
     return result;
 }
 
@@ -164,9 +170,13 @@ private:
         auto own = part.value;
         if (own.contains("$ref")) {
             const auto ref = own["$ref"].get<std::string>();
-            if (!refs.insert(ref).second)
+            // A sibling reference below is a duplicate, not a recursive descent, so the descent
+            // gets its own visited set and the allOf expansions keep the unextended one.
+            auto cycle = refs;
+            if (!cycle.insert(ref).second)
                 fail(part.path, "reference cycle does not descend into a value");
-            expand({source_.at(Json::json_pointer(ref.substr(1))), ref.substr(1)}, output, refs);
+            expand({source_.at(Json::json_pointer(ref.substr(1))), ref.substr(1)}, output,
+                   std::move(cycle));
             own.erase("$ref");
         }
         if (own.contains("allOf")) {

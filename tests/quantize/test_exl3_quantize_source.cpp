@@ -132,6 +132,17 @@ void test_hessian_round_trip() {
     expect_throws<std::runtime_error>(
         [&] { (void)app::read_hessian_f32(dir / "long.h.f32", 2); },
         "a Hessian with trailing bytes was accepted");
+    // A dimension whose square wraps the 64-bit product, or whose square outgrows the host address
+    // space, must be refused before any buffer is sized from it.
+    expect_throws<std::overflow_error>(
+        [&] { (void)app::read_hessian_f32(dir / "x.h.f32", std::uint64_t{1} << 32); },
+        "a Hessian dimension that wraps k * k was accepted");
+    expect_throws<std::invalid_argument>(
+        [&] { (void)app::read_hessian_f32(dir / "x.h.f32", (std::uint64_t{1} << 32) - 1U); },
+        "a Hessian dimension beyond the host address space was accepted");
+    expect_throws<std::overflow_error>(
+        [&] { (void)app::identity_hessian(std::uint64_t{1} << 32); },
+        "an identity Hessian dimension that wraps k * k was accepted");
     std::filesystem::remove_all(dir);
 }
 

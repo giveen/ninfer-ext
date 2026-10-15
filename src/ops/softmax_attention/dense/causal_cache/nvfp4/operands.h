@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_operands.h"
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 template <bool Writable>

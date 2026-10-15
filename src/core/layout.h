@@ -32,6 +32,13 @@ struct TensorRegion {
 // exact offsets produced here.
 class LayoutBuilder {
 public:
+    // A live Scope keeps a pointer to its builder, so a copy or move would leave that scope
+    // rolling back a different object.
+    LayoutBuilder()                                = default;
+    LayoutBuilder(const LayoutBuilder&)            = delete;
+    LayoutBuilder& operator=(const LayoutBuilder&) = delete;
+    LayoutBuilder(LayoutBuilder&&)                 = delete;
+    LayoutBuilder& operator=(LayoutBuilder&&)      = delete;
     class Scope {
     public:
         ~Scope() noexcept;
@@ -49,6 +56,7 @@ public:
 
     [[nodiscard]] LayoutRegion add(std::size_t bytes, std::size_t alignment,
                                    std::string_view label);
+    // `shape` must have rank 1 to 4: the region stores a fixed four-extent shape.
     [[nodiscard]] TensorRegion add_tensor(DType dtype, std::initializer_list<std::int32_t> shape,
                                           std::size_t alignment, std::string_view label);
     [[nodiscard]] Scope scope() noexcept;
@@ -66,6 +74,8 @@ private:
 class WorkspaceLayoutBuilder {
 public:
     using Scope = LayoutBuilder::Scope;
+
+    // Same rank-1-to-4 bound as LayoutBuilder::add_tensor.
 
     [[nodiscard]] Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                std::size_t alignment = 256);

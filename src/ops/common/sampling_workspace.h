@@ -14,7 +14,8 @@
 namespace ninfer::ops {
 
 inline constexpr int kSamplerBlock               = 256;
-inline constexpr int kSamplerTileItems           = 256;
+// The small route gives every block thread one tile item, so the tile cannot outgrow the block.
+inline constexpr int kSamplerTileItems           = kSamplerBlock;
 inline constexpr int kSamplerItemsPerThread      = 2;
 inline constexpr int kSamplerPartialTileItems    = kSamplerBlock * kSamplerItemsPerThread;
 inline constexpr int kSamplerGroupBlock          = 256;

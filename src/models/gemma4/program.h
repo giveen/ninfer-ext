@@ -4,7 +4,8 @@
 // forward.
 //
 // The Program owns everything mutable: one KV cache and one sampler state per lane, and the scratch
-// arena, token, hidden and logits buffers the lanes share, since a pass runs one lane at a time. It
+// arena, token, hidden and logits buffers the lanes share, since a prefill or scoring pass runs one
+// lane at a time while decode and speculation run one column per lane. It
 // shares no device allocation with any other Program, and the execution view is supplied per call,
 // so a Program is bound to streaming but not to a stream. Every allocation is made at construction:
 // a request never discovers half way through that its cache does not fit.
@@ -18,6 +19,7 @@
 #include "models/gemma4/model.h"
 #include "models/gemma4/vision.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/types.h" // LogitsSink
 
 #include <cstdint>
 #include <map>
@@ -28,13 +30,17 @@
 
 namespace ninfer::models::gemma4 {
 
+// The vision tower's patch-merge ratio: one soft token pools a `pooling_kernel_size`-square cell
+// (3x3 for Gemma 4), so 9 patches become one.
+inline constexpr std::int32_t kPatchesPerSoftToken = 9;
+
 // One image of a prompt: its soft tokens occupy ids [begin, begin + patches / 9), every one of them
 // the image token, and the encoder's features replace their embeddings.
 struct PromptImage {
     std::int32_t begin = 0;
     ImagePatches patches;
 
-    [[nodiscard]] std::int32_t tokens() const noexcept { return patches.patches() / 9; }
+    [[nodiscard]] std::int32_t tokens() const noexcept { return patches.patches() / kPatchesPerSoftToken; }
 };
 
 class Program {
@@ -42,7 +48,9 @@ public:
     // `capacity` bounds the tokens one lane's global layers can hold; sliding layers always hold
     // the window. `draft_tokens` > 0 enables MTP rounds of up to that many drafts, which needs the
     // drafter loaded, and gives the sliding rings that much slack. With `cuda_graphs`, each lane's
-    // decode step is captured once into a CUDA Graph and replayed (see decode()).
+    // decode step is captured once into a CUDA Graph and replayed (see decode()). `device` is
+    // unused: the per-call execution view carries the stream, so the Program is bound to no device
+    // context (the parameter is kept for the Engine's uniform construction call).
     Program(const Model& model, std::int32_t capacity, std::int32_t lanes, DeviceContext& device,
             std::int32_t draft_tokens = 0, bool cuda_graphs = false,
             KvCacheStorage storage = KvCacheStorage::BFloat16);
@@ -207,6 +215,20 @@ private:
         void* round_hidden          = nullptr;
         // The logits column the lane's last pass left for sample().
         std::int32_t column = 0;
+    };
+
+    // Frees every raw allocation this object owns. The destructor calls it, and the constructor's
+    // guard calls it when a later step throws, because the destructor never runs for a
+    // partially-built object.
+    void release() noexcept;
+
+    struct ConstructorReleaseGuard {
+        Program& program;
+        bool armed = true;
+
+        ~ConstructorReleaseGuard() {
+            if (armed) program.release();
+        }
     };
 
     // A decode pass captured for one set of lanes (a bit per lane), replayed whenever that set

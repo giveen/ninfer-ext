@@ -83,6 +83,9 @@ PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream
         throw std::invalid_argument("PLE table does not match its configuration");
     }
     for (std::uint32_t head = 0; head < config.heads(); ++head) {
+        if (config.head_moduli[head] == 0) {
+            throw std::invalid_argument("PLE hash head has a zero modulus");
+        }
         if (config.head_offsets[head] + config.head_moduli[head] > table.rows) {
             throw std::invalid_argument("PLE hash head exceeds the table");
         }

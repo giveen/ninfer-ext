@@ -238,6 +238,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
+    // The resolved prefill chunk (EngineOptions leaves it empty; the model default depends on
+    // whether its routed experts are host-resident), so the report states the run's real chunk.
+    const std::uint32_t prefill_chunk_tokens = engine.memory_summary().prefill_chunk;
 
     ninfer::perplexity::Reference reference;
     if (options.reference) {
@@ -521,8 +524,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"device", options.device},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
-          {"prefill_chunk_tokens", 1024},
-          {"score_tile_tokens", 1024},
+          {"prefill_chunk_tokens", prefill_chunk_tokens},
           {"kv_dtype", kv_name(options.kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 namespace ninfer::ops::detail {
 namespace {

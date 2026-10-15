@@ -376,7 +376,7 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
         throw std::invalid_argument("causal_conv1d: snapshot selectors must be I32");
     }
 
-    const std::int64_t n = numel_allow_zero(x, "x");
+    (void) numel_allow_zero(x, "x");
     (void)numel_allow_zero(weight, "weight");
     (void)numel_allow_zero(conv_states, "conv_states");
     if (masked) { (void)numel_allow_zero(valid_columns, "valid_columns"); }
@@ -392,7 +392,6 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     require_selector_shape(initial_state_slots, batch, "initial_state_slots");
     require_selector_shape(snapshot_base_slots, batch, "snapshot_base_slots");
     require_out_shape(x, out);
-    if (n == 0) { return; }
 
     require_non_empty_accessible(x, weight, conv_states, out);
     if (masked) { require_metadata_accessible(valid_columns, "valid_columns"); }

@@ -17,11 +17,10 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
-    if (!allows_a4(policy)) {
-        return Nvfp4GdnInputRoute::A16;
-    }
-    if (allows_a4(policy)) { return Nvfp4GdnInputRoute::W4A4; }
+    if (!valid_linear_policy(policy)) {
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
+    }
+    return allows_a4(policy) ? Nvfp4GdnInputRoute::W4A4 : Nvfp4GdnInputRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

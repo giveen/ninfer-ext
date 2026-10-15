@@ -27,6 +27,9 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
 // no such weight, so the projection is the whole encoder. `features` is [3h, width, batch]; `g` is
 // [h, width, batch].
 void TextContext::eagle3_encode_batch(const Tensor& features, Tensor& g) {
+    if (!parameters_.draft.has_value()) {
+        throw std::runtime_error("EAGLE3 encoder is not enabled");
+    }
     const auto& draft       = *parameters_.draft;
     const std::int32_t h    = dimension(parameters_.model.config().text.hidden_size);
     const std::int32_t fused = features.ne[0];
@@ -66,6 +69,10 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
     const std::int32_t kv_heads = dimension(attn.num_key_value_heads);
     const std::int32_t width    = ids.ne[0];
     const std::int32_t batch    = ids.ne[1];
+    if (width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) ||
+        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("EAGLE3 decode batch is outside the supported domain");
+    }
     if (ids.dtype != DType::I32 || rope_positions.dtype != DType::I32 ||
         cache_positions.dtype != DType::I32 || valid_columns.dtype != DType::I32 ||
         kv_table_rows.dtype != DType::I32 || width <= 0 || batch <= 0 ||
@@ -74,7 +81,8 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
         valid_columns.ne[0] != batch || kv_table_rows.ne[0] != batch ||
         g.dtype != DType::BF16 || g.ne[0] != h || g.ne[1] != width || g.ne[2] != batch ||
         hidden.dtype != DType::BF16 || hidden.ne[0] != h || hidden.ne[1] != width ||
-        hidden.ne[2] != batch) {
+        hidden.ne[2] != batch ||
+        !hidden.is_contiguous()) {
         throw std::invalid_argument("EAGLE3 decode batch shapes are invalid");
     }
     const std::int32_t columns = width * batch;

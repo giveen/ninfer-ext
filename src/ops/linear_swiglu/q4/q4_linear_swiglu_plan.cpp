@@ -109,6 +109,10 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             "q4 linear_swiglu: exact problem or column count is not admitted");
     }
 
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("q4 linear_swiglu: invalid compute policy");
+    }
+
     if (allows_a8(policy) && problem.cols >= kA8MinCols) {
         return Q4LinearSwiGluPlan{Q4LinearSwiGluScheduleId::MmaInt8SplitHalfPair,
                                   q4_a8_workspace_capacity_bytes(problem.cols, problem.k), policy};
@@ -131,8 +135,8 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
             return plan;
         case Q4LinearSwiGluScheduleId::MmaInt8SplitHalfPair:
-            plan.workspace_bytes = q4_a8_workspace_capacity_bytes(problem.cols, problem.k);
-            return plan;
+            // The A8 route is resolved above, so the catalog never selects it.
+            throw std::logic_error("q4 linear_swiglu: A8 schedule is not in the route catalog");
         }
     }
     throw std::logic_error("q4 linear_swiglu: admitted problem has no covering route");

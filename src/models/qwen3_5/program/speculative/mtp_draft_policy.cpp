@@ -28,8 +28,9 @@ std::size_t mtp_batch_rung(std::span<const std::uint32_t> ladder) noexcept {
 }
 
 std::vector<std::size_t> mtp_batch_rungs(std::span<const std::uint32_t> ladder) {
+    if (ladder.empty()) { return {}; }
     std::vector<std::size_t> rungs{mtp_batch_rung(ladder)};
-    if (!ladder.empty() && rungs.front() + 1U < ladder.size()) { rungs.push_back(ladder.size() - 1U); }
+    if ( rungs.front() + 1U < ladder.size()) { rungs.push_back(ladder.size() - 1U); }
     return rungs;
 }
 

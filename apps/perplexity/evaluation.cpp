@@ -43,14 +43,15 @@ std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
 }
 
 void ScoreAggregate::add(std::span<const float> logprobs) {
+    // Checked before accumulating so the overflow leaves the aggregate untouched.
+    if (logprobs.size() > std::numeric_limits<std::uint64_t>::max() - scored_tokens) {
+        throw std::overflow_error("perplexity scored-token count overflowed");
+    }
     for (const float logprob : logprobs) {
         if (!std::isfinite(logprob)) {
             throw std::runtime_error("causal scoring returned a non-finite logprob");
         }
         total_nll -= static_cast<double>(logprob);
-    }
-    if (logprobs.size() > std::numeric_limits<std::uint64_t>::max() - scored_tokens) {
-        throw std::overflow_error("perplexity scored-token count overflowed");
     }
     scored_tokens += static_cast<std::uint64_t>(logprobs.size());
 }
@@ -68,6 +69,9 @@ double ScoreAggregate::mean_nll() const {
 double ScoreAggregate::ppl() const { return std::exp(mean_nll()); }
 
 void KlAggregate::add(double kl) noexcept {
+    // A degenerate row's NaN/inf would poison total_kl (and mean_kl) for the rest of the run. This
+    // is noexcept, so the row is dropped rather than counted.
+    if (!std::isfinite(kl)) { return; }
     total_kl += kl;
     ++rows;
 }
@@ -92,10 +96,15 @@ float bf16_to_float(std::uint16_t value) noexcept {
 }
 
 // log(sum_v exp(row[v])) of a full BF16 logits row, with the row maximum factored out.
-double row_log_sum_exp(const std::uint16_t* row, std::uint32_t vocab) noexcept {
+double row_log_sum_exp(const std::uint16_t* row, std::uint32_t vocab) {
     float maximum = -std::numeric_limits<float>::infinity();
     for (std::uint32_t v = 0; v < vocab; ++v) {
         maximum = std::max(maximum, bf16_to_float(row[v]));
+    }
+    if (!std::isfinite(maximum)) {
+        // An all -inf or NaN-bearing row has no distribution to normalise: refuse it here rather
+        // than returning NaN to every caller as a log-sum-exp.
+        throw std::invalid_argument("logits row has no finite entry");
     }
     double sum = 0.0;
     for (std::uint32_t v = 0; v < vocab; ++v) {

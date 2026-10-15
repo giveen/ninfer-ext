@@ -8,6 +8,7 @@
 #include <array>
 #include <limits>
 #include <mutex>
+#include <utility>
 
 namespace ninfer::artifact {
 
@@ -37,7 +38,8 @@ struct Reader::Impl {
         }
         const auto json_bytes = read_u64_le(header.data() + 8);
         if (!json_bytes || json_bytes > file->bytes() - kHeaderBytes ||
-            json_bytes > std::numeric_limits<std::size_t>::max()) {
+            std::cmp_greater(
+            json_bytes, std::numeric_limits<std::size_t>::max())) {
             throw ArtifactError(entry.string() + ": invalid directory length");
         }
         std::copy_n(header.begin() + 16, id.size(), id.begin());
@@ -160,9 +162,14 @@ std::vector<std::byte> Reader::read_range(std::uint64_t offset, std::uint64_t by
     if (bytes > std::numeric_limits<std::size_t>::max()) {
         throw ArtifactError("Host read size exceeds size_t");
     }
-    (void)segments(offset, bytes);
     std::vector<std::byte> result(static_cast<std::size_t>(bytes));
-    read_into(offset, result);
+    std::span<std::byte> destination(result.data(), result.size());
+    for (const auto& segment : segments(offset, bytes)) {
+        impl_->file(segment.file_index)
+            .read_exact(segment.file_offset,
+                        destination.subspan(static_cast<std::size_t>(segment.destination_offset),
+                                            static_cast<std::size_t>(segment.bytes)));
+    }
     return result;
 }
 

@@ -161,7 +161,7 @@ LinearAttentionStateLayerView LinearAttentionStatePool::layer_view(std::uint32_t
 
 LinearAttentionStateSlotView LinearAttentionStatePool::slot_view(std::int32_t slot) const {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool slot_view");
-    const auto all   = all_layers_view();
+    // The inventory and both layer pitches are validated once during construction.
     Tensor conv      = conv_slot(0, slot);
     Tensor recurrent = recurrent_slot(0, slot);
     return {
@@ -169,8 +169,8 @@ LinearAttentionStateSlotView LinearAttentionStatePool::slot_view(std::int32_t sl
         .recurrent_layer0            = recurrent,
         .conv_layer_bytes            = conv.bytes(),
         .recurrent_layer_bytes       = recurrent.bytes(),
-        .conv_layer_pitch_bytes      = all.conv_layer_stride_bytes,
-        .recurrent_layer_pitch_bytes = all.recurrent_layer_stride_bytes,
+        .conv_layer_pitch_bytes      = layer_stride_bytes(conv_, "conv"),
+        .recurrent_layer_pitch_bytes = layer_stride_bytes(recurrent_, "recurrent"),
         .layers                      = layer_count(),
     };
 }

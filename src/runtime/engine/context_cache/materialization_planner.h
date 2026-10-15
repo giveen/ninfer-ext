@@ -1178,15 +1178,6 @@ private:
         return found == policies.end() ? nullptr : &*found;
     }
 
-    [[nodiscard]] static const MaterializationCheckpointPolicy*
-    checkpoint_policy_for(std::span<const MaterializationCheckpointPolicy> policies,
-                          PlanningOwnerId owner, CheckpointRef checkpoint) noexcept {
-        const auto found = std::ranges::find_if(policies, [&](const auto& policy) {
-            return policy.owner == owner && policy.checkpoint == checkpoint;
-        });
-        return found == policies.end() ? nullptr : &*found;
-    }
-
     [[nodiscard]] FoldedCost
     fold_identity(const CandidateInput& candidate,
                   const IdentityMaterializationAssessment& assessment,

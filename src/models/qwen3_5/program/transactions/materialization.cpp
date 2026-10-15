@@ -288,7 +288,6 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             for (std::size_t index = 0; index < used.size(); ++index) {
                 if (!used[index]) {
                     prompt.media_payloads[index].reset();
-                    continue;
                 }
             }
             VisionPrefillPlan& vision      = *request_plan.vision;

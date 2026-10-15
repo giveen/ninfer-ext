@@ -244,7 +244,10 @@ enum class Name : std::size_t {
         }
         return out;
     }();
-    return handles[static_cast<std::size_t>(name)];
+    const auto index =static_cast<std::size_t>(name);
+    // Name::Count is a sentinel, not a message: never index past the table with it.
+    if (index >= names.size()) { return nvtxStringHandle_t{}; }
+    return handles[index];
 }
 
 [[nodiscard]] inline nvtxEventAttributes_t attributes(Name name, Category category,

@@ -72,11 +72,14 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
 int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
 Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::uint64_t max_pixels) {
-    if (height <= 0 || width <= 0 || min_pixels == 0 || max_pixels < min_pixels) {
+    if ( min_pixels == 0 || max_pixels < min_pixels) {
         throw std::invalid_argument("invalid image resize configuration");
     }
+    if (height <= 0 || width <= 0) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "image has an empty extent");
+    }
     if (static_cast<double>(std::max(height, width)) / std::min(height, width) > 200.0) {
-        throw std::invalid_argument("image aspect ratio must be at most 200");
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,"image aspect ratio must be at most 200");
     }
     int h                    = round_even(static_cast<double>(height) / kFactor) * kFactor;
     int w                    = round_even(static_cast<double>(width) / kFactor) * kFactor;
@@ -96,12 +99,15 @@ Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::ui
 
 Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pixels,
                         std::uint64_t max_pixels) {
-    if (frames <= 0 || height < kFactor || width < kFactor || min_pixels == 0 ||
+    if ( min_pixels == 0 ||
         max_pixels < min_pixels) {
         throw std::invalid_argument("invalid video resize configuration");
     }
+    if (frames <= 0 || height < kFactor || width < kFactor) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "video has an empty extent");
+    }
     if (static_cast<double>(std::max(height, width)) / std::min(height, width) > 200.0) {
-        throw std::invalid_argument("video aspect ratio must be at most 200");
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,"video aspect ratio must be at most 200");
     }
     int h                      = round_even(static_cast<double>(height) / kFactor) * kFactor;
     int w                      = round_even(static_cast<double>(width) / kFactor) * kFactor;

@@ -3,12 +3,12 @@
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -604,8 +604,11 @@ public:
 
     void retain_reference(LogicalKVPageHandle handle, bool writer) {
         Page& page = require(handle);
+        // Exactly the precondition can_retain_reference reports, including the writer role's
+        // exclusive claim on an otherwise unreferenced page.
         if (page.references == std::numeric_limits<std::uint32_t>::max() ||
-            (writer && page.writer_references != 0)) {
+            page.destination_pinned ||
+            (writer && (page.writer_references != 0 || page.references != 0))) {
             throw std::logic_error("logical KV page reference is not retainable");
         }
         ++page.references;
@@ -1004,7 +1007,7 @@ public:
             }
         }
         const std::uint32_t device_pages = required_pages - streamed;
-        const std::uint32_t growth = entitlement > device_pages ? entitlement - device_pages : 0U;
+        const std::uint32_t growth   = entitlement > device_pages ? entitlement - device_pages : 0U;
         const std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
@@ -1190,14 +1193,31 @@ public:
             reservation, staged_tail_release ? 1U : entitlement - full_pages);
         KVExecutionRowLease row = tables_->acquire(execution_row);
         std::optional<LogicalKVPageHandle> tail_destination;
-        if (tail_columns != 0) {
-            tail_destination = pages_->materialize_transfer_destination(reservation, tail_columns);
+        std::uint32_t pinned_through = 0;
+        try {
+            if (tail_columns != 0) {
+                tail_destination =
+                    pages_->materialize_transfer_destination(reservation, tail_columns);
+            }
+            for (std::uint32_t page = 0; page < required_pages; ++page) {
+                if (!streamed(page)) { pages_->pin_source(membership(source, page)); }
+                pinned_through = page + 1;
+            }
+        } catch (...) {
+            // No reservation object exists yet, so nothing else can abort the staged tail or undo
+            // these pins. A streamed member was never pinned by this call, so it is skipped.
+            for (std::uint32_t page = 0; page < pinned_through; ++page) {
+                if (streamed(page)) { continue; }
+                const LogicalKVPageHandle logical = membership(source, page);
+                if (pages_->source_pins(logical) != 0) { pages_->unpin_source(logical); }
+            }
+            if (tail_destination) {
+                pages_->abort_transfer_destination(*tail_destination, reservation);
+            }
+            throw;
         }
-        for (std::uint32_t page = 0; page < required_pages; ++page) {
-            if (!streamed(page)) { pages_->pin_source(membership(source, page)); }
-        }
-        KVPrefixForkReservation fork(*this, source_handle, destination_handle, frontier,
-                                     full_pages, tail_columns, entitlement, std::move(reservation),
+        KVPrefixForkReservation fork(*this, source_handle, destination_handle, frontier, full_pages,
+                                     tail_columns, entitlement, std::move(reservation),
                                      std::move(row), tail_destination, staged_tail_release);
         fork.stream_begin_ = stream_begin;
         fork.stream_end_   = stream_end;
@@ -1294,7 +1314,8 @@ public:
             const bool settled_tail = page == fork.full_pages_ && fork.tail_source_settled_;
             if (streamed(page)) {
                 if (!pages_->can_retain_reference(logical, false)) {
-                    throw std::logic_error("KV prefix-fork streamed source changed before publication");
+                    throw std::logic_error(
+                        "KV prefix-fork streamed source changed before publication");
                 }
                 continue;
             }
@@ -1469,6 +1490,7 @@ public:
             pages_->physical_pool().resize_reservation(tail_reservation, shape.copied_pages());
         }
         std::optional<LogicalKVPageHandle> tail_destination;
+        std::uint32_t pinned_pages = 0;
         try {
             if (shape.tail_columns != 0) {
                 tail_destination =
@@ -1476,8 +1498,14 @@ public:
             }
             for (std::uint32_t page = 0; page < required_pages; ++page) {
                 pages_->pin_source(membership(source, page));
+                ++pinned_pages;
             }
         } catch (...) {
+            // No reservation object exists yet, so nothing else can undo these pins.
+            for (std::uint32_t page = 0; page < pinned_pages; ++page) {
+                const LogicalKVPageHandle logical = membership(source, page);
+                if (pages_->source_pins(logical) != 0) { pages_->unpin_source(logical); }
+            }
             if (tail_destination) {
                 pages_->abort_transfer_destination(*tail_destination, tail_reservation);
             }
@@ -1606,8 +1634,8 @@ public:
         if (entitlement < address.page_count || entitlement > page_capacity_) {
             throw std::invalid_argument(
                 "KV entitlement is smaller than mapped pages: entitlement=" +
-                std::to_string(entitlement) + " mapped_pages=" + std::to_string(address.page_count) +
-                " capacity=" + std::to_string(page_capacity_));
+                std::to_string(entitlement) + " mapped_pages=" +
+                std::to_string(address.page_count) + " capacity=" + std::to_string(page_capacity_));
         }
         pages_->physical_pool().resize_reservation(address.reservation,
                                                    entitlement - address.page_count);
@@ -1671,7 +1699,8 @@ public:
         }
         for (std::uint32_t page = begin; page < begin + count; ++page) {
             if (!pages_->can_demote_active(membership(address, page))) {
-                throw std::logic_error("KV demotion range contains a page that must stay on Device");
+                throw std::logic_error(
+                    "KV demotion range contains a page that must stay on Device");
             }
         }
         publish_scratch_.clear();
@@ -1988,22 +2017,24 @@ private:
         try {
             for (const Address& address : addresses_) {
                 if (!address.occupied) { continue; }
-                for (std::uint32_t page = 0; page < address.page_count; ++page) {
-                    pages_->set_protected_coverage(membership(address, page), 0);
-                }
-            }
-            for (const Address& address : addresses_) {
-                if (!address.occupied || address.checkpoint_frontier == 0) { continue; }
+                const std::uint32_t protected_pages = pages_for_tokens(address.checkpoint_frontier);
                 if (address.checkpoint_frontier > address.committed_frontier ||
-                    pages_for_tokens(address.checkpoint_frontier) > address.page_count) {
+                    protected_pages > address.page_count) {
                     std::terminate();
                 }
-                for (std::uint32_t page = 0; page < pages_for_tokens(address.checkpoint_frontier);
-                     ++page) {
-                    const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
-                    pages_->protect_coverage(membership(address, page),
-                                             std::min(static_cast<std::uint32_t>(kPagedKVPageSize),
-                                                      address.checkpoint_frontier - begin));
+                for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                    // One pass per address: pages past the frontier clear to zero, and a page
+                    // already at its target coverage is left untouched.
+                    const std::uint32_t coverage =
+                        page < protected_pages
+                            ? std::min(static_cast<std::uint32_t>(kPagedKVPageSize),
+                                       address.checkpoint_frontier -
+                                           page * static_cast<std::uint32_t>(kPagedKVPageSize))
+                            : 0U;
+                    const LogicalKVPageHandle logical = membership(address, page);
+                    if (pages_->protected_columns(logical) != coverage) {
+                        pages_->set_protected_coverage(logical, coverage);
+                    }
                 }
             }
         } catch (...) { std::terminate(); }

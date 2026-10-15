@@ -226,7 +226,7 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 releases.push_back(addresses.logical_page(address, selected_begin + offset));
             }
             if (!host_extents->can_release_page_replicas(pages, releases)) {
-                end = begin;
+                end = selected_begin;
                 continue;
             }
             mark_action({

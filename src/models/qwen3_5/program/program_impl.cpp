@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -591,11 +592,18 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     } catch (...) {
         try {
             device.synchronize();
-        } catch (...) {}
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "causal score: device synchronize failed while unwinding: %s\n",
+                         error.what());
+        } catch (...) {
+            std::fprintf(stderr, "causal score: device synchronize failed while unwinding\n");}
         work.reset();
         try {
             cleanup();
-        } catch (...) {}
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "causal score: cleanup failed while unwinding: %s\n",
+                         error.what());
+        } catch (...) { std::fprintf(stderr, "causal score: cleanup failed while unwinding\n");}
         throw;
     }
 }

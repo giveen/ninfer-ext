@@ -413,6 +413,7 @@ int main(int argc, char** argv) {
                     for (const auto& tensor : shard_tensors) { names.push_back(tensor.name); }
                     std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
                     out << nlohmann::json{{"names", names}, {"tensors", shard_reports}}.dump() << '\n';
+                    if (!out) { throw std::runtime_error("cannot write " + sidecar.string()); }
                 }
                 std::fprintf(stderr, "wrote %s (%zu matrices)\n", shard_name.c_str(),
                              shard_tensors.size() / 3);
@@ -431,6 +432,7 @@ int main(int argc, char** argv) {
                                     {"weight_map", expert_files}}
                          .dump(2)
                   << '\n';
+            if (!index) { throw std::runtime_error("cannot write model.safetensors.index.json"); }
             report["expert_matrices"]  = expert_matrices;
             report["expert_proxy_mean"] = expert_proxy_sum / static_cast<double>(expert_matrices);
             report["expert_proxy_max"]  = expert_proxy_max;
@@ -439,6 +441,7 @@ int main(int argc, char** argv) {
         report["skipped"]   = skipped;
         std::ofstream out(options.output / "report.json", std::ios::binary | std::ios::trunc);
         out << report.dump(2) << '\n';
+        if (!out) { throw std::runtime_error("cannot write report.json"); }
         std::fprintf(stderr, "wrote %s (%zu dense tensors, %zu expert matrices)\n",
                      options.output.string().c_str(), done, expert_matrices);
         return 0;

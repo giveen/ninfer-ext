@@ -39,6 +39,14 @@ void require_same_shape(const Tensor& a, const Tensor& b) {
     }
 }
 
+// The contract excludes shared storage: an offset destination would make rows race.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
@@ -65,6 +73,7 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     if (x.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("l2norm: x/out data must be non-null");
     }
+    if (overlaps(x, out)) { throw std::invalid_argument("l2norm: x and out must not overlap"); }
 
     detail::l2norm_launch(x, eps, out, stream);
 }

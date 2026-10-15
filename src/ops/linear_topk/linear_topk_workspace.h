@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -36,10 +37,18 @@ LinearTopKWorkspace
 allocate_linear_topk_workspace(Allocator& allocator, std::int32_t head_rows, std::int32_t columns,
                                std::int32_t rows_per_producer, std::int32_t tile_columns = 0,
                                std::int32_t block_k = 128) {
+    if (head_rows <= 0 || columns <= 0 || rows_per_producer <= 0) {
+        throw std::invalid_argument("linear_topk workspace: invalid dimensions");
+    }
     const std::int32_t producer_groups = div_up(head_rows, rows_per_producer);
     const std::int32_t merge_groups    = div_up(producer_groups, kLinearTopKMergeFanIn);
     const std::int32_t secondary_groups =
         merge_groups > kLinearTopKMergeFanIn ? div_up(merge_groups, kLinearTopKMergeFanIn) : 0;
+    // The merge kernel folds at most kLinearTopKMergeFanIn groups per level, so two levels
+    // only cover up to producer_groups <= kLinearTopKMergeFanIn * kLinearTopKMergeFanIn.
+    if (secondary_groups > kLinearTopKMergeFanIn) {
+        throw std::invalid_argument("linear_topk workspace: merge hierarchy is too deep");
+    }
     LinearTopKWorkspace out;
     out.tile_columns = tile_columns;
     out.block_k      = block_k;

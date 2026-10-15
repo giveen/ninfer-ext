@@ -41,7 +41,14 @@ public:
         publish(StartupStatus::Progress, current_, total_);
     }
 
-    void complete(std::uint64_t current = 0, std::uint64_t total = 0) noexcept {
+    // Completes the phase without changing progress: the terminal event keeps the last reported
+    // current and total, so completing a phase never resets them to zero.
+    void complete() noexcept {
+        terminal_ = true;
+        publish(StartupStatus::Complete, current_, total_);
+    }
+
+    void complete(std::uint64_t current, std::uint64_t total) noexcept {
         if (unit_ != StartupProgressUnit::None) {
             if (total != 0) { total_ = total; }
             current_ = current;

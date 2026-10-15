@@ -43,6 +43,14 @@ OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model)
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
                                           const GenerationOutcome& outcome);
 
+// One OpenAI Chat SSE response's event state machine, driven in wire order. Every method throws
+// std::logic_error on a precondition violation, so the SSE driver must keep the sequence: `start()`
+// once and first; `note_start()` once after start; the prompt-progress pair only in its own order;
+// `note_timing()` only when timings_per_token was requested and only with cumulative observations;
+// `reasoning_delta()` only while the reasoning channel is open (nothing finished, no content yet);
+// `content_delta()` only before `finish()`; and `finish()` once, at the end, with a terminal output
+// whose reasoning and text the streamed deltas are a prefix of.
+
 class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,

@@ -14,9 +14,10 @@ class HostWorkerPool;
 
 namespace ninfer::models::qwen3_5::execution {
 
-// Batched direct (O_DIRECT) reads of byte ranges of one file object, bypassing the page cache.
-// Every call gathers the distinct 4 KiB pages its ranges touch, reads them concurrently into
-// private aligned staging and exposes each range from there until the next call.
+// Batched direct (O_DIRECT) reads of byte ranges of the mapped file segments, bypassing the page
+// cache. The segments may come from several files. Every call gathers the distinct 4 KiB pages its
+// ranges touch, reads them concurrently into private aligned staging and exposes each range from
+// there until the next call.
 class PleRowReader {
 public:
     explicit PleRowReader(std::span<const artifact::MappedObjectSegment> segments);

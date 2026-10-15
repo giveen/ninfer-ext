@@ -2,9 +2,22 @@
 
 #include "ops/launcher/cast.h"
 
+#include <cstdint>
+
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
+
+// The contract excludes any shared storage, not just identical base pointers.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
+} // namespace
 
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream) {
     if (source.dtype != DType::FP32 || destination.dtype != DType::BF16) {
@@ -19,7 +32,7 @@ void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t s
         destination.data == nullptr) {
         throw std::invalid_argument("cast_fp32_to_bf16: tensors must be contiguous and non-null");
     }
-    if (source.data == destination.data) {
+    if (overlaps(source, destination)) {
         throw std::invalid_argument("cast_fp32_to_bf16: source and destination must not alias");
     }
     detail::cast_fp32_to_bf16_launch(source, destination, stream);

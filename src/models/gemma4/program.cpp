@@ -88,13 +88,23 @@ std::size_t draft_lane_bytes(const TextConfig& config, std::int32_t draft_tokens
            kRoundLaneInts * sizeof(std::int32_t);
 }
 
+// Validates the draft count before it sizes any allocation, so an out-of-range value is refused
+// with the documented error rather than as a failed multi-GB cudaMalloc.
+std::int32_t checked_draft_tokens(std::int32_t draft_tokens) {
+    if (draft_tokens < 0 || draft_tokens > Program::kMaximumDraftTokens) {
+        throw std::invalid_argument("gemma4 Program: draft tokens must be in [0, 7]");
+    }
+    return draft_tokens;
+}
+
 } // namespace
 
 std::size_t Program::device_bytes(const TextConfig& config, std::int32_t capacity,
                                   std::int32_t lanes, std::int32_t draft_tokens,
                                   const VisionConfig* vision, KvCacheStorage storage) {
     const std::size_t lane = KvCache::device_bytes(config, capacity, draft_tokens, storage) +
-                             token_count_bytes(config) + draft_lane_bytes(config, draft_tokens);
+                             token_count_bytes(config) + draft_lane_bytes(config, draft_tokens) +
+                             sizeof(ops::SamplingConfig) + 2 * sizeof(std::int32_t);
     return shared_bytes(config, draft_tokens, vision, storage) +
            static_cast<std::size_t>(lanes) * lane;
 }
@@ -104,17 +114,15 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
                  KvCacheStorage storage)
     : model_(&model),
       arena_(arena_bytes(model.config(), model.vision_config() ? &*model.vision_config() : nullptr,
-                         storage, draft_tokens)),
+                         storage, checked_draft_tokens( draft_tokens))),
       sampling_workspace_(sampling_bytes(model.config(), draft_tokens)),
       draft_tokens_(draft_tokens), capacity_(capacity), cuda_graphs_(cuda_graphs),
       kv_storage_(storage) {
+    ConstructorReleaseGuard guard{*this};
     if (capacity < 1) throw std::invalid_argument("gemma4 Program: capacity must be positive");
     // A decode round names its lanes by a bit each (decode_graphs_).
     if (lanes < 1 || lanes > 64)
         throw std::invalid_argument("gemma4 Program: lanes must be in [1, 64]");
-    if (draft_tokens < 0 || draft_tokens > kMaximumDraftTokens) {
-        throw std::invalid_argument("gemma4 Program: draft tokens must be in [0, 7]");
-    }
     if (draft_tokens > 0 && !model.draft_config()) {
         throw std::invalid_argument("gemma4 Program: speculation needs the drafter loaded");
     }
@@ -187,9 +195,12 @@ Program::Program(const Model& model, std::int32_t capacity, std::int32_t lanes,
     }
     for (std::int32_t lane = 0; lane < lanes; ++lane) reset(lane);
     (void)device;
+    guard.armed = false;
 }
 
-Program::~Program() {
+Program::~Program() { release(); }
+
+void Program::release() noexcept {
     for (Lane& lane : lanes_) {
         if (lane.token_counts != nullptr) (void)cudaFree(lane.token_counts);
     }
@@ -746,8 +757,13 @@ std::vector<std::int32_t> Program::sample(std::span<const std::int32_t> lanes,
     const std::size_t column_bytes = static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t);
     auto* drawn                    = static_cast<std::int32_t*>(sampling_[1]);
     auto* positions                = static_cast<std::int32_t*>(sampling_[2]);
+    std::uint64_t set              = 0;
     for (std::size_t i = 0; i < lanes.size(); ++i) {
         const Lane& lane = lane_at(lanes[i]);
+        const std::uint64_t bit = std::uint64_t{1} << lanes[i];
+        if ((set & bit) != 0)
+            throw std::invalid_argument("gemma4 Program: a lane samples once a round");
+        set |= bit;
         // A pageable source is staged before cudaMemcpyAsync returns.
         CUDA_CHECK(cudaMemcpyAsync(positions + i, &lane.position, sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, stream));

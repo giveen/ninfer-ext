@@ -71,7 +71,10 @@ public:
     DeviceArena(DeviceArena&& other) noexcept;
     DeviceArena& operator=(DeviceArena&& other) noexcept;
 
+    [[nodiscard]]
+
     DeviceSpan alloc_bytes(std::size_t bytes, std::size_t align = 256);
+    [[nodiscard]]
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
     [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;

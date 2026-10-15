@@ -38,6 +38,9 @@ struct LoggingOptions {
     LogPresentation presentation = LogPresentation::Service;
 };
 
+// Parses a user-supplied CLI value (lowercase only): trace, debug, info, warning|warn, error,
+// critical|fatal, off. Throws std::invalid_argument for any other spelling.
+
 [[nodiscard]] LogLevel parse_log_level(std::string_view value);
 
 // One transient terminal line coordinated with the operational stderr sink. It is enabled only

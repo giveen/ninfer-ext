@@ -20,7 +20,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
-constexpr std::int32_t kMaximumRows = 8;
+constexpr std::int32_t kMaximumRows = detail::gated_delta_net::kGdnReplayFoldMaximumRows;
 
 void require_tensor(const Tensor& tensor, DType dtype, std::initializer_list<std::int32_t> shape,
                     std::uintptr_t alignment, const char* op, const char* label) {
@@ -211,12 +211,8 @@ void validate_fold_states(const GdnReplayRecords& records,
         throw std::invalid_argument(std::string(kOp) + ": invalid state layer stride");
     }
 
-    for (std::int32_t layer = 0; layer < record.layers; ++layer) {
-        (void)layer_range(states.conv_layer0, states.conv_layer_stride_bytes, layer,
-                          "gdn_replay_fold conv state");
-        (void)layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
-                          "gdn_replay_fold recurrent state");
-    }
+    // The merge scan below advances one array per iteration until both reach record.layers, so it
+    // already visits every layer of both arrays and applies the same range checks.
     std::int32_t conv_layer      = 0;
     std::int32_t recurrent_layer = 0;
     while (conv_layer < record.layers && recurrent_layer < record.layers) {
@@ -260,7 +256,9 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
 detail::gated_delta_net::GdnReplayFoldKernelRows
 validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                    std::span<const GdnReplayFoldRow> rows) {
-    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity)) {
+    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity) ||
+        rows.size() >
+            static_cast<std::size_t>(detail::gated_delta_net::kGdnReplayFoldMaximumRows)) {
         throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
     }
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};

@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,

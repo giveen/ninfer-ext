@@ -136,7 +136,6 @@ public:
                 if (value.positive &&
                     (!incumbent || better(value, assessment, input, *incumbent))) {
                     incumbent = Incumbent{
-                        .target              = queued.target,
                         .assessed            = std::move(assessed),
                         .value               = value,
                         .stable_target       = assessment.stable_target_ordinal,
@@ -238,18 +237,12 @@ private:
     struct TransitionValue {
         std::uint64_t baseline_public = 0;
         std::uint64_t target_public   = 0;
-        std::uint64_t private_loss    = 0;
         std::uint64_t immediate       = 0;
         std::uint64_t gain            = 0;
         bool positive                 = false;
-        bool saturated                = false;
-
-        [[nodiscard]] friend constexpr bool operator==(TransitionValue,
-                                                       TransitionValue) noexcept = default;
     };
 
     struct Incumbent {
-        PressureTargetHandle target;
         std::optional<AssessedPressureTarget> assessed;
         TransitionValue value;
         std::uint32_t stable_target       = 0;
@@ -403,11 +396,9 @@ private:
         return TransitionValue{
             .baseline_public = portfolio.baseline_public_value,
             .target_public   = portfolio.target_public_value,
-            .private_loss    = portfolio.private_transition_loss,
             .immediate       = immediate,
             .gain            = positive ? portfolio.target_public_value - threshold : 0,
             .positive        = positive,
-            .saturated       = saturated,
         };
     }
 

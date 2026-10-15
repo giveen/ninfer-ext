@@ -85,6 +85,11 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     require_same_gate_shape(a, g, "g");
     require_same_gate_shape(a, beta, "beta");
     if (n == 0) { return; }
+    // The launcher casts div_up(n, 256) to int, so bound the element count the way the
+    // row-count bound in the sibling norm wrappers does.
+    if (n > static_cast<std::int64_t>(std::numeric_limits<int>::max()) * 256) {
+        throw std::overflow_error("gdn_gating: element count exceeds CUDA grid limit");
+    }
 
     if (!a.is_contiguous() || !b.is_contiguous() || !A_log.is_contiguous() ||
         !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous()) {

@@ -36,6 +36,9 @@ public:
 
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
 
+    // Throws std::out_of_range when `id` does not address a bound weight, including a
+    // default-constructed WeightId (its index is the SIZE_MAX sentinel).
+
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
     [[nodiscard]] ops::WeightInput input(WeightUseId id) const;

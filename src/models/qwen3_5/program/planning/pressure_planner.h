@@ -63,7 +63,10 @@ inline std::size_t planning_direction_index(runtime::ContextTransferDirection di
 struct PlanningTransferAccumulator {
     runtime::CoalescedTransferWork work{};
 
-    void append(std::span<const runtime::ContextTransferRequirement> requirements) noexcept {
+    // Not noexcept: `planning_direction_index` throws std::logic_error for an unrecognized
+    // direction, and terminating instead of diagnosing it would hide the caller's error.
+
+    void append(std::span<const runtime::ContextTransferRequirement> requirements) {
         for (const runtime::ContextTransferRequirement& requirement : requirements) {
             const std::size_t index = planning_direction_index(requirement.direction);
             planning_saturating_add(work[index].payload_bytes, requirement.work.payload_bytes);
@@ -76,7 +79,7 @@ struct PlanningTransferAccumulator {
 
 inline runtime::MaterializationMachineWork
 materialization_machine_work(const ResourceCandidateState& candidate,
-                             const PlanningTransferAccumulator& pressure) noexcept {
+                             const PlanningTransferAccumulator& pressure) {
     PlanningTransferAccumulator request;
     request.append(candidate.transfer_requirements);
 
@@ -104,7 +107,7 @@ materialization_machine_work(const ResourceCandidateState& candidate,
 inline runtime::MaterializationMachineWork materialization_machine_work(
     const ResourceCandidateState& candidate,
     std::span<const qwen3_5::detail::PressureDecision* const> private_decisions,
-    std::span<const qwen3_5::detail::PressureDecision* const> shared_decisions) noexcept {
+    std::span<const qwen3_5::detail::PressureDecision* const> shared_decisions) {
     PlanningTransferAccumulator pressure;
     for (const qwen3_5::detail::PressureDecision* decision : private_decisions) {
         if (decision != nullptr) { pressure.append(decision->transfer_requirements); }
@@ -117,7 +120,7 @@ inline runtime::MaterializationMachineWork materialization_machine_work(
 
 inline runtime::CheckpointRecoveryAlternativeWork
 recovery_alternative_work(std::span<const runtime::ContextTransferRequirement> requirements,
-                          runtime::PrefillWork prefill_work = {}) noexcept {
+                          runtime::PrefillWork prefill_work = {}) {
     PlanningTransferAccumulator transfer;
     transfer.append(requirements);
     return runtime::CheckpointRecoveryAlternativeWork{

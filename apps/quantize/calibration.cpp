@@ -140,6 +140,10 @@ public:
     void observe_expert(int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
         const Key key = make_key(Site::MoeActivation, layer, expert);
         if (!names_.contains(key)) { return; }
+        // The tap delivers BF16 rows, so the gather below sizes them at two bytes an element;
+        // anything else is dropped here rather than mis-copied (accumulate() would reject it, but
+        // only after the copy had already run).
+        if (rows.dtype != ninfer::DType::BF16) { return; }
         const std::size_t row_bytes = static_cast<std::size_t>(rows.ne[0]) * 2;
         const std::size_t need      = row_bytes * static_cast<std::size_t>(rows.ne[1]);
         if (need > gather_bytes_) {
@@ -288,7 +292,10 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         }
     }
     std::map<int, std::uint64_t> layer_bytes;
-    for (const auto& [key, bytes] : site_bytes) { layer_bytes[key[1]] += bytes; }
+    for (const auto& [key, bytes] : site_bytes) {
+        // The MTP sentinel layer (-1) never runs in the scoring pass; its Hessians come from the
+        // generation pass below, so it must not consume the scoring budget.
+        if (key[1] < 0) { continue; } layer_bytes[key[1]] += bytes; }
     if (names.empty()) {
         throw std::runtime_error("weights artifact has no calibratable Text projections");
     }

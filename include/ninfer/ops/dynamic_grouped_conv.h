@@ -53,8 +53,10 @@ namespace ninfer::ops {
  *
  * Effects:
  *   Writes every element of prepared and finish_delta and preserves every input. Inputs, the
- *   weight payload, both outputs, and live workspace must be pairwise non-overlapping. The Op has
- *   no persistent state side effect.
+ *   weight payload, both outputs, and live workspace must be pairwise non-overlapping, and every
+ *   operand pointer is 16-byte aligned. A shape, alignment, overlap, or domain violation, or a
+ *   non-positive/non-finite eps, throws std::invalid_argument. The Op has no persistent state
+ *   side effect.
  *
  * Workspace:
  *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does
@@ -103,7 +105,8 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  * Effects:
  *   Updates every element of residual in place and preserves x, projection_weight, base_kernel,
  *   and finish_delta. All operand storage, both weight planes, and live workspace must be pairwise
- *   non-overlapping. The Op has no persistent state side effect.
+ *   non-overlapping and 16-byte aligned. A shape, alignment, or overlap violation throws
+ *   std::invalid_argument. The Op has no persistent state side effect.
  *
  * Workspace:
  *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does

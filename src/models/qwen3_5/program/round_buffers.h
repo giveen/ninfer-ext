@@ -13,7 +13,6 @@
 namespace ninfer::models::qwen3_5 {
 
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 7;
-inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
 // Widest verify frame the MTP round machinery carries. MTP itself drafts at most seven tokens (the
 // MTP layer's domain); a prompt-lookup round verifies up to this many and skips the MTP draft
 // phases, so the transfer arrays are sized for it while an MTP state binds a narrower prefix of the
@@ -295,7 +294,9 @@ struct MtpDecodeState {
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
-    // EAGLE3 only: the fused encoder input captured by the target verify feature sink.
+    // EAGLE3 only: the fused encoder input captured by the target verify feature sink. Both tensors
+    // are bound only when the layout set `eagle3_features`; on other backends the layout leaves the
+    // optional empty and these stay default-constructed (null data).
     Tensor features;
     // EAGLE3 only: the feature-sink row-to-slot map.
     Tensor feature_lanes;

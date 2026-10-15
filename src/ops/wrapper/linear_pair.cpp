@@ -104,7 +104,11 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     if (x.ne[0] != 5120 && x.ne[0] != 2048) {
         throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");
     }
-    require_matrix(x, x.ne[0], cols, "x");
+    // x's own extents are the only shape it can have here, so check its layout only.
+    if(x.dtype != DType::BF16 || x.ne[2] != 1 || x.ne[3] != 1 || !x.is_contiguous() ||
+        !aligned_to(x.data, 16)) {
+        throw std::invalid_argument("linear_pair: invalid x");
+    }
     require_matrix(first_out, 1024, cols, "first output");
     require_matrix(second_out, 1024, cols, "second output");
     if (first_weight.k != x.ne[0]) {

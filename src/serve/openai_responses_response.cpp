@@ -414,7 +414,7 @@ std::vector<std::string> OpenAIResponsesEventStream::start() {
 }
 
 std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::string& text) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
@@ -429,7 +429,7 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
 }
 
 std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::string& text) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid content delta event state");
     }
     if (text.empty()) { return {}; }
@@ -448,7 +448,7 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
 }
 
 OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid Responses stream finish state");
     }
     impl_->finish_built = true;

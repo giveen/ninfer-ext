@@ -26,6 +26,11 @@ public:
     ~GrammarSession();
     GrammarSession(GrammarSession&&) noexcept;
     GrammarSession& operator=(GrammarSession&&) noexcept;
+    // Lookahead transaction: `words` receives one token bitmask per draft position plus a final
+    // position, and the return value is the bitmask of the positions found dead. The matcher is
+    // rolled back, so the call never advances the session. Requires drafts.size() < 32, no
+    // tentative token in flight and words.size() == (drafts.size() + 1) * mask_words(); otherwise
+    // it throws std::logic_error.
     [[nodiscard]] std::uint32_t masks(std::span<const std::int32_t> drafts,
                                       std::span<std::uint32_t> words);
     void accept(std::int32_t token);
@@ -51,6 +56,9 @@ public:
     // Empty entries explicitly identify forbidden/special IDs. EOS is supplied separately.
     GrammarCompiler(std::vector<std::string> vocabulary, std::vector<std::int32_t> eos,
                     std::size_t cache_bytes);
+    // Non-copyable (unique Impl); movable like GrammarSession. Defined where Impl is complete.
+    GrammarCompiler(GrammarCompiler&&) noexcept;
+    GrammarCompiler& operator=(GrammarCompiler&&) noexcept;
     ~GrammarCompiler();
     [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           std::string_view reasoning_close,

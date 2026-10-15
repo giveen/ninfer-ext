@@ -140,7 +140,6 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     const std::size_t private_checkpoint_capacity =
         2U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (private_checkpoint_capacity > std::numeric_limits<std::size_t>::max() - 3U ||
-        private_checkpoint_capacity != 0 &&
             private_checkpoint_capacity >
                 std::numeric_limits<std::size_t>::max() / (private_checkpoint_capacity + 3U)) {
         throw std::overflow_error("pressure recovery alternative capacity overflow");

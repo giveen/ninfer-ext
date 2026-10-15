@@ -13,8 +13,6 @@ struct Q8LinearGeometry {
     static constexpr std::int32_t kOutputRows    = OutputRows;
     static constexpr std::int32_t kInputRows     = InputRows;
     static constexpr std::int32_t kGroupsPerRow  = InputRows / 32;
-    static constexpr std::int32_t kCodeRowBytes  = InputRows;
-    static constexpr std::int32_t kScaleRowBytes = kGroupsPerRow * sizeof(std::uint16_t);
 };
 
 } // namespace ninfer::ops::detail

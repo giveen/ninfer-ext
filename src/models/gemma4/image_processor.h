@@ -30,7 +30,8 @@ struct PreparedImage {
 };
 
 // The resized (height, width) for an image of `height` x `width` pixels. Throws
-// std::invalid_argument for an image the reference cannot resize (both sides rounding to zero).
+// std::invalid_argument when a side is not positive, when both sides round to zero, or when the
+// resize would exceed the patch budget.
 struct ImageSize {
     int height = 0;
     int width  = 0;

@@ -101,7 +101,9 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
     const std::int32_t cols = x.ne[1];
     const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
     const std::int32_t tail = cols - wide;
-    if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
+    // Only the MmaResidualR64T128Tail route calls this, whose column domain starts at 513, so the
+    // wide slab always covers at least one full wave.
+    if ( tail == 0 || tail > kNarrowTailCols) {
         q5_linear_add_mma_r64_t128_launch(x, w, residual_out, stream);
         return;
     }
@@ -186,7 +188,6 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
-    (void)ws;
 
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:

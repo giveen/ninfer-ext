@@ -37,7 +37,7 @@ std::uint64_t splitmix64(std::uint64_t value) {
 bool is_prime(std::uint64_t value) {
     if (value < 2) { return false; }
     if (value % 2 == 0) { return value == 2; }
-    for (std::uint64_t divisor = 3; divisor * divisor <= value; divisor += 2) {
+    for (std::uint64_t divisor = 3; divisor <= value / divisor; divisor += 2) {
         if (value % divisor == 0) { return false; }
     }
     return true;

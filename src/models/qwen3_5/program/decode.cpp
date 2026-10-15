@@ -98,15 +98,6 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
-                                         std::uint32_t frontier, const char* label);
-
-DecodeGraphTopology& select_graph_topology(DecodeGraphFamily& family, std::uint32_t topology_class,
-                                           const char* label);
-
-DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGraphProfile& profile,
-                                             const char* label);
-
-DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label) {
     const auto it = std::ranges::find_if(family.profiles, [&](const DecodeGraphProfile& profile) {
         return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
@@ -180,15 +171,6 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
-}
-
-void ProgramImpl::require_unmasked_round(runtime::TokenMaskProvider* masks,
-                                         std::span<const std::uint32_t> lanes) const {
-    for (std::size_t row = 0; row < lanes.size(); ++row) {
-        if (masks != nullptr && masks->constrained(row)) {
-            throw std::logic_error("constrained decoding is not implemented for this round");
-        }
-    }
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -740,7 +722,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     stats.lookup_drafted_by_match_bucket[bucket] += lookup;
                     stats.lookup_accepted_by_match_bucket[bucket] +=
                         static_cast<std::uint64_t>(accepted_i);
-                } else if (pcur > 0) {
+                } else {
                     // A zero-extent round verifies no draft position, so it carries no evidence.
                     sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
                 }
@@ -956,9 +938,7 @@ ProgramImpl::decode_eagle3_batch(std::span<const std::uint32_t> lanes,
                 stats.rounds_by_draft_length[k - 1U] += 1;
                 stats.drafted_tokens += pcur;
                 stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                if (pcur > 0) {
                     sequence.mtp_acceptance.observe(pcur, static_cast<std::uint32_t>(accepted_i));
-                }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
                 }
@@ -1181,6 +1161,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 request.speculative_stats.fallback_steps += 1;
             } else {
                 request.speculative_stats.rounds += 1;
+                request.speculative_stats.rounds_by_draft_length[extent - 1U] += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
                 for (std::int32_t i = 0; i < accepted_i; ++i) {

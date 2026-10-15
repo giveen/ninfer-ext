@@ -48,7 +48,7 @@ struct ProfileOption {
     }
     std::vector<ProfileOption> result;
     for (const auto& [key, value] : options->items()) {
-        if (key.empty() || key.rfind("--", 0) == 0) {
+        if (key.empty() || key.front() == '-') {
             throw std::invalid_argument(
                 "--profile option names omit the leading dashes, got: " + key);
         }

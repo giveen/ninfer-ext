@@ -390,13 +390,19 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,
                                                           std::int32_t max_cols) {
-    std::size_t maximum =
-        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw
+    std::invalid_argument("BF16 GDN gating: invalid column interval");
+    }
     if (heads == 48 && input_rows == 5120) {
+        // The fused route replaces the composed control up to 42 columns, so the control's own
+        // capacity is only needed above that point.
         if (max_cols <= 42) return 0;
         return bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, std::max(min_cols, 43),
                                                         max_cols);
     }
+    std::size_t maximum =
+        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
         const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
         maximum                       = std::max(

@@ -82,6 +82,17 @@ public:
         }
     };
 
+    // The context-cache capacities are optional at the EngineOptions boundary and the factory
+    // normally engages them, so a disengaged value would throw std::bad_optional_access from the
+    // member initializer list, before the constructor body could report the mismatch.
+    [[nodiscard]] static std::uint32_t
+    require_admission_capacity(const std::optional<std::uint32_t>& value) {
+        if (!value) {
+            throw std::logic_error("target admission capacity does not match the Engine");
+        }
+        return *value;
+    }
+
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
@@ -89,18 +100,16 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
-                     options.context_cache.max_shared_prefixes.value(),
+          resources_(max_concurrency_,
+                     require_admission_capacity( options.context_cache.max_private_continuations),
+                     require_admission_capacity(
+                     options.context_cache.max_shared_prefixes),
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
                      std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
-        }
-        if (!options.context_cache.max_private_continuations ||
-            !options.context_cache.max_shared_prefixes) {
-            throw std::logic_error("target admission capacity does not match the Engine");
         }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();

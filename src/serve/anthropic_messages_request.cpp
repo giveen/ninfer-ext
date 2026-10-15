@@ -2,6 +2,7 @@
 #include "serve/request_validation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <limits>
 #include <iterator>
@@ -109,7 +110,12 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     }
     if (type == "url") {
         result.value = require_string(source, "url", "messages", "URL image source");
-        if (!result.value.starts_with("http://") && !result.value.starts_with("https://")) {
+        // URI schemes are case-insensitive (RFC 3986), so `HTTP://host/x.png` is a valid URL.
+        std::string scheme = result.value.substr(0, 8);
+        for (char& character : scheme) {
+            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+        }
+        if (!scheme.starts_with("http://") && !scheme.starts_with("https://")) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
         result.kind = ninfer::product::media_acquire::SourceKind::Url;
@@ -809,7 +815,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
     }
     if (selection.kind == ToolSelectionKind::Any) {
         if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        request.tool_choice.mode = ToolChoiceMode::Required;
     }
 
     request.tool_choice.mode = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None

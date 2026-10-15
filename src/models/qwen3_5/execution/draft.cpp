@@ -60,7 +60,6 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
                                             DFlashFeatureSink::PrefillConsumer consume_prefill) {
     {
         require_dflash_state(state);
-        const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
         return DFlashFeatureSink{
             .features        = &dflash_state(state).prefill_features,
@@ -75,7 +74,6 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
                                           const Tensor& valid_columns, std::int32_t width,
                                           std::int32_t batch_size) {
     {
-        const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
         return DFlashFeatureSink{
             .batch_features      = &dflash_state(state).pending_features,

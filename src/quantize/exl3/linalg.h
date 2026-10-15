@@ -10,8 +10,12 @@ namespace ninfer::quantize::exl3 {
 
 // C[m][n] = A[m][k] * B[k][n]            (transpose_b = false)
 // C[m][n] = A[m][k] * B[n][k]ᵀ           (transpose_b = true)
+// a/b/c must be device pointers; throws std::invalid_argument if m, n or k is not positive.
 void gemm(const float* a, const float* b, float* c, std::int64_t m, std::int64_t n, std::int64_t k,
           bool transpose_b, cudaStream_t stream);
+
+// The element-wise helpers below do not validate their dimensions: `count`/`rows`/`cols` must be
+// positive (a zero would launch a zero-block kernel), and every pointer is a device pointer.
 
 // x[r][c] *= row[r] (row may be null) and *= col[c] (col may be null).
 void scale_rows_cols(float* x, std::int64_t rows, std::int64_t cols, const float* row,

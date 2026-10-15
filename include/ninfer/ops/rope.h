@@ -9,20 +9,21 @@ namespace ninfer::ops {
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_pairs), angle phi(i,t), and
  * each head:
  *
- *   ideal[i]              = x[i] * cos(phi) - x[i+R/2] * sin(phi)
- *   ideal[i+rotary_dim/2] = x[i+R/2] * cos(phi) + x[i] * sin(phi).
+ *   ideal[i]              = x[i] * cos(phi) - x[i+rotary_dim/2] * sin(phi)
+ *   ideal[i+rotary_dim/2] = x[i+rotary_dim/2] * cos(phi) + x[i] * sin(phi).
  *
- * `rotary_pairs` is the number of rotated pairs, in [1,rotary_dim/2] and at most 128. The
- * frequency denominator remains rotary_dim, so a partial profile rotates its leading pairs at the
- * full rotary span's frequencies rather than at its own span's. Pairs in
+ * `rotary_pairs` is the number of rotated pairs, in [1,rotary_dim/2] and at most 128. The Text
+ * frequency denominator remains rotary_dim, so a partial Text profile rotates its leading pairs at
+ * the full rotary span's frequencies rather than at its own span's (Vision instead uses
+ * rotary_dim/2, below). Pairs in
  * [rotary_pairs,rotary_dim/2) and their partners in [rotary_dim/2+rotary_pairs,rotary_dim) are
  * bit-exact unchanged, and so are dimensions [rotary_dim,head_dim). Supported modes are:
  *
  * - Text 1-D: positions I32 [T], head_dim=256 with even 0<rotary_dim<=256, or the DFlash
  *   full-head domain head_dim=rotary_dim=128, or the proportional domain
  *   head_dim=rotary_dim=512; phi=positions[t]*theta^(-2*i/rotary_dim).
- * - Text MRoPE: positions I32 [T,3], head_dim=256, rotary_dim=64 and rotary_pairs=32; pair i
- *   uses axis i%3 with the same frequency as Text 1-D.
+ * - Text MRoPE: positions I32 [T,3], head_dim=256, rotary_dim=64 and rotary_pairs in [1,32]
+ *   (32 in the registered models); pair i uses axis i%3 with the same frequency as Text 1-D.
  * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=72 and rotary_pairs=36; pairs 0..17 use
  *   axis 0 and pairs 18..35 use axis 1, each with local frequency theta^(-2*(i%18)/36).
  *

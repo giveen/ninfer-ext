@@ -50,9 +50,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     }
     if (request.seed) {
         sampling.seed = *request.seed;
-    } else if (server.sampling_overrides.seed) {
-        sampling.seed = *server.sampling_overrides.seed;
-    } else {
+    } else if (!sampling.seed) {
+        // `sampling` already carries the server-default seed when it has one.
         sampling.seed = random_seed();
     }
 

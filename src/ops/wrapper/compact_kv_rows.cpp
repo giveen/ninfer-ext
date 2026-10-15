@@ -28,6 +28,14 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
+// The contract excludes shared storage between out and the gather sources; v and k may alias.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void compact_kv_rows(const Tensor& v, const Tensor& k, Tensor& out, std::int32_t rotary_dim,
@@ -59,6 +67,9 @@ void compact_kv_rows(const Tensor& v, const Tensor& k, Tensor& out, std::int32_t
     }
     if (v.data == nullptr || k.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("compact_kv_rows: v/k/out data must be non-null");
+    }
+    if (overlaps(out, v) || overlaps(out, k)) {
+        throw std::invalid_argument("compact_kv_rows: out must not overlap v or k");
     }
 
     detail::compact_kv_rows_launch(v, k, out, rotary_dim, rotary_pairs, stream);

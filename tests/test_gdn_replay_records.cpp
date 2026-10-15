@@ -120,6 +120,45 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
     failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
 
+    const ninfer::GdnReplayRecords narrowed = records.with_width(2);
+    failures += expect(narrowed.conv.data == records.conv.data, "narrowed conv base differs");
+    failures += expect(narrowed.key.data == records.key.data, "narrowed key base differs");
+    failures += expect(narrowed.value.data == records.value.data, "narrowed value base differs");
+    failures += expect(narrowed.gate.data == records.gate.data, "narrowed gate base differs");
+    failures += expect(narrowed.conv.dtype == ninfer::DType::BF16, "narrowed conv dtype differs");
+    failures += expect(narrowed.gate.dtype == ninfer::DType::FP32, "narrowed gate dtype differs");
+    failures += expect_shape(narrowed.conv, 256, 2, 15, 1, "narrowed conv plane");
+    failures += expect_shape(narrowed.key, 128, 2, 2, 15, "narrowed key plane");
+    failures += expect_shape(narrowed.value, 128, 6, 2, 15, "narrowed value plane");
+    failures += expect_shape(narrowed.gate, 2, 6, 2, 15, "narrowed gate plane");
+    failures += expect_size(narrowed.conv.bytes(), 256 * 2 * 15 * 2, "narrowed conv bytes");
+    failures += expect_size(narrowed.key.bytes(), 128 * 2 * 2 * 15 * 2, "narrowed key bytes");
+    failures += expect_size(narrowed.value.bytes(), 128 * 6 * 2 * 15 * 2, "narrowed value bytes");
+    failures += expect_size(narrowed.gate.bytes(), 2 * 6 * 2 * 15 * 4, "narrowed gate bytes");
+    failures +=
+        expect_size(static_cast<std::size_t>(narrowed.spec.width), 2, "narrowed spec width");
+
+    const auto narrowed_layer = narrowed.layer(1, 2);
+    failures += expect_shape(narrowed_layer.conv, 256, 2, 2, 1, "narrowed layer conv slice");
+    failures += expect_shape(narrowed_layer.key, 128, 2, 2, 2, "narrowed layer key slice");
+    failures += expect_shape(narrowed_layer.value, 128, 6, 2, 2, "narrowed layer value slice");
+    failures += expect_shape(narrowed_layer.gate, 2, 6, 2, 2, "narrowed layer gate slice");
+    failures +=
+        expect(static_cast<std::byte*>(narrowed_layer.key.data) -
+                       static_cast<std::byte*>(narrowed.key.data) ==
+                   static_cast<std::ptrdiff_t>(1 * spec.record_capacity * narrowed.key.nb[3]),
+               "narrowed layer key slice offset differs");
+
+    // The planned width leaves the view unchanged; widths outside [2, planned] are rejected.
+    const ninfer::GdnReplayRecords full = records.with_width(spec.width);
+    failures += expect_shape(full.conv, 256, 4, 15, 1, "planned-width conv plane");
+    failures += expect_shape(full.key, 128, 2, 4, 15, "planned-width key plane");
+    failures += expect_size(full.conv.bytes(), records.conv.bytes(), "planned-width conv bytes");
+    failures += expect_throw([&] { (void)records.with_width(1); }, "width below two");
+    failures += expect_throw([&] { (void)records.with_width(0); }, "zero width");
+    failures +=
+        expect_throw([&] { (void)records.with_width(spec.width + 1); }, "width above the plan");
+
     failures += expect_size(record_bytes({.layers          = 48,
                                           .record_capacity = 8,
                                           .width           = 6,

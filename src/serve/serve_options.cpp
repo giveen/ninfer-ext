@@ -3,13 +3,10 @@
 #include "product/serve_profile.h"
 #include "product/speculative_options.h"
 
-#include <nlohmann/json.hpp>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -88,10 +85,13 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--generation-token-trace-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2|eagle3 --draft-tokens N] "
-           "[--fixed-draft] [--draft-tree N] [--lookup-drafts off|auto|always] [--lookup-min-match N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2|eagle3 --draft-tokens "
+           "N] "
+           "[--fixed-draft] [--draft-tree N] [--lookup-drafts off|auto|always] [--lookup-min-match "
+           "N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--no-auto-system-shared-prefix] [--kv-stream] "
+           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--no-auto-system-shared-prefix] "
+           "[--kv-stream] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--tolerant-tool-calls] "
            "[--cors] "
@@ -124,19 +124,23 @@ std::string serve_usage_text(const char* argv0) {
            "       --ngram-residency reads the Qwen4Exp n-gram table through the page cache "
            "(mapped) or with batched direct I/O (stream); auto maps it when host memory allows\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       --kv-stream lets --kv-capacity be below --max-context: each request owns an equal "
+           "       --kv-stream lets --kv-capacity be below --max-context: each request owns an "
+           "equal "
            "share, borrows idle shares, and moves older full pages to Host KV (--host-kv-mib) "
-           "beyond that, reserving Host KV at admission for prompt plus output limit beyond the share; "
+           "beyond that, reserving Host KV at admission for prompt plus output limit beyond the "
+           "share; "
            "reused context keeps its older pages in Host KV\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,7), anchors=4; Host state=8 slots, Host KV=8192 MiB\n"
-           "       --host-cache-mib sizes the whole Host cache tier from one pinned-RAM ceiling and replaces --host-state-slots and --host-kv-mib\n"
+           "       --host-cache-mib sizes the whole Host cache tier from one pinned-RAM ceiling "
+           "and replaces --host-state-slots and --host-kv-mib\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
-           "       --tolerant-tool-calls recovers a malformed terminal tool-call region's complete\n"
+           "       --tolerant-tool-calls recovers a malformed terminal tool-call region's "
+           "complete\n"
            "       calls instead of returning the whole response as content\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -169,12 +173,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
         redact_next = options.startup_argv.back() == "--api-key";
     }
-    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    // argv elements may be null (the startup-argv loop above treats them as empty), so read the
+    // first one once and reuse it.
+    const std::string first =argc >= 2 && argv[1] != nullptr ?std::string(argv[1]) : std::string{};
+    if (first == "--help" || first == "-h") {
         options.help_requested = true;
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path = argv[1];
+    options.artifact_path = first;
 
     // A `--profile` supplies the base options; every other command-line flag is applied after it,
     // so the command line always wins over the profile, whatever the argument order.
@@ -428,6 +435,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (arg == "--help" || arg == "-h") {
+            // Help in any position, not only as the first argument.
+            options.help_requested = true;
+            return options;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }

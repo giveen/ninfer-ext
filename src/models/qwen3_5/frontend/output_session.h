@@ -2,6 +2,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -40,7 +41,10 @@ public:
 
     [[nodiscard]] auto end(this auto& self) noexcept { return self.values_.begin() + self.size_; }
 
-    [[nodiscard]] auto& back(this auto& self) noexcept { return self.values_[self.size_ - 1]; }
+    // Precondition: the output is non-empty.
+
+    [[nodiscard]] auto& back(this auto& self) noexcept {
+        assert(self.size_ != 0 && "back() called on an empty PublishedOutput"); return self.values_[self.size_ - 1]; }
 
     void clear() noexcept;
     void push_back(OutputDelta value);

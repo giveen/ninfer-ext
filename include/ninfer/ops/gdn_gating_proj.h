@@ -64,7 +64,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
                      DeviceExecutionView execution);
 
 /**
- * Applies the Qwen3.6 GDN input RMSNorm and control projection as one semantic Op:
+ * Applies the Qwen3.6/Qwen3.8 GDN input RMSNorm and control projection as one semantic Op:
  *
  *   n[k,t]    = x[k,t] * rsqrt(mean_j(x[j,t]^2) + eps) * (1 + norm_weight[k])
  *   h_ideal[k,t] = n[k,t]
@@ -76,12 +76,13 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  * `h` is the explicit BF16 output consumed by the other GDN projections. Its BF16 values are
  * promoted and compared directly with `h_ideal`; final storage rounding is not reproduced inside
  * the oracle. The control branch is evaluated directly from `n` and is not required to round
- * through h. Private tensor-core operand staging remains an implementation choice. The tensor and
- * weight domains otherwise match the two-weight gdn_gating_proj form. The implementation may fuse
- * or compose its internal kernels for any positive T; that route is not observable at this
- * boundary. A contiguous [hidden,W,B] block is presented as the matrix with T=W*B; each
- * column has its own norm and controls. DFlash2 target verification uses W=2..16, B=1..8
- * (T<=128), without restricting the positive-T matrix contract.
+ * through h. Private tensor-core operand staging remains an implementation choice. `x` is
+ * contiguous BF16 [hidden,T] and `norm_weight` is contiguous BF16 [hidden]; eps must be positive
+ * and finite (a violation throws). The remaining tensor and weight domains otherwise match the
+ * two-weight gdn_gating_proj form. The implementation may fuse or compose its internal kernels for
+ * any positive T; that route is not observable at this boundary. A contiguous [hidden,W,B] block is
+ * presented as the matrix with T=W*B; each column has its own norm and controls. DFlash2 target
+ * verification uses W=2..16, B=1..8 (T<=128), without restricting the positive-T matrix contract.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,

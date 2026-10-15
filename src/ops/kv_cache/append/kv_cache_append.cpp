@@ -131,14 +131,14 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
         cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
         cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_tables.ne[0] <= 0 ||
         envelope.max_count >
-            static_cast<std::uint32_t>(cache.block_tables.ne[0]) * kPagedKVPageSize) {
+            static_cast<std::uint64_t>(cache.block_tables.ne[0]) *
+                                 static_cast<std::uint64_t>( kPagedKVPageSize)) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid paged cache");
     }
-    const std::int32_t physical_pages = cache.k_pages.ne[2];
     if (cache.k_pages.dtype != DType::BF16 || cache.v_pages.dtype != DType::FP16 ||
         cache.k_pages.ne[0] != kHeadDim || cache.k_pages.ne[1] != kPagedKVPageSize ||
         cache.k_pages.ne[3] != kKVHeads || cache.v_pages.ne[0] != kHeadDim ||
-        cache.v_pages.ne[1] != kPagedKVPageSize || cache.v_pages.ne[2] != physical_pages ||
+        cache.v_pages.ne[1] != kPagedKVPageSize ||
         cache.v_pages.ne[3] != kKVHeads || cache.k_scale_pages.data != nullptr ||
         cache.v_scale_pages.data != nullptr || cache.block_tables.dtype != DType::I32 ||
         cache.block_tables.ne[1] <= 0 || cache.block_tables.ne[2] != 1 ||

@@ -24,9 +24,6 @@ struct MtpAlignmentWindow {
     if (columns == 0 || chunk_begin >= prompt_tokens || columns > prompt_tokens - chunk_begin) {
         throw std::invalid_argument("MTP alignment window is outside the prompt");
     }
-    if (chunk_begin == std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("MTP shifted embedding position exceeds uint32");
-    }
     return MtpAlignmentWindow{
         .hidden_begin                      = chunk_begin,
         .position_begin                    = chunk_begin,
@@ -50,9 +47,9 @@ shifted_visual_overlap(std::span<const std::int32_t> scatter_indices, std::uint3
                        const MtpAlignmentWindow& window) {
     // VisionControl construction owns the sorted, unique, nonnegative scatter invariant. This
     // helper runs for every MTP prefill chunk and only resolves the dynamic shifted window.
-    if (window.columns == 0 || window.shifted_embedding_begin > prompt_tokens ||
-        window.columns > prompt_tokens - window.hidden_begin ||
-        window.shifted_embedding_begin != window.hidden_begin + 1) {
+    if (window.columns == 0 || window.hidden_begin >= prompt_tokens ||
+        window.shifted_embedding_begin != window.hidden_begin + 1 ||
+        window.columns > prompt_tokens - window.hidden_begin) {
         throw std::invalid_argument("MTP visual overlap received an invalid alignment window");
     }
 

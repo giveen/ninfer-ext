@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -105,6 +106,23 @@ void hc_mix(const TextConfig& config, const HyperConnectionParameters& p, const 
     project(roots.lowrank, p.up, roots.up, work, s);
     ops::hyper_connection_collapse(roots.up, roots.normalized, hc, x, s);
 }
+
+// Scratch blocks of qwen4_capture_all_experts, released with cudaFreeAsync on scope exit so a
+// throw between the allocations and the end of the function cannot leak them.
+struct AsyncExpertBlocks {
+    cudaStream_t stream = nullptr;
+    void* ids           = nullptr;
+    void* weights       = nullptr;
+    void* gate          = nullptr;
+    void* shared        = nullptr;
+    void* y             = nullptr;
+
+    ~AsyncExpertBlocks() {
+        for (void* block : {ids, weights, gate, shared, y}) {
+            if (block != nullptr) { (void)cudaFreeAsync(block, stream); }
+        }
+    }
+};
 
 } // namespace
 
@@ -387,6 +405,10 @@ void TextContext::qwen4_ple(const PleParameters& p, const Tensor& embedding, Pha
     std::int32_t W = T, B = 1;
     Tensor source_slots, destination_slots;
     if (ph == Phase::Verify) {
+        if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
+            throw std::logic_error(
+                "Verify PLE requires an explicit sequence batch and state slots");
+        }
         W            = active_sequence_width_;
         B            = active_sequence_batch_;
         source_slots = *active_linear_state_source_slots_;
@@ -512,22 +534,21 @@ void TextContext::qwen4_capture_all_experts(const Tensor& x, const ops::ExpertWe
                            H = ops::kOffloadMoeHidden, I = ops::kOffloadMoeIntermediate;
     const std::size_t routed = static_cast<std::size_t>(K) * T;
     const std::size_t wide   = static_cast<std::size_t>(H) * T;
-    void *ids_d = nullptr, *weights_d = nullptr, *gate_d = nullptr, *shared_d = nullptr,
-         *y_d = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&ids_d, routed * sizeof(std::int32_t), s));
-    CUDA_CHECK(cudaMallocAsync(&weights_d, routed * sizeof(float), s));
-    CUDA_CHECK(cudaMallocAsync(&gate_d, static_cast<std::size_t>(T) * sizeof(float), s));
-    CUDA_CHECK(cudaMallocAsync(&shared_d, wide * 2, s));
-    CUDA_CHECK(cudaMallocAsync(&y_d, wide * 2, s));
+    AsyncExpertBlocks blocks{s};
+    CUDA_CHECK(cudaMallocAsync(&blocks.ids, routed * sizeof(std::int32_t), s));
+    CUDA_CHECK(cudaMallocAsync(&blocks.weights, routed * sizeof(float), s));
+    CUDA_CHECK(cudaMallocAsync(&blocks.gate, static_cast<std::size_t>(T) * sizeof(float), s));
+    CUDA_CHECK(cudaMallocAsync(&blocks.shared, wide * 2, s));
+    CUDA_CHECK(cudaMallocAsync(&blocks.y, wide * 2, s));
     // Unit weights and a zero shared gate keep the scratch output finite; it is never consumed.
     const std::vector<float> ones(routed, 1.0F);
-    CUDA_CHECK(cudaMemcpyAsync(weights_d, ones.data(), routed * sizeof(float),
+    CUDA_CHECK(cudaMemcpyAsync(blocks.weights, ones.data(), routed * sizeof(float),
                                cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemsetAsync(gate_d, 0, static_cast<std::size_t>(T) * sizeof(float), s));
-    CUDA_CHECK(cudaMemsetAsync(shared_d, 0, wide * 2, s));
-    Tensor ids(ids_d, DType::I32, {K, T}), weights(weights_d, DType::FP32, {K, T});
-    Tensor gate(gate_d, DType::FP32, {T}), shared(shared_d, DType::BF16, {H, T});
-    Tensor y(y_d, DType::BF16, {H, T});
+    CUDA_CHECK(cudaMemsetAsync(blocks.gate, 0, static_cast<std::size_t>(T) * sizeof(float), s));
+    CUDA_CHECK(cudaMemsetAsync(blocks.shared, 0, wide * 2, s));
+    Tensor ids(blocks.ids, DType::I32, {K, T}), weights(blocks.weights, DType::FP32, {K, T});
+    Tensor gate(blocks.gate, DType::FP32, {T}), shared(blocks.shared, DType::BF16, {H, T});
+    Tensor y(blocks.y, DType::BF16, {H, T});
 
     std::vector<std::int32_t> host(routed);
     for (std::int32_t first = 0; first < E; first += K) {
@@ -539,7 +560,7 @@ void TextContext::qwen4_capture_all_experts(const Tensor& x, const ops::ExpertWe
                 host[static_cast<std::size_t>(t) * K + i] = first + std::min(i, valid - 1);
             }
         }
-        CUDA_CHECK(cudaMemcpyAsync(ids_d, host.data(), routed * sizeof(std::int32_t),
+        CUDA_CHECK(cudaMemcpyAsync(blocks.ids, host.data(), routed * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaStreamSynchronize(s)); // `host` is reused by the next pass
         const ops::MoeActivationTap tap = [&](const Tensor& act, const Tensor&, cudaStream_t st) {
@@ -555,11 +576,6 @@ void TextContext::qwen4_capture_all_experts(const Tensor& x, const ops::ExpertWe
         };
         ops::moe_experts(x, ids, ids, weights, gate, shared, staged, E, work_, y, s, nullptr, &tap);
     }
-    CUDA_CHECK(cudaFreeAsync(ids_d, s));
-    CUDA_CHECK(cudaFreeAsync(weights_d, s));
-    CUDA_CHECK(cudaFreeAsync(gate_d, s));
-    CUDA_CHECK(cudaFreeAsync(shared_d, s));
-    CUDA_CHECK(cudaFreeAsync(y_d, s));
 }
 
 void TextContext::qwen4_block(const Qwen4BlockParameters& p, Tensor& wide, Phase ph,

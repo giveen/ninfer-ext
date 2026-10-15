@@ -96,7 +96,11 @@ public:
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
             return std::nullopt;
         }
-        for (const LogicalKVPageHandle page : membership) {
+        for (std::size_t index = 0; index < membership.size(); ++index) {const LogicalKVPageHandle page = membership[index];
+            // A repeated page would be pinned twice and then fail its second host attach, which
+            // publish() reports by terminating.
+            const auto prior = membership.first(index);
+            if (std ::find(prior.begin(), prior.end(), page) != prior.end()) { return std::nullopt; }
             const bool pinnable =
                 demotion ? pages.can_pin_demotion_source(page) : pages.can_pin_source(page);
             if (!pinnable || pages.host_resident(page)) { return std::nullopt; }

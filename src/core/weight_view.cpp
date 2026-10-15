@@ -385,6 +385,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
+    } else if (g.layout == QuantLayout::RowGroup) {
+        // One binary16 scale per group of 32 columns; see the RowGroup geometry branch.
+        out.scale_dtype = DType::FP16;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype         = DType::FP8_E4M3FN;
         out.weight_divisors     = region.parent->data + g.divisor_offset;

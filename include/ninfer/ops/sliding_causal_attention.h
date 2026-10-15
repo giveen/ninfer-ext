@@ -25,11 +25,13 @@ namespace ninfer::ops {
  * below it) opens the keys up to it: Gemma 4 gives every token of an image the block's last
  * position, so the image attends bidirectionally while the window's lower edge stays at each token.
  * A query row with no visible key writes exact BF16 zero, and the window may exceed the key count.
- * `window` is at most 4096, which is what keeps the visible keys in shared memory.
+ * `window` is in [1,4096], which is what keeps the visible keys in shared memory, and `scale` must
+ * be positive and finite.
  *
  * `k_extra`, `v_extra` and `position_extra` ([D,Hkv,E,B] and [E,B]) are a second key set the same
  * formula covers, scanned after the first: a pass's own keys beside a ring that does not hold them
- * yet, so a pass may be wider than the ring's free slots. An empty `position_extra` means none.
+ * yet, so a pass may be wider than the ring's free slots. `position_extra` with a null data pointer
+ * (or no elements) means none; `position_q_high` means none only when its data pointer is null.
  *
  * The route is tensor-core flash attention (ops/kernel/gemma_flash_attention.cuh): blocks of 16
  * query rows that share a KV head stream 32-key tiles with an online Softmax, and a tile no row can

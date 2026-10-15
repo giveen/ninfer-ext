@@ -2,8 +2,12 @@
 
 // ninfer::ops::detail - private launch prototype for sample.
 
+#include "core/arena.h"
+
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
+
+#include <cstddef>
 
 #include <cstdint>
 

@@ -145,7 +145,6 @@ const char* finish_reason(ninfer::FinishReason reason) {
     case ninfer::FinishReason::Cancelled:
         return "stop";
     }
-    return "stop";
 }
 
 const char* finish_reason(const GenerationOutcome& outcome) {

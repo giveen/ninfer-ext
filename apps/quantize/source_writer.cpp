@@ -36,7 +36,11 @@ void write_safetensors(const std::filesystem::path& path,
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) { throw std::runtime_error("cannot write safetensors: " + path.string()); }
     const std::uint64_t header_size = header_text.size();
-    out.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+    // safetensors mandates a little-endian 64-bit header length; serialize it byte-wise so the file
+    // stays readable independently of the host's byte order.
+    for(std::size_t i = 0; i< sizeof(header_size); ++i) {
+        out.put(static_cast<char>((header_size >> (8U * i)) & 0xFFU));
+    }
     out.write(header_text.data(), static_cast<std::streamsize>(header_text.size()));
     // The offsets are already known, so each tensor streams straight out: quantized shards reach
     // hundreds of megabytes and buffering them would double peak host memory for no gain.

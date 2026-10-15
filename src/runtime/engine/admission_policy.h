@@ -32,6 +32,10 @@ struct AdmissionProtection {
     std::size_t donor_count = 0;
 };
 
+// Freezes the head's donor partition from the current active set. Throws std::invalid_argument
+// when the epoch, head request id or resource revision is zero, when `active` is empty or exceeds
+// kMaximumConcurrency, or when an active request id is zero, names the head, or repeats.
+
 [[nodiscard]] AdmissionProtection
 make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
                           ProgramResourceRevision resource_revision,
@@ -39,6 +43,9 @@ make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
 
 // Revalidates the frozen donor partition after Program topology changed. Current-epoch persistent
 // borrowers are never promoted to donors, so repeated backfill cannot move the head's frontier.
+// Throws std::invalid_argument on an invalid identity (zero epoch/head/revision) or a zero,
+// repeated or oversized active request set, and std::logic_error when an active request is neither
+// a frozen donor nor a current-epoch persistent borrower, or a frozen donor was relabelled as one.
 void rebind_admission_protection(AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
                                  ProgramResourceRevision resource_revision);

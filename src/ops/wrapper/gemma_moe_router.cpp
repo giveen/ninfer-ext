@@ -3,6 +3,8 @@
 
 #include "ops/launcher/gemma_moe_router.h" // detail::gemma_moe_router_launch
 
+#include <cmath>
+
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -60,7 +62,7 @@ void gemma_moe_router(const Tensor& x, const GemmaMoeRouterWeights& weights,
     if (experts > kMaxExperts) { fail("num_experts must be at most " + std::to_string(kMaxExperts)); }
     if (top_k <= 0 || top_k > experts) { fail("top_k must lie in [1, num_experts]"); }
     if (top_k > kMaxRanks) { fail("top_k must be at most " + std::to_string(kMaxRanks)); }
-    if (!(geometry.rms_norm_eps >= 0.0F)) { fail("rms_norm_eps must be nonnegative"); }
+    if (!(geometry.rms_norm_eps >= 0.0F) || !std::isfinite(geometry.rms_norm_eps)) { fail("rms_norm_eps must be nonnegative and finite"); }
 
     if (x.dtype != DType::BF16) { fail("x must be BF16"); }
     const std::int32_t tokens = x.ne[1];

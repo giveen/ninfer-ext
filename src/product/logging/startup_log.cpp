@@ -123,15 +123,13 @@ std::string begin_line(const PhasePresentation& phase, const StartupEvent& event
 
 std::string progress_line_candidate(const PhasePresentation& phase, const StartupEvent& event,
                                     const PhaseProgress& state, double ratio, std::size_t bar_width,
-                                    bool include_bytes, bool include_rate, bool include_eta) {
+                                    bool include_rate, bool include_eta) {
     std::ostringstream out;
     out << "  " << phase.active << ' ';
     if (bar_width != 0) { out << '[' << progress_bar(ratio, bar_width) << "] "; }
     out << format_pretty_percent(ratio);
-    if (include_bytes) {
         out << " | " << format_pretty_bytes(event.current) << '/'
             << format_pretty_bytes(event.total);
-    }
     if (include_rate && state.smoothed_bytes_per_second > 0.0) {
         out << " | "
             << format_pretty_bytes(static_cast<std::uint64_t>(state.smoothed_bytes_per_second))
@@ -145,19 +143,24 @@ std::string progress_line_candidate(const PhasePresentation& phase, const Startu
     return out.str();
 }
 
-std::string interactive_progress_line(const PhasePresentation& phase, const StartupEvent& event,
-                                      const PhaseProgress& state) {
-    const double ratio =
+// Shared by the terminal line and the persistent record so neither can report past 100%.
+double progress_ratio( const StartupEvent& event) noexcept {
+    return
         event.total == 0
             ? 0.0
             : std::clamp(static_cast<double>(event.current) / static_cast<double>(event.total), 0.0,
                          1.0);
+}
+
+std::string interactive_progress_line(const PhasePresentation& phase, const StartupEvent& event,
+                                      const PhaseProgress& state) {
+    const double ratio          = progress_ratio(event);
     const std::size_t columns   = terminal_columns();
     const std::array candidates = {
-        progress_line_candidate(phase, event, state, ratio, 20, true, true, true),
-        progress_line_candidate(phase, event, state, ratio, 16, true, true, false),
-        progress_line_candidate(phase, event, state, ratio, 12, true, false, false),
-        progress_line_candidate(phase, event, state, ratio, 0, true, false, false),
+        progress_line_candidate(phase, event, state, ratio, 20, true, true),
+        progress_line_candidate(phase, event, state, ratio, 16, true, false),
+        progress_line_candidate(phase, event, state, ratio, 12, false, false),
+        progress_line_candidate(phase, event, state, ratio, 0, false, false),
     };
     for (const std::string& candidate : candidates) {
         if (candidate.size() < columns) { return candidate; }
@@ -235,10 +238,9 @@ struct StartupLogRenderer::Impl {
             if (now - state.last_persistent < kPersistentRefresh) { return; }
             state.last_persistent = now;
             if (event.progress_unit == StartupProgressUnit::Bytes && event.total != 0) {
-                logger->info("{}", progress_line_candidate(presentation, event, state,
-                                                           static_cast<double>(event.current) /
-                                                               static_cast<double>(event.total),
-                                                           0, true, true, true));
+                const double ratio = progress_ratio(event);
+                logger->info("{}", progress_line_candidate(presentation, event, state, ratio,
+                                                           0, true, true));
             }
             return;
         }

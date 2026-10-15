@@ -13,8 +13,6 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
-
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -169,8 +167,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
 }
 
 void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVLayerView& cache,
-                       std::int32_t tokens, const char* op) {
-    const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
+                       std::int32_t kv_heads, std::int32_t tokens, const char* op) {
+    const std::uint32_t capacity = validate_cache(cache, kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity) {
@@ -208,7 +206,7 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     if (cache.num_kv_heads != kv_heads) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
-    validate_envelope(envelope, cache, tokens, op);
+    validate_envelope(envelope, cache, kv_heads, tokens, op);
 }
 
 void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions,

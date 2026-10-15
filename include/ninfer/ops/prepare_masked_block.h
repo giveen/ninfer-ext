@@ -11,8 +11,9 @@ namespace ninfer::ops {
 /**
  * Op: prepare a batch of finite anchor-and-mask query blocks.
  *
- * anchors, lengths, and valid_columns are distinct contiguous device I32 [B] vectors. ids and
- * positions are distinct contiguous I32 [W,B] outputs. For each batch row b:
+ * anchors, lengths, and valid_columns are contiguous device I32 [B] vectors; ids and positions are
+ * contiguous I32 [W,B] outputs. The two outputs must not overlap each other and neither input may
+ * overlap either output; the read-only inputs may alias one another. For each batch row b:
  *
  *   ids[0,b]       = anchors[b]
  *   ids[i,b]       = mask_id,                         1 <= i < W

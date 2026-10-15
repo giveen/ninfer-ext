@@ -78,8 +78,6 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
     }
     require_positions(position_q, "position_q", query_tokens, batch);
     require_positions(position_k, "position_k", key_tokens, batch);
-
-    if (q.numel() == 0) { return; }
     const Tensor* tensors[] = {&q, &kv, &position_q, &position_k, &out};
     for (const Tensor* tensor : tensors) {
         if (!tensor->is_contiguous()) {
@@ -103,6 +101,10 @@ std::size_t causal_compact_attention_workspace_bytes(AttentionHeadGeometry geome
                                                      std::int32_t key_tokens, std::int32_t batch) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("causal_compact_attention: invalid head geometry");
+    }
+    if (rotary_dim <= 0 || rotary_dim > kMaximumRotaryDim || rotary_dim != geometry.head_dim) {
+        throw std::invalid_argument(
+            "causal_compact_attention: rotary_dim must equal head_dim and be in [1,512]");
     }
     return detail::causal_compact_attention_workspace_bytes(rotary_dim, query_tokens,
                                                             geometry.query_heads,

@@ -16,6 +16,9 @@ enum class DType : std::uint8_t {
     FP8_E4M3FN = 7,
 };
 
+// Size in bytes of one element of `dtype`; throws std::invalid_argument for an unrecognized DType.
+[[nodiscard]]
+
 std::size_t dtype_size(DType dtype);
 
 } // namespace ninfer

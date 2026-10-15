@@ -8,6 +8,10 @@
 
 namespace ninfer::ops::detail {
 
+// `select_q5_launch` throws std::invalid_argument for T <= 0, an unsupported (n,k) shape or an
+// invalid policy; `q5_dispatch` passes weight.n/weight.k and x.ne[1] through and so throws the
+// same way. Neither is noexcept.
+
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t);
 Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy);
 

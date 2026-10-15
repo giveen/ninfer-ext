@@ -1,5 +1,10 @@
 #pragma once
 
+// Private launch prototypes (host/cu only; not public api). Every Tensor is a device buffer,
+// `configs`/`id_map` are device pointers, and each launcher assumes the wrapper has already
+// validated shapes/contiguity and device residency. `workspace` is device memory sized for the
+// `token_domain`/`columns` configuration. The launches are asynchronous on `stream`.
+
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 
@@ -37,6 +42,8 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
                                      std::int32_t n, cudaStream_t stream);
 
 void mask_selected_logits_launch(Tensor& logits, const Tensor& selected, cudaStream_t stream);
+
+// accepted.ne[0] == winners.ne[0] * tree_width, with winners.ne[0] the batch.
 
 void select_tree_winners_launch(const Tensor& accepted, Tensor& winners, std::int32_t tree_width,
                                 cudaStream_t stream);

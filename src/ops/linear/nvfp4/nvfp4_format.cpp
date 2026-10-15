@@ -5,33 +5,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops::detail {
-namespace {
-
-std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right, const char* operation) {
-    if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
-        throw std::overflow_error(std::string(operation) + ": NVFP4 geometry overflows");
-    }
-    return left * right;
-}
-
-std::uint64_t checked_add(std::uint64_t left, std::uint64_t right, const char* operation) {
-    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
-        throw std::overflow_error(std::string(operation) + ": NVFP4 geometry overflows");
-    }
-    return left + right;
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char* operation) {
-    return checked_mul(checked_add(value, alignment - 1, operation) / alignment, alignment,
-                       operation);
-}
-
-} // namespace
 
 Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* operation,
                                           bool stacked) {
@@ -39,20 +16,24 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         throw std::invalid_argument(std::string(operation) + ": NVFP4 requires N%128=0 and K%64=0");
     }
 
-    const std::uint64_t elements = checked_mul(static_cast<std::uint64_t>(weight.n),
+    const std::uint64_t elements = ninfer:: checked_mul(static_cast<std::uint64_t>(weight.n),
                                                static_cast<std::uint64_t>(weight.k), operation);
     Nvfp4WeightGeometry geometry{};
     geometry.code_plane_bytes           = elements / 2;
-    geometry.scale_plane_offset         = align_up(geometry.code_plane_bytes, 256, operation);
+    geometry.scale_plane_offset         =
+        ninfer:: align_up(geometry.code_plane_bytes, std::uint64_t{ 256}, operation);
     geometry.scale_plane_bytes          = elements / 16;
     const std::int32_t rows_per_divisor = weight.weight_divisor_rows;
     const bool divisor_shape = rows_per_divisor > 0 && (weight.n % rows_per_divisor) == 0 &&
                                (rows_per_divisor % 128) == 0 &&
                                (stacked || rows_per_divisor == weight.n);
-    geometry.required_payload_bytes = checked_add(
+    geometry.required_payload_bytes = ninfer:: checked_add(
+        ninfer::
         checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation),
+        ninfer::
         checked_mul(divisor_shape ? static_cast<std::uint64_t>(weight.n / rows_per_divisor) : 1,
-                    sizeof(float), operation),
+                            static_cast<std::uint64_t>(
+                    sizeof(float)), operation),
         operation);
 
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
@@ -70,7 +51,9 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     }
 
     const auto* payload = static_cast<const std::byte*>(weight.payload);
-    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset) {
+    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset ||
+        weight.weight_divisors !=
+            payload + geometry.scale_plane_offset + geometry.scale_plane_bytes) {
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 plane geometry");
     }
     return geometry;

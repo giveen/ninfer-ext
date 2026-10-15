@@ -65,7 +65,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * Algorithm:
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
  *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
- *   bonus column). With both penalties disabled, target_tokens is the exact raw-logit fast path.
+ *   bonus column). With both penalties disabled and no sampling mask, target_tokens is the exact
+ *   raw-logit fast path.
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
  *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft

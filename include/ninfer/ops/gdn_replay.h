@@ -27,13 +27,13 @@ struct GdnReplayFoldRow {
  * source_state_slot and destination_state_slot are in [0,states.spec.slot_count). A row may be
  * in-place. Destinations are distinct and cannot overwrite another active row's source.
  * source_state_slot is the absolute slot used to produce that row's records. commit_columns is in
- * [0,T]. Zero is a
- * strict no-op for the row: no record or state is read and neither recurrent state nor convolution
- * history is written. For a positive extent, the Op consumes raw key/value/{g,beta} records in
- * order, writes the final FP32 recurrent state, and sets convolution history to
- * tail_3(old_history || conv_record[0:commit_columns]). Both state regions must be bit-identical
- * to the corresponding Nth snapshot of the same full physical record-producing block, with the
- * same initial state and represented inputs. Projection is not re-evaluated at the commit width.
+ * [0,records.spec.width]. Zero is a strict no-op for the row: no record or state is read and
+ * neither recurrent state nor convolution history is written. For a positive extent, the Op
+ * consumes raw key/value/{g,beta} records in order, writes the final FP32 recurrent state, and sets
+ * convolution history to tail_3(old_history || conv_record[0:commit_columns]). Both state regions
+ * must be bit-identical to the corresponding Nth snapshot of the same full physical
+ * record-producing block, with the same initial state and represented inputs. Projection is not
+ * re-evaluated at the commit width.
  *
  * Construction validates the immutable record/state geometry, layout, address ranges and
  * disjointness once. execute() validates only active rows, state selectors and commit extents.

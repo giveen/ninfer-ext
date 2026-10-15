@@ -50,6 +50,11 @@ struct Bf16GdnNormGatingPlan {
     std::size_t workspace_bytes;
 };
 
+// `admits` and the schedule-name helpers are noexcept. The resolve and capacity helpers throw
+// std::invalid_argument on an inadmissible problem or an invalid column interval, and
+// std::logic_error when an admitted problem has no covering route. The admitted geometries are
+// heads=48 with input_rows=5120 and heads=32 with input_rows=2048, both with cols >= 1.
+
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept;
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;

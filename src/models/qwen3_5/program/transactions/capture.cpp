@@ -1196,6 +1196,8 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         };
         context_source_ready_.record(device.stream);
         context_source_ready_.wait(device.transfer_stream);
+        // The resource whose transfer timer is currently running, so an exception below stops it.
+        std::optional<runtime::ContextResourceClass> measuring;
         try {
             for (const runtime::ContextResourceClass resource : resources) {
                 bool has_copy = false;
@@ -1208,11 +1210,13 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                                                   runtime::ContextTransferDirection::DeviceToHost;
                                    });
                 });
-                if (has_copy) { start_context_transfer_timer(resource); }
+                if (has_copy) { start_context_transfer_timer(resource);
+                    measuring = resource; }
                 for_each_pending_pressure(
                     [&](auto& work) { prepare_pressure_work(work, resource); });
                 if (!has_copy) { continue; }
                 stop_context_transfer_timer(resource);
+                measuring.reset();
                 const std::size_t resource_index = context_resource_index(resource);
                 pressure_transition.timer_mask |= static_cast<std::uint8_t>(1U << resource_index);
                 for_each_pending_pressure([&](const auto& work) {
@@ -1254,6 +1258,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 });
             }
         } catch (...) {
+            if (measuring) { stop_context_transfer_timer(*measuring); }
             (void)cudaStreamSynchronize(device.transfer_stream);
             for_each_pending_pressure([&](auto& work) { abort_pressure_work(work); });
             throw;

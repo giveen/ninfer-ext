@@ -418,9 +418,7 @@ public:
         if (object.source_pins != 1 || object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
@@ -434,9 +432,7 @@ public:
             object.source_pins != 0 || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
@@ -676,9 +672,7 @@ public:
         if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
@@ -701,6 +695,18 @@ private:
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept {
         return object.pending_device_slot.has_value() || object.pending_host_slot.has_value() ||
                object.transfer_id != 0;
+    }
+
+    // The preflight predicates answer `false` for a host replica they cannot read, while
+    // HostStatePool reports a stale slot by throwing.
+    [[nodiscard]] bool
+    host_slot_usable(const std::optional<qwen3_5::HostStateSlotHandle>& slot) const {
+        if (!slot) { return true; }
+        if (host_ == nullptr) { return false; }
+        try {
+            (void)host_->view(*slot);
+        } catch (const std::invalid_argument&) { return false; }
+        return true;
     }
 
     [[nodiscard]] std::optional<StateImageHandle> allocate(StateImageRole role,

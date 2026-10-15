@@ -232,9 +232,6 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
-                                                 std::uint32_t token);
-
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
     if (token >= tokens || prompt.positions.size() != 3 * tokens) {

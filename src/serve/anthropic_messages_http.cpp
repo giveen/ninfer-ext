@@ -15,6 +15,18 @@ namespace ninfer::serve {
 
 namespace {
 
+// A 500 body carries no internal detail: the raw exception text can name filesystem paths or
+// parser state, and is already recorded by the caller on the operational log and the request
+// failure. The type is the protocol's valid 5xx type (Anthropic normalizes every 5xx to api_error
+// before rendering).
+[[nodiscard]] ApiError internal_server_error() {
+    ApiError error;
+    error.status  = 500;
+    error.type    = "internal_error";
+    error.message = "internal error";
+    return error;
+}
+
 class MessagesSseEncoder final : public SseStreamEncoder {
 public:
     MessagesSseEncoder(AnthropicResponseIdentity identity, int input_tokens, bool hide_thinking)
@@ -57,8 +69,9 @@ public:
         return normalize_anthropic_error(std::move(error));
     }
 
-    ApiError internal_error(const std::string& message) const override {
-        return ApiError{500, "invalid_request_error", message};
+    ApiError internal_error(const std::string&) const override {
+        // The driver passes the failure detail for the log only; the client gets a fixed message.
+        return internal_server_error();
     }
 
 private:
@@ -82,10 +95,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         operational_log_.http_failure(
             "anthropic_count_tokens",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, internal_server_error(), request_id);
     }
 }
 
@@ -105,10 +115,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         operational_log_.http_failure(
             "anthropic_messages",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, internal_server_error(), request_id);
         return;
     }
 
@@ -130,13 +137,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         write_anthropic_error(res, error, request_id);
         return;
     } catch (const std::exception& exception) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
+        // The rejection record keeps the failure detail; the client body does not.
+        ApiError logged;
+        logged.status  = 500;
+        logged.type    = "internal_error";
+        logged.message = exception.what();
         record_request_rejected(make_request_rejection_log_context(
-            req_id, "anthropic_messages", request.generation, metadata, error));
-        write_anthropic_error(res, error, request_id);
+            req_id, "anthropic_messages", request.generation, metadata, logged));
+        write_anthropic_error(res, internal_server_error(), request_id);
         return;
     }
 
@@ -159,10 +167,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->failure(
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, internal_server_error(), request_id);
             return;
         }
         lifecycle->done(outcome);
@@ -178,10 +183,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, internal_server_error(), request_id);
         }
         return;
     }

@@ -33,6 +33,9 @@ ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_checked_math_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_checked_math.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_layout_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_layout.cpp"
   LIBRARIES ninfer_core)
 

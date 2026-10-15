@@ -68,10 +68,6 @@ void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_
     if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
         throw std::invalid_argument("target_logprobs: valid_rows must be in [1, physical_rows]");
     }
-
-    (void)logits.bytes();
-    (void)target_ids.bytes();
-    (void)output.bytes();
     require_accessible(logits, alignof(std::uint16_t), "logits");
     require_accessible(target_ids, alignof(std::int32_t), "target_ids");
     require_accessible(output, alignof(float), "output");

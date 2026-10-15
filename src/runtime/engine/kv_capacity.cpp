@@ -39,6 +39,9 @@ std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
     }
     const std::uint64_t pages =
         1ULL + (static_cast<std::uint64_t>(policy.explicit_tokens) - 1ULL) / curve.main_page_tokens;
+    // Unreachable while explicit_tokens is uint32 and main_page_tokens is at least one: the
+    // quotient is below UINT32_MAX, so the sum cannot exceed it. Kept as the guard for a future
+    // widening of the input type.
     if (pages > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("explicit KV page count exceeds uint32");
     }

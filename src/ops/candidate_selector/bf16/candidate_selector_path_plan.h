@@ -1,11 +1,13 @@
 #pragma once
 #include "core/tensor.h"
-#include "core/layout.h"
 #include "core/arena.h"
 #include "ninfer/ops/sampling.h"
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
+// Candidate width of the lattice kernel, which indexes edges[(column * kSelectorCandidates + p) *
+// kSelectorCandidates + lane]; the edge buffer below is sized and laid out by it.
+inline constexpr int kSelectorCandidates = 16;
 enum class SelectorRoute { Direct, Lattice };
 
 struct SelectorWorkspace {
@@ -13,7 +15,6 @@ struct SelectorWorkspace {
 };
 
 SelectorRoute candidate_selector_path_route(int steps, int batch);
-const char* candidate_selector_path_route_name(int steps, int batch);
 const char* selector_route_name(SelectorRoute route);
 
 template <class Allocator>
@@ -21,7 +22,7 @@ SelectorWorkspace allocate_selector_workspace(Allocator& allocator, SelectorRout
                                               int batch) {
     SelectorWorkspace out;
     if (route == SelectorRoute::Lattice)
-        out.edges = allocator.alloc(DType::FP32, {16, 16, steps, batch}, 256);
+        out.edges = allocator.alloc(DType::FP32, {kSelectorCandidates, kSelectorCandidates, steps, batch});
     return out;
 }
 

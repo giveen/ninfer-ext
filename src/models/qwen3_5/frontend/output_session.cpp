@@ -6,6 +6,7 @@
 #include "text/grammar.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <limits>
 #include <optional>
 #include <stdexcept>

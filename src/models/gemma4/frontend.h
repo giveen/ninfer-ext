@@ -29,10 +29,6 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
-class Tokenizer;
-} // namespace ninfer::models::qwen3_5::frontend
-
 namespace ninfer::models::gemma4 {
 
 // The text resources a frontend is built from, owned: an artifact's bytes live only as long as the

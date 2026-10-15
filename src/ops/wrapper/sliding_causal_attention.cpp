@@ -99,8 +99,6 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
     }
 
-    const bool empty = q.numel() == 0;
-    if (empty) { return; }
     const Tensor* tensors[] = {&q, &k, &v, &position_q, &position_k, &out};
     for (const Tensor* tensor : tensors) {
         if (!tensor->is_contiguous()) {

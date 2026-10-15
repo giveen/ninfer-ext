@@ -69,8 +69,10 @@ LinearPolicy common_policy(std::span<const WeightInput> inputs) {
     return result;
 }
 
-SingleProjectionWeight single(std::span<const WeightInput> inputs) {
-    auto view         = concatenate_rows(inputs);
+// `view` is the caller's already-built concatenation of `inputs`, so its concatenate_rows and
+// geometry validation are reused rather than repeated.
+
+SingleProjectionWeight single_from_view(const WeightView& view,std::span<const WeightInput> inputs) {
     const auto region = contiguous_weight_region(view);
     const auto policy = common_policy(inputs);
     float divisor     = 0;
@@ -104,6 +106,10 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return {native_weight(view, divisor), policy};
 }
 
+SingleProjectionWeight single(std::span<const WeightInput> inputs) {
+    return single_from_view(concatenate_rows(inputs), inputs);
+}
+
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
     const auto& q      = matrix(inputs[0]);
     const auto& k      = matrix(inputs[1]);
@@ -122,7 +128,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     require(dense || moe, "input projection: unsupported logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
-        auto result       = single(inputs);
+        auto result       = single_from_view(joined,inputs);
         const auto format = result.weight.qtype;
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
@@ -214,17 +220,19 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
     require(matrix(router) == std::vector<std::uint64_t>{256, 2048} &&
                 matrix(shared_score) == std::vector<std::uint64_t>{1, 2048},
             "SparseMoe router geometry differs");
+    const std::vector<std::uint64_t> gate_up_shape{512, 2048};
+    const std::vector<std::uint64_t> down_shape{2048, 512};
     for (const auto& input : expert_gate_up) {
-        require(matrix(input) == std::vector<std::uint64_t>{512, 2048},
+        require(matrix(input) == gate_up_shape,
                 "SparseMoe gate/up geometry differs");
     }
     for (const auto& input : expert_down) {
-        require(matrix(input) == std::vector<std::uint64_t>{2048, 512},
+        require(matrix(input) == down_shape,
                 "SparseMoe down geometry differs");
     }
-    require(matrix(shared_gate) == std::vector<std::uint64_t>{512, 2048} &&
+    require(matrix(shared_gate) == gate_up_shape &&
                 matrix(shared_up) == matrix(shared_gate) &&
-                matrix(shared_down) == std::vector<std::uint64_t>{2048, 512},
+                matrix(shared_down) == down_shape,
             "SparseMoe shared expert geometry differs");
     const std::array router_inputs{router, shared_score};
     const auto router_bank        = single(router_inputs);
@@ -274,6 +282,11 @@ GemmaMoeExpertWeights prepare_gemma_moe_expert_weights(std::span<const WeightInp
             "gemma_moe_experts: the two banks must share one format");
     require(format == QType::BF16 || format == QType::NVFP4 || format == QType::Q4_G32_FP16_ROWS,
             "gemma_moe_experts: the banks must be BF16, NVFP4 or q4_g32_fp16_rows");
+    // The header's contract: no part may grant A4, since the Op decodes the codes itself and no
+    // activation-quantised route consumes them.
+    const auto no_a4 = [](const WeightInput& input) { return !allows_a4(input.policy); };
+    require(std::ranges::all_of(gate_up, no_a4) && std::ranges::all_of(down, no_a4),
+            "gemma_moe_experts: the parts must not grant A4");
     return {gate_up_bank.weight, down_bank.weight};
 }
 

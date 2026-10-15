@@ -170,7 +170,10 @@ using Clock = std::chrono::steady_clock;
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
-        error.code   = "request_queue_timeout";
+        // The request never waited in the queue: its media fetch/preparation deadline expired, so
+        // it must not be reported as a queue timeout. The media timeout code is also what
+        // make_request_failure classifies as a Timeout.
+        error.code   = "media_fetch_timeout";
         break;
     case ninfer::product::media_acquire::ErrorKind::Cancelled:
         throw_preparation_cancelled();

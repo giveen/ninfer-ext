@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -81,7 +82,8 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
         spec = &format["json_schema"];
         schema_param += ".json_schema";
     }
-    for (const auto& [key, value] : spec->items()) {
+    for (const auto& option : spec->items()) {
+        const std::string& key = option.key();
         const bool allowed =
             key == "schema" || (key == "type" && protocol != JsonFormatProtocol::Chat) ||
             (protocol != JsonFormatProtocol::Anthropic &&
@@ -193,7 +195,7 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
     if (request.constraint && request.uses_tools() &&
         request.constraint->kind != OutputConstraintKind::JsonObject &&
         request.constraint->kind != OutputConstraintKind::JsonSchema) {
-        bad_request("active tools can be combined with JSON output constraints",
+        bad_request("active tools can only be combined with JSON output constraints",
                     request.constraint_param);
     }
     if (request.constrains_tools() && !request.stop_strings.empty()) {

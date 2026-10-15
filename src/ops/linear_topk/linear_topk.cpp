@@ -173,9 +173,7 @@ void require_scratch_nonoverlap(const Tensor& hidden, const Tensor& candidate_id
 }
 
 Tensor column_slice(const Tensor& tensor, int first, int columns) {
-    return Tensor(static_cast<std::uint8_t*>(tensor.data) +
-                      static_cast<std::int64_t>(first) * tensor.nb[1],
-                  tensor.dtype, {tensor.ne[0], columns});
+    return tensor.slice(1, first, columns);
 }
 
 void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Tensor& ids,
@@ -198,8 +196,12 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         else if (profile == HeadProfile::Fp8Full)
             detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
                                            stream);
-        else
+        else {
+            if (id_map == nullptr) {
+                throw std::invalid_argument("linear_topk: Q4 profile requires an id map");
+            }
             detail::linear_topk_q4_launch(x, head, *id_map, scratch, stream);
+        }
         detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
         first += columns;
     }

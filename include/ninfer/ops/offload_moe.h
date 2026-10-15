@@ -150,7 +150,7 @@ struct ExpertCacheState {
     unsigned long long* statistics = nullptr; // [2]: hits, misses
     std::int32_t slots             = 0;
     std::int32_t layers            = 0;
-    std::byte* pool                = nullptr; // [slots, kExpertSlotBytes]
+    std::byte* pool                = nullptr; // [slots, layout.slot_bytes]
 };
 
 /**
@@ -228,6 +228,19 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * call's assignments in shared memory, or counts per slot when the pool has at most 4096 slots.
  */
 [[nodiscard]] std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept;
+struct MoeExpertsPending {
+    const Tensor* misses;
+    cudaEvent_t fetched;
+};
+
+/**
+ * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
+ * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
+ * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
+ * Serving never passes a tap.
+ */
+using MoeActivationTap =
+    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
 
 /**
  * Routed expert SwiGLU and down projections, routing-weight merge and shared expert:
@@ -246,19 +259,6 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * still be filling: the other assignments run first, then `stream` waits on `pending->fetched`
  * before the listed slots are read. The result is identical to a call made after the fetch.
  */
-struct MoeExpertsPending {
-    const Tensor* misses;
-    cudaEvent_t fetched;
-};
-
-/**
- * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
- * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
- * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
- * Serving never passes a tap.
- */
-using MoeActivationTap =
-    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
 
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,

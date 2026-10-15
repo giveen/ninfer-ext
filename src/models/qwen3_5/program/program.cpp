@@ -136,6 +136,7 @@ PressurePlanningSession::root_maximal_target(runtime::PlanningCandidateId root_c
 
 PressureTargetHandle
 PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->maximal_target(candidate);
 }
 
@@ -162,21 +163,25 @@ std::uint32_t PressurePlanningSession::optional_targets_remaining() const noexce
 
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->begin_construction(target, restore);
 }
 
 runtime::PressureConstructionStep
 PressurePlanningSession::next_construction_option(PressureConstructionCursor& cursor) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->next_construction_option(cursor);
 }
 
 void PressurePlanningSession::choose_construction(PressureConstructionCursor& cursor,
                                                   runtime::PressureConstructionOptionId option) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     impl_->choose_construction(cursor, option);
 }
 
 std::optional<PressureTargetHandle>
 PressurePlanningSession::construction_target(const PressureConstructionCursor& cursor) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->construction_target(cursor);
 }
 

@@ -15,7 +15,8 @@ DynamicConvPrepareRoute resolve_route(int tokens) {
 }
 
 std::size_t capacity(DynamicConvPrepareRoute route, int tokens) {
-    return static_cast<std::size_t>(1280) * tokens * route.split_k * sizeof(float);
+    return kPrepareCoefficientRows * static_cast<std::size_t>(tokens) *
+           static_cast<std::size_t>( route.split_k) * sizeof(float);
 }
 
 void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor& norm, float eps,
@@ -30,9 +31,10 @@ void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor
 }
 } // namespace
 
-std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int min_width, int max_width,
-                                                                       int min_batch,
-                                                                       int max_batch) {
+std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(std::int32_t min_width,
+                                                                       std::int32_t max_width,
+                                                                       std::int32_t min_batch,
+                                                                       std::int32_t max_batch) {
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
         max_batch > 8 || min_batch > max_batch)
         throw std::invalid_argument("dynamic grouped conv prepare workspace: invalid W/B interval");

@@ -196,6 +196,12 @@ struct RequestRecord {
     SpeculativeStats speculative_stats;
     MaterializationDiagnostics materialization_diagnostics;
 
+    // Guards the published stream state the worker writes and the consumer reads: `events`,
+    // `result`, `stream_start`, `stream_progress`, `error`, `response_done`, `consumer_released`
+    // and `capacity_released`. Every other member is worker-thread-only once the request is
+    // submitted (submit writes the request-owned fields before publishing it); `cancelled` is the
+    // one shared flag outside this mutex, and is atomic.
+
     std::mutex mutex;
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;

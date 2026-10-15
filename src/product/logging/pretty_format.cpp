@@ -1,5 +1,7 @@
 #include "product/logging/pretty_format.h"
 
+#include <algorithm>
+
 #include <array>
 #include <cmath>
 #include <format>
@@ -43,20 +45,49 @@ std::string format_pretty_count(std::uint64_t count) {
 
 std::string format_pretty_duration(double seconds) {
     if (!std::isfinite(seconds) || seconds < 0.0) { return "n/a"; }
-    if (seconds < 0.001) { return fixed(seconds * 1.0e6, 0) + " us"; }
+    // A sub-unit component rounded to its own unit's threshold must carry into the next unit
+    // (119.99 s must not print as "1m 60.0s"), so promote the value to that boundary and
+    // re-dispatch instead of printing the rounded component.
+    for (;;) {
+    if (seconds < 0.001) {
+            const double microseconds = std::round(seconds * 1.0e6);
+            if (microseconds >= 1000.0) {
+                seconds = 0.001;
+                continue;
+            }
+            return fixed(microseconds, 0) + " us"; }
     if (seconds < 1.0) {
         const double milliseconds = seconds * 1.0e3;
+            if (std::round(milliseconds) >= 1000.0) {
+                seconds = 1.0;
+                continue;
+            }
         const int precision       = milliseconds < 10.0 ? 2 : milliseconds < 100.0 ? 1 : 0;
         return fixed(milliseconds, precision) + " ms";
     }
-    if (seconds < 60.0) { return fixed(seconds, 1) + "s"; }
+    if (seconds < 60.0) {
+            const double rounded = std::round(seconds * 10.0) / 10.0;
+            if (rounded >= 60.0) {
+                seconds = 60.0;
+                continue;
+            } return fixed(rounded, 1) + "s"; }
     if (seconds < 3600.0) {
         const auto minutes = static_cast<std::uint64_t>(seconds / 60.0);
-        return std::to_string(minutes) + "m " + fixed(seconds - 60.0 * minutes, 1) + "s";
+            const double remainder = std::max(0.0, seconds - 60.0 * static_cast<double>(minutes));
+            if (std::round(remainder * 10.0) >= 600.0) {
+                seconds = 60.0 * static_cast<double>(minutes + 1);
+                continue;
+            }
+        return std::to_string(minutes) + "m " + fixed(remainder, 1) + "s";
     }
-    const auto hours   = static_cast<std::uint64_t>(seconds / 3600.0);
-    const auto minutes = static_cast<std::uint64_t>((seconds - 3600.0 * hours) / 60.0);
+        // Clamp before narrowing: a finite but huge duration does not fit in uint64_t.
+        constexpr double kMaxHours = 1.0e15;
+        const double capped        = std::min(seconds, 3600.0 * kMaxHours);
+    const auto hours   = static_cast<std::uint64_t>(capped / 3600.0);
+    const auto minutes = static_cast<std::uint64_t>(
+            std::max(0.0, capped - 3600.0 * static_cast<double>( hours)) / 60.0);
     return std::to_string(hours) + "h " + std::to_string(minutes) + "m";
+    }
 }
 
 std::string format_pretty_percent(double ratio) {

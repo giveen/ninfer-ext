@@ -509,7 +509,7 @@ VisionPrefillSession::VisionPrefillSession(
         previous_end  = use.end;
         previous_item = use.prepared_item_index;
     }
-    if (plan_.max_merged_count != 0 &&
+    if (
         std::ranges::none_of(plan_.control->items, [&](const qwen3_5::VisionItemControl& item) {
             return item.merged_count == plan_.max_merged_count;
         })) {

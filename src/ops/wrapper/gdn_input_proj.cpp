@@ -1219,9 +1219,7 @@ void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_wei
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     const ConvGeometry geometry       = require_record_input(conv_record, kChannels);
-    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                              initial_state_slots, kChannels,
-                              ConvGeometry{geometry.width, geometry.batch, 1});
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,geometry);
     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
                         "gdn_projected_conv_record", "query");
     require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, "gdn_projected_conv_record",

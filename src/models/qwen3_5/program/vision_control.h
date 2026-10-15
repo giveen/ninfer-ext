@@ -17,6 +17,10 @@ struct VisionItemControl {
     std::size_t merged_count    = 0;
     std::int32_t segment_length = 0;
     std::int32_t segment_count  = 0;
+    // These four buffers are copied straight into kernel memory, so their lengths are a device
+    // contract the producer must keep: position_ids is 2 * patch_count (a y block then an x block),
+    // scatter_indices is merged_count, and the position-table index and weight vectors are
+    // 4 * patch_count each (one entry per corner).
     std::vector<std::int32_t> position_ids;
     std::vector<std::int32_t> scatter_indices;
     std::vector<std::int32_t> position_table_indices;
