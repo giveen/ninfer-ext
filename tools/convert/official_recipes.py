@@ -741,7 +741,40 @@ def gemma4_26b_a4b_qat(model, recipe, sources):
             recipe.group(pair)
 
 
+def nemotron_h_74b_nvfp4(model, recipe, sources):
+    """Nemotron 3.5 Bolt 74B A9B from the BF16 checkpoint, in NVIDIA's own per-tensor assignment.
+
+    The routed and shared experts are NVFP4 -- E2M1 codes, E4M3 per-16-block scales, one FP32
+    divisor per bank -- quantized from full precision with ModelOpt's weight-MSE scale sweep. That
+    is **W4A16**: a full-precision source carries no calibrated activation divisor, and the engine
+    refuses an A4 use without one, so the banks report `A16Only` exactly as the released
+    `W4A16_NVFP4` Lightning checkpoint does. The Mamba mixer projections, the attention projections
+    and the head are the engine's FP8 W8A8 route (row-scaled, which is finer than the recipe's
+    per-tensor scale); the latent projections, the router, the embeddings, the norms and the Mamba
+    per-head vectors stay BF16, and the four scalars the scan and the router read stay FP32.
+
+    Each layer's `up` and `down` banks become one parent each, so an expert is a fixed row range of
+    its bank: the MoE Op reads expert `e`'s rows in place, and a host-offload cache addresses them as
+    a few contiguous spans.
+    """
+    if "block_configs" not in model.config:
+        raise ValueError("this official recipe requires Nemotron-H mathematics")
+    fp8_roles = ("/attention/", "/mamba/in_projection", "/mamba/out_projection")
+    for name, parameter in model.parameters.items():
+        if "/moe/experts/" in name or "/moe/shared/" in name:
+            recipe.assign(
+                name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
+            )
+            continue
+        if name == "text/output_head" or any(role in name for role in fp8_roles):
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
+    "nemotron_h_74b_nvfp4": nemotron_h_74b_nvfp4,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
