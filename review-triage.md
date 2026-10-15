@@ -1109,7 +1109,20 @@ which these inputs exercised for the first time here.
 
 Both are internal-consistency assertions, so they are input-independent rather than artifacts of
 this particular prompt. The documentation gap is closed in the same commit; these two are open, and
-the next thing to diagnose.
+are next to diagnose.
+
+What the discriminators already settle. The 31B M1 artifact passes both tests, so this is not a
+general MTP defect; the 26B-A4B QAT fails both, identically on every run — lane 0 diverges at token
+16 every time — so it is not input flakiness either. In `gemma4_batch_test` the two lanes differ only
+in draft count (7 for lane 0, 3 for lane 2), and lane 2 with the narrower window is identical batched
+and solo: the widest window on the MoE artifact is what breaks. `speculate`'s documented contract is
+that several lanes are verified "each against its own cache", and `commit_round` accepts any prefix of
+the licensed run, so the test uses the API as documented and the divergence violates the promise
+rather than exercising it. The defect is latent rather than a review-wave regression: the diffs in
+`src/models/gemma4/` since the last feature commit are `std::move`, comment order, includes, an
+allocation size, a release guard and a per-round duplicate-sample check. It was masked three ways —
+`ctest -L real` never runs the suite (no label), the tests skip without a prompt, and the `width` bug
+made them throw on round 1 until this session fixed it.
 
 ### The one that was mine, and why the bound was wrong
 
