@@ -4,6 +4,7 @@ set(ninfer_op_tests
   gelu_mul
   gemma_moe_router
   gemma_moe_experts
+  nemotron_h_moe_router
   silu_mul
   residual_add
   residual_add_norm
@@ -16,6 +17,7 @@ set(ninfer_op_tests
   mul_scalar
   gated_delta_net
   kimi_delta_attention
+  mamba2_scan
   causal_conv1d_silu
   layer_norm
   embedding
