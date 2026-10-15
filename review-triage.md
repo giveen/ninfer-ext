@@ -1086,9 +1086,11 @@ scenarios pass, and `ctest --preset real` is 14/14 with the three draft-less ski
 
 Answering "do the other models' tests need prompt/vision/images too?" found a coverage hole rather
 than a shared convention. Only gemma4 gates on captured inputs, and it was worse than a missing
-fixture: those tests read `NINFER_GEMMA_*` from the environment, carry no `real` label, and so are
-absent from `ctest -L real` (14 tests) while a plain `ctest` reports them as passing — they skip.
-Nine need inputs the repository does not carry: a prompt token file (five, plus `draft`), the vision
+fixture: those tests read `NINFER_GEMMA_*` from the environment and carried no `real` label, so they
+were absent from `ctest -L real` (14 tests) while a plain `ctest` reported them as passing — they
+skip. They carry the label now, which puts them in `-L real` and out of the parallel `fast` preset;
+the silent skip when their environment is absent remains. Nine need inputs the repository does not
+carry: a prompt token file (five, plus `draft`), the vision
 patch dump (`vision`, `image_processor`) and images (`image_prompt`). Nothing in `tests/README.md`
 or `docs/` named any of them; the only record was each test's own header comment.
 

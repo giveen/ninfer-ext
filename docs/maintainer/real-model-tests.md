@@ -1,13 +1,13 @@
 # Opt-in real-model Engine tests
 
 Most of the suite is self-contained: it builds synthetic inputs, runs an Op or a planner, and
-checks an oracle. Two groups are different. Eight qwen3.5 tests carry the `real` label and are
-configured through `NINFER_ARTIFACT_*` cache variables; the Gemma 4 suite has its own section below
-and reads its artifact and inputs from the environment instead. Both load a complete `.ninfer`
-artifact, construct a real `Program`, and drive the public Engine, so they need a model on disk, a
-supported GPU, and several minutes each; nine of the Gemma 4 tests additionally need captured
-inputs. This reference records what each one covers, how to configure and select them, and why their
-opt-in surface is shaped the way it is.
+checks an oracle. Two groups are different, and both carry the `real` label: the eight qwen3.5 tests
+below, configured through `NINFER_ARTIFACT_*` cache variables, and the Gemma 4 suite, whose own
+section follows and which reads its checkpoint, artifact and inputs from the environment instead.
+Both load a complete `.ninfer` artifact, construct a real `Program`, and drive the public Engine, so
+they need a model on disk, a supported GPU, and several minutes each; nine of the Gemma 4 tests
+additionally need captured inputs. This reference records what each one covers, how to configure and
+select them, and why their opt-in surface is shaped the way it is.
 
 [`tests/README.md`](../../tests/README.md) remains the entry point for running the suite; this
 document is the authority for the real-model subset.
@@ -16,9 +16,8 @@ document is the authority for the real-model subset.
 
 A real-model test cannot run from a clean checkout: artifacts are tens of gigabytes and are not in
 the repository. Making them ordinary tests would fail every clone. Instead each test returns
-`77` (CMake's skip code) when no artifact is configured, so a normal `ctest` reports the suite
-green with eight labelled skips — and with the Gemma 4 suite skipping as well, since those tests
-carry no label of their own (see below).
+`77` (CMake's skip code) when no artifact or checkpoint is configured, so a normal `ctest` reports
+the suite green with twenty-three skips — eight qwen3.5 and fifteen Gemma 4.
 
 That skip-by-default behavior is also a known hazard. A green `ctest` does **not** exercise these
 tests, and a regression inside them survives an otherwise clean sweep. Run `ctest -L real` (below)
@@ -88,9 +87,10 @@ a Program or establish native Op support. `--help` lists the accepted options.
 ## The Gemma 4 suite
 
 The Gemma 4 tests follow different conventions, and the difference is easy to miss. They read their
-artifact and their inputs from the environment rather than from a cache variable, and none of them
-carries the `real` label — so `ctest -L real` does not include them, and a plain `ctest` reports
-them as passing only because they skip.
+checkpoint, artifact and inputs from the environment rather than from a cache variable. They carry
+the `real` label, so `ctest -L real` selects them and the parallel `fast` preset leaves them out —
+but they still skip silently when their environment is absent, so a green plain `ctest` says nothing
+about them.
 
 `NINFER_GEMMA_ARTIFACT` names the artifact and `NINFER_GEMMA_CHECKPOINT` a Gemma 4 checkpoint
 directory; the suite's artifact-dependent tests skip without them. Nine of the tests need more than
