@@ -56,6 +56,30 @@ the loader's names will come from:
 The config's block list and its per-layer expert counts match the tensors exactly: 40 mamba, 40 moe and 8
 attention in the same order, with 240/304/368/432/496 experts in 12/6/9/10/3 layers.
 
+## The draft (LiLiCorr)
+
+The draft is a separate 962 MB NVFP4 file (`model.safetensors` beside the target), and its tensors say
+what it is: a Qwen3-shaped five-layer block drafter (`block_size` 8) with an elaborate head.
+
+- **What it needs from the target.** `fc.weight` is packed two values per byte, so its `[4096, 12288]` is
+  really `4096 x 24576`, which its `weight_scale` of `[4096, 1536]` at group 16 confirms — that is
+  **6 x 4096**, i.e. all six `target_layer_ids` (1, 18, 35, 51, 68, 85) concatenated. The target has to
+  expose those six hidden states for the draft to exist at all, so that is a target-side decision even
+  though the draft itself is phase 5.
+- Its own attention is GQA with **per-head QK norms** (`q_norm`/`k_norm` `[128]`), **attention sinks**
+  (`attention_sink_bias [32]`), a 1024 sliding window, and `causal: false` — bidirectional inside the
+  block, which is what block drafting needs.
+- A **grouped dynamic convolution** wraps both sublayers: `{attention,mlp}_conv.base_kernel [2,2,4096]`
+  (2 taps x 2 sides) modulated by `kernel_projection [1024,4096]`, at group width 16. That is exactly
+  `dynamic_grouped_conv`'s shape, so phase 5 reuses that op rather than porting it.
+- The LiLiCorr head: `token_proj`, `context_proj` and `pass_hidden_proj` (4096 -> 1024), a five-feature MLP
+  (`feature_norm [5]`, `up_proj [1024,5]`), a two-layer pre-norm transformer over slot x rank tokens
+  (`slot_embedding [1,1,7,1,1024]` for block 8, `rank_embedding [1,1,1,8,1024]` for the top-8),
+  `in_head`/`out_head` for the vectors the paper matches, `anchor_out_head`, and the pairwise terms
+  `relative_slot_bias [8,15]` and `same_slot_bias [8]`.
+- It has no embedding and no LM head: it shares the target's tokenizer and vocabulary, which is why every
+  tensor here is a projection, a norm or a bias.
+
 ## The mathematics, with citations
 
 **Block** (`modeling_nemotron_h.py:922`). Pre-norm RMSNorm → mixer → `residual + mixer_out`. No
