@@ -151,6 +151,30 @@ was trained against. Pairing it with an EXL3 target is exactly the mismatch that
 drafter accept almost nothing while every mechanism still tested clean. EXL3 becomes a second route
 afterwards, and the BF16 checkpoint is the conversion source for both.
 
+Concretely, at NVFP4 this is the Flash-Next recipe applied to this model, and the sizes are worth stating
+before anyone plans a machine. The routed experts are **66.14 B of the checkpoint's 74.9 B parameters**, so
+NVFP4 at 4.5 bits puts the expert banks alone at **37.2 GB**; EXL3 at 3.5 bits gives 28.9 GB and NVIDIA's
+`IQ2_XXS` 17.1 GB. With the dense side at Q8 the artifact lands near **46 GB** (EXL3: 38 GB). This corrects
+the earlier estimate in this document of 25 GB of experts and a 33 GB artifact: that was an estimate, and
+these are computed from the checkpoint's own `block_configs`.
+
+Which makes the host side load-bearing rather than incidental. Flash-Next's mechanism pins the expert set in
+Host memory behind a device cache, and **37.2 GB does not fit this machine's 32 GiB** — the pinned route is
+unavailable here at NVFP4, where at EXL3's 28.9 GB it was already marginal. Two things follow. The artifact
+is identical either way, because this is a property of the serving host and not of the format; and the route
+needs either NVMe-resident experts streamed into the device cache instead of pinned — about 24 MB per token
+(9 experts x up+down x 1024 latent x ~2300 intermediate x 0.5625 B), so ~1.2 GB/s at 50 tok/s, which makes
+NVMe a requirement rather than a preference — or a host with at least 64 GB. That is a serving decision and
+it does not change the converter.
+
+Two properties the recipe inherits from `qwen3_8_flash_next_nvfp4`: each layer's bank becomes one parent per
+matrix, so an expert is a fixed row range addressed as contiguous spans; and a full-precision source carries
+no calibrated activation divisor, so this conversion is **W4A16**, the same precision family as the LiLiCorr
+draft. One more thing the checkpoint's `block_configs` show: the per-layer geometry is more heterogeneous
+than a count list suggests — **twelve** distinct (experts, intermediate width) pairs, not five — so the
+offload sites key on the pair, and the expert op taking `{E, I}` at runtime is load-bearing rather than
+defensive.
+
 A correction from the draft's own tensors, because this argument was overstated: the draft's stated base is
 the *24GB* variant, whose mixer projections are NVFP4 but whose 27,728 expert tensors are `IQ2_XXS` at
 2.06 bits. The target it was qualified against therefore has **2-bit experts**, which our NVFP4 experts at
