@@ -255,6 +255,14 @@ That descriptor is also the converter's input format, and it is now known rather
 `…mixer.experts.E.{up,down}_proj` or `mixer.shared_experts.*` with its own `quant_algo` and `group_size: 16` —
 the same per-tensor shape our `import_encoded` path already consumes for Flash-Next.
 
+On disk that comes to three tensors per expert matrix, which is exactly what our loader has to consume:
+`weight` (the packed E2M1 codes), `weight_scale` (the per-16-block scale) and `weight_scale_2` (the
+per-tensor second level). An FP8 projection carries `weight`, `weight_scale` and — the decisive difference —
+**`input_scale`**, the calibrated *activation* divisor. That is the whole of the W4A16/W4A4 distinction at the
+file level: a W4A16 release's experts carry no `input_scale`, so there is nothing to quantize their
+activations with, while a W4A4 one does. It is also why a conversion from the BF16 checkpoint lands on W4A16
+whether or not we choose it.
+
 The checkpoint inventory decides how we get there. Our own Bolt 74B has **no official NVFP4 release** — what
 exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 GB quant whose experts are 2-bit,
 which is precisely the LiLiCorr draft's base and confirms it. So the NVFP4 conversion for this checkpoint is
