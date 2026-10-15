@@ -1146,6 +1146,22 @@ sparse corruption of the *target's own* logits — round 1 differed at one colum
 the same anchors and inputs — so naming the line needs an engine-side per-column dump of the verify's
 hidden state, comparing one batched round against the same round run solo.
 
+That instrument settled the mechanism, and it is not corruption. Dumping the verify pass's tapped
+hidden per column as raw 16-bit sums shows that *every* column of a lane differs between a batched
+round and the same round solo, while the per-column peak word matches within one to three ULP and the
+sums differ in their last digits: the same computation, rounded differently, by a reduction whose
+shape depends on the pass width. That is why the signature looks sparse (only near-tie argmaxes
+flip), why the width matters (8 columns accumulate one way, 12 and 16 another), and why it is
+model-specific (the dense 31B is bit-exact at every width, while the 26B-A4B's linears are Q6, Q8 and
+int4 and its sliding KV is quantized). The plain path stays exact on the same model because its
+batched decode is one token per lane.
+
+What remains is a choice rather than a hunt: make those kernels' reduction shape-independent, which
+the suite already requires of the plain path and gets from it, or accept the last-bit difference and
+give the MTP batch comparison a documented tolerance. The coverage added in the same session -- the
+failing widths and the model's 128 experts in the two MoE oracles -- is what makes either choice
+verifiable.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
