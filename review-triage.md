@@ -1173,6 +1173,27 @@ quantized ring, or the MoE branch. Checking that Op's per-query exactness at 8 a
 isolation is the next step, and it is an Op-level question the existing Op tests can be extended to
 answer.
 
+Root cause, found and proved end to end. `src/ops/linear/q8/q8_dispatch.cpp` picks the Q8 linear's
+kernel from `t`, the pass width: `select_q8_launch(n, k, x.ne[1], policy)` forwards to
+`select_q8_a16_launch(n, k, t)`, which looks the (N, K) shape up in a table and calls that shape's
+`select(t)`. The 26B-A4B's query, key, value and output projections are Q8, so a verify pass at 12
+columns runs a *different schedule* than the same pass at 8 — a different accumulation order, and so
+a last-bit difference of exactly the size measured at layer 0 above. Near-tie argmaxes then flip,
+which is the sparse divergence. The dense 31B is exact across widths because its linears are Q6 and
+take no such selection, and the plain path is exact on this model because its batched decode selects
+at one to three columns, where the schedules agree. The review waves are unrelated: their single
+change to the q8 instances added a schedule for the hyper-connection projections and re-aligned
+declarations, leaving this model's widths alone.
+
+A second, independent defect surfaced on the way: run eagerly, lane 2 passes and only lane 0 fails.
+The MTP Program was built with `cuda_graphs = true`, so lane 2's route-independent failure is the
+captured graph rather than the reduction. That is its own bug, and the smaller one.
+
+The fix for the first is a dispatch change rather than a kernel rewrite: the 26B's projection shapes
+must select one schedule regardless of `t`, which costs the throughput the shape-driven choice buys.
+The Op oracle at 8 against 12 columns is the gate, and the widened MoE oracles from this session make
+the rest verifiable.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
