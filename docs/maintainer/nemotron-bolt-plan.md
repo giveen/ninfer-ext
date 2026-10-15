@@ -198,12 +198,19 @@ breath: an elastic (nested) Bolt checkpoint would be device-resident on a 5090 a
 host-offload requirement entirely, and the converter would take it unchanged -- the architecture is the
 same.
 
-The host-offload cache does **not** survive heterogeneous banks as written: `slot_of` is `layers × E`,
-the owner→layer decode is a division by `E`, the staged bank is `2E`, and the pool stride is one global
-`slot_bytes`. Four sites fix it — sum the per-layer `E` (`startup.cpp:1451`), replace `slot_of` with a
-per-layer prefix-sum offset table (`startup.cpp:361`), decode an owner by search (`pressure.cpp:2676`),
-size the staged bytes per layer (`qwen4_expert_pager.cpp:15`) — with the pool stride becoming the
-maximum slot. No artifact-format change.
+The host-offload cache assumed a uniform bank: `slot_of` was `layers × E`, the owner→layer decode was a
+division by `E`, the staged bank was `2E`, and the pool stride was one global slot size. That is now
+**done.** `ExpertPoolGeometry`, built from the pool's per-layer bank shapes, derives all of it: a prefix-sum
+table places the expert space, so a layer's experts stay tight in the pool instead of being padded to the
+widest bank, and one stride sizes the cache slots at the widest bank's per-expert count — a cost the device
+cache pays per *slot* and the pinned host banks do not, since those are the artifact's own tensors. The
+uniform case is the table's equal-entry case, so Flash-Next runs the same code rather than a second path,
+and it is verified end to end rather than by argument: both pool tests drive resolve, fetch, stage and
+reclaim through the new geometry and pass, the EXL3 one covering the zero-tail branch, and the arithmetic has
+its own test, itself checked against a library mutated to fail it three separate ways. Two things remain
+unverified: a *heterogeneous* staged fill end to end, which no pool can exercise until this family's loader
+and Program exist, and the Engine-level Flash-Next path, which needs its ~70 GB artifact. No artifact-format
+change.
 
 ## What the layout work actually is
 
