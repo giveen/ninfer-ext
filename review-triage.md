@@ -1082,6 +1082,35 @@ is its point and drops the caller stop token and `publish_stop_token` that a con
 cannot carry. `all`, `shared-replacement`, both `rewrite-checkpoint` topologies and the five agent
 scenarios pass, and `ctest --preset real` is 14/14 with the three draft-less skips.
 
+### The Gemma 4 suite's inputs, and what running them exposed
+
+Answering "do the other models' tests need prompt/vision/images too?" found a coverage hole rather
+than a shared convention. Only gemma4 gates on captured inputs, and it was worse than a missing
+fixture: those tests read `NINFER_GEMMA_*` from the environment, carry no `real` label, and so are
+absent from `ctest -L real` (14 tests) while a plain `ctest` reports them as passing — they skip.
+Nine need inputs the repository does not carry: a prompt token file (five, plus `draft`), the vision
+patch dump (`vision`, `image_processor`) and images (`image_prompt`). Nothing in `tests/README.md`
+or `docs/` named any of them; the only record was each test's own header comment.
+
+Both producers exist in the tree. `tools/verify/gemma4_vision_reference.py prepare` wrote the patch
+dump for two lossless images, and a tokenization of `docs/maintainer/engine-architecture.md` became
+`/tmp/gemma_prompt.i32`; `IMAGE_DUMP`, `DRAFT_DUMP` and `SCORES_OUT` are outputs the tests write for
+the reference tools to read back, so any writable directory serves. All eighteen gemma4 tests then
+ran against `out/gemma4_26b_a4b_qat.ninfer`: seven of the nine pass, and two fail in the MTP path,
+which these inputs exercised for the first time here.
+
+- `gemma4_mtp_test`: 67 rounds, 317 of 466 drafts accepted, 72 leading tokens equal to the plain
+  decode's, but a fresh pass disagrees in 11 of 384 tokens (worst margin 1.625) against plain
+  decode's 5 (0.875) — an accepted draft is supposed to leave the target no less consistent than
+  plain decode.
+- `gemma4_batch_test`: every lane and both execution modes agree with their own rounds except MTP
+  lane 0, which diverges from its own rounds and from plain greedy at token 16, while lane 2 stays
+  identical.
+
+Both are internal-consistency assertions, so they are input-independent rather than artifacts of
+this particular prompt. The documentation gap is closed in the same commit; these two are open, and
+the next thing to diagnose.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
