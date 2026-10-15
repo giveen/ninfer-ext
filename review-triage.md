@@ -1162,6 +1162,17 @@ give the MTP batch comparison a documented tolerance. The coverage added in the 
 failing widths and the model's 128 experts in the two MoE oracles -- is what makes either choice
 verifiable.
 
+Two further results, both narrowing. Running the MTP section *eager* — the Program had been built
+with `cuda_graphs = true` — fixes lane 2 outright, so lane 2's route-independent failure was the
+captured graph rather than the reduction, while lane 0 still fails at the same token. And
+instrumenting every layer's output (per-column 16-bit sums) with 12 columns batched against 8 solo
+shows the two already differ at layer 0, by about 1e-4 relative: a numeric difference, not a
+different input, since a different draft token would move the values far more. Layer 0 is a sliding
+layer, so the shape-dependent reduction is inside it — the input norm, the sliding attention over the
+quantized ring, or the MoE branch. Checking that Op's per-query exactness at 8 against 12 columns in
+isolation is the next step, and it is an Op-level question the existing Op tests can be extended to
+answer.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
