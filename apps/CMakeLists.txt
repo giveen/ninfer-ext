@@ -12,6 +12,15 @@ add_executable(ninfer-serve serve/main.cpp)
 ninfer_internal_includes(ninfer-serve)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging)
 
+# Host-pointer-for-registered-memory diagnostic. It answers whether a kernel can read pinned host
+# memory at the address the CPU holds for it, which is the one Windows port question that cannot be
+# settled on Linux (docs/maintainer/windows-port.md). It loads no model and needs no artifact, and it
+# is the report a Windows user pastes into an issue, so it is an app rather than a test. The source is
+# a .cu because it defines and launches a kernel, which only nvcc parses.
+add_executable(ninfer-probe probe/main.cu)
+ninfer_internal_includes(ninfer-probe)
+target_link_libraries(ninfer-probe PRIVATE CUDA::cudart)
+
 add_executable(ninfer-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp
