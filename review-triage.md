@@ -1063,9 +1063,24 @@ kinds, the shapes and the last global layer likewise — and both pass on both a
 repository had already recorded the gap as a follow-up in `gemma4-26b-plan.md`, which is now marked
 resolved.
 
-The closing run: 9 of the 13 real tests pass, three skip for want of a local draft artifact, and
-`prefix_real` is the one remaining red — pre-existing, and not yet explained. `stream_real` passes,
-both gemma suites pass on both artifacts, and `ctest --preset fast` is 188/188.
+The closing run of that batch: 9 of the 13 real tests pass and three skip for want of a local draft
+artifact, with `prefix_real` the one red — now explained and fixed below. `stream_real` passes, both
+gemma suites pass on both artifacts, and `ctest --preset fast` is 188/188.
+
+`prefix_real` is explained and fixed. Its tool-requesting exercises all set
+`stop.include_model_defaults = false` for a deterministic stop, and the frontend refuses that for a
+*constrained* request — "constraints require default EOS, text output, no custom stops, and one
+output language" — because a grammar has to terminate on the checkpoint's own EOS rather than at a
+caller's stop. A prompt that declares tools is constrained: `select_tool_call_contract` marks it so,
+and this artifact's tool-call output is itself a constrained language. The guard arrived with
+constrained decoding on 2026-10-08 (`b03e20ae`); the test's lines are from 2026-08-16, and nothing
+but this test runs those exercises, so seven weeks of regression surfaced as a single red test.
+Seven sites now keep the model stops — the three in-tree exercises and the five agent scenarios,
+which are reachable only by scenario name and so were never caught — while the tool-free exercises
+still turn them off. The full-capacity arm keeps the `requested_output_tokens = max` reservation that
+is its point and drops the caller stop token and `publish_stop_token` that a constrained request
+cannot carry. `all`, `shared-replacement`, both `rewrite-checkpoint` topologies and the five agent
+scenarios pass, and `ctest --preset real` is 14/14 with the three draft-less skips.
 
 ### The one that was mine, and why the bound was wrong
 
