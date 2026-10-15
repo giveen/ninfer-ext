@@ -1046,11 +1046,26 @@ failure except the EAGLE3 pair. The baseline also refuted my own first suspicion
 constraint failure is identical there, so this session's `include_model_defaults` propagation — the
 one change in that area — is not its cause.
 
-The two harness gaps are worth fixing on their own account, since both turn a legitimately
-not-applicable test into a red one: the dflash tests should return the qualifying skip for
-`missing component dflash2`, and the gemma4 tokenizer and frontend tests should resolve their
-fixtures relative to the source tree (or skip) instead of aborting. The 26B-A4B failure is a real
-defect and deserves its own investigation rather than being folded into a review batch.
+Both gaps are closed (commit `dadb9041`), and the closing run is the receipt: the dflash tests report
+Skipped, and the gemma4 tokenizer and frontend tests pass on both artifacts.
+
+The 26B-A4B failure was not an engine defect at all. The artifact, `parse_text_config` and the
+load/forward paths are all correct — `test_load` loads and plans the model — but `test_model` and
+`test_forward` pinned the 31B's geometry as literals: 60 layers, 833 bound weights, hidden 5376, the
+layer kinds, and `weights.text.layers[59]`. On a 30-layer artifact that index is an unchecked
+out-of-bounds read whose stray bytes become a `WeightId`, so the model test's
+`vector::_M_range_check` against the 12,118-entry bound table and the forward test's printed
+`layer 59 = 1` (a layer-scalar slot pre-filled with 1.0F and never written) are the same undefined
+behaviour seen two ways. Both tests now derive every expectation from the artifact's config — the
+layer count as the declaration against the materialized vector, which also guards that read; the
+bound-weight count from the structural formula, now shared with `test_load` so it cannot drift; the
+kinds, the shapes and the last global layer likewise — and both pass on both artifacts. The
+repository had already recorded the gap as a follow-up in `gemma4-26b-plan.md`, which is now marked
+resolved.
+
+The closing run: 9 of the 13 real tests pass, three skip for want of a local draft artifact, and
+`prefix_real` is the one remaining red — pre-existing, and not yet explained. `stream_real` passes,
+both gemma suites pass on both artifacts, and `ctest --preset fast` is 188/188.
 
 ### The one that was mine, and why the bound was wrong
 

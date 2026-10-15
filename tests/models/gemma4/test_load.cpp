@@ -1,5 +1,6 @@
 #include "artifact/binder.h" // ParameterReference
 #include "artifact/reader.h"
+#include "models/gemma4/expected_weights.h"
 #include "models/gemma4/load.h"
 
 #include <cstdlib>
@@ -61,15 +62,11 @@ int main() {
         // four norms, its scalar, its attention projections and norms, and its dense MLP (14 with a
         // value projection, 13 without); a MoE layer adds three norms, the router with its two
         // scales, and one matrix per expert per projection. A shape or format the artifact does not
-        // store would have thrown above.
+        // store would have thrown above. `models/gemma4/expected_weights.h` holds that structure,
+        // which `test_model.cpp` counts with too.
         const auto& weights        = plan.weights();
         const std::uint64_t hidden = config.hidden_size;
-        const std::uint64_t moe_extra =
-            config.enable_moe_block ? 6 + 3 * static_cast<std::uint64_t>(config.num_experts) : 0;
-        std::uint64_t expected = 3; // token_embedding, output_head, final_norm
-        for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
-            expected += moe_extra + (config.sliding_attention(layer) ? 14 : 13);
-        }
+        const std::uint64_t expected = ninfer::test::gemma4_expected_parameter_count(config);
         check(plan.parameter_count() == expected,
               "parameter count is " + std::to_string(plan.parameter_count()) +
                   ", the structure has " + std::to_string(expected));
