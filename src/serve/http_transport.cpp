@@ -7,6 +7,12 @@
 #if defined(__linux__)
 #    include <netinet/tcp.h>
 #    include <sys/socket.h>
+#elif defined(_WIN32)
+// httplib has already included <winsock2.h>/<ws2tcpip.h> for the socket_t it hands this file; the
+// TCP-level option names below come from there, so the includes are repeated to keep the block
+// self-contained.
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
 #endif
 
 #include <stdexcept>
@@ -24,6 +30,20 @@ constexpr unsigned int kTcpUserTimeoutMilliseconds = 15000;
 template <class T>
 void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
     (void)::setsockopt(socket, level, option, &value, sizeof(value));
+}
+#elif defined(_WIN32)
+// The same keep-alive timers as the Linux block, with the meanings Windows gives them: idle
+// seconds before the first probe, seconds between probes, and failed probes before the connection
+// is dropped.
+constexpr int kKeepAliveIdleSeconds     = 10;
+constexpr int kKeepAliveIntervalSeconds = 3;
+constexpr int kKeepAliveProbeCount      = 3;
+
+template <class T>
+void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
+    // Winsock spells the option value as a char pointer where POSIX spells it as a void pointer.
+    (void)::setsockopt(socket, level, option, reinterpret_cast<const char*>(&value),
+                       static_cast<int>(sizeof(value)));
 }
 #endif
 
@@ -100,6 +120,17 @@ void configure_http_server_socket(socket_t socket) noexcept {
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#elif defined(_WIN32)
+    const int enabled = 1;
+    // Windows 10 1709 and later implement the three Linux keep-alive timers under the same names,
+    // so the settings below are the Linux ones. TCP_USER_TIMEOUT has no Windows equivalent and is
+    // left out: the 5 s send timeout httplib sets on every accepted socket bounds an
+    // unacknowledged write, and the 5 s SSE heartbeat keeps traffic flowing, so a dead SSE peer
+    // is still noticed, just on the next write rather than by a timer firing.
+    set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
 #endif
 }
 
