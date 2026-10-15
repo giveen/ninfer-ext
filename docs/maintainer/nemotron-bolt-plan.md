@@ -283,6 +283,36 @@ Mamba layers' in and out projections — whereas the Super VL quantizes them, it
 attention plus the head, which is the recipe exactly. Where the two disagree, we follow the recipe and the
 flagship.
 
+## What the vendor's own deployment does
+
+The model cards carry the deployment recipe for this exact checkpoint, and several of its choices settle
+things we would otherwise be guessing.
+
+| Their choice | What it means here |
+|---|---|
+| `--kv-cache-dtype fp8` (24 GB card; the BF16 card has no such flag) | the FP8 KV the ModelOpt recipe names, and this repository already has an FP8 KV codec |
+| `--mamba-ssm-cache-dtype bfloat16` / `--mamba-cache-dtype bfloat16` | their *deployment* runs the SSM state in BF16 even though the checkpoint declares `mamba_ssm_cache_dtype: float32`. Ours stays fp32, which this branch's scan test justifies: a BF16 state image misses its criterion by 12x |
+| `--max-model-len 262144`, `--max-num-seqs 1` | the 256K context the config declares, served one sequence at a time — inside the one-to-eight concurrency this engine fixes at start |
+| `--enable-chunked-prefill` | their long-context prefill is chunked; ours is one compact decode batch per round, so this is a difference to keep in view rather than a target to match now |
+| `--tool-call-parser qwen3_coder`, `--reasoning-parser ultra_v3` | the frontend pieces this family needs: the ultra_v3 reasoning parser ships beside the checkpoint (`ultra_v3_reasoning_parser.py`) and the tool parser is the qwen3_coder one this tree already has |
+| `temperature 1.0`, `top_p 0.95` | the recommended sampling defaults, inherited from the Super VL client |
+| `enable_thinking=True/False` in the chat template | the reasoning mode is a template control, so the family's frontend needs that template |
+
+The speculative setup is named exactly, in the 24 GB card's invocation: `"method":"dflash"`,
+`"model":"…-24GB-LiLiCorr"`, `"num_speculative_tokens":7`. So the drafter is a **DFlash** drafter (LiLiCorr is
+the checkpoint), it proposes seven tokens, and — the part that matters — it is bound to the **24 GB** target.
+
+Two facts here change what we should expect rather than what we should do. That 24 GB release is **QAT**: its
+card says "IQ2 (2-bit quantization with quantization-aware training)". So the drafter was trained against a
+differently *post-trained* artifact, not merely a different precision family, which sharpens the pairing risk
+this document already flags rather than resolving it. And their own benchmark table puts that 2-bit QAT release
+within a few points of BF16 on most agentic benchmarks — which sets the floor for our conversion: an NVFP4
+W4A16 target at 4.5 bits should be at least as good, and that is the bar the conversion gets measured against.
+
+The same cards also name a third route for this checkpoint that we are deliberately not taking: serve the 24 GB
+IQ2 target itself, which is what the drafter expects and what fits a 5090 outright. It would need a 2-bit
+expert codec, which this tree does not have and which the NVFP4 decision was taken to avoid.
+
 ## What the layout work actually is
 
 The artifact container is layer-blind and already carries the variation: a bank is one binding of parts
