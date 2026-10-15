@@ -2,16 +2,16 @@
  "counts": {
   "P0": 5,
   "P1": 38,
-  "P2": 86,
+  "P2": 84,
   "P3": 655,
   "M": 471,
-  "F": 31,
-  "fixed": 51
+  "F": 33,
+  "fixed": 128
  },
  "verdicts": {
-  "true": 784,
+  "true": 782,
   "maybe": 471,
-  "false": 31
+  "false": 33
  },
  "overlap": {
   "agree": [
@@ -293,7 +293,9 @@
    "evidence": "apps/serve/main.cpp:81 -- `g_logging.store(&logging);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the logging pointer is scoped so it is cleared on every exit path, including the early returns"
   },
   "15": {
    "path": "apps/quantize/trace_reader.h",
@@ -341,7 +343,9 @@
    "evidence": "read_i64 memcpys count*8 from entry.begin with no check against entry.end-entry.begin; parse_header only bounds end<=data_bytes",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a trace entry's declared count is checked against its own extent, by division so the check cannot overflow"
   },
   "18": {
    "path": "apps/quantize/trace_reader.cpp",
@@ -523,7 +527,9 @@
    "evidence": "apps/quantize/options.cpp:72-79 -- `for (char& ch : out) { if (ch == '/' || ch == '\\\\' || ch == ':') { ch = '_'; } }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the lossy name mapping is documented as the contract it is (injective escaping would rename existing files)"
   },
   "29": {
    "path": "apps/quantize/options.h",
@@ -635,7 +641,9 @@
    "evidence": "apps/quantize/parameter_reader.cpp:114 -- `if (part.end * bytes_per_word > payload.size()) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the wrapping length guard compares by division; the sibling instance in main.cpp:334 was fixed too"
   },
   "36": {
    "path": "apps/quantize/parameter_reader.cpp",
@@ -717,7 +725,9 @@
    "evidence": "apps/perplexity/main.cpp:250-251 -- `logger->info(\"kl reference | {} rows | vocab {} | text {}\", reference.rows(), reference.vocab_size(), reference.text_digest());`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the reference's text digest is enforced instead of merely logged"
   },
   "41": {
    "path": "apps/perplexity/main.cpp",
@@ -733,7 +743,9 @@
    "evidence": "apps/perplexity/main.cpp:480 -- `reference_report[\"delta_nats\"] = overall.mean_nll() - overall_reference.mean_nll();`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the model side of delta_nats is accumulated at the reference's own positions"
   },
   "42": {
    "path": "apps/perplexity/main.cpp",
@@ -893,7 +905,9 @@
    "evidence": "apps/quantize/main.cpp:311 -- `const nlohmann::json prior = nlohmann::json::parse(in);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a truncated sidecar is discarded and the shard recomputed instead of throwing into the outer handler"
   },
   "52": {
    "path": "apps/quantize/main.cpp",
@@ -941,7 +955,9 @@
    "evidence": "apps/quantize/calibration.cpp:348 -- \"expert_activation_observer() = [&](int layer, int expert, ...) { accumulator.observe_expert(...); };\" reset only at :367 after flush",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "an ExpertObserverScope RAII guard clears the observers on every exit"
   },
   "55": {
    "path": "apps/quantize/calibration.cpp",
@@ -975,7 +991,9 @@
    "evidence": "apps/quantize/calibration.cpp:423 -- \"result.skipped_names = 0;\" vs calibration.h:20 \"// eligible names with no observed site (for example MTP)\"",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "skipped_names is computed from the planned set instead of hardcoded to 0"
   },
   "57": {
    "path": "apps/quantize/calibration.cpp",
@@ -1363,7 +1381,9 @@
    "evidence": "include/ninfer/ops/attn_input_proj.h:41 -- \"no packed parent output is materialized\" vs src/ops/wrapper/attn_input_proj.cpp:109-111 EXL3 allocates whole[kRows,T] and requires workspace",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the header now states that EXL3_MUL1 materialises the packed parent into workspace"
   },
   "81": {
    "path": "include/ninfer/ops/linear_topk.h",
@@ -1525,7 +1545,9 @@
    "evidence": "include/ninfer/ops/gemma_moe_experts.h:63-64 -- `Caller-owned, graph-stable transient storage of at least \\`gemma_moe_experts_workspace_bytes\\` for the call's geometry, bank format and T`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "16 bytes is the true alignment: the launcher's 256-byte claim was the wrong side"
   },
   "91": {
    "path": "include/ninfer/ops/gemma_moe_experts.h",
@@ -1541,7 +1563,9 @@
    "evidence": "include/ninfer/ops/gemma_moe_experts.h:86 -- `// The workspace a call over T tokens needs for banks stored as \\`qtype\\`. Throws on a non-positive T.`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the workspace query now rejects a non-positive T"
   },
   "92": {
    "path": "include/ninfer/ops/gemma_moe_experts.h",
@@ -2567,7 +2591,9 @@
    "evidence": "src/ops/launcher/speculative_round.cu:111 -- `if (raw_greedy) { speculative_accept_sparse_warp_greedy_kernel<<<...>>>` (no mask parameter)",
    "source": "adjudicated",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the raw_greedy contract requires an empty sampling mask, as the launcher imposes"
   },
   "156": {
    "path": "include/ninfer/ops/speculative_round.h",
@@ -2663,7 +2689,9 @@
    "evidence": "Reader::geometry() writes impl_->geometries[handle.index] (mutable cache) with no synchronisation while open_all() advertises concurrent reads",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the artifact reader's lazy geometry cache is guarded by a mutex"
   },
   "162": {
    "path": "src/artifact/formats.cpp",
@@ -4215,7 +4243,9 @@
    "evidence": "src/core/paged_kv_cache.cpp:830-831 -- `if (!ref.host() && static_cast<std::uint32_t>(ref.word()) >= pages_->capacity_pages()) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the KVPageRef publish overload also requires the page's liveness flag"
   },
   "259": {
    "path": "src/core/paged_kv_cache.cpp",
@@ -4727,7 +4757,9 @@
    "evidence": "quantized() is noexcept but calls sliding_attention()->layer_types.at() which throws out_of_range",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "quantized() is no longer noexcept, matching the accessor it calls"
   },
   "291": {
    "path": "src/models/qwen3_5/execution/ple_rows.h",
@@ -4807,7 +4839,9 @@
    "evidence": "configure() does std::vector<void*>().swap(owned_) without cudaFree while dtor/move-assign free",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "reconfigure releases device memory through the same path the destructor uses"
   },
   "296": {
    "path": "src/models/gemma4/cache.cpp",
@@ -4823,7 +4857,9 @@
    "evidence": "src/models/gemma4/cache.cpp:250-253 -- `Tensor KvCache::keys(std::size_t layer) { ensure(layer); return layers_[layer].keys; }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "keys()/values() refuse a quantized ring in the plane accessors' own idiom"
   },
   "297": {
    "path": "src/models/qwen3_5/execution/attention.cpp",
@@ -5019,7 +5055,9 @@
    "evidence": "sliding.rope_theta uses rope.contains()->at().get<float>() instead of number(); missing key silently 0.0F",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "rope_theta uses the numeric accessor, so a missing key fails instead of yielding 0"
   },
   "309": {
    "path": "src/models/gemma4/config.cpp",
@@ -5163,7 +5201,9 @@
    "evidence": "src/models/gemma4/measurement.cpp:32 -- `Json facts{{\"implementation\", \"gemma4-prefill-1\"},` ... no weight/binding facts, unlike qwen3_5/measurement.cpp:53-72 which folds `part.parent->geometry` and use.policy",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the prefill signature folds binding structure as the documented key requires (scheme tag bumped)"
   },
   "318": {
    "path": "src/models/gemma4/measurement.cpp",
@@ -5259,7 +5299,9 @@
    "evidence": "src/models/qwen3_5/execution/attention.cpp:89 -- `ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query, normalized_key, execution.stream);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the header's bit-identity claim now states the eps/theta condition the guard enforces"
   },
   "324": {
    "path": "src/models/qwen3_5/execution/attention.h",
@@ -5371,7 +5413,9 @@
    "evidence": "src/models/qwen3_5/execution/ple_rows.cpp:140 -- `for (auto& task : pending) { task.get(); }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "submitted tasks are waited on before the result drain"
   },
   "331": {
    "path": "src/models/qwen3_5/execution/ple_rows.cpp",
@@ -5451,7 +5495,9 @@
    "evidence": "src/media/decode/resize.cpp:63 -- `if (width <= 0 || height <= 0) throw std::invalid_argument(\"resize_bicubic: empty size\");`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the resize input descriptor is validated against the buffer it actually has"
   },
   "336": {
    "path": "src/media/decode/resize.cpp",
@@ -5499,7 +5545,9 @@
    "evidence": "src/models/qwen3_5/execution/draft.cpp:362 `const auto& head = *state.execution.parameters.proposal;` vs :541 has_value check",
    "source": "adjudicated",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the proposal-head deref carries the sibling's has_value guard (consistency repair; unreachable today)"
   },
   "339": {
    "path": "src/models/qwen3_5/execution/draft.cpp",
@@ -5627,7 +5675,9 @@
    "evidence": "src/models/gemma4/image_processor.cpp:43 -- \"static_cast<int>(std::floor(static_cast<double>(width) / height)) * kSide, max_side);\"",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the aspect ratio is clamped before scaling, so the int product cannot overflow"
   },
   "347": {
    "path": "src/models/gemma4/frontend.cpp",
@@ -5661,7 +5711,9 @@
    "evidence": "src/models/gemma4/frontend.cpp:373 -- `bool thinking = context.value(\"enable_thinking\", false);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "template boolean kwargs are type-checked and fail as invalid_argument"
   },
   "349": {
    "path": "src/models/gemma4/frontend.cpp",
@@ -5821,7 +5873,9 @@
    "evidence": "src/media/decode/decode.cpp:493 -- `plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the duration guard runs before the double-to-int frame conversion"
   },
   "359": {
    "path": "src/media/decode/decode.cpp",
@@ -6229,7 +6283,9 @@
    "evidence": "require_u64 default positive=false, divisor then used as (total+divisor-1)/divisor",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a zero n-gram base/divisor is refused before the division"
   },
   "384": {
    "path": "src/models/qwen3_5/config.cpp",
@@ -6245,7 +6301,9 @@
    "evidence": "require_u64 default positive=false; base=0 -> prime=base-1 wraps to UINT64_MAX and the search restarts at 2",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the base is established non-zero before base-1 is formed"
   },
   "385": {
    "path": "src/models/qwen3_5/config.cpp",
@@ -6277,7 +6335,9 @@
    "evidence": "heads() is u32 (ngram_size-1)*heads_per_ngram and can wrap to 0 (65537*65536), then embed_dim % heads() and row_width() divide by zero",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the head count is computed in u64, proved non-zero and bounded before any use"
   },
   "387": {
    "path": "src/models/gemma4/forward.cpp",
@@ -6775,7 +6835,9 @@
    "evidence": "src/models/qwen3_5/frontend/output_session.cpp:539 -- `if (impl_->grammar) { impl_->grammar->discard(); }` (no impl_ guard) versus :773 `if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the empty-session rule is stated and enforced, replacing an unchecked deref and a terminate"
   },
   "418": {
    "path": "src/models/qwen3_5/frontend/tokenizer.h",
@@ -6871,7 +6933,9 @@
    "evidence": "src/models/qwen3_5/load/prepare.cpp:81 -- `if (parts.size() != 1 || parts[0].begin != 0) {` (error text: 'a file-mapped weight must bind a whole object'), while src/artifact/binder.cpp:46-48 only checks the object shape when `binding.whole_object` is set",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a partial-prefix parts binding no longer passes as a whole-object binding"
   },
   "424": {
    "path": "src/models/qwen3_5/load/prepare.cpp",
@@ -7585,7 +7649,9 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.cpp:322 -- `state->lru.push_front(key);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the ready entry is inserted before the LRU push, so a failed allocation cannot strand a key"
   },
   "468": {
    "path": "src/models/qwen3_5/frontend/media_cache.cpp",
@@ -7745,7 +7811,9 @@
    "evidence": "src/models/qwen3_5/frontend/resources.cpp:8-11 -- `resources.tokenizer = std::make_shared<const frontend::Tokenizer>(frontend::TokenizerResources{...});`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "tokenizer parse failures are normalised to the loader's ArtifactError"
   },
   "478": {
    "path": "src/models/qwen3_5/frontend/resources.cpp",
@@ -7921,7 +7989,9 @@
    "evidence": "src/models/qwen3_5/frontend/frontend.cpp:189 -- `if (tokenizer_config.value(\"add_bos_token\", true) ||`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the config flag is type-checked before asserting, mirroring its sibling key"
   },
   "489": {
    "path": "src/models/qwen3_5/frontend/frontend.cpp",
@@ -8026,16 +8096,17 @@
    "line": "840-844",
    "category": "bug",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P2",
+   "verdict": "false",
+   "priority": "F",
    "kind": "bug",
    "impact": "medium",
    "reach": "requires two concurrent requests sharing the same media digest",
-   "note": "The caller's cancellation view is dropped inside workers, and the request-local flag is the only cancellation the shared builder sees, so one request's abort fails its singleflight waiters.",
+   "note": "re-examined: the premise is wrong. The launching request's cancellation is already observed on its own thread (processor.cpp:874, :876, :906 via media_cache.cpp:377/388, :839, :958, :989) and inside await, so the worker never needed to see it for that request to fail. Composing the caller's view into the workers' control instead made one participant's cancel decide a *shared* flight's fate: the control is copied into the flight closure (media_cache.cpp:312-313), drives the pool checkpoint and the post-build check whose throw becomes flight->error (:346), which every joiner rethrows (:391). The composition was reverted; the code is HEAD plus a comment recording the invariant. Pre-existing and left alone: stop_preparation has the same cross-request shape (the producer's abort flags the shared builder), which would need participation tracking on MediaCacheFlight to remove.",
    "evidence": "src/models/qwen3_5/frontend/processor.cpp:841 -- `cancellation = CancellationView([&stop_preparation] { return stop_preparation.load(std::memory_order_relaxed); })` with media_cache.cpp:391 `if (pending.flight->error) { std::rethrow_exception(pending.flight->error); }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false
   },
   "496": {
    "path": "src/models/qwen3_5/frontend/processor.cpp",
@@ -8149,7 +8220,9 @@
    "evidence": "src/models/qwen3_5/execution/qwen4_text.cpp:465-466 -- `if (capture_experts) { qwen4_capture_all_experts(x, staged, calibration_layer); } experts.release_staged(cache_layer, s);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the staged-expert reader releases on every throw, not just the named one"
   },
   "503": {
    "path": "src/models/qwen3_5/execution/qwen4_text.cpp",
@@ -8165,7 +8238,9 @@
    "evidence": "src/models/qwen3_5/execution/qwen4_text.cpp:295 -- `CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv.data, qkv.bytes(), cudaMemcpyDeviceToDevice, s));`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the GDN replay record's shape is checked before the flat copy"
   },
   "504": {
    "path": "src/models/qwen3_5/execution/qwen4_text.cpp",
@@ -8823,7 +8898,9 @@
    "evidence": "src/models/qwen3_5/program/program.h:1158-1159 -- `out.row_count_   = rows.size(); for (std::size_t i = 0; i < rows.size(); ++i) { out.rows_[i] = rows[i]; }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the pending-batch copy is bounded by the array extent with an explicit width check"
   },
   "545": {
    "path": "src/models/qwen3_5/program/prefix_identity.h",
@@ -9323,7 +9400,9 @@
    "evidence": "partition_extent moves/resets allocation and bumps the generation before arena_->split()/page_unit() can throw, leaving the extent Published with an empty allocation",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the host arena refuses a split plan it cannot serve before mutating anything"
   },
   "576": {
    "path": "src/models/qwen3_5/program/storage/host_kv_store.h",
@@ -9549,7 +9628,9 @@
    "evidence": "src/models/qwen3_5/program/storage/state_store.h:589 -- `source.device_slot = source.pending_device_slot;` committed before the host release whose failure throws at :594",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the pending slot stays abortable until the last fallible step has succeeded"
   },
   "590": {
    "path": "src/models/qwen3_5/program/storage/state_store.h",
@@ -9839,7 +9920,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     642
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "the execution-table membership is published before any address state changes"
   },
   "608": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -9993,7 +10076,9 @@
    "evidence": "src/models/qwen3_5/program/planning/pressure.cpp:1146 -- `: text_kv_addresses->mapped_pages(sequence.kv->text);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the pressure validity predicate guards a live store and handle instead of throwing"
   },
   "617": {
    "path": "src/models/qwen3_5/program/planning/pressure.cpp",
@@ -10159,7 +10244,9 @@
     635,
     641,
     648
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "prepare's frontier basis and commit's mapped basis are one basis or the mismatch is refused"
   },
   "627": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10175,7 +10262,9 @@
    "evidence": "src/models/qwen3_5/program/storage/kv_store.h:944 -- `(void)release(*handle);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "can_release now sees an inactive address, so its release succeeds"
   },
   "628": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10193,7 +10282,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     643
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "abort_prefix_fork skips exactly the members prepare did not pin"
   },
   "629": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10313,7 +10404,9 @@
     626,
     641,
     648
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "same single-basis contract at the commit site"
   },
   "636": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10349,7 +10442,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     649
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "ownership transfer happens after the membership publish"
   },
   "638": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10422,7 +10517,9 @@
     626,
     635,
     648
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "same single-basis contract at the commit site"
   },
   "642": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10440,7 +10537,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     607
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "reservation and row move after the publish, with owner_ cleared last"
   },
   "643": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10458,7 +10557,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     628
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "the abort loop decrements only the pins prepare actually took"
   },
   "644": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10549,7 +10650,9 @@
     626,
     635,
     641
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "same single-basis contract at the commit site"
   },
   "649": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -10567,7 +10670,9 @@
    "agent_verdict": "true",
    "dupe_of": [
     637
-   ]
+   ],
+   "fixed": true,
+   "fixed_note": "the hand-over no longer precedes the fallible per-page updates"
   },
   "650": {
    "path": "src/models/qwen3_5/program/storage/kv_store.h",
@@ -11438,7 +11543,9 @@
    "evidence": "src/models/qwen3_5/state/state_image.cpp:294 -- `if (layout.ple_state) { ple_state_ = layout.ple_state->bind(backing); }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the PLE state bind carries the sibling's dtype/contiguity/extent checks"
   },
   "704": {
    "path": "src/models/qwen3_5/state/state_image.cpp",
@@ -11486,7 +11593,9 @@
    "evidence": "src/models/qwen3_5/state/state_image.cpp:190 -- `if (layout.dflash_local_k) {` ... :203 `(layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL)`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the DFlash payload and copy-operation gates can no longer disagree"
   },
   "707": {
    "path": "src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp",
@@ -11681,7 +11790,9 @@
    "evidence": "members[row] copy loops over the unvalidated row_count; the row_count>max_concurrency check happens later in the try",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the copy loop is bounded before the later size check"
   },
   "719": {
    "path": "src/models/qwen3_5/program/transactions/commit.cpp",
@@ -11697,7 +11808,9 @@
    "evidence": "src/models/qwen3_5/program/transactions/commit.cpp:460 -- `release_members` clears lanes for the unvalidated batch, while abort_pending returns early at :588 `if (!valid) { return out; }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "release_members refuses an unvalidated batch, so it cannot tear down other lanes"
   },
   "720": {
    "path": "src/models/qwen3_5/program/transactions/commit.cpp",
@@ -11713,7 +11826,9 @@
    "evidence": "src/models/qwen3_5/program/transactions/commit.cpp:675 -- `text_kv_addresses->set_checkpoint_requirement(state.kv->text, state.execution_frontier);` inside noexcept publish_active_continuation, while salvage_continuation at :711 checks `!state.kv`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a missing KV bundle fails the publish instead of dereferencing a null optional"
   },
   "721": {
    "path": "src/models/qwen3_5/program/transactions/capture.cpp",
@@ -12803,7 +12918,9 @@
    "evidence": "exl3_copy_rows passes source_row/rows/columns straight to cudaMemcpy2DAsync with no extent validation",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "exl3_copy_rows validates its extents against both tensors"
   },
   "789": {
    "path": "src/ops/linear/exl3/exl3_dispatch.h",
@@ -14725,7 +14842,9 @@
    "evidence": "include/ninfer/ops/kimi_delta_attention.h:41 -- `Inputs/out are non-overlapping.` (and :42 `no other operand overlaps state.`); src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:119 -- `if (state_in.data != state_out.data && overlaps(state_in, state_out)) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "kimi delta validates operand and state non-overlap, as its header documents"
   },
   "909": {
    "path": "src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp",
@@ -14741,7 +14860,9 @@
    "evidence": "src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:178-179 -- `require_control_parameters(lower_bound, scale);` `return geometry;` (no overlap check)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the batch form validates non-overlap with the in-place update still legal"
   },
   "910": {
    "path": "src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp",
@@ -16157,7 +16278,9 @@
    "evidence": "src/ops/sparse_attention/sparse_attention.cpp:112 -- `require_dense(table_rows, DType::I32, op, \"table rows\");` (qsa_select, dtype/contiguity only)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "qsa_select requires one table row per lane, as the kernel indexes"
   },
   "998": {
    "path": "src/ops/sparse_attention/sparse_attention.cpp",
@@ -16173,7 +16296,9 @@
    "evidence": "src/ops/sparse_attention/sparse_attention.cpp:171 -- `require_dense(selected, DType::I32, op, \"selected\");`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "qsa_attention requires the selected shape the kernel strides over"
   },
   "999": {
    "path": "src/ops/sparse_attention/sparse_attention.cpp",
@@ -16189,7 +16314,9 @@
    "evidence": "src/ops/sparse_attention/sparse_attention.cpp:72 -- `index.pages.ne[0] == kQsaIndexRecordWords,` (the only index-plane validation)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the qsa index block tables are validated before reaching the kernel"
   },
   "1000": {
    "path": "src/ops/sparse_attention/sparse_attention.cpp",
@@ -16308,16 +16435,17 @@
    "line": "154-158",
    "category": "bug",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P2",
+   "verdict": "false",
+   "priority": "F",
    "kind": "bug",
    "impact": "medium",
    "reach": "requires a caller passing envelope.max_context > window",
-   "note": "The envelope is never checked against the ring; the sibling context_softmax_attention.cpp:162 rejects `envelope.max_context > logical_capacity`, and validate_context (:51) already fixes context.capacity == window.",
+   "note": "re-examined: not a defect. The envelope's max_context is the absolute context length and the kernel bounds the query position with it, ring addressing is modulo, and launch.cu:69 already clamps rows with min(max_context, window - 1). The sibling's check bounds the paged cache's total capacity, a different quantity; adding it would reject decode.cpp:1056 and two tests that deliberately run an 8194-token context over a 4096 window (test_sliding_window_attention ::349,377).",
    "evidence": "src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp:154-156 -- `if (envelope.min_context > envelope.max_context || envelope.max_context > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false
   },
   "1008": {
    "path": "src/product/media_acquire/acquire.h",
@@ -16575,7 +16703,9 @@
    "evidence": "include/ninfer/ops/gemma_moe_experts.h:86 -- `// The workspace a call over T tokens needs for banks stored as `qtype`. Throws on a non-positive T.`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "same contract defect as 91, fixed at the query"
   },
   "1024": {
    "path": "src/ops/wrapper/mtp_pack.cpp",
@@ -16751,7 +16881,9 @@
    "evidence": "src/ops/kernel/vision_pos_embed.cuh:38 -- `table[static_cast<std::int64_t>(corner_indices[corner]) * pairs + pair]` (also :73) vs :61 `if (index >= 0 && index < table_rows) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the D==1152 kernels clamp an out-of-range corner index like the scalar route"
   },
   "1035": {
    "path": "src/ops/wrapper/vision_pool.cpp",
@@ -16995,7 +17127,9 @@
    "evidence": "src/product/logging/startup_log.cpp:224 -- `if (progress->enabled()) {` (the Progress branch, with no presentation.visibility test)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Progress honours the same Debug visibility gate as Begin"
   },
   "1050": {
    "path": "src/product/logging/startup_log.cpp",
@@ -17255,7 +17389,9 @@
    "evidence": "curl_write is not noexcept and vector::insert can throw; curl_progress is noexcept with catch(...)",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the libcurl write callback is noexcept and rethrows in the caller's error branch"
   },
   "1066": {
    "path": "src/product/media_acquire/acquire.cpp",
@@ -17691,7 +17827,9 @@
    "evidence": "src/ops/wrapper/sparse_moe.cpp:152-156 -- only `weight.qdata` (code) and `weight.scales` are pushed as ranges for a stacked NVFP4 weight",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the NVFP4 divisor plane joins the overlap ranges the kernels read"
   },
   "1093": {
    "path": "src/ops/wrapper/sparse_moe.cpp",
@@ -17947,7 +18085,9 @@
    "evidence": "src/product/serve_profile.h:35 -- `if (document.value(\"artifact_type\", std::string()) != \"ninfer_serve_profile\") {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "profile loading raises invalid_argument, with no json::exception escaping the parse"
   },
   "1109": {
    "path": "src/product/serve_profile.h",
@@ -18203,7 +18343,9 @@
    "evidence": "src/product/prompt_input/prompt_input.cpp:112 -- `const std::string type = item.value(\"type\", \"\");`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a non-string message part type is refused before value() throws"
   },
   "1125": {
    "path": "src/runtime/contract/execution.h",
@@ -18833,7 +18975,9 @@
    "evidence": "src/runtime/engine/engine_core.h:266 -- `pending_.push_back(request);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the queue insert is inside the guard, so a throwing push_back releases its reservation"
   },
   "1164": {
    "path": "src/runtime/engine/engine_core.h",
@@ -18993,7 +19137,9 @@
    "evidence": "src/serve/generation_service.cpp:433-434 -- `int GenerationService::count_prompt_tokens(const GenerationRequest& request, std::function<bool()> is_cancelled) const {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "media acquisition and count_tokens take the same request lifetime as prepare"
   },
   "1174": {
    "path": "src/serve/generation_service.cpp",
@@ -19153,7 +19299,9 @@
    "evidence": "src/runtime/engine/context_cache/materialization_planner.h:1296 -- `                 .target_recovery_ns   = recovery});` (no .unreachable, unlike line 1387 `                .unreachable          = policy.unreachable,`) with src/runtime/engine/context_cache/context_portfolio_value.h:66 -- `if (checkpoint.unreachable) { continue; }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "fold_guidance forwards the unreachable flag its sibling already forwards"
   },
   "1184": {
    "path": "src/runtime/engine/context_cache/materialization_planner.h",
@@ -19555,7 +19703,9 @@
    "evidence": "src/serve/request_log.h:75 -- `[[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "enabled() reads the failure flag, which is atomic because request threads now read it"
   },
   "1209": {
    "path": "src/serve/openai_common.h",
@@ -19619,7 +19769,9 @@
    "evidence": "codepoint_to_utf8 checks only length<=0; the vendored utf8proc_encode_char deliberately encodes 0xD800-0xDFFF",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "surrogate code points are refused instead of encoded"
   },
   "1213": {
    "path": "src/text/unicode.cpp",
@@ -20441,7 +20593,9 @@
    "evidence": "src/serve/openai_responses_response.cpp:475 -- `append(impl_->close_reasoning(outcome.reasoning, reasoning_status));`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "the reasoning side gets the content side's prefix check before done"
   },
   "1264": {
    "path": "src/serve/openai_responses_response.cpp",
@@ -20685,7 +20839,9 @@
    "evidence": "src/text/grammar.cpp:104 -- `std::string result   = \"\\\"\\\\x00\\\"\";`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "a non-ASCII reasoning delimiter is refused rather than building a byte-wise DFA that cannot express it"
   },
   "1279": {
    "path": "src/text/grammar.cpp",

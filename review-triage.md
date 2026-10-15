@@ -18,18 +18,18 @@ breach, or a caller-side misuse; P3 = cosmetic.
 |---|---|
 | P0 — breaks a shipped path | 5 |
 | P1 — reachable on a documented or in-repo path | 38 |
-| P2 — real, but needs malformed input, an internal invariant breach or caller error | 86 |
+| P2 — real, but needs malformed input, an internal invariant breach or caller error | 84 |
 | P3 — real but cosmetic: dead code, wording, naming, style | 655 |
 | maybe — partially true or unreachable; needs a decision | 471 |
-| false — claim contradicted by the code | 31 |
+| false — claim contradicted by the code | 33 |
 | **total** | **1286** |
-| of which fixed in the working tree | 51 |
+| of which fixed in the working tree | 128 |
 
 | verdict | findings |
 |---|---|
-| true | 784 |
+| true | 782 |
 | maybe | 471 |
-| false | 31 |
+| false | 33 |
 
 ## 2. Action list
 
@@ -401,6 +401,130 @@ This host's edit pipeline reformats every file it writes and this tree is hand-f
 file was passed through `refmt.py`, which re-applies only the changed tokens onto the committed text; that
 is why the diffs stay limited to the fixes.
 
+## 3i. Fourth batch — the P2 band
+
+The 79 findings left after the P0/P1 pass: 66 bugs and 13 contract mismatches, 17 of them high and 2
+critical. They were split into file-disjoint slices — one owner per file, so no two writers could touch the
+same text — and each slice's owner had to verify its finding against the code *and its callers* before
+changing anything, fix the root cause, and report a per-finding verdict. One finding was falsified and one
+disproved on re-derivation; the rest were fixed.
+
+| slice | findings | fix | verification |
+|---|---|---|---|
+| storage and lifetime | 575, 607, 626/627/628/635/637/641/642/643/648/649, 589, 616 | the host arena refuses a split plan it cannot serve *before* mutating (a 4-line `available_descriptors()` accessor in `core/host_kv_arena.h` was needed and disclosed); `prepare_activation`'s frontier basis and `commit_activation`'s mapped basis are now one basis or the mismatch is refused; the execution-table membership is published before any address state changes, with the remaining page loop shown non-throwing and the hand-over moving only reservation, row and flags; `abort_prefix_fork` skips exactly the members prepare did not pin; the pending device slot stays abortable until the last fallible step; the pressure validity predicate guards a live store and handle instead of throwing | build; `kv_cache_append` (k8v4/nvfp4/plain), `context_kv_materialize`, `gemma4_kv_quant`, `resource`/`materialization` suites: 23/23; fast suite 185/185 |
+| quantize tooling | 17, 161, 788, 1212, 28, 35, 51, 54, 56 | a trace entry's declared count is checked against its own extent by division (no overflow); the artifact reader's lazy geometry cache is mutex-guarded in the repo's own idiom; `exl3_copy_rows` validates its extents (six call sites checked); surrogates are refused via `utf8proc_codepoint_valid`; the lossy name mapping is documented rather than changed (any injective escape would rename existing files and silently skip calibrations); the wrapping length guard divides (its sibling in `main.cpp:334` fixed too); a truncated sidecar is discarded instead of throwing into the outer handler; an RAII scope clears the expert observers; `skipped_names` is computed from the planned set | build; `exl3_quantize_source`/`interop`, quantize and trace-reader tests inside 185/185 |
+| qwen3_5 config and execution | 383, 384, 386, 323, 330, 417, 488, 495→disproved, 502, 503, 544, 703, 706 | the n-gram head count is established in u64 and proved non-zero/bounded before any use, with a zero base/divisor refused and `table_rows` computed through `artifact::align_up`; the fused-attention header states the eps/theta condition its guard enforces; submitted tasks are waited on before the drain; the empty-session rule is stated and enforced where an unchecked deref and a `std::terminate()` were; the config flag is type-checked before asserting; the staged-expert reader releases on every throw; the GDN replay record is shape-checked before the flat copy; the pending-batch copy is bounded; the PLE state bind and the DFlash payload/copy gates carry the sibling checks | build; fast suite 185/185 |
+| gemma4 | 290, 295, 296, 308, 317, 346, 348 | `quantized()` is no longer `noexcept`; reconfigure releases device memory through the destructor's path; `keys()`/`values()` refuse a quantized ring; `rope_theta` uses the numeric accessor; the prefill signature folds binding structure and parts as the documented key requires (scheme tag bumped to `gemma4-prefill-2`, verified to be reporting-only so no cost default goes stale); the aspect ratio is clamped before scaling; template boolean kwargs are type-checked | build; fast suite. **Gap:** the 15 Gemma 4 tests self-skip without `NINFER_GEMMA_CHECKPOINT`, so these are covered by the build and the shared suites only — the 833-weight assertion never runs here |
+| attention and wrapper contracts | 997, 998, 999, 908, 909, 80, 90, 91, 1023, 1034, 1092, 1007→false | the qsa entries require the operand shapes their kernels stride over and validate the index block tables; kimi delta validates operand and state non-overlap in both forms; the EXL3 parent claim is corrected (that route does materialise the packed parent); 16 bytes is the true alignment, so the *launcher's* 256-byte claim was corrected; the workspace query rejects a non-positive T (one defect at two sites); the `D == 1152` kernels clamp an out-of-range corner like the scalar route; the NVFP4 divisor plane joins the overlap ranges | build; `sparse_attention`, `sliding_window_attention`, `speculative_round` and the wrapper tests: 33/33 in the touched areas; fast suite 185/185 |
+| serving and product | 14, 40, 41, 1049, 1108, 1124, 1173, 1208, 1263, 1278 | the logging pointer is scoped so every exit path clears it; the reference's text digest is enforced (the same expression the writer stored); the model side of `delta_nats` is accumulated at the reference's own positions, so the comparison is paired; `Progress` honours `Begin`'s Debug gate; profile loading raises `invalid_argument` with no `json::exception` escaping; a non-string part type is refused before `value()` throws; media acquisition and `count_tokens` take the same request lifetime as `prepare`; `enabled()` reads the failure flag, now atomic because request threads read it; the reasoning side gets the content side's prefix check; a non-ASCII reasoning delimiter is refused instead of building a byte-wise DFA that cannot express it | build; `openai_schema`, `anthropic_schema`, responses store tests inside 185/185; `docs/serving.md:1175` documents the count-endpoint admission change |
+| engine and media | 258, 1163, 1183, 335, 358 | the `KVPageRef` publish overload also requires the page's liveness flag; the queue insert is inside the guard so a throwing `pending_.push_back` releases its reservation (the leak path); `fold_guidance` forwards the unreachable flag its sibling already forwards; the resize input descriptor is validated against its buffer; the duration guard runs before the double-to-int frame conversion | build; `paged_kv_cache`/`context_cost`/media tests plus the targeted media decode run; fast suite 185/185 |
+| independent review of the above | — | see below | read-only; found 4 defects in the fixes and 2 cosmetic artifacts, all resolved |
+
+### Independent review round
+
+A second, read-only agent reviewed every hunk of the landed slices plus the callers each depends on, across
+five categories (over-strict validation, exception-safety/lifetime, contract claims, behaviour changes beyond
+the finding, formatting), and swept all 416 added lines for splice artifacts.
+
+It confirmed the riskiest claims: the `engine_core.h` fix is the leak path and is balanced on every exit;
+`page_allocated_` cannot reject a legitimate word; the `ple_rows` wait covers exactly the submitted set and
+cannot starve; `program.h`'s bound is the array's real extent and unreachable from its caller;
+`commit.cpp`'s bounded copy and `valid` gate are right; the `kv_store.h` frontier check is satisfied by its
+only producer and the moved publish is safe where it now sits; the abort skip matches what prepare pinned
+(a pinned page cannot lose its device replica, so `can_stream` is stable); the `state_image` DFlash gate
+direction and PLE check match their siblings; the `qwen4_text`/`state_image` repaired regions are consistent
+pure insertions; the `gemma4-prefill-2` tag cannot stale cost defaults; the perplexity digest gate is the
+same expression the writer stored; and each new operand check is consistent with its callers.
+
+Its four findings, and what was done:
+
+1. **`processor.cpp` (495) — cross-request coupling; reverted.** The composed cancellation view is copied
+   into the *shared* digest-keyed media flight (`media_cache.cpp:312-313`), drives the pool checkpoint and the
+   post-build check whose throw becomes `flight->error` (:346) and is rethrown to every joiner (:391), so a
+   cancelled launcher failed requests waiting on the same digest. Re-derivation showed the launching request's
+   cancellation is already observed on its own thread (:874, :876, :906 via :377/388, :839, :958, :989) and
+   inside `await`, so the worker never needed it: **495's premise is wrong**, and the change was reverted to
+   HEAD plus a comment recording the invariant. Recorded as disproved, not fixed.
+2. **`generation_service.cpp` (1173) — behaviour change, documented.** The count endpoints now hold a request
+   lifetime, so they can answer a saturated server (`Overloaded`/queue-timeout) instead of always succeeding,
+   and count against `max_concurrency + max_pending_requests`; the deadline origin also moved to the
+   acquisition timestamp. Verified that no test, fixture or schema asserts the old behaviour (no test
+   references `GenerationService`/`HttpServer`/`count_prompt_tokens`; the count tests are parse/render-level;
+   the smoke tool calls them serially against an idle server), so nothing needed updating, and
+   `docs/serving.md:1175` now states it with the per-surface normalization.
+3. **`openai_responses_response.cpp` (1263) — delta after `done`; fixed.** `content_delta` closes the reasoning
+   item (:436) and `close_reasoning` emits `done` then early-returns (:306-309), so an ungated reconciliation
+   could emit a delta after `done`. Now gated on `!impl_->reasoning_done`: while open, the missing tail is
+   emitted before `done` (the case 1263 was for); once closed, nothing is emitted and the streamed prefix is
+   kept for both deltas and `done`, which is the behaviour before this wave. The close is not premature — the
+   Responses protocol requires the reasoning item to complete before the message item starts.
+4. **`gemma4/measurement.cpp` (317) — the file-mapped case; resolved as an invariant guard.** No gemma4 weight
+   can be file-mapped today (three guarantees: `load.cpp:242-255` rejects every residency but Device/HostPinned;
+   `views.cpp:14-16` rejects `HostFile`; `views.cpp:27-29` rejects a region list that does not cover the shape,
+   and the gemma4 test asserts 833/833 weights have non-empty parts). The sibling's branch cannot be mirrored —
+   gemma4's `BoundWeight` is `{name, view}`, so `mapped`/`mapped_geometry` would be two always-empty members on
+   every weight of every artifact — so the invariant that branch protects is enforced loudly instead
+   (`view.parts.empty()` → `ArtifactError`), with a comment recording why no mapped branch exists.
+5. Cosmetic, fixed: the `paged_kv_cache.cpp` continuation indentation (hand-repaired; **refmt re-splices this
+   hunk deterministically, so that file must not go through refmt again**) and the `kv_store.h` comment, which
+   now separates what the checks above prove from what the loop relies on (`retain_active_reference`'s
+   `active_references < references`, established by the address being inactive).
+
+### Verification of the fourth batch
+
+Final tree, with every fix above and the review round's changes:
+
+- Build clean (full tree, after each slice group and again after the review fixes).
+- `ctest --preset fast`: **185/185**, 0 failed (15 Gemma 4 tests self-skipped for the missing checkpoint).
+- Touched areas: `33/33` (sparse/sliding attention, speculative round, exl3 quantize, media, reader, unicode).
+- Storage/serving: `23/23` (kv-cache append k8v4/nvfp4/plain, context materialization, gemma4 kv quant, openai/anthropic schema, responses store).
+- Real preset: `spec_residue` and `spec_residue_eagle3` pass; `11/13` `prefix` scenarios pass, and the two
+  failures are the committed guard mismatch recorded in 3h (`shared-replacement`, `anthropic-prefix-regression`).
+  After the review fixes, `vision`, `concurrent`, `salvage-mid-prefill` and both residue tests pass again.
+- One scare worth recording as an environment fact: `shared-rewrite-materialization` failed deterministically
+  in one sweep and passed in the next with no code change. The requirement is byte-identical across runs
+  (4,420,901,376) while the available side moves (4,406,378,496 → 4,416,274,432), because
+  `model_instance.cpp:203` passes `free_bytes` straight into `resolve_kv_capacity`. It is the most
+  memory-hungry scenario in that test, so it needs roughly 4.43 GB of free device memory; other clients on
+  this box (sd-server holding 5.0 GB, browsers, an editor) can tip it. Not a regression, and not a
+  test-side flake to chase.
+
+### Deliberately not done, with reasons
+
+- 1007 was falsified rather than patched: the envelope's `max_context` is the absolute context length, the
+  kernel bounds the query position with it, ring addressing is modulo, and the launcher already clamps rows
+  with `min(max_context, window - 1)`; the sibling's check bounds the paged cache's total capacity, a different
+  quantity. Adding it would reject `decode.cpp:1056` and two tests that deliberately run an 8194-token context
+  over a 4096 window.
+- 495 was disproved rather than fixed, as above.
+- The band's security-flavoured findings are robustness, not exploit paths: the inputs are local files in a
+  single-owner tool. They were fixed anyway because the checks are cheap and bounded.
+
+### Follow-ups surfaced by this batch, not fixed
+
+1. `qsa_select`'s `valid_columns` numel, its unvalidated `index.pages`, and `QsaIndexPlane::host` on both entries (same class as 997/998/999).
+2. `apps/quantize/trace_reader.cpp:65`'s unused anonymous-namespace `require()`.
+3. `linear/nvfp4/nvfp4_format.cpp`: `weight_divisors` non-null is checked, its placement is not (1092's residual).
+4. `media/decode/decode.cpp`: `fps_of()` is unbounded, so an absurd `avg_frame_rate` can still overflow the `double → int` frame estimate (`sample_indices:468` has the same shape); the repo's idiom is the `nb_frames <= INT_MAX` bound six lines above (358's residual).
+5. Shared media flights: a producer's abort records the flight failed for every waiter, including for external cancellation that reaches the flag through the producer's thread; removing it needs participation tracking on `MediaCacheFlight` (495's residual, pre-existing at HEAD).
+6. `gemma4` `values()` on a global layer still returns a null-data Tensor (296's residual).
+7. `config.cpp`: an absurd non-wrapping head count (e.g. 10^8) loops/allocates before `ple_gather.cpp:93` rejects more than 32 heads.
+8. `kv_store` 719: an invalid batch also skips `pending_transaction_.reset()` (mirrors its sibling; unreachable today).
+9. `kv_store` 628/643: `can_stream` is recomputed at three sites instead of recorded in the reservation, so a flip between prepare and abort would still mis-account pins (narrowed, not widened, by this batch).
+10. `reasoning_delta()` guards only `!started || finish_built`, so an engine emitting a reasoning delta after content began would append one after the content-triggered reasoning `done`; no in-tree caller does.
+11. `gemma_moe_experts.h`'s re-wrapped sentence still ends short (cosmetic).
+12. `qwen4_text.cpp`'s conv check does not also assert contiguity before the raw `memcpyAsync`.
+
+### Tooling notes for anyone editing these files
+
+`refmt.py` (the minimal-diff helper used by every agent here) re-applies changed tokens onto the committed
+text, which has two consequences worth knowing. It can splice *committed* whitespace into newly inserted code,
+so the delivered state of `qwen4_text.cpp`, `state_image.cpp`, `paged_kv_cache.cpp`, `media_cache.cpp`,
+`resources.cpp` and gemma4's `cache.{h,cpp}`/`config.cpp` is a hand repair that re-running it would undo. And
+it cannot re-indent unchanged lines that move into a new block, which is why several fixes are shaped to add
+guards inside existing braces rather than wrapping a region. Its character-literal rule also mis-tokenised C++
+digit separators (`1'000`) until this batch; that is fixed in the helper.
+
 ## 4. Full table
 
 `idx | location | band | verdict | note` — sorted by band then path. Use the idx as the key.
@@ -451,92 +575,92 @@ is why the diffs stay limited to the fixes.
 | 1274 | `src/serve/openai_common.cpp:184-186` | bug·medium | P1 | true | FIXED — Earlier markers are reset with no error or log; anthropic_messages_request.cpp:975 does `bad_request(..., "too_many_cache_breakpoints")`. Divergent handling of the identical condition is real. |
 | 1275 | `src/serve/openai_common.cpp:215-218` | bug·medium | P1 | true | FIXED — The sibling automatic target at :199-202 uses the policy-derived `evidence`. resource_manager.h:587-590 grants declared credit only for ExplicitBoundary/RequestedAutomatic, so the shared system head loses credit on a Req |
 | 615 | `src/models/qwen3_5/measurement.cpp:22-24` | bug·low | P1 | true | FIXED — TextConfig.sparse_attention (config.h:140) with budget/compress_ratio and block_topk() (config.h:88) changes per-query key-block work without changing any weight shape, so two such configs hash identically. |
-| 40 | `apps/perplexity/main.cpp:250-251` | bug·medium | P2 | true | Only context/stride are compared (line 244) and the digest is merely logged; the rows==0 check (line 444) only catches non-overlapping positions. The writer stores sha256 of the text (line 456). |
-| 41 | `apps/perplexity/main.cpp:479-480` | bug·medium | P2 | true | overall_reference only accumulates positions the reference covers (line 370) while overall spans every scored token; the code's own comment (line 476) notes the counts differ when --sample-stride > 1. |
-| 54 | `apps/quantize/calibration.cpp:348-351` | bug·medium | P2 | true | Expert observer globals capture accumulator by reference but lack the ObserverScope RAII; an exception leaves dangling lambdas. |
-| 56 | `apps/quantize/calibration.cpp:423-423` | bug·medium | P2 | true | Field documented and printed by main.cpp:230 but hardcoded to 0, so skipped names are always reported as none. |
-| 51 | `apps/quantize/main.cpp:310-311` | bug·medium | P2 | true | Sidecar is neither checked nor guarded, and line 407 rewrites it with std::ios::trunc; a job killed mid-write makes the whole run abort in the outer handler before report.json/index. |
-| 28 | `apps/quantize/options.h:52-52` | bug·medium | P2 | true | The mapping is lossy as claimed ('a/b_c' and 'a_b/c' both yield 'a_b_c') and throws std::invalid_argument for an empty name, neither documented in options.h:50-51. |
-| 35 | `apps/quantize/parameter_reader.cpp:114-116` | security·medium | P2 | true | Both operands are std::uint64, so a bogus part.end wraps the product and the guard passes; the following `payload[at]`/`payload[at + 1]` then read out of bounds. |
-| 17 | `apps/quantize/trace_reader.cpp:104-109` | security·critical | P2 | true | bounds check missing |
-| 14 | `apps/serve/main.cpp:81-81` | bug·medium | P2 | true | g_logging is written once and never cleared (only hits: decl :24, load :42, store :81), while g_server is reset on both exit paths. A terminate after main's scope dies dereferences a destroyed stack LoggingRuntime. |
-| 80 | `include/ninfer/ops/attn_input_proj.h:41-42` | documentation·medium | P2 | true | EXL3_MUL1 is supported by dispatch_single_parent and does materialize a packed [14336,T] parent needing workspace, contradicting the contract and missing from the registered-forms list. |
-| 90 | `include/ninfer/ops/gemma_moe_experts.h:63-64` | documentation·medium | P2 | true | Alignment is unstated here while the launcher preconditions require 256 bytes (launcher/gemma_moe_experts.h:3) and the wrapper only rejects `% 16 != 0` (wrapper/gemma_moe_experts.cpp:115); the router sibling documents '1 |
-| 91 | `include/ninfer/ops/gemma_moe_experts.h:86-86` | documentation·medium | P2 | true | The implementation throws only on non-positive hidden_size/num_experts/intermediate_size/top_k (wrapper/gemma_moe_experts.cpp:76-79) and never validates tokens, so the documented condition does not hold. |
-| 155 | `include/ninfer/ops/speculative_round.h:15-15` | bug·high | P2 | true | The raw_greedy route takes a kernel with no configs/mask argument, so the header promise must also require an empty sampling mask; no in-tree caller sets the envelope true today (only a test, with false). |
-| 161 | `src/artifact/reader.h:35-35` | bug·high | P2 | true | unsynchronised lazy cache |
-| 258 | `src/core/paged_kv_cache.cpp:830-833` | bug·medium | P2 | true | This overload range-checks the Device word only; the Handle overload resolves it through physical_index (:793) and the Lease overload through belongs_to (:812), which also reject stale/unallocated pages. |
-| 358 | `src/media/decode/decode.cpp:492-495` | bug·medium | P2 | true | The duration guard is at line 495, after the multiply and the double->int cast; duration_seconds() (line 223) comes straight from stream/format metadata. |
-| 335 | `src/media/decode/resize.cpp:63-63` | bug·medium | P2 | true | Only the target is validated; :85-86 then walks input.rgb with `input.width * input.height * 3`, so an undersized or zero-sized source reads out of bounds (or fails as `bicubic resize produced zero weights`). |
-| 296 | `src/models/gemma4/cache.cpp:250-253` | bug·medium | P2 | true | ensure() leaves keys/values unset for a quantized ring (L120-133 sets only key_codes/.../value_scales), so these accessors return a null-data Tensor while the header says such a layer "refuses these" (cache.h:85). |
-| 295 | `src/models/gemma4/cache.cpp:79-80` | bug·high | P2 | true | device leak on reconfigure |
-| 290 | `src/models/gemma4/cache.h:76-78` | bug·high | P2 | true | noexcept + throwing callee |
-| 308 | `src/models/gemma4/config.cpp:47-47` | bug·high | P2 | true | silent zero base |
-| 348 | `src/models/gemma4/frontend.cpp:373-373` | bug·medium | P2 | true | context is filled from user chat_template_kwargs (line 370), so a non-boolean value throws nlohmann::json::type_error, which none of the callers map (generation_service.cpp:426 catches only ApiException/RequestError/inva |
-| 346 | `src/models/gemma4/image_processor.cpp:43-43` | bug·medium | P2 | true | The int cast is applied before multiplying by kSide, so a wide image (width>~44.7M) overflows int (UB) and yields a negative/tiny target_width; the mirrored height branch shares it. |
-| 317 | `src/models/gemma4/measurement.cpp:32-32` | bug·medium | P2 | true | The doc says the prefill signature is generated from config, binding structure and Use (docs/maintainer/resource-scheduling-and-context-cache.md:650), so two layouts with identical config collide on one key. |
-| 386 | `src/models/qwen3_5/config.cpp:166-168` | bug·high | P2 | true | u32 wrap -> div by zero |
-| 384 | `src/models/qwen3_5/config.cpp:169-169` | bug·high | P2 | true | silent wrong moduli + long loop |
-| 383 | `src/models/qwen3_5/config.cpp:170-171` | bug·critical | P2 | true | division by zero |
-| 323 | `src/models/qwen3_5/execution/attention.h:24-24` | bug·medium | P2 | true | The fused op applies its own kEpsilon = 1.0e-6F (ops/rmsnorm_rope/d256.cuh:21) while the fallback passes rms_norm_eps (:95-96), so the two schedules differ whenever rms_norm_eps != 1e-6 despite the header's 'same arithme |
-| 338 | `src/models/qwen3_5/execution/draft.cpp:362-363` | bug·high | P2 | true | Guard genuinely absent where the sibling checks; loader invariants (proposal_head==Optimized implies a bound proposal) mean UB needs a state this file cannot create. |
-| 330 | `src/models/qwen3_5/execution/ple_rows.cpp:140-140` | bug·medium | P2 | true | submit() hands back packaged_task futures (core/host_worker_pool.h:38), whose destructors do not wait, so the remaining tasks keep writing into staging_/pages_ after the first rethrow. |
-| 503 | `src/models/qwen3_5/execution/qwen4_text.cpp:295-296` | bug·low | P2 | true | records.conv is slice(2,..).view({conv_channels, spec.width, rows}) (gdn_replay_records.cpp:151) whose T-axis index is w+b*spec.width, so the flat copy is correct only when spec.width == W; no shape/pitch check, unlike t |
-| 502 | `src/models/qwen3_5/execution/qwen4_text.cpp:465-466` | bug·medium | P2 | true | Unguarded manual pairing; qwen4_expert_pager.h:69 documents 'Every acquire is paired with release_staged on the same stream after the layer's last reader', and moe_experts/capture validate and can throw, skipping the eve |
-| 488 | `src/models/qwen3_5/frontend/frontend.cpp:189-190` | bug·medium | P2 | true | nlohmann value() throws json::type_error for a non-bool key, while parse_resource_json/require_integer/validate_pixel_pipeline all normalize to std::invalid_argument (validate_pixel_pipeline checks is_boolean()). |
-| 467 | `src/models/qwen3_5/frontend/media_cache.cpp:322-324` | bug·medium | P2 | true | `state->ready.emplace(...)` on the next line can throw after the LRU push, and evict_one_locked() terminates on a key with no ready entry (line 152). |
-| 417 | `src/models/qwen3_5/frontend/output_session.h:77-77` | maintainability·medium | P2 | true | Empty-state behaviour is genuinely inconsistent: queries default, previews throw, commit terminates, discard_preview dereferences impl_ unguarded. |
+| 40 | `apps/perplexity/main.cpp:250-251` | bug·medium | P2 | true | FIXED — Only context/stride are compared (line 244) and the digest is merely logged; the rows==0 check (line 444) only catches non-overlapping positions. The writer stores sha256 of the text (line 456). |
+| 41 | `apps/perplexity/main.cpp:479-480` | bug·medium | P2 | true | FIXED — overall_reference only accumulates positions the reference covers (line 370) while overall spans every scored token; the code's own comment (line 476) notes the counts differ when --sample-stride > 1. |
+| 54 | `apps/quantize/calibration.cpp:348-351` | bug·medium | P2 | true | FIXED — Expert observer globals capture accumulator by reference but lack the ObserverScope RAII; an exception leaves dangling lambdas. |
+| 56 | `apps/quantize/calibration.cpp:423-423` | bug·medium | P2 | true | FIXED — Field documented and printed by main.cpp:230 but hardcoded to 0, so skipped names are always reported as none. |
+| 51 | `apps/quantize/main.cpp:310-311` | bug·medium | P2 | true | FIXED — Sidecar is neither checked nor guarded, and line 407 rewrites it with std::ios::trunc; a job killed mid-write makes the whole run abort in the outer handler before report.json/index. |
+| 28 | `apps/quantize/options.h:52-52` | bug·medium | P2 | true | FIXED — The mapping is lossy as claimed ('a/b_c' and 'a_b/c' both yield 'a_b_c') and throws std::invalid_argument for an empty name, neither documented in options.h:50-51. |
+| 35 | `apps/quantize/parameter_reader.cpp:114-116` | security·medium | P2 | true | FIXED — Both operands are std::uint64, so a bogus part.end wraps the product and the guard passes; the following `payload[at]`/`payload[at + 1]` then read out of bounds. |
+| 17 | `apps/quantize/trace_reader.cpp:104-109` | security·critical | P2 | true | FIXED — bounds check missing |
+| 14 | `apps/serve/main.cpp:81-81` | bug·medium | P2 | true | FIXED — g_logging is written once and never cleared (only hits: decl :24, load :42, store :81), while g_server is reset on both exit paths. A terminate after main's scope dies dereferences a destroyed stack LoggingRuntime. |
+| 80 | `include/ninfer/ops/attn_input_proj.h:41-42` | documentation·medium | P2 | true | FIXED — EXL3_MUL1 is supported by dispatch_single_parent and does materialize a packed [14336,T] parent needing workspace, contradicting the contract and missing from the registered-forms list. |
+| 90 | `include/ninfer/ops/gemma_moe_experts.h:63-64` | documentation·medium | P2 | true | FIXED — Alignment is unstated here while the launcher preconditions require 256 bytes (launcher/gemma_moe_experts.h:3) and the wrapper only rejects `% 16 != 0` (wrapper/gemma_moe_experts.cpp:115); the router sibling documents '1 |
+| 91 | `include/ninfer/ops/gemma_moe_experts.h:86-86` | documentation·medium | P2 | true | FIXED — The implementation throws only on non-positive hidden_size/num_experts/intermediate_size/top_k (wrapper/gemma_moe_experts.cpp:76-79) and never validates tokens, so the documented condition does not hold. |
+| 155 | `include/ninfer/ops/speculative_round.h:15-15` | bug·high | P2 | true | FIXED — The raw_greedy route takes a kernel with no configs/mask argument, so the header promise must also require an empty sampling mask; no in-tree caller sets the envelope true today (only a test, with false). |
+| 161 | `src/artifact/reader.h:35-35` | bug·high | P2 | true | FIXED — unsynchronised lazy cache |
+| 258 | `src/core/paged_kv_cache.cpp:830-833` | bug·medium | P2 | true | FIXED — This overload range-checks the Device word only; the Handle overload resolves it through physical_index (:793) and the Lease overload through belongs_to (:812), which also reject stale/unallocated pages. |
+| 358 | `src/media/decode/decode.cpp:492-495` | bug·medium | P2 | true | FIXED — The duration guard is at line 495, after the multiply and the double->int cast; duration_seconds() (line 223) comes straight from stream/format metadata. |
+| 335 | `src/media/decode/resize.cpp:63-63` | bug·medium | P2 | true | FIXED — Only the target is validated; :85-86 then walks input.rgb with `input.width * input.height * 3`, so an undersized or zero-sized source reads out of bounds (or fails as `bicubic resize produced zero weights`). |
+| 296 | `src/models/gemma4/cache.cpp:250-253` | bug·medium | P2 | true | FIXED — ensure() leaves keys/values unset for a quantized ring (L120-133 sets only key_codes/.../value_scales), so these accessors return a null-data Tensor while the header says such a layer "refuses these" (cache.h:85). |
+| 295 | `src/models/gemma4/cache.cpp:79-80` | bug·high | P2 | true | FIXED — device leak on reconfigure |
+| 290 | `src/models/gemma4/cache.h:76-78` | bug·high | P2 | true | FIXED — noexcept + throwing callee |
+| 308 | `src/models/gemma4/config.cpp:47-47` | bug·high | P2 | true | FIXED — silent zero base |
+| 348 | `src/models/gemma4/frontend.cpp:373-373` | bug·medium | P2 | true | FIXED — context is filled from user chat_template_kwargs (line 370), so a non-boolean value throws nlohmann::json::type_error, which none of the callers map (generation_service.cpp:426 catches only ApiException/RequestError/inva |
+| 346 | `src/models/gemma4/image_processor.cpp:43-43` | bug·medium | P2 | true | FIXED — The int cast is applied before multiplying by kSide, so a wide image (width>~44.7M) overflows int (UB) and yields a negative/tiny target_width; the mirrored height branch shares it. |
+| 317 | `src/models/gemma4/measurement.cpp:32-32` | bug·medium | P2 | true | FIXED — The doc says the prefill signature is generated from config, binding structure and Use (docs/maintainer/resource-scheduling-and-context-cache.md:650), so two layouts with identical config collide on one key. |
+| 386 | `src/models/qwen3_5/config.cpp:166-168` | bug·high | P2 | true | FIXED — u32 wrap -> div by zero |
+| 384 | `src/models/qwen3_5/config.cpp:169-169` | bug·high | P2 | true | FIXED — silent wrong moduli + long loop |
+| 383 | `src/models/qwen3_5/config.cpp:170-171` | bug·critical | P2 | true | FIXED — division by zero |
+| 323 | `src/models/qwen3_5/execution/attention.h:24-24` | bug·medium | P2 | true | FIXED — The fused op applies its own kEpsilon = 1.0e-6F (ops/rmsnorm_rope/d256.cuh:21) while the fallback passes rms_norm_eps (:95-96), so the two schedules differ whenever rms_norm_eps != 1e-6 despite the header's 'same arithme |
+| 338 | `src/models/qwen3_5/execution/draft.cpp:362-363` | bug·high | P2 | true | FIXED — Guard genuinely absent where the sibling checks; loader invariants (proposal_head==Optimized implies a bound proposal) mean UB needs a state this file cannot create. |
+| 330 | `src/models/qwen3_5/execution/ple_rows.cpp:140-140` | bug·medium | P2 | true | FIXED — submit() hands back packaged_task futures (core/host_worker_pool.h:38), whose destructors do not wait, so the remaining tasks keep writing into staging_/pages_ after the first rethrow. |
+| 503 | `src/models/qwen3_5/execution/qwen4_text.cpp:295-296` | bug·low | P2 | true | FIXED — records.conv is slice(2,..).view({conv_channels, spec.width, rows}) (gdn_replay_records.cpp:151) whose T-axis index is w+b*spec.width, so the flat copy is correct only when spec.width == W; no shape/pitch check, unlike t |
+| 502 | `src/models/qwen3_5/execution/qwen4_text.cpp:465-466` | bug·medium | P2 | true | FIXED — Unguarded manual pairing; qwen4_expert_pager.h:69 documents 'Every acquire is paired with release_staged on the same stream after the layer's last reader', and moe_experts/capture validate and can throw, skipping the eve |
+| 488 | `src/models/qwen3_5/frontend/frontend.cpp:189-190` | bug·medium | P2 | true | FIXED — nlohmann value() throws json::type_error for a non-bool key, while parse_resource_json/require_integer/validate_pixel_pipeline all normalize to std::invalid_argument (validate_pixel_pipeline checks is_boolean()). |
+| 467 | `src/models/qwen3_5/frontend/media_cache.cpp:322-324` | bug·medium | P2 | true | FIXED — `state->ready.emplace(...)` on the next line can throw after the LRU push, and evict_one_locked() terminates on a key with no ready entry (line 152). |
+| 417 | `src/models/qwen3_5/frontend/output_session.h:77-77` | maintainability·medium | P2 | true | FIXED — Empty-state behaviour is genuinely inconsistent: queries default, previews throw, commit terminates, discard_preview dereferences impl_ unguarded. |
 | 495 | `src/models/qwen3_5/frontend/processor.cpp:840-844` | bug·medium | P2 | true | The caller's cancellation view is dropped inside workers, and the request-local flag is the only cancellation the shared builder sees, so one request's abort fails its singleflight waiters. |
-| 477 | `src/models/qwen3_5/frontend/resources.cpp:8-10` | bug·medium | P2 | true | Tokenizer parsing throws std::invalid_argument (tokenizer.cpp:147 "missing field ... in tokenizer.json") and nothing here normalizes it, while the loader contract is ArtifactError (docs/maintainer/real-model-tests.md:87) |
-| 423 | `src/models/qwen3_5/load/prepare.cpp:80-81` | bug·medium | P2 | true | A converter-emitted parts binding of range [0,k) on a larger parent passes (elements == shape, whole_object false), then :87-89 return the parent's segments/geometry for the smaller declared view. Coverage is never requi |
-| 616 | `src/models/qwen3_5/program/planning/pressure.cpp:1146-1147` | bug·medium | P2 | true | mapped_pages->require throws std::invalid_argument for a stale handle (kv_store.h:1985) and the store pointer is unchecked, so the predicate can throw instead of returning false. |
-| 544 | `src/models/qwen3_5/program/program.h:1158-1159` | bug·low | P2 | true | rows_ is std::array<SequenceHandle, kMaximumConcurrency> (line 756) and the copy is unbounded; the sole caller wrap_pending (commit.cpp:24) rejects lanes>max_concurrency. |
-| 575 | `src/models/qwen3_5/program/storage/host_kv_store.h:596-598` | bug·high | P2 | true | mutation before throwing calls |
-| 626 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1076` | bug·high | P2 | true | Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
-| 641 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1076` | bug·high | P2 | true | Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
-| 648 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1077` | bug·high | P2 | true | Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
-| 635 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1079` | bug·high | P2 | true | Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
-| 637 | `src/models/qwen3_5/program/storage/kv_store.h:1084-1087` | bug·medium | P2 | true | Ownership transfer, the active flag and owner_=nullptr all precede the per-page writer/protection updates and publish_membership (1099), whose failure leaves a half-activated address that release() cannot free. |
-| 649 | `src/models/qwen3_5/program/storage/kv_store.h:1084-1087` | bug·medium | P2 | true | The hand-over happens before the fallible per-page updates and publish_membership, and create_active's cleanup release(*handle) is a no-op for an already-active address. |
-| 607 | `src/models/qwen3_5/program/storage/kv_store.h:1087-1089` | bug·medium | P2 | true | active is set and owner_ cleared (1089) before the fallible per-page loop and publish_membership (1099); create_active's `(void)release(*handle)` (944) cannot free an active address (can_release, 1884-1886). |
-| 642 | `src/models/qwen3_5/program/storage/kv_store.h:1087-1089` | bug·medium | P2 | true | Reservation and row move into the address and owner_ is cleared before the writer/protection loop and publish_membership; afterwards release(*handle) can no longer free the slot. |
-| 628 | `src/models/qwen3_5/program/storage/kv_store.h:1338-1338` | bug·medium | P2 | true | abort_prefix_fork skips only the settled tail, not streamed members, unlike commit_prefix_fork (1325-1329) and prepare_prefix_fork (1177); it can unpin a pin owned by another fork reservation. |
-| 643 | `src/models/qwen3_5/program/storage/kv_store.h:1338-1340` | bug·medium | P2 | true | The abort loop decrements any non-zero pin, including pages prepare_prefix_fork skipped as streamed, so a pin owned by another fork reservation can be released here. |
-| 627 | `src/models/qwen3_5/program/storage/kv_store.h:944-944` | bug·medium | P2 | true | can_release rejects an address with active/row/reservation set (1884-1886), so a throw from commit_activation after the transfer leaks the slot, its capacity reservation and its execution row. |
-| 589 | `src/models/qwen3_5/program/storage/state_store.h:589-593` | bug·medium | P2 | true | With pending reset before the throw, abort_transfer's else branch finds no pending_device_slot, so the published device slot is never returned and the previous state cannot be restored. |
-| 718 | `src/models/qwen3_5/program/transactions/commit.cpp:450-452` | bug·high | P2 | true | copy before bound check |
-| 719 | `src/models/qwen3_5/program/transactions/commit.cpp:464-466` | bug·medium | P2 | true | clear_execution_failure_lanes (:1054) checks only the lane index and the continuation binding, so a stale batch can tear down whatever sequence now occupies those lanes. |
-| 720 | `src/models/qwen3_5/program/transactions/commit.cpp:675-675` | bug·low | P2 | true | A missing KV binding dereferences null in a noexcept function instead of failing the publish, although the sibling path guards exactly that. |
-| 706 | `src/models/qwen3_5/state/state_image.cpp:190-191` | bug·low | P2 | true | Payload is gated on dflash_local_k while copy_operations is gated on spec.dflash_local, so a layout with one but not the other reports inconsistent work instead of being rejected. |
-| 703 | `src/models/qwen3_5/state/state_image.cpp:294-294` | bug·medium | P2 | true | No dtype/contiguity/ne checks on ple_state_, unlike continuation_hidden_ eight lines above (286). A wrong ne[0] is caught later by the host-layout cross-check; wrong dtype or ne[1] are not. |
-| 788 | `src/ops/linear/exl3/exl3_dispatch.h:40-41` | bug·high | P2 | true | no argument validation |
-| 908 | `src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:119-122` | bug·medium | P2 | true | validate() checks only the state pair; kernels mark q/k/v/g/beta/a_log/dt_bias/out __restrict__ (recurrent.cuh:136-140) and causal_conv1d_silu does check cross-pairs. |
-| 909 | `src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:178-179` | bug·medium | P2 | true | Header documents batch non-overlap; recurrent.cuh:176-180 marks states, state_slots and out __restrict__, so aliasing is UB rather than a diagnosed error. |
+| 477 | `src/models/qwen3_5/frontend/resources.cpp:8-10` | bug·medium | P2 | true | FIXED — Tokenizer parsing throws std::invalid_argument (tokenizer.cpp:147 "missing field ... in tokenizer.json") and nothing here normalizes it, while the loader contract is ArtifactError (docs/maintainer/real-model-tests.md:87) |
+| 423 | `src/models/qwen3_5/load/prepare.cpp:80-81` | bug·medium | P2 | true | FIXED — A converter-emitted parts binding of range [0,k) on a larger parent passes (elements == shape, whole_object false), then :87-89 return the parent's segments/geometry for the smaller declared view. Coverage is never requi |
+| 616 | `src/models/qwen3_5/program/planning/pressure.cpp:1146-1147` | bug·medium | P2 | true | FIXED — mapped_pages->require throws std::invalid_argument for a stale handle (kv_store.h:1985) and the store pointer is unchecked, so the predicate can throw instead of returning false. |
+| 544 | `src/models/qwen3_5/program/program.h:1158-1159` | bug·low | P2 | true | FIXED — rows_ is std::array<SequenceHandle, kMaximumConcurrency> (line 756) and the copy is unbounded; the sole caller wrap_pending (commit.cpp:24) rejects lanes>max_concurrency. |
+| 575 | `src/models/qwen3_5/program/storage/host_kv_store.h:596-598` | bug·high | P2 | true | FIXED — mutation before throwing calls |
+| 626 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1076` | bug·high | P2 | true | FIXED — Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
+| 641 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1076` | bug·high | P2 | true | FIXED — Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
+| 648 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1077` | bug·high | P2 | true | FIXED — Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
+| 635 | `src/models/qwen3_5/program/storage/kv_store.h:1076-1079` | bug·high | P2 | true | FIXED — Two page bases confirmed (prepare sizes over the frontier-limited required_pages, commit counts over the full page_count), but in-tree callers truncate mapped pages to the frontier before commit, so it is a contract/robu |
+| 637 | `src/models/qwen3_5/program/storage/kv_store.h:1084-1087` | bug·medium | P2 | true | FIXED — Ownership transfer, the active flag and owner_=nullptr all precede the per-page writer/protection updates and publish_membership (1099), whose failure leaves a half-activated address that release() cannot free. |
+| 649 | `src/models/qwen3_5/program/storage/kv_store.h:1084-1087` | bug·medium | P2 | true | FIXED — The hand-over happens before the fallible per-page updates and publish_membership, and create_active's cleanup release(*handle) is a no-op for an already-active address. |
+| 607 | `src/models/qwen3_5/program/storage/kv_store.h:1087-1089` | bug·medium | P2 | true | FIXED — active is set and owner_ cleared (1089) before the fallible per-page loop and publish_membership (1099); create_active's `(void)release(*handle)` (944) cannot free an active address (can_release, 1884-1886). |
+| 642 | `src/models/qwen3_5/program/storage/kv_store.h:1087-1089` | bug·medium | P2 | true | FIXED — Reservation and row move into the address and owner_ is cleared before the writer/protection loop and publish_membership; afterwards release(*handle) can no longer free the slot. |
+| 628 | `src/models/qwen3_5/program/storage/kv_store.h:1338-1338` | bug·medium | P2 | true | FIXED — abort_prefix_fork skips only the settled tail, not streamed members, unlike commit_prefix_fork (1325-1329) and prepare_prefix_fork (1177); it can unpin a pin owned by another fork reservation. |
+| 643 | `src/models/qwen3_5/program/storage/kv_store.h:1338-1340` | bug·medium | P2 | true | FIXED — The abort loop decrements any non-zero pin, including pages prepare_prefix_fork skipped as streamed, so a pin owned by another fork reservation can be released here. |
+| 627 | `src/models/qwen3_5/program/storage/kv_store.h:944-944` | bug·medium | P2 | true | FIXED — can_release rejects an address with active/row/reservation set (1884-1886), so a throw from commit_activation after the transfer leaks the slot, its capacity reservation and its execution row. |
+| 589 | `src/models/qwen3_5/program/storage/state_store.h:589-593` | bug·medium | P2 | true | FIXED — With pending reset before the throw, abort_transfer's else branch finds no pending_device_slot, so the published device slot is never returned and the previous state cannot be restored. |
+| 718 | `src/models/qwen3_5/program/transactions/commit.cpp:450-452` | bug·high | P2 | true | FIXED — copy before bound check |
+| 719 | `src/models/qwen3_5/program/transactions/commit.cpp:464-466` | bug·medium | P2 | true | FIXED — clear_execution_failure_lanes (:1054) checks only the lane index and the continuation binding, so a stale batch can tear down whatever sequence now occupies those lanes. |
+| 720 | `src/models/qwen3_5/program/transactions/commit.cpp:675-675` | bug·low | P2 | true | FIXED — A missing KV binding dereferences null in a noexcept function instead of failing the publish, although the sibling path guards exactly that. |
+| 706 | `src/models/qwen3_5/state/state_image.cpp:190-191` | bug·low | P2 | true | FIXED — Payload is gated on dflash_local_k while copy_operations is gated on spec.dflash_local, so a layout with one but not the other reports inconsistent work instead of being rejected. |
+| 703 | `src/models/qwen3_5/state/state_image.cpp:294-294` | bug·medium | P2 | true | FIXED — No dtype/contiguity/ne checks on ple_state_, unlike continuation_hidden_ eight lines above (286). A wrong ne[0] is caught later by the host-layout cross-check; wrong dtype or ne[1] are not. |
+| 788 | `src/ops/linear/exl3/exl3_dispatch.h:40-41` | bug·high | P2 | true | FIXED — no argument validation |
+| 908 | `src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:119-122` | bug·medium | P2 | true | FIXED — validate() checks only the state pair; kernels mark q/k/v/g/beta/a_log/dt_bias/out __restrict__ (recurrent.cuh:136-140) and causal_conv1d_silu does check cross-pairs. |
+| 909 | `src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp:178-179` | bug·medium | P2 | true | FIXED — Header documents batch non-overlap; recurrent.cuh:176-180 marks states, state_slots and out __restrict__, so aliasing is UB rather than a diagnosed error. |
 | 930 | `src/ops/offload_moe/offload_moe.cpp:250-251` | bug·high | P2 | true | FIXED — missing length check |
 | 890 | `src/ops/softmax_attention/common/causal_operands.h:107-107` | bug·high | P2 | true | FIXED — head dim unvalidated |
 | 1007 | `src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp:154-158` | bug·medium | P2 | true | The envelope is never checked against the ring; the sibling context_softmax_attention.cpp:162 rejects `envelope.max_context > logical_capacity`, and validate_context (:51) already fixes context.capacity == window. |
-| 997 | `src/ops/sparse_attention/sparse_attention.cpp:119-123` | bug·medium | P2 | true | qsa_append:66 and qsa_attention:176 both enforce numel()==lanes; the kernels index a.table_rows[lane], so qsa_select silently accepts a short tensor. |
-| 998 | `src/ops/sparse_attention/sparse_attention.cpp:171-172` | bug·medium | P2 | true | qsa_attention never checks selected's size although the launch uses selected.ne[0] as max_selected and the kernel indexes column*max_selected for column<W*B (kernels.cu:700). |
-| 999 | `src/ops/sparse_attention/sparse_attention.cpp:71-72` | bug·medium | P2 | true | index.block_tables is dereferenced as args.tables/args.table_stride at kernels.cu:1145-1146 but never validated; qsa_select validates no part of the index plane at all. |
+| 997 | `src/ops/sparse_attention/sparse_attention.cpp:119-123` | bug·medium | P2 | true | FIXED — qsa_append:66 and qsa_attention:176 both enforce numel()==lanes; the kernels index a.table_rows[lane], so qsa_select silently accepts a short tensor. |
+| 998 | `src/ops/sparse_attention/sparse_attention.cpp:171-172` | bug·medium | P2 | true | FIXED — qsa_attention never checks selected's size although the launch uses selected.ne[0] as max_selected and the kernel indexes column*max_selected for column<W*B (kernels.cu:700). |
+| 999 | `src/ops/sparse_attention/sparse_attention.cpp:71-72` | bug·medium | P2 | true | FIXED — index.block_tables is dereferenced as args.tables/args.table_stride at kernels.cu:1145-1146 but never validated; qsa_select validates no part of the index plane at all. |
 | 947 | `src/ops/wrapper/argmax.cpp:64-66` | bug·high | P2 | true | FIXED — missing overlap check |
 | 1059 | `src/ops/wrapper/gdn_gating_proj.cpp:100-102` | bug·high | P2 | true | FIXED — missing overlap check |
-| 1023 | `src/ops/wrapper/gemma_moe_experts.cpp:75-78` | bug·medium | P2 | true | gemma_moe_experts_workspace_bytes (wrapper/gemma_moe_experts.cpp:73-81) validates the geometry but never tokens, so a negative T produces a huge size_t instead of the documented throw. |
+| 1023 | `src/ops/wrapper/gemma_moe_experts.cpp:75-78` | bug·medium | P2 | true | FIXED — gemma_moe_experts_workspace_bytes (wrapper/gemma_moe_experts.cpp:73-81) validates the geometry but never tokens, so a negative T produces a huge size_t instead of the documented throw. |
 | 1084 | `src/ops/wrapper/gemma_moe_router.cpp:22-24` | bug·high | P2 | true | FIXED — validation gap |
 | 1047 | `src/ops/wrapper/sigmoid_mul.cpp:45-47` | bug·high | P2 | true | FIXED — missing overlap check |
 | 1017 | `src/ops/wrapper/sliding_causal_attention.cpp:62-65` | bug·high | P2 | true | FIXED — partial extent validation |
-| 1092 | `src/ops/wrapper/sparse_moe.cpp:155-156` | bug·medium | P2 | true | core/weight.h:68 declares weight_divisors (read by sparse_moe_decode_kernels.cu:345 and sparse_moe_prefill_kernels.cu:1388-1392) after the scale plane, so an operand aliasing that region passes require_disjoint. |
-| 1034 | `src/ops/wrapper/vision_pos_embed.cpp:17-17` | security·medium | P2 | true | The D==1152 warp/CTA kernels index table with no bounds check while the scalar kernel clamps, so an out-of-range index is silently clamped or read out of bounds for the same call. |
-| 1049 | `src/product/logging/startup_log.cpp:224-226` | bug·medium | P2 | true | Begin gates Debug phases on visibility (line 208) but Progress does not. Latent: the only progress() emitter is the Info WeightsMaterialize scope (materializer.cpp:418,236). |
-| 1065 | `src/product/media_acquire/acquire.cpp:197-199` | bug·high | P2 | true | exception through C frames |
-| 1124 | `src/product/prompt_input/prompt_input.cpp:112-112` | bug·medium | P2 | true | json::value() throws nlohmann::json::type_error when `type` exists but is not a string; only `stream >> root` is wrapped (line 239-245), so it escapes prompt_from_messages instead of std::invalid_argument. |
-| 1108 | `src/product/serve_profile.h:35-40` | bug·medium | P2 | true | Only `stream >> document` sits inside the try (lines 29-33); json::value() throws nlohmann::json::type_error for a non-object root or a wrongly-typed field, breaking the documented std::invalid_argument contract. |
-| 1183 | `src/runtime/engine/context_cache/materialization_planner.h:1291-1296` | bug·medium | P2 | true | fold_guidance omits the flag fold_assessment forwards; the fold skips unreachable checkpoints, so guidance loss is overstated for diverged-lineage checkpoints, skewing allow_work, rank_guidance and pending ordering (both |
-| 1163 | `src/runtime/engine/engine_core.h:266-266` | bug·medium | P2 | true | outstanding_ is incremented under the lock at :215 and released only by release_reserved_capacity (:806) on completion; a bad_alloc from push_back escapes submit leaving the reservation permanently held. |
-| 1173 | `src/serve/generation_service.cpp:433-434` | bug·medium | P2 | true | It performs media acquisition (L450-453) and engine_->count_tokens (L461) without acquire_request_lifetime, which is what enforces max_concurrency + max_pending_requests for generation (L376, L321-330). |
-| 1263 | `src/serve/openai_responses_response.cpp:473-475` | bug·medium | P2 | true | close_reasoning assigns `reasoning_text = final_text` (L302) with no prefix check, while the content path at L487 validates `outcome.text.starts_with(impl_->content_text)`. |
-| 1208 | `src/serve/request_log.h:75-75` | bug·medium | P2 | true | failed_ (set at request_log.cpp:918) is ignored, so after a permanent write failure enabled() stays true, the write_* guards still format records, and append() drops them (line 914) after a single log line. |
-| 1278 | `src/text/grammar.cpp:103-106` | bug·medium | P2 | true | xgrammar's ParseNextEscaped returns \xNN as a codepoint (third_party/xgrammar/cpp/support/encoding.h:427-438) and ParseStringToken re-encodes it with CharToUTF8 (grammar_parser.cc:426-428), so a delimiter byte >= 0x80 be |
-| 1212 | `src/text/unicode.cpp:76-77` | bug·high | P2 | true | surrogates encoded |
+| 1092 | `src/ops/wrapper/sparse_moe.cpp:155-156` | bug·medium | P2 | true | FIXED — core/weight.h:68 declares weight_divisors (read by sparse_moe_decode_kernels.cu:345 and sparse_moe_prefill_kernels.cu:1388-1392) after the scale plane, so an operand aliasing that region passes require_disjoint. |
+| 1034 | `src/ops/wrapper/vision_pos_embed.cpp:17-17` | security·medium | P2 | true | FIXED — The D==1152 warp/CTA kernels index table with no bounds check while the scalar kernel clamps, so an out-of-range index is silently clamped or read out of bounds for the same call. |
+| 1049 | `src/product/logging/startup_log.cpp:224-226` | bug·medium | P2 | true | FIXED — Begin gates Debug phases on visibility (line 208) but Progress does not. Latent: the only progress() emitter is the Info WeightsMaterialize scope (materializer.cpp:418,236). |
+| 1065 | `src/product/media_acquire/acquire.cpp:197-199` | bug·high | P2 | true | FIXED — exception through C frames |
+| 1124 | `src/product/prompt_input/prompt_input.cpp:112-112` | bug·medium | P2 | true | FIXED — json::value() throws nlohmann::json::type_error when `type` exists but is not a string; only `stream >> root` is wrapped (line 239-245), so it escapes prompt_from_messages instead of std::invalid_argument. |
+| 1108 | `src/product/serve_profile.h:35-40` | bug·medium | P2 | true | FIXED — Only `stream >> document` sits inside the try (lines 29-33); json::value() throws nlohmann::json::type_error for a non-object root or a wrongly-typed field, breaking the documented std::invalid_argument contract. |
+| 1183 | `src/runtime/engine/context_cache/materialization_planner.h:1291-1296` | bug·medium | P2 | true | FIXED — fold_guidance omits the flag fold_assessment forwards; the fold skips unreachable checkpoints, so guidance loss is overstated for diverged-lineage checkpoints, skewing allow_work, rank_guidance and pending ordering (both |
+| 1163 | `src/runtime/engine/engine_core.h:266-266` | bug·medium | P2 | true | FIXED — outstanding_ is incremented under the lock at :215 and released only by release_reserved_capacity (:806) on completion; a bad_alloc from push_back escapes submit leaving the reservation permanently held. |
+| 1173 | `src/serve/generation_service.cpp:433-434` | bug·medium | P2 | true | FIXED — It performs media acquisition (L450-453) and engine_->count_tokens (L461) without acquire_request_lifetime, which is what enforces max_concurrency + max_pending_requests for generation (L376, L321-330). |
+| 1263 | `src/serve/openai_responses_response.cpp:473-475` | bug·medium | P2 | true | FIXED — close_reasoning assigns `reasoning_text = final_text` (L302) with no prefix check, while the content path at L487 validates `outcome.text.starts_with(impl_->content_text)`. |
+| 1208 | `src/serve/request_log.h:75-75` | bug·medium | P2 | true | FIXED — failed_ (set at request_log.cpp:918) is ignored, so after a permanent write failure enabled() stays true, the write_* guards still format records, and append() drops them (line 914) after a single log line. |
+| 1278 | `src/text/grammar.cpp:103-106` | bug·medium | P2 | true | FIXED — xgrammar's ParseNextEscaped returns \xNN as a codepoint (third_party/xgrammar/cpp/support/encoding.h:427-438) and ParseStringToken re-encodes it with CharToUTF8 (grammar_parser.cc:426-428), so a delimiter byte >= 0x80 be |
+| 1212 | `src/text/unicode.cpp:76-77` | bug·high | P2 | true | FIXED — surrogates encoded |
 | 63 | `apps/cli/options.cpp:337-339` | maintainability·low | P3 | true | With --reasoning-effort none plus --thinking-budget the conflict is real but the message names --no-thinking, which the user never passed. |
 | 4 | `apps/perplexity/corpus.h:25-25` | documentation·low | P3 | true | Every documented failure mode is a std::runtime_error (lines 19-119); corpus.h states no exception contract for either entry point. |
 | 46 | `apps/perplexity/evaluation.cpp:102-102` | bug·low | P3 | true | With an all -inf row maximum stays -inf and `bf16_to_float(row[v]) - maximum` is -inf-(-inf)=NaN, which propagates into the KL/NLL callers. |
