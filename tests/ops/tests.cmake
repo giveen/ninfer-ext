@@ -5,6 +5,8 @@ set(ninfer_op_tests
   gemma_moe_router
   gemma_moe_experts
   nemotron_h_moe_router
+  nemotron_h_moe_experts
+  relu2
   silu_mul
   residual_add
   residual_add_norm
