@@ -209,11 +209,15 @@ NVMe drive.
 
 ### 1. Requirements
 
-- 64-bit Linux and an RTX 5090 (`sm_120a`). No other GPU is supported.
+- 64-bit Linux or Windows (x64) and an RTX 5090 (`sm_120a`). No other GPU is supported. The Windows
+  build is packaged and its behavior on Windows hardware is still being established
+  ([Windows port](docs/maintainer/windows-port.md)).
 - A CUDA toolkit supporting `sm_120a`. CUDA 13.3 is validated.
-- CMake 3.28 or newer, a C++23 host compiler, Ninja and `pkg-config`.
+- CMake 3.28 or newer, a C++23 host compiler and Ninja. Linux additionally needs `pkg-config`; Windows
+  needs MSVC 1951 or newer (Visual Studio 2026 18.x) and takes its libraries from vcpkg
+  ([`vcpkg.json`](vcpkg.json)).
 - FFmpeg development libraries (`libavformat`, `libavcodec`, `libavutil`, `libswscale`) and
-  `libcurl >= 7.85`.
+  `libcurl >= 7.85`, from the platform's packages on Linux and from vcpkg on Windows.
 - For Qwen3.8-Flash-Next only: about 65 GiB of host RAM and 127 GB of disk
   ([details](docs/flash-next.md#requirements)).
 
