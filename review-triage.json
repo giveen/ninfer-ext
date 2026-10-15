@@ -3,15 +3,15 @@
   "P0": 5,
   "P1": 39,
   "P2": 110,
-  "P3": 742,
-  "M": 294,
-  "F": 96,
-  "fixed": 741
+  "P3": 782,
+  "M": 251,
+  "F": 99,
+  "fixed": 873
  },
  "verdicts": {
-  "true": 896,
-  "maybe": 294,
-  "false": 96
+  "true": 936,
+  "maybe": 251,
+  "false": 99
  },
  "overlap": {
   "agree": [
@@ -85,7 +85,10 @@
    "evidence": "apps/quantize/parameter_reader.h:9-11 -- `#include <cstdint>` / `#include <string>` / `#include <vector>` (no <utility>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::pair is used directly at :38 (LinearParent::ranges); added #include <utility> (was transitive only).",
+   "s_resolution": "FIXED"
   },
   "2": {
    "path": "apps/quantize/parameter_reader.h",
@@ -171,7 +174,10 @@
    "evidence": "apps/quantize/source_writer.cpp:46 -- `std::span<const std::uint16_t>(states, artifact::kExl3WeightsPerTile),`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Claim confirmed: the bare pointer is wrapped as span(states, kExl3WeightsPerTile) at source_writer.cpp:56, so the 256-element contract is invisible \u2014 either keep the pointer and document the 256 states, or change the type to std::span<const std::uint16_t, 256>; the latter needs an explicit construct at apps/quantize/main.cpp:139 and tests/quantize/test_exl3_quantize_source.cpp:190 (outside my file set), so no patch."
   },
   "7": {
    "path": "apps/quantize/source_writer.h",
@@ -239,7 +245,10 @@
    "evidence": "apps/perplexity/evaluation.h:42 -- `double kl_divergence_row(const std::uint16_t* reference, const std::uint16_t* model, std::uint32_t vocab);`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Claim confirmed: the row buffer and `vocab` are independent, only the null/zero check at evaluation.cpp:111 guards it \u2014 either keep the pointer+length pair or convert both entry points (:42, :46) to std::span and drop `vocab`; an app-API change whose caller (apps/perplexity/main.cpp:381) still owns the length, so the direction is the owner's call."
   },
   "11": {
    "path": "apps/perplexity/evaluation.h",
@@ -522,7 +531,10 @@
    "evidence": "apps/quantize/options.cpp:6 -- `#include <vector>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed #include <vector>: the TU contains no `vector` token at all besides that include, and a .cpp has no consumer that could rely on the path.",
+   "s_resolution": "FIXED"
   },
   "27": {
    "path": "apps/quantize/options.cpp",
@@ -906,8 +918,8 @@
    "line": "19-20",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -915,7 +927,10 @@
    "evidence": "apps/sensitivity/main.cpp:20 -- \"#include <cmath>\" (also <cstring>:22, <map>:23; std::map/strlen unused; <cstdint>/<cstddef> missing)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped unused <cmath>/<cstring>/<map> (no math, <cstring> or map facility occurs in the TU) and added <cstddef> (:21), <cstdint> (:22) and <utility> (:28, for the std::move uses at :107/:143), all used directly.",
+   "s_resolution": "FIXED"
   },
   "49": {
    "path": "apps/sensitivity/main.cpp",
@@ -1243,8 +1258,8 @@
    "line": "13-17",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "only via in-tree callers that are correct",
@@ -1252,7 +1267,10 @@
    "evidence": "include/ninfer/ops/gdn_replay.h:14 -- `std::int32_t source_state_slot;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Gave all three members `= 0`, matching GdnReplayRecordSpec/LinearAttentionStatePoolSpec; the type stays an aggregate, so prefill.cpp:848 `fold_rows{}` and the designated init at :879-882 keep compiling.",
+   "s_resolution": "FIXED"
   },
   "68": {
    "path": "include/ninfer/ops/gdn_replay.h",
@@ -1268,7 +1286,10 @@
    "evidence": "include/ninfer/ops/gdn_replay.h:6 -- `#include <cuda_runtime.h>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "Swap is cosmetic and its stated rationale is inverted (269 tree files include <cuda_runtime.h> vs 5 <cuda_runtime_api.h>); the header is a shared transitive path for 5 consumers (prefill.cpp:6, program_impl.h:7, replay.cpp:3, test_gdn_replay_fold.cpp:3, bench/ops/gdn_replay_bench.cu:8), so left per the include-removal rule.",
+   "s_resolution": "DEFERRED"
   },
   "69": {
    "path": "include/ninfer/ops/rmsnorm_pack_tail.h",
@@ -1322,7 +1343,10 @@
    "evidence": "include/ninfer/ops/linear_pair.h:10 -- `[[nodiscard]] std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,` with includes limited to core/weight.h, core/tensor.h, cuda_runtime.h",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>; :14 returns std::size_t and :15-16 take std::int32_t, which until now arrived only through core/tensor.h.",
+   "s_resolution": "FIXED"
   },
   "72": {
    "path": "include/ninfer/ops/gdn_gating.h",
@@ -1385,8 +1409,8 @@
    "line": "106-106",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -1394,15 +1418,18 @@
    "evidence": "include/ninfer/engine.h:106 -- `GenerationResult generate(PreparedPrompt prompt, RequestOptions options,`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added [[nodiscard]] to generate(); sibling submit() (:103) and prepare/score_tokens/count_tokens already carry it, and every in-repo call site consumes the result \u2014 the single deliberate discard (test_engine_moe_real.cpp:224) is already written `(void)engine.generate(...)`, the form [[nodiscard]] exempts.",
+   "s_resolution": "FIXED"
   },
   "76": {
    "path": "include/ninfer/engine.h",
    "line": "53-53",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -1410,15 +1437,18 @@
    "evidence": "include/ninfer/engine.h:53 -- `GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added [[nodiscard]] to GenerationHandle::wait(); all in-repo call sites consume it (apps/cli/main.cpp:356, src/serve/generation_service.cpp:488, test_engine_dflash2_real.cpp:125, test_spec_concurrency_real.cpp:123), and no CMake target sets -Werror.",
+   "s_resolution": "FIXED"
   },
   "77": {
    "path": "include/ninfer/engine.h",
    "line": "3-5",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -1426,7 +1456,10 @@
    "evidence": "include/ninfer/engine.h:3 -- `#include \"ninfer/types.h\"` with no <cstdint> (includes listed at :5-9)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint>; :80 and :84 use std::uint32_t (score_tokens/count_tokens) obtained only via ninfer/types.h.",
+   "s_resolution": "FIXED"
   },
   "78": {
    "path": "include/ninfer/engine.h",
@@ -1912,7 +1945,10 @@
    "evidence": "include/ninfer/ops/sampling.h:88 -- `const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Either take the strong `SamplePurpose purpose` (converting inside if the kernel needs an integer) or keep `std::int32_t` (callers already pass named enumerators, and the doc already names the domains) \u2014 public-API direction is the owner's call."
   },
   "105": {
    "path": "include/ninfer/ops/sampling.h",
@@ -1946,7 +1982,10 @@
    "evidence": "include/ninfer/ops/sampling.h:40 -- `unsigned long long seed    = 0;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "The layout half of the claim is false (unsigned long long is 64-bit on every target here, so the verbatim device copy already matches) and the neighbours do not decide it: the tree's four other `unsigned long long` uses are this same RNG key (sampling_device.cuh:92,94; candidate_selector_path.cu:33 mirrors this struct), while types.h:324 spells the same field std::uint64_t.",
+   "s_resolution": "DEFERRED"
   },
   "107": {
    "path": "include/ninfer/ops/sampling.h",
@@ -2135,8 +2174,8 @@
    "line": "146-146",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -2144,7 +2183,10 @@
    "evidence": "include/ninfer/ops/offload_moe.h:146 -- `std::int32_t* slot_of          = nullptr; // [layers*512], -1 when absent`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Extent comments now name kOffloadMoeExperts (defined = 512 at :19) instead of the literal, so the geometry is single-sourced.",
+   "s_resolution": "FIXED"
   },
   "118": {
    "path": "include/ninfer/ops/gated_delta_net.h",
@@ -2197,7 +2239,10 @@
    "evidence": "include/ninfer/ops/mtp_round.h:3-5 -- `#include \"core/tensor.h\"` / `#include <cuda_runtime.h>` (no <cstdint>; std::int32_t in the signature at :34)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint>; :40 declares std::int32_t, which arrived only via core/tensor.h.",
+   "s_resolution": "FIXED"
   },
   "121": {
    "path": "include/ninfer/ops/prepare_ragged_prefix.h",
@@ -2339,7 +2384,10 @@
    "evidence": "include/ninfer/ops/gdn_input_proj.h:159 -- `Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,` vs :74 `WorkspaceArena& workspace,`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "Both spellings are live conventions in include/ninfer/ops \u2014 ws at gated_delta_net.h:54, gdn_gating_proj.h:49, linear_add.h:75, linear_swiglu.h:81 and :146/:163/:174 here; workspace at :77/:222/:235/:243 here \u2014 so no convention decides, and declarations already agree with their definitions.",
+   "s_resolution": "DEFERRED"
   },
   "129": {
    "path": "include/ninfer/ops/gemma_moe_router.h",
@@ -2509,8 +2557,8 @@
    "line": "3-5",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -2518,7 +2566,10 @@
    "evidence": "include/ninfer/ops/scatter.h:3 -- `#include \"core/tensor.h\"` with no <cstdint> (tensor.h:6 includes it)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint>; :77 declares std::int32_t source_column, which arrived only via core/tensor.h.",
+   "s_resolution": "FIXED"
   },
   "139": {
    "path": "include/ninfer/ops/vision_pool.h",
@@ -2625,7 +2676,10 @@
    "evidence": "include/ninfer/ops/softmax_attention.h:171 -- `CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,` while the implementation names them min_width/max_width (src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp:267)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "The file's own two sibling capacity queries spell the same width/token interval min_tokens/max_tokens (:108, :211) while the definition spells it min_width/max_width (src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp:267) \u2014 the neighbours disagree, nothing behaves differently.",
+   "s_resolution": "DEFERRED"
   },
   "145": {
    "path": "include/ninfer/ops/softmax_attention.h",
@@ -2677,7 +2731,10 @@
    "evidence": "include/ninfer/ops/weight_input.h:12 -- `struct WeightInput {` with the reference member at :13 and only the struct-level note `// The model owns the view and its backing.`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Either document the borrowed-WeightView lifetime on the member, or reshape it (pointer/span) so the borrow requirement is visible at construction \u2014 a design choice, no minimal patch."
   },
   "148": {
    "path": "include/ninfer/ops/weight_input.h",
@@ -2693,7 +2750,10 @@
    "evidence": "include/ninfer/ops/weight_input.h:18 -- `struct SingleProjectionWeight {` using `Weight weight;` while the includes at :3-6 are core/weight_view.h, ninfer/ops/linear.h, sparse_moe.h, gemma_moe_experts.h",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added `#include \"core/weight.h\"`; Weight is a member of SingleProjectionWeight (:23) and PairedProjectionWeights (:33) and arrived only via weight_view.h/linear.h.",
+   "s_resolution": "FIXED"
   },
   "149": {
    "path": "include/ninfer/ops/weight_input.h",
@@ -2737,8 +2797,8 @@
    "line": "602-602",
    "category": "style",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -2746,7 +2806,10 @@
    "evidence": "include/ninfer/types.h:602 -- `[[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value, SharedCandidateEvidence evidence) {`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added noexcept to has_shared_candidate_evidence (now :607-608); the finding's other half is wrong \u2014 `operator|=` already carried noexcept at :601-603.",
+   "s_resolution": "FIXED"
   },
   "152": {
    "path": "include/ninfer/types.h",
@@ -2898,8 +2961,8 @@
    "line": "7-9",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -2907,7 +2970,10 @@
    "evidence": "src/artifact/reader.h:7 -- \"#include <filesystem>\" (with <memory>,<span>; no <cstddef>/<cstdint>/<string_view>/<vector>)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<string_view>/<vector>; the header uses std::size_t (:18), std::uint64_t (:19), std::string_view (:37) and std::vector (:42) with only filesystem/memory/span included.",
+   "s_resolution": "FIXED"
   },
   "161": {
    "path": "src/artifact/reader.h",
@@ -2941,7 +3007,10 @@
    "evidence": "src/artifact/formats.cpp:5-7 -- `#include <array>` only, while the file uses `std::pair{QType::BF16, std::string_view{\"bf16\"}}` (line 10) and `ArtifactError(\"unknown tensor format: \" + std::string(name))` (line 38)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <string> and <utility>; the file builds std::pair tables at :13-20 and throws ArtifactError(\"...\" + std::string(name)) at :40 with only <array> included.",
+   "s_resolution": "FIXED"
   },
   "163": {
    "path": "src/core/dtype.h",
@@ -3190,7 +3259,10 @@
    "evidence": "src/artifact/materializer.h:96 -- `std::optional<WeightParent> device;` with includes limited to filesystem, memory, span, vector",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<optional>; the header uses std::optional (:99-102), std::uint64_t (:23) and std::size_t (:39) while including only filesystem/memory/span/vector.",
+   "s_resolution": "FIXED"
   },
   "177": {
    "path": "src/artifact/views.cpp",
@@ -3233,8 +3305,8 @@
    "line": "239-239",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "",
@@ -3242,7 +3314,10 @@
    "evidence": "src/core/nvtx.h:239 -- `static_assert(names.size() == static_cast<std::size_t>(Name::Count));`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Either single-source the enum and message table (X-macro / {Name,const char*} pairs with a per-name static_assert) or keep the count-only assert \u2014 an abstraction decision the owner must make; no minimal patch exists that ties names to indices."
   },
   "180": {
    "path": "src/core/nvtx.h",
@@ -3416,7 +3491,10 @@
    "evidence": "src/artifact/schema.h:12 -- `#include <span>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed #include <span>: \"span\" occurred only on the include line; a full include-closure walk (1431 files) plus -fsyntax-only on all 98 host TUs that reach schema.h shows no TU loses <span>.",
+   "s_resolution": "FIXED"
   },
   "190": {
    "path": "src/artifact/schema.h",
@@ -3849,7 +3927,10 @@
    "evidence": "src/artifact/exl3_trellis.cpp:3-4 -- `#include <cstddef>` / `#include <stdexcept>` (no <cstdint>/<span>/<vector>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint>/<span>/<vector>; the TU uses std::uint64_t/std::uint32_t/std::uint16_t (:12, :35), std::span (:35, :68) and std::vector<std::byte> (:84) with only <cstddef>/<stdexcept> included.",
+   "s_resolution": "FIXED"
   },
   "214": {
    "path": "src/artifact/exl3_trellis.cpp",
@@ -3987,7 +4068,10 @@
    "evidence": "src/core/layout.h:6-10 -- `#include <cstddef>` ... `#include <initializer_list>` then `#include <array>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "Only `<array>` sits after `<initializer_list>`; include ordering is pure formatting with no behavioural or robustness consequence.",
+   "s_resolution": "DEFERRED"
   },
   "222": {
    "path": "src/core/paged_kv_cache.h",
@@ -4218,8 +4302,8 @@
    "line": "29-30",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -4227,7 +4311,10 @@
    "evidence": "src/core/host_worker_pool.h:32 -- `~HostWorkerPool();` with the copy operations deleted at :34-35 and no move declarations",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Spelled the suppressed moves out as `= delete` beside the deleted copies; the class was already neither copyable nor movable (user-declared destructor), no in-repo caller moves it, and the outcomes are identical.",
+   "s_resolution": "FIXED"
   },
   "236": {
    "path": "src/core/host_worker_pool.h",
@@ -4261,7 +4348,10 @@
    "evidence": "src/core/host_worker_pool.h:3 -- `#include <chrono>` with no std::chrono use in the header, whose only consumer is host_worker_pool.cpp:107 `std::chrono::milliseconds(10)`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped the unused <chrono> from the header and added it to its only user, host_worker_pool.cpp:4 (`std::chrono::milliseconds` at :111); all three consumers checked \u2014 media_cache.cpp includes <chrono> itself (:6), ple_rows.cpp has no chrono use, and both compile clean with -fsyntax-only.",
+   "s_resolution": "FIXED"
   },
   "238": {
    "path": "src/artifact/reader.cpp",
@@ -4415,8 +4505,8 @@
    "line": "123-123",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "",
@@ -4424,7 +4514,10 @@
    "evidence": "src/core/linear_attention_state.cpp:123 -- `const Tensor conv_shape(nullptr, spec_.conv_dtype,` (also plan:95, validate:183)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Either extract shared make_conv_shape/make_recurrent_shape helpers reused at plan :95/:97, ctor :123/:125 and validate :183/:185, or leave the three literal constructions and their bytes()-only comparison \u2014 a refactor whose direction is the owner's call."
   },
   "247": {
    "path": "src/core/linear_attention_state.cpp",
@@ -4536,8 +4629,8 @@
    "line": "3-6",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -4545,7 +4638,10 @@
    "evidence": "src/core/layout.cpp:15 -- `std::size_t checked_add(std::size_t a, std::size_t b, std::string_view label) {` with includes only <algorithm>/<limits>/<stdexcept>/<string> at :3-7",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<string_view>; the TU uses std::size_t (`is_power_of_two`, :16/:23), std::string_view (:16/:23) and std::uintptr_t (:38) obtained only via core/layout.h.",
+   "s_resolution": "FIXED"
   },
   "254": {
    "path": "src/core/layout.cpp",
@@ -4611,7 +4707,10 @@
    "evidence": "src/artifact/binder.cpp:6 -- `#include <cmath>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed #include <cmath>: no floating-point facility from it is used (std::max comes from <algorithm>, std::bit_cast from <bit>), and the TU still passes -fsyntax-only.",
+   "s_resolution": "FIXED"
   },
   "258": {
    "path": "src/core/paged_kv_cache.cpp",
@@ -4841,7 +4940,10 @@
    "evidence": "src/models/qwen3_5/execution/gdn.h:4 -- `#include \"models/qwen3_5/execution/parameters.h\"` with GdnConfig used at lines 12-16",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `models/qwen3_5/config.h` (GdnConfig, config.h:44) plus `<cstddef>`/`<cstdint>`; both were undeclared here (note: `<cstddef>`/`<cstdint>` also arrive via core/device.h:5-6, the reviewer's \"only parameters.h and core/device.h\" was half right).",
+   "s_resolution": "FIXED"
   },
   "271": {
    "path": "src/media/decode/resize.h",
@@ -5003,8 +5105,8 @@
    "line": "9-11",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "only via in-tree callers that are correct",
@@ -5012,15 +5114,18 @@
    "evidence": "src/models/gemma4/load.h:9 -- `#include <filesystem>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed unused <filesystem> (no std::filesystem symbol in the header) and added <cstddef>/<optional> for std::size_t (:51) and std::optional (:45-46); no TU loses <filesystem> (98-TU syntax check), and no other file in the tree relies on load.h for it.",
+   "s_resolution": "FIXED"
   },
   "281": {
    "path": "src/models/qwen3_5/execution/mtp.h",
    "line": "3-3",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "n/a",
@@ -5028,7 +5133,10 @@
    "evidence": "src/models/qwen3_5/execution/mtp.h:3 -- `#include \"models/qwen3_5/execution/parameters.h\"`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `core/arena.h`, `core/tensor.h`, `models/qwen3_5/config.h`, `<cstddef>`, `<cstdint>`, `<cuda_runtime.h>`; all named types verified used (AttentionConfig, Tensor, WorkspaceArena, cudaStream_t).",
+   "s_resolution": "FIXED"
   },
   "282": {
    "path": "src/models/qwen3_5/execution/mtp.h",
@@ -5245,7 +5353,10 @@
    "evidence": "src/models/qwen3_5/execution/ffn.h:11 -- `const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `core/arena.h` and `core/tensor.h` (WorkspaceArena :11, Tensor :10) plus `<cstddef>`/`<cstdint>`; both previously only via parameters.h:2 -> offload_moe.h.",
+   "s_resolution": "FIXED"
   },
   "295": {
    "path": "src/models/gemma4/cache.cpp",
@@ -5366,7 +5477,10 @@
    "evidence": "src/models/qwen3_5/execution/ple_gather.h:11 -- `#include <vector>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "dropped `<vector>`; no `std::vector` in the header, and all four consumers (ple_gather.cpp, qwen4_text.cpp, program_impl.h, test_ple_gather.cpp) include `<vector>` themselves \u2014 none relies on the path.",
+   "s_resolution": "FIXED"
   },
   "302": {
    "path": "src/models/qwen3_5/execution/probe_registry.h",
@@ -5400,7 +5514,10 @@
    "evidence": "src/models/qwen3_5/execution/probe_registry.h:22 -- `inline std::vector<ProbeTarget>& probe_targets() {`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "mutable global accessor + unsynchronized read-then-push_back are real but nothing is broken: either `const std::vector<ProbeTarget>& probe_targets()` plus explicit reset/register helpers (or a mutex), or keep it and document that preparation is the only, sequential writer \u2014 owner's call."
   },
   "304": {
    "path": "src/models/qwen3_5/execution/probe_registry.h",
@@ -5506,7 +5623,10 @@
    "evidence": "src/models/gemma4/config.cpp:7 -- `#include <set>` with no std::set use in the file",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed #include <set>: the TU contains no std::set (or any other entity from that header) and still passes -fsyntax-only.",
+   "s_resolution": "FIXED"
   },
   "310": {
    "path": "src/media/decode/decode.h",
@@ -5843,15 +5963,18 @@
    "evidence": "src/models/qwen3_5/execution/parameters.h:7-9 -- `#include <array>` / `#include <memory>` / `#include <limits>` (no <cstdint>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<cstdint>` (std::int32_t/uint32_t/uint64_t used at :19-23,131,138), dropped `<memory>` (no smart pointer in the file; the 12 direct consumers keep `<memory>` through model.h:10, which parameters.h:3 includes).",
+   "s_resolution": "FIXED"
   },
   "329": {
    "path": "src/models/qwen3_5/execution/linear.h",
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -5859,7 +5982,10 @@
    "evidence": "src/models/qwen3_5/execution/linear.h:3 -- `#include \"models/qwen3_5/execution/parameters.h\"` (no core/device.h, unlike ffn.h:3)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `core/arena.h`, `core/device.h`, `core/tensor.h`; cudaStream_t/Tensor/WorkspaceArena are all named in the inline definitions below.",
+   "s_resolution": "FIXED"
   },
   "330": {
    "path": "src/models/qwen3_5/execution/ple_rows.cpp",
@@ -5985,7 +6111,10 @@
    "evidence": "src/media/decode/resize.cpp:116-120 -- `destination[c] = static_cast<std::uint8_t>(std::clamp(round_even(value[c]), 0, 255));`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Duplication confirmed: identical accumulate-round-clamp blocks at :97-99 and :125-127 differing only in base pointer and stride \u2014 either leave both passes as they are, or extract the shared helper; the helper is a new abstraction in a hot loop, so the direction is the owner's call."
   },
   "337": {
    "path": "src/media/decode/resize.cpp",
@@ -6109,7 +6238,10 @@
    "evidence": "src/models/gemma4/frontend.h:22-27 -- includes cstdint/memory/optional/span/string/string_view/vector but not <cstddef>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>; the header uses std::size_t at :77 (PublishedOutput::size) and :129 (constraint_uploaded), matching the sibling qwen3_5 frontend headers.",
+   "s_resolution": "FIXED"
   },
   "344": {
    "path": "src/models/gemma4/frontend.h",
@@ -6134,8 +6266,8 @@
    "line": "8-8",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -6143,7 +6275,10 @@
    "evidence": "src/models/gemma4/image_processor.cpp:8 -- \"#include <cstring>\" (unused); \"std::array<std::uint16_t, 256> lut{}\" at :67 while <array> is never included",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Replaced unused <cstring> with <array>: no memcpy/strlen/memcmp occurs in the file, and the std::array<std::uint16_t, 256> lut at :72 needed <array>, which was absent.",
+   "s_resolution": "FIXED"
   },
   "346": {
    "path": "src/models/gemma4/image_processor.cpp",
@@ -6229,7 +6364,10 @@
    "evidence": "src/models/gemma4/frontend.cpp:275 -- `const bool allowed = std::isalnum(static_cast<unsigned char>(byte)) != 0 || byte == '_' ||`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cctype> (:11) and <exception> (:14); the file calls std::isalnum at :281 and std::terminate at :1023, neither header being included.",
+   "s_resolution": "FIXED"
   },
   "351": {
    "path": "src/models/gemma4/model.h",
@@ -6261,7 +6399,10 @@
    "evidence": "src/models/gemma4/model.h:17 -- `#include <cstdint>`; grep for uint/int/size_t types in the file returns nothing",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed #include <cstdint>: the header names no fixed-width integer type, and no file reaching model.h loses <cstdint> (98-TU syntax check + closure walk).",
+   "s_resolution": "FIXED"
   },
   "353": {
    "path": "src/models/gemma4/program.cpp",
@@ -6331,7 +6472,10 @@
    "evidence": "src/models/gemma4/program.cpp:794 -- `LogitsSink sink          = std::move(sink_in);` with parameter `const LogitsSink& sink_in` (:773) and LogitsSink = std::function (include/ninfer/types.h:33)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped the no-op std::move: sink_in is `const LogitsSink&` (:789) and LogitsSink is std::function<void(const ScoredLogits&)> (include/ninfer/types.h:33), so the move bound the copy constructor; behaviour identical, and program.cpp still passes -fsyntax-only.",
+   "s_resolution": "FIXED"
   },
   "357": {
    "path": "src/models/gemma4/program.cpp",
@@ -6945,15 +7089,18 @@
    "evidence": "src/models/gemma4/forward.cpp:136 -- `void check_segments(std::span<const PassSegment> segments, std::int32_t columns,`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<span>; the TU uses std::size_t (:58), std::int32_t (:133) and std::span<const PassSegment> (:136, :317) with only algorithm/stdexcept/string/vector included.",
+   "s_resolution": "FIXED"
   },
   "392": {
    "path": "src/models/qwen3_5/execution/visual_scatter.h",
    "line": "5-5",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -6961,7 +7108,10 @@
    "evidence": "src/models/qwen3_5/execution/visual_scatter.h:5 -- `#include \"core/arena.h\"`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "dropped `core/arena.h`, `<span>`, `<cstdint>` \u2014 the one declaration names only Tensor, MtpVisualOverlap and cudaStream_t; consumers keep Arena via workspace.h and the std headers via their own includes (all four consumer TUs re-verified with -fsyntax-only).",
+   "s_resolution": "FIXED"
   },
   "393": {
    "path": "src/models/qwen3_5/execution/visual_scatter.h",
@@ -7002,8 +7152,8 @@
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -7011,7 +7161,10 @@
    "evidence": "src/models/qwen3_5/frontend/tool_grammar.h:3 -- \"#include \\\"models/qwen3_5/frontend/tool_contract.h\\\"\" (no <memory>/<string_view>/<optional>)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<memory>`, `<optional>`, `<string_view>` for std::unique_ptr/optional/string_view in the declaration.",
+   "s_resolution": "FIXED"
   },
   "396": {
    "path": "src/models/qwen3_5/frontend/resources.h",
@@ -7027,7 +7180,10 @@
    "evidence": "src/models/qwen3_5/frontend/resources.h:20 -- `std::uint32_t public_token_count = 0;` with includes limited to config.h/tokenizer.h, memory and string_view (no <cstdint>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<cstdint>`; `std::uint32_t public_token_count` is now declared from a directly included header.",
+   "s_resolution": "FIXED"
   },
   "397": {
    "path": "src/models/qwen3_5/frontend/test_access.h",
@@ -7043,7 +7199,10 @@
    "evidence": "src/models/qwen3_5/frontend/test_access.h:4 -- `#include \"models/qwen3_5/frontend/resources.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "dropped `resources.h` (unreferenced; the header names only PreparedPrompt/PreparedPromptData); both consumers (frontend.cpp, test_frontend.cpp) include resources.h themselves. Kept `frontend.h` \u2014 it is the header that declares PreparedPrompt, and prepared_prompt.h's own include of it is not this header's dependency to borrow.",
+   "s_resolution": "FIXED"
   },
   "398": {
    "path": "src/models/qwen3_5/frontend/prompt_layout.h",
@@ -7059,7 +7218,10 @@
    "evidence": "src/models/qwen3_5/frontend/prompt_layout.h:3 -- `#include \"models/qwen3_5/frontend/chat_template.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<cstddef>`, `<cstdint>`, `<optional>`, `<span>`, `<vector>` for size_t/uint32_t/optional/span/vector in the declarations.",
+   "s_resolution": "FIXED"
   },
   "399": {
    "path": "src/models/qwen3_5/load/bindings.h",
@@ -7204,7 +7366,10 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.h:55 -- \"MediaCacheDisposition disposition = MediaCacheDisposition::Hit;\"",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "real: a default-constructed PendingMedia is indistinguishable from a hit, and await() counts it as one. Two directions \u2014 add an `Invalid` enumerator and default to it (changes the public enum's values and turns misuse into a distinct state, i.e. a behaviour change on the error path), or keep `Hit` and document the precondition \u2014 owner's call."
   },
   "407": {
    "path": "src/models/qwen3_5/frontend/media_cache.h",
@@ -7220,15 +7385,18 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.h:31 -- \"MediaPreparationPermit() noexcept = default;\" (public; gate_ null)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "the public default ctor yields a no-gate permit whose reset() is a no-op; make it private so only MediaPreprocessCache mints permits, or document that a default-constructed permit holds no slot \u2014 owner's call (nothing constructs it in-tree)."
   },
   "408": {
    "path": "src/models/qwen3_5/frontend/media_cache.h",
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -7236,7 +7404,10 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.h:3 -- \"#include \\\"models/qwen3_5/frontend/processor.h\\\"\" only",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `prepared_prompt.h` (qwen3_5::PreparedMediaPayload at :24) and `<ninfer/types.h>` (PreparationControl, types.h:814).",
+   "s_resolution": "FIXED"
   },
   "409": {
    "path": "src/models/qwen3_5/frontend/tool_contract.h",
@@ -7314,8 +7485,8 @@
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -7323,7 +7494,10 @@
    "evidence": "src/models/qwen3_5/load.h:27 -- `[[nodiscard]] const artifact::MaterializationPlan& materialization() const;` (only `class Reader;` and `struct ParameterReference;` are forward-declared)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `artifact/materializer.h` (artifact::MaterializationPlan, materializer.h:31) rather than relying on model.h.",
+   "s_resolution": "FIXED"
   },
   "414": {
    "path": "src/models/qwen3_5/load/resources.cpp",
@@ -7373,7 +7547,10 @@
    "evidence": "src/models/qwen3_5/frontend/output_session.h:97 -- `std::string_view continuation = {}, bool combined = false);` with the include block at :9-16 carrying `<string>` but no `<string_view>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<string_view>`; the private ctor names `std::string_view continuation`.",
+   "s_resolution": "FIXED"
   },
   "417": {
    "path": "src/models/qwen3_5/frontend/output_session.h",
@@ -7444,7 +7621,10 @@
    "evidence": "src/models/qwen3_5/frontend/prepared_prompt.h:13 -- `std::string continuation_content;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<string>`; the claim is right but the cited line is wrong \u2014 `std::string continuation_content` is at :155, not :13.",
+   "s_resolution": "FIXED"
   },
   "421": {
    "path": "src/models/qwen3_5/frontend/prepared_prompt.h",
@@ -7467,8 +7647,8 @@
    "line": "8-12",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -7476,7 +7656,10 @@
    "evidence": "src/models/qwen3_5/frontend/frontend.h:8 -- includes <array>/<span> while using std::filesystem::path (:21) and std::optional (:89)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<filesystem>` (:21) and `<optional>` (:89), dropped `<array>`/`<span>` (no std::array/std::span anywhere in the file; output_session.h still provides both for consumers).",
+   "s_resolution": "FIXED"
   },
   "423": {
    "path": "src/models/qwen3_5/load/prepare.cpp",
@@ -7565,15 +7748,18 @@
    "evidence": "src/models/qwen3_5/frontend/chat_template.h:7 -- `#include <ninfer/types.h>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<ninfer/types.h>`; PreparationControl at :162/:166 and kMaximumPromptMediaBytes at :91 are now declared directly.",
+   "s_resolution": "FIXED"
   },
   "428": {
    "path": "src/models/qwen3_5/frontend/processor.h",
    "line": "52-54",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "",
@@ -7581,7 +7767,10 @@
    "evidence": "src/models/qwen3_5/frontend/prepared_prompt.h:63 -- `struct VisionItem {` (namespace ninfer::models::qwen3_5) vs processor.h:52 in the nested ...::frontend namespace",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "real duplication: frontend VisionGrid/TokenSpan/VisionItem shadow the model-level types and already need convert_vision_item. Reuse the model-level types (temporal/height/width, PromptModality) and drop the frontend copies, or rename/document the frontend variants \u2014 API/type change, owner's call."
   },
   "429": {
    "path": "src/models/qwen3_5/frontend/processor.h",
@@ -7597,7 +7786,10 @@
    "evidence": "src/models/qwen3_5/frontend/prepared_prompt.h:124 -- `struct PrepareStats {`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "real but overstated: PreprocessStats shares 14 fields with PrepareStats, adds prompt_tokens and omits seconds \u2014 embed/reuse PrepareStats, or keep the parallel struct \u2014 owner's call."
   },
   "430": {
    "path": "src/models/qwen3_5/frontend/processor.h",
@@ -7686,7 +7878,10 @@
    "evidence": "src/models/qwen3_5/frontend/chat_template.h:21 -- `struct ToolCall {` vs include/ninfer/types.h:433 `struct ToolCall {` (identical id/name/arguments_json)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "frontend::ToolCall is a byte-for-byte duplicate of ninfer::ToolCall (types.h:433); alias the shared type or add explicit conversions \u2014 the definitions agree today, so this is a direction call, not a bug."
   },
   "435": {
    "path": "src/models/qwen3_5/frontend/chat_template.h",
@@ -7709,8 +7904,8 @@
    "line": "6-6",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "",
@@ -7718,7 +7913,10 @@
    "evidence": "src/models/qwen3_5/frontend/chat_template.h:6 -- `#include \"models/qwen3_5/frontend/prepared_prompt.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "the include is needed for RewriteCheckpointKind alone (prepared_prompt.h:75); move that enum to a lightweight shared header (touches prepared_prompt.h and its consumers) or accept the heavier include \u2014 owner's call."
   },
   "437": {
    "path": "src/models/qwen3_5/frontend/chat_template.h",
@@ -7782,7 +7980,10 @@
    "evidence": "src/models/qwen3_5/load/dflash2.cpp:19 -- \"weights.layers[i].attention_conv = convolution(\\\"attention_conv\\\");\"",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "`weights.layers[i]` is only in-bounds because bind_draft pre-sizes the vector; switch to `.at(i)` (throws), add an explicit check, or leave the documented invariant \u2014 owner's call (in-tree it holds)."
   },
   "441": {
    "path": "src/models/qwen3_5/frontend/digest.cpp",
@@ -8005,7 +8206,10 @@
    "evidence": "src/models/qwen3_5/execution/text.h:2 -- `#include \"models/qwen3_5/program/internal.h\"`; program/context.h:12 and program_impl.h:25 include execution/text.h",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "the execution -> program include cycle is real (TextPhase in program/program.h:60, RoundState in round_buffers.h:346, both included by context.h/program_impl.h): move the shared value types into a lower-layer header, or keep the cycle \u2014 architectural, owner's call."
   },
   "454": {
    "path": "src/models/qwen3_5/execution/text.h",
@@ -8124,8 +8328,8 @@
    "line": "60-61",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -8133,7 +8337,10 @@
    "evidence": "src/models/qwen3_5/frontend/tool_grammar.cpp:60 -- `const auto body = !tool.strict && basic_arguments` inside `build(const Contract& contract, const std::optional<OutputConstraint>& body)` at :48",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "renamed the loop-local `body` to `arguments_rule` (it shadows the `std::optional<OutputConstraint>& body` parameter of `build` and holds a rule id); three uses in the loop updated.",
+   "s_resolution": "FIXED"
   },
   "461": {
    "path": "src/models/qwen3_5/frontend/tool_grammar.cpp",
@@ -8230,8 +8437,8 @@
    "line": "184-189",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "in-repo-reachable only if a caller passes preprocess_threads > 64",
@@ -8239,7 +8446,10 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.cpp:187 -- `if (threads == 0 || threads > 64) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "both halves confirmed: validation runs after `workers` has spawned `threads` OS threads, and `threads == 0` is unreachable (resolve_threads at :72 never returns 0). Either validate in the member-initializer list through a static helper (invalid arguments then throw before any thread exists \u2014 changes the error path, not the valid path), or keep the current order \u2014 owner's call."
   },
   "467": {
    "path": "src/models/qwen3_5/frontend/media_cache.cpp",
@@ -8273,7 +8483,10 @@
    "evidence": "src/models/qwen3_5/frontend/media_cache.cpp:125 -- `void check_preparation_control(const PreparationControl& control, std::string_view stage) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<cstdint>` and `<string_view>` (std::string_view at :127 and std::uint8_t/uint32_t/uint64_t throughout).",
+   "s_resolution": "FIXED"
   },
   "469": {
    "path": "src/models/qwen3_5/frontend/media_cache.cpp",
@@ -8296,8 +8509,8 @@
    "line": "109-109",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -8305,7 +8518,10 @@
    "evidence": "src/models/qwen3_5/frontend/prompt_layout.cpp:109 -- `template_bytes(output, header_end + 1, header_end + 1 + 7)` with `header_end + 1 + 7` on line 111, against `constexpr std::string_view open = \"<think>\\n\";` at line 105",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added file-scope `kReasoningOpenTag = \"<think>\"` and derived the probe and both offsets from it, removing the two hard-coded 7s in that block. (The block above probes `\"<think>\\n\"` (8) for a different purpose, so it keeps its own local view \u2014 the reviewer's \"same opener\" premise is loose, but the duplicated length in *this* block was real.)",
+   "s_resolution": "FIXED"
   },
   "471": {
    "path": "src/models/qwen3_5/frontend/prompt_layout.cpp",
@@ -8994,8 +9210,8 @@
    "line": "2-2",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -9003,7 +9219,10 @@
    "evidence": "src/models/qwen3_5/program/planning/graph_profiles.h:2 -- `#include \"models/qwen3_5/program/program.h\"`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `ninfer/types.h` (SpeculativeBackend, types.h:121) plus `<cstdint>` and `<vector>`.",
+   "s_resolution": "FIXED"
   },
   "510": {
    "path": "src/models/qwen3_5/program/planning/graph_profiles.h",
@@ -9084,8 +9303,8 @@
    "line": "10-12",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -9093,7 +9312,10 @@
    "evidence": "src/models/qwen3_5/model.h:10 -- \"#include <memory>\" with no <vector>, though the private ctor takes std::vector<BoundWeight>",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<vector>`; the private ctor and member use `std::vector<BoundWeight>` (:61, :69).",
+   "s_resolution": "FIXED"
   },
   "515": {
    "path": "src/models/qwen3_5/model.h",
@@ -9179,7 +9401,10 @@
    "evidence": "src/models/qwen3_5/program/planning/resource_projection.h:29 -- `struct PhysicalResources { PhysicalDeviceResources device; PhysicalHostResources host; };` (only defaulted operator==; the copy is real: context_work.cpp:184 `checked_resource_sum`, pressure_planner.h:23 `planning_resource_sum`)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "the duplication is real (checked_resource_sum/difference in context_work.cpp:184+, planning_resource_sum in pressure_planner.h:23, open-coded max() guards in request_plan.cpp/checkpoint_recovery.cpp/materialization.cpp/storage/context.cpp); co-locate the checked add/subtract with PhysicalResources (multi-file change) or leave them per consumer \u2014 owner's call. No consumer is missing a check today."
   },
   "520": {
    "path": "src/models/qwen3_5/program/planning/resource_projection.h",
@@ -9264,7 +9489,10 @@
    "evidence": "src/models/qwen3_5/program/planning/pressure_planner.h:5-7 -- `#include <array>` / `#include <limits>` / `#include <tuple>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "`<span>`/`<stdexcept>`/`<cstdint>` added and unused `<array>` dropped, but `<tuple>` stays: its only consumer, program/planning/pressure_planner.cpp:72, uses `std::tuple` with no include of its own (libstdc++ supplies it today only incidentally through <functional> <- <algorithm>), so the removal is not established as safe under the asymmetry rule.",
+   "s_resolution": "DEFERRED"
   },
   "525": {
    "path": "src/models/qwen3_5/program/context.h",
@@ -9298,7 +9526,10 @@
    "evidence": "src/models/qwen3_5/program/context.h:103 -- `const qwen3_5::PagedKVCache& eagle3_cache;` versus :87 `const qwen3_5::PagedKVCache& mtp_cache;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "layout identity of Eagle3BatchContext/MtpBatchContext (and OrdinaryBatchContext as a near-subset) is confirmed; extract a shared BatchCore base or keep the three hand-written structs \u2014 refactor, owner's call."
   },
   "527": {
    "path": "src/models/qwen3_5/program/context.h",
@@ -9314,15 +9545,18 @@
    "evidence": "include/ninfer/ops/sampling.h:15 -- `kSamplePurposePrefill = 0,` (context.h:204 takes a bare std::int32_t purpose)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "`std::int32_t purpose` on sample_from_hidden has no type checking (though callers do pass named ops::SamplePurpose enumerators, so \"callers must guess\" is inaccurate): introduce a scoped enum, or keep the int \u2014 type/API change, owner's call."
   },
   "528": {
    "path": "src/models/qwen3_5/program/context.h",
    "line": "30-30",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -9330,7 +9564,10 @@
    "evidence": "src/models/qwen3_5/program/context.h:30 -- `using qwen3_5::PromptModality;` (no other use in the header; <functional> also unused)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "dropped the unused `using qwen3_5::PromptModality;` (no consumer references `execution::PromptModality` \u2014 the other PromptModality uses are prepared_prompt.h's own enum, reached directly by vision_control.h:5) and unused `<functional>` (no file in the tree uses std::function without including `<functional>`).",
+   "s_resolution": "FIXED"
   },
   "529": {
    "path": "src/models/qwen3_5/program/planning/startup.h",
@@ -9346,7 +9583,10 @@
    "evidence": "src/models/qwen3_5/program/planning/startup.h:226 -- `[[nodiscard]] std::vector<std::uint32_t>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<vector>`; `idle_prefill_chunk_candidates_impl` returns `std::vector<std::uint32_t>` (:226) \u2014 and its .cpp is now compiled with the include present.",
+   "s_resolution": "FIXED"
   },
   "530": {
    "path": "src/models/qwen3_5/program/planning/startup.h",
@@ -9362,7 +9602,10 @@
    "evidence": "src/models/qwen3_5/program/planning/startup.h:175 -- `struct SequencePlanImpl {`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "SequencePlanImpl re-declares SequencePlanningInputs' field set with a hand-written copy in build_sequence_candidate; embed the inputs struct (copy as a whole) or keep the parallel field list \u2014 drift-hazard refactor, owner's call."
   },
   "531": {
    "path": "src/models/qwen3_5/program/storage/draft_context.h",
@@ -9378,7 +9621,10 @@
    "evidence": "src/models/qwen3_5/program/storage/draft_context.h:17 -- `std::optional<qwen3_5::PagedKVCache> full;` while the includes are internal.h, cyclic_kv_cache.h, startup.h, <cuda_runtime_api.h>, <cstdint>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<optional>` (:17) and `models/qwen3_5/state/decoder_state.h` (class PagedKVCache, decoder_state.h:57; it also brings core/paged_kv_cache.h for PagedKVBatchLayerView).",
+   "s_resolution": "FIXED"
   },
   "532": {
    "path": "src/models/qwen3_5/program/storage/draft_context.h",
@@ -9413,7 +9659,10 @@
    "evidence": "src/models/qwen3_5/program/context_work.h:4 -- `#include <chrono>` only, besides program_impl.h",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<cstddef>`, `<cstdint>`, `<optional>`, `<span>` alongside `<chrono>` (all four are named in the declarations below).",
+   "s_resolution": "FIXED"
   },
   "534": {
    "path": "src/models/qwen3_5/program/context_work.h",
@@ -9592,7 +9841,10 @@
    "evidence": "src/models/qwen3_5/program/program.h:626 -- `std::uint32_t maximum_owners = std::numeric_limits<std::uint32_t>::max());`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<limits>`; `std::numeric_limits<std::uint32_t>::max()` at :627 is the only use and was resolving transitively.",
+   "s_resolution": "FIXED"
   },
   "544": {
    "path": "src/models/qwen3_5/program/program.h",
@@ -9856,15 +10108,18 @@
    "evidence": "src/models/qwen3_5/program/planning/kv_stream.h:34 -- `[[nodiscard]] constexpr std::uint32_t kv_stream_pages(std::uint32_t tokens) noexcept {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "made the byte-identical copy `kv_pages_for_tokens` (program_impl.h:48, which includes kv_stream.h at :10) delegate to `kv_stream_pages`, so the rounding rule lives once; the expression is unchanged, verified -fsyntax-only.",
+   "s_resolution": "FIXED"
   },
   "559": {
    "path": "src/models/qwen3_5/program/planning/kv_stream.h",
    "line": "7-7",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "in-repo-reachable (build-time coupling only)",
@@ -9872,7 +10127,10 @@
    "evidence": "src/core/paged_kv_cache.h:9 -- `#include <cuda_runtime_api.h>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "confirmed: the header needs only `kPagedKVPageSize` (core/paged_kv_cache.h:19) but pulls `<cuda_runtime_api.h>` with it. Extract that constant into a lightweight header (touches core/paged_kv_cache.h and its users) or keep the CUDA coupling \u2014 owner's call."
   },
   "560": {
    "path": "src/models/qwen3_5/program/graph_execution.h",
@@ -10320,7 +10578,10 @@
    "evidence": "src/models/qwen3_5/program/program_impl.cpp:613 -- `TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "renamed the parameters to `transfer_work`/`state_image_count` (ProgramImpl::work at :687, ::state_images at :700); both body uses updated. The matching declaration in program_impl.h:1082 keeps the old names \u2014 that file is cited by finding 558 only, so it was left alone.",
+   "s_resolution": "FIXED"
   },
   "585": {
    "path": "src/models/qwen3_5/program/program_impl.cpp",
@@ -10605,7 +10866,10 @@
    "evidence": "src/models/qwen3_5/program/planning/checkpoint_recovery.cpp:500 -- `return std::tuple{left.checkpoint.ref.frontier, left.checkpoint.ref.kind,`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "added `<tuple>`; `std::tuple` is used in the checkpoint comparators at :504/:506/:562.",
+   "s_resolution": "FIXED"
   },
   "601": {
    "path": "src/models/qwen3_5/program/planning/checkpoint_recovery.cpp",
@@ -11720,7 +11984,10 @@
    "evidence": "src/ops/candidate_selector/bf16/candidate_selector_path_kernels.h:1-2 -- only `#include \"ops/candidate_selector/bf16/candidate_selector_path_plan.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Uses Tensor/SamplingConfig/cudaStream_t; added core/tensor.h, ninfer/ops/sampling.h, <cuda_runtime.h>; header now compiles as the sole include of a TU.",
+   "s_resolution": "FIXED"
   },
   "660": {
    "path": "src/ops/candidate_selector/bf16/candidate_selector_path_kernels.h",
@@ -11746,8 +12013,8 @@
    "line": "16-16",
    "category": "bug",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -11755,7 +12022,10 @@
    "evidence": "src/ops/attn_input_proj/bf16/bf16_attn_input_plan.h:16-18 -- `kBf16AttnInputSmallTMinTokens = 2; kBf16AttnInputSmallTMaxTokens = 32; kBf16AttnInputSmallTDispatchEnd = 22;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added the static_assert tying kBf16AttnInputSmallTDispatchEnd to [MinTokens, MaxTokens]; 22<=32 holds today, so no instantiation's behaviour changes.",
+   "s_resolution": "FIXED"
   },
   "662": {
    "path": "src/ops/attn_input_proj/q8/q8_attn_input_plan.h",
@@ -12099,16 +12369,18 @@
    "line": "32-32",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "false",
+   "priority": "F",
    "kind": "style",
    "impact": "",
    "reach": "latent drift only",
-   "note": "The comment already names it as the TMA cutoff used by every caller; lifting the literal into a named constant is a readability preference.",
+   "note": "re-examined in the style wave: The cutoff is not duplicated: both call sites call the predicate (nvfp4_attn_input_w4a4.cu:88,91 and wrapper/attn_input_proj.cpp:300), so no caller mirrors 1024 and nothing can drift.",
    "evidence": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h:32 -- `return tokens >= 1024;` under `// Shared by the ordinary W4A4 launcher and the fused entry. This is the TMA cutoff.`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "FALSE"
   },
   "682": {
    "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h",
@@ -12185,8 +12457,8 @@
    "line": "6-6",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -12194,7 +12466,10 @@
    "evidence": "src/ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp:6 -- `#include <algorithm>` (no std::min/max/sort anywhere in the TU)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed <algorithm>: no std::min/max/sort in the TU, and a .cpp is a leaf so no consumer can rely on the transitive path; TU still compiles.",
+   "s_resolution": "FIXED"
   },
   "687": {
    "path": "src/ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp",
@@ -12217,16 +12492,18 @@
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "false",
+   "priority": "F",
    "kind": "style",
    "impact": "low",
    "reach": "",
-   "note": "std::uintptr_t is used at lines 36/39/43 while only <stdexcept> is included; <cstdint> arrives transitively.",
+   "note": "re-examined in the style wave: <cstdint> is already included at line 3 (`#include \"\u2026path_plan.h\"` / `/kernels.h` / <cstdint> / <limits> / <stdexcept>).",
    "evidence": "src/ops/candidate_selector/bf16/candidate_selector_path_plan.cpp:36 -- `const auto begin = reinterpret_cast<std::uintptr_t>(work->data),`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "FALSE"
   },
   "689": {
    "path": "src/ops/candidate_selector/bf16/candidate_selector_path_plan.cpp",
@@ -12278,7 +12555,10 @@
    "evidence": "src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp:21 -- `return {schedule, static_cast<std::size_t>(5120) * columns * sizeof(std::uint16_t)};` while src/ops/wrapper/dynamic_grouped_conv.cpp:19 has `constexpr std::int32_t kHidden = 5120;` and the kernel TU has `constexpr int kRows = 5120, kGroups = 320;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "The three 5120s agree (here, wrapper/dynamic_grouped_conv.cpp:19 kHidden, kernel TU kRows); a single shared constant is a naming/placement preference, and the fix needs a declaration outside the cited file.",
+   "s_resolution": "DEFERRED"
   },
   "692": {
    "path": "src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp",
@@ -12294,7 +12574,10 @@
    "evidence": "src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp:20 -- `const S schedule  = columns <= 88 ? S::TiledMma : S::MmaK128;` with `make_launchers<4096>(std::make_index_sequence<11>{})` giving TileColumns 8..88 (materialized.cu:53-62)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "88 does equal the TiledMma table maximum (TileColumns 8..88), but naming a local threshold has no checkable right answer; tying it to the launcher table needs a static_assert in materialized.cu.",
+   "s_resolution": "DEFERRED"
   },
   "693": {
    "path": "src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp",
@@ -12412,7 +12695,10 @@
    "evidence": "src/ops/context_kv_materialize/launch.h:22 -- `if (columns <= 32) return Route::KSplit16;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Not a defect: launch_grouped<16> is generic in envelope.max_count (materialize.cu:405-420), so the 25..32 band is a schedule choice \u2014 either keep it and document the rationale, or re-route the band to Route::Mma32 (that is a behaviour change)."
   },
   "700": {
    "path": "src/ops/common/sampling_workspace.h",
@@ -12892,7 +13178,10 @@
    "evidence": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp:376 -- `if (is_27(problem) && problem.cols <= 42)` (mirrored at :397 `if (max_cols <= 42) return 0;`)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "42/16 agree across resolver (:376), capacity estimator (:397, :402) and the launcher's x.ne[1] <= 16 guard; naming shared constants is a preference and the third copy lives in another TU.",
+   "s_resolution": "DEFERRED"
   },
   "727": {
    "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp",
@@ -13047,7 +13336,10 @@
    "evidence": "src/ops/launcher/causal_compact_attention.h:21 -- `std::size_t causal_compact_attention_workspace_bytes(std::int32_t rotary_dim,` while the includes at :5-8 are core/device.h, core/tensor.h, <cstdint>, <cuda_runtime.h>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::size_t at :23 had no <cstddef>; added it, matching sibling launcher headers.",
+   "s_resolution": "FIXED"
   },
   "736": {
    "path": "src/ops/gdn_input_proj/q8/q8_gdn_input_plan.h",
@@ -13139,8 +13431,8 @@
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -13148,7 +13440,10 @@
    "evidence": "src/ops/kv_cache/append/launch.h:3 -- `#include \"ninfer/ops/kv_cache_append.h\"`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "KVCacheAppendPrefixPlan uses std::int32_t; added <cstdint>; header now compiles as the sole include of a TU.",
+   "s_resolution": "FIXED"
   },
   "742": {
    "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp",
@@ -13516,7 +13811,10 @@
    "evidence": "src/ops/linear/bf16/bf16_launch.h:8 -- `#include <cstdint>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "The header itself uses no fixed-width type, but its consumer src/ops/linear/bf16/bf16_shapes.h (14 std::int32_t uses; bf16_launch.h is its only include) is served by exactly this include, so removal would only shunt that consumer's dependency onto core/weight.h's internal <cstdint>; the matching fix also adds <cstdint> to bf16_shapes.h, which no finding in this slice owns. Include left in place.",
+   "s_resolution": "DEFERRED"
   },
   "763": {
    "path": "src/ops/linear/q4/q4_shapes.h",
@@ -13532,7 +13830,10 @@
    "evidence": "src/ops/linear/q4/q4_shapes.h:9 -- `[[nodiscard]] Q4Launch select_q4_n5120_k6144(std::int32_t tokens);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::int32_t at :9 reached only through q4_launch.h -> core/tensor.h; added <cstdint>.",
+   "s_resolution": "FIXED"
   },
   "764": {
    "path": "src/ops/launcher/sliding_causal_attention.h",
@@ -13548,7 +13849,10 @@
    "evidence": "src/ops/launcher/sliding_causal_attention.h:8 -- `#include <cstdint>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "sliding_causal_attention_workspace_bytes returns std::size_t at :24 with no <cstddef>; added it (gemma_flash_attention.h:11 already does).",
+   "s_resolution": "FIXED"
   },
   "765": {
    "path": "src/ops/linear/bf16/bf16_dispatch.h",
@@ -13600,7 +13904,10 @@
    "evidence": "src/ops/linear/fp8/fp8_format.h:4 -- `#include \"core/tensor.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "File names only Weight and std::uint64_t (grep: no Tensor); core/tensor.h removed after checking all 9 consumers, each of which has its own direct path when it needs Tensor (public op header, or fp8_dispatch.h:5); all consumer TUs still syntax-check.",
+   "s_resolution": "FIXED"
   },
   "768": {
    "path": "src/ops/linear/fp8/fp8_format.h",
@@ -13634,15 +13941,18 @@
    "evidence": "src/ops/linear/nvfp4/nvfp4_dispatch.h:21 -- `WorkspaceArena* workspace, cudaStream_t stream);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "WorkspaceArena* at :21 with no direct core/arena.h (came via ninfer/ops/linear.h:4); added core/arena.h as sibling fp8_dispatch.h:4 does.",
+   "s_resolution": "FIXED"
   },
   "770": {
    "path": "src/ops/linear/nvfp4/nvfp4_format.h",
    "line": "4-4",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -13650,7 +13960,10 @@
    "evidence": "src/ops/linear/nvfp4/nvfp4_format.h:4 -- `#include \"core/tensor.h\"`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Tensor never appears in the file (0 grep hits); core/tensor.h removed after checking all 8 consumers \u2014 every one that uses Tensor names its own provider (sparse_moe.h:6, gemma_moe_experts.h:3, nvfp4_dispatch.h:4, or a public op header) \u2014 and all consumer TUs still syntax-check.",
+   "s_resolution": "FIXED"
   },
   "771": {
    "path": "src/ops/launcher/scatter.h",
@@ -13682,7 +13995,10 @@
    "evidence": "src/ops/linear/fp8/fp8_shapes.h:7 -- `std::int32_t n, k;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::int32_t at :9 and std::size_t at :13 relied on fp8_a8_plan.h; added <cstddef> and <cstdint>.",
+   "s_resolution": "FIXED"
   },
   "773": {
    "path": "src/ops/linear/fp8/fp8_shapes.h",
@@ -13733,7 +14049,10 @@
    "evidence": "src/ops/linear/nvfp4/nvfp4_shapes.h:2 -- `#include \"ops/linear/nvfp4/nvfp4_launch.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Struct names Tensor, Weight and std::int32_t arriving only via nvfp4_launch.h; added core/tensor.h, core/weight.h and <cstdint> (the three the finding names); the header is now self-contained.",
+   "s_resolution": "FIXED"
   },
   "776": {
    "path": "src/ops/linear/nvfp4/nvfp4_shapes.h",
@@ -13783,7 +14102,10 @@
    "evidence": "Bf16GemvSchedule is (PhaseStride,PrefetchDepth,PhaseUnroll,MinBlocksPerSm) and Bf16SimtSchedule is (PhaseStride,PhaseUnroll,PrefetchDepth,...), all plain ints",
    "source": "parent-audit",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Bf16SimtSchedule tail reordered to (PhaseStride, PrefetchDepth, PhaseUnroll, MinBlocksPerSm) to match Bf16GemvSchedule, and the two middle args swapped at all 26 Simt instantiations in 6 files; all 35 instantiations in the 9 instantiation files re-parsed from source before/after and every one still binds the same PhaseStride/PhaseUnroll/PrefetchDepth/MinBlocksPerSm (table below, 0 mismatches).",
+   "s_resolution": "FIXED"
   },
   "779": {
    "path": "src/ops/linear/bf16/bf16_config.h",
@@ -13799,7 +14121,10 @@
    "evidence": "src/ops/linear/bf16/bf16_config.h:73 -- `struct Bf16SimtSchedule {`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "The duplication is real (8 static_asserts, 10 derived members and the literal warp size 32 repeated) but nothing is inconsistent today: option A factor the shared constraints/members into a common base or validation trait plus one named warp-size constant, option B leave the two schedules independent. Direction is the owner's call; no patch."
   },
   "780": {
    "path": "src/ops/launcher/speculative_round.h",
@@ -13815,7 +14140,10 @@
    "evidence": "src/ops/launcher/speculative_round.h:3-4 -- `#include \"core/tensor.h\"` / `#include \"ninfer/ops/sampling.h\"` only, while the declarations use std::int32_t and DeviceSpan",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::int32_t and DeviceSpan (defined core/arena.h:12) were both absent; added core/arena.h and <cstdint>, as sibling launcher headers do; header is now self-contained.",
+   "s_resolution": "FIXED"
   },
   "781": {
    "path": "src/ops/launcher/speculative_round.h",
@@ -13939,7 +14267,10 @@
    "evidence": "src/ops/launcher/sigmoid_gate_mul.h:3 -- `// ninfer::ops::detail - private launch prototype for sigmoid_mul.`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "This is a name-family preference, and the cited convention documents its own carve-out (op-development.md \u00a75.3: \"unless several contracts intentionally share an implementation family\"), so there is no checkable right answer; the rename would also span the header, the .cu, wrapper/sigmoid_mul.cpp:6,59 and bench/ops/sigmoid_mul_bench.cu:3,71. Code left alone.",
+   "s_resolution": "DEFERRED"
   },
   "788": {
    "path": "src/ops/linear/exl3/exl3_dispatch.h",
@@ -14081,7 +14412,10 @@
    "evidence": "src/ops/linear/q4/q4_dispatch.cpp:32 -- `throw std::invalid_argument(\"q4 linear: unsupported shape\");`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Message now carries the failing N/K/T as the q8 sibling does at q8_dispatch.cpp:101-102; added <string> for std::to_string.",
+   "s_resolution": "FIXED"
   },
   "796": {
    "path": "src/ops/linear/fp8/fp8_a8_plan.h",
@@ -14134,7 +14468,10 @@
    "evidence": "src/ops/linear/fp8/fp8_format.cpp:28 -- `std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char* operation) {`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Deleted the local checked_mul/checked_add/align_up in favour of the already-included core/checked_math.h; the two call sites now spell the type (align_up<std::uint64_t>, checked_mul<std::uint64_t>) because the shared templates cannot deduce T from (uint64_t, int). Side effects: alignment==0 can no longer divide by zero, and the overflow text becomes the shared \"<op> overflows\" (nothing greps the old text).",
+   "s_resolution": "FIXED"
   },
   "799": {
    "path": "src/ops/linear/fp8/fp8_format.cpp",
@@ -14430,7 +14767,10 @@
    "evidence": "src/ops/linear/q6/q6_shapes.h:9 -- `[[nodiscard]] Q6Launch select_q6_n248320_k2048(std::int32_t tokens);`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::int32_t at :9 reached only through q6_launch.h (no <cstdint> there); added <cstdint>, as q6_dispatch.h/q6_operands.h do.",
+   "s_resolution": "FIXED"
   },
   "816": {
    "path": "src/ops/linear/q5/q5_shapes.h",
@@ -14464,7 +14804,10 @@
    "evidence": "src/ops/linear_add/q4/q4_linear_add_dispatch.h:6 -- `Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens);` with includes core/tensor.h, core/weight.h, cuda_runtime.h only",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::int32_t at :9 with no <cstdint> (it arrived via core/tensor.h); added, as q4_dispatch.h does.",
+   "s_resolution": "FIXED"
   },
   "818": {
    "path": "src/ops/linear/q5/shapes/n1152_k1152.cpp",
@@ -14532,7 +14875,10 @@
    "evidence": "src/ops/linear/q8/q8_dispatch.h:3 -- `#include \"core/weight.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added core/tensor.h and <cuda_runtime.h> for Tensor/cudaStream_t (core/weight.h:3 includes only core/dtype.h); note the suggested patch also adds <cstdint>, which is already present at :5, so only the other two were needed. Header is now self-contained.",
+   "s_resolution": "FIXED"
   },
   "822": {
    "path": "src/ops/linear/q5/q5_dispatch.h",
@@ -14548,7 +14894,10 @@
    "evidence": "src/ops/linear/q5/q5_dispatch.h:3 -- `#include \"core/weight.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Tensor resolved only through ninfer/ops/linear.h:5; core/weight.h declares Weight, not Tensor; added core/tensor.h.",
+   "s_resolution": "FIXED"
   },
   "823": {
    "path": "src/ops/linear/q5/q5_dispatch.h",
@@ -14573,16 +14922,18 @@
    "line": "17-17",
    "category": "bug",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "false",
+   "priority": "F",
    "kind": "style",
    "impact": "",
    "reach": "in-repo-reachable",
-   "note": "Unsettled: the signed/unsigned product is folded back at compile time, and no -Wconversion/-Werror flag appears in the build files, so this is an intent/diagnostic concern only.",
+   "note": "re-examined in the style wave: No kScaleRowBytes exists in that file at all: q8_geometry.h is 18 lines and its last declaration is kGroupsPerRow at :15; the quoted expression kGroupsPerRow * sizeof(std::uint16_t) appears nowhere in the tree (nearest real ones: q5_ksplit_mma.cuh:126, which uses the literal 2, and q8_pair_plan.cpp:273).",
    "evidence": "src/ops/linear/q8/q8_geometry.h:17 -- `static constexpr std::int32_t kScaleRowBytes = kGroupsPerRow * sizeof(std::uint16_t);`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "FALSE"
   },
   "825": {
    "path": "src/ops/linear/q8/q8_geometry.h",
@@ -14913,15 +15264,18 @@
    "evidence": "src/ops/linear_add/fp8/fp8_linear_add_plan.cpp:7 -- `#include <algorithm>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "TU uses only std::int*/std::uint*/std::size_t/std::invalid_argument; removed <algorithm>, and the TU still syntax-checks.",
+   "s_resolution": "FIXED"
   },
   "844": {
    "path": "src/ops/linear/q8/q8_dispatch.cpp",
    "line": "4-5",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -14929,7 +15283,10 @@
    "evidence": "src/ops/linear/q8/q8_dispatch.cpp:101 -- `\" K=\" + std::to_string(k) + \" T=\" + std::to_string(t));` with only <array>/<stdexcept> included",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "std::to_string at :101-102 and the int32 types resolved only transitively; added <cstdint> and <string>.",
+   "s_resolution": "FIXED"
   },
   "845": {
    "path": "src/ops/linear_add/q5/q5_linear_add_plan.cpp",
@@ -15100,7 +15457,10 @@
    "evidence": "src/ops/linear_topk/linear_topk_launch.h:7 -- `#include <cuda_runtime.h>` with the rest of the includes being core/weight.h, core/tensor.h and linear_topk_workspace.h; std::int32_t is used throughout and no <cstdint> appears",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for the std::int32_t parameters; header now compiles standalone.",
+   "s_resolution": "FIXED"
   },
   "855": {
    "path": "src/ops/linear_pair/q8/q8_pair_kernels.h",
@@ -15162,8 +15522,8 @@
    "line": "9-9",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -15171,7 +15531,10 @@
    "evidence": "src/ops/softmax_attention/common/causal_geometry.h:9 -- `static_assert(HeadDim > 0 && HeadDim % 64 == 0);`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Tightened to HeadDim == kCausalHeadDim with a diagnostic message; downstream already hard-requires 256 (causal_merge.cuh:47, causal_operands.h:106) and all three aliases plus every causal launch TU still compile.",
+   "s_resolution": "FIXED"
   },
   "859": {
    "path": "src/ops/softmax_attention/common/causal_geometry.h",
@@ -15203,7 +15566,10 @@
    "evidence": "src/ops/ple/launch.h:8 -- `#include <cuda_runtime.h>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for the std::int32_t declarations.",
+   "s_resolution": "FIXED"
   },
   "861": {
    "path": "src/ops/ple/launch.h",
@@ -15219,7 +15585,10 @@
    "evidence": "src/ops/ple/launch.h:6 -- `#include \"ninfer/ops/ple.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped ninfer/ops/ple.h; consumers of this header are ple.cpp (which includes ple.h at :2 itself) and kernels.cu (which names no public ple_gate/ple_dilated_conv/ple_conv_advance symbol) \u2014 kernels.cu still compiles.",
+   "s_resolution": "FIXED"
   },
   "862": {
    "path": "src/ops/linear_swiglu/q8/q8_linear_swiglu_plan.h",
@@ -15290,7 +15659,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/bf16/launch.h:3 -- `#include \"ops/softmax_attention/dense/causal_cache/bf16/operands.h\"`, while the two declarations use only Tensor, PagedKVBatchLayerView, PagedKVLayerView, CausalAttentionExecutionEnvelope, WorkspaceArena, DeviceExecutionView",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped operands.h; bf16/launch.cu still reaches it via template_launch.cuh -> tiled_mma.cuh -> tile_io.cuh:9, and causal_softmax_attention.cpp uses no Bf16Kv* or CausalAttentionOperands symbol; both TUs compile.",
+   "s_resolution": "FIXED"
   },
   "866": {
    "path": "src/ops/linear_add/q8/q8_linear_add_plan.h",
@@ -15306,7 +15678,10 @@
    "evidence": "src/ops/linear_add/q8/q8_linear_add_plan.h:4 -- `#include \"core/arena.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "No arena type is used (q8_linear_add_execute_plan takes no workspace) while Tensor arrived via core/arena.h:4; swapped to core/tensor.h \u2014 the only arena-using consumers, wrapper/linear_add.cpp and bench/ops/q8_linear_add_bench.cu, both include ninfer/ops/linear_add.h, which has core/arena.h at :6.",
+   "s_resolution": "FIXED"
   },
   "867": {
    "path": "src/ops/linear_add/q8/q8_linear_add_plan.h",
@@ -15545,7 +15920,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/bf16/instances.h:22 -- `Schedule::kKeyRows, GROUPED};` \u2014 the grouped flag is a macro argument, not derived from the schedule, and plan.grouped() selects the kernel",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Hardening only (all five NINFER_BF16_KV_INSTANCE uses pass the matching flag): derive the flag from a schedule trait, or add a static_assert tying it to the schedule \u2014 both need a trait on the schedule types, so the direction is the owner's."
   },
   "881": {
    "path": "src/ops/linear_topk/linear_topk_workspace.h",
@@ -15776,7 +16154,10 @@
    "evidence": "src/ops/softmax_attention/common/causal_operands.h:7 -- `#include <type_traits>` (no `<cstdint>`), while std::int32_t/int64_t are used at lines 24, 84, 109-111",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for std::int32_t/std::int64_t; header now compiles standalone.",
+   "s_resolution": "FIXED"
   },
   "894": {
    "path": "src/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp",
@@ -15990,15 +16371,18 @@
    "evidence": "src/ops/softmax_attention/common/mxfp8_tiled_plan.h:5 -- `#include <algorithm>` while :17 uses `const std::int64_t tiles =` and :34 `inline std::size_t mxfp8_tiled_workspace_bytes(`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> and <cstdint> for std::size_t/std::int64_t.",
+   "s_resolution": "FIXED"
   },
   "906": {
    "path": "src/ops/offload_moe/launch.h",
    "line": "8-8",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16006,7 +16390,10 @@
    "evidence": "src/ops/offload_moe/launch.h:7 -- `#include <cuda_bf16.h>` with no <cstdint> (int32/uint8 arrive via ninfer/ops/offload_moe.h:9)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for std::int32_t/std::uint8_t.",
+   "s_resolution": "FIXED"
   },
   "907": {
    "path": "src/ops/offload_moe/launch.h",
@@ -16120,8 +16507,8 @@
    "line": "8-10",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16129,7 +16516,10 @@
    "evidence": "src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp:168 -- `const chunked::Arguments args{static_cast<const __nv_bfloat16*>(q.data),` with no `#include <cuda_bf16.h>` in the include list at :1-10",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cuda_bf16.h>; __nv_bfloat16 is named at :259-266; TU compiles.",
+   "s_resolution": "FIXED"
   },
   "914": {
    "path": "src/ops/linear_attention/gated_delta_net/chunked/launch.h",
@@ -16471,8 +16861,8 @@
    "line": "4-4",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16480,7 +16870,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/int8/plan.h:4 -- includes only softmax_attention.h and causal_partition.h, no <cstddef>",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> for std::size_t in int8_kv_workspace_bytes.",
+   "s_resolution": "FIXED"
   },
   "934": {
    "path": "src/ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.h",
@@ -16496,7 +16889,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.h:5 -- `void nvfp4_kv_tiled_attention(const CausalAttentionOperands&, Nvfp4KvReadView, cudaStream_t);` with only line 2's `#include \".../nvfp4/operands.h\"`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cuda_runtime.h> for cudaStream_t; nvfp4/tiled_launch.cu still compiles.",
+   "s_resolution": "FIXED"
   },
   "935": {
    "path": "src/ops/softmax_attention/dense/packed/launch.h",
@@ -16512,7 +16908,10 @@
    "evidence": "src/ops/softmax_attention/dense/packed/launch.h:1-5 -- includes only \"core/tensor.h\" and <cuda_runtime.h>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for std::int32_t in the public interface.",
+   "s_resolution": "FIXED"
   },
   "936": {
    "path": "src/ops/softmax_attention/dense/causal_cache/k8v4/operands.h",
@@ -16528,15 +16927,18 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/k8v4/operands.h:6 -- `using K8V4KvCacheView = QuantizedCausalCacheView<std::uint8_t, __half, std::uint8_t, Writable>;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> and <cuda_fp16.h> for std::uint8_t/__half in K8V4KvCacheView.",
+   "s_resolution": "FIXED"
   },
   "937": {
    "path": "src/ops/softmax_attention/dense/causal_cache/fp8/plan.h",
    "line": "3-4",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16544,7 +16946,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/fp8/plan.h:21 -- `std::size_t fp8_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> for std::size_t in fp8_kv_workspace_bytes.",
+   "s_resolution": "FIXED"
   },
   "938": {
    "path": "src/ops/softmax_attention/dense/causal_cache/int8/operands.h",
@@ -16560,7 +16965,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/int8/operands.h:6 -- `using Int8KvCacheView = QuantizedCausalCacheView<std::int8_t, __half, __half, Writable>;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> and <cuda_fp16.h> for std::int8_t/__half in Int8KvCacheView.",
+   "s_resolution": "FIXED"
   },
   "939": {
    "path": "src/ops/softmax_attention/dense/context/launch.h",
@@ -16576,7 +16984,10 @@
    "evidence": "src/ops/softmax_attention/dense/context/launch.h:3 -- `#include \"ninfer/ops/softmax_attention.h\"` as the only include, while :9 declares `context_attention_launch(const Tensor& q, ...` and uses std::int32_t and PagedKVBatchLayerView",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added core/tensor.h, core/paged_kv_cache.h, <cstdint>, <cuda_runtime.h>: Tensor, PagedKVBatchLayerView, std::int32_t and cudaStream_t were all arriving only through the public header.",
+   "s_resolution": "FIXED"
   },
   "940": {
    "path": "src/ops/softmax_attention/dense/causal_cache/nvfp4/plan.h",
@@ -16599,8 +17010,8 @@
    "line": "15-22",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16608,7 +17019,10 @@
    "evidence": "src/ops/softmax_attention/sliding_window/launch.h:15 -- `SlidingWindowAttentionRoute route;` vs src/ops/softmax_attention/dense/context/launch.h:13 `ContextAttentionRoute route = ContextAttentionRoute::SplitKv;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added in-class defaults mirroring ContextAttentionPlan; the only construction site is a full designated-initializer return (launch.cu:86-95), unchanged, and launch.cu compiles.",
+   "s_resolution": "FIXED"
   },
   "942": {
    "path": "src/ops/softmax_attention/dense/causal_cache/nvfp4/operands.h",
@@ -16633,8 +17047,8 @@
    "line": "7-7",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16642,7 +17056,10 @@
    "evidence": "src/ops/sparse_attention/launch.h:5 -- `#include \"ninfer/ops/sparse_attention.h\"` with no <cstdint>/<cstddef>",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> and <cstdint> for std::size_t/std::int32_t.",
+   "s_resolution": "FIXED"
   },
   "944": {
    "path": "src/ops/softmax_attention/dense/causal_cache/bf16/plan.h",
@@ -16658,7 +17075,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/bf16/plan.h:23 -- `std::size_t bf16_kv_workspace_bytes(int query_heads, int kv_heads, int batch, int min_width,`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> for std::size_t in bf16_kv_workspace_bytes.",
+   "s_resolution": "FIXED"
   },
   "945": {
    "path": "src/ops/wrapper/cast.cpp",
@@ -16733,8 +17153,8 @@
    "line": "3-3",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -16742,7 +17162,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/k8v4/plan.h:3 -- \"#include \\\"ninfer/ops/softmax_attention.h\\\"\" (no <cstddef>)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef> for std::size_t in k8v4_kv_workspace_bytes.",
+   "s_resolution": "FIXED"
   },
   "950": {
    "path": "src/ops/softmax_attention/dense/context/context_softmax_attention.cpp",
@@ -16878,7 +17301,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/bf16/split_policy.h:23 -- `const int target  = visible >= 32768 ? long_target : normal_target;` and src/ops/softmax_attention/dense/causal_cache/bf16/plan.cpp:52 `interval_capacity(low, std::min(visible, 32767), partition.normal_target)`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "Both copies of 32768 agree (split_policy.h:26 vs plan.cpp:52-53's 32767/32768 pair); extracting one shared constexpr is a naming/placement choice with no checkable right answer.",
+   "s_resolution": "DEFERRED"
   },
   "958": {
    "path": "src/ops/softmax_attention/dense/causal_cache/bf16/split_policy.h",
@@ -16894,7 +17320,10 @@
    "evidence": "src/ops/softmax_attention/dense/causal_cache/bf16/split_policy.h:25 -- `const int keys    = rounded < 64 ? 64 : rounded;` and :32 `boundary >= target * 64`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "64 is 2*key_rows and the two copies agree, and the :32 guard is correct as written; naming a minimum-keys constant is a preference, not a defect.",
+   "s_resolution": "DEFERRED"
   },
   "959": {
    "path": "src/ops/softmax_attention/dense/causal_cache/bf16/split_policy.h",
@@ -16983,7 +17412,10 @@
    "evidence": "src/ops/sparse_moe/small_t/sparse_moe_small_t.h:48 -- `const std::int32_t assignments = 8 * tokens;` versus src/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu:21 `constexpr int kTopK = 8;` used as `token_ids + token * kTopK` (:103)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "8 == kTopK (sparse_moe_small_t_kernels.cu:21) and the kernels index with it, but values agree today and the fix is \"name and share a constant\" \u2014 a naming decision, no checkable right answer.",
+   "s_resolution": "DEFERRED"
   },
   "964": {
    "path": "src/ops/sparse_moe/small_t/sparse_moe_small_t.h",
@@ -17384,7 +17816,10 @@
    "evidence": "src/ops/softmax_attention/dense/packed/packed_softmax_attention.cpp:36 -- `constexpr std::int64_t tile_rows = 64;` versus src/ops/softmax_attention/dense/packed/kernel.cuh:16 `inline constexpr int kPackedAttentionBr      = 64;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "deferred_note": "tile_rows 64 == kPackedAttentionBr (kernel.cuh:16); a shared host constant plus a static_assert needs a new declaration in launch.h and a check in launch.cu, both outside this finding's cited file.",
+   "s_resolution": "DEFERRED"
   },
   "987": {
    "path": "src/ops/softmax_attention/dense/packed/packed_softmax_attention.cpp",
@@ -18124,7 +18559,10 @@
    "evidence": "src/serve/serve_metrics.cpp:335 -- `const char* constraint_cache[] = {\"hit\", \"built\", \"waited\"};`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Duplication confirmed: the nested ternaries at :14-19 encode hit/built/waited, which src/serve/serve_metrics.cpp:335 encodes again as {\"hit\",\"built\",\"waited\"} \u2014 either leave both encodings or expose constraint_output_branch_name()/constraint_cache_access_name() and reuse them in both files (one of which is outside my file set), so the direction is the owner's call."
   },
   "1029": {
    "path": "src/product/constraint_observation.h",
@@ -18147,8 +18585,8 @@
    "line": "3-4",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -18156,7 +18594,10 @@
    "evidence": "include/ninfer/types.h:9 -- `#include <optional>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <optional>; the helper's signature takes const std::optional<ConstraintObservation>& (:11) and the header included only ninfer/types.h and json.hpp.",
+   "s_resolution": "FIXED"
   },
   "1031": {
    "path": "src/product/constraint_observation.h",
@@ -18298,7 +18739,10 @@
    "evidence": "src/ops/wrapper/scatter.cpp:5-6 -- `#include <cstddef>` / `#include <stdexcept>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> for std::int32_t/std::uintptr_t; TU compiles.",
+   "s_resolution": "FIXED"
   },
   "1039": {
    "path": "src/ops/wrapper/scatter.cpp",
@@ -18323,8 +18767,8 @@
    "line": "27-29",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "true",
-   "priority": "P3",
+   "verdict": "maybe",
+   "priority": "M",
    "kind": "style",
    "impact": "low",
    "reach": "requires a caller that aliases inputs and destination; no in-tree caller does",
@@ -18332,15 +18776,18 @@
    "evidence": "include/ninfer/ops/scatter.h:24 -- `*   Inputs and destination must not alias.`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "scatter/scatter_bf16_batch do not enforce the documented non-aliasing while extract_bf16_columns:76 does: add the same overlaps() call (behaviour: new throw for aliasing callers) or leave it as a documented caller contract."
   },
   "1041": {
    "path": "src/ops/wrapper/residual_add_norm.cpp",
    "line": "8-11",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -18348,7 +18795,10 @@
    "evidence": "src/ops/wrapper/residual_add_norm.cpp:9 -- `#include <stdexcept>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <string>, matching rmsnorm.cpp; std::string is built in numel_allow_zero.",
+   "s_resolution": "FIXED"
   },
   "1042": {
    "path": "src/ops/wrapper/residual_add_norm.cpp",
@@ -18400,7 +18850,10 @@
    "evidence": "src/ops/wrapper/residual_add.cpp:45 -- no overlap check, while include/ninfer/ops/residual_add.h:14 documents \"y and x are non-overlapping\"",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "residual_add.h:14 documents y/x as non-overlapping but nothing enforces it: add the byte-range overlaps() guard used at linear_add.cpp:164 (behaviour: new throw) or keep the precondition on callers."
   },
   "1045": {
    "path": "src/ops/wrapper/gdn_input_proj.cpp",
@@ -18716,7 +19169,10 @@
    "evidence": "src/ops/wrapper/scale_columns.cpp:19 -- `throw std::invalid_argument(std::string(\"scale_columns: \") + label +`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <string>; std::string is built in numel_allow_zero.",
+   "s_resolution": "FIXED"
   },
   "1063": {
    "path": "src/ops/wrapper/scale_columns.cpp",
@@ -19133,7 +19589,10 @@
    "evidence": "src/ops/wrapper/dense_kv_ring.cpp:15 -- `constexpr std::int32_t kHeadDim = 256;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "kHeadDim is now ninfer::kD256KVCacheHeadDim (core/paged_kv_storage.h:12, already included): same value, same type, no other occurrence of the literal; TU compiles.",
+   "s_resolution": "FIXED"
   },
   "1087": {
    "path": "src/ops/wrapper/causal_conv1d_silu.cpp",
@@ -19194,8 +19653,8 @@
    "line": "10-10",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -19203,7 +19662,10 @@
    "evidence": "src/ops/wrapper/compact_kv_rows.cpp:16 -- `throw std::invalid_argument(std::string(\"compact_kv_rows: \") + label +`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <string>; std::string is built in numel_allow_zero.",
+   "s_resolution": "FIXED"
   },
   "1091": {
    "path": "src/ops/wrapper/prepare_ragged_prefix.cpp",
@@ -19403,7 +19865,10 @@
    "evidence": "src/product/prompt_input/prompt_input.h:5-6 -- `#include <filesystem>` / `#include <string>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <optional>; both declarations take std::optional<bool> (:13, :17) while the header included only <filesystem>/<string>.",
+   "s_resolution": "FIXED"
   },
   "1102": {
    "path": "src/product/prompt_input/prompt_input.h",
@@ -19556,8 +20021,8 @@
    "line": "59-60",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -19565,7 +20030,10 @@
    "evidence": "src/runtime/engine/context_cache/context_cost.h:59 -- `std::array<ContextTransferCost, 3> transfer{};`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added a static_assert pinning kContextTransferDirectionCount (already defined at resources.h:234) to ContextTransferDirection's last enumerator and replaced all three bare `, 3>` transfer extents with that constant, so a reordered or extended enum is a compile error instead of a silent mispricing.",
+   "s_resolution": "FIXED"
   },
   "1111": {
    "path": "src/runtime/engine/context_cache/context_cost.h",
@@ -19833,7 +20301,10 @@
    "evidence": "src/runtime/contract/execution.h:3-6 -- `#include \"runtime/contract/request.h\"` / `#include \"runtime/contract/timing.h\"` / `#include <compare>` / `#include <span>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<optional>; the header names std::size_t (TokenMaskProvider), std::uint32_t/uint8_t and std::int32_t (CommitDecision, ConsumeStatus, BatchedGeneratedRound) and std::optional (CommitDecision) with no direct include.",
+   "s_resolution": "FIXED"
   },
   "1126": {
    "path": "src/runtime/contract/execution.h",
@@ -19867,7 +20338,10 @@
    "evidence": "src/runtime/engine/scheduler.h:285 -- `const std::uint32_t lanes = std::min<std::uint32_t>(max_concurrency, kMaximumConcurrency);` with an include list (:7-19) that has no <algorithm>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <algorithm>; all four std::min<std::uint32_t> uses (:151, :181, :213, :288) had no direct include.",
+   "s_resolution": "FIXED"
   },
   "1128": {
    "path": "src/runtime/engine/scheduler.h",
@@ -19921,7 +20395,10 @@
    "evidence": "src/serve/generation_service.h:10-17 -- `#include <chrono>` ... `#include <cstdint>` (no <span> or <string_view>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <span>/<string_view> for request_error_to_api_error (:131). Left <chrono>/<cstddef> in place: every chrono-using consumer includes <chrono> itself, but the transitive std::size_t path reaches 13 includers, so the removals could not be cleared (asymmetry rule).",
+   "s_resolution": "FIXED"
   },
   "1131": {
    "path": "src/serve/generation_service.h",
@@ -20029,7 +20506,10 @@
    "evidence": "src/serve/anthropic_messages.h:11-12 -- `#include \"serve/request.h\"` / `#include \"serve/request_json.h\"` (no <ninfer/types.h>)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added \"ninfer/types.h\"; ninfer::GenerationStart is named in the public start() declaration (:75) and only arrived via serve/request.h.",
+   "s_resolution": "FIXED"
   },
   "1137": {
    "path": "src/runtime/engine/engine.cpp",
@@ -20061,7 +20541,10 @@
    "evidence": "src/runtime/engine/engine.cpp:15-16 -- `#include <algorithm>` / `#include <limits>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Dropped <algorithm>/<limits> (no std::sort/find/min/max/transform or numeric_limits in the TU) and added <memory>, which unique_ptr/make_unique/shared_ptr use throughout (:82-463).",
+   "s_resolution": "FIXED"
   },
   "1139": {
    "path": "src/runtime/engine/generation_budget.h",
@@ -20130,7 +20613,10 @@
    "evidence": "src/runtime/contract/sampling.cpp:18 -- `if (sampling.top_k < 1 || sampling.top_k > 20) {` and again at :52 `if (resolved.top_k == 0) { resolved.top_k = 20; }`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "One TU-local `kResolvedTopKCap = 20` now drives both the [1,cap] bound (:22) and the zero\u2192cap resolution (:56). Not wired to ops::kSamplerCandidateCap because that header pulls cuda_runtime.h into a runtime/contract TU; the exception text is unchanged.",
+   "s_resolution": "FIXED"
   },
   "1143": {
    "path": "src/runtime/contract/sampling.cpp",
@@ -20199,7 +20685,10 @@
    "evidence": "src/runtime/engine/gemma_instance.h:238 -- `if (row >= row_count_) throw std::out_of_range(\"pending row out of range\");`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<stdexcept>/<utility> for std::size_t (row_count, kMaximumRowStride), std::out_of_range (:241) and std::move (:156).",
+   "s_resolution": "FIXED"
   },
   "1147": {
    "path": "src/product/speculative_options.h",
@@ -20329,8 +20818,8 @@
    "line": "8-12",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -20338,7 +20827,10 @@
    "evidence": "src/runtime/engine/model_instance.cpp:10 -- `#include <chrono>` with no <optional>/<string>/<cstdint>/<limits> above :92 `std::set<std::string> formats;`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<limits>/<optional>/<string>/<vector>; all are used directly (:69 size_t, :133 numeric_limits, :200 optional, :242 std::set<std::string>).",
+   "s_resolution": "FIXED"
   },
   "1155": {
    "path": "src/runtime/engine/model_instance.cpp",
@@ -20388,7 +20880,10 @@
    "evidence": "src/runtime/contract/timing.h:13 -- `struct ExecutionTiming {` (ResolvedRequestOptions is in request.h:19)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added the owning headers runtime/contract/request.h (ResolvedRequestOptions, :123) and runtime/contract/timing.h (ExecutionTiming, :63), both previously transitive through execution.h.",
+   "s_resolution": "FIXED"
   },
   "1158": {
    "path": "src/runtime/engine/request_record.h",
@@ -20840,7 +21335,10 @@
    "evidence": "src/runtime/engine/gemma_instance.cpp:8 -- `#include <cstdio>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed <cstdio>; the TU has no printf-family, FILE or stdio use.",
+   "s_resolution": "FIXED"
   },
   "1183": {
    "path": "src/runtime/engine/context_cache/materialization_planner.h",
@@ -21015,7 +21513,10 @@
    "evidence": "src/text/unicode.h:12 -- `std::size_t offset = 0;` in CodepointSpan, with includes <cstdint>/<string>/<string_view>/<vector> and no <cstddef>",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>; the header uses std::size_t in the CodepointSpan members (:13-14) and in the declarations below (:18) with only <cstdint>/<string>/<string_view>/<vector> included.",
+   "s_resolution": "FIXED"
   },
   "1193": {
    "path": "src/text/schema_composition.h",
@@ -21050,7 +21551,10 @@
    "evidence": "src/serve/translate.h:9 -- `#include <functional>` with `std::optional<bool> enable_thinking;` (line 19) and `std::string chat_template_kwargs_json;`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <optional>/<string> for ResolvedPromptSemantics (:21 enum-think/reasoning/preserve, :24 chat_template_kwargs_json).",
+   "s_resolution": "FIXED"
   },
   "1195": {
    "path": "src/serve/translate.h",
@@ -21248,8 +21752,8 @@
    "line": "7-7",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "n/a",
@@ -21257,15 +21761,18 @@
    "evidence": "src/serve/serve_options.h:25 -- `std::filesystem::path chat_template_path;` with no `<filesystem>` include; include/ninfer/types.h:6 -- `#include <filesystem>`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <filesystem>; std::filesystem::path appears at :26 and :42.",
+   "s_resolution": "FIXED"
   },
   "1207": {
    "path": "src/serve/serve_options.h",
    "line": "32-33",
    "category": "maintainability",
    "severity": "medium",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "n/a",
@@ -21273,7 +21780,10 @@
    "evidence": "src/serve/serve_options.h:32-33 -- `std::uint32_t max_context          = 8192;` / `KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "kv_capacity's default now derives from max_context (matching serve_options.cpp:447, which derives it the same way), removing the duplicated 8192. default_max_tokens stays on kDefaultMaxTokens: it is the protocol output-token cap, not the context window, and tying them would move max_context whenever that cap changes.",
+   "s_resolution": "FIXED"
   },
   "1208": {
    "path": "src/serve/request_log.h",
@@ -21298,8 +21808,8 @@
    "line": "5-6",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -21307,7 +21817,10 @@
    "evidence": "src/serve/openai_common.h:34 -- `std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata);` with includes limited to serve/request.h, serve/request_json.h, nlohmann/json.hpp",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added \"ninfer/types.h\"; make_models_list/make_model_object take `const ninfer::ModelMetadata&` (:34) and only got the type via serve/request.h.",
+   "s_resolution": "FIXED"
   },
   "1210": {
    "path": "src/serve/openai_common.h",
@@ -21482,7 +21995,10 @@
    "evidence": "src/serve/openai_chat.h:52 -- `void note_start(const ninfer::GenerationStart& start);` with only `struct GenerationOutcome;` forward-declared (line 18)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added \"ninfer/types.h\"; GenerationStart/PromptProgress/GenerationTimingObservation were undeclared here (:62/:64/:65) while GenerationOutcome was forward-declared (:18).",
+   "s_resolution": "FIXED"
   },
   "1220": {
    "path": "src/serve/openai_chat.h",
@@ -21670,8 +22186,8 @@
    "line": "38-38",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -21679,7 +22195,10 @@
    "evidence": "src/serve/request.h:38 -- `: std::runtime_error(error.message), error_(std::move(error)) {}`",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <utility> for std::move in ApiException's constructor (:39).",
+   "s_resolution": "FIXED"
   },
   "1231": {
    "path": "src/serve/http_transport.h",
@@ -21695,7 +22214,10 @@
    "evidence": "src/serve/http_transport.h:63 -- \"httplib::DataSink& sink_;\" and \"std::atomic<bool>& cancelled_;\"",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": false,
+   "s_resolution": "POLICY",
+   "policy_note": "Deleting copy/move changes the class's public signature, so the direction is the owner's: delete both (optionally documenting that sink_/cancelled_ must outlive the transport) or leave it as today \u2014 nothing in-tree copies it (http_transport.cpp:140 and tests/test_http_transport.cpp:46/83 construct in place) and copy *assignment* is already implicitly deleted by the reference members, so only the copy constructor is generated."
   },
   "1232": {
    "path": "src/serve/http_transport.h",
@@ -22090,7 +22612,10 @@
    "evidence": "src/serve/openai_responses_state.cpp:11 -- `#include <unordered_set>`",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed <unordered_set>; the TU only uses std::unordered_map (:44, :45 in normalize_call_graph).",
+   "s_resolution": "FIXED"
   },
   "1254": {
    "path": "src/serve/openai_responses.h",
@@ -22237,8 +22762,8 @@
    "line": "7-10",
    "category": "maintainability",
    "severity": "low",
-   "verdict": "maybe",
-   "priority": "M",
+   "verdict": "true",
+   "priority": "P3",
    "kind": "style",
    "impact": "",
    "reach": "",
@@ -22246,7 +22771,10 @@
    "evidence": "src/text/jinja.cpp:7 -- \"#include <algorithm>\" (with exception/stdexcept/unordered_map; no <cstddef>/<cstdint>/<memory>/<string>)",
    "source": "batch",
    "agent_verdict": "maybe",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstddef>/<cstdint>/<memory>/<string> for std::size_t (:48), INT64_MAX/std::uint64_t (:43), std::make_shared (:92) and std::string (:25); none were included directly.",
+   "s_resolution": "FIXED"
   },
   "1263": {
    "path": "src/serve/openai_responses_response.cpp",
@@ -22369,7 +22897,10 @@
    "evidence": "src/serve/openai_chat_request.cpp:10 -- `#include <string_view>`; grepping the file for `string_view` returns only that include line",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Removed <string_view>; the TU never names std::string_view, and the include was the only occurrence.",
+   "s_resolution": "FIXED"
   },
   "1270": {
    "path": "src/text/json_input.cpp",
@@ -22513,7 +23044,10 @@
    "evidence": "src/serve/openai_common.cpp:6-11 -- includes are `<chrono> <format> <random> <vector> <string_view> <utility>` (no `<string>`, no `<cstdint>`)",
    "source": "batch",
    "agent_verdict": "true",
-   "dupe_of": []
+   "dupe_of": [],
+   "fixed": true,
+   "fixed_note": "Added <cstdint> and <string>; std::int64_t/:34 and std::uint64_t/:24 and std::string (:19 chat_identifier) are used directly, and the block was put back in sorted order.",
+   "s_resolution": "FIXED"
   },
   "1278": {
    "path": "src/text/grammar.cpp",
