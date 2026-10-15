@@ -27,7 +27,7 @@ this repository's own quantization routes, with the
 |---|---|---|
 | `hidden_size` | 4096 | |
 | `vocab_size` | 131072 | untied head; the draft shares it |
-| attention | 32 heads, 2 KV heads, `head_dim` 128, no bias | plain GQA, RoPE, no sinks or window |
+| attention | 32 heads, 2 KV heads, `head_dim` 128, no bias | plain GQA with **no positional encoding at all** — not RoPE, in any variant; see the note under the reuse survey |
 | mamba | 128 heads × head_dim 64 = 8192 inner, `conv_kernel` 4, `n_groups` 8, `ssm_state_size` 128, `chunk_size` 128 | `conv_dim = 8192 + 2·8·128 = 10240`, `in_proj` out = `2·8192 + 10240 + 128 = 18560` |
 | `use_conv_bias` | **true** | the depthwise conv has a bias even though `use_bias` is false |
 | `time_step_min` / `_max` | 0.001 / 0.1 | **only the minimum clamps**; the reference's maximum clamp is commented out and `time_step_limit` is unused on the torch path |
@@ -112,7 +112,7 @@ scaling, no other state.
    a NemotronH difference from Mixtral/DeepSeek.
 5. The **shared expert is computed on the pre-latent residual** and added after the round trip.
 
-**Attention** (`:860`). Plain GQA with `rotate_half` RoPE, causal, no bias, no sinks, no window.
+**Attention** (`:860`). Plain GQA, causal, no bias, no sinks, no window — and **no positional encoding**, which is the one thing the reference's own code invites you to get wrong: `NemotronHAttention` is decorated with `@use_kernelized_func(apply_rotary_pos_emb)` at `:859` and **never calls it**, and its `forward` takes no `position_embeddings`. Four things agree that the rotation is absent rather than merely unwired: the checkpoint's own `modeling_nemotron_h.py` mentions rotary nowhere, llama.cpp's `nemotron-h.cpp` has no rope at all, `NemotronHConfig` has no `rope_theta`, and the dump settles it numerically — an FP64 attend-only oracle over the dumped q/k/v reproduces the dumped `o_proj` and `mixer.0` to 1.4e-7, where any rotation gives about 6e-3. So the composition calls no rope Op, and there is nothing to port there.
 
 ## What this costs
 
@@ -284,3 +284,14 @@ the operands an op consumes as well as its outputs, which every remaining op nee
 
 Remaining: the non-gated experts and the latent round trip (a new latent-MoE op), attention (largely
 reuse), the block and the 88-block forward, the converter, the host-offload cache work, and then the draft.
+
+Two caveats of the tiny oracle belong beside its results, because both are adaptors rather than production
+behaviour. The scan's state axis is zero-padded from 8 to 128 and `sliding_causal_attention` runs at
+`head_dim` 32 with the model's own `scale` passed in — both because the landed Ops encode production
+geometry, both inert for a stated reason rather than by luck (`mamba2_scan` takes no scale argument at all,
+and the attention Op takes `scale` as an argument rather than baking `1/sqrt(head_dim)`). The real model is
+inside both domains: state 128 and head 128. The projection routes the family needs, in BF16 today and in
+Q8/Q6 for the artifact route, are in_proj (18560, 4096), out_proj (4096, 8192), q and o (4096, 4096), k and
+v (256, 4096), the router (up to 496, 4096), fc1 (1024, 4096), fc2 (4096, 1024), the shared expert's up and
+down (5376, 4096) and (4096, 5376), and the head (131072, 4096) — none of which the registry carries, since
+no registered pair has k = 4096 or k = 1024.
