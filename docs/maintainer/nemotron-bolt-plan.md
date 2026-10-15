@@ -159,5 +159,17 @@ already opaque.
   arena, the state images and the OS. Flash-Next's guide asks for about 65 GiB for a larger model; this
   one sits under that only because the model is smaller. Reducing the pinned set, or a smaller expert
   route, is the escape if it does not fit — neither is needed to start.
+- **The state's key/value index is ambiguous, and both extents are 128 today**, so a swap would be
+  silent: `LinearAttentionStatePool` plans `ne[0] = key_head_dim` while the GDN and KDA kernels index
+  the state as `value * kStateDim + key`. Mamba-2's 128 (state size) against 64 (head_dim) makes it a
+  real decision, so a test has to pin the layout rather than a comment.
+- **The readout scale is locked** in the linear-attention ops: `scale = 1/sqrt(128)` is required to
+  within 1e-6. Mamba-2's readout is unscaled, so that lock has to be lifted for the new instantiation.
+- **`D*x` has no home yet.** It is added before the gated norm, and no op in this tree applies a
+  per-head scalar over `ne[1]`, so it belongs in the scan epilogue rather than being composed — and it
+  cannot be left to the norm to absorb.
+- **The scan's chunk size need not be the config's 128.** Chunked SSD is chunk-size invariant in exact
+  arithmetic, so keeping the existing 16 is a tolerance decision against the reference dump, not a
+  correctness one.
 - Vision (RADIO/InternVL tower, projector 20480, video) and MTP (`num_nextn_predict_layers` is 0 in this
   release) are out of phase 1.
