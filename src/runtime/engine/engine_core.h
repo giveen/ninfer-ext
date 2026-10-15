@@ -974,6 +974,19 @@ private:
         }
     }
 
+    // Settle a request whose slot is already released. The failure sweep only reaches requests that
+    // are still in `slots_`, so a throw here must complete the request with its error anyway: the
+    // consumer is parked in wait_for_request() with no deadline and would otherwise never wake.
+    void complete_released(const std::shared_ptr<Request>& request, FinishReason reason) {
+        try {
+            complete_success(request, reason);
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            complete_error(request, error);
+            throw;
+        }
+    }
+
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
         if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
@@ -1035,7 +1048,7 @@ private:
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
             publish_runtime_stats();
-            complete_success(request, reason);
+            complete_released(request, reason);
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1066,7 +1079,7 @@ private:
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
             publish_runtime_stats();
-            complete_success(request, FinishReason::Cancelled);
+            complete_released(request, FinishReason::Cancelled);
             boundary = begin_host_phase();
         }
     }

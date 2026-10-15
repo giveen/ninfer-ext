@@ -21,6 +21,8 @@ constexpr std::int32_t kMaxExperts = 256; // eight logits a lane in the selectio
 // A contiguous 2-D tensor: the leading two extents carry the shape and the trailing two are one.
 void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t columns,
                     const char* label) {
+    if (tensor.data == nullptr) { fail(std::string(label) + " must be bound"); }
+    if (!tensor.is_contiguous()) { fail(std::string(label) + " must be contiguous"); }
     if (tensor.ne[0] != rows || tensor.ne[1] != columns || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
         fail(std::string(label) + " must be a contiguous matrix of the geometry's shape");
     }

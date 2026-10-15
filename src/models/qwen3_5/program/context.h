@@ -1,5 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/round_buffers.h"
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
@@ -138,7 +139,12 @@ struct DFlashAppendContext {
 struct MtpCausalAttentionEnvelopes {
     ops::CausalAttentionExecutionEnvelope target_verify;
     ops::CausalAttentionExecutionEnvelope batch;
-    std::array<ops::CausalAttentionExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+    // One envelope per drafted step of the widest round the machinery carries. The MTP layer drafts
+    // at most kMaximumMtpDraftTokens tokens, but a prompt-lookup round is verified at the suffix
+    // index's width and EAGLE3 drafts wider as well, and both walk every step of the widest rung;
+    // so the array is sized for kLookupDecodeMaximumDrafts rather than for the MTP layer's domain.
+    // mtp_causal_attention_envelopes() rejects a round above that bound.
+    std::array<ops::CausalAttentionExecutionEnvelope, kLookupDecodeMaximumDrafts - 1> ar;
 };
 
 struct DFlashEnvelopes {

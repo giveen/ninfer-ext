@@ -359,7 +359,9 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     }
     if (state.in_reasoning) {
         // A close marker still pending at the end of the turn is the model's implicit close.
-        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true);
+        // Use the same close marker the running feed uses: it differs under exact framing.
+        const std::string_view close_marker = reasoning_close_marker(state.exact_reasoning_framing);
+        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true, close_marker, state.exact_reasoning_framing);
         const std::size_t split =
             scan.close != std::string::npos ? scan.close : state.think_marker_pending.size();
         feed_channel(state, OutputChannel::Reasoning,
@@ -368,10 +370,10 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         close_channel(state, OutputChannel::Reasoning, emitted);
         if (scan.close != std::string::npos) {
             std::string content =
-                state.think_marker_pending.substr(scan.close + kThinkClose.size());
+                state.think_marker_pending.substr(scan.close + close_marker.size());
             state.think_marker_pending.clear();
             state.in_reasoning          = false;
-            state.strip_content_leading = true;
+            state.strip_content_leading = !state.exact_reasoning_framing;
             feed_content(state, std::move(content), policy, emitted, committed_tokens, nullptr);
         } else {
             state.think_marker_pending.clear();

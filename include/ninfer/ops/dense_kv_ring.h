@@ -37,8 +37,9 @@ namespace ninfer::ops {
  * `keys[:, h, i]` and `values[:, h, i]` are written at slot `slots[i]`; no other slot's entry is
  * read or written, and the inputs are unchanged. The caller guarantees every `slots[i]` is in
  * [0,S), that the four planes never alias the inputs or each other, and that a row's plane
- * addresses are 2-byte aligned (the FP16 scale planes). The Op owns no workspace and no persistent
- * state.
+ * addresses are 2-byte aligned (the FP16 scale planes), and that the `slots[i]` of one call are
+ * distinct: two tokens addressing one slot would have two warps write the same row in an
+ * indeterminate order. The Op owns no workspace and no persistent state.
  */
 void dense_kv_ring_encode(const Tensor& keys, const Tensor& values, const Tensor& slots,
                           KvCacheStorage storage, Tensor& key_codes, Tensor& key_scales,

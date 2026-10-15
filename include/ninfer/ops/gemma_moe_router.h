@@ -36,7 +36,7 @@ namespace ninfer::ops {
  *   router_scale   BF16 [H], one per hidden index, as a tensor.
  *   per_expert_scale BF16 [E], as a tensor.
  *   W_router       BF16 Weight [E,H].
- *   expert_ids     contiguous I32 [K,T]  (rank fastest axis), fully overwritten.
+ *   expert_ids     contiguous I32 [K,T]  (row-major, token fastest axis), fully overwritten.
  *   expert_weights contiguous FP32 [K,T], fully overwritten.
  *
  * Supported domain:

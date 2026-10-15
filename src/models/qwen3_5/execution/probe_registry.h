@@ -24,6 +24,12 @@ inline std::vector<ProbeTarget>& probe_targets() {
     return targets;
 }
 
+// Drop every recorded target. Preparation is the only writer, so a new preparation starts from an
+// empty registry: otherwise a stale address can read storage a destroyed model freed, or a target
+// that happens to reuse one is silently skipped by register_probe_target's address check.
+inline void clear_probe_targets() { probe_targets().clear();
+}
+
 // Records one prepared EXL3 projection. A no-op for every other format, and for a repeat of a plane
 // already recorded (preparation visits some parameters more than once).
 inline void register_probe_target(const std::string& name, const Weight& weight) {

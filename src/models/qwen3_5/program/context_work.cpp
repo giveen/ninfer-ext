@@ -297,6 +297,10 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
                                                                       std::uint32_t k,
                                                                       std::uint32_t capacity) {
+    if (k == 0 || k > kLookupDecodeMaximumDrafts) {
+        throw std::invalid_argument("MTP attention envelopes require a round width of at most " +
+                                    std::to_string(kLookupDecodeMaximumDrafts));
+    }
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };

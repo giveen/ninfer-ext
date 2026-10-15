@@ -75,9 +75,17 @@ void test_options() {
            "--list did not select the listing mode");
     const app::QuantizeOptions experts =
         parse({"ninfer-quantize", "m.ninfer", "--out", "o", "--hessians", "h", "--experts-only",
-               "--only", "text/layers/0/", "--calibrate-only"});
-    expect(experts.experts_only && experts.calibrate_only && experts.only == "text/layers/0/",
-           "--experts-only, --only and --calibrate-only were not parsed");
+               "--only", "text/layers/0/", "--calibrate-only", "--trace", "t", "--activation-model", "a"});
+    expect(experts.experts_only && experts.calibrate_only && experts.only == "text/layers/0/" &&
+               experts.trace == "t" && experts.activation_model == "a",
+           "--experts-only, --only, --calibrate-only and the calibration inputs were not parsed");
+    expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse({"ninfer-quantize", "m.ninfer", "--out", "o", "--hessians", "h",
+                         "--calibrate-only"});
+        },
+        "--calibrate-only without --trace was accepted, which would exit successfully having "
+        "written nothing");
     expect(parse({"ninfer-quantize", "--help"}).help, "--help did not select help");
     expect_throws<std::invalid_argument>(
         [] { (void)parse({"ninfer-quantize", "m.ninfer", "--hessians", "h"}); },

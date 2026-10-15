@@ -944,10 +944,23 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                 !sequence.rewrite_checkpoint.valid) {
                 throw std::logic_error("recycled rewrite metadata changed before publication");
             }
+            // Book the recycled checkpoint by its actual residency and add it to the shared
+            // replacement's removal: assigning 1 here would overwrite that count (the invariant
+            // compares against private+shared) and would lose a Host-only replica entirely.
+            const StateReplicaResidency recycled_residency =
+                state_store->residency(*sequence.rewrite_state);
             sequence.rewrite_state.reset();
             sequence.rewrite_checkpoint        = {};
             sequence.rewrite_checkpoint_hidden = {};
-            removed.device.state_slots         = 1;
+            if (recycled_residency == StateReplicaResidency::DeviceOnly ||
+                recycled_residency == StateReplicaResidency::Both) {
+                ++
+            removed.device.state_slots;
+            }
+            if (recycled_residency         == StateReplicaResidency::HostOnly ||
+                recycled_residency == StateReplicaResidency::Both) {
+                ++removed.host.state_slots;
+            }
         }
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,

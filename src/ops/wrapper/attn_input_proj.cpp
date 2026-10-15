@@ -73,6 +73,26 @@ void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32
     }
 }
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+// Contract: the input and the four outputs are mutually non-overlapping.
+void require_mutual_nonoverlap(const Tensor& x, const Tensor& q, const Tensor& gate,
+                               const Tensor& k, const Tensor& v) {
+    const Tensor* const tensors[5] = {&x, &q, &gate, &k, &v};
+    for (int lhs = 0; lhs < 5; ++lhs) {
+        for (int rhs = lhs + 1; rhs < 5; ++rhs) {
+            if (overlaps(*tensors[lhs], *tensors[rhs])) {
+                throw std::invalid_argument(
+                    "attn_input_proj: x, q, gate, k and v must not overlap");
+            }
+        }
+    }
+}
+
 void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
@@ -88,6 +108,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
+    // Contract: the input and the four outputs are mutually non-overlapping.
+    require_mutual_nonoverlap(x, q, gate, k, v);
     if (weight.qtype == QType::EXL3_MUL1) {
         // One parent holds query, key, gate and value in that row order.
         constexpr std::int32_t kHidden = 5120;
@@ -257,6 +279,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
+    require_mutual_nonoverlap(x, q, gate, k, v);
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);

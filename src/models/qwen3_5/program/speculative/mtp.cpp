@@ -70,8 +70,12 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpCausalAttentionEnvelopes envelopes, bool lookup_only) {
     return [&state, batch_size, k, envelopes, lookup_only] {
+        // A lookup round substitutes the suffix index's drafts for the MTP layer's own, so only
+        // then may the round be wider than the tokens the MTP layer drafts.
+        const std::uint32_t maximum_drafts =
+            lookup_only ? kLookupDecodeMaximumDrafts : kMaximumMtpDraftTokens;
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kLookupDecodeMaximumDrafts) {
+            k == 0 || k > maximum_drafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
 

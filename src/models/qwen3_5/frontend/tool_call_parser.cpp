@@ -251,7 +251,11 @@ bool admits_value(TypeSet types, JsonValueKind kind) {
     return false;
 }
 
-std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(); }
+// Tool-call arguments are model output, so a value can carry bytes that are not valid UTF-8. A
+// strict dump would throw out of the recovery path that exists for malformed calls and fail the
+// whole request; the replacement handler keeps the emitted JSON well formed instead.
+
+std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(-1, ' ', false, Json::error_handler_t::replace); }
 
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);

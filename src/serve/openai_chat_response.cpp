@@ -412,7 +412,7 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings));
     } else {
-        events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
+        events.push_back(chunk(identity_, Json::object(), finish_reason(outcome),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings));
     }
     if (include_usage_) {

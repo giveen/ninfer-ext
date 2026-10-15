@@ -35,6 +35,11 @@ using LogitsSink = std::function<void(const ScoredLogits&)>;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+// The speculative round machinery's draft domain: `mtp_prepare_next_round` accepts a verified frame
+// of at most this many drafts plus one, and the MTP layer drafts at most this many tokens. A
+// prompt-lookup round skips those draft phases and may be wider, but EAGLE3 has no such mode, so
+// this is its window too. Host-visible because the CLI and bench validate the option without CUDA.
+inline constexpr std::int32_t kMtpRoundMaximumDrafts = 7;
 // Explicit markers plus the engine's automatic tool/leading-instruction/full-prompt candidates;
 // one request's shared-prefix opportunities never exceed this (frontend.cpp opportunities.reserve).
 inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;

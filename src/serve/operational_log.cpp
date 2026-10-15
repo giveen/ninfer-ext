@@ -565,4 +565,8 @@ void OperationalLog::server_failure(bool serving, std::string_view detail) const
                       product::format_pretty_text(detail));
 }
 
+void OperationalLog::stats_failure(std::string_view detail) const {
+    logger_->error("stats reporter failed | {}", product::format_pretty_text(detail));
+}
+
 } // namespace ninfer::serve

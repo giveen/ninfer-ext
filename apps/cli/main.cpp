@@ -169,7 +169,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
     }
     print_metric("model elapsed", format_seconds(model_seconds));
-    print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
+    // The rate covers prefill work actually done: a reused prefix is not prefilled, and the
+    // project's own throughput record subtracts the same reuse before dividing.
+    const std::uint64_t prefilled = result.prompt.prompt_tokens > result.reused_prompt_tokens
+                                        ? result.prompt.prompt_tokens - result.reused_prompt_tokens
+                                        : 0;
+    print_metric("prefill speed", format_rate(static_cast<double>(prefilled),
                                               result.timings.prefill_seconds));
     print_metric("decode speed",
                  format_rate(static_cast<double>(decoded), result.timings.decode_seconds));

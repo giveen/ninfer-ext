@@ -519,6 +519,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                    ? RequestErrorKind::MediaBudgetExceeded
                                    : RequestErrorKind::InvalidMedia,
                                std::string("image: ") + error.what());
+        } catch (const RequestError&) {
+            // RequestError derives from std::invalid_argument, so the handler below would relabel a
+            // cancellation, deadline or queue timeout as invalid media. Its kind and message stand.
+            throw;
         } catch (const std::invalid_argument& error) {
             throw RequestError(RequestErrorKind::InvalidMedia,
                                std::string("image: ") + error.what());

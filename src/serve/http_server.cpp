@@ -322,6 +322,8 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
+        try {
+
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
@@ -332,7 +334,16 @@ void HttpServer::run_stats_reporter() {
         next_deadline += interval;
         const Clock::time_point after_write = Clock::now();
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
+    } catch (const std::exception& error) {
+            // A failed stats or log write must not escape this thread (the entry point would call
+            // std::terminate and abort the server). Report it and keep the cadence: without moving
+            // the deadline a persistent failure would spin.
+            operational_log_.stats_failure(error.what());
+            next_deadline = Clock::now() + interval;
+        }
     }
+
+    try {
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
@@ -341,6 +352,7 @@ void HttpServer::run_stats_reporter() {
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
     if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }
+    } catch (const std::exception& error) { operational_log_.stats_failure(error.what()); }
 }
 
 void HttpServer::stop_stats_reporter() {

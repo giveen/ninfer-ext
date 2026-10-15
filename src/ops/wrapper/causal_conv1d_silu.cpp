@@ -235,6 +235,30 @@ void require_split_nonoverlap(const Tensor& x, const Tensor& weight, const Tenso
     }
 }
 
+// The snapshot entry mutates conv_states in place and reads the state selectors, so no other
+// operand may share storage with it or with out.
+void require_snapshot_nonoverlap(const Tensor& x, const Tensor& weight, const Tensor& conv_states,
+                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, const Tensor& out) {
+    const Tensor* const written[2] = {&out, &conv_states};
+    const Tensor* const others[5]  = {&x, &weight, &valid_columns, &initial_state_slots,
+                                      &snapshot_base_slots};
+    for (const Tensor* target : written) {
+        if (target->data == nullptr) { continue; }
+        for (const Tensor* other : others) {
+            if (other->data == nullptr) { continue; }
+            if (overlaps(*target, *other)) {
+                throw std::invalid_argument(
+                    "causal_conv1d: out and conv_states must not overlap x, weight, or the state "
+                    "selectors");
+            }
+        }
+    }
+    if (out.data != nullptr && conv_states.data != nullptr && overlaps(out, conv_states)) {
+        throw std::invalid_argument("causal_conv1d: out must not overlap conv_states");
+    }
+}
+
 } // namespace
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
@@ -374,6 +398,8 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     if (masked) { require_metadata_accessible(valid_columns, "valid_columns"); }
     require_metadata_accessible(initial_state_slots, "initial_state_slots");
     require_metadata_accessible(snapshot_base_slots, "snapshot_base_slots");
+    require_snapshot_nonoverlap(x, weight, conv_states, valid_columns, initial_state_slots,
+                                snapshot_base_slots, out);
     detail::causal_conv1d_snapshot_launch(x, weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, out, stream);
 }

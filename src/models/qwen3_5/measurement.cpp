@@ -35,6 +35,12 @@ std::string prefill_signature(const Model& model) {
         facts["gdn"]  = {g.linear_num_key_heads, g.linear_key_head_dim, g.linear_num_value_heads,
                          g.linear_value_head_dim, g.linear_conv_kernel_dim};
     }
+    if (t.sparse_attention) {
+        // The indexer's budget and block ratio change how many key blocks a query attends, which is
+        // prefill work no weight shape records.
+        const auto& q             = *t.sparse_attention;
+        facts["sparse_attention"] = {q.budget, q.compress_ratio};
+    }
     if (const auto* d = std::get_if<DenseConfig>(&t.ffn)) {
         facts["ffn"] = {d->intermediate_size};
     } else {
@@ -64,6 +70,14 @@ std::string prefill_signature(const Model& model) {
                   {"shape", weight->view.shape},
                   {"parts", Json::array()},
                   {"uses", Json::array()}};
+        if (weight->view.parts.empty() && !weight->mapped.empty()) {
+            // A file-mapped weight keeps its geometry beside the view instead of in parts, so
+            // without this the signature would see only the shape and two artifacts differing in
+            // this weight's quantization would hash alike.
+            const auto& geometry = weight->mapped_geometry;
+            item["mapped"] = {geometry.format,         geometry.layout,     geometry.shape,
+                              geometry.padded_columns, geometry.group_size, weight->mapped.size()};
+        }
         for (const auto& part : weight->view.parts) {
             const auto [it, inserted] = parents.emplace(part.parent, parents.size());
             const auto& geometry      = part.parent->geometry;

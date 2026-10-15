@@ -531,6 +531,13 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
                           "assistant_prefill_not_supported",
                       "Thinking-on assistant prefill was not rejected at capability resolution");
+    // A server that sets no thinking default leaves the flag unspecified, which the template
+    // renders as Thinking on: the prefill must still be refused.
+    failures += check(api_code([&] {
+                          ServeOptions options;
+                          (void)resolve_prompt_semantics(parse(body).generation, options);
+                      }) == "assistant_prefill_not_supported",
+                      "prefill with an unspecified thinking default was not rejected");
     return failures;
 }
 

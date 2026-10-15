@@ -172,6 +172,17 @@ int main() {
     failures += check(eagle3_chain.speculative.backend == ninfer::SpeculativeBackend::Eagle3 &&
                           eagle3_chain.speculative.tree_width == 1,
                       "EAGLE3 did not default to a draft chain");
+    // EAGLE3 has no prompt-lookup mode, so every round runs the MTP draft phases and its window is
+    // bounded by the round op's domain rather than by the lookup frame's width.
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "eagle3", "--draft-tokens", "8"});
+                      }),
+                      "CLI accepted an EAGLE3 draft window above the round op's domain");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "eagle3",
+                             "--draft-tokens", "7"})
+                              .speculative.draft_tokens == 7,
+                      "CLI rejected the widest EAGLE3 draft window the round op accepts");
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                        "mtp", "--draft-tokens", "3", "--draft-tree", "2"});

@@ -111,12 +111,12 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
         checked_mul(static_cast<std::uint64_t>(h), static_cast<std::uint64_t>(w), "video area"),
         "video pixels");
     if (volume > max_pixels) {
-        const double beta = std::sqrt(static_cast<double>(frames) * height * width / max_pixels);
+        const double beta = std::sqrt(static_cast<double>(padded_frames) * height * width / max_pixels);
         h = std::max(kFactor, static_cast<int>(std::floor(height / beta / kFactor)) * kFactor);
         w = std::max(kFactor, static_cast<int>(std::floor(width / beta / kFactor)) * kFactor);
     } else if (volume < min_pixels) {
         const double beta = std::sqrt(static_cast<double>(min_pixels) /
-                                      (static_cast<double>(frames) * height * width));
+                                      (static_cast<double>(padded_frames) * height * width));
         h                 = static_cast<int>(std::ceil(height * beta / kFactor)) * kFactor;
         w                 = static_cast<int>(std::ceil(width * beta / kFactor)) * kFactor;
     }

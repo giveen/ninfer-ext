@@ -974,6 +974,52 @@ int test_leading_instruction_shared_prefix() {
     return failures;
 }
 
+int test_explicit_markers_outrank_automatic_candidates() {
+    int failures = 0;
+    // Four client breakpoints fill every marker slot while the leading instruction run stays
+    // unmarked, which is exactly when the policy wants to add its own system-frontier candidate.
+    // The client's boundaries are a contract and that candidate is a reclaimable heuristic, so the
+    // heuristic must yield: resetting a client boundary would silently keep the shortest reusable
+    // prefix instead of the ones the client asked for.
+    const auto marked = [](const char* role, const char* content) {
+        return Json{{"role", role},
+                    {"content",
+                     Json::array({Json{{"type", "text"},
+                                       {"text", content},
+                                       {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}}})}};
+    };
+    Json body        = base_request();
+    body["messages"] = Json::array({Json{{"role", "system"}, {"content", "you are an agent"}},
+                                    marked("user", "one"), marked("assistant", "two"),
+                                    marked("user", "three"), marked("assistant", "four")});
+    const GenerationRequest request = parse(body).generation;
+    // A breakpoint inside a content part lands on the part rather than the turn, so count both the
+    // way the cache policy collects them.
+    std::size_t explicit_boundaries = 0;
+    const auto count_boundary       = [&](const auto& boundary) {
+        if (!boundary) { return; }
+        if (!ninfer::has_shared_candidate_evidence(
+                boundary->evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary)) {
+            failures += check(false, "a client breakpoint lost its explicit standing");
+            return;
+        }
+        ++explicit_boundaries;
+    };
+    for (const auto& turn : request.messages) {
+        for (const auto& part : turn.content) { count_boundary(part.cache_boundary_after); }
+        count_boundary(turn.cache_boundary_after);
+    }
+    failures +=
+        check(explicit_boundaries == 4, "client breakpoints were dropped to free a marker slot");
+    bool leading_marked = request.messages.front().cache_boundary_after.has_value();
+    for (const auto& part : request.messages.front().content) {
+        leading_marked = leading_marked || part.cache_boundary_after.has_value();
+    }
+    failures +=
+        check(!leading_marked, "an automatic candidate took a slot from the client's breakpoints");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -984,6 +1030,7 @@ int main() {
     failures += test_tools();
     failures += test_messages_and_media();
     failures += test_leading_instruction_shared_prefix();
+    failures += test_explicit_markers_outrank_automatic_candidates();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();

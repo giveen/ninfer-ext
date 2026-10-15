@@ -60,9 +60,12 @@ std::string quantize_usage_text(const char* argv0) {
            "       --out-scales auto|always|never  (default auto)\n"
            "       --limit N               quantize at most N eligible parameters (debug)\n"
            "       --rates FILE            per-tensor half bits JSON from tools/exl3/allocate.py\n"
-           "       --only TEXT             quantize only parents whose name contains TEXT (debug, per layer)\n"
-           "       --experts-only          quantize only routed experts, one shard per bank (resumable)\n"
-           "       --calibrate-only        write the Hessians from --trace and stop before quantizing\n"
+           "       --only TEXT             quantize only parents whose name contains TEXT (debug, "
+           "per layer)\n"
+           "       --experts-only          quantize only routed experts, one shard per bank "
+           "(resumable)\n"
+           "       --calibrate-only        write the Hessians from --trace and stop before "
+           "quantizing\n"
            "       --list                  list eligible parameters and exit without a device\n"
            "       --help                  print this message\n"
            "       quantizes each eligible BF16 projection and writes an exl3_mul1 source store\n"
@@ -168,6 +171,9 @@ QuantizeOptions parse_quantize_options(int argc, char** argv) {
     }
     if (!options.trace.empty() && options.activation_model.empty()) {
         throw std::invalid_argument("--trace requires --activation-model");
+    }
+    if (options.calibrate_only && options.trace.empty()) {
+        throw std::invalid_argument("--calibrate-only requires --trace");
     }
     return options;
 }

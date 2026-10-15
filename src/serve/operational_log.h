@@ -59,6 +59,8 @@ public:
                       bool auth_enabled) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
+    // A failed periodic stats or log write: reported, not fatal.
+    void stats_failure(std::string_view detail) const;
 
 private:
     void write(OperationalRecord record) const;

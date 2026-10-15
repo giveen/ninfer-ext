@@ -136,6 +136,7 @@ void ProgramImpl::prepare_graphs() {
     std::vector<KVAddressSpaceHandle> text_capture_allocations;
     std::vector<KVAddressSpaceHandle> mtp_capture_allocations;
     std::vector<KVAddressSpaceHandle> dflash_capture_allocations;
+    std::vector<KVAddressSpaceHandle> eagle3_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_5::PagedKVCache& cache,
                                           KVAddressSpaceStore& addresses,
                                           std::vector<KVAddressSpaceHandle>& allocations,
@@ -167,6 +168,12 @@ void ProgramImpl::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
                              "MTP KV cache");
+    } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+        // The EAGLE3 draft KV is its own cache, so its capture rows need the same repeated page
+        // mapping MTP and DFlash get: the warmup and the captured graphs replay rows of this
+        // cache's execution table, and without a published allocation those rows name no page.
+        reserve_capture_rows(*decoder->eagle3_cache(), *backend_kv_addresses,
+                             eagle3_capture_allocations, "EAGLE3 KV cache");
     } else if (dflash && dflash->full) {
         reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
                              "DFlash Full KV cache");
@@ -214,6 +221,10 @@ void ProgramImpl::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
+        }
+        if (speculative_backend == SpeculativeBackend::Eagle3) {
+            zero_capture_pages(*decoder->eagle3_cache(), *backend_kv_addresses,
+                               eagle3_capture_allocations, batch_size);
         }
         if (dflash && dflash->full) {
             zero_capture_pages(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
@@ -638,6 +649,9 @@ void ProgramImpl::prepare_graphs() {
     }
     if (!mtp_capture_allocations.empty()) {
         release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
+    }
+    if (!eagle3_capture_allocations.empty()) {
+        release_capture_rows(*backend_kv_addresses, eagle3_capture_allocations);
     }
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }

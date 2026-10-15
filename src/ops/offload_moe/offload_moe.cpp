@@ -248,6 +248,7 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
     require_routed(slot_ids, DType::I32, columns, op, "slot ids");
     require_routed(weights, DType::FP32, columns, op, "weights");
     require_dense(shared_gate, DType::FP32, op, "shared gate");
+    require(shared_gate.numel() == columns, op, "shared gate must be [T]");
     require_dense(shared, DType::BF16, op, "shared");
     require_dense(y, DType::BF16, op, "y");
     require(shared.numel() == x.numel() && y.numel() == x.numel(), op, "shared/y must match x");

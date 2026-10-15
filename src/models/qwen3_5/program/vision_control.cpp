@@ -147,6 +147,12 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
             checked_mul(item_patches, 4, "position table weight count"));
         const auto expected = static_cast<std::uint8_t>(item.modality);
         for (const TokenSpan& span : item.token_spans) {
+            // The same bound the planner enforces: a rebuilt control may be paired with a prompt it
+            // did not come from, and the span indexes into that prompt's token types below.
+            if (span.count == 0 || span.begin > prompt.token_types.size() ||
+                span.count > prompt.token_types.size() - span.begin) {
+                throw std::invalid_argument("vision control token span exceeds prompt");
+            }
             if (!std::all_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
                              prompt.token_types.begin() +
                                  static_cast<std::ptrdiff_t>(span.begin + span.count),

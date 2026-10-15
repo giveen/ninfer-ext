@@ -32,6 +32,12 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
 } // namespace
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
@@ -63,6 +69,10 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     }
     if (logits.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("argmax: logits/out data must be non-null");
+    }
+    // The contract requires disjoint storage: the Op reads logits and writes out in one pass.
+    if (overlaps(logits, out)) {
+        throw std::invalid_argument("argmax: out must not overlap logits");
     }
 
     detail::argmax_launch(logits, out, valid_rows, stream);

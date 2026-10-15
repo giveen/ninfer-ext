@@ -255,9 +255,16 @@ public:
             const int rc = av_read_frame(format_, packet_);
             if (rc == AVERROR_EOF) { break; }
             if (rc < 0) { throw_invalid_media("failed while reading media: " + av_error(rc)); }
-            if (packet_->stream_index == stream_index_) {
-                const int send = avcodec_send_packet(codec_, packet_);
-                if (send < 0 && send != AVERROR(EAGAIN)) {
+            if (packet_->stream_index == stream_index_) { int send = avcodec_send_packet(codec_, packet_);
+                // EAGAIN means the decoder's output queue is full: drain it and submit the same
+                // packet again. Unrefing it here instead would silently drop a frame.
+                for (; send == AVERROR(EAGAIN); send = avcodec_send_packet(codec_, packet_)) {
+                    if (!receive()) {
+                        av_packet_unref(packet_);
+                        return;
+                    }
+                }
+                if (send < 0) {
                     av_packet_unref(packet_);
                     throw_invalid_media("failed to submit media packet: " + av_error(send));
                 }

@@ -1,6 +1,8 @@
 #include "ninfer/ops/mtp_round.h"
 #include "ops/launcher/mtp_round.h"
 
+#include "ninfer/types.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -53,8 +55,9 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 8) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,8]");
+    if (T < 2 || T > kMtpRoundMaximumDrafts + 1) {
+        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2," +
+                                    std::to_string(kMtpRoundMaximumDrafts + 1) + "]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {

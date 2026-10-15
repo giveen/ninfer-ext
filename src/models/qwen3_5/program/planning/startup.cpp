@@ -1347,8 +1347,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (!parameters.draft || !parameters.model.config().draft->eagle3) {
             throw std::invalid_argument("selected EAGLE3 backend is not supported by this target");
         }
-        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
-            throw std::invalid_argument("EAGLE3 draft window must be in [1,15]");
+        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > static_cast<std::uint32_t>(kMtpRoundMaximumDrafts)) {
+            throw std::invalid_argument("EAGLE3 draft window must be in [1," +
+                                        std::to_string(kMtpRoundMaximumDrafts) + "]");
         }
         if (options.speculative.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument("EAGLE3 uses its own draft head, not the proposal head");

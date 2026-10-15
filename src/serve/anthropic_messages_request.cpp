@@ -181,7 +181,11 @@ void append_turn(ChatTurn& target, ChatTurn turn) {
                              std::make_move_iterator(turn.tool_calls.begin()),
                              std::make_move_iterator(turn.tool_calls.end()));
     target.reasoning_content += turn.reasoning_content;
-    target.cache_boundary_after = turn.cache_boundary_after;
+    // The appended turn's boundary becomes the merged turn's. A target with no content parts could
+    // not relocate its own boundary onto one, so keep it rather than let this overwrite it: a
+    // tool_use-only turn with a terminal breakpoint would otherwise lose it silently.
+    if (turn.cache_boundary_after) {
+    target.cache_boundary_after = turn.cache_boundary_after; }
 }
 
 void merge_turn(GenerationRequest& request, ChatTurn turn) {

@@ -28,6 +28,13 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void scale_columns(const Tensor& scale, Tensor& x, std::int32_t dims_begin, std::int32_t dims_end,
@@ -49,6 +56,10 @@ void scale_columns(const Tensor& scale, Tensor& x, std::int32_t dims_begin, std:
     }
     if (scale.data == nullptr || x.data == nullptr) {
         throw std::invalid_argument("scale_columns: scale/x data must be non-null");
+    }
+    // The contract requires disjoint storage: the Op reads scale while updating x in place.
+    if (overlaps(scale, x)) {
+        throw std::invalid_argument("scale_columns: scale and x must not overlap");
     }
 
     detail::scale_columns_launch(scale, x, dims_begin, dims_end, stream);

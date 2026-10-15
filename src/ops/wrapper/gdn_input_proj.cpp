@@ -506,6 +506,19 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "value");
         require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
+        require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                    snapshot_base_slots, query, key, value, z, workspace);
+        const std::array<const Tensor*, 10> tensors{&x,
+                                                    &conv_weight,
+                                                    &conv_states,
+                                                    &valid_columns,
+                                                    &initial_state_slots,
+                                                    &snapshot_base_slots,
+                                                    &query,
+                                                    &key,
+                                                    &value,
+                                                    &z};
+        require_parent_nonoverlap(weight, tensors, workspace, "nvfp4 gdn_input_proj_conv_snapshot");
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (geometry.batch > 1) {
@@ -588,6 +601,19 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                         "gdn_input_proj_conv_snapshot", "value");
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_snapshot",
                         "z");
+    require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                snapshot_base_slots, query, key, value, z, workspace);
+    const std::array<const Tensor*, 10> tensors{&x,
+                                                &conv_weight,
+                                                &conv_states,
+                                                &valid_columns,
+                                                &initial_state_slots,
+                                                &snapshot_base_slots,
+                                                &query,
+                                                &key,
+                                                &value,
+                                                &z};
+    require_parent_nonoverlap(weight, tensors, workspace, "q8 gdn_input_proj_conv_snapshot");
     if (geometry.batch > 1) {
         compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                  snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows,

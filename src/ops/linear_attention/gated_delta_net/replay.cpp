@@ -274,7 +274,11 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
         if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.spec.width) {
             throw std::invalid_argument("gdn_replay_fold: commit extent is out of range");
         }
+        // An inert row commits nothing, so the kernel never reads or writes its bindings: two such
+        // rows may legitimately name the same slots.
+        const bool inert = rows[row].commit_columns == 0;
         for (std::size_t previous = 0; previous < row; ++previous) {
+            if (inert || rows[previous].commit_columns == 0) { continue; }
             if (rows[previous].destination_state_slot == rows[row].destination_state_slot ||
                 rows[previous].destination_state_slot == rows[row].source_state_slot ||
                 rows[row].destination_state_slot == rows[previous].source_state_slot) {

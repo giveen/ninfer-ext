@@ -46,8 +46,15 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
         throw std::invalid_argument(
             "causal_compact_attention: rotary_dim must equal head_dim and be in [1,512]");
     }
-    if (rope_angles <= 0 || rope_angles > rotary_dim / 2) {
-        throw std::invalid_argument("causal_compact_attention: rope_angles must be in [1,rd/2]");
+    // The route is implemented for three (rotary_dim, rope_angles) pairs; reject anything else here
+    // rather than letting it reach the launcher, so an undocumented pair fails as a contract error.
+    const bool implemented_pair = (rotary_dim == 512 && rope_angles == 64) ||
+                                  (rotary_dim == 128 && rope_angles == 16) ||
+                                  (rotary_dim == 64 && rope_angles == 8);
+    if (!implemented_pair) {
+        throw std::invalid_argument(
+            "causal_compact_attention: (rotary_dim, rope_angles) must be (512,64), (128,16) or "
+            "(64,8)");
     }
     if (!(scale > 0.0F) || !std::isfinite(scale)) {
         throw std::invalid_argument("causal_compact_attention: scale must be positive and finite");

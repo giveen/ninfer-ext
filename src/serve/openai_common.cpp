@@ -177,10 +177,21 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         policy.auto_system_shared_prefix && automatic_enabled &&
         leading_instruction != static_cast<std::size_t>(-1) &&
         !request.messages[leading_instruction].cache_boundary_after.has_value();
-    const std::size_t base_slots =
-        !automatic_enabled || automatic_merges_explicit ? kMaximumExplicitPromptCacheMarkers
-                                                        : kMaximumExplicitPromptCacheMarkers - 1U;
-    const std::size_t explicit_write_slots = base_slots - (system_candidate ? 1U : 0U);
+    // The four frontend marker slots are shared with this policy's own automatic candidates. The
+    // client's explicit boundaries are a request contract, while the automatic ones are heuristics
+    // that "only take spare capacity" (see the note below); the Engine ranks them the same way,
+    // treating declared credit as stronger than automatic evidence. So a candidate claims a slot
+    // only when the explicit boundaries leave one free. The Anthropic path enforces that priority
+    // too: it refuses its own request-level candidate once four block-level breakpoints are
+    // present.
+    const bool automatic_target_needs_slot =
+        automatic_enabled && !automatic_merges_explicit &&
+        explicit_boundaries.size() < kMaximumExplicitPromptCacheMarkers;
+    const std::size_t base_slots = automatic_target_needs_slot ? kMaximumExplicitPromptCacheMarkers - 1U
+                                       : kMaximumExplicitPromptCacheMarkers;
+    const bool system_candidate_needs_slot =
+        system_candidate && explicit_boundaries.size() < base_slots;
+    const std::size_t explicit_write_slots = base_slots - (system_candidate_needs_slot ? 1U : 0U);
     const std::size_t first_selected       = explicit_boundaries.size() > explicit_write_slots
                                                  ? explicit_boundaries.size() - explicit_write_slots
                                                  : 0U;
@@ -195,7 +206,7 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         }
     }
 
-    if (automatic_enabled) {
+    if (automatic_enabled && (automatic_merges_explicit || automatic_target_needs_slot)) {
         const ninfer::SharedCandidateEvidence evidence =
             policy.automatic == OpenAIPromptCacheAutomatic::Default
                 ? ninfer::SharedCandidateEvidence::DefaultAutomatic
@@ -209,12 +220,13 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         // system/developer frontier (agent siblings share the long head).
         // Mark the end of the contiguous leading instruction run so requests
         // sharing both system and developer turns reuse the whole prefix.
-        if (policy.auto_system_shared_prefix &&
-            leading_instruction != static_cast<std::size_t>(-1)) {
+        if (system_candidate_needs_slot) {
             ChatTurn& turn = request.messages[leading_instruction];
             if (!turn.cache_boundary_after) {
+                // The same evidence the automatic target carries: a client that asked for
+                // automatic caching keeps the declared credit for its shared system head.
                 turn.cache_boundary_after =
-                    CacheBoundary{.evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic};
+                    CacheBoundary{.evidence = evidence};
             }
         }
     }

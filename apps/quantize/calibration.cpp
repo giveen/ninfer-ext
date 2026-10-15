@@ -399,6 +399,16 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                                            cudaStream_t stream) {
                 mtp_accumulator.observe(site, layer, input, stream);
             });
+            // The MTP block is a routed MoE too, and its calibration layer is -1 (see
+            // qwen4_moe), so its per-expert down inputs need the same tap the scoring pass
+            // installs -- without it those Hessians are never observed and the names are dropped.
+            ninfer::models::qwen3_5::execution::expert_activation_observer() =
+                [&](int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
+                    mtp_accumulator.observe_expert(layer, expert, rows, stream);
+                };
+            ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
+                return mtp_accumulator.wants_experts(layer);
+            };
             for (std::uint32_t row = 0; row < mtp_rows; ++row) {
                 const std::int32_t length = trace.lengths[row];
                 if (length < 2) { continue; }
@@ -415,6 +425,8 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                 request.stop.include_model_defaults       = false;
                 (void)gen.generate(gen.prepare_tokens(std::move(tokens)), request);
             }
+            ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
+            ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
             result.hessians += mtp_accumulator.flush();
             std::fprintf(stderr, "MTP calibration over %u rows (%llu Hessians so far)\n", mtp_rows,
                          static_cast<unsigned long long>(result.hessians));
