@@ -2,6 +2,8 @@
 
 #include "artifact/schema.h"
 
+#include "test_platform.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -46,12 +48,7 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
-        auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        const char* path = ::mkdtemp(buffer.data());
-        if (!path) { throw std::runtime_error("cannot create fixture directory"); }
-        directory = path;
+        directory = ninfer::test::temporary_directory("ninfer-artifact");
         entry     = directory / "model.ninfer";
         root      = {
             {"components",

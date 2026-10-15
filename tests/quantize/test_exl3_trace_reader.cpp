@@ -3,13 +3,14 @@
 #include "source_writer.h"
 #include "trace_reader.h"
 
+#include "test_platform.h"
+
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -33,11 +34,7 @@ void expect_throws(Operation operation, const char* message) {
 }
 
 std::filesystem::path scratch() {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     ("ninfer-exl3-trace-" + std::to_string(::getpid()));
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
-    return dir;
+    return ninfer::test::temporary_directory("ninfer-exl3-trace");
 }
 
 std::vector<std::byte> i64_bytes(const std::vector<std::int64_t>& values) {
