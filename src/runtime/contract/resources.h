@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/contract/request.h"
+#include "runtime/contract/uint128.h"
 #include "core/transfer_work.h"
 #include <array>
 #include <cstddef>
@@ -24,7 +25,11 @@ struct PrefillWork {
 };
 
 // Exact prefill feature definition for a suffix beginning after prefix_tokens. Attention work is
-// prefix*suffix + suffix*(suffix+1)/2 and all arithmetic saturates.
+// prefix*suffix + suffix*(suffix+1)/2 and all arithmetic saturates. Both products overflow 64 bits,
+// so the contract carries them in UInt128: on Linux that is unsigned __int128 unchanged, and on
+// MSVC, which has no 128-bit integer type, it is the exact two-word replacement. The halving of the
+// triangular term is a shift because the type is unsigned, where division by two and a one-bit
+// shift are the same operation.
 [[nodiscard]] inline PrefillWork make_prefill_work(std::uint64_t prefix_tokens,
                                                    std::uint64_t suffix_tokens,
                                                    std::uint64_t vision_items,
@@ -36,11 +41,11 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
+    const UInt128 suffix      = suffix_tokens;
+    const UInt128 linear      = static_cast<UInt128>(prefix_tokens) * suffix;
+    const UInt128 triangular  = (suffix * (suffix + 1U)) >> 1U;
+    constexpr UInt128 maximum = ~static_cast<UInt128>(0);
+    const UInt128 attention =
         triangular > maximum - linear ? maximum : linear + triangular;
     result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
                                  ? std::numeric_limits<std::uint64_t>::max()

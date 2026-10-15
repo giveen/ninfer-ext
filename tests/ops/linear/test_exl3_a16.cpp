@@ -12,6 +12,7 @@
 
 #include <array>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -45,7 +46,9 @@ std::vector<double> hadamard128() {
     std::vector<double> h(128 * 128);
     for (int a = 0; a < 128; ++a) {
         for (int b = 0; b < 128; ++b) {
-            h[a * 128 + b] = (__builtin_popcount(a & b) & 1) ? -1.0 : 1.0;
+            // std::popcount replaces the GCC builtin, which MSVC does not provide; the cast to
+            // unsigned is the one conversion __builtin_popcount performed on its argument.
+            h[a * 128 + b] = (std::popcount(static_cast<unsigned>(a & b)) & 1) ? -1.0 : 1.0;
         }
     }
     const double scale = 1.0 / std::sqrt(128.0);
