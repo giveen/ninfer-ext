@@ -1207,6 +1207,28 @@ columns with identical per-column inputs and asserts bit-identity, iterating the
 fails. That finds the Op the same way the widened MoE oracles cleared theirs, and it is the gate for
 making the reduction shape-independent, which is the fix chosen for this defect.
 
+That fix was then attempted twice, and neither form lands — which is itself the finding, with the
+cause settled: `flash_splits` counted the key split from the pass's shape, so two widths in one band
+divided the keys differently and reduced the softmax in a different order, exactly what the batch test
+compares. Both ways of making the count one number per cache were built and measured.
+
+Taking the count at one row tile — the narrow pass's count, applied to every width — fixed the 26B's
+lane independence for both lanes and made `gemma4_mtp_test` pass on both artifacts, leaving only a
+batched round against plain greedy red. But that form multiplies the widest pass's rows by the
+narrowest pass's count, so the arena the flash attention reserves grows, and the 31B's batch test —
+two Programs at the memory edge — aborted on `cudaMalloc`. Stashing the change restored it, which
+pinned the cause; matching the decode path's key bound to the layer path's was necessary but not
+sufficient, because the layer path's growth is what the arena's max over widths picks up.
+
+Taking the count at the tiled route's threshold — the coarse direction, which shrinks the arena — was
+worse: it broke the 26B's lane independence again, at tokens 13 and 9, and the 31B's batch test still
+failed.
+
+So the fix needs a third design rather than a threshold choice: a split merge that rounds the same way
+for any count, a workspace bound decoupled from the count, or the option set aside earlier — a
+documented tolerance for the batched-round comparison. The diagnosis stands whichever is chosen, and
+the widened MoE oracles and the coverage added alongside it are what make the choice verifiable.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
