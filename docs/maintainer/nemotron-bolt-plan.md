@@ -184,6 +184,12 @@ both existing offload and sparse-MoE ops bake their geometry into headers and ev
 unit. The new op takes `{E, I, K, H}` at runtime; the artifact side needs nothing, because a bank is
 already opaque.
 
+One loader question is settled too: stacking a bank needs nothing new, because
+`prepare_linear_weight(std::span<const WeightInput> rows)` already concatenates a bank's per-expert row
+parts and propagates its divisors — it is what Gemma 4's per-expert parts use. So a bank needs one
+contiguous parent per matrix in the artifact, which is the converter's packing group, and the per-layer
+variation is carried entirely by the config.
+
 ## Milestones
 
 1. **Oracle — done.** `tools/verify/nemotron_h_reference.py` dumps every stage an op has to reproduce
@@ -233,6 +239,7 @@ against an FP64 oracle plus — where one exists — the reference dump or the r
 | Conv bias | the bias-free path is bit-identical (the biased entry with a null or all-zero bias must match byte for byte); `SiLU(conv+bias)` is separated from `SiLU(conv)+bias` by about 240x the criterion |
 | Mamba-2 selective scan | sequential in registers rather than chunked, so there is no chunk-boundary tolerance question; 0.54 us/token at T=4096, about 88 ms across the 40 Mamba layers of a 4096-token prefill. A swapped state extent is rejected at 15492x, an unscaled readout at 3299x, and a BF16 state image fails the fp32 criterion by 12x |
 | MoE router | the correction bias selects experts while the emitted weights stay uncorrected — 130 of 130 tokens change their expert set with it — and the group mask can exclude the bank's largest score outright |
+| Latent expert dispatch and `relu2` | non-gated `down(relu2(up(x)))` in the 1024-wide latent space, with `E` and `I` as runtime arguments because the banks differ per layer; fp32 accumulation per expert and per token in rank order, one BF16 rounding, and a single shared definition of the activation so the two ops cannot drift |
 
 The config parse is verified against the released checkpoint's own tensors, and the reference dump carries
 the operands an op consumes as well as its outputs, which every remaining op needs.
