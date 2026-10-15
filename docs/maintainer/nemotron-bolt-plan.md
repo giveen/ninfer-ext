@@ -310,6 +310,40 @@ are **BF16** while this branch's scan Op requires FP32 for all three, so the con
 its attention projections are BF16 although the recipe puts them at FP8 — we follow the recipe, which is what
 the flagship release does.
 
+### What is not in main yet
+
+Main is not the whole story for this model: several pieces are open branches rather than merged code, and two
+of them are a *recipe* and a *format*.
+
+- **The search** — open PR #2582, branch `weimingc/autoquant-mtp-recipes`: an AutoQuantize recipe for the Super
+  VL checkpoint. It searches every decoder module and `lm_head` over weight-MSE NVFP4, FP8 and BF16 at a 4.9
+  effective-bit budget using gradient-based sensitivity scores, with the MTP experts fixed at NVFP4 W4A4 and
+  the backbone KV as a fixed-range FP8 cast. Its `disabled_layers` list is the clearest statement of what stays
+  BF16 by construction — `*mixer.conv1d*`, `*mlp.gate.*`, `*router*` and the whole vision/audio stack — and it
+  states the accounting explicitly: "Four value bits plus one FP8 scale per 16-element block". Two caveats from
+  its own README keep it in proportion: the 4.9-bit budget covers only the searched language modules rather
+  than the whole checkpoint, and the search yields a *candidate*, not the published QAD weights. So it refines
+  this plan's fixed route rather than replacing it, and the assignment it would choose is not published.
+- **The 24 GB format** — branch `hungyuehc/omniml-5823-iq2xs-nemotron-recipe`, with **no PR at all**: the
+  recipe that produced the released Bolt-24GB, carrying both a quantizer and reference reconstruction
+  (`validate_iq2_xs_reconstruction.py`, `validate_iq2_xs_stock_ggml.py`). Main has no Bolt recipe directory
+  whatsoever, so the two-bit route this document declines is unmerged work with reference decoders, not merely
+  a released file.
+- **The draft** — open PRs #2824, #2826, #2827 and the external-draft series #2637/#2687/#2688, on branches
+  `haoguo/dflash-*` and `chenhany/dflash-*`: a DFlash *training* stack — packed pretraining data, a
+  language-modelling anchor for a trainable base, a draft-loss weight, a training runbook, a vocabulary swap
+  for cross-tokenizer drafts — plus RoPE-theta fixes for DFlash heads. That is the machinery that would let a
+  drafter be trained or adapted to a target this repository actually serves, which is precisely phase 5's
+  position.
+- **Offload, conversion-side again** — PR #2825: a regression test for exporting NVFP4 from a CPU-offloaded
+  model, from a bug where a 64 GB DGX Spark's `cudaMemGetInfo` under-counted reclaimable page cache, so
+  `hf_ptq` offloaded part of the model and the NVFP4 scale arithmetic crossed devices. Main is fixed, and
+  offloaded models have used a *streaming exporter* since #2008. That is a third independent confirmation that
+  NVIDIA's offload story is a conversion-time mechanism rather than a serving one.
+- **Expert quantization details** — #2745 (ungated and transposed fused experts), #2820 (native FP8 experts),
+  #2821 (merging input amax across tied fused experts): each touches the exact shape of model we have, ungated
+  experts behind a fused dispatch.
+
 The checkpoint inventory decides how we get there. Our own Bolt 74B has **no official NVFP4 release** — what
 exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 GB quant whose experts are 2-bit,
 which is precisely the LiLiCorr draft's base and confirms it. So the NVFP4 conversion for this checkpoint is
