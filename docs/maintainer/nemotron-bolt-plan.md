@@ -176,6 +176,19 @@ than a count list suggests — **twelve** distinct (experts, intermediate width)
 offload sites key on the pair, and the expert op taking `{E, I}` at runtime is load-bearing rather than
 defensive.
 
+Sized in bytes, the split above is two independent budgets:
+
+| Side | Holds | Size |
+|---|---|---|
+| **Host RAM** | the routed expert banks, pinned | **37.2 GB** at NVFP4 — so at least 64 GB of RAM, and a 32 GiB box cannot serve this route at all |
+| **VRAM** | everything else | dense side 8.8 B parameters at Q8/Q6 (~9 GB); Mamba-2 recurrent state 4 MiB per layer plus 2.34 MiB of convolution history per sequence (162 MiB across the 40 layers); attention KV at 8 KB per token across the 8 attention layers (2.1 GB at the full 262144-token context in BF16, ~0.6 GB at NVFP4) |
+| **VRAM, remainder** | the device expert cache | roughly 20 GB on a 32 GB card, i.e. about half the bank resident, with the rest streamed from the pinned copy |
+
+The 64 GB host requirement is not a preference: the pinned expert set is not optional in this design, and 37.2 GB
+of it does not fit 32 GiB. Everything the device holds besides the cache is small — 9 GB of dense weights plus
+memory that scales with context, not with the model — which is why the expert cache is where the remaining VRAM
+goes and why its size is a Program decision rather than a fixed number.
+
 A correction from the draft's own tensors, because this argument was overstated: the draft's stated base is
 the *24GB* variant, whose mixer projections are NVFP4 but whose 27,728 expert tensors are `IQ2_XXS` at
 2.06 bits. The target it was qualified against therefore has **2-bit experts**, which our NVFP4 experts at
