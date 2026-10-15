@@ -10,7 +10,12 @@ the mathematics they are supposed to implement -- including the two rules that a
 and impossible to notice: the depthwise convolution's activation applies to B and C as well as to x,
 and the output norm is gated *before* it normalises, within groups. Beside a module's output the dump
 also carries the tensors an op consumes and cannot reconstruct -- the router's input, weight and
-correction bias -- because an op cannot be run against a dump that holds only what it produces.
+correction bias -- because an op cannot be run against a dump that holds only what it produces. For
+composed work it also carries the decoder blocks themselves: every `model.layers.N` output beside the
+residual stream it was handed, so a forward can be qualified stage by stage rather than only at the
+logits. `--weights` adds every parameter under those layers (and the embedding, final norm and head
+matrices), which is how a model-side test builds its parameters before a converter exists; it is off by
+default because on the full checkpoint it would be the checkpoint.
 
 Two model sources:
 
@@ -36,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -69,6 +75,13 @@ STAGE_SUFFIXES = (
 # can never shadow a stage name.
 INPUT_SUFFIXES = ("mixer.gate",)
 PARAMETER_SUFFIXES = {"mixer.gate": ("weight", "e_score_correction_bias")}
+
+# The decoder block is matched by name rather than by suffix, because its name ends in a layer index.
+# Its output is the residual stream the next block consumes, and its input is what it was handed, so a
+# composed forward can be qualified one block at a time instead of only at the logits.
+LAYER_PATTERN = re.compile(r"^model\.layers\.\d+$")
+# With `--weights`: the parameters outside the layers that a whole-model forward needs.
+TOP_LEVEL_PARAMETERS = ("model.embeddings.weight", "model.norm_f.weight", "lm_head.weight")
 
 
 def tiny_config() -> "object":
@@ -119,11 +132,11 @@ def load_model(args) -> tuple["object", "object"]:
     return model.eval(), model.config
 
 
-def register_hooks(model) -> dict[str, torch.Tensor]:
-    """Capture the output of every module whose name ends with one of the stage suffixes."""
+def register_hooks(model, weights: bool) -> dict[str, torch.Tensor]:
+    """Capture every staged module's output, the blocks themselves, and with `weights` their parameters."""
     captured: dict[str, torch.Tensor] = {}
 
-    def make_hook(name: str):
+    def make_hook(name: str, capture_input: bool = False):
         def hook(_module, _inputs, output):
             # A module may return a tuple: the router returns (logits, weights, indices), and all three
             # are part of what its op has to reproduce, so each element is dumped with its position as
@@ -134,7 +147,9 @@ def register_hooks(model) -> dict[str, torch.Tensor]:
                     continue
                 stage = name if len(outputs) == 1 else f"{name}.{index}"
                 captured[stage] = tensor.detach().to(torch.float32).cpu()
-            if any(name == suffix or name.endswith("." + suffix) for suffix in INPUT_SUFFIXES):
+            if capture_input or any(
+                name == suffix or name.endswith("." + suffix) for suffix in INPUT_SUFFIXES
+            ):
                 argument = _inputs[0] if _inputs else None
                 if isinstance(argument, torch.Tensor):
                     captured[f"{name}.input"] = argument.detach().to(torch.float32).cpu()
@@ -143,8 +158,9 @@ def register_hooks(model) -> dict[str, torch.Tensor]:
     handles = []
     for name, module in model.named_modules():
         tail = name.split(".", 1)[-1] if "." in name else name
-        if any(tail == suffix or name.endswith("." + suffix) for suffix in STAGE_SUFFIXES):
-            handles.append(module.register_forward_hook(make_hook(name)))
+        is_layer = LAYER_PATTERN.match(name) is not None
+        if is_layer or any(tail == suffix or name.endswith("." + suffix) for suffix in STAGE_SUFFIXES):
+            handles.append(module.register_forward_hook(make_hook(name, capture_input=is_layer)))
         for suffix, parameters in PARAMETER_SUFFIXES.items():
             if tail != suffix and not name.endswith("." + suffix):
                 continue
@@ -154,6 +170,10 @@ def register_hooks(model) -> dict[str, torch.Tensor]:
                     captured[f"{name}.{parameter}"] = tensor.detach().to(torch.float32).cpu()
     if not handles:
         sys.exit("no stages matched: the model does not look like a NemotronH stack")
+    if weights:
+        for name, parameter in model.named_parameters():
+            if name.startswith("model.layers.") or name in TOP_LEVEL_PARAMETERS:
+                captured[name] = parameter.detach().to(torch.float32).cpu()
     return captured
 
 
@@ -173,6 +193,11 @@ def main() -> int:
     parser.add_argument("--out", type=pathlib.Path, required=True)
     parser.add_argument("--tokens", type=int, default=130, help="sequence length (default past chunk_size)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--weights",
+        action="store_true",
+        help="also dump every parameter under the decoder layers, plus the embedding, final norm and head",
+    )
     arguments = parser.parse_args()
 
     out = arguments.out
@@ -183,7 +208,7 @@ def main() -> int:
     # A checkpoint load has no random initialisation, so this only ever pins the tiny path.
     torch.manual_seed(arguments.seed)
     model, config = load_model(arguments)
-    captured = register_hooks(model)
+    captured = register_hooks(model, arguments.weights)
 
     generator = torch.Generator().manual_seed(arguments.seed)
     tokens = torch.randint(0, config.vocab_size, (1, arguments.tokens), generator=generator)
