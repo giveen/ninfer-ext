@@ -4,7 +4,7 @@ This decodes the artifact's own bytes from its registered layouts and compares t
 element-wise against the checkpoint tensor the logical parameter came from; it does not use the
 converter's quantization code or its logical sources.
 
-Usage:  .venv/bin/python tools/verify/check_nemotron_artifact.py [artifact] [source-dir]
+Usage:  .venv/bin/python -m tools.verify.check_nemotron_artifact [artifact] [source-dir]
 """
 
 from __future__ import annotations
