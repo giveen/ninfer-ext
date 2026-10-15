@@ -69,9 +69,15 @@ std::size_t read_at(NativeFileHandle handle, std::uint64_t offset,
     overlapped.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFFULL);
     overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
 
+    // ReadFile takes a DWORD length, so one call covers at most 4 GiB - 1; a longer request is
+    // served as a short read, which callers already loop over. Both platforms therefore agree that
+    // a read may be short.
+    const DWORD requested =
+        static_cast<DWORD>(destination.size() > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : destination.size());
+
     DWORD read = 0;
-    if (::ReadFile(static_cast<HANDLE>(handle), destination.data(),
-                   static_cast<DWORD>(destination.size()), &read, &overlapped) == 0) {
+    if (::ReadFile(static_cast<HANDLE>(handle), destination.data(), requested, &read,
+                   &overlapped) == 0) {
         const DWORD error = ::GetLastError();
         if (error == ERROR_IO_PENDING) {
             // A pending overlapped read is normal even for a disk file; wait for this request only,
