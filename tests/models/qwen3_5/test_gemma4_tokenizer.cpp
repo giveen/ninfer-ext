@@ -52,7 +52,7 @@ int main() {
     const std::string config_json    = read_file(dir + "/tokenizer_config.json");
     const std::string generation     = read_file(dir + "/generation_config.json");
 
-    const std::string fixture = read_file("tests/fixtures/gemma4/tokenizer_ids.json");
+    const std::string fixture = read_file(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/gemma4/tokenizer_ids.json");
     const nlohmann::json cases = ninfer::artifact::parse_json(fixture, "gemma4 tokenizer fixture");
 
     // The Gemma family loads the checkpoint's pipeline; the Qwen family must refuse it rather than

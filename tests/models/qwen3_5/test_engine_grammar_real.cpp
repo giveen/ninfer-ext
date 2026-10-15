@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include "real_test_artifact.h"
 
 namespace {
 void require(bool condition, const char* message) {
@@ -315,7 +316,6 @@ int main(int argc, char** argv) {
                      "input, JSON/schema passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "GBNF integration: " << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }

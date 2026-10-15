@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "real_test_artifact.h"
 
 namespace {
 void require(bool condition, const char* message) {
@@ -266,7 +267,6 @@ int main(int argc, char** argv) {
                   << " state_d2h=" << stats.state_d2h_count
                   << " state_h2d=" << stats.state_h2d_count << '\n';
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }

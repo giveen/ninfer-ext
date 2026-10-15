@@ -131,6 +131,7 @@ ninfer_add_test(ninfer_qwen3_5_suffix_drafter_test
   LIBRARIES ninfer_engine ninfer_core)
 
 ninfer_add_test(ninfer_gemma4_tokenizer_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_tokenizer.cpp"
   LIBRARIES ninfer_model_runtime ninfer_artifact)
 set_tests_properties(ninfer_gemma4_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77)

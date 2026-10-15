@@ -13,6 +13,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include "real_test_artifact.h"
 
 namespace {
 
@@ -352,7 +353,6 @@ int main(int argc, char** argv) {
         device->synchronize();
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }

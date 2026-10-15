@@ -148,7 +148,7 @@ int main() {
 
     // The template, against HF.
     const Json fixture = ninfer::artifact::parse_json(
-        read_file("tests/fixtures/gemma4/chat_template.json"), "gemma4 chat fixture");
+        read_file(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/gemma4/chat_template.json"), "gemma4 chat fixture");
     for (const Json& test : fixture.at("cases")) {
         const std::string name     = test.at("name");
         const std::string expected = test.at("text");

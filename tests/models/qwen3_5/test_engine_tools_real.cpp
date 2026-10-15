@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include "real_test_artifact.h"
 
 namespace {
 using Json = nlohmann::ordered_json;
@@ -334,7 +335,6 @@ int main(int argc, char** argv) {
         else
             exercise(engine, options.max_concurrency, backend != "none");
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }
