@@ -23,6 +23,21 @@ namespace {
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
 std::atomic<ninfer::product::LoggingRuntime*> g_logging{nullptr};
 
+// Publishes the logging runtime to the terminate handler for exactly the scope whose stack holds
+// it. The pointer is trivial to read, so a terminate during static destruction, or from a thread
+// that outlives main, always finds either a live runtime or nothing.
+class ScopedLoggingPointer {
+public:
+    explicit ScopedLoggingPointer(ninfer::product::LoggingRuntime& logging) {
+        g_logging.store(&logging);
+    }
+
+    ~ScopedLoggingPointer() { g_logging.store(nullptr); }
+
+    ScopedLoggingPointer(const ScopedLoggingPointer&)            = delete;
+    ScopedLoggingPointer& operator=(const ScopedLoggingPointer&) = delete;
+};
+
 // An exception that escapes a request boundary ends the process through
 // std::terminate, and the default handler's message is the only record of which
 // exception it was. That message is worth writing through the server's own log:
@@ -78,7 +93,7 @@ int main(int argc, char** argv) {
          .level        = options.log_level,
          .presentation = ninfer::product::LogPresentation::Service});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-    g_logging.store(&logging);
+    const ScopedLoggingPointer logging_pointer(logging);
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);
     bool serving = false;

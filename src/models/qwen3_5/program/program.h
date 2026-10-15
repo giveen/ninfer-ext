@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1152,6 +1153,9 @@ struct RuntimeContractAccess {
     make_pending(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
                  std::span<const TokenId> tokens, std::span<const std::int32_t> row_counts,
                  std::uint32_t row_stride, runtime::ExecutionTiming timing) {
+        if (rows.size() > kMaximumConcurrency) {
+            throw std::logic_error("pending batch is too wide");
+        }
         PendingBatch out;
         out.owner_       = owner;
         out.transaction_ = transaction;

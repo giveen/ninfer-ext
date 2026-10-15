@@ -1172,7 +1172,10 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
-There is no admission ETA or unbounded overflow queue.
+There is no admission ETA or unbounded overflow queue. Token counting holds one of these lifetimes
+while it expands media and counts through the Engine, so `POST /v1/responses/input_tokens` and
+`POST /v1/messages/count_tokens` answer a saturated server with the same overload or queue-timeout
+response instead of counting anyway.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

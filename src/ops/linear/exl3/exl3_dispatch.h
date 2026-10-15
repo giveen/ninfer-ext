@@ -5,6 +5,7 @@
 #include "ninfer/ops/linear.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -32,6 +33,11 @@ struct Exl3WeightProbe {
 // one decoded parent into its member outputs this way.
 inline void exl3_copy_rows(const Tensor& source, std::int32_t source_row, Tensor& destination,
                            std::int32_t rows, std::int32_t columns, cudaStream_t stream) {
+    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 || source_row < 0 ||
+        rows <= 0 || columns <= 0 || static_cast<std::int64_t>(source_row) + rows > source.ne[0] ||
+        columns > source.ne[1] || rows > destination.ne[0] || columns > destination.ne[1]) {
+        throw std::invalid_argument("exl3_copy_rows: copy exceeds the tensor geometry");
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         destination.data, static_cast<std::size_t>(destination.ne[0]) * sizeof(std::uint16_t),
         static_cast<const std::uint8_t*>(source.data) +

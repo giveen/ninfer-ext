@@ -251,19 +251,15 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
                                                 pending_deadline, submitted);
-        } catch (...) {
-            release_reserved_capacity();
-            throw;
-        }
-
-        {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
             pending_.push_back(request);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
         }
         request_admission_check();
         queue_cv_.notify_one();

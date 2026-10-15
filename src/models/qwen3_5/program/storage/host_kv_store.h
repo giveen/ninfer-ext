@@ -587,11 +587,29 @@ private:
         if (additional_extents > free_count_) {
             throw std::logic_error("Host KV partition descriptor capacity is exhausted");
         }
+        // Every cut borrows an arena descriptor before the run it releases can return one, so
+        // prove the arena funds the busiest point of the plan while the extent still owns its
+        // allocation: a cut that failed later would leave the extent Published without one.
+        std::uint32_t arena_held   = 0;
+        std::uint32_t arena_needed = 0;
+        for (std::size_t run_index = 0; run_index + 1U < partition_runs_.size(); ++run_index) {
+            ++arena_held;
+            arena_needed = std::max(arena_needed, arena_held);
+            if (partition_runs_[run_index].release) { --arena_held; }
+        }
+        if (arena_needed > arena_->available_descriptors()) {
+            throw std::logic_error("Host KV partition arena descriptor capacity is exhausted");
+        }
         const std::size_t stride = page_layout(*pages).page_stride;
         if (released_pages > std::numeric_limits<std::size_t>::max() / stride) {
             throw std::overflow_error("Host KV released byte count overflow");
         }
         const std::size_t released_bytes = stride * static_cast<std::size_t>(released_pages);
+
+        // Nothing below can throw: the plan above proved every cut has an arena descriptor, the
+        // entry check proved the allocation's handle is live and exactly `page_count` long, and
+        // the runs are non-empty pieces of that length, so no cut can be out of range. The
+        // allocation moves out together with its generation, so no capability observes the gap.
 
         HostKVAllocation remaining = std::move(*original.allocation);
         original.allocation.reset();

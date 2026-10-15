@@ -5,9 +5,13 @@
 namespace ninfer::models::qwen3_5 {
 
 void parse_resources(FrontendResources& resources, const Config& config) {
-    resources.tokenizer = std::make_shared<const frontend::Tokenizer>(
-        frontend::TokenizerResources{resources.tokenizer_json, resources.tokenizer_config_json,
-                                     resources.generation_config_json});
+    // Tokenizer parsing reports malformed resources as invalid_argument; the loader's contract is
+    // ArtifactError.
+    try {
+        resources.tokenizer = std::make_shared<const frontend::Tokenizer>(
+            frontend::TokenizerResources{resources.tokenizer_json, resources.tokenizer_config_json,
+                                         resources.generation_config_json});
+    } catch (const std::invalid_argument& error) { throw artifact::ArtifactError(error.what()); }
     const auto count = resources.tokenizer->vocab_size();
     if (!count || count > config.text.vocab_size ||
         !resources.tokenizer->has_exact_token_domain(count)) {

@@ -163,12 +163,22 @@ void qwen4_extensions(const Json& value, TextConfig& out) {
     ple.embed_dim       = dimension(value, "ple_embed_dim");
     ple.conv_kernel     = dimension(value, "ple_conv_kernel_size");
     ple.eos_token_id    = integer(value.at("eos_token_id"), "eos_token_id", false);
-    if (ple.ngram_size < 2 || ple.embed_dim % ple.heads() || ple.eos_token_id >= out.vocab_size) {
+    // heads() computes (ngram_size - 1) * heads_per_ngram in u32, where a large product wraps to
+    // a smaller count (zero covers ngram_size < 2); establish it in u64 instead.
+    const std::uint64_t head_count = std::uint64_t(ple.ngram_size - 1) * ple.heads_per_ngram;
+    if (head_count == 0 || head_count > std::numeric_limits<std::uint32_t>::max()) {
+        throw ArtifactError("invalid n-gram geometry");
+    }
+    if (ple.embed_dim % head_count || ple.eos_token_id >= out.vocab_size) {
         throw ArtifactError("invalid n-gram geometry");
     }
     const auto base = artifact::require_u64(value.at("ngram_vocab_size_base"), "vocab base");
     const auto divisor =
         artifact::require_u64(value.at("make_ngram_vocab_size_divisible_by"), "n-gram row divisor");
+    // base is decremented and divisor divides the padded row count below, so neither may be zero.
+    if (!base || !divisor) {
+        throw ArtifactError("n-gram vocab base and row divisor must be positive");
+    }
     const auto seed = artifact::require_u64(value.at("seed"), "seed", false);
     // Hash products stay in signed 64-bit range because each multiplier is below 2^63 / vocab.
     const std::uint64_t half_bound = std::max<std::uint64_t>(
@@ -180,14 +190,14 @@ void qwen4_extensions(const Json& value, TextConfig& out) {
     }
     std::uint64_t prime = base - 1;
     std::uint64_t total = 0;
-    for (std::uint32_t head = 0; head < ple.heads(); ++head) {
+    for (std::uint32_t head = 0; head < head_count; ++head) {
         do { ++prime; } while (!is_prime(prime));
         ple.head_moduli.push_back(prime);
         ple.head_offsets.push_back(total);
         total = artifact::checked_add(total, prime, "n-gram table rows");
     }
     ple.table_rows =
-        artifact::checked_mul((total + divisor - 1) / divisor, divisor, "padded n-gram table rows");
+        artifact::align_up(total, divisor, "padded n-gram table rows");
     out.ple = std::move(ple);
 }
 

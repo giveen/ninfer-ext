@@ -102,6 +102,9 @@ CalibrationTrace read_calibration_trace(const std::filesystem::path& path) {
     }
 
     const auto read_i64 = [&](const Entry& entry, std::uint64_t count) {
+        if (count > (entry.end - entry.begin) / sizeof(std::int64_t)) {
+            throw std::invalid_argument("safetensors entry is smaller than the declared shape");
+        }
         std::vector<std::int64_t> out(static_cast<std::size_t>(count));
         std::memcpy(out.data(), bytes.data() + data_start + entry.begin,
                     static_cast<std::size_t>(count) * sizeof(std::int64_t));

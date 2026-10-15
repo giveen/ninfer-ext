@@ -187,6 +187,9 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
         payload =
             checked_add(payload, layout.ple_state->bytes, "StateImage transfer payload overflow");
     }
+    if (layout.spec.dflash_local && !layout.dflash_local_k) {
+        throw std::invalid_argument("StateImage DFlash transfer layout is incomplete");
+    }
     if (layout.dflash_local_k) {
         if (!layout.spec.dflash_local || !layout.dflash_local_v) {
             throw std::invalid_argument("StateImage DFlash transfer layout is incomplete");
@@ -291,7 +294,14 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
     if (layout.dflash_local.has_value() != host_layout_.spec.dflash_local.has_value()) {
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
-    if (layout.ple_state) { ple_state_ = layout.ple_state->bind(backing); }
+    if (layout.ple_state) {
+        ple_state_ = layout.ple_state->bind(backing);
+        if (ple_state_.dtype != DType::BF16 || !ple_state_.is_contiguous() ||
+            ple_state_.ne[0] != host_layout_.spec.ple_state ||
+            ple_state_.ne[1] != linear_.slot_count()) {
+            throw std::invalid_argument("StateImage PLE state layout is inconsistent");
+        }
+    }
     StateImageSpec device_spec{.linear    = layout.linear.spec,
                                .hidden    = continuation_hidden_.ne[0],
                                .ple_state = layout.ple_state ? ple_state_.ne[0] : 0};

@@ -283,6 +283,21 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_count(total_windows),
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
+    // A reference's rows are BF16 logits for the target positions of the text it was written from,
+    // so a run over different text would consume them as if they were its own. The writer stores
+    // sha256 of the first stream's text, which is the one text both sides can hash.
+    std::string text_digest;
+    if (options.reference || options.write_reference) {
+        using ninfer::models::qwen3_5::frontend::sha256;
+        using ninfer::models::qwen3_5::frontend::sha256_hex;
+        text_digest = sha256_hex(sha256(std::string_view(streams.front().source.text)));
+        if (options.reference && reference.text_digest() != text_digest) {
+            throw std::runtime_error(std::format(
+                "reference was built from different text: its sha256 is {}, this corpus is {}",
+                reference.text_digest(), text_digest));
+        }
+    }
+
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
@@ -293,9 +308,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ScoreAggregate overall;
     std::map<std::string, ScoreAggregate> domains;
     KlAggregate overall_kl;
-    // Reference-side NLL over exactly the positions the KL reference scores, so the two runs' mean
-    // NLLs are reported in the same unit.
+    // Reference-side NLL over exactly the positions the KL reference scores, and the model's own
+    // NLL at those same positions, both read from the rows this run's sink sees: delta_nats pairs
+    // the two instead of subtracting means over different position sets.
     ScoreAggregate overall_reference;
+    ScoreAggregate overall_reference_model;
     std::vector<std::uint32_t> written_positions;
     std::vector<std::uint16_t> written_logits;
     std::uint32_t written_vocab = 0;
@@ -355,19 +372,24 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                               (local - window.first_target);
                           const std::uint16_t* reference_row = reference.row(target);
                           if (reference_row == nullptr) { continue; }
-                          window_kl.add(ninfer::perplexity::kl_divergence_row(
-                              reference_row,
+                          const std::uint16_t* model_row =
                               view.values.data() +
-                                  static_cast<std::size_t>(column) * view.vocab_size,
-                              view.vocab_size));
+                                  static_cast<std::size_t>(column) * view.vocab_size;
+                          window_kl.add(ninfer::perplexity::kl_divergence_row(
+                              reference_row, model_row, view.vocab_size));
                           // `target` is a sequence position, not a vocabulary index: the scored
                           // token is stream.tokens[target], the same token score_tokens scores
                           // the model column against.
+                          const std::uint32_t scored =
+                              static_cast<std::uint32_t>(stream.tokens[target]);
                           const float reference_logprob =
                               static_cast<float>(ninfer::perplexity::reference_logprob_row(
-                                  reference_row, view.vocab_size,
-                                  static_cast<std::uint32_t>(stream.tokens[target])));
+                                  reference_row, view.vocab_size, scored));
                           overall_reference.add(std::span<const float>(&reference_logprob, 1));
+                          const float model_logprob =
+                              static_cast<float>(ninfer::perplexity::reference_logprob_row(
+                                  model_row, view.vocab_size, scored));
+                          overall_reference_model.add(std::span<const float>(&model_logprob, 1));
                       }
                   })
                                         : ninfer::LogitsSink{};
@@ -449,12 +471,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     progress->clear();
     if (options.write_reference) {
         if (written_positions.empty()) { throw std::runtime_error("no scored position was kept"); }
-        using ninfer::models::qwen3_5::frontend::sha256;
-        using ninfer::models::qwen3_5::frontend::sha256_hex;
-        ninfer::perplexity::write_reference(
-            *options.write_reference, written_vocab, options.context, options.stride,
-            sha256_hex(sha256(std::string_view(streams.front().source.text))), written_positions,
-            written_logits);
+        ninfer::perplexity::write_reference(*options.write_reference, written_vocab, options.context,
+                                            options.stride, text_digest, written_positions,
+                                            written_logits);
         logger->info("wrote kl reference {} | {} rows | vocab {}",
                      options.write_reference->string(), written_positions.size(), written_vocab);
     }
@@ -471,13 +490,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         domain_reports.push_back(std::move(item));
     }
 
-    // The reference's own NLL, so the accuracy cost reads as delta_nats exactly like a published
-    // "+X% perplexity". scored_tokens states how many positions were paired with the model's own
-    // overall.scored_tokens, which differ when the reference was written with --sample-stride.
+    // The reference's own NLL over the positions it scores, and the model's NLL at those same
+    // positions: delta_nats pairs the two, so it reads exactly like a published "+X% perplexity"
+    // against the reference's own text. scored_tokens states how many positions were paired, which
+    // is below overall's when the reference was written with --sample-stride.
     json reference_report = json{{"scored_tokens", 0}};
     if (options.reference) {
         reference_report               = aggregate_json(overall_reference);
-        reference_report["delta_nats"] = overall.mean_nll() - overall_reference.mean_nll();
+        reference_report["delta_nats"] =
+            overall_reference_model.mean_nll() - overall_reference.mean_nll();
     }
 
     json report{
@@ -549,7 +570,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         std::println("reference: {} tokens | mean_nll {:.6f} | ppl_reference {:.6f} | delta_nats "
                      "{:.6f}\n",
                      overall_reference.scored_tokens, overall_reference.mean_nll(),
-                     overall_reference.ppl(), overall.mean_nll() - overall_reference.mean_nll());
+                     overall_reference.ppl(),
+                     overall_reference_model.mean_nll() - overall_reference.mean_nll());
     }
     std::println("score rate: {:.1f} tok/s",
                  static_cast<double>(overall.scored_tokens) / scoring_seconds);

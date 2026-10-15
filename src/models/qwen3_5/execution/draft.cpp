@@ -359,6 +359,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 ids_flat, scores, work, stream);
         } else {
+            if (!state.execution.parameters.proposal.has_value()) {
+                throw std::logic_error("optimized DFlash proposal head is unavailable");
+            }
             const auto& head = *state.execution.parameters.proposal;
             if (head.token_ids) {
                 ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,

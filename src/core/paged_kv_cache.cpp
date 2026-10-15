@@ -828,7 +828,8 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
     for (std::size_t index = 0; index < page_refs.size(); ++index) {
         const KVPageRef ref = page_refs[index];
         if (!ref.host() &&
-            static_cast<std::uint32_t>(ref.word()) >= pages_->capacity_pages()) {
+            (static_cast<std::uint32_t>(ref.word()) >= pages_->capacity_pages() ||
+             !pages_->page_allocated_[static_cast<std::size_t>(ref.word())])) {
             throw std::invalid_argument("Paged KV execution mapping names a missing Device page");
         }
         shadow[index] = ref.word();

@@ -48,7 +48,9 @@ struct QuantizeOptions {
 [[nodiscard]] std::string quantize_usage_text(const char* argv0);
 
 // Logical parameter names carry '/', which is fine for safetensors keys but not for one flat
-// Hessian filename per parameter.
+// Hessian filename per parameter. '/', '\\' and ':' all become '_', so the mapping is lossy: two
+// distinct names can sanitize to the same stem. An empty name is rejected with
+// std::invalid_argument rather than returning one.
 [[nodiscard]] std::string sanitize_parameter_name(std::string_view name);
 
 // Rate in half bits for one logical parameter: the output head uses head_bits_half, and --hq

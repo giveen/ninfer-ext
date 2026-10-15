@@ -292,6 +292,10 @@ void TextContext::qwen4_gdn(const Qwen4GdnParameters& p, const Tensor& x, int gi
         Tensor v3          = vc.view({vwidth, W, B});
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, B);
+            if (records.conv.data == nullptr || records.conv.ne[0] != conv ||
+                records.conv.ne[1] != W || records.conv.ne[2] != B) {
+                throw std::logic_error("Qwen4Exp GDN replay record does not match the round width");
+            }
             CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv.data, qkv.bytes(),
                                        cudaMemcpyDeviceToDevice, s));
             ops::gdn_projected_conv_record(records.conv, p.convolution, conv_states, valid,
@@ -455,14 +459,20 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         const ops::ExpertWeights staged = experts.acquire_staged(
             cache_layer, p.bank, static_cast<std::int32_t>(next),
             has_next ? &qwen4_->layers[next].moe.bank : nullptr, forward_start, s);
-        if (p.bank.gate_up_input_divisor > 0.0F) {
-            ops::moe_experts_a4(x, roots.ids, roots.weights, roots.shared_gate, roots.shared,
-                                staged, work_, y, s);
-        } else {
-            ops::moe_experts(x, roots.ids, roots.ids, roots.weights, roots.shared_gate,
-                             roots.shared, staged, ops::kOffloadMoeExperts, work_, y, s);
+        try {
+            if (p.bank.gate_up_input_divisor > 0.0F) {
+                ops::moe_experts_a4(x, roots.ids, roots.weights, roots.shared_gate, roots.shared,
+                                    staged, work_, y, s);
+            } else {
+                ops::moe_experts(x, roots.ids, roots.ids, roots.weights, roots.shared_gate,
+                                 roots.shared, staged, ops::kOffloadMoeExperts, work_, y, s);
+            }
+            if (capture_experts) { qwen4_capture_all_experts(x, staged, calibration_layer); }
+        } catch (...) {
+            // The bank's next reader waits on this release, so record it even when a reader fails.
+            experts.release_staged(cache_layer, s);
+            throw;
         }
-        if (capture_experts) { qwen4_capture_all_experts(x, staged, calibration_layer); }
         experts.release_staged(cache_layer, s);
         return;
     }

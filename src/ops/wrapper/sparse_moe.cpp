@@ -154,6 +154,12 @@ void require_nvfp4(const Weight& weight, std::int32_t n, std::int32_t k, const c
         address_range(weight.qdata, geometry.code_plane_bytes, std::string(name) + " code"));
     ranges.push_back(
         address_range(weight.scales, geometry.scale_plane_bytes, std::string(name) + " scales"));
+    // The kernels divide each source's rows by its divisor, which the payload holds after the
+    // scales, so an operand aliasing that plane has to be caught here too.
+    ranges.push_back(address_range(weight.weight_divisors,
+                                   static_cast<std::size_t>(weight.n / weight.weight_divisor_rows) *
+                                       sizeof(float),
+                                   std::string(name) + " divisors"));
 }
 
 void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {

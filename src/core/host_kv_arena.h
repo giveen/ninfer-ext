@@ -245,6 +245,11 @@ public:
         return capacity_bytes_ - occupied_bytes_;
     }
 
+    /** Allocations `split` or `allocate` can still take before any of them is released. */
+    [[nodiscard]] std::uint32_t available_descriptors() const noexcept {
+        return static_cast<std::uint32_t>(free_descriptors_.size());
+    }
+
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
 
     [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,

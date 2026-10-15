@@ -72,9 +72,11 @@ std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_vi
 }
 
 std::string codepoint_to_utf8(std::int32_t codepoint) {
+    if (!utf8proc_codepoint_valid(codepoint)) {
+        throw std::invalid_argument("invalid Unicode codepoint");
+    }
     utf8proc_uint8_t buffer[4];
     const utf8proc_ssize_t length = utf8proc_encode_char(codepoint, buffer);
-    if (length <= 0) { throw std::invalid_argument("invalid Unicode codepoint"); }
     return {reinterpret_cast<const char*>(buffer), static_cast<std::size_t>(length)};
 }
 

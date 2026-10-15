@@ -60,6 +60,9 @@ public:
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
 
+    // The session is movable. Queries answer on an empty session with their neutral values; every
+    // call that previews, commits, discards or validates output rejects one with std::logic_error.
+
     [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
                                                         std::uint32_t total_budget_remaining,
                                                         FinishReason limit_reason);

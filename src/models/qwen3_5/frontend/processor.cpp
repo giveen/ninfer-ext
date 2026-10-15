@@ -837,6 +837,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
+    // The builder runs inside the digest-keyed singleflight flight other requests may join, so its
+    // only cancellation is this request's own abort flag; the caller's view is checked on this
+    // thread by check_preparation_control and inside await.
     const PreparationControl worker_control{
         .deadline     = control.deadline,
         .cancellation = CancellationView(

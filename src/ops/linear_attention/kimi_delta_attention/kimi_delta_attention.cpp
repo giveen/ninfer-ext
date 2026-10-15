@@ -5,6 +5,8 @@
 
 #include <cuda_bf16.h>
 
+#include <array>
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -57,6 +59,46 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     const auto lhs_end   = lhs_begin + lhs.bytes();
     const auto rhs_end   = rhs_begin + rhs.bytes();
     return lhs_begin < rhs_end && rhs_begin < lhs_end;
+}
+
+// The recurrent and chunked kernels declare every represented operand and the output __restrict__:
+// they must be pairwise disjoint and disjoint from both states. The state pair has its own rule at
+// the call site.
+void require_operand_nonoverlap(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                                const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+                                const Tensor& out, const Tensor& state_in,
+                                const Tensor& state_out) {
+    const std::array<const Tensor*, 8> operands{&q, &k, &v, &g, &beta, &a_log, &dt_bias, &out};
+    for (std::size_t lhs = 0; lhs < operands.size(); ++lhs) {
+        for (std::size_t rhs = lhs + 1; rhs < operands.size(); ++rhs) {
+            if (overlaps(*operands[lhs], *operands[rhs])) {
+                throw std::invalid_argument(
+                    "kimi_delta_attention: tensor operands must not overlap");
+            }
+        }
+        if (overlaps(*operands[lhs], state_in) || overlaps(*operands[lhs], state_out)) {
+            throw std::invalid_argument(
+                "kimi_delta_attention: tensor operands must not overlap the state");
+        }
+    }
+}
+
+// The batch update reads and writes its selected state rows in place, and its kernel declares the
+// pooled states, the selectors and the output __restrict__: no two operands may share storage.
+void require_batch_nonoverlap(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+                              const Tensor& ssm_states, const Tensor& state_slots,
+                              const Tensor& out) {
+    const std::array<const Tensor*, 10> tensors{&q,     &k,       &v,          &g,           &beta,
+                                                &a_log, &dt_bias, &ssm_states, &state_slots, &out};
+    for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
+        for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
+            if (overlaps(*tensors[lhs], *tensors[rhs])) {
+                throw std::invalid_argument(
+                    "kimi_delta_attention: tensor operands must not overlap");
+            }
+        }
+    }
 }
 
 void require_control_parameters(float lower_bound, float scale) {
@@ -120,6 +162,7 @@ Geometry validate(const Tensor& q, const Tensor& k, const Tensor& v, const Tenso
         throw std::invalid_argument(
             "kimi_delta_attention: state input/output may only be disjoint or exactly alias");
     }
+    require_operand_nonoverlap(q, k, v, g, beta, a_log, dt_bias, out, state_in, state_out);
     return geometry;
 }
 
@@ -176,6 +219,7 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     require_contiguous_nonnull(out, "out");
 
     require_control_parameters(lower_bound, scale);
+    require_batch_nonoverlap(q, k, v, g, beta, a_log, dt_bias, ssm_states, state_slots, out);
     return geometry;
 }
 

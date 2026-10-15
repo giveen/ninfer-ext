@@ -538,6 +538,7 @@ std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
 }
 
 void OutputSession::discard_preview() {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->grammar) { impl_->grammar->discard(); }
     impl_->preview_ready = false;
     impl_->preview_output.clear();
@@ -772,7 +773,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
 }
 
 PublishedOutput OutputSession::commit_preview() {
-    if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
+    if (impl_ == nullptr || !impl_->preview_ready) { throw std::logic_error("no output preview"); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);

@@ -496,11 +496,11 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
                             ? static_cast<int>(probe.stream()->nb_frames)
                             : 0;
     plan.duration     = probe.duration_seconds();
-    if (plan.total_frames == 0 && plan.duration > 0.0) {
-        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
-    }
     if (plan.duration > policy.max_video_duration_seconds) {
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
     if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }

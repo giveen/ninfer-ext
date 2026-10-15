@@ -110,6 +110,13 @@ std::string quoted(unsigned char c) {
 // A small DFA consumes through the first complete delimiter, including delimiters split across
 // tokens. Concatenation keeps the user's rule names in their own namespace.
 xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
+    // xgrammar reads a GBNF `\xNN` escape as a codepoint and re-encodes it as UTF-8, so a byte
+    // above 0x7f cannot be written as the single byte this byte-wise DFA compares; the grammar
+    // would silently match a different byte sequence. Only ASCII delimiters are expressible.
+    if (std::any_of(delimiter.begin(), delimiter.end(),
+                    [](char byte) { return static_cast<unsigned char>(byte) >= 0x80; })) {
+        throw std::invalid_argument("reasoning delimiter must be ASCII");
+    }
     std::string alphabet(delimiter);
     std::sort(alphabet.begin(), alphabet.end());
     alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());

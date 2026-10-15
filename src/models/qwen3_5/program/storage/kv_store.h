@@ -988,6 +988,9 @@ public:
             stream_begin > stream_end) {
             throw std::logic_error("KV address space is not reservable for activation");
         }
+        // The frontier names the members the activation covers: the caller trims the address to
+        // `pages_for_tokens(frontier)` before committing, and commit_activation refuses a frontier
+        // that does not cover the mapped membership.
         const std::uint32_t required_pages =
             activation_frontier ? pages_for_tokens(*activation_frontier) : address.page_count;
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
@@ -1061,11 +1064,23 @@ public:
              address.committed_frontier != *activation.activation_frontier_)) {
             throw std::logic_error("KV activation destination changed after reservation");
         }
+        // prepare_activation sizes the growth reservation over the frontier's members while every
+        // loop here walks the mapped membership: they are one page basis only when the caller has
+        // trimmed the address to the frontier first.
+        if (activation.activation_frontier_ &&
+            pages_for_tokens(*activation.activation_frontier_) != address.page_count) {
+            throw std::logic_error("KV activation frontier does not cover the mapped membership");
+        }
         std::uint32_t streamed = 0;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
             if (streams_member(address, page, activation.stream_begin_, activation.stream_end_)) {
                 ++streamed;
+                // A streamed member is read in place and never written, but one this address
+                // solely owns still loses its protection below, which a source pin forbids.
+                if (pages_->address_references(logical) == 1 && pages_->source_pins(logical) != 0) {
+                    throw std::logic_error("KV activation has an unavailable streamed member");
+                }
                 continue;
             }
             if (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
@@ -1081,6 +1096,12 @@ public:
             activation.page_reservation_.pages() != expected) {
             throw std::logic_error("KV activation capacity reservation changed");
         }
+        // Publish before the address or any of its members change. The checks above cover the
+        // member loop below (device residency, writer and source-pin availability for every
+        // member), and this address being inactive is what leaves each member with
+        // `active_references < references` for its retain; the hand-over below then moves only
+        // the reservation, the row and the flags, so a failed copy leaves the address as found.
+        publish_membership(address, activation.row_->handle(), stream);
         address.reservation = std::move(activation.page_reservation_);
         address.row.emplace(std::move(*activation.row_));
         activation.row_.reset();
@@ -1096,7 +1117,6 @@ public:
             }
             pages_->retain_active_reference(logical);
         }
-        publish_membership(address, stream);
     }
 
     void deactivate(KVAddressSpaceHandle handle) {
@@ -1334,8 +1354,16 @@ public:
         if (valid(fork.source_)) {
             Address& source                    = addresses_[fork.source_.index_];
             const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+            // prepare_prefix_fork pins every member it does not stream and commit_prefix_fork
+            // unpins exactly those: a member inside the stream window was never pinned by this
+            // reservation, so any pin it holds belongs to another one over the same source.
+            const auto streamed = [&](std::uint32_t page) {
+                return page >= fork.stream_begin_ && page < fork.stream_end_ &&
+                       page < fork.full_pages_ && pages_->can_stream(membership(source, page));
+            };
             for (std::uint32_t page = 0; page < required_pages; ++page) {
                 if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
+                if (streamed(page)) { continue; }
                 const LogicalKVPageHandle logical = membership(source, page);
                 if (pages_->valid(logical) && pages_->source_pins(logical) != 0) {
                     pages_->unpin_source(logical);
@@ -2041,13 +2069,15 @@ private:
                pages_->can_stream(membership(address, page));
     }
 
-    void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
-        if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
+    // Publishes `address`'s members into `row`, which the caller still owns: an activation
+    // publishes its execution table before the destination address takes the row over.
+
+    void publish_membership(const Address& address, KVExecutionRowHandle row, cudaStream_t stream) {
         publish_scratch_.clear();
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             publish_scratch_.push_back(pages_->table_ref(membership(address, page)));
         }
-        tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+        tables_->publish(row, 0, publish_scratch_, stream);
     }
 
     LogicalKVPageStore* pages_    = nullptr;

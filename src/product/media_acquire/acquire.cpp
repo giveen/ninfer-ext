@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -177,6 +178,7 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
 struct CurlBuffer {
     std::vector<std::uint8_t> bytes;
     std::size_t limit = 0;
+    std::exception_ptr failure;
 };
 
 int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
@@ -189,14 +191,19 @@ int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) 
     } catch (...) { return 1; }
 }
 
-std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) {
+std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) noexcept {
     auto& out = *static_cast<CurlBuffer*>(opaque);
+    try {
     if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { return 0; }
     const std::size_t amount = size * count;
     if (amount > out.limit - std::min(out.limit, out.bytes.size())) { return 0; }
     out.bytes.insert(out.bytes.end(), reinterpret_cast<std::uint8_t*>(data),
                      reinterpret_cast<std::uint8_t*>(data) + amount);
     return amount;
+    } catch (...) {
+        out.failure = std::current_exception();
+        return 0;
+    }
 }
 
 std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
@@ -247,6 +254,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
             check_control(policy);
+            if (buffer.failure) { std::rethrow_exception(buffer.failure); }
             if (code == CURLE_OPERATION_TIMEDOUT) {
                 throw Error(ErrorKind::RemoteTimeout,
                             "media URL fetch timed out: " + std::string(curl_easy_strerror(code)));

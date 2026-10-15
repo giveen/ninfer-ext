@@ -587,14 +587,16 @@ public:
             source.transfer_id        = 0;
             break;
         case StateTransferDirection::HostToDevice:
-            source.device_slot = source.pending_device_slot;
-            source.pending_device_slot.reset();
+            // The pending slot stays abortable (abort_transfer returns it) until the last
+            // fallible step has succeeded, so a failed release leaves the object untouched.
             if (!keep_source_replica) {
                 if (host_ == nullptr || !host_->release(*source.host_slot)) {
                     throw std::logic_error("StateImage Host replica release failed at publication");
                 }
                 source.host_slot.reset();
             }
+            source.device_slot = source.pending_device_slot;
+            source.pending_device_slot.reset();
             --source.source_pins;
             source.destination_pinned = false;
             source.transfer_id        = 0;

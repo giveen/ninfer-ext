@@ -137,6 +137,9 @@ void PleRowReader::read(std::span<const Range> ranges) {
             }
         }));
     }
+    // Every task is awaited before the first failure is rethrown: an abandoned task would still
+    // be writing staging_ while the caller reacts to the failure.
+    for (auto& task : pending) { task.wait(); }
     for (auto& task : pending) { task.get(); }
 
     // Consecutive pages of one range are adjacent in the sorted page list.

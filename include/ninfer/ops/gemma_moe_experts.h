@@ -61,8 +61,9 @@ namespace ninfer::ops {
  *   between calls.
  *
  * Workspace:
- *   Caller-owned, graph-stable transient storage of at least `gemma_moe_experts_workspace_bytes`
- *   for the call's geometry, bank format and T, carrying no state beyond the call. An NVFP4 or
+ *   Caller-owned, graph-stable, 16-byte aligned transient storage of at least
+ *   `gemma_moe_experts_workspace_bytes` for the call's geometry, bank format and T, carrying no
+ *   state beyond the call. An NVFP4 or
  *   q4_g32_fp16_rows pair at a registered geometry (the 26B-A4B's H 2816, stored I 768, K 8)
  *   streams every selected expert over the whole machine and keeps each rank's FP32 GeGLU product
  *   there; every other pair needs none. The Op allocates nothing.

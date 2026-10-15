@@ -32,10 +32,14 @@ struct ProfileOption {
     } catch (const nlohmann::json::exception& error) {
         throw std::invalid_argument("--profile is not valid JSON: " + std::string(error.what()));
     }
-    if (document.value("artifact_type", std::string()) != "ninfer_serve_profile") {
+    if (!document.is_object()) {
+        throw std::invalid_argument("--profile must be a JSON object: " + path);
+    }
+    if (!document.contains("artifact_type") || !document.at("artifact_type").is_string() ||
+        document.at("artifact_type").get<std::string>() != "ninfer_serve_profile") {
         throw std::invalid_argument("--profile is not a ninfer_serve_profile: " + path);
     }
-    if (document.value("schema_version", 0) != 1) {
+    if (!document.contains("schema_version") || document.at("schema_version") != 1) {
         throw std::invalid_argument("--profile has an unsupported schema_version: " + path);
     }
     const auto options = document.find("options");

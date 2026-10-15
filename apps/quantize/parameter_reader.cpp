@@ -111,7 +111,7 @@ std::vector<float> read_parameter_matrix(const artifact::Reader& reader,
         const auto& geometry = reader.geometry(part.object);
         const std::uint64_t bytes_per_word = word_bytes(geometry);
         const std::vector<std::byte> payload = reader.read_object(part.object);
-        if (part.end * bytes_per_word > payload.size()) {
+        if (part.end > payload.size() / bytes_per_word) {
             throw std::runtime_error(parameter.name + ": binding range exceeds its object");
         }
         for (std::uint64_t element = part.begin; element < part.end; ++element) {

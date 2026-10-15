@@ -148,10 +148,15 @@ struct MediaPreprocessCache::Impl {
         bool evict_one_locked() {
             if (lru.empty()) { return false; }
             const MediaCacheKey key = lru.back();
-            auto found              = ready.find(key);
-            if (found == ready.end() || found->second.bytes > retained_bytes) { std::terminate(); }
-            retained_bytes -= found->second.bytes;
             lru.pop_back();
+            auto found = ready.find(key);
+            if (found == ready.end()) {
+                // A ready-entry insert that threw after its LRU push leaves the key listed but not
+                // ready; dropping the listing is the whole cleanup.
+                return true;
+            }
+            if (found->second.bytes > retained_bytes) { std::terminate(); }
+            retained_bytes -= found->second.bytes;
             ready.erase(found);
             ++evictions;
             return true;

@@ -110,6 +110,8 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
             "index query must be [heads*dim,W,B]");
     require_positions(query_rope_positions, columns, op);
     require_dense(table_rows, DType::I32, op, "table rows");
+    require(table_rows.numel() == cache_positions.ne[1], op, "one table row per lane");
+    require_dense(index.block_tables, DType::I32, op, "index block tables");
     require_dense(query_norm, DType::BF16, op, "query norm");
     require_dense(key_norm, DType::BF16, op, "key norm");
     require_dense(selected, DType::I32, op, "selected");
@@ -169,6 +171,8 @@ void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts
     require_dense(out, DType::BF16, op, "out");
     require(out.numel() == q.numel() && out.data != q.data, op, "out must match q and not alias");
     require_dense(selected, DType::I32, op, "selected");
+    require(selected.numel() == static_cast<std::int64_t>(q.ne[2]) * q.ne[3] * selected.ne[0], op,
+            "selected must be [max_selected,W,B]");
     require_dense(counts, DType::I32, op, "counts");
     require(counts.numel() == static_cast<std::int64_t>(q.ne[2]) * q.ne[3], op,
             "counts must be [W,B]");

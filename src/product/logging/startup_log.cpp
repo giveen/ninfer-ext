@@ -221,6 +221,9 @@ struct StartupLogRenderer::Impl {
             const Clock::time_point now = Clock::now();
             PhaseProgress& state        = phases[index];
             update_rate(state, event.current, now);
+            // A debug phase's begin and complete are debug-level records, so its progress must not
+            // reach the terminal line or the info level either.
+            if (presentation.visibility == PhaseVisibility::Debug) { return; }
             if (progress->enabled()) {
                 if (now - state.last_interactive < kInteractiveRefresh) { return; }
                 state.last_interactive = now;

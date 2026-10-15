@@ -78,7 +78,8 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     for (auto& item : pending) {
         if (item.reference.residency == artifact::Residency::HostFile) {
             const auto& parts = item.reference.binding.parts;
-            if (parts.size() != 1 || parts[0].begin != 0) {
+            if (parts.size() != 1 || parts[0].begin != 0 ||
+                materialized.file_geometry(parts[0].object).shape != item.reference.shape) {
                 throw artifact::ArtifactError(item.reference.name +
                                               ": a file-mapped weight must bind a whole object");
             }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <mutex>
 
 namespace ninfer::artifact {
 
@@ -18,6 +19,7 @@ struct Reader::Impl {
     std::uint64_t file_bytes          = 0;
     mutable std::vector<std::unique_ptr<InputFile>> files;
     mutable std::vector<std::optional<WeightGeometry>> geometries;
+    mutable std::mutex geometries_mutex;
 
     explicit Impl(const std::filesystem::path& path) : entry(path) {
         auto file = std::make_unique<InputFile>(entry);
@@ -105,6 +107,7 @@ ObjectHandle Reader::find(std::string_view id) const {
 
 const WeightGeometry& Reader::geometry(ObjectHandle handle) const {
     const auto& tensor = directory().tensor(handle);
+    std::lock_guard lock(impl_->geometries_mutex);
     auto& result       = impl_->geometries[handle.index];
     if (!result) { result = describe_tensor(tensor); }
     return *result;

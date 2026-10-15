@@ -109,6 +109,10 @@ std::vector<MessagePart> parse_content(const Json& content, std::size_t message_
             throw std::invalid_argument("message " + std::to_string(message_index) +
                                         " content parts must be objects");
         }
+        if (item.contains("type") && !item.at("type").is_string()) {
+            throw std::invalid_argument("message " + std::to_string(message_index) +
+                                        " content part type must be a string");
+        }
         const std::string type = item.value("type", "");
         MessagePart part;
         if (type == "text" || item.contains("text")) {

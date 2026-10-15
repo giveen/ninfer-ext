@@ -160,6 +160,17 @@ MatrixResult quantize_matrix(const std::string& name, const std::vector<float>& 
     return result;
 }
 
+// A sidecar is resumable only while it still parses. A job killed between the shard write and the
+// sidecar write leaves a truncated manifest, which must make the shard get rewritten instead of
+// aborting the whole run in the outer handler.
+bool sidecar_resumable(const std::filesystem::path& sidecar) {
+    if (!std::filesystem::is_regular_file(sidecar)) { return false; }
+    std::ifstream in(sidecar, std::ios::binary);
+    const nlohmann::json prior = nlohmann::json::parse(in, nullptr, false);
+    return prior.is_object() && prior.contains("names") && prior["names"].is_array() &&
+           prior.contains("tensors") && prior["tensors"].is_array();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -305,8 +316,7 @@ int main(int argc, char** argv) {
                     "exl3-" + app::sanitize_parameter_name(bank.key) + ".safetensors";
                 const std::filesystem::path shard   = options.output / shard_name;
                 const std::filesystem::path sidecar = options.output / (shard_name + ".json");
-                if (std::filesystem::is_regular_file(shard) &&
-                    std::filesystem::is_regular_file(sidecar)) {
+                if (std::filesystem::is_regular_file(shard) && sidecar_resumable(sidecar)) {
                     std::ifstream in(sidecar);
                     const nlohmann::json prior = nlohmann::json::parse(in);
                     for (const auto& name : prior["names"]) { expert_files[name.get<std::string>()] = shard_name; }
@@ -321,7 +331,7 @@ int main(int argc, char** argv) {
                 }
                 const auto& part = bank.binding.parts.front();
                 const std::vector<std::byte> payload = reader.read_object(part.object);
-                if (bank.binding.parts.size() != 1 || part.end * 2 > payload.size()) {
+                if (bank.binding.parts.size() != 1 || part.end > payload.size() / 2) {
                     throw std::runtime_error(bank.key + ": expert bank is not one BF16 object");
                 }
                 std::vector<app::SafetensorsTensor> shard_tensors;

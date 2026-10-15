@@ -37,7 +37,7 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
                 static_cast<const __nv_bfloat162*>(table.data),
                 static_cast<const std::int32_t*>(indices.data),
                 static_cast<const float*>(weights.data), static_cast<__nv_bfloat162*>(x.data),
-                x.ne[1], tiles);
+                x.ne[1], tiles, table.ne[1]);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -46,7 +46,7 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
                 static_cast<const __nv_bfloat162*>(table.data),
                 static_cast<const std::int32_t*>(indices.data),
                 static_cast<const float*>(weights.data), static_cast<__nv_bfloat162*>(x.data),
-                x.ne[1]);
+                x.ne[1], table.ne[1]);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

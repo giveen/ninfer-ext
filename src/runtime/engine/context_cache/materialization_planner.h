@@ -1293,7 +1293,8 @@ private:
                  .demand_mask          = checkpoint.demand_mask,
                  .rebuild_ns           = checkpoint.rebuild_ns,
                  .baseline_recovery_ns = checkpoint.baseline_recovery_ns,
-                 .target_recovery_ns   = recovery});
+                 .target_recovery_ns   = recovery,
+                 .unreachable          = checkpoint.unreachable});
         }
         const auto value =
             portfolio_value_.fold(portfolio_owner_scratch_, portfolio_checkpoint_scratch_);

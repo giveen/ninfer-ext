@@ -10,7 +10,8 @@ __global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* tab
                                                        const std::int32_t* indices,
                                                        const float* weights, __nv_bfloat162* x,
                                                        std::int32_t patches,
-                                                       std::int32_t tiles_per_patch) {
+                                                       std::int32_t tiles_per_patch,
+                                                       std::int32_t table_rows) {
     constexpr int pairs = 1152 / 2;
     const int lane      = static_cast<int>(threadIdx.x);
     const int patch     = static_cast<int>(blockIdx.x) / tiles_per_patch;
@@ -34,6 +35,8 @@ __global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* tab
         float hi = 0.0f;
 #pragma unroll
         for (int corner = 0; corner < 4; ++corner) {
+            // A corner index outside the table contributes nothing, as in the scalar route.
+            if (corner_indices[corner] < 0 || corner_indices[corner] >= table_rows) { continue; }
             const float2 value = __bfloat1622float2(
                 table[static_cast<std::int64_t>(corner_indices[corner]) * pairs + pair]);
             lo += value.x * corner_weights[corner];
@@ -49,7 +52,7 @@ template <int Block>
 __launch_bounds__(Block) __global__
     void vision_pos_embed_add_d1152_kernel(const __nv_bfloat162* table, const std::int32_t* indices,
                                            const float* weights, __nv_bfloat162* x,
-                                           std::int32_t patches) {
+                                           std::int32_t patches, std::int32_t table_rows) {
     constexpr int d     = 1152;
     constexpr int pairs = d / 2;
     const int patch     = static_cast<int>(blockIdx.x);
@@ -69,6 +72,8 @@ __launch_bounds__(Block) __global__
         float hi = 0.0f;
 #pragma unroll
         for (int corner = 0; corner < 4; ++corner) {
+            // A corner index outside the table contributes nothing, as in the scalar route.
+            if (corner_indices[corner] < 0 || corner_indices[corner] >= table_rows) { continue; }
             const float2 value = __bfloat1622float2(
                 table[static_cast<std::int64_t>(corner_indices[corner]) * pairs + pair]);
             lo += value.x * corner_weights[corner];

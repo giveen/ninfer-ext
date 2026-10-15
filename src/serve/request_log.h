@@ -6,6 +6,7 @@
 #include "serve/request_events.h"
 #include "serve/serve_options.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -72,7 +73,7 @@ public:
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
+    [[nodiscard]] bool enabled() const noexcept { return output_.is_open() && !failed_; }
 
     [[nodiscard]] const std::string& server_instance_id() const noexcept {
         return server_instance_id_;
@@ -97,7 +98,8 @@ private:
     std::ofstream output_;
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
-    bool failed_ = false;
+    // Set by append() under `mutex_`, read by enabled() from the request threads.
+    std::atomic<bool> failed_{false};
 };
 
 } // namespace ninfer::serve

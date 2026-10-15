@@ -237,6 +237,17 @@ public:
     ObserverScope& operator=(const ObserverScope&) = delete;
 };
 
+// Clears the per-expert observers when the enclosing pass leaves its scope, including on a throw:
+// their lambdas capture the accumulator by reference, so leaving one installed past the
+// accumulator's lifetime would dangle.
+class ExpertObserverScope {
+public:
+    ~ExpertObserverScope() {
+        ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
+        ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
+    }
+};
+
 } // namespace
 
 CalibrationResult calibrate(const std::filesystem::path& activation_model,
@@ -352,6 +363,7 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
             return accumulator.wants_experts(layer);
         };
+        ExpertObserverScope expert_scope;
         for (std::uint32_t row = 0; row < rows; ++row) {
             const std::int32_t length = trace.lengths[row];
             if (length < 2) { continue; }
@@ -364,8 +376,6 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
             if (group_index == 0) { result.tokens += static_cast<std::uint64_t>(length); }
         }
         result.hessians += accumulator.flush();
-        ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
-        ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
         std::fprintf(stderr, "calibration group %zu/%zu done (%llu Hessians so far)\n",
                      group_index + 1, groups.size(),
                      static_cast<unsigned long long>(result.hessians));
@@ -409,6 +419,7 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
             ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
                 return mtp_accumulator.wants_experts(layer);
             };
+            ExpertObserverScope mtp_expert_scope;
             for (std::uint32_t row = 0; row < mtp_rows; ++row) {
                 const std::int32_t length = trace.lengths[row];
                 if (length < 2) { continue; }
@@ -425,14 +436,16 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                 request.stop.include_model_defaults       = false;
                 (void)gen.generate(gen.prepare_tokens(std::move(tokens)), request);
             }
-            ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
-            ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
             result.hessians += mtp_accumulator.flush();
             std::fprintf(stderr, "MTP calibration over %u rows (%llu Hessians so far)\n", mtp_rows,
                          static_cast<unsigned long long>(result.hessians));
         }
     }
-    result.skipped_names = 0;
+    // Names no pass observed (for example MTP sites the generation pass never reached) wrote no
+    // Hessian, so they are the skipped ones the report and stderr line count.
+    std::uint64_t expected_names = 0;
+    for (const auto& [key, value] : names) { expected_names += value.size(); }
+    result.skipped_names = expected_names - result.hessians;
     return result;
 }
 
