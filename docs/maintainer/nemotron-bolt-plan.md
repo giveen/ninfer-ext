@@ -155,8 +155,9 @@ already opaque.
 
 1. **Oracle — done.** `tools/verify/nemotron_h_reference.py` dumps every stage an op has to reproduce
    (29 stages on the tiny config), from a scaled-down config or a downloaded checkpoint.
-2. **Config and artifact** (next): the per-layer FFN descriptor, the loader threading and the converter's
-   per-layer loops. The artifact format does not change.
+2. **Config and artifact — config done, the rest next.** The per-layer block descriptor is parsed and
+   tested; what remains here is the loader threading and the converter's per-layer loops. The artifact
+   format does not change.
 3. **Ops, one at a time, each against the oracle**: `relu2` + RMSNorm → Mamba-2 (selective scan, fp32
    state) → router + non-gated experts → the latent round trip → the new latent-MoE op → attention →
    the block → the 88-block forward.
@@ -168,11 +169,6 @@ already opaque.
 - The draft pairs with the **24GB NVFP4** target, not the BF16 one, so its qualification belongs on our
   NVFP4 route; the cheap decisive check is ranking the draft's token inside the target's own next-token
   distribution, the diagnostic that exposed the Gemma 4 QAT mismatch.
-- `e_score_correction_bias` is a buffer in the reference and must be confirmed against the released
-  checkpoint's tensors.
-- Whether the released checkpoint's expert banks are one fused tensor per layer or one per expert; the
-  reference's expert weights are 3-D `(num_experts, out, in)` while llama.cpp derives the count from the
-  router width.
 - The host-offload cache pins the expert set, so the maintenance machine's 32 GiB of RAM is itself a
   constraint: the pinned experts at EXL3 3.5 are roughly 25 GB, which leaves little for the host KV
   arena, the state images and the OS. Flash-Next's guide asks for about 65 GiB for a larger model; this
