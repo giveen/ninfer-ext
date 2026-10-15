@@ -45,6 +45,18 @@ The executable `--help` output is the exact source for command-line option spell
 - [Tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
 
+## Review records
+
+The [review directory](review/) holds the review pass that drove the fix waves merged in PR #52, and
+its triage. These are records of completed work, not active contracts.
+
+| File | Contents |
+|---|---|
+| [review-triage.md](review/review-triage.md) | the triage: each finding's verdict and band, with a ledger per fix wave |
+| [review-triage.json](review/review-triage.json) | the same triage in machine-readable form |
+| [review-results.txt](review/review-results.txt) | the raw review output: 1,286 findings across 565 files |
+| [critical-triage.txt](review/critical-triage.txt) | a separate critical-only pass over the same tree |
+
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,

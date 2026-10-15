@@ -1,0 +1,932 @@
+106-[bug · medium] This merge overload is declared `noexcept`, while the `std::span` overload is allowed
+107:to throw on `scored_tokens` overflow. Merging two aggregates therefore silently wraps
+108-`scored_tokens` (and produce a wrong `mean_nll`/`ppl`) once the combined count exceeds `uint64_t`.
+109-Either validate the accumulation on merge (and drop `noexcept`) or document the saturation behaviour
+110-explicitly so the inconsistency with `add(std::span)` is intentional.
+111-
+112-
+--
+117-async-signal-safe. If a signal is delivered on a thread that currently holds one of those locks
+118:(e.g. while `listen()`/route handling is running), the handler can deadlock or corrupt state — the
+119-POSIX contract only permits async-signal-safe functions here. Prefer setting an `std::atomic<bool>`
+120-flag in the handler and having the main/accept loop poll it to perform the stop (or use a
+121-self-pipe), and install the handler with `sigaction` rather than `std::signal`.
+122-
+123-
+--
+138-(see `trace_reader.cpp`). A trace whose row width exceeds `INT32_MAX` (yet still <= `UINT32_MAX`)
+139:would make the reader's narrowing cast overflow into a negative value. Make the element types
+140-consistent with the dimension types (e.g. `std::uint32_t`), or explicitly document/cap the I32
+141-domain in the contract.
+142-
+143-
+144-
+--
+153-─── apps/quantize/trace_reader.cpp:104-109 ───
+154:[security · critical] `read_i64` computes `count` from the declared tensor shape but never checks it
+155-against the entry's declared data range `[begin, end)`. `parse_header` only guarantees `end <=
+156-data_bytes`, not that `count * sizeof(int64_t) <= end - begin`. If a header declares a shape larger
+157-than its `data_offsets` range (malformed or malicious trace), the `memcpy` reads past the entry's
+158-region and potentially past the end of `bytes`, causing a heap out-of-bounds read. Add a bounds
+159:check before copying (using division to avoid overflow).
+160-
+161-      const auto read_i64 = [&](const Entry& entry, std::uint64_t count) {
+162-+         const std::uint64_t range = entry.end - entry.begin;
+163-+         if (range < sizeof(std::int64_t) || count > range / sizeof(std::int64_t)) {
+164-+             throw std::invalid_argument("trace tensor shape does not match its data range");
+--
+355-─── apps/quantize/parameter_reader.cpp:114-116 ───
+356:[security · medium] The bounds check multiplies two 64-bit values before comparing, so it can
+357:overflow. With a malformed artifact where `part.end` is very large, `part.end * bytes_per_word`
+358-wraps around and the guard passes even though the range is out of bounds, after which
+359-`payload[at]`/`payload[at + 1]` read past the vector. Compare using division so the multiplication
+360-cannot wrap.
+361-
+362--         if (part.end * bytes_per_word > payload.size()) {
+--
+457-[bug · low] Exception-safety: the loop mutates `total_nll` before the `scored_tokens` capacity check
+458:runs, so if the overflow `throw` fires the aggregate is left inconsistent (`total_nll` includes the
+459-new logprobs but `scored_tokens` does not, making `mean_nll()`/`ppl()` wrong). Validate
+460-`logprobs.size()` against the remaining `uint64` capacity *before* accumulating, so the operation
+461-either fully succeeds or leaves the object untouched.
+462-
+463-
+--
+773-DType::BF16`, a contiguous tensor, and non-null `x.data`, throwing `std::invalid_argument`
+774:otherwise, and throws `std::overflow_error` if the element count overflows `int64` (an empty tensor
+775-returns without touching `x`). Other op headers in this project document such throwing behavior, so
+776-adding a short note here would keep the interface contract complete and save callers from
+777-discovering it by trial and error.
+778-
+779-+ // Preconditions: x must be a contiguous BF16 tensor with non-null data. Invalid
+780:+ // dtype/contiguity/null data throw std::invalid_argument and a size overflow throws
+781:+ // std::overflow_error; an empty (zero-element) tensor is a no-op.
+782-  void gelu(Tensor& x, GeluMode mode, cudaStream_t stream);
+783-
+784-
+785-─── include/ninfer/ops/linear_pair.h:3-6 ───
+786-[maintainability · low] This header uses `std::size_t` (return type of
+--
+1119-easily size the arena with this query while executing the policy-bearing `linear_swiglu(...)` under
+1120:`AllowA4`, producing an undersized workspace and a device-side buffer overflow. Please document that
+1121-this form is A16-only and must only be paired with the A16-only op overload / a matching policy.
+1122-
+1123--  * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
+1124--  * Invalid profiles or intervals throw; a legal static-zero route returns zero.
+1125-+  * [min_tokens,max_tokens] interval under the A16-only policy. The QType and dimensions are the
+--
+1825-concurrently race on this member: both may observe `direct_fd_ < 0`, open two descriptors, and the
+1826:loser leaks one (or, worse, a torn `int` write leaves a bogus fd value). `pread` itself is
+1827-thread-safe, so this mutable state is the only reason the class is not safely concurrent. Either
+1828-open the O_DIRECT descriptor eagerly in the constructor, guard the lazy open with a
+1829-`std::once_flag`/mutex, or explicitly document that `InputFile` is not thread-safe and must be
+1830-externally synchronized.
+1831-
+--
+1920-─── src/artifact/framing.h:21-21 ───
+1921:[security · medium] `read_u64_le`/`read_u32_le` dereference a raw `const std::byte*` with no length
+1922-information, so there is no way to guarantee that 8 (resp. 4) readable bytes are actually available.
+1923-Since this header is meant for parsing artifact bytes that may come from untrusted/partially-read
+1924-files, an accidental short buffer at any call site becomes an out-of-bounds read. Consider making
+1925-the precondition explicit and hard to violate, e.g. accept a fixed-extent span or add a `size_t
+1926-size` parameter that is validated (or at minimum document the precondition prominently).
+--
+2010-in the header). If two threads call `read_direct` on the same `InputFile` concurrently, they both
+2011:observe `direct_fd_ < 0`, both call `open`, and one of the resulting descriptors is leaked forever
+2012-(the member can only hold one value); the unsynchronized read/write of `direct_fd_` is also a data
+2013-race (UB). Since the API is `const` and is intended for large payload reads, it invites concurrent
+2014-use. Please either open `direct_fd_` eagerly in the constructor, or guard the lazy initialization
+2015-(e.g. `std::once_flag`/`std::call_once` or an atomic CAS loop), and document the thread-safety
+2016-contract.
+--
+2233-─── src/core/checked_math.h:42-43 ───
+2234:[test · low] This header carries the project's shared overflow/alignment helpers but has no unit
+2235-tests (no `tests/` file references `core/checked_math.h`). The boundary cases that are easy to get
+2236-wrong here are exactly the ones worth pinning down: `checked_add`/`checked_mul` at
+2237-`std::numeric_limits<T>::max()` (and the `checked_mul` `a == 0` path that must not divide by zero),
+2238-narrow types smaller than `int` where integral promotion applies (e.g.
+2239-`std::uint8_t`/`std::uint16_t`), `align_up` with `alignment == 1`/`0`/non-power-of-two, and
+2240:`align_up` where `value + alignment - 1` overflows `T`. Please add a dedicated test target covering
+2241-these.
+2242-
+2243-
+2244-
+2245-─── src/core/arena.h:74-75 ───
+--
+2381-documented here, so callers reading only the header can build a spec that fails at planning time
+2382:with `std::invalid_argument`/`std::overflow_error`: every field must be > 0, `record_capacity` must
+2383-be <= 8, `value_heads` must be divisible by `qk_heads`, and `layers * record_capacity` must fit in
+2384-`int32_t`. Please document these (or reference the validation function) on the struct.
+2385-
+2386-+ // All fields must be positive. record_capacity <= 8; value_heads % qk_heads == 0;
+2387-+ // layers * record_capacity must fit in int32_t (validated by plan_gdn_replay_records).
+--
+2423-`decoder_state.cpp` (`static_cast<HostPageUnit>(record * record_units)`) can exceed this limit on
+2424:overflow, so a guard here is valuable.
+2425-
+2426-
+2427-
+2428-─── src/core/kv_page_ref.h:57-57 ───
+2429-[maintainability · low] Every other member of `KVPageRef` is annotated `NINFER_KV_REF_HD`, but this
+--
+2699-[maintainability · low] This overload duplicates the logic of the C-array overload of `shape_numel`
+2700:almost verbatim. Two copies of the same validation/overflow logic can drift apart; consider unifying
+2701-them (e.g. a single implementation taking `std::span<const std::int32_t>` or a template) and having
+2702-both call sites use it.
+2703-
+2704-
+2705-
+--
+2736-an unbounded time. Because of (2), calling `submit` from within a pool worker (nested submission)
+2737:can deadlock once every worker is blocked on a full queue. Please document this contract
+2738-(throw-on-stopping and blocking / no re-entrant submission) either in the class comment or on
+2739-`submit`.
+2740-
+2741-
+2742-
+--
+2883-precondition and throws, so this local re-implementation is strictly weaker. In addition, the
+2884:overflow case is reported as `std::invalid_argument`, while equivalent overflow guards in this
+2885-codebase (`padded_dflash_capacity`, `plan_linear_attention_state_pool`, `Tensor::bytes`) throw
+2886:`std::overflow_error` — since `plan_cyclic_kv_cache` runs before `plan_host_state_image`, the same
+2887-bad capacity is classified differently depending on which planner throws first. Validate the
+2888:alignment and use `std::overflow_error` for the range failure.
+2889-
+2890-
+2891-
+2892-─── src/artifact/materializer.cpp:96-96 ───
+2893-[bug · medium] `geometry.divisor_count` is not validated here. If it is 0, `words` is empty and the
+--
+2939-safe because the preceding `Tensor tensor(nullptr, dtype, shape)` throws when `shape.size()` is
+2940:outside [1, 4]. That invariant is implicit and would silently become a buffer overflow if the two
+2941-statements are ever reordered or the `Tensor` ctor's rank validation changes. Prefer copying the
+2942-tensor's own normalized shape (or add an explicit `shape.size() <= out.shape.size()` guard) so the
+2943-safety is local rather than assumed.
+2944-
+2945-
+--
+2951-`.at(0)` throw `std::out_of_range` instead of the `ArtifactError` this API uses consistently. Note
+2952:also that `weight_element_count(shape)` can throw `std::invalid_argument`, so this function may leak
+2953-exception types that callers catching `ArtifactError` will not handle. Add an explicit non-empty
+2954-guard and prefer `front()`/checked access.
+2955-
+2956-+     if (binding.whole_object && binding.parts.empty()) {
+2957-+         throw ArtifactError(name + ": whole-object Binding has no parts");
+--
+3167-[bug · medium] `patches()` multiplies two `std::int32_t` grid dimensions directly into an
+3168:`std::int32_t` result. For large grids the product overflows (signed overflow is UB) and can wrap to
+3169-a negative or unexpectedly small value, silently corrupting every downstream size derivation
+3170-(`vector` sizing, `cudaMemcpy` lengths, workspace math in `encode_image`) and potentially defeating
+3171-the range checks that are meant to run after this call. Since the struct itself imposes no bound on
+3172-the dimensions, compute the product in a wider type and/or validate that the result fits before
+3173-returning.
+--
+3457-─── src/models/gemma4/cache.cpp:79-80 ───
+3458:[bug · high] Device-memory leak on reconfigure. `std::vector<void*>().swap(owned_)` only clears the
+3459-ownership list (a `std::vector<void*>` does not free its pointees); every pointer previously
+3460-returned by `cudaMalloc` in `ensure` is dropped without `cudaFree`. If `configure` is ever called on
+3461-a cache that was already allocated (a public, documented entry point), all per-layer device buffers
+3462:leak, and `bytes_` is then reset to 0 so the loss is invisible. Free the owned pointers before
+3463-discarding them, as the destructor and move-assignment already do.
+3464-
+3465-Suggested:
+3466-```cpp
+3467-for (void* pointer : owned_) {
+--
+3671-row-major, with `rgb.size() == static_cast<std::size_t>(width) * height * 3` and no padding. Any
+3672:mismatch (e.g. overflow of `width * height` computed in `int`) is a silent out-of-bounds risk
+3673-downstream. Please document the layout and the size invariant, and consider a helper
+3674-factory/validation so the three fields cannot drift apart.
+3675-
+3676-+     // Packed RGB8, row-major, no padding: size() == static_cast<std::size_t>(width) * height * 3.
+3677-      std::vector<std::uint8_t> rgb;
+--
+4058-─── src/models/gemma4/image_processor.cpp:43-43 ───
+4059:[bug · medium] Potential signed-overflow: `static_cast<int>(floor(width / height)) * kSide` is
+4060-evaluated in `int` before the `std::min` clamp. For a very wide image allowed by the default decode
+4061-policy (e.g. 44M x 1, since `max_decoded_pixels` is 64M), `floor(width/height) * 48` exceeds
+4062-`INT_MAX` and wraps (UB), yielding a negative `target_width` that `std::min(neg, max_side)` keeps
+4063-and that is then handed to `resize_bicubic`, corrupting the resize. Clamp in floating point/64-bit
+4064-before narrowing. The mirrored branch for `target_height` a few lines below has the same problem.
+--
+4178-`CUDA_CHECK`, or the validation throws above), the destructor never runs and every allocation made
+4179:so far leaks. Consider wrapping the CUDA allocations in an RAII owner (`std::unique_ptr`-style
+4180-handle with a `cudaFree` deleter) so partially-constructed objects release their resources, rather
+4181-than relying on a hand-written destructor and `nullptr` checks.
+4182-
+4183-
+4184-
+--
+4242-[bug · low] `base + offset` is computed in signed 64-bit before being range-checked. For a large
+4243:positive `offset` (e.g. near `INT64_MAX`) this addition overflows, which is undefined behaviour and
+4244-also defeats the subsequent `static_cast<std::uint64_t>(...)` bounds test. Compare against
+4245:`cursor.size - base` (which cannot overflow, since `base` is in `[0, size]`) instead of forming
+4246-`base + offset`.
+4247-
+4248--     if (offset < -base || base + offset < 0 ||
+4249--         static_cast<std::uint64_t>(base + offset) > cursor.size) {
+4250-+     if (offset < -base || offset > static_cast<std::int64_t>(cursor.size) - base) {
+--
+4360-with a raw `static_cast`. Every other place in this namespace converts model dimensions with the
+4361:overflow-checked helper `dimension(std::uint64_t)` (declared in `execution/parameters.h`, already
+4362-included via `gdn.h`) — e.g. `attention.cpp`, `draft.cpp`. Using the helper keeps this conversion
+4363-consistent and turns a silent truncation into a diagnosable error. Note the same pattern appears in
+4364-`gdn_record_workspace_bytes` below.
+4365-
+4366-          bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+--
+4468-─── src/models/qwen3_5/execution/qwen4_expert_pager.cpp:31-32 ───
+4469:[bug · medium] Resource leak if any CUDA_CHECK after this point throws: this class manages raw CUDA
+4470-resources (pinned host buffer, stream, 6 events), and the destructor is not invoked for an object
+4471-whose constructor throws. If `cudaStreamCreateWithFlags`, any `cudaEventCreateWithFlags`, or a later
+4472:check fails, `resident_` (pinned memory) plus the already-created stream/events leak.
+4473-
+4474-Suggested fix: make the members RAII-owned (e.g. `std::unique_ptr<std::int32_t,
+4475-decltype(&cudaFreeHost)>` for the host buffer and stream/event wrappers with
+4476-`cudaStreamDestroy`/`cudaEventDestroy` deleters), or wrap the body after this allocation in a
+4477-try/catch that destroys the already-acquired resources before rethrowing.
+--
+4576-─── src/models/qwen3_5/config.cpp:40-40 ───
+4577:[bug · medium] `divisor * divisor` is evaluated in 64-bit arithmetic and overflows for `value` near
+4578-2^64, wrapping to a small number so the `<=` comparison succeeds and a composite number can be
+4579-classified as prime. Compare against the quotient instead (this matters as long as
+4580-`ngram_vocab_size_base` is not upper bounded).
+4581-
+4582--     for (std::uint64_t divisor = 3; divisor * divisor <= value; divisor += 2) {
+--
+4720-`std::uint32_t`, `std::span` and `std::optional` but only includes `chat_template.h`. It currently
+4721:compiles only because those symbols leak in transitively (via `chat_template.h` -> `text/jinja.h`).
+4722-Relying on transitive includes is fragile and inconsistent with the sibling header
+4723-`chat_template.h`, which explicitly includes `<cstddef>`, `<cstdint>`, `<optional>`, `<vector>`. Add
+4724-the direct includes to make this header robust to include-graph changes.
+4725-
+4726-  #include "models/qwen3_5/frontend/chat_template.h"
+--
+4990-[maintainability · low] `std::string continuation_content;` is used in this header, but `<string>`
+4991:is not included. It currently compiles only because `<string>` leaks in transitively (resources.h ->
+4992-request.h -> ninfer/types.h). Relying on transitive includes is fragile: if that chain changes, this
+4993-header breaks. Add the direct include.
+4994-
+4995-+ #include <string>
+4996-  #include <string_view>
+--
+5002-guard elsewhere (`size() > kPreparedSessionKeyCapacity`) before the cast, so there is no truncation
+5003:today, but if the capacity constant is ever raised past 65535 this field would silently overflow and
+5004-`view()` would read out of bounds. Consider storing the length as `std::size_t` (or clamping) to
+5005-make the type consistent with the capacity it bounds.
+5006-
+5007--     std::uint16_t size = 0;
+5008-+     std::size_t size = 0;
+--
+5469-[bug · low] Derived row widths are computed in `std::int32_t` arithmetic before being handed to
+5470:`alloc`, so the overflow guard that `dimension()` applies to the individual config values (`qw`,
+5471-`kw`) does not cover the composite expressions. Here `2 * qw + 2 * kw` is evaluated as `int` (signed
+5472:overflow is UB) and the same pattern appears in the other roots: `2 * heads` and `conv + vw`
+5473-(`qwen4_gdn`), `2 * width` (`qwen4_moe`), `wide + h` and `rank + inject_rows`
+5474-(`qwen4_ple`/`qwen4_hc`), and `2 * ops::kOffloadMoeTopK * group + 1` (`qwen4_moe`). Since
+5475-`dimension()` saturates its argument at `INT32_MAX`, a large config here silently wraps into a
+5476:negative/small alloc size instead of raising `std::overflow_error`. Prefer widening the arithmetic
+5477-(e.g. `std::int64_t`) or using the project's `artifact::checked_mul` (used for derived widths in
+5478-`config.cpp`) for these composite row counts.
+5479-
+5480-
+5481-
+--
+5571-`shared_ptr` (which is needed here only for the custom accounting deleter); that removes the manual
+5572:cleanup and makes the exception path obviously leak-free.
+5573-
+5574--             payload                 = new qwen3_5::PreparedMediaPayload();
+5575--             payload->patches        = std::make_unique<std::uint16_t[]>(elements);
+5576--             payload->patch_elements = elements;
+5577-+             auto owner              = std::make_unique<qwen3_5::PreparedMediaPayload>();
+--
+5997-copies/memsets, the `std::vector` allocations, and `expert_activation_observer()` invoked from `tap`
+5998:(it runs E/K times inside the op). Any such throw leaks all five blocks. Wrap them in a small RAII
+5999-holder (or allocate them from the workspace arena) so the frees are unconditional.
+6000-
+6001-
+6002-
+6003-─── src/models/qwen3_5/execution/qwen4_text.cpp:465-466 ───
+--
+6183-─── src/models/qwen3_5/program/speculative/mtp_alignment.h:27-29 ───
+6184:[maintainability · low] This overflow guard is unreachable dead code. The preceding check guarantees
+6185-`chunk_begin < prompt_tokens <= UINT32_MAX`, hence `chunk_begin <= UINT32_MAX - 1` and `chunk_begin
+6186:+ 1` can never overflow. Either reorder it before the first check (so it actually protects the
+6187-addition) or drop it; as written it only misleads readers into thinking a real edge case exists.
+6188-
+6189-
+6190-
+6191-─── src/models/qwen3_5/program/speculative/mtp_alignment.h:53-57 ───
+--
+6211-[maintainability · medium] The type defines (defaulted) comparison but no checked arithmetic, so
+6212:every consumer re-implements overflow-checked accumulation of the same fields. This has already
+6213-produced near-identical copies: `checked_resource_sum`/`checked_resource_difference` in
+6214-context_work.cpp:184-269 and `planning_resource_sum` in pressure_planner.h:23-49 (plus open-coded
+6215-`+=` with `std::numeric_limits<std::size_t>::max()` guards in request_plan.cpp,
+6216-checkpoint_recovery.cpp, materialization.cpp and storage/context.cpp). Any field added/renamed here
+6217:must be updated in all of those places, and a missed copy silently loses the overflow/underflow
+6218-check. Consider co-locating the checked add/subtract (and a `positive_difference`) helpers next to
+6219-this type so the accounting invariants live with the data.
+6220-
+6221-
+6222-
+--
+6611-validates `k`, so any `k > kMaximumMtpDraftTokens` silently writes past the end of the array. Today
+6612:all callers feed `rung.k`, which comes from the validated draft ladder, so the overflow is
+6613-unreachable — but it is an unguarded out-of-bounds write that a future caller (or a new rung source)
+6614-can trigger. Add a cheap guard, e.g. `if (k > kMaximumMtpDraftTokens) { throw std::logic_error(...);
+6615-}` (or an assert) at the top of the function.
+6616-
+6617-
+--
+6836-`private_checkpoint_capacity = 2U + max_long_anchors_per_continuation.value_or(0)` is at least 2.
+6837:This is dead/always-true condition logic that obscures the real overflow check; drop the redundant
+6838-term.
+6839-
+6840-      if (private_checkpoint_capacity > std::numeric_limits<std::size_t>::max() - 3U ||
+6841--         private_checkpoint_capacity != 0 &&
+6842-+         private_checkpoint_capacity >
+--
+6855-─── src/models/qwen3_5/program/planning/pressure_planner.cpp:230-233 ───
+6856:[bug · low] The destructor detects leaked assessment-slot leases but has no equivalent check for a
+6857:still-leased construction cursor or a live `scratch_live` expansion. Those leak classes are exactly
+6858-as fatal to session consistency (the constructor rejects starting while `pressure_planning_active_`,
+6859-yet the destructor silently resets it). Consider asserting on leased `construction_slots` and
+6860-`scratch_live` here as well.
+6861-
+6862-
+--
+6885-which can throw for an invalid handle). On such a throw the Reserved extent, its allocation, the
+6886:consumed membership nodes and `free_count_` are all leaked/left dangling, and pages already pinned
+6887-in the earlier iterations of the final loop are never unpinned. Wrap the post-allocation work so
+6888-that a failure un-pins the already-pinned pages and calls `release_descriptor` before rethrowing (or
+6889-convert it to a `std::nullopt` return).
+6890-
+6891-
+--
+6969-`prepare_representative`/`install_and_upload` can throw as well;
+6970:`cudaEventElapsedTime`/`cudaEventSynchronize` go through `CUDA_CHECK` which throws) leaks both
+6971-events and aborts the timing phase with an unclean CUDA state. Wrap them in an RAII holder (e.g. a
+6972-small scope guard or `std::unique_ptr` with a `cudaEventDestroy` deleter) so the destructor releases
+6973-them on every exit path.
+6974-
+6975-
+--
+7020-throwing). The original exception is correctly rethrown, but the release failure is completely
+7021:invisible; a leaked address-space/state slot will be undiagnosable. At minimum record the failure
+7022-(assert/log) instead of discarding it silently.
+7023-
+7024-
+7025-
+7026-─── src/models/qwen3_5/program/storage/state_store.h:101-101 ───
+--
+7040-both replicas with its pending state already reset, so the destructor-driven `abort_transfer` can no
+7041:longer restore the previous state and the device slot leaks. Perform the Host release before
+7042-committing `pending_device_slot` so the transfer stays abortable on failure.
+7043-
+7044-          case StateTransferDirection::HostToDevice:
+7045--             source.device_slot = source.pending_device_slot;
+7046--             source.pending_device_slot.reset();
+--
+7103-─── src/models/qwen3_5/program/planning/startup.cpp:68-71 ───
+7104:[bug · low] `checked_i32` reports a zero input as an overflow, which is misleading: zero is not an
+7105:overflow and the call-site labels describe an int32 range/exceeded condition. Consider throwing
+7106-`std::invalid_argument` (or a dedicated range error) for the `value == 0` case, or separating the
+7107:non-zero check from the overflow check, so callers can rely on the exception type semantics.
+7108-
+7109--     if (value == 0 ||
+7110--         value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+7111-+     if (value == 0) { throw std::invalid_argument(label); }
+7112-+     if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+7113:          throw std::overflow_error(label);
+7114-      }
+7115-
+7116-
+7117-─── src/models/qwen3_5/program/planning/startup.cpp:122-127 ───
+7118-[maintainability · low] The MTP and EAGLE3 "extra pages" computations are byte-for-byte identical.
+--
+7150-+                 std::numeric_limits<std::int32_t>::max()) {
+7151:              throw std::overflow_error("generated MRoPE position exceeds int32");
+7152-+         }
+7153--         }
+7154-+     }
+7155-
+7156-
+--
+7158-[maintainability · low] `prefix_item_count` validates far less than `checked_vision_end` does for
+7159:the same `VisionItem` data: only the first/last span counts and one overflow are checked, while
+7160-zero-count or overlapping/unsorted *intermediate* spans pass here but are rejected by
+7161-`checked_vision_end` (`span.count == 0 || span.begin < previous_end`). That means
+7162-`matches`/`prefix_equals` can accept vision metadata that `PrefixShortlistDigests::assign` treats as
+7163-invalid, so the two paths can disagree about the same prompt. Consider extracting one shared span
+7164-validator and using it in both places.
+--
+7284-`address.active`), so the address-space slot, its Device capacity reservation, and its execution row
+7285:leak silently.
+7286-
+7287-Suggestion: keep the address non-active and keep `owner_` set until all fallible work is done (do
+7288-the retain/publish first, transfer ownership and set `active` last), or make `create_active`'s
+7289-failure path undo an already-active address (e.g. via `release_after_deactivate`) before rethrowing.
+7290-
+--
+7304-─── src/models/qwen3_5/program/storage/kv_store.h:1449-1457 ───
+7305:[bug · low] Partial source-pin leak on the exception path. The `catch` correctly aborts the staged
+7306-tail destination, but it does not undo the `pin_source` calls already performed by the loop above:
+7307:if `pin_source` throws (handle validation or pin-count overflow) after some pages were pinned, those
+7308-pins are left behind and the destination address is never activated, so the members can never be
+7309-unpinned by a later commit or abort. The same pattern exists in `prepare_prefix_fork`, where the pin
+7310-loop runs after the tail destination has been materialized with no rollback. Track how many pages
+7311-were pinned and unpin them in the handler (or pin before allocating anything fallible).
+7312-
+--
+7524-`release(*handle)` here is a no-op because `can_release()` rejects active addresses, so the address
+7525:slot, its Device capacity reservation, and its execution row leak. Use
+7526-`release_after_deactivate(*handle)` (which deactivates first) or move the active flag/publication
+7527-ordering so the address remains releasable on throw.
+7528-
+7529--             (void)release(*handle);
+7530-+             (void)release_after_deactivate(*handle);
+--
+7559-─── src/models/qwen3_5/program/storage/kv_store.h:1454-1454 ───
+7560:[bug · low] Pin leak on exception in `prepare_active_snapshot`. The pin loop over `[0,
+7561-required_pages)` runs before/inside this `try`; if a later `pin_source` throws, the pins already
+7562-applied are never rolled back (only the tail destination is aborted), leaving pages permanently
+7563-pinned. Track how many pins were added and unpin exactly those in the catch.
+7564-
+7565-
+--
+7642-`destination_pinned == true`, the following `pin_source` loop and the reservation/row hand-off can
+7643:still throw (stale membership handle, pin-count overflow). If that happens the reservation object is
+7644-never constructed, so `abort_prefix_fork` never runs: the staged tail descriptor stays occupied with
+7645:a leaked Device lease and its reservation page is never returned, and any pages pinned earlier in
+7646-the loop keep their `source_pins`. Wrap the materialize/pin sequence in a try/catch that aborts the
+7647-tail destination and unpins already-pinned sources (mirror `prepare_active_snapshot`).
+7648-
+7649-
+7650-
+--
+7657-returns false for an active address) and the address slot, its Device capacity reservation and its
+7658:execution row are leaked, leaving a half-activated address. Publish the membership (or at least keep
+7659-the state rollback-able) before committing the active state, or teach the error path to unwind this
+7660-case.
+7661-
+7662-
+7663-
+--
+7667-the reservation object is never constructed, so `abort_active_snapshot` never runs and the earlier
+7668:pins leak (subsequent activations/fork checks will see non-zero `source_pins`). Track how many pages
+7669-were pinned and unpin them in the catch block.
+7670-
+7671-
+7672-
+7673-─── src/models/qwen3_5/program/storage/kv_store.h:1923-1926 ───
+--
+7711-the cleanup in `create_active`/`activate` — `release(*handle)` — is a no-op for an active address,
+7712:leaking the address slot, its Device capacity reservation and the execution row. Perform the state
+7713-transition after the fallible publication, or add explicit rollback on this path.
+7714-
+7715-
+7716-
+7717-─── src/models/qwen3_5/program/storage/kv_store.h:1338-1340 ───
+--
+7783-publication). If any of those fail, the reservation can no longer abort via the reservation object
+7784:and `create_active`'s cleanup `release(*handle)` is a no-op for an already-active address, leaking
+7785-the address slot, its Device capacity reservation and the execution row. Perform the hand-over after
+7786-the fallible publication/updates succeed, or add an explicit rollback path.
+7787-
+7788-
+7789-
+--
+8068-[bug · medium] `x + a - 1` is evaluated in type `T`, and the static_assert allows `T` to be signed.
+8069:For `T = int` with `x` near `std::numeric_limits<T>::max()` this is signed overflow (UB); for
+8070-unsigned `T` it wraps and produces a bogus 0. The host-side counterpart in `core/checked_math.h`
+8071-performs a checked add for exactly this reason. Consider computing in an unsigned/wider type, or
+8072:explicitly document that `x + Alignment - 1` must not overflow.
+8073-
+8074--     constexpr T a = static_cast<T>(Alignment);
+8075--     return (x + a - 1) & ~(a - 1);
+8076-+     using U = std::make_unsigned_t<T>;
+8077-+     constexpr U a = static_cast<U>(Alignment);
+--
+8251-[bug · low] The interval endpoints are computed as `begin + work->bytes()` / `tb + tensor->bytes()`
+8252:without any overflow guard. The wrapper's `overlaps()` helper
+8253-(src/ops/wrapper/candidate_selector.cpp) explicitly rejects `bytes > max - begin` before the same
+8254-computation; performing the unchecked addition here can wrap around and silently skip a real
+8255-overlap. Consider the same checked addition.
+8256-
+8257-
+--
+8414-already applies via `align_up_u32(capacity, 128)` in `plan_cyclic_kv_cache`. The two rules (and
+8415:their exception types: `std::overflow_error` here vs `std::invalid_argument` there) must stay
+8416-bit-for-bit identical or the host DFlash layer pitch will disagree with the device tensor size.
+8417-Prefer factoring this padding rule into a single shared helper used by both the host planner and
+8418-`plan_cyclic_kv_cache` instead of re-deriving the constant locally.
+8419-
+8420-
+--
+8431-+     const std::size_t payload_bytes =
+8432:+         checked_mul(component_bytes, 2U, "StateImage DFlash transfer payload overflow");
+8433-+     if (operations > std::numeric_limits<std::uint32_t>::max()) {
+8434-
+8435-
+8436-─── src/models/qwen3_5/state/state_image.cpp:190-191 ───
+8437-[bug · low] The DFlash payload is gated on `layout.dflash_local_k` while `copy_operations` below is
+--
+8468-`size_t`. `merge` comes from `config.spatial_merge_size` (uint32) and is only narrowed by
+8469:`checked_i32`, so it can legally be large enough for `merge * merge` to overflow int32 (UB, and a
+8470-negative/wrapped divisor). Perform the product in `size_t` (as done elsewhere in this file), or
+8471-bound `merge` explicitly in the plan validation.
+8472-
+8473--         if (item_tokens != item_patches / static_cast<std::size_t>(merge * merge)) {
+8474-+         if (item_tokens != item_patches / (static_cast<std::size_t>(merge) * static_cast<std::size_t>(merge))) {
+--
+8498-─── src/models/qwen3_5/program/vision_control.cpp:149-152 ───
+8499:[security · medium] Unlike `plan_vision_control`, which validates every span against
+8500-`prompt.token_types.size()`, this function indexes `prompt.token_types` with
+8501-`span.begin`/`span.count` taken straight from `prompt.vision_items` without re-checking them. The
+8502-only cross-check is `plan.items.size() == prompt.vision_items.size()`, so a plan produced for a
+8503-different prompt (same item count, fewer tokens) makes `all_of` read out of bounds instead of
+8504-throwing (and an empty span would silently pass `all_of`). Re-validate the span range here as well.
+--
+8664-+             if (removed.device.state_slots == std::numeric_limits<std::uint32_t>::max()) {
+8665:+                 throw std::overflow_error("active capture Device state removal overflow");
+8666-+             }
+8667-+             ++removed.device.state_slots;
+8668-
+8669-
+8670-─── src/models/qwen3_5/program/transactions/capture.cpp:101-101 ───
+--
+9241-[documentation · low] The declared contract is not documented: `validate_fp8_weight` performs
+9242:validation by throwing (`std::invalid_argument` / `std::overflow_error`) *and* returns geometry,
+9243-`operation` is dereferenced into an exception message (so it must be non-null/non-empty), and all
+9244-four struct fields are only meaningful on success. Adding a short doc comment for the function and
+9245-the struct fields would make the throwing semantics and the `operation` precondition explicit for
+9246-callers.
+9247-
+--
+9593-`align_up`) duplicate the shared, already-included `core/checked_math.h` API (that header is pulled
+9594:in just above for `aligned_to`, and its own comment states it exists exactly for "overflow-checked
+9595-arithmetic, and power-of-two rounding"). Besides the copy-paste, this local `align_up` is also
+9596-weaker than the shared one: it does not validate the alignment, so if it were ever called with
+9597-`alignment == 0` the `alignment - 1` underflow and the `/ alignment` become undefined (division by
+9598-zero). Prefer deleting the local copies and calling the shared
+9599-`align_up`/`checked_add`/`checked_mul`, which already reject a zero/non-power-of-two alignment.
+--
+9682-straight to `std::size_t`: a non-positive extent wraps to a huge value and the multiplications
+9683:overflow silently, yielding a garbage (possibly too small) capacity instead of throwing. Validate
+9684-N/K positivity (and the EXL3 alignment) before computing the size.
+9685-
+9686-      case QType::EXL3_MUL1: {
+9687-+         if (output_rows <= 0 || input_rows <= 0) {
+9688-+             throw std::invalid_argument("linear workspace: exl3 n/k must be positive");
+--
+9713-─── src/ops/linear/nvfp4/nvfp4_format.cpp:72-73 ───
+9714:[security · medium] `weight.weight_divisors` is only null-checked in the validation block, whereas
+9715-`qdata`/`scales` are pinned to their exact plane positions here. The kernels dereference
+9716-`weight_divisors` as an array of `float`, so a weight with a valid `payload_bytes`/geometry but a
+9717-bogus (yet non-null) `weight_divisors` passes validation and can lead to out-of-bounds reads. Since
+9718-the layout (see `weight_view.cpp`: `divisor_offset = scale_offset + scale_bytes`) places the
+9719-divisors immediately after the scale plane, validate that position too, mirroring the check for
+--
+10343-`packed.row[row]` for every row, so if `kMaximumRecordCapacity` is ever raised above 8 (or the two
+10344:values ever drift) this struct would silently overflow. The constraint is only indirectly pinned by
+10345-a `static_assert(sizeof(...) == 128)` in `recurrent.cu`, which is fragile. Expose a named
+10346-maximum-rows constant (shared with `kMaximumRecordCapacity`) and assert it here so the coupling is
+10347-explicit and enforced at this declaration.
+10348-
+10349-
+--
+10494-[bug · medium] `history` is computed from `dilation` before `dilation > 0` is verified. `Tensor::ne`
+10495:is `std::int32_t`, so `(weight.ne[1] - 1) * dilation` uses signed int32 arithmetic and can overflow
+10496-(UB) for large `dilation` — the `history <= 32` check comes too late to help. Also, combining two
+10497-independent conditions in one `require` makes the error message "history must be in [1,32] columns"
+10498-misleading when the real problem is `dilation <= 0`. Validate `dilation` first, then compute and
+10499-validate `history`.
+10500-
+--
+11116-[bug · low] The overlap test computes `rhs_begin + rhs_bytes` / `lhs_begin + lhs_bytes` in
+11117:`std::uintptr_t` without overflow checking; if the address plus size wraps (large tensor mapped near
+11118-the top of the address space), the comparison can silently report "no overlap", defeating the
+11119:aliasing guards. Consider an overflow-safe formulation (e.g. compare using subtraction after
+11120-ordering the two ranges) or `checked_add`.
+11121-
+11122-
+11123-
+11124-─── src/ops/linear_topk/linear_topk.cpp:142-142 ───
+--
+11215-reach `record.layers`, so it already visits every layer of both arrays and calls the same
+11216:`layer_range` checks (including the overflow/empty-range checks). The loop duplicates up to `2 *
+11217-layers` range computations and two overlap-validation passes over the same data; it can be dropped.
+11218-
+11219-
+11220-
+11221-─── src/ops/softmax_attention/dense/causal_cache/int8/plan.h:4-4 ───
+--
+11625-has already guaranteed `x.ne[0] >= 0`, this call can never throw (`bias.ne[0] < 0` would already
+11626:fail the `bias.ne[0] != x.ne[0]` comparison; the product `bias.ne[0] * 1 * 1 * 1` cannot overflow).
+11627-Worse, if it ever did throw, it would surface the unlabeled "negative dimension" message instead of
+11628-the descriptive shape error. Consider removing it (or moving it after the shape check if an explicit
+11629-numel validation is desired).
+11630-
+11631-
+--
+11902-allocation helper rather than at the call site; (2) for very large bounds, `8 * capacity_tokens`
+11903:overflows `std::int32_t` (signed overflow is UB) and the derived allocations shrink instead of
+11904-growing, which would under-measure the layout and let the public workspace query under-report.
+11905-Callers currently clamp to `[min, 4096]`, but the helper itself has no precondition; add an
+11906-assert/clamp, or take the clamp as an explicit documented contract.
+11907-
+11908-
+--
+12182-`speculative_accept_greedy_drafts_workspace_capacity_bytes`, this function performs no
+12183:multiplication-overflow guard before returning `row_bytes * max_batch`. If
+12184-`sampling_workspace_capacity_bytes` ever returns a large value, the multiplication can silently wrap
+12185:`std::size_t` and under-allocate the workspace. Add the same overflow check used by the greedy
+12186-variant for consistency and safety.
+12187-
+12188-      if (envelope.all_rows_greedy_without_penalties) { return 0; }
+12189-      const std::size_t row_bytes =
+12190-          sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+--
+12192-+         static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
+12193:+         throw std::overflow_error("sparse speculative accept workspace capacity overflows size_t");
+12194-+     }
+12195-      return row_bytes * static_cast<std::size_t>(max_batch);
+12196-
+12197-
+12198-─── src/ops/wrapper/gelu.cpp:13-21 ───
+--
+12201-recomputes `x.numel()` internally. The early `return` on a zero dimension already handles the
+12202:empty-tensor case, so the only residual effect of this loop is the redundant overflow `throw` (which
+12203-`Tensor::numel()`/`checked_mul_i64` inside the launcher already performs). Either drop the loop
+12204-entirely, or factor it into a small `numel(const Tensor&)` helper and actually use the result,
+12205-mirroring the established pattern in `src/ops/wrapper/mul_scalar.cpp` (`if (numel(x) == 0) { return;
+12206-}`).
+12207-
+--
+12212--         if (n > std::numeric_limits<std::int64_t>::max() / x.ne[i]) {
+12213:-             throw std::overflow_error("gelu: tensor size overflows int64");
+12214--         }
+12215--         n *= x.ne[i];
+12216-      }
+12217-
+12218-
+--
+12339-`static_cast<std::size_t>(top_k) * intermediate * tokens * sizeof(float)`, where the signed `tokens`
+12340:is converted to a huge `size_t`, yielding a nonsense (potentially overflowing) requirement instead
+12341-of the documented exception. Validate `tokens > 0` (the op-level function also validates `top_k <=
+12342-num_experts`, which this query does not).
+12343-
+12344-      if (geometry.hidden_size <= 0 || geometry.num_experts <= 0 || geometry.intermediate_size <= 0 ||
+12345-          geometry.top_k <= 0) {
+--
+12461-─── src/ops/wrapper/vision_pos_embed.cpp:17-17 ───
+12462:[security · medium] The wrapper validates dtype/shape/contiguity but never validates the *values* of
+12463-`indices`, even though the public header documents the precondition "indices ... with values in
+12464-[0,R)". This is not a harmless documentation gap: the scalar route (`vision_pos_embed_add_kernel`)
+12465-explicitly guards `if (index >= 0 && index < table_rows)`, while the optimized routes selected for
+12466-D==1152 (`vision_pos_embed_add_d1152_warp_kernel` / `vision_pos_embed_add_d1152_kernel`) index
+12467-`table[corner_indices[corner] * pairs + pair]` with no bounds check at all. So a caller passing an
+--
+12587-          if (total > std::numeric_limits<std::int64_t>::max() / t.ne[d]) {
+12588:              throw std::overflow_error("residual_add: tensor size overflows int64");
+12589-          }
+12590-          total *= t.ne[d];
+12591-      }
+12592-      return total;
+12593-
+--
+12712-─── src/ops/wrapper/linear_pair.cpp:36-36 ───
+12713:[bug · low] Both intermediate products are given manual overflow checks, but the final `code_bytes +
+12714-r * groups * 2u` addition is not guarded and can wrap. The file already includes
+12715-`core/checked_math.h`, which provides `checked_mul`/`checked_add` for exactly this. Also note the
+12716-function divides by `r`, so it invokes undefined behaviour if `rows == 0`; the checked helpers avoid
+12717-both problems.
+12718-
+--
+12747-does not guard against `begin + bytes` wrapping `std::uintptr_t`. It is not reachable with the
+12748:current bounded shapes, but adding the same overflow check keeps the two implementations consistent
+12749-and avoids silently missing an overlap if the tensor sizes ever grow. Note this helper is also
+12750-non-null/zero-size safe only because the callers validate first, whereas the sibling version handles
+12751-those cases itself.
+12752-
+12753-
+--
+12758-div_up(n, 256))` and does `static_cast<int>(...)` with no check, so when `n > 256 * INT_MAX` the
+12759:cast overflows and yields an invalid/negative launch configuration. The wrapper is the validation
+12760-layer and knows `n`, so it should bound it the same way the sibling wrappers do.
+12761-
+12762-      if (n == 0) { return; }
+12763-+     // Mirror the launcher's int grid cast (div_up(n, 256)) with a conservative bound.
+12764-+     if (n > std::numeric_limits<int>::max() * 256LL) {
+12765:+         throw std::overflow_error("gdn_gating: element count exceeds CUDA grid limit");
+12766-+     }
+12767-
+12768-
+12769-─── src/ops/wrapper/gdn_gating.cpp:14-14 ───
+12770-[maintainability · low] This validation helper (and
+--
+12772-every ops wrapper (argmax, l2norm, rmsnorm, rope, causal_conv1d_silu, ...), differing only in the
+12773:message prefix. This is a maintenance hazard: a fix to the overflow/zero-dimension logic must be
+12774-replicated in ~15 files. Consider extracting these into a shared internal header (e.g.
+12775-ops/wrapper/validation.h) parameterized by an op-name prefix.
+12776-
+12777-
+12778-
+--
+12915-`out` is already forced to equal `x` by the shape loop below, and `weight`/`bias` are constrained to
+12916:`[x.ne[0],1,1,1]` by `vector_of(...)`, so their element counts can never overflow independently of
+12917-`checked_numel(x)`. Worse, because they run before the shape checks, a malformed tensor surfaces the
+12918:generic message "negative dimension"/"tensor size overflows int64" (which does not say *which*
+12919-tensor is bad) instead of the actionable shape error. Recommend dropping them (or at least
+12920-`checked_numel(out)`) and, if kept, passing a label so the message identifies the offending tensor.
+12921-
+12922-
+12923-
+--
+12933-+     if (rows > std::numeric_limits<int>::max()) {
+12934:+         throw std::overflow_error("layer_norm: row count exceeds CUDA grid limit");
+12935-+     }
+12936-
+12937-
+12938-─── src/ops/wrapper/dynamic_grouped_conv.cpp:136-136 ───
+12939-[maintainability · low] The op-name literal is hardcoded here even though `kPrepareOp` exists and is
+--
+12974-[maintainability · low] Dead code: these three statements evaluate `Tensor::bytes()` and discard the
+12975:result. `bytes()` only ever throws on element/byte-size overflow, and that guard is unreachable here
+12976-because the shape was already validated above (rank-2, both leading dims positive `int32`, trailing
+12977:dims == 1, so `ne[0]*ne[1]` cannot overflow `int64`/`size_t`). The calls therefore have no
+12978-observable effect and merely look like intent to validate byte sizes. Remove them (no other wrapper
+12979-in the repo uses this idiom).
+12980-
+12981-
+12982-
+--
+12998-yield a false negative (missed overlap) if an address is near the top of the address space; a missed
+12999:overlap would let the kernel overwrite an input tensor. The codebase already has an overflow-safe
+13000-subtraction-based variant in `src/ops/wrapper/target_logprobs.cpp`. Prefer that form for consistency
+13001-and robustness.
+13002-
+13003-  bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+13004-      const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+--
+13138-packed/split entries, this entry therefore silently has no empty-input path. Either drop the dead
+13139:guard (and the now-unused `n`, keeping only the overflow/non-negative check on `x`) or make
+13140-zero-size handling explicit and documented for this entry.
+13141-
+13142--     const std::int64_t n = numel_allow_zero(x, "x");
+13143-+     (void)numel_allow_zero(x, "x");
+13144-      (void)numel_allow_zero(weight, "weight");
+--
+13276-[documentation · low] This is a public API with non-obvious, throwing behavior: it validates the
+13277:curve and policy, and on `Explicit` mode can throw `std::overflow_error` (page count exceeding
+13278-uint32), while infeasible budgets / invalid policies throw `std::invalid_argument`. Callers (e.g.
+13279-`model_instance.cpp`, the perplexity runner) must be able to tell which inputs are rejected and what
+13280-`available_runtime_bytes` is measured against. Sibling headers in this directory document their
+13281-contracts, so it is worth adding a short doc comment covering: the meaning of the three parameters,
+13282-the fact that the function throws on invalid/infeasible input (not `noexcept`), and how
+--
+13470-buffer of `(n/16)*(k/16)*256` `uint16_t`). Callers can only discover these from the implementation,
+13471:which is easy to get wrong (a too-small `states_host` silently overflows). Please document the
+13472-preconditions and the thrown exceptions in the header.
+13473-
+13474-+ // Preconditions (violations throw std::invalid_argument unless noted):
+13475-+ //   w, h, su, sv, wq are non-null device pointers; h is the undamped [k][k] mean X^T X and is not
+13476-+ //   modified; w and wq are [k][n] with k > 0, n > 0, k % 128 == 0, n % 128 == 0. states_host must
+--
+13736-`ninfer/types.h`), plus `std::uint32_t` from `<cstdint>`. They currently compile only because they
+13737:leak in transitively (e.g. through `models/qwen3_5/model.h` -> `artifact/materializer.h` ->
+13738-`core/device.h`, and `runtime/engine/context_cache/context_cost.h` -> `ninfer/types.h`). Sibling
+13739-headers in the same directory (`engine_core.h`, `causal_score_core.h`, `gemma_instance.h`) include
+13740-`core/device.h` and `ninfer/types.h` explicitly, so this header is the odd one out and will break if
+13741-those transitive chains change. Add the direct includes.
+13742-
+--
+13849-─── src/runtime/engine/kv_capacity.cpp:42-44 ───
+13850:[maintainability · low] This overflow guard is unreachable with the current types and is effectively
+13851-dead code. `policy.explicit_tokens` is `std::uint32_t` (max 2^32-1) and `curve.main_page_tokens >=
+13852-1`, so `1 + (tokens - 1) / main_page_tokens <= 2^32 - 1 == UINT32_MAX`; `pages > UINT32_MAX` can
+13853-never be true. Consider either removing the check or leaving a comment explaining that it only
+13854-guards against a future widening of the input type, so a reader doesn't mistake it for reachable
+13855-logic.
+--
+14120-`recover_from_oom_locked`) cannot force-complete it. The consumer stays parked in `wait_for_request`
+14121:(it polls forever with no deadline) and `outstanding_` capacity leaks. Either complete first and
+14122-release the slot afterwards, or guard the completion so a throw still force-completes the request
+14123-before propagating.
+14124-
+14125-
+14126-
+--
+14130-request unreachable from `slots_`, so the global failure sweep cannot complete it and the consumer
+14131:blocks indefinitely while its reserved capacity is leaked. Prefer completing the request first, or
+14132-wrap the completion so the request is force-completed on failure.
+14133-
+14134-
+14135-
+14136-─── src/runtime/engine/engine_core.h:266-266 ───
+--
+14309-─── src/serve/anthropic_messages_http.cpp:82-87 ───
+14310:[security · low] The raw internal exception text is copied into the client-facing error body:
+14311-`normalize_anthropic_error` only rewrites `type` for `status >= 500` and never touches `message`, so
+14312-`exception.what()` (JSON parse diagnostics, filesystem paths, engine/backend errors) is disclosed to
+14313-untrusted callers. The detail is already preserved for diagnostics via
+14314-`make_internal_request_failure(...)`/`operational_log_.http_failure`, so the response can use a
+14315-generic message. The same pattern is repeated in the other 500 paths of this file; note also that
+--
+14405-only use of the type in `src/`. Consider a portable comparison (e.g. 64x64->128 via a small helper,
+14406:or comparing the two ratios using division with overflow guards on the dominant term) so the header
+14407-builds on all supported toolchains.
+14408-
+14409-
+14410-
+14411-─── src/runtime/engine/context_cache/materialization_planner.h:1545-1546 ───
+--
+14563-relies on `Json::sax_parse`, which throws `nlohmann::json::parse_error` on malformed input (no error
+14564:channel is exposed here). Callers that don't wrap this call in try/catch will leak a nlohmann
+14565-exception across the API boundary. Consider documenting the throwing behaviour explicitly, or
+14566-returning `std::optional<ParsedJsonNumbers>` / `expected` so the failure mode is part of the
+14567-contract. Marking the declaration `[[nodiscard]]` is also advisable since the return value is the
+14568-entire point of the call.
+14569-
+--
+14735-[maintainability · medium] Manual `malloc`/`std::free` management is not exception-safe: if the
+14736:`std::string` construction below throws (e.g. `std::bad_alloc`), `mapped` is leaked. Prefer RAII by
+14737-owning the buffer in a `std::unique_ptr` with a `std::free` deleter (or a small scope guard) so the
+14738-allocation is always released.
+14739-
+14740--     std::string normalized(reinterpret_cast<const char*>(mapped), static_cast<std::size_t>(result));
+14741--     std::free(mapped);
+--
+14922-─── src/serve/generation_token_trace.h:25-25 ───
+14923:[security · low] These records persist the exact prompt token IDs, i.e. the full user prompt (chat
+14924-template included) in plaintext, and the file is opened in append mode with default permissions, so
+14925-it can contain sensitive user content and grow without bound. Since this header documents the
+14926-on-disk schema, please state the sensitivity/permission expectation here (and/or restrict the file
+14927-permissions where it is opened, e.g. 0600) so operators do not inadvertently expose prompt data.
+14928-
+--
+15182-─── src/serve/http_server.cpp:217-217 ───
+15183:[security · low] The API key is compared with ordinary string equality, which short-circuits on the
+15184:first differing byte and therefore leaks a timing side channel that can be used to brute-force the
+15185-credential. Use a constant-time comparison for the bearer token here (the same applies to the
+15186-`x-api-key` comparison in the pre-routing handler).
+15187-
+15188--     return authorization.substr(position, end - position) == api_key;
+15189-+     const std::string_view presented = authorization.substr(position, end - position);
+--
+15536-[bug · low] `current_bytes_` is decremented before `release_context_locked`, which can throw
+15537:(`std::logic_error`/`std::overflow_error`). If it throws, control leaves `erase_locked` with the
+15538-record still present in `records_`/`lru_` but its envelope bytes already subtracted, and with only
+15539-part of its context chain released. That silently desynchronises `bytes()` from the real contents
+15540-and can make a later `release_context_locked` fail on the same nodes. Release the context first (or
+15541-otherwise make this path exception-safe) so the accounting stays consistent when an error is raised.
+15542-
+--
+15600-─── src/serve/openai_common.cpp:20-20 ───
+15601:[security · low] `std::mt19937_64` is not a cryptographically secure generator, and
+15602-`std::random_device` is permitted (and known on some standard-library implementations, e.g. older
+15603-MinGW) to be deterministic and identical across processes. The generated identifier is not merely
+15604-cosmetic: `new_openai_response_id()` becomes the session key and the `previous_response_id` lookup
+15605-key for stored responses, so predictable/duplicated IDs would allow enumerating other clients'
+15606-stored conversations. Consider deriving these tokens from a CSPRNG (OS entropy directly, or
+--
+15765-The public contract headers almost universally state "inputs and outputs must not overlap", but the wrapper layer — the only place that can enforce it — frequently does not check. When it is violated the kernels read and write the same buffers and silently produce wrong results (no crash, no diagnostic).
+15766:Representative paths: `src/ops/wrapper/rmsnorm.cpp`, `silu_mul.cpp`, `sigmoid_mul.cpp`, `l2norm.cpp`, `residual_add.cpp`, `residual_add_norm.cpp`, `compact_kv_rows.cpp`, `mtp_pack.cpp` (both entry points), `mtp_round.cpp`, `gdn_gating_proj.cpp`, `attn_input_proj.cpp`, `vision_pool.cpp`, `add_bias.cpp`, `scatter.cpp`, `argmax.cpp`, `sr/ops/hyper_connection/hyper_connection.cpp`. Several wrappers duplicate a half-copy of `overlaps()` (`candidate_selector.cpp`, `linear_topk.cpp`, `position.cpp`, `prepare_masked_block.cpp`) that drops the null/empty short-circuit or the `begin + bytes` overflow guard — so even "checked" ops have gaps. `dense_kv_ring.h` additionally leaves the *distinctness* of `slots` unspecified, which is an in-order data race.
+15767-
+15768:**2. Exception-safety holes around raw device resources (leaks / termination)**
+15769:Raw `cudaMalloc`/`cudaEventCreate`/thread construction happens before the validation that can throw, and cleanup lives only on the straight-line path. A mid-construction throw leaks the allocations or (worse) `std::terminate`s the process.
+15770-Representative paths: `src/models/gemma4/program.cpp` (raw `void*` members freed manually in the destructor), `src/models/qwen3_5/execution/qwen4_expert_pager.cpp` (pinned buffer + stream + 6 events), `src/models/qwen3_5/execution/qwen4_text.cpp` (five device allocations), `src/models/qwen3_5/frontend/media_cache.cpp` (spawns `HostWorkerPool` threads in the member init list before validating `preprocess_threads`), `src/models/gemma4/cache.cpp` (`std::vector<void*>().swap(owned_)` drops without `cudaFree`), `src/models/qwen3_5/program/graphs.cpp` (events created before the throwing `time_round`). A second class lives in the KV store: `src/models/qwen3_5/program/storage/kv_store.h` fails to roll back source pins / staged transfer destinations / active reservations on the many throwing paths across `prepare_activation`, `commit_activation`, `prepare_prefix_fork`, `prepare_active_snapshot`, `abort_prefix_fork`.
+15771-
+15772:**3. Integer overflow / underflow / divide-by-zero on unvalidated geometry**
+15773-A recurring class of silent-miscompilation and UB bugs where derived quantities (`k * k`, `capacity - 1`, `ngram_size - 1`, `merge * merge`, `y * position_side + x`, `patches()` grid products) are computed in fixed-width arithmetic before the invariant is checked, or a divisor is used without a zero guard.
+15774:Representative paths: `apps/quantize/hessian_io.cpp` and `parameter_reader.cpp` (unbounded `k * k` / `end * bytes_per_word` in bounds checks), `src/models/qwen3_5/config.h` (five distinct underflows: `ngram_size - 1`, `conv_kernel - 1`, `compress_ratio` and `budget - 1`, sliding-layer count), `src/models/qwen3_5/config.cpp` (`divisor == 0` → SIGFPE, `prime = base - 1`, `divisor * divisor` overflow, `heads()` wrap), `src/models/qwen3_5/program/planning/graph_profiles.cpp` (`capacity - 1`), `src/models/qwen3_5/execution/ple_gather.cpp` (`row_width_` / `head_moduli` division by zero in a member initializer), `src/models/gemma4/vision.h` (`patches()` product), `src/models/qwen3_5/program/vision_control.cpp`, `src/models/gemma4/image_processor.cpp`, `src/models/gemma4/forward.cpp` (`position % ring`), `src/ops/softmax_attention/common/causal_partition.h`, `src/ops/launcher/gemma_flash_attention.h`, `src/core/host_kv_arena.h`. A related pattern: q4/q5/q6/q8 shape selectors only check the *upper* bound and divisibility, so `tokens == 0` and negative multiples of 4 pass validation (e.g. `src/ops/linear/q4/shapes/n3456_k1152.cpp`, `n4304_k1152.cpp`, `src/ops/linear/q5/shapes/n1152_k1152.cpp`, `n1152_k4304.cpp`, `src/ops/linear/q6/shapes/n1152_k1536.cpp`).
+15775-
+15776-**4. Public contract headers omit throw / precondition / ownership behavior**
+15777-Sibling headers within the same module document this and the divergent ones do not; consumers reading only the header cannot tell that a function throws, what it accepts, or who owns the storage. This is pervasive across `include/ninfer/ops/` (cast, gelu, rmsnorm_pack_tail, linear_add, linear_swiglu, gemma_moe_router, gemma_moe_experts, sliding_causal_attention, gdn_gating_proj, kv_cache_append, vision_pool, sparse_moe), `src/artifact/` (reader, binder, materializer, exl3_trellis, formats), `src/quantize/exl3/` (hessian, block_ldl, hadamard, linalg, pipeline, trellis_encoder, ldlq), `src/runtime/contract/` (sampling, execution, request), `src/serve/` (openai_chat, http_transport, generation_service), and `include/ninfer/engine.h` (no thread-safety contract at all).
+15778-
+15779-**5. Unchecked `std::optional` / sentinel dereferences (UB / `std::bad_*`)**
+--
+15802-
+15803:- **`src/models/qwen3_5/config.h` / `config.cpp`** — five distinct underflow/overflow/divide-by-zero findings on the PleConfig / QSA geometry, plus `divisor` and prime-search arithmetic in the parser.
+15804-
+15805-- **`src/ops/linear/**` (esp. `fp8/`, `nvfp4/`, `q4/`, `q5/`, `q6/`, `q8/`)** — include hygiene (many headers), duplicated shape catalogues across alias/enum/if-chain (`fp8_geometry.h`, `nvfp4_geometry.h`), dead `allows_a4` policy branches (`nvfp4_*_plan.cpp`), boundary holes in shape selectors (upper-bound-only checks), duplicated route thresholds, and asymmetric schedule-uses-mma declarations.
+15806-
+15807-- **`src/ops/softmax_attention/dense/causal_cache/**`** — dead `Tiled` branch repeated across `bf16/`, `fp8/`, `int8/`, `k8v4/`, `nvfp4/` `plan.cpp`s; magic warp/row-tile heuristics duplicated three ways; hard-coded `32768`/`64`/`17`/`9`/`DChunk` values; `independent_tiles` divide-by-zero in `common/causal_partition.h`.
+15808-
+--
+15814-
+15815:- **`src/artifact/**` and `src/quantize/exl3/**`** — error contracts undocumented across nearly every header; `Reader::geometry` and `InputFile::read_direct` mutate shared state from `const` methods; `k * k`-style overflow in `hessian_io.cpp`; magic `510` offset and re-validated per-tile work in `exl3_trellis.cpp`.
+15816-
+15817-- **`apps/quantize/` and `apps/perplexity/`** — header/implementation doc drift (`calibration.h`/`skipped_names` always 0), old-format byte-order bugs in safetensors and the perplexity reference writer, signal-handler unsafe `server->stop()` and a dangling `g_logging` in `apps/serve/main.cpp`.
+15818-
+15819----
+15820-
+--
+15848-
+15849:- **Consolidate the `overlaps()` / `require_nonoverlap()` helpers** — `dynamic_grouped_conv.cpp` already has the correct overflow-guarded version; lifting it and calling it from `rmsnorm.cpp`, `silu_mul.cpp`, `sigmoid_mul.cpp`, `l2norm.cpp`, `residual_add.cpp`, `residual_add_norm.cpp`, `compact_kv_rows.cpp`, `mtp_pack.cpp`, `mtp_round.cpp`, `gdn_gating_proj.cpp`, `attn_input_proj.cpp`, `vision_pool.cpp`, `argmax.cpp`, `add_bias.cpp`, `scatter.cpp` and `hyper_connection.cpp` closes the highest-severity *and* highest-count correctness gap in one change.
+15850-
+15851-- **Add plain zero-guards** in front of the known divisors: `head = (ngram_size - 1) * heads_per_ngram` and `head_moduli` in `ple_gather.cpp`/`config.h`/`config.cpp`, `capacity - 1` in `graph_profiles.cpp`, `k * k` in `hessian_io.cpp`/`parameter_reader.cpp`, `position % ring` in `gemma4/forward.cpp`, `independent_tiles`/`multiprocessor_count` in the split-policy headers, and lower-bound checks in the q4/q5/q6/q8 shape selectors. These are all a few lines each and eliminate the silent UB / SIGFPE class.
+15852-
+15853-- **Add `has_value()` guards before the `.value()` / `*opt` / `->` dereferences** enumerated in `draft.cpp`, `eagle3.cpp`, `load/dflash2.cpp`, `load/eagle3.cpp`, `qwen4_workspace.h`, `output_session.cpp`, `grammar_masks.cpp`, and before the default-constructed `Weight`/`WeightId` sentinels in the model/weight layers.
+15854-
