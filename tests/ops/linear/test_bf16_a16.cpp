@@ -274,8 +274,13 @@ int run_bf16_linear() {
 
     // The Gemma 4 assistant drafter's shapes, which run one token per step, eager and replayed.
     constexpr std::array<std::array<std::int32_t, 2>, 7> kDraftShapes{{
-        {1024, 10752}, {8192, 1024}, {16384, 1024}, {1024, 8192}, {1024, 16384},
-        {262144, 1024}, {5376, 1024},
+        {1024, 10752},
+        {8192, 1024},
+        {16384, 1024},
+        {1024, 8192},
+        {1024, 16384},
+        {262144, 1024},
+        {5376, 1024},
     }};
     std::uint32_t seed = 431U;
     for (const auto& [n, k] : kDraftShapes) {
@@ -297,6 +302,48 @@ int run_bf16_linear() {
     return failures;
 }
 
+// The dense fallback, over the shapes no registered kernel covers. Today that is every projection
+// of the Nemotron-H family, whose K is 4096 or 1024 (or 64 at the scaled-down reference config) and
+// whose N is 18560 or 164 -- no registered pair carries either, so before this route existed not
+// one of that family's projections computed at all.
+//
+// 164 is deliberate and is the case the fallback's own indexing has to survive: it is not a
+// multiple of any tile, so the row tail is predicated rather than padded. K is deliberately odd in
+// one case for the same reason on the inner axis. T covers the single-token decode, the scaled
+// reference config's own 130, and a prefill-wide 1024.
+int run_bf16_generic() {
+    int failures = 0;
+    constexpr std::array<std::array<std::int32_t, 2>, 8> kNemotronShapes{{
+        {164, 64},
+        {64, 64},
+        {32, 64},
+        {8, 64},
+        {16, 64},
+        {64, 16},
+        {64, 32},
+        {256, 64},
+    }};
+    std::uint32_t seed = 7001U;
+    for (const auto& [n, k] : kNemotronShapes) {
+        DeviceWeight weight(make_patterned(n, k, seed++));
+        for (int tokens : {1, 130, 1024}) { failures += run_bf16_linear_case(weight, tokens); }
+    }
+    DeviceWeight in_projection(make_patterned(164, 64, seed++));
+    failures += run_bf16_linear_case(in_projection, 130, true);
+
+    // The family's own in_projection at the checkpoint's width, at the token counts the decode loop
+    // and a prefill step use. One pass at each, not the whole sweep: this route is a correctness
+    // route, and its cost is linear in T.
+    DeviceWeight wide(make_patterned(18560, 4096, seed++));
+    for (int tokens : {1, 7, 130}) { failures += run_bf16_linear_case(wide, tokens); }
+
+    // An odd K and an odd N, neither of which any tile divides.
+    DeviceWeight odd(make_patterned(37, 65, seed++));
+    failures += run_bf16_linear_case(odd, 1);
+    failures += run_bf16_linear_case(odd, 129);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -306,7 +353,7 @@ int main() {
     }
 
     try {
-        const int failures = run_bf16_linear();
+        const int failures = run_bf16_linear() + run_bf16_generic();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

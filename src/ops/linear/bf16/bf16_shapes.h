@@ -24,4 +24,9 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n5376_k1152(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n2816_k1152(std::int32_t tokens);
 
+// The dense fallback for a problem no registered shape matches, which is where every one of
+// Nemotron-H's widths lands today (see bf16_generic.cuh). N, K and T are read from the call, so one
+// route serves every shape.
+void bf16_generic_launch(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

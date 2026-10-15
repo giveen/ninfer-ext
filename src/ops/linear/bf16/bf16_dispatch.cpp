@@ -33,7 +33,11 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("bf16 linear: unsupported shape");
+    // No registered kernel covers this problem. The dense fallback is consulted *after* the whole
+    // registry, so every problem that had a route keeps exactly that route; what changes is that a
+    // problem no model has registered yet computes instead of throwing. It carries no performance
+    // claim: a shape a model actually runs is expected to get its own kernel here.
+    return &bf16_generic_launch;
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
