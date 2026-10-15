@@ -25,8 +25,9 @@
 namespace ninfer::test::nemotron_h_moe_router_ref {
 
 struct Result {
-    // ids and weights are [top_k, tokens] with the rank fastest, like the Op's outputs. logits is
-    // [experts, tokens], like the Op's workspace -- the reference's own dump writes the transpose.
+    // Flat payloads in the Op's own order: ids and weights at `rank*tokens + token` and logits at
+    // `expert*tokens + token`. That is the reference's own [T,K] and [T,E] tensors transposed --
+    // the reference's dump writes those, and the Op's outputs and workspace carry the transpose.
     std::vector<std::int32_t> ids;
     std::vector<double> weights;
     std::vector<double> logits;

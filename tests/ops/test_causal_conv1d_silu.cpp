@@ -335,7 +335,7 @@ int split_rejection_case(std::int32_t T) {
     // same storage, and this is neither.
     Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
 
-    int failures = 0;
+    int failures         = 0;
     auto expect_rejected = [&](bool rejected, const char* what) {
         if (!rejected) {
             std::cout << "FAIL causal_conv1d_silu_split T=" << T << " accepted " << what << "\n";
@@ -515,7 +515,7 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
 
     const std::string tag = "causal_conv1d_silu C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " " + call_name(call);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " final state",
@@ -532,6 +532,167 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
         failures += verify_buffer_guards(tag + " state output", *state_out);
     }
     failures += verify_buffer_guards(tag + " output", output);
+    return failures;
+}
+
+// The weight's element order. `weight` is tap-major -- the tap j of channel c at the flat index
+// j*C + c -- while the checkpoint's own `[C,1,4]` parameter flattens to c*4 + j, so a parameter
+// bound as it is stored is shape-valid and wrong. An oracle that reads the payload through one flat
+// index cannot see the order by itself, so this case builds *both* readings of one buffer:
+// `tap_major` as the contract states it, and `channel_major` at c*4 + j, which is what a kernel
+// following the wrong order would be handed. It is the case that fails if the order flips: the two
+// references must be separated by far more than the criterion -- otherwise the case would prove
+// nothing -- and the Op must reproduce the tap-major one and disagree with the other. The weight
+// makes that separation by construction: every channel carries four distinct taps (c + 1, c + 9, c
+// + 17, c + 25, each over 64), while the channel-major reading hands channel c the tap-0 values of
+// channels 4c..4c+3. An all-equal weight, or one symmetric in c and j (w(c,j) == w(j,c)), gives the
+// same number under both readings and could not distinguish them.
+//
+// The weight and the inputs are scaled so the convolution sums stay within about two. That is not
+// incidental: the criterion's per-element limit is 1e-3 + 3.7e-3 * max|reference|, and a BF16
+// output is stored to half an ulp, so a sum of about 130 (half an ulp 0.5 against a limit of 0.48)
+// would fail on output storage rounding rather than on the order.
+int weight_layout_point(std::int32_t C, std::int32_t T, StateCall call) {
+    const std::size_t channels = static_cast<std::size_t>(C);
+    std::vector<float> x(static_cast<std::size_t>(C) * static_cast<std::size_t>(T));
+    std::vector<float> state(static_cast<std::size_t>(C) * 3U);
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            x[offset(c, t, C)] = 0.25F + 0.0625F * static_cast<float>((c + 3 * t) % 7);
+        }
+    }
+    for (std::int32_t s = 0; s < 3; ++s) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            state[offset(c, s, C)] = 0.125F + 0.0625F * static_cast<float>((c + s) % 3);
+        }
+    }
+
+    const auto tap_value = [](std::int32_t c, std::int32_t j) {
+        return static_cast<float>(c + 1 + 8 * j) * 0.015625F;
+    };
+    std::vector<float> tap_major(channels * 4U);
+    std::vector<float> channel_major(channels * 4U);
+    for (std::int32_t j = 0; j < 4; ++j) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            tap_major[offset(c, j, C)] = tap_value(c, j);
+            channel_major[static_cast<std::size_t>(c) * 4U + static_cast<std::size_t>(j)] =
+                tap_value(c, j);
+        }
+    }
+
+    // The same oracle reads whichever buffer it is given through the tap-major index, so the second
+    // reference is the ideal of the transposed logical weight.
+    const OracleResult tap_ideal  = causal_conv_oracle(x, tap_major, state, C, T, false);
+    const OracleResult flip_ideal = causal_conv_oracle(x, channel_major, state, C, T, false);
+
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(tap_major);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+
+    GuardedDeviceBuffer x_buffer(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight_buffer(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in_buffer(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out_buffer(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x_buffer.copy_from_host(x_bits.data(), x_buffer.bytes());
+    weight_buffer.copy_from_host(weight_bits.data(), weight_buffer.bytes());
+    state_in_buffer.copy_from_host(state_bits.data(), state_in_buffer.bytes());
+    state_out_buffer.fill(0x5a);
+    output.fill(kOutputPoison);
+
+    const Tensor tx(x_buffer.data(), DType::BF16, {C, T});
+    const Tensor tw(weight_buffer.data(), DType::BF16, {C, 4});
+    Tensor ts_in(state_in_buffer.data(), DType::BF16, {C, 3});
+    Tensor ts_out(state_out_buffer.data(), DType::BF16, {C, 3});
+    Tensor tout(output.data(), DType::BF16, {C, T});
+    if (call == StateCall::InPlaceEntry) {
+        ops::causal_conv1d_silu(tx, tw, ts_in, tout, nullptr);
+    } else {
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string tag         = "causal_conv1d_silu weight order C=" + std::to_string(C) +
+                                    " T=" + std::to_string(T) + " " + call_name(call);
+    const std::vector<double> got = from_device_bf16(output.data(), x_bits.size());
+    const auto count              = static_cast<std::int64_t>(tap_ideal.output.size());
+    int failures                  = 0;
+    failures += verify_output(tag + " output", got, tap_ideal.output);
+
+    // Only a separated pair of references makes a flip a criterion failure rather than a
+    // coincidence, so the separation is asserted here rather than assumed of the generated weight.
+    if (reduction_passes(
+            compute_reduction_stats(tap_ideal.output.data(), flip_ideal.output.data(), count),
+            count, kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " the two weight orders are not separated\n";
+        ++failures;
+    }
+    if (reduction_passes(compute_reduction_stats(got.data(), flip_ideal.output.data(), count),
+                         count, kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " output matches the channel-major reading of the weight\n";
+        ++failures;
+    }
+    failures += verify_bits(tag + " weight preserved", weight_buffer.data(), weight_bits);
+    failures += verify_buffer_guards(tag + " weight", weight_buffer);
+    return failures;
+}
+
+// The checkpoint's own declaration of that payload is the one wrong binding a shape can detect, and
+// only because C != 4 makes the declarations different tensors. A payload in the checkpoint's order
+// inside a tensor that already declares [C,4] carries no shape evidence, which is what the flat
+// index in the header is for.
+int weight_layout_refusal_case() {
+    constexpr std::int32_t C = 8;
+    constexpr std::int32_t T = 5;
+    const std::size_t n      = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    GuardedDeviceBuffer x(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(static_cast<std::size_t>(C) * 4U * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state(static_cast<std::size_t>(C) * 3U * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out(n * sizeof(std::uint16_t));
+    x.fill(0);
+    weight.fill(0);
+    state.fill(0);
+    out.fill(0);
+
+    const Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor ts(state.data(), DType::BF16, {C, 3});
+    Tensor tout(out.data(), DType::BF16, {C, T});
+    const Tensor tw(weight.data(), DType::BF16, {C, 4});
+    // The checkpoint's parameter shape, and its flattened form: both put the tap axis first.
+    const Tensor checkpoint_declaration(weight.data(), DType::BF16, {4, 1, C});
+    const Tensor flattened_declaration(weight.data(), DType::BF16, {4, C});
+
+    auto is_rejected = [&](const Tensor& weight_arg) {
+        try {
+            ops::causal_conv1d_silu(tx, weight_arg, ts, tout, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    int failures         = 0;
+    auto expect_rejected = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cout << "FAIL causal_conv1d_silu accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    if (is_rejected(tw)) {
+        std::cout << "FAIL causal_conv1d_silu rejected the tap-major [C,4] weight\n";
+        ++failures;
+    }
+    expect_rejected(is_rejected(checkpoint_declaration), "the checkpoint's [C,1,4] declaration");
+    expect_rejected(is_rejected(flattened_declaration), "a flattened [4,C] declaration");
+    return failures;
+}
+
+int weight_layout_case() {
+    int failures = weight_layout_refusal_case();
+    // T = 1 selects the decode kernels, T = 5 the small-T one and T = 33 the prefill pair kernel:
+    // the three sites that index the weight by tap. The two state forms cover both decode kernels.
+    for (const StateCall call : {StateCall::InPlaceEntry, StateCall::DistinctEntry}) {
+        for (const std::int32_t T : {1, 5, 33}) { failures += weight_layout_point(8, T, call); }
+    }
     return failures;
 }
 
@@ -751,7 +912,7 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
 
     const std::string tag = "causal_conv1d_silu continuation C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " read_slot=" + std::to_string(read_slot);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -831,7 +992,7 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
                             " initial_slot=" + std::to_string(initial_slot) +
                             " snapshot_base_slot=" + std::to_string(snapshot_base_slot) +
                             (bias == nullptr ? "" : " biased");
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -933,7 +1094,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
                             " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                             (masked ? " masked" : " dense");
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -988,6 +1149,10 @@ int main() {
     // The peer 35B-A3B geometry is a separate real channel extent.
     constexpr std::int32_t kQwen35Channels = 8192;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
+
+    // The weight's element order, at the routes that index it, plus the two declarations of the
+    // checkpoint's own order a shape can refuse.
+    failures += weight_layout_case();
 
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not

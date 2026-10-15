@@ -12,9 +12,26 @@ namespace ninfer::ops {
  *
  *   ideal[c,t] = SiLU(sum_{j=0..3} weight[c,j] * u[c,t-3+j]).
  *
- * `x` and `out` are contiguous BF16 [C,T], `weight` is contiguous BF16 [C,4], and a state is
- * contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates `ideal` naively in FP64 from
- * the represented inputs. The BF16 output is promoted and compared directly with that result;
+ * `x` and `out` are contiguous BF16 [C,T] and a state is contiguous BF16 [C,3] ordered oldest to
+ * newest, in this tree's own axis order, which puts the innermost axis first: element (c,t) of x is
+ * at the flat index `t*C + c`. `weight` is contiguous BF16 [C,4] in that same order, so it is
+ * *tap-major*: the tap j of channel c is at the flat index `j*C + c` -- the payload is four runs of
+ * C channels, one run per tap -- and `weight[c,j]` in the formula above denotes that element. The
+ * kernels read it that way. That is *not* the checkpoint's order: its `mixer.conv1d.weight` is
+ * `[conv_channels,1,conv_kernel]`, whose own flattening is `c*4 + j`, so binding the stored payload
+ * as it is stored yields a shape-valid [C,4] tensor in which every tap of every channel belongs to
+ * another channel -- a silently wrong model rather than a refusal. The transpose belongs to whoever
+ * binds the parameter.
+ *
+ * The wrapper requires the declared shape to be exactly [C,4] (ne[0] = C), which refuses the
+ * checkpoint's own declaration ([4,1,C], or a flattened [4,C]) whenever C != 4. Two bindings cannot
+ * be refused and are stated here instead: at C == 4 the two declarations are the same tensor and
+ * differ only in the payload, and a checkpoint-order payload inside a tensor that already declares
+ * [C,4] carries no shape evidence at all. The flat index above is therefore the whole contract for
+ * the order, and a caller that reshapes a stored `[C,1,4]` parameter has to transpose it.
+ *
+ * The oracle evaluates `ideal` naively in FP64 from the represented inputs. The BF16 output is
+ * promoted and compared directly with that result;
  * output storage rounding belongs to the Op's numerical criterion, not the oracle. Kernel
  * accumulator and staging precision are implementation choices. Input, weight, output, and state
  * storage do not overlap except for the explicitly allowed exact alias between state input and

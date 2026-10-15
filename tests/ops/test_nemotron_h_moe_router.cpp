@@ -181,9 +181,12 @@ struct Fixture {
 
 struct Run {
     int failures = 0;
-    std::vector<std::int32_t> ids; // [K,T], rank fastest
-    std::vector<double> weights;   // [K,T]
-    std::vector<double> logits;    // [E,T]
+    // Flat payloads in the Op's own order: ids and weights at `rank*tokens + token`, logits at
+    // `expert*tokens + token`. The declared shapes are the reference's own and read as the
+    // transpose of this, which is what the layout case below exercises.
+    std::vector<std::int32_t> ids;
+    std::vector<double> weights;
+    std::vector<double> logits;
 };
 
 Run run_case(const char* label, const Inputs& inputs, const Geometry& geometry,
@@ -262,6 +265,71 @@ double maximum_deviation(const std::vector<double>& left, const std::vector<doub
         worst = std::max(worst, std::abs(left[index] - right[index]));
     }
     return worst;
+}
+
+// --- the output order ------------------------------------------------------
+
+// The transposed reading of a flat payload: the same buffer indexed the other way round, which is
+// what a caller that derives its offsets from ne/nb gets from a tensor declared with the
+// reference's shape.
+template <typename T>
+std::vector<T> transposed(const std::vector<T>& flat, std::int32_t outer, std::int32_t inner) {
+    std::vector<T> flipped(flat.size());
+    for (std::int32_t row = 0; row < outer; ++row) {
+        for (std::int32_t column = 0; column < inner; ++column) {
+            flipped[static_cast<std::size_t>(row) * inner + column] =
+                flat[static_cast<std::size_t>(column) * outer + row];
+        }
+    }
+    return flipped;
+}
+
+// The Op writes the reference's tensors *transposed*: the token axis is the innermost one of the
+// payload (`ids[rank*tokens + token]`, `weights[rank*tokens + token]`, `logits[expert*tokens +
+// token]`) while the buffers are declared with the reference's own shapes, whose axis order in this
+// tree is the opposite, so a caller that indexes through ne/nb reads a transposed matrix.
+//
+// This is the case that fails if that order flips. top_k != tokens makes the two orders different
+// vectors of the same length, and the expectations are stated as numbers rather than sampled, so
+// the separation is a property of the case instead of a property of a seed: the four logits below
+// rank experts 1 then 2 for every token, so the rank-major ids are [1,1,1,2,2,2] where the
+// transposed reading of the same buffer is [1,1,2,1,2,2]. With top_k == tokens the two orders
+// coincide and no case could tell them apart, which is also why the refusal of a swapped
+// declaration in refusal_cases needs the two extents to differ.
+int output_layout_case() {
+    constexpr std::int32_t kExperts = 4;
+    constexpr std::int32_t kTopK    = 2;
+    constexpr std::int32_t kTokens  = 3;
+    const Geometry geometry{/*hidden*/ 8,   /*experts*/ kExperts, /*top_k*/ kTopK,
+                            /*groups*/ 1,   /*groups_used*/ 1,    /*normalize*/ false,
+                            /*scale*/ 1.0F, /*tokens*/ kTokens};
+    // sigmoid(-1) > sigmoid(0) > sigmoid(-3): the top-2 is experts 1 and 2, with distinct weights.
+    const std::vector<float> logits{-1.0F, 1.0F, 0.0F, -3.0F};
+    const Inputs inputs =
+        point_inputs(logits, std::vector<float>(kExperts, 0.0F), geometry.hidden, kTokens);
+
+    const std::vector<std::int32_t> expected_ids{1, 1, 1, 2, 2, 2};
+    const Run run = run_case("output order", inputs, geometry, &expected_ids);
+    int failures  = run.failures;
+
+    const auto ids_flipped     = transposed(run.ids, kTopK, kTokens);
+    const auto weights_flipped = transposed(run.weights, kTopK, kTokens);
+    const auto logits_flipped  = transposed(run.logits, kExperts, kTokens);
+    const double weight_gap    = maximum_deviation(run.weights, weights_flipped);
+    const double logit_gap     = maximum_deviation(run.logits, logits_flipped);
+    if (run.ids == ids_flipped || weight_gap < 0.1 || logit_gap < 0.1) {
+        std::cerr << "output order: the two orders are not separated (ids "
+                  << (run.ids == ids_flipped ? "coincide" : "differ") << ", weights gap "
+                  << weight_gap << ", logits gap " << logit_gap
+                  << "), so the case discriminates "
+                     "nothing\n";
+        ++failures;
+    }
+
+    // The other half of the order contract -- refusing a declaration whose extents are swapped --
+    // is in refusal_cases, where the shape rule is already exercised: it needs top_k != tokens, and
+    // the case above is the one that shows the payload's own order.
+    return failures;
 }
 
 // --- the correction bias ----------------------------------------------------
@@ -669,6 +737,40 @@ int refusal_cases() {
         Fixture fixture(inputs, good, 16);
         fixture.call();
     });
+
+    // The outputs' order, in the one form the shape check can decide: with top_k != tokens a
+    // declaration whose extents are swapped is a different tensor, so it is refused. The geometry
+    // above has top_k == tokens, where the two declarations are one tensor and nothing can refuse
+    // them. These tensors are rebuilt over the same buffers so their strides match their extents;
+    // editing ne alone would trip the contiguity rule instead, and the shape rule could then be
+    // dropped without any case noticing.
+    const Geometry swapped{/*hidden*/ 8,       /*experts*/ 8,     /*top_k*/ 2,
+                           /*groups*/ 2,       /*groups_used*/ 1,
+                           /*normalize*/ true, /*scale*/ 1.0F,    /*tokens*/ 3};
+    const Inputs swapped_inputs = sampled_inputs(swapped, 9);
+    failures += refuse_case("expert_ids declared [tokens, top_k]", [&] {
+        Fixture fixture(swapped_inputs, swapped);
+        fixture.expert_ids =
+            Tensor(fixture.ids_buffer.data(), DType::I32, {swapped.tokens, swapped.top_k});
+        fixture.call();
+    });
+    failures += refuse_case("expert_weights declared [tokens, top_k]", [&] {
+        Fixture fixture(swapped_inputs, swapped);
+        fixture.expert_weights =
+            Tensor(fixture.weights_buffer.data(), DType::FP32, {swapped.tokens, swapped.top_k});
+        fixture.call();
+    });
+    // The required declaration stays accepted at that same geometry, so tightening the order cannot
+    // have refused the Op's own callers.
+    try {
+        Fixture fixture(swapped_inputs, swapped);
+        fixture.call();
+        cuda_synchronize();
+    } catch (const std::exception& error) {
+        std::cerr << "expert_ids and expert_weights declared [top_k, tokens]: rejected: "
+                  << error.what() << '\n';
+        ++failures;
+    }
     return failures;
 }
 
@@ -972,6 +1074,8 @@ int main() {
         failures += group_tie_case();
         failures += normalize_and_scale_case();
         failures += bias_changes_selection_case();
+        // The orders of the three buffers the Op writes, against the transposed reading of them.
+        failures += output_layout_case();
 
         // The banks and the token counts the checkpoint's MoE layers actually carry, at the
         // degenerate grouping it sets. 240 experts is the most common bank and 496 the widest.

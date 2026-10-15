@@ -51,8 +51,29 @@ namespace ninfer::ops {
  *   correction_bias  contiguous FP32 [E], one per expert, as a tensor. The checkpoint stores this
  *                    buffer in FP32, which is the precision the reference adds it in, so a BF16
  *                    copy would lose what the selection is made of.
- *   expert_ids       contiguous I32 [K,T] (row-major, token fastest axis), fully overwritten.
- *   expert_weights   contiguous FP32 [K,T], fully overwritten.
+ *   expert_ids       contiguous I32; fully overwritten. The wrapper requires the declared shape to
+ *                    be ne = [K,T], and the payload holds element (rank, token) at the flat index
+ *                    `rank*tokens + token`.
+ *   expert_weights   contiguous FP32, the same declared shape and the same flat index.
+ *
+ * Element order: the Op writes the reference's own tensors *transposed*. The reference and its dump
+ * hold the logits as [T,E] and the top-k as [T,K], both row-major with the expert or the rank axis
+ * innermost; this Op writes the other way round -- expert-major and rank-major, with the *token*
+ * axis innermost -- so an element lives at `expert*tokens + token` or `rank*tokens + token`. The
+ * declared shapes stay the reference's own ([K,T] for the two outputs, [E,T] for the workspace).
+ * Those three are the only tensors here whose declaration reads as the transpose of their payload:
+ * `x` keeps this tree's Tensor order (ne[0] = H, the innermost axis) and `W_router` keeps the
+ * [rows, columns] convention every Weight in the tree uses. `ne` and `nb` therefore do not describe
+ * these three buffers, and a caller indexes them with the flat expressions above. The model that
+ * binds them says the same in its own allocation comment.
+ *
+ * What a shape can and cannot refuse: a declaration whose extents are swapped is refused for the
+ * two outputs whenever the two extents differ, because the check names their shape -- and for no
+ * other tensor here, since the workspace's dtype and shape are not validated. A payload bound in
+ * the other order inside a declaration of the right shape carries no shape evidence at all -- both
+ * orders hold the same element count -- and the Op writes these buffers rather than reading them,
+ * so no check can refuse it: the flat index is the whole contract for the order, and the shape
+ * requirement above must not be read as evidence about the payload.
  *
  * Supported domain:
  *   T >= 1, H >= 1 and a multiple of 8, 1 <= E <= 512 (the family config's own bound; this
@@ -89,9 +110,11 @@ namespace ninfer::ops {
  * Workspace:
  *   Caller-owned, graph-stable transient storage of at least
  * `nemotron_h_moe_router_workspace_bytes`, 16-byte aligned, carrying no state beyond the call: it
- * holds the FP32 [E,T] logits between the projection and the selection, so the projection alone is
- * observable to a verification harness (the reference dump exposes the same tensor). The Op
- * allocates nothing.
+ * holds the FP32 logits between the projection and the selection, element (expert, token) at the
+ * flat index `expert*tokens + token`, so the projection alone is observable to a verification
+ * harness -- whose dump holds the reference's own [T,E] and therefore the transpose of this buffer.
+ * The Op allocates nothing. Nothing but the element count its byte size implies is validated of a
+ * workspace, whose dtype and shape are the caller's; see Element order above for the payload.
  *
  * Execution:
  *   The caller's stream; graph-capturable (no host synchronization, no allocation).

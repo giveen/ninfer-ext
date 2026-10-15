@@ -52,9 +52,15 @@ void require_snapshot_x_shape(const Tensor& x) {
     }
 }
 
+// The weight's shape is the only evidence of its order a call carries, so the refusal states the
+// accepted flat index rather than the extents alone: the payload is tap-major, and the checkpoint's
+// own [C,1,4] flattening (c*4 + j) is refused here whenever it is bound under its own declaration.
 void require_weight_shape(const Tensor& weight, std::int32_t C) {
     if (weight.ne[0] != C || weight.ne[1] != 4 || weight.ne[2] != 1 || weight.ne[3] != 1) {
-        throw std::invalid_argument("causal_conv1d: weight must have shape [C,4]");
+        throw std::invalid_argument(
+            "causal_conv1d: weight must be a [C,4] tensor whose payload is tap-major -- the tap j "
+            "of channel c at j*C + c -- so the checkpoint's own [C,1,4] order (c*4 + j) has to be "
+            "transposed at bind time");
     }
 }
 

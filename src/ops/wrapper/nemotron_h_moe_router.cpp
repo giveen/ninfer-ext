@@ -25,12 +25,16 @@ constexpr std::int32_t kMaxGroups  = 32;
 }
 
 // A contiguous 2-D tensor: the leading two extents carry the shape and the trailing two are one.
+// `layout` states the payload's element order at the point of refusal, because the declared shape
+// of this Op's outputs is the reference's own and reads as the transpose of what the Op writes: a
+// caller told the extents alone would still not know which flat index to use.
 void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t columns,
-                    const char* label) {
+                    const char* label, const char* layout) {
     if (tensor.data == nullptr) { fail(std::string(label) + " must be bound"); }
     if (!tensor.is_contiguous()) { fail(std::string(label) + " must be contiguous"); }
     if (tensor.ne[0] != rows || tensor.ne[1] != columns || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
-        fail(std::string(label) + " must be a contiguous matrix of the geometry's shape");
+        fail(std::string(label) + " must be a contiguous [" + std::to_string(rows) + "," +
+             std::to_string(columns) + "] matrix (" + layout + ")");
     }
 }
 
@@ -75,7 +79,7 @@ void nemotron_h_moe_router(const Tensor& x, const NemotronHMoeRouterWeights& wei
 
     if (x.dtype != DType::BF16) { fail("x must be BF16"); }
     const std::int32_t tokens = x.ne[1];
-    require_matrix(x, hidden, tokens, "x");
+    require_matrix(x, hidden, tokens, "x", "the hidden axis innermost, x[t*hidden + h]");
     if (!aligned16(x.data)) { fail("x must be 16-byte aligned"); }
 
     // The router weight is the artifact's BF16 role, exactly as the checkpoint stores it; the
@@ -98,9 +102,11 @@ void nemotron_h_moe_router(const Tensor& x, const NemotronHMoeRouterWeights& wei
     }
 
     if (expert_ids.dtype != DType::I32) { fail("expert_ids must be I32"); }
-    require_matrix(expert_ids, top_k, tokens, "expert_ids");
+    require_matrix(expert_ids, top_k, tokens, "expert_ids",
+                   "the payload is rank*tokens + token, the token axis innermost");
     if (expert_weights.dtype != DType::FP32) { fail("expert_weights must be FP32"); }
-    require_matrix(expert_weights, top_k, tokens, "expert_weights");
+    require_matrix(expert_weights, top_k, tokens, "expert_weights",
+                   "the payload is rank*tokens + token, the token axis innermost");
 
     const std::size_t required = nemotron_h_moe_router_workspace_bytes(geometry, tokens);
     if (workspace.data == nullptr || !workspace.is_contiguous() || workspace.bytes() < required ||
