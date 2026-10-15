@@ -80,26 +80,70 @@ the linear-attention/recurrent-state machinery (GDN is the same family of proble
 mathematics), MoE routing infrastructure, GQA attention, KV paging, and the host-offload expert cache
 that Flash-Next already uses for a model whose weights exceed the device.
 
-Memory: NVIDIA's own 24GB variant demonstrates the target — 74B at a mixed NVFP4 group-16 (mixer and
-expert matrices) plus Q8 (head) footprint of **24.12 GB**, which is the shape of this repository's
-NVFP4 and Q8 routes. Weights then fit a 5090; KV at 256K context is what the paged/host cache is for.
+Memory: NVIDIA's own 24GB variant is the only size evidence there is, and it is aggressive — see
+[the serving footprint](#serving-footprint-and-what-it-implies) below, which records their per-tensor
+recipe, why this repository's routes land above a 5090's 32 GB, and why that makes host offload part of
+the serving configuration rather than an option.
+
+## Serving footprint, and what it implies
+
+NVIDIA's own 24GB variant is the only evidence about what this model costs on a small card, and it is
+informative: **27,728 expert tensors at `IQ2_XXS`** (2.0625 bits, group 256, ggml packing), the mixer
+projections at NVFP4 group 16, the head at Q8_0 — 24.12 GB in total. So 74B fits 32 GB only at roughly
+2.5 bits per parameter on average.
+
+This repository's routes are larger. EXL3 at 3.5 bpw puts the expert banks alone near 25 GB, and with the
+dense, attention, embedding and projection parts the artifact lands around 33 GB — over a 5090's 32 GB.
+The serving configuration is therefore **host offload**, the route Flash-Next already uses: experts in
+pinned Host memory behind a Program-owned device cache. That corrects an assumption earlier in this
+document, that the weights would be device-resident and only KV would need the paged machinery. A ~2-bit
+expert route is the alternative, and it is a quality experiment rather than a phase-1 dependency.
+
+The host-offload cache does **not** survive heterogeneous banks as written: `slot_of` is `layers × E`,
+the owner→layer decode is a division by `E`, the staged bank is `2E`, and the pool stride is one global
+`slot_bytes`. Four sites fix it — sum the per-layer `E` (`startup.cpp:1451`), replace `slot_of` with a
+per-layer prefix-sum offset table (`startup.cpp:361`), decode an owner by search (`pressure.cpp:2676`),
+size the staged bytes per layer (`qwen4_expert_pager.cpp:15`) — with the pool stride becoming the
+maximum slot. No artifact-format change.
+
+## What the layout work actually is
+
+The artifact container is layer-blind and already carries the variation: a bank is one binding of parts
+with its own shape and divisors, validation is per requested parameter, and materialization has no layer
+stride. Gemma 4's global layers already bind *no* `attention/value` and use different query/key row
+counts, so per-layer shape and per-layer parameter *presence* are both proven. Names are per layer
+already (`text/layers/<i>/moe/experts/<e>/…`), and the converter's recipe, packing groups and per-layer
+layout file need no change at all.
+
+What is uniform is the family parser (one `MoeConfig` per model), `bind_block` deciding dense-vs-moe once
+for the whole model, and the expert-consuming ops. So: the config gains a per-layer FFN descriptor
+(`layer_types` is the existing pattern), the loader takes it mechanically, and the MoE op is written
+**new** rather than generalised — Bolt's experts are non-gated with a latent round trip and `relu2`, and
+both existing offload and sparse-MoE ops bake their geometry into headers and every kernel translation
+unit. The new op takes `{E, I, K, H}` at runtime; the artifact side needs nothing, because a bank is
+already opaque.
 
 ## Milestones
 
-1. **Oracle.** A reference harness that instantiates the canonical implementation on tiny shapes and
-   dumps per-stage tensors, then the same at real shapes. Nothing below is qualified without it.
-2. **Config and artifact.** The hybrid block list, per-layer expert counts and per-layer expert widths;
-   the layout question is whether the existing artifact/binding code expresses per-layer variation.
-3. **Ops, one at a time, each against the oracle**: RMSNorm + `relu2` → Mamba-2 → router + experts →
-   latent round trip → attention → the block → the whole 88-block forward.
-4. **Converter** from the BF16 checkpoint, then the Engine path and the decode loop.
+1. **Oracle — done.** `tools/verify/nemotron_h_reference.py` dumps every stage an op has to reproduce
+   (29 stages on the tiny config), from a scaled-down config or a downloaded checkpoint.
+2. **Config and artifact** (next): the per-layer FFN descriptor, the loader threading and the converter's
+   per-layer loops. The artifact format does not change.
+3. **Ops, one at a time, each against the oracle**: `relu2` + RMSNorm → Mamba-2 (selective scan, fp32
+   state) → router + non-gated experts → the latent round trip → the new latent-MoE op → attention →
+   the block → the 88-block forward.
+4. **Converter and Engine path**, then the host-offload cache work above, then the decode loop.
+5. **Draft** (LiLiCorr) after the target runs, qualified against an NVFP4-family artifact.
 
 ## Open items
 
-- The draft pairs with the **24GB NVFP4** target, not the BF16 one, so its qualification belongs on
-  our NVFP4 route. The cheap decisive check is ranking the draft's token inside the target's own
-  next-token distribution — the diagnostic that exposed the Gemma 4 QAT mismatch.
+- The draft pairs with the **24GB NVFP4** target, not the BF16 one, so its qualification belongs on our
+  NVFP4 route; the cheap decisive check is ranking the draft's token inside the target's own next-token
+  distribution, the diagnostic that exposed the Gemma 4 QAT mismatch.
 - `e_score_correction_bias` is a buffer in the reference and must be confirmed against the released
   checkpoint's tensors.
-- Vision (RADIO/InternVL-style tower, projector 20480, video) and MTP (`num_nextn_predict_layers` is 0
-  in this release) are out of phase 1.
+- Whether the released checkpoint's expert banks are one fused tensor per layer or one per expert; the
+  reference's expert weights are 3-D `(num_experts, out, in)` while llama.cpp derives the count from the
+  router width.
+- Vision (RADIO/InternVL tower, projector 20480, video) and MTP (`num_nextn_predict_layers` is 0 in this
+  release) are out of phase 1.
