@@ -61,6 +61,21 @@ attention in the same order, with 240/304/368/432/496 experts in 12/6/9/10/3 lay
 The draft is a separate 962 MB NVFP4 file (`model.safetensors` beside the target), and its tensors say
 what it is: a Qwen3-shaped five-layer block drafter (`block_size` 8) with an elaborate head.
 
+Verified against its own 179 tensors, and reconciling exactly with its 962,485,872 bytes — which is what makes
+the parameter count trustworthy rather than copied off a card:
+
+| | |
+|---|---|
+| Parameters | 1.1128 B: 878.7 M packed 4-bit weights, 234.1 M at BF16, plus 54.9 M F8_E4M3 group scales that the Hub's summary omits |
+| Body | 5 layers, hidden 4096, 32 query and 2 KV heads at `head_dim` 128, intermediate 12288, vocab 131072 — `model_type qwen3`, `LiLiCorrDraftModel`, with no embedding and no LM head |
+| Attention | every layer `sliding_attention` with window 1024, `causal: false`, and attention sinks |
+| Convolutions | a grouped convolution, kernel 2 and group 16, wrapping both sublayers |
+| Precision | `W4A16_NVFP4` group 16, and only in part: the five body MLPs, `fc` and ten LiLiCorr projections are packed, while attention, the convolutions, the norms and the in/out/anchor/feature heads stay BF16 |
+
+Those six taps land on target layers of type `[moe, mamba, mamba, mamba, mamba, moe]`, which is a concrete
+pattern for the context projection to bind against. The card states acceptance 4.30 at draft length 7: that is
+the number to match or beat, not a number to assume.
+
 - **What it needs from the target.** `fc.weight` is packed two values per byte, so its `[4096, 12288]` is
   really `4096 x 24576`, which its `weight_scale` of `[4096, 1536]` at group 16 confirms — that is
   **6 x 4096**, i.e. all six `target_layer_ids` (1, 18, 35, 51, 68, 85) concatenated. The target has to
@@ -135,9 +150,11 @@ the serving configuration rather than an option.
 ## Serving footprint, and what it implies
 
 NVIDIA's own 24GB variant is the only evidence about what this model costs on a small card, and it is
-informative: **27,728 expert tensors at `IQ2_XXS`** (2.0625 bits, group 256, ggml packing), the mixer
-projections at NVFP4 group 16, the head at Q8_0 — 24.12 GB in total. So 74B fits 32 GB only at roughly
-2.5 bits per parameter on average.
+informative: **27,728 expert tensors at `IQ2_XXS`** (2.0625 bits, group 256, ggml packing), 80 NVFP4 tensors —
+its Mamba `in_proj` and `out_proj` only, not the mixer projections generally — 113 at `Q8_0` including the
+head, and no quantization of its KV cache; 24.12 GB in total. So 74B fits 32 GB only at roughly 2.5 bits per
+parameter on average. That per-tensor split was measured from the checkpoint rather than read off a card, and
+it corrects an earlier, looser line in this document.
 
 This repository's routes are larger. EXL3 at 3.5 bpw puts the expert banks alone near 25 GB, and with the
 dense, attention, embedding and projection parts the artifact lands around 33 GB — over a 5090's 32 GB.
@@ -274,6 +291,19 @@ rather than described:
 | FP8 projection | F8_E4M3 `weight`, F32 scalar `weight_scale`, F32 `[1]` `input_scale` | per-tensor W8A8, the input scale being the activation divisor |
 | norms, `A_log`, `D`, `dt_bias`, `conv1d`, `gate`, embeddings | BF16 (this family's router weight F32) | unquantized |
 
+Three of those details are load-bearing for a decoder and are worth stating exactly. The `U8` codes pack two
+E2M1 values per byte with the **low nibble holding the even element**. The two scale levels compose as
+`e2m1(nibble) * weight_scale * weight_scale_2`, and for a block they reduce to `block_amax / 6` — the E4M3
+range the NVFP4 format is defined on. And `input_scale` is present *only* where activations are quantized, so
+its presence is the W8A8 and W4A4 signal rather than a separate flag; the FP8 form never carries
+`weight_scale_2`. KV scales, where a checkpoint exports them at all, are named
+`<attention>.k_proj.k_scale` / `v_proj.v_scale` and disappear entirely under a constant-range cast — which is
+what the backbone of the flagship does, and what our own FP8 KV does.
+
+The naming the loader will see is `backbone.layers.N.mixer.*`, under a `language_model.` prefix in the omni
+wrapper. ModelOpt's own HF↔Megatron table is `export/plugins/mcore_nemotron.py`, not the export-mapping commit
+that appeared to promise it.
+
 That is exactly the shape our `import_encoded` path already consumes, so the conversion needs no new format
 work. Two details will bite a loader that assumes its own dtypes: in that checkpoint `A_log`, `D` and `dt_bias`
 are **BF16** while this branch's scan Op requires FP32 for all three, so the conversion has to upcast them; and
@@ -329,6 +359,24 @@ W4A16 target at 4.5 bits should be at least as good, and that is the bar the con
 The same cards also name a third route for this checkpoint that we are deliberately not taking: serve the 24 GB
 IQ2 target itself, which is what the drafter expects and what fits a 5090 outright. It would need a 2-bit
 expert codec, which this tree does not have and which the NVFP4 decision was taken to avoid.
+
+The technical report settles why the two releases differ, and it is the strongest support this plan has for
+its own route. Verbatim: "Lightning 3.5 is designed to excel in local, agentic use cases… we quantize
+Lightning 3.5 to **minimize weight fetch and raise activation precision to maintain accuracy**… deploys W4A16
+**regardless of GPU SKU**, while Super 3.5 VL… deploys W4A4 on Blackwell, and W4A16 on non-Blackwell". So
+W4A16 is not the cheap variant of W4A4 — it is the deliberate choice for local, agentic serving, taken to keep
+activation precision, which is precisely our case and precisely what a conversion from the BF16 checkpoint
+produces. The same report gives the recoveries: median accuracy 99.62% over 36 benchmarks for the Super NVFP4
+(it also states 99.52 and prints 99.36/99.52 in a table, an inconsistency it does not resolve) and 99.24% for
+Lightning's W4A16. Cite those as the accuracy bar, not as guarantees for this model: the report covers Super
+and Lightning, **not Bolt**, and its throughput figures are GB200-class.
+
+One negative result that matters for planning: **nothing in the vendor's serving material mentions expert
+residency or CPU/host offload at all.** Their Nemotron serving keeps the experts on devices and uses expert
+parallelism (EP=4 for PTQ, EP=32 for QAD); the only host-tiering they describe is a 240 GiB host **KV** tier on
+Rubin and a `host_cache_size: 0` in a TRT-LLM Spark config. Our host-RAM expert bank, then, is this
+repository's own design carried over from Flash-Next rather than a vendor recipe we can follow, and there is no
+published counterpart to compare it against.
 
 ## What the layout work actually is
 
