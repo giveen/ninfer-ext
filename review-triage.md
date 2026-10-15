@@ -1126,6 +1126,26 @@ allocation size, a release guard and a per-round duplicate-sample check. It was 
 `ctest -L real` never runs the suite (no label), the tests skip without a prompt, and the `width` bug
 made them throw on round 1 until this session fixed it.
 
+Further narrowing, and one correction to the oracles themselves. Both MoE components are
+oracle-clean at the failing shapes: `test_gemma_moe_experts` passed after its streamed coverage was
+widened from `{1, 3, 8}` to `{1, 3, 8, 12, 15}` and a 128-expert case was added for each route, and
+`test_gemma_moe_router` after `{1, 5, 8, 300}` became `{1, 5, 8, 12, 15, 16, 300}`. Those gaps are
+what let the defect ship: the streamed MoE route stopped at 8 tokens, so the widths a multi-lane
+verify spans (9 to 15) had no oracle, and the router jumped straight from 8 to 300. The review waves
+are excluded a second way — reverting the router and the MoE wrapper reproduced the failure at the
+same tokens, and the remaining Op diffs on this model's path are validation only (an added shape
+check, a head-dim check, a `batch > 65535` guard, and a throw when argmax's operands overlap).
+
+Forcing the per-token reference route fixed lane 0 — the lane whose sliding ring wraps, positions
+1103-1128 against a capacity of 1140 — and left lane 2 (unwrapped, positions 303-322) failing, so the
+specialized route is implicated for lane 0 while lane 2's failure is route-independent. What remains
+is the pass-level assembly, not any Op: the arena reserves a 512-token layer, `forward_layer` derives
+its token count from the pass indices, the router chunks at 128+ columns with one plan for 8, 12 and
+16, and `write_pass_indices` writes only lane-relative `positions` and `ring_slots`. The symptom is
+sparse corruption of the *target's own* logits — round 1 differed at one column, round 2 at two, with
+the same anchors and inputs — so naming the line needs an engine-side per-column dump of the verify's
+hidden state, comparing one batched round against the same round run solo.
+
 ### The one that was mine, and why the bound was wrong
 
 `width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a

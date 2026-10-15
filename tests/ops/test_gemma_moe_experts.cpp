@@ -216,8 +216,8 @@ int run_nvfp4_case(const char* label, std::int32_t hidden, std::int32_t experts,
         }
     }
 
-    const auto reference = gemma_moe_experts_ref::run(x_bits, hidden, tokens, ids, routing,
-                                                      gate_up, down, intermediate, top_k);
+    const auto reference = gemma_moe_experts_ref::run(x_bits, hidden, tokens, ids, routing, gate_up,
+                                                      down, intermediate, top_k);
 
     GuardedDeviceBuffer gate_up_device(gate_up.payload.size());
     GuardedDeviceBuffer down_device(down.payload.size());
@@ -254,9 +254,9 @@ int run_nvfp4_case(const char* label, std::int32_t hidden, std::int32_t experts,
     cuda_synchronize();
 
     const auto got = from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
-    int failures   = verify_pointwise(std::string(label) + " out",
-                                      std::vector<double>(got.begin(), got.end()), reference,
-                                      kCriterion);
+    int failures =
+        verify_pointwise(std::string(label) + " out", std::vector<double>(got.begin(), got.end()),
+                         reference, kCriterion);
 
     // The same call again over a re-poisoned output: the route has no order the scheduler picks.
     out_device.copy_from_host(poison.data(), out_device.bytes());
@@ -280,7 +280,6 @@ int run_nvfp4_case(const char* label, std::int32_t hidden, std::int32_t experts,
                      down.payload);
     return failures;
 }
-
 
 int run_q4_rows_case(const char* label, std::int32_t hidden, std::int32_t experts,
                      std::int32_t top_k, std::int32_t intermediate, std::int32_t tokens,
@@ -341,11 +340,11 @@ int run_q4_rows_case(const char* label, std::int32_t hidden, std::int32_t expert
                            workspace, nullptr);
     cuda_synchronize();
     const auto got = from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
-    int failures = 0;
+    int failures   = 0;
     if (!boundaries.expert_out_bf16) {
-        failures += verify_pointwise(std::string(label) + " out",
-                                     std::vector<double>(got.begin(), got.end()), reference,
-                                     kCriterion);
+        failures +=
+            verify_pointwise(std::string(label) + " out",
+                             std::vector<double>(got.begin(), got.end()), reference, kCriterion);
     } else {
         // A route that rounds each expert's output to BF16 may land one ulp away from the
         // oracle's rounding of the same value, since their accumulations differ; where the
@@ -353,7 +352,8 @@ int run_q4_rows_case(const char* label, std::int32_t hidden, std::int32_t expert
         std::size_t worst  = 0;
         double worst_ratio = 0.0;
         for (std::size_t i = 0; i < reference.size(); ++i) {
-            const double bound = kCriterion.absolute + kCriterion.relative * std::abs(reference[i]) +
+            const double bound = kCriterion.absolute +
+                                 kCriterion.relative * std::abs(reference[i]) +
                                  std::ldexp(magnitude[i], -7);
             const double ratio = std::abs(static_cast<double>(got[i]) - reference[i]) / bound;
             if (!(ratio <= worst_ratio)) {
@@ -375,11 +375,11 @@ int run_q4_rows_case(const char* label, std::int32_t hidden, std::int32_t expert
     const auto again =
         from_device_bf16(out_device.data(), static_cast<std::int64_t>(x_bits.size()));
     failures += verify_exact((std::string(label) + " run-to-run").c_str(), again, got);
-    failures += verify_exact(
-        (std::string(label) + " gate_up preserved").c_str(),
-        from_device<std::uint8_t>(gate_up_device.data(),
-                                  static_cast<std::int64_t>(gate_up_bytes.size())),
-        gate_up_bytes);
+    failures +=
+        verify_exact((std::string(label) + " gate_up preserved").c_str(),
+                     from_device<std::uint8_t>(gate_up_device.data(),
+                                               static_cast<std::int64_t>(gate_up_bytes.size())),
+                     gate_up_bytes);
     return failures;
 }
 } // namespace
@@ -392,8 +392,9 @@ int main() {
         failures += run_nvfp4_case("nvfp4 per-token", 256, 4, 2, 128, 4);
         failures += run_q4_rows_case("q4 rows per-token", 256, 4, 2, 128, 4);
         // The 26B's H, stored I and K over a 16-expert bank: the streamed route, at one token, at
-        // a batched-decode width and at an MTP verify width.
-        for (const std::int32_t tokens : {1, 3, 8}) {
+        // a batched-decode width, at one lane's MTP verify width, and across every width a
+        // multi-lane verify reaches before the grouped route takes over at 16.
+        for (const std::int32_t tokens : {1, 3, 8, 12, 15}) {
             failures += run_nvfp4_case(("nvfp4 streamed T=" + std::to_string(tokens)).c_str(), 2816,
                                        16, 8, 768, tokens);
             failures += run_q4_rows_case(("q4 rows streamed T=" + std::to_string(tokens)).c_str(),
@@ -405,6 +406,12 @@ int main() {
             failures += run_q4_rows_case(("q4 rows grouped T=" + std::to_string(tokens)).c_str(),
                                          2816, 16, 8, 768, tokens, {true, true, true});
         }
+        // The bank the model actually loads: 128 experts rather than 16. The grouped route's job
+        // layout is sized from min(experts, assignments), so its spacing has never been exercised
+        // at this expert count, and neither has the streamed route's bank addressing.
+        failures += run_q4_rows_case("q4 rows streamed T=12, 128 experts", 2816, 128, 8, 768, 12);
+        failures += run_q4_rows_case("q4 rows grouped T=16, 128 experts", 2816, 128, 8, 768, 16,
+                                     {true, true, true});
     } catch (const std::exception& error) {
         std::cerr << "gemma_moe_experts: " << error.what() << '\n';
         return 1;
