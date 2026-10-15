@@ -263,6 +263,23 @@ file level: a W4A16 release's experts carry no `input_scale`, so there is nothin
 activations with, while a W4A4 one does. It is also why a conversion from the BF16 checkpoint lands on W4A16
 whether or not we choose it.
 
+Read out of the downloaded Lightning checkpoint's own safetensors headers, so the converter's input is pinned
+rather than described:
+
+| Tensor | dtype | shape |
+|---|---|---|
+| expert and shared-expert `weight` | **U8** | `[I, K/2]` — two 4-bit codes per byte, packed along K |
+| expert and shared-expert `weight_scale` | **F8_E4M3** | `[I, K/16]` — one scale per 16 input elements |
+| expert and shared-expert `weight_scale_2` | **F32** | scalar — the per-tensor second level |
+| FP8 projection | F8_E4M3 `weight`, F32 scalar `weight_scale`, F32 `[1]` `input_scale` | per-tensor W8A8, the input scale being the activation divisor |
+| norms, `A_log`, `D`, `dt_bias`, `conv1d`, `gate`, embeddings | BF16 (this family's router weight F32) | unquantized |
+
+That is exactly the shape our `import_encoded` path already consumes, so the conversion needs no new format
+work. Two details will bite a loader that assumes its own dtypes: in that checkpoint `A_log`, `D` and `dt_bias`
+are **BF16** while this branch's scan Op requires FP32 for all three, so the conversion has to upcast them; and
+its attention projections are BF16 although the recipe puts them at FP8 — we follow the recipe, which is what
+the flagship release does.
+
 The checkpoint inventory decides how we get there. Our own Bolt 74B has **no official NVFP4 release** — what
 exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 GB quant whose experts are 2-bit,
 which is precisely the LiLiCorr draft's base and confirms it. So the NVFP4 conversion for this checkpoint is
