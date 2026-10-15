@@ -10,6 +10,7 @@ set(ninfer_op_tests
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail
+  gated_group_rmsnorm
   gated_rmsnorm
   l2norm
   mul_scalar
