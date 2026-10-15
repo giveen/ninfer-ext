@@ -82,6 +82,9 @@ jobs:
 
       - name: Install CUDA 13.3
         uses: Jimver/cuda-toolkit@v0.2.36
+        # The full local installer took 19 minutes on one run and over 40 on another, so this bounds
+        # it: a stuck installer should fail the job in half an hour, not hold the only runner slot.
+        timeout-minutes: 30
         with:
           cuda: '13.3.0'
           method: 'local'
@@ -146,7 +149,10 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --target ninfer ninfer-serve ninfer-probe --parallel
+          # -k 0 keeps ninja going after a failed translation unit: the first MSVC compile of this tree
+          # is expected to produce several independent errors, and one run should report all of them
+          # rather than the first. The step still fails, because ninja reports failure for the run.
+          cmake --build build --target ninfer ninfer-serve ninfer-probe --parallel -- -k 0
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
       - name: Stage a runnable package
