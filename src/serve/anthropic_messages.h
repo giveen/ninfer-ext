@@ -8,6 +8,8 @@
 // itself, so request lowering restores it from the returned block. A signature without the NInfer
 // marker stays non-semantic transport metadata.
 
+#include "ninfer/types.h"
+
 #include "serve/request.h"
 #include "serve/request_json.h"
 
@@ -78,6 +80,7 @@ public:
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
+    // Terminal: the last event of a failed stream, which must not be finished afterwards.
     std::string error(const ApiError& api_error) const;
 
 private:

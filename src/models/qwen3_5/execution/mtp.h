@@ -1,8 +1,21 @@
 #pragma once
 
+#include "core/arena.h"
+#include "core/tensor.h"
+#include "models/qwen3_5/config.h"
+
 #include "models/qwen3_5/execution/parameters.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+
 namespace ninfer::models::qwen3_5::execution {
+
+// Workspace sizing for the projection entry points below. `first`/`last` are the token-column
+// bounds (minimum and maximum token count) of the corresponding call and must match it: the
+// projection takes its actual extent from `hidden.ne[1]`, so planning a smaller range
+// under-allocates the arena.
 
 [[nodiscard]] std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                                          std::int32_t first, std::int32_t last);

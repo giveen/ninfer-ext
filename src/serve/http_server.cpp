@@ -187,6 +187,18 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+// Compares a presented credential with the configured one without an early exit, so the answer
+// cannot be recovered from per-character timing. The lengths are not secret.
+bool credential_matches(std::string_view presented, std::string_view expected) noexcept {
+    if (presented.size() != expected.size()) { return false; }
+    unsigned char difference = 0;
+    for (std::size_t index = 0; index < presented.size(); ++index) {
+        difference |= static_cast<unsigned char>(presented[index]) ^
+                      static_cast<unsigned char>(expected[index]);
+    }
+    return difference == 0;
+}
+
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
     if (api_key.empty()) { return false; }
     const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
@@ -214,7 +226,7 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     }
     std::size_t end = authorization.size();
     while (end > position && is_whitespace(authorization[end - 1])) { --end; }
-    return authorization.substr(position, end - position) == api_key;
+    return credential_matches( authorization.substr(position, end - position), api_key);
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
@@ -322,6 +334,8 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
+        try {
+
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
@@ -332,7 +346,16 @@ void HttpServer::run_stats_reporter() {
         next_deadline += interval;
         const Clock::time_point after_write = Clock::now();
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
+    } catch (const std::exception& error) {
+            // A failed stats or log write must not escape this thread (the entry point would call
+            // std::terminate and abort the server). Report it and keep the cadence: without moving
+            // the deadline a persistent failure would spin.
+            operational_log_.stats_failure(error.what());
+            next_deadline = Clock::now() + interval;
+        }
     }
+
+    try {
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
@@ -341,6 +364,7 @@ void HttpServer::run_stats_reporter() {
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
     if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }
+    } catch (const std::exception& error) { operational_log_.stats_failure(error.what()); }
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -383,7 +407,8 @@ void HttpServer::register_routes() {
         // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
         const bool bearer_ok =
             matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+        const bool x_api_key_ok =
+            credential_matches( req.get_header_value("x-api-key"), options_.api_key);
         if (!bearer_ok && !x_api_key_ok) {
             ApiError error;
             error.status  = 401;

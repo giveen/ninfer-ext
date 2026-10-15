@@ -25,6 +25,9 @@ constexpr std::size_t kPagesPerTask = 8;
 struct PleRowReader::File {
     std::filesystem::path path;
     int fd = -1;
+    // Declared end of this volume, from the segments that live in it. A read that reaches
+    // end-of-file before this offset means the volume is truncated or corrupt.
+    std::uint64_t extent = 0;
 
     explicit File(std::filesystem::path p) : path(std::move(p)) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -49,9 +52,15 @@ struct PleRowReader::File {
                                          ": direct n-gram read failed: " + std::strerror(errno));
             }
             if (n == 0) {
-                // A short final page: the rest of the page lies past the end of the volume.
+                // Only the tail of the page past the volume's declared extent may be short. A zero
+                // read inside that extent means the volume is truncated or corrupt, so reject it
+                // instead of fabricating zeros.
+                if (offset + done >= extent) {
                 std::memset(destination + done, 0, kPage - done);
                 return;
+                }
+                throw std::runtime_error(path.string() +
+                                         ": direct n-gram read hit a hole inside the volume");
             }
             done += static_cast<std::size_t>(n);
         }
@@ -65,11 +74,14 @@ PleRowReader::PleRowReader(std::span<const artifact::MappedObjectSegment> segmen
     for (const auto& segment : segments_) {
         const auto it =
             std::ranges::find_if(files_, [&](const auto& f) { return f->path == segment.file; });
+        const std::uint64_t end = segment.file_offset + segment.bytes;
         if (it != files_.end()) {
             segment_file_.push_back(static_cast<std::uint32_t>(it - files_.begin()));
+            (*it)->extent = std::max((*it)->extent, end);
         } else {
             segment_file_.push_back(static_cast<std::uint32_t>(files_.size()));
             files_.push_back(std::make_unique<File>(segment.file));
+            files_.back()->extent = end;
         }
     }
 }
@@ -101,10 +113,13 @@ PleRowReader::Page PleRowReader::page_of(std::uint64_t object_offset, std::uint3
 
 void PleRowReader::reserve(std::size_t pages) {
     if (pages <= staging_pages_) { return; }
+    // Allocate before releasing the old block: a failed allocation leaves the previously read
+    // pages (and the pointers data() handed out) intact instead of freeing them under the caller.
+    std::byte* const grown       = static_cast<std::byte*>(std::aligned_alloc(kPage, pages * kPage));
+    if (grown == nullptr) { throw std::bad_alloc(); }
     std::free(staging_);
-    staging_       = static_cast<std::byte*>(std::aligned_alloc(kPage, pages * kPage));
-    staging_pages_ = staging_ != nullptr ? pages : 0;
-    if (staging_ == nullptr) { throw std::bad_alloc(); }
+    staging_       = grown;
+    staging_pages_ = pages;
 }
 
 void PleRowReader::read(std::span<const Range> ranges) {
@@ -137,6 +152,9 @@ void PleRowReader::read(std::span<const Range> ranges) {
             }
         }));
     }
+    // Every task is awaited before the first failure is rethrown: an abandoned task would still
+    // be writing staging_ while the caller reacts to the failure.
+    for (auto& task : pending) { task.wait(); }
     for (auto& task : pending) { task.get(); }
 
     // Consecutive pages of one range are adjacent in the sorted page list.

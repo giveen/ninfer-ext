@@ -4,7 +4,10 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
+#include <cstddef>
+
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -27,16 +30,24 @@ struct Exl3WeightProbe {
 
 [[nodiscard]] Exl3WeightProbe& exl3_weight_probe();
 
-// Copy `rows` complete rows of a column-major BF16 [*, columns] tensor to another from `source_row`.
-// Rows of a column-major tensor are strided, so this is a pitched 2D copy. The fused consumers split
-// one decoded parent into its member outputs this way.
+// Copy `rows` complete rows of a column-major BF16 [*, columns] tensor to another from
+// `source_row`. The rows of a column-major tensor are packed along nb[0] and the columns are
+// strided by nb[1], so this is a pitched 2D copy. The fused consumers split one decoded parent into
+// its member outputs this way.
 inline void exl3_copy_rows(const Tensor& source, std::int32_t source_row, Tensor& destination,
                            std::int32_t rows, std::int32_t columns, cudaStream_t stream) {
+    constexpr std::int64_t kElementBytes = static_cast<std::int64_t>(sizeof(std::uint16_t));
+    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 || source_row < 0 ||
+        rows <= 0 || columns <= 0 || static_cast<std::int64_t>(source_row) + rows > source.ne[0] ||
+        columns > source.ne[1] || rows > destination.ne[0] || columns > destination.ne[1] ||
+        source.nb[0] != kElementBytes || destination.nb[0] != kElementBytes) {
+        throw std::invalid_argument("exl3_copy_rows: copy exceeds the tensor geometry");
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
-        destination.data, static_cast<std::size_t>(destination.ne[0]) * sizeof(std::uint16_t),
+        destination.data, static_cast<std::size_t>(destination.nb[1]),
         static_cast<const std::uint8_t*>(source.data) +
-            static_cast<std::size_t>(source_row) * sizeof(std::uint16_t),
-        static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
+            static_cast<std::size_t>(source_row) * static_cast<std::size_t>(source.nb[0]),
+        static_cast<std::size_t>(source.nb[1]),
         static_cast<std::size_t>(rows) * sizeof(std::uint16_t),
         static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice, stream));
 }

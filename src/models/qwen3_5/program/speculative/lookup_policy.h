@@ -11,6 +11,8 @@
 // has measured its own, are how Strata's `DraftPolicy` and `Controller` both model it, and the
 // measured shape (a monotone rise from ~0.3 to ~0.9) is what we start from.
 
+#include "models/qwen3_5/program/round_buffers.h"
+
 #include <array>
 #include <cstdint>
 
@@ -57,7 +59,7 @@ private:
 class LookupPolicy {
 public:
     // Largest lookup window the MTP frame can verify (its own window is at most seven).
-    static constexpr std::uint32_t kMaxDrafts = 15;
+    static constexpr std::uint32_t kMaxDrafts = kLookupDecodeMaximumDrafts;
     // Rounds a promising but unmeasured match bucket is tried before its measured rate may veto it.
     static constexpr std::uint32_t kProbes = 3;
     // A bucket is "promising" from its prior (or measurement) at or above this rate. Without this,

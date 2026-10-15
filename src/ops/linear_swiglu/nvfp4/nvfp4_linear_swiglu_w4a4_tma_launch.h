@@ -16,6 +16,11 @@ namespace ninfer::ops::detail {
  * allocate_nvfp4_w4a4_workspace sizes and launch_nvfp4_w4a4_quantize fills and checks. The
  * descriptor this builds covers that whole plane, so a caller that sizes the plane at tokens
  * instead has it read past the end.
+ *
+ * `tokens <= 0` throws std::invalid_argument, and CUDA failures propagate through CUDA_CHECK, so
+ * the call is not noexcept. `output` is a BF16 [tokens,17408] buffer, and `weight_codes` /
+ * `weight_scales` are the pre-quantized NVFP4 weights in the layout produced for the fixed
+ * 34816x5120 geometry.
  */
 void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
                                          const std::uint8_t* activation_scales,

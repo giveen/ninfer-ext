@@ -160,8 +160,10 @@ std::int64_t seek_packet(void* opaque, std::int64_t offset, int whence) {
     } else if (base_kind != SEEK_SET) {
         return AVERROR(EINVAL);
     }
-    if (offset < -base || base + offset < 0 ||
-        static_cast<std::uint64_t>(base + offset) > cursor.size) {
+    // Compare against the remaining span rather than forming base + offset, which overflows for a
+    // near-INT64_MAX offset and would then defeat the bounds test.
+    if (offset < -base || offset >
+        static_cast<std::int64_t>( cursor.size) - base) {
         return AVERROR(EINVAL);
     }
     cursor.offset = static_cast<std::size_t>(base + offset);
@@ -255,9 +257,16 @@ public:
             const int rc = av_read_frame(format_, packet_);
             if (rc == AVERROR_EOF) { break; }
             if (rc < 0) { throw_invalid_media("failed while reading media: " + av_error(rc)); }
-            if (packet_->stream_index == stream_index_) {
-                const int send = avcodec_send_packet(codec_, packet_);
-                if (send < 0 && send != AVERROR(EAGAIN)) {
+            if (packet_->stream_index == stream_index_) { int send = avcodec_send_packet(codec_, packet_);
+                // EAGAIN means the decoder's output queue is full: drain it and submit the same
+                // packet again. Unrefing it here instead would silently drop a frame.
+                for (; send == AVERROR(EAGAIN); send = avcodec_send_packet(codec_, packet_)) {
+                    if (!receive()) {
+                        av_packet_unref(packet_);
+                        return;
+                    }
+                }
+                if (send < 0) {
                     av_packet_unref(packet_);
                     throw_invalid_media("failed to submit media packet: " + av_error(send));
                 }
@@ -489,11 +498,11 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
                             ? static_cast<int>(probe.stream()->nb_frames)
                             : 0;
     plan.duration     = probe.duration_seconds();
-    if (plan.total_frames == 0 && plan.duration > 0.0) {
-        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
-    }
     if (plan.duration > policy.max_video_duration_seconds) {
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
     if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }
@@ -568,13 +577,12 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
         orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     }
     ImageInfo result;
-    decoder.frames([&](int index, const AVFrame* frame) {
+    // frames() calls back from index 0 and stops on the first false, so the image paths handle the
+    // single decoded frame directly.
+    decoder.frames([&](int, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
-        if (index == 0) {
             result = frame_info(frame, orientation, policy.max_decoded_pixels);
             return false;
-        }
-        return true;
     });
     if (result.width == 0 || result.height == 0) {
         throw_invalid_media("image contains no decoded frame");
@@ -609,13 +617,10 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
         orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     }
     Image result;
-    decoder.frames([&](int index, const AVFrame* frame) {
+    decoder.frames([&](int, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
-        if (index == 0) {
             result = decoder.rgb(frame, orientation);
             return false;
-        }
-        return true;
     });
     if (result.rgb.empty()) { throw_invalid_media("image contains no decoded frame"); }
     return result;

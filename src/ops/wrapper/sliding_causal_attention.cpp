@@ -62,7 +62,7 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.ne[0] != head_dim || out.ne[0] != head_dim || k.ne[0] != head_dim ||
         v.ne[0] != head_dim || q.ne[1] != geometry.query_heads ||
         out.ne[1] != geometry.query_heads || k.ne[1] != geometry.kv_heads ||
-        v.ne[1] != geometry.kv_heads) {
+        v.ne[1] != geometry.kv_heads || out.ne[2] != query_tokens || out.ne[3] != batch) {
         throw std::invalid_argument(
             "sliding_causal_attention: q/k/v/out must be [head_dim,heads,tokens,batch] per the "
             "geometry");
@@ -99,8 +99,6 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
     }
 
-    const bool empty = q.numel() == 0;
-    if (empty) { return; }
     const Tensor* tensors[] = {&q, &k, &v, &position_q, &position_k, &out};
     for (const Tensor* tensor : tensors) {
         if (!tensor->is_contiguous()) {

@@ -2,12 +2,14 @@
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::text {
@@ -40,7 +42,10 @@ public:
 
     [[nodiscard]] auto end(this auto& self) noexcept { return self.values_.begin() + self.size_; }
 
-    [[nodiscard]] auto& back(this auto& self) noexcept { return self.values_[self.size_ - 1]; }
+    // Precondition: the output is non-empty.
+
+    [[nodiscard]] auto& back(this auto& self) noexcept {
+        assert(self.size_ != 0 && "back() called on an empty PublishedOutput"); return self.values_[self.size_ - 1]; }
 
     void clear() noexcept;
     void push_back(OutputDelta value);
@@ -59,6 +64,9 @@ public:
 
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
+
+    // The session is movable. Queries answer on an empty session with their neutral values; every
+    // call that previews, commits, discards or validates output rejects one with std::logic_error.
 
     [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
                                                         std::uint32_t total_budget_remaining,

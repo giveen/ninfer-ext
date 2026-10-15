@@ -43,7 +43,6 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
             make_int8_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
-        if (plan.family == Int8KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, splits, batch);

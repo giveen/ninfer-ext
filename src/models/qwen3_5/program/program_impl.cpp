@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -591,11 +592,18 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     } catch (...) {
         try {
             device.synchronize();
-        } catch (...) {}
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "causal score: device synchronize failed while unwinding: %s\n",
+                         error.what());
+        } catch (...) {
+            std::fprintf(stderr, "causal score: device synchronize failed while unwinding\n");}
         work.reset();
         try {
             cleanup();
-        } catch (...) {}
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "causal score: cleanup failed while unwinding: %s\n",
+                         error.what());
+        } catch (...) { std::fprintf(stderr, "causal score: cleanup failed while unwinding\n");}
         throw;
     }
 }
@@ -610,7 +618,7 @@ void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass reso
 
 runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
     runtime::ContextResourceClass resource, runtime::ContextTransferDirection direction,
-    TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
+    TransferWork transfer_work, std::uint32_t page_count, std::uint64_t state_image_count) const {
     const double elapsed_ns =
         static_cast<double>(
             context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
@@ -623,9 +631,9 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
         .resource  = resource,
         .direction = direction,
         .units =
-            resource == runtime::ContextResourceClass::State ? state_images : work.payload_bytes,
+            resource == runtime::ContextResourceClass::State ? state_image_count : transfer_work.payload_bytes,
         .page_count = page_count,
-        .work       = work,
+        .work       = transfer_work,
         .elapsed_ns = measured_ns,
     };
 }

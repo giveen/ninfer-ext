@@ -150,7 +150,6 @@ Q6Launch select_q6_gemma4_vision_n1152_k1152(std::int32_t tokens) {
 }
 
 Q6Launch select_q6_gemma4_vision_n1152_k4352(std::int32_t tokens) {
-    if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 162) return launch_q6_a16_sliced_r16_t24_w4_s2;
     if (tokens <= 384) return launch_q6_a16_sliced_r32_t32_w4_s1;
     if (tokens <= 648) return launch_q6_a16_mma_r64_t40_k128;

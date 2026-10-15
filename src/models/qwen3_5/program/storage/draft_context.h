@@ -3,12 +3,19 @@
 
 #include "core/cyclic_kv_cache.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/state/decoder_state.h"
 
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::models::qwen3_5::detail {
+
+// Non-owning view over the Program's masked-draft backing. `backing` and `local_state` are borrowed
+// for the whole lifetime of this object: the three Tensors are bound into `backing`, and `local`
+// refers into `local_state`, so either must outlive it. Owners keep this state beside the arena
+// they bound it into and never move it across one.
 
 struct DFlashPersistentState {
     CyclicKVCache& local;

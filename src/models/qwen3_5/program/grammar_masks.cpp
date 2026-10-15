@@ -5,8 +5,14 @@ namespace ninfer::models::qwen3_5::detail {
 
 ops::SamplingMask ProgramImpl::bind_grammar_mask(runtime::TokenMaskProvider* provider,
                                                  std::size_t row) {
+    if (row >= grammar_dead_positions.size() ||
+        row >= static_cast<std::size_t>(grammar_masks_device.ne[2])) {
+        throw std::logic_error("grammar mask row is outside the mask lanes");
+    }
     grammar_dead_positions[row] = 0;
     if (provider == nullptr || !provider->constrained(row)) { return {}; }
+    if (!grammar_masks_host.has_value()) {
+        throw std::logic_error("constrained round has no grammar mask storage"); }
     const auto words = static_cast<std::size_t>(grammar_masks_device.ne[0]);
     return {static_cast<const std::uint32_t*>(grammar_masks_device.data) +
                 row * (draft_window + 1) * words,
@@ -16,10 +22,17 @@ ops::SamplingMask ProgramImpl::bind_grammar_mask(runtime::TokenMaskProvider* pro
 ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* provider,
                                                  std::size_t row,
                                                  std::span<const TokenId> drafts) {
+    if (row >= grammar_dead_positions.size() ||
+        row >= static_cast<std::size_t>(grammar_masks_device.ne[2])) {
+        throw std::logic_error("grammar mask row is outside the mask lanes");
+    }
     grammar_dead_positions[row] = 0;
     if (provider == nullptr || !provider->constrained(row)) { return {}; }
     if (drafts.size() + 1U > draft_window + 1U) {
         throw std::logic_error("constrained round verifies more positions than it can mask");
+    }
+    if (!grammar_masks_host.has_value()) {
+        throw std::logic_error("constrained round has no grammar mask staging buffer");
     }
     const auto words  = static_cast<std::size_t>(grammar_masks_device.ne[0]);
     const auto offset = row * (draft_window + 1) * words;

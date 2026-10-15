@@ -105,6 +105,13 @@ std::uint64_t positive_u64(std::int64_t value, std::string_view field) {
     return static_cast<std::uint64_t>(value);
 }
 
+int checked_int(std::int64_t value, std::string_view field) {
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(field) + " is outside the supported range");
+    }
+    return static_cast<int>(value);
+}
+
 void validate_pixel_pipeline(const Json& config, std::string_view resource) {
     for (const char* flag : {"do_resize", "do_rescale", "do_normalize", "do_convert_rgb"}) {
         if (config.contains(flag) && (!config[flag].is_boolean() || !config[flag].get<bool>())) {
@@ -170,10 +177,12 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
         "video longest_edge");
     options.video_fps =
         number_or_default(video, "fps", "video_preprocessor_config.json", kVideoFps);
-    options.video_min_frames = static_cast<int>(
-        integer_or_default(video, "min_frames", "video_preprocessor_config.json", kVideoMinFrames));
-    options.video_max_frames = static_cast<int>(
-        integer_or_default(video, "max_frames", "video_preprocessor_config.json", kVideoMaxFrames));
+    options.video_min_frames = checked_int(
+        integer_or_default(video, "min_frames", "video_preprocessor_config.json", kVideoMinFrames),
+        "video min_frames");
+    options.video_max_frames = checked_int(
+        integer_or_default(video, "max_frames", "video_preprocessor_config.json", kVideoMaxFrames),
+        "video max_frames");
     if (options.video_fps != kVideoFps || options.video_min_frames != kVideoMinFrames ||
         options.video_max_frames != kVideoMaxFrames) {
         throw std::invalid_argument(
@@ -186,8 +195,12 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
-    if (tokenizer_config.value("add_bos_token", true) ||
-        tokenizer_config.value("add_prefix_space", true)) {
+    if (!tokenizer_config.contains("add_bos_token") ||
+        !tokenizer_config.at("add_bos_token").is_boolean() ||
+        tokenizer_config.at("add_bos_token").get<bool>() ||
+        !tokenizer_config.contains("add_prefix_space") ||
+        !tokenizer_config.at("add_prefix_space").is_boolean() ||
+        tokenizer_config.at("add_prefix_space").get<bool>()) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.5 tokenizer prefix semantics");
     }
@@ -358,6 +371,7 @@ VisionItem convert_vision_item(fi::VisionItem item) {
 
 StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
     StopPolicy result;
+    result.include_model_defaults = caller.include_model_defaults;
     result.publish_stop_token = caller.publish_stop_token;
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
@@ -888,7 +902,6 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         cache_boundaries   = std::move(encoded.cache_boundaries);
         assign_text_positions(result);
     }
-    (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
     const std::uint32_t full_prompt_frontier = checked_token_count(result.token_ids.size());
     {

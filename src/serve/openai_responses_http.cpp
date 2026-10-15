@@ -484,7 +484,11 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
         write_openai_error(res, response_not_found(id));
         return;
     }
+    try {
     res.set_content(stored->response.dump(), "application/json");
+    } catch (const std::exception& exception) {
+        write_openai_error(res, internal_error(exception));
+    }
 }
 
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {

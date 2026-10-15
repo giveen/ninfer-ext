@@ -36,6 +36,10 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                WorkspaceArena& workspace, cudaStream_t stream);
 
+// `workspace` may be null only when no A8 route can be selected for x.ne[1]. Whenever an A8 route
+// may be selected it must be a workspace sized by fp8_gdn_input_workspace_capacity_bytes for the
+// same policy and token interval; a null one then throws std::invalid_argument.
+
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 

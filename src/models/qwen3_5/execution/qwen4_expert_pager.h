@@ -23,11 +23,12 @@ namespace ninfer::models::qwen3_5::execution {
  *   Experts the cache holds are copied device-to-device instead of from the Host. Staged calls do
  *   not change the cache.
  *
- * The banks sit past the cache pool's slots (plus the pool's divisor tail), so a cache-route call
- * never touches them and the staged route never has to reclaim cache residency first. When the idle
- * prefill width exceeds the ordinary chunk, the top `base_slots_..decode_slots_` cache slots are a
- * lend region: `lend` reclaims them and the Program uses their bytes as the wide prefill arena;
- * `return_lend` makes them cache again.
+ * The banks overlay the top of the cache pool's slots: the constructor requires
+ * `bank_slot + kBankSlots == cache.slots`, so a decode-time cache-route `resolve` can evict into
+ * the slot range `[bank_slot, cache.slots)`, and the staged route reclaims the bank slots on its
+ * first fill of a forward (`forward_start`). When the idle prefill width exceeds the ordinary
+ * chunk, the top `base_slots_..decode_slots_` cache slots are a lend region: `lend` reclaims them
+ * and the Program uses their bytes as the wide prefill arena; `return_lend` makes them cache again.
  *
  * The two routes differ numerically (the staged route may quantize activations), so the route
  * choice is fixed by `stages`. Within a route, placement never changes a result.

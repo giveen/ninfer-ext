@@ -129,6 +129,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_eagle3_prefill_kv(state.eagle3_kv);
+    // The same three settings the text chunk applies: without the feature sink the EAGLE3 draft is
+    // never appended inside the chunk that captures its inputs, and without the table row the
+    // append would land on row 0 instead of the sequence's draft row.
+    card.set_eagle3_kv_table_row(state.dflash_kv_table_row);
+    if (state.eagle3 != nullptr) { card.set_eagle3_prefill_features(&state.eagle3->features); }
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -225,9 +230,6 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
 namespace ninfer::models::qwen3_5::detail {
 
 namespace {
-
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
-                                                 std::uint32_t token);
 
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
@@ -1012,7 +1014,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             commit_generated_prefix_identity(sequence, pending.base_S,
                                              std::span<const TokenId>(token_base, committed),
                                              prefix_execution_splits[row]);
-            advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
+            advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk,
+                recorded_split_frontier(pending.base_S, prefix_execution_splits[row]));
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;

@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <memory>
 #include <span>
-#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -29,7 +28,9 @@ public:
 
     // BF16 `[width, count]` embedding columns of `tokens[first, first + count)`. Tokens before
     // `first` (and EOS before the sequence start) form each n-gram context, and an EOS closes
-    // every window it falls into. `out` holds `width * count` BF16 words.
+    // every window it falls into. `out` holds `width * count` BF16 words. Not thread-safe: a
+    // streamed gather reuses this gather's reader staging, so two calls on one instance must not
+    // overlap.
     void gather(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count,
                 std::span<std::uint16_t> out);
 

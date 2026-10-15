@@ -11,13 +11,15 @@
 // on both arms. The unit counts 256-byte steps from the plane's base; every layer and plane of a
 // page sits at the same unit offset from its own base, so one word serves them all.
 
+#include <cassert>
+
 #include <cstddef>
 #include <cstdint>
 
 #if defined(__CUDACC__)
-#define NINFER_KV_REF_HD __host__ __device__
+#    define NINFER_KV_REF_HD __host__ __device__
 #else
-#define NINFER_KV_REF_HD
+#    define NINFER_KV_REF_HD
 #endif
 
 namespace ninfer {
@@ -36,7 +38,10 @@ public:
     NINFER_KV_REF_HD constexpr explicit KVPageRef(DevicePageGroup group) noexcept
         : word_(static_cast<std::int32_t>(group)) {}
     NINFER_KV_REF_HD constexpr explicit KVPageRef(HostPageUnit unit) noexcept
-        : word_(~static_cast<std::int32_t>(static_cast<std::uint32_t>(unit))) {}
+        : word_(~static_cast<std::int32_t>(static_cast<std::uint32_t>(unit))) {
+        // A unit above kMaxHostPageUnit negates into a non-negative word, which readers would
+        // take for a Device page group.
+        assert(static_cast<std::uint32_t>(unit) <= kMaxHostPageUnit);}
 
     [[nodiscard]] NINFER_KV_REF_HD static constexpr KVPageRef from_word(std::int32_t word) noexcept {
         return KVPageRef(word);

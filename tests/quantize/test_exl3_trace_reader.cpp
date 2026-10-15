@@ -72,6 +72,15 @@ void test_trace_round_trip() {
     expect_throws<std::invalid_argument>(
         [&] { (void)app::read_calibration_trace(dir / "missing.safetensors"); },
         "a trace without input_ids was accepted");
+
+    // A declared row width beyond the I32 domain must be refused rather than narrowed to a negative
+    // int32 in the in-memory lengths.
+    app::write_safetensors(dir / "wide.safetensors",
+                           {{"input_ids", "I64", {1, 3'000'000'000ULL}, i64_bytes({0})},
+                            {"lengths", "I64", {1}, i64_bytes({1})}});
+    expect_throws<std::invalid_argument>(
+        [&] { (void)app::read_calibration_trace(dir / "wide.safetensors"); },
+        "a trace wider than the I32 domain was accepted");
     std::filesystem::remove_all(dir);
 }
 

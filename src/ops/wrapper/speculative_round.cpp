@@ -31,13 +31,6 @@ void require_dtype(const Tensor& t, DType dtype, const char* op, const char* nam
     require_contiguous_nonnull(t, op, name);
 }
 
-void require_scalar(const Tensor& t, DType dtype, const char* op, const char* name) {
-    require_dtype(t, dtype, op, name);
-    if (t.ne[0] != 1 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": invalid scalar shape for " + name);
-    }
-}
-
 void require_vector(const Tensor& t, DType dtype, std::int32_t n, const char* op,
                     const char* name) {
     require_dtype(t, dtype, op, name);
@@ -263,9 +256,6 @@ void mask_selected_logits(Tensor& logits, const Tensor& selected, cudaStream_t s
         selected.ne[3] != 1) {
         throw std::invalid_argument("mask_selected_logits: selected must match the batch width");
     }
-    if (!logits.is_contiguous() || !selected.is_contiguous()) {
-        throw std::invalid_argument("mask_selected_logits: inputs must be contiguous");
-    }
     detail::mask_selected_logits_launch(logits, selected, stream);
 }
 
@@ -281,9 +271,6 @@ void select_tree_winners(const Tensor& accepted, Tensor& winners, std::int32_t t
     if (accepted.ne[0] != winners.ne[0] * tree_width || accepted.ne[1] != 1 ||
         accepted.ne[2] != 1 || accepted.ne[3] != 1) {
         throw std::invalid_argument("select_tree_winners: accepted must hold batch*tree_width");
-    }
-    if (!accepted.is_contiguous() || !winners.is_contiguous()) {
-        throw std::invalid_argument("select_tree_winners: inputs must be contiguous");
     }
     detail::select_tree_winners_launch(accepted, winners, tree_width, stream);
 }

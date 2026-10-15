@@ -12,6 +12,8 @@
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
 
+#include <algorithm>
+
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -36,14 +38,9 @@ std::int64_t checked_numel(const Tensor& tensor, const char* label) {
 }
 
 void validate_linear_policy(LinearPolicy policy) {
-    switch (policy) {
-    case LinearPolicy::A16Only:
-    case LinearPolicy::AllowA8Pair:
-    case LinearPolicy::AllowA8:
-    case LinearPolicy::AllowA4:
-        return;
-    }
+    if (!valid_linear_policy (policy)) {
     throw std::invalid_argument("linear: invalid compute policy");
+    }
 }
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
@@ -153,6 +150,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
     case QType::EXL3_MUL1: {
+        if (output_rows <= 0 || input_rows <= 0) {
+            throw std::invalid_argument("linear workspace: exl3 n/k must be positive");
+        }
         // The rotated activation scratch [K,T] BF16 plus, for T <= 8, the multi-column GEMV's [N,T]
         // partial accumulator.
         return static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(max_tokens) *

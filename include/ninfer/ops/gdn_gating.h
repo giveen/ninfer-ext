@@ -13,7 +13,8 @@ namespace ninfer::ops {
  *   beta[h,t] = sigmoid(b[h,t]).
  *
  * `a` and `b` are contiguous BF16 [48,T], `A_log` and `dt_bias` are contiguous FP32 [48], and
- * `g` and `beta` are contiguous FP32 [48,T]. The oracle evaluates the formula naively in FP64;
+ * `g` and `beta` are contiguous FP32 [48,T], for any T >= 0 (a zero-column call is a no-op). The
+ * oracle evaluates the formula naively in FP64;
  * transcendental implementation and intermediate precision are private kernel choices. Inputs and
  * the two outputs must be mutually non-overlapping. There is no workspace or persistent state side
  * effect.

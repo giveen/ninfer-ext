@@ -414,7 +414,7 @@ std::vector<std::string> OpenAIResponsesEventStream::start() {
 }
 
 std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::string& text) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
@@ -429,7 +429,7 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
 }
 
 std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::string& text) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid content delta event state");
     }
     if (text.empty()) { return {}; }
@@ -448,7 +448,7 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
 }
 
 OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || impl_->terminal_emitted) {
         throw std::logic_error("invalid Responses stream finish state");
     }
     impl_->finish_built = true;
@@ -469,6 +469,24 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
                                                   {"output_index", impl_->reasoning_index},
                                                   {"content_index", 0},
                                                   {"delta", outcome.reasoning}})));
+    }
+    // The reasoning deltas already sent must be the prefix of the text this finish closes the item
+    // with, exactly as the content path below requires of `outcome.text`. Once content_delta has
+    // closed the item its done payload is already out, so nothing may follow it: a longer terminal
+    // reasoning keeps the streamed prefix rather than emitting a delta after done.
+    if (!impl_->reasoning_done && outcome.reasoning != impl_->reasoning_text) {
+        if (!outcome.reasoning.starts_with(impl_->reasoning_text)) {
+            throw std::logic_error("streamed reasoning does not match terminal reasoning");
+        }
+        const std::string suffix = outcome.reasoning.substr(impl_->reasoning_text.size());
+        if (!suffix.empty()) {
+            impl_->reasoning_text += suffix;
+            finished.events_before_terminal.push_back(sse(impl_->event(
+                "response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
+                                                      {"output_index", impl_->reasoning_index},
+                                                      {"content_index", 0},
+                                                      {"delta", suffix}})));
+        }
     }
     const char* reasoning_status =
         (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;

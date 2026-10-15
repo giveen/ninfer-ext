@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -30,7 +31,7 @@ struct ServeOptions {
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::string generation_token_trace_jsonl;     // empty => generated token tracing disabled
     std::uint32_t max_context          = 8192;
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(max_context);
     ExpertCachePolicy expert_cache;
     NgramResidency ngram_residency = NgramResidency::Automatic;
     std::uint32_t max_concurrency      = 1;

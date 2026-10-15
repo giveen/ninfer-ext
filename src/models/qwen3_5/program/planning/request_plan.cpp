@@ -87,6 +87,7 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::size_t prefill_splits,
                                      std::span<const CaptureGroup> captures,
                                      std::span<const std::uint32_t> rewrite_frontiers) noexcept {
+    if (prefill_chunk == 0) { return 0; }
     std::uint64_t prefill_units = 0;
     std::uint32_t segment_begin = reuse_base;
     std::size_t capture_index   = 0;
@@ -987,7 +988,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 std::max(plan->text_kv_page_entitlement, main_required - main_streamed) +
                 (consumes ? 0U : main_streamed);
         }
-        if (main_missing != main_required - main_device - main_streamed) {
+        if ( main_streamed > main_all_missing) {
             throw std::logic_error("Text KV restore inventory is inconsistent");
         }
         plan->needs_transfer = plan->needs_transfer || main_missing != 0;

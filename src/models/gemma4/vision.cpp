@@ -20,7 +20,10 @@ namespace {
 // Slices the arena allocates per image: hidden-sized and intermediate-sized activations, the patch
 // input, and the I32/FP32 controls. Each allocation is rounded up to the arena's 256-byte
 // alignment.
-constexpr std::size_t kHiddenSlices       = 11;
+// Hidden-sized activations: hidden, normed, branch, q, k_raw, v, q_normed, k_normed, v_normed and
+// attended. The patch input is the separate `pixels` term; keep this count in step with the
+// allocations in encode_image.
+constexpr std::size_t kHiddenSlices       = 10;
 constexpr std::size_t kIntermediateSlices = 3;
 constexpr std::size_t kAllocations        = kHiddenSlices + kIntermediateSlices + 8;
 
@@ -29,6 +32,8 @@ constexpr std::size_t kAllocations        = kHiddenSlices + kIntermediateSlices 
 std::size_t vision_workspace_bytes(const VisionConfig& config, std::int32_t patches) {
     if (patches < 1)
         throw std::invalid_argument("vision_workspace_bytes: patches must be positive");
+    if (config.pooling_kernel_size == 0)
+        throw std::invalid_argument("vision_workspace_bytes: pooling_kernel_size must be positive");
     const std::size_t p      = static_cast<std::size_t>(patches);
     const std::size_t cells  = p / (config.pooling_kernel_size * config.pooling_kernel_size) + 1;
     const std::size_t h      = config.hidden_size;

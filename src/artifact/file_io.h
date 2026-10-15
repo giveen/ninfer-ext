@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <span>
 
 namespace ninfer::artifact {
@@ -25,6 +26,8 @@ public:
 private:
     std::filesystem::path path_;
     int fd_                = -1;
+    // Opened once on the first direct read; guarded so concurrent read_direct calls are safe.
+    mutable std::once_flag direct_open_once_;
     mutable int direct_fd_ = -1;
     std::uint64_t bytes_   = 0;
 };

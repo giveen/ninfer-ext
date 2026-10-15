@@ -148,6 +148,16 @@ void report_logging_error(const std::string& message) noexcept {
     std::fflush(stderr);
 }
 
+// Erasing the transient line blanks one space per rendered column, so count terminal columns
+// (one per UTF-8 codepoint) rather than bytes.
+std::size_t display_columns(std::string_view text) noexcept {
+    std::size_t columns = 0;
+    for (const unsigned char byte : text) {
+        if ((byte & 0xC0) != 0x80) { ++columns; }
+    }
+    return columns;
+}
+
 class ProgressAwareStderrSink final : public spdlog::sinks::sink {
 public:
     explicit ProgressAwareStderrSink(spdlog::color_mode color)
@@ -206,9 +216,7 @@ public:
 private:
     void erase_unlocked() {
         if (!interactive_ || rendered_width_ == 0) { return; }
-        std::fputc('\r', stderr);
-        for (std::size_t index = 0; index < rendered_width_; ++index) { std::fputc(' ', stderr); }
-        std::fputc('\r', stderr);
+        std::fprintf(stderr, "\r%*s\r", static_cast<int>(rendered_width_), "");
         rendered_width_ = 0;
     }
 
@@ -216,7 +224,7 @@ private:
         if (!interactive_ || active_line_.empty()) { return; }
         std::fwrite(active_line_.data(), 1, active_line_.size(), stderr);
         std::fflush(stderr);
-        rendered_width_ = active_line_.size();
+        rendered_width_ = display_columns( active_line_);
     }
 
     std::mutex mutex_;

@@ -140,6 +140,10 @@ public:
     void observe_expert(int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
         const Key key = make_key(Site::MoeActivation, layer, expert);
         if (!names_.contains(key)) { return; }
+        // The tap delivers BF16 rows, so the gather below sizes them at two bytes an element;
+        // anything else is dropped here rather than mis-copied (accumulate() would reject it, but
+        // only after the copy had already run).
+        if (rows.dtype != ninfer::DType::BF16) { return; }
         const std::size_t row_bytes = static_cast<std::size_t>(rows.ne[0]) * 2;
         const std::size_t need      = row_bytes * static_cast<std::size_t>(rows.ne[1]);
         if (need > gather_bytes_) {
@@ -237,6 +241,17 @@ public:
     ObserverScope& operator=(const ObserverScope&) = delete;
 };
 
+// Clears the per-expert observers when the enclosing pass leaves its scope, including on a throw:
+// their lambdas capture the accumulator by reference, so leaving one installed past the
+// accumulator's lifetime would dangle.
+class ExpertObserverScope {
+public:
+    ~ExpertObserverScope() {
+        ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
+        ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
+    }
+};
+
 } // namespace
 
 CalibrationResult calibrate(const std::filesystem::path& activation_model,
@@ -277,7 +292,10 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         }
     }
     std::map<int, std::uint64_t> layer_bytes;
-    for (const auto& [key, bytes] : site_bytes) { layer_bytes[key[1]] += bytes; }
+    for (const auto& [key, bytes] : site_bytes) {
+        // The MTP sentinel layer (-1) never runs in the scoring pass; its Hessians come from the
+        // generation pass below, so it must not consume the scoring budget.
+        if (key[1] < 0) { continue; } layer_bytes[key[1]] += bytes; }
     if (names.empty()) {
         throw std::runtime_error("weights artifact has no calibratable Text projections");
     }
@@ -352,6 +370,7 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
         ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
             return accumulator.wants_experts(layer);
         };
+        ExpertObserverScope expert_scope;
         for (std::uint32_t row = 0; row < rows; ++row) {
             const std::int32_t length = trace.lengths[row];
             if (length < 2) { continue; }
@@ -364,8 +383,6 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
             if (group_index == 0) { result.tokens += static_cast<std::uint64_t>(length); }
         }
         result.hessians += accumulator.flush();
-        ninfer::models::qwen3_5::execution::expert_activation_observer() = nullptr;
-        ninfer::models::qwen3_5::execution::expert_activation_wanted()   = nullptr;
         std::fprintf(stderr, "calibration group %zu/%zu done (%llu Hessians so far)\n",
                      group_index + 1, groups.size(),
                      static_cast<unsigned long long>(result.hessians));
@@ -399,6 +416,17 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                                            cudaStream_t stream) {
                 mtp_accumulator.observe(site, layer, input, stream);
             });
+            // The MTP block is a routed MoE too, and its calibration layer is -1 (see
+            // qwen4_moe), so its per-expert down inputs need the same tap the scoring pass
+            // installs -- without it those Hessians are never observed and the names are dropped.
+            ninfer::models::qwen3_5::execution::expert_activation_observer() =
+                [&](int layer, int expert, const ninfer::Tensor& rows, cudaStream_t stream) {
+                    mtp_accumulator.observe_expert(layer, expert, rows, stream);
+                };
+            ninfer::models::qwen3_5::execution::expert_activation_wanted() = [&](int layer) {
+                return mtp_accumulator.wants_experts(layer);
+            };
+            ExpertObserverScope mtp_expert_scope;
             for (std::uint32_t row = 0; row < mtp_rows; ++row) {
                 const std::int32_t length = trace.lengths[row];
                 if (length < 2) { continue; }
@@ -420,7 +448,11 @@ CalibrationResult calibrate(const std::filesystem::path& activation_model,
                          static_cast<unsigned long long>(result.hessians));
         }
     }
-    result.skipped_names = 0;
+    // Names no pass observed (for example MTP sites the generation pass never reached) wrote no
+    // Hessian, so they are the skipped ones the report and stderr line count.
+    std::uint64_t expected_names = 0;
+    for (const auto& [key, value] : names) { expected_names += value.size(); }
+    result.skipped_names = expected_names - result.hessians;
     return result;
 }
 

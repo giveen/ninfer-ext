@@ -75,9 +75,17 @@ void test_options() {
            "--list did not select the listing mode");
     const app::QuantizeOptions experts =
         parse({"ninfer-quantize", "m.ninfer", "--out", "o", "--hessians", "h", "--experts-only",
-               "--only", "text/layers/0/", "--calibrate-only"});
-    expect(experts.experts_only && experts.calibrate_only && experts.only == "text/layers/0/",
-           "--experts-only, --only and --calibrate-only were not parsed");
+               "--only", "text/layers/0/", "--calibrate-only", "--trace", "t", "--activation-model", "a"});
+    expect(experts.experts_only && experts.calibrate_only && experts.only == "text/layers/0/" &&
+               experts.trace == "t" && experts.activation_model == "a",
+           "--experts-only, --only, --calibrate-only and the calibration inputs were not parsed");
+    expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse({"ninfer-quantize", "m.ninfer", "--out", "o", "--hessians", "h",
+                         "--calibrate-only"});
+        },
+        "--calibrate-only without --trace was accepted, which would exit successfully having "
+        "written nothing");
     expect(parse({"ninfer-quantize", "--help"}).help, "--help did not select help");
     expect_throws<std::invalid_argument>(
         [] { (void)parse({"ninfer-quantize", "m.ninfer", "--hessians", "h"}); },
@@ -124,6 +132,17 @@ void test_hessian_round_trip() {
     expect_throws<std::runtime_error>(
         [&] { (void)app::read_hessian_f32(dir / "long.h.f32", 2); },
         "a Hessian with trailing bytes was accepted");
+    // A dimension whose square wraps the 64-bit product, or whose square outgrows the host address
+    // space, must be refused before any buffer is sized from it.
+    expect_throws<std::overflow_error>(
+        [&] { (void)app::read_hessian_f32(dir / "x.h.f32", std::uint64_t{1} << 32); },
+        "a Hessian dimension that wraps k * k was accepted");
+    expect_throws<std::invalid_argument>(
+        [&] { (void)app::read_hessian_f32(dir / "x.h.f32", (std::uint64_t{1} << 32) - 1U); },
+        "a Hessian dimension beyond the host address space was accepted");
+    expect_throws<std::overflow_error>(
+        [&] { (void)app::identity_hessian(std::uint64_t{1} << 32); },
+        "an identity Hessian dimension that wraps k * k was accepted");
     std::filesystem::remove_all(dir);
 }
 

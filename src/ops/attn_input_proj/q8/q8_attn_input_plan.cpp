@@ -89,8 +89,6 @@ const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.q8.decode.r8.direct.k2048";
     case Q8AttnInputScheduleId::SplitKMmaDirect:
         return "attn_input_proj.q8.splitk.mma.r16.direct";
-    case Q8AttnInputScheduleId::SimtR8C4:
-        return "attn_input_proj.q8.simt.r8.c4";
     case Q8AttnInputScheduleId::MmaR32C64:
         return "attn_input_proj.q8.mma.r32.c64";
     case Q8AttnInputScheduleId::MmaR32C128:
@@ -160,9 +158,6 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
         return;
     case Q8AttnInputScheduleId::SplitKMmaDirect:
         q8_attn_input_splitk_mma_launch(x, weight, q, gate, k, v, stream);
-        return;
-    case Q8AttnInputScheduleId::SimtR8C4:
-        q8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
         return;
     case Q8AttnInputScheduleId::MmaR32C128:
         q8_attn_input_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
@@ -235,9 +230,6 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
         return;
     case Q8AttnInputScheduleId::SplitKMmaDirect:
         q8_attn_input_splitk_mma_launch(x, weight, q, k, v, stream);
-        return;
-    case Q8AttnInputScheduleId::SimtR8C4:
-        q8_attn_input_simt_r8_c4_launch(x, weight, q, k, v, stream);
         return;
     case Q8AttnInputScheduleId::MmaR32C128:
         q8_attn_input_mma_r32_c128_launch(x, weight, q, k, v, stream);

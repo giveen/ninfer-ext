@@ -3,11 +3,16 @@
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 
 inline constexpr int kMxfp8TiledQueryRows = 128;
 inline constexpr int kMxfp8TiledMaxSplits = 8;
+// Narrowest width the scan below starts from when a caller passes a looser floor. Callers of the
+// tiled family already floor at the grouped families' ceiling, so this never binds today.
+inline constexpr int kMxfp8TiledFirstWidth = 17;
 
 // Minimize waves per KV partition, retaining fewer partitions on a tie.
 // The bound limits FP32 partial traffic; live rows cap the count at
@@ -37,7 +42,7 @@ inline std::size_t mxfp8_tiled_workspace_bytes(int heads, int min_width, int max
     // A query-tile interval has one split target and increasing partial storage.
     // Check each interval's last width; checking max_width alone would miss a
     // larger allocation immediately before the split target decreases.
-    for (std::int64_t begin = std::max(min_width, 17); begin <= max_width;) {
+    for (std::int64_t begin = std::max(min_width, kMxfp8TiledFirstWidth); begin <= max_width;) {
         const auto last =
             ((begin + kMxfp8TiledQueryRows - 1) / kMxfp8TiledQueryRows) * kMxfp8TiledQueryRows;
         const int end = static_cast<int>(std::min<std::int64_t>(max_width, last));

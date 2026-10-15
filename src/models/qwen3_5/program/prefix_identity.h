@@ -25,8 +25,13 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
+    // Compares the resident metadata (token types, positions, vision items, rewrite frontiers) of
+    // the first `count` tokens against `prompt`. Token ids are NOT compared: they live in the
+    // ledger, so this method is only a complete match together with the id comparison performed by
+    // prefix_matches(), its only caller. Call it directly only when the ids are already known
+    // equal.
+
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
-    [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;
 
 private:
@@ -48,6 +53,11 @@ public:
     void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta,
                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
+
+    // `size()` counts token frontiers, not slots: index 0 always holds the sentinel seed digest
+    // (kDigestOffset), so size() is digests_.size() - 1 and at(0) returns that seed rather than a
+    // zero-token prefix. append_generated requires a resident prefix and throws when digests_ is
+    // empty.
 
     [[nodiscard]] std::size_t size() const noexcept {
         return digests_.empty() ? 0 : digests_.size() - 1U;

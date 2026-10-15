@@ -71,6 +71,8 @@ private:
 
 // Reusable non-timing event for worker-driven asynchronous control transactions. The owning
 // component records it after enqueueing one transfer batch and polls it from later boundaries.
+// All operations run against the calling thread's current CUDA device, so a worker polling the
+// event must first bind the owning device (DeviceContext::bind_to_current_thread).
 class CudaCompletionEvent {
 public:
     explicit CudaCompletionEvent(const DeviceContext& ctx);

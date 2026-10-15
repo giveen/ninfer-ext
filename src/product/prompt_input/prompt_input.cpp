@@ -62,7 +62,6 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
     }
 
     media_acquire::Source source;
-    source.media_type = media_type;
     if (value.starts_with("http://") || value.starts_with("https://")) {
         source.kind = media_acquire::SourceKind::Url;
     } else if (value.starts_with("data:")) {
@@ -72,6 +71,7 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
         source.kind = media_acquire::SourceKind::Path;
         if (value.starts_with("file://")) { value.erase(0, 7); }
     }
+    source.media_type = media_type;
     source.value = value;
 
     media_acquire::Policy policy;
@@ -108,6 +108,10 @@ std::vector<MessagePart> parse_content(const Json& content, std::size_t message_
         if (!item.is_object()) {
             throw std::invalid_argument("message " + std::to_string(message_index) +
                                         " content parts must be objects");
+        }
+        if (item.contains("type") && !item.at("type").is_string()) {
+            throw std::invalid_argument("message " + std::to_string(message_index) +
+                                        " content part type must be a string");
         }
         const std::string type = item.value("type", "");
         MessagePart part;

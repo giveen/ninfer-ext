@@ -226,7 +226,10 @@ ctest --test-dir build -L real --output-on-failure
 ```
 
 See [Opt-in real-model Engine tests](../docs/maintainer/real-model-tests.md) for the full variable
-table, coverage, and selection rules.
+table, coverage, and selection rules, including the Gemma 4 suite: those tests carry the `real`
+label too, read `NINFER_GEMMA_CHECKPOINT`, `NINFER_GEMMA_ARTIFACT` and their inputs from the
+environment rather than from a cache variable, and nine of them need captured inputs the repository
+does not carry.
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
 

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <stdexcept>
 #include <string>
 
@@ -39,6 +40,33 @@ void require_contiguous_nonnull(const Tensor& t, const char* name) {
     if (t.data == nullptr) {
         throw std::invalid_argument(std::string("gated_delta_net: ") + name +
                                     " data must be non-null");
+    }
+}
+
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+// The recurrent and chunked kernels declare every represented operand and the output __restrict__:
+// they must be pairwise disjoint and disjoint from both states. The state pair has its own rule at
+// the call site.
+void require_operand_nonoverlap(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                                const Tensor& beta, const Tensor& out, const Tensor& state_in,
+                                const Tensor& state_out) {
+    const Tensor* operands[]{&q, &k, &v, &g, &beta, &out};
+    constexpr std::size_t count = sizeof(operands) / sizeof(operands[0]);
+    for (std::size_t lhs = 0; lhs < count; ++lhs) {
+        for (std::size_t rhs = lhs + 1; rhs < count; ++rhs) {
+            if (overlaps(*operands[lhs], *operands[rhs])) {
+                throw std::invalid_argument("gated_delta_net: tensor operands must not overlap");
+            }
+        }
+        if (overlaps(*operands[lhs], state_in) || overlaps(*operands[lhs], state_out)) {
+            throw std::invalid_argument(
+                "gated_delta_net: tensor operands must not overlap the state");
+        }
     }
 }
 
@@ -164,6 +192,11 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     require_shape(ssm_state_in, detail::gated_delta_net::kStateDim,
                   detail::gated_delta_net::kStateDim, geometry.value_heads, 1, "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
+    if (ssm_state_in.data != ssm_state_out.data && overlaps(ssm_state_in, ssm_state_out)) {
+        throw std::invalid_argument(
+            "gated_delta_net: ssm_state_in and ssm_state_out must be disjoint or exactly alias");
+    }
+    require_operand_nonoverlap(q, k, v, g, beta, out, ssm_state_in, ssm_state_out);
 }
 
 } // namespace
@@ -208,15 +241,16 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      DeviceExecutionView execution) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
-    if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument("gated_delta_net: invalid SM count");
-    }
     namespace chunked = detail::gated_delta_net::chunked;
     if (q.ne[2] < chunked::kMinTokens) {
+        // The recurrent path decomposes by head, not by SM count, and reads only the stream.
         detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
                                                         ssm_state_in, ssm_state_out, out,
                                                         execution.stream);
         return;
+    }
+    if (execution.multiprocessor_count <= 0) {
+        throw std::invalid_argument("gated_delta_net: invalid SM count");
     }
     auto scope         = ws.scope();
     const auto layout  = chunked::workspace_layout(q.ne[1], v.ne[1], q.ne[2]);

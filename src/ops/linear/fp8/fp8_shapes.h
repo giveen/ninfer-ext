@@ -2,6 +2,9 @@
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
+#include <cstddef>
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 struct Fp8LinearShape {
     std::int32_t n, k;

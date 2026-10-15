@@ -41,8 +41,15 @@ private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
 };
 
+// Bump allocator over one device region. Not thread-safe: alloc_bytes/alloc/reset and Scope
+// destruction mutate the offset and the peak without synchronization, so one arena belongs to one
+// thread at a time (a workspace shared between threads needs external locking).
+
 class DeviceArena {
 public:
+    // Rewinds the arena to the offset observed at construction, unless later allocations have
+    // already passed it. A Scope borrows its arena: the arena must outlive the Scope and must not
+    // be moved while one is alive, since the rewind targets the arena object, not its storage.
     class Scope {
     public:
         ~Scope() noexcept;
@@ -71,7 +78,10 @@ public:
     DeviceArena(DeviceArena&& other) noexcept;
     DeviceArena& operator=(DeviceArena&& other) noexcept;
 
+    [[nodiscard]]
+
     DeviceSpan alloc_bytes(std::size_t bytes, std::size_t align = 256);
+    [[nodiscard]]
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
     [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;

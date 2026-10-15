@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <utility>
 
 namespace ninfer::runtime {
 
@@ -20,7 +21,8 @@ public:
                 claimed_ = true;
                 break;
             }
-            std::this_thread::sleep_for(kBackoff);
+            if (attempt + 1 < kAttempts) {
+            std::this_thread::sleep_for(kBackoff); }
         }
     }
 
@@ -39,6 +41,11 @@ public:
     }
 
 private:
+    // Both calls run from noexcept code, so a throwing Session implementation would terminate.
+    static_assert(noexcept(std::declval<Session&>().try_claim_seal_window()),
+                  "SealWindowClaim requires a noexcept try_claim_seal_window()");
+    static_assert(noexcept(std::declval<Session&>().release_seal_window()),
+                  "SealWindowClaim requires a noexcept release_seal_window()");
     static constexpr std::uint32_t kAttempts = 32;
     static constexpr std::chrono::microseconds kBackoff{125};
 

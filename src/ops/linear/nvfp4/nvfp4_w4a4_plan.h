@@ -16,6 +16,9 @@
 namespace ninfer::ops::detail {
 
 struct Nvfp4W4a4Workspace {
+    // Must hold `tokens * input_rows / 2` bytes for the token count being quantized: the quantizer
+    // writes one code per input pair. Unlike the scale plane below, this extent is neither carried
+    // nor checked, so a hand-built or reused workspace has to size it.
     std::uint8_t* codes  = nullptr;
     std::uint8_t* scales = nullptr;
     // Extent of the scale plane. The tiled layout writes over whole tiles, so it reaches past the
@@ -26,6 +29,8 @@ struct Nvfp4W4a4Workspace {
 
 inline std::size_t nvfp4_w4a4_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 W4A4 workspace: T must be positive"); }
+    if (bytes_per_token == 0) {
+        throw std::invalid_argument("nvfp4 W4A4 workspace: bytes per token must be nonzero"); }
     const auto count = static_cast<std::size_t>(tokens);
     if (count > std::numeric_limits<std::size_t>::max() / bytes_per_token) {
         throw std::overflow_error("nvfp4 W4A4 workspace size overflow");

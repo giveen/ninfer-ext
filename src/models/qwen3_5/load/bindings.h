@@ -5,9 +5,14 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 
+#include <cstdint>
+#include <functional>
+
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::loading {

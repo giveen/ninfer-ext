@@ -63,7 +63,7 @@ void check_literal(const Json& value, const std::string& path) {
          value.get<std::uint64_t>() > std::uint64_t(std::numeric_limits<std::int64_t>::max())) ||
         (value.is_number_float() && std::abs(value.get<double>()) >= 0x1p63))
         fail(Kind::UnsupportedJsonSchema, path,
-             "const/enum integers must fit signed 64-bit integers");
+             "const/enum numbers must fit signed 64-bit integers");
     if (value.is_object() || value.is_array())
         for (const auto& [key, item] : value.items()) check_literal(item, child(path, key));
 }
@@ -352,7 +352,7 @@ std::string prepare_json_schema(std::string_view source) {
         schema.root = std::move(parsed.value);
     } catch (const Json::exception& error) { fail(Kind::InvalidJsonSchema, {}, error.what()); }
     schema.source_validation = true;
-    schema.draft7            = schema.root.is_object() && schema.root.contains("$schema") &&
+    schema.draft7 = schema.root.is_object() && schema.root.contains("$schema") &&
                     schema.root["$schema"].is_string() &&
                     schema.root["$schema"].get<std::string>().find("draft-07") != std::string::npos;
     schema.check(schema.root, {});

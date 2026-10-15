@@ -72,20 +72,14 @@ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
               config.rope_theta, query, execution);
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               DeviceExecutionView execution) {
-    require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), dimension(config.rotary_dim) / 2,
-              config.rope_theta, query, key, execution);
-}
-
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, DeviceExecutionView execution) {
     require_rope_axes(positions, rope);
-    if (fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    if (fused_text_qk_norm_rope(positions, rope, attention, query.ne[2]) && rms_norm_eps == 1e-6F &&
+        rope.rope_theta == 1e7F) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, execution.stream);
         return;

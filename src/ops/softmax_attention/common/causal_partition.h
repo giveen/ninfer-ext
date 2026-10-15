@@ -12,7 +12,7 @@ struct CausalKvPartition {
     static constexpr int kMaxSplits = 256;
     int capacity                    = 1;
     int target                      = 1;
-    int key_shift                   = 6; // log2 of the minimum KV keys per split
+    int key_shift                   = 6; // log2 of the target keys per split: ceil(visible / 2^s)
 
     __host__ __device__ int active(int visible) const {
         const int count = (visible + (1 << key_shift) - 1) >> key_shift;
@@ -24,14 +24,17 @@ struct CausalKvPartition {
 // Each dtype chooses whether a shortfall warrants a larger CTA budget.
 inline constexpr bool causal_query_tiles_underfill_sms(int independent_tiles,
                                                        int multiprocessor_count) {
+    // No independent tile fills no SM, so a caller that can pass one gets the larger budget.
+    if (independent_tiles <= 0) { return true; }
     const std::int64_t filled =
         (multiprocessor_count / independent_tiles) * static_cast<std::int64_t>(independent_tiles);
     return filled < static_cast<std::int64_t>(multiprocessor_count) * 9 / 10;
 }
 
 inline constexpr int causal_partition_target(std::int64_t cta_budget, int independent_tiles) {
+    const std::int64_t tiles = independent_tiles > 0 ? independent_tiles : 1;
     return static_cast<int>(
-        std::clamp<std::int64_t>(cta_budget / independent_tiles, 1, CausalKvPartition::kMaxSplits));
+        std::clamp<std::int64_t>(cta_budget / tiles, 1, CausalKvPartition::kMaxSplits));
 }
 
 } // namespace ninfer::ops::detail

@@ -70,7 +70,9 @@ std::int64_t Tensor::numel() const { return shape_numel(ne); }
 std::size_t Tensor::bytes() const {
     const std::int64_t elements = numel();
     const std::size_t elem_size = dtype_size(dtype);
-    if (elements < 0 ||
+    // numel() rejects a non-positive extent, so `elements` is positive; the size_t bound only
+    // bites on a 32-bit target.
+    if (
         static_cast<unsigned long long>(elements) >
             static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
         throw std::overflow_error("tensor element count overflows size_t");

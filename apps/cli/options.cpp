@@ -142,7 +142,8 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--spec mtp adapts the draft length of a single request per round (up to 7 tokens, or\n"
            "--draft-tokens N); --fixed-draft always drafts exactly N. --spec eagle3 uses the\n"
-           "           SpecForge EAGLE3 head and adapts its draft length the same way.\n"
+           "           SpecForge EAGLE3 head and adapts its draft length the same way, up to 7\n"
+           "           tokens (it has no prompt-lookup mode).\n"
            "--draft-tree N selects the EAGLE3 static draft-tree root width (currently 1,\n"
            "           a chain; wider trees are planned).\n"
            "--lookup-drafts adds prompt-lookup drafts to MTP: tokens that followed an earlier\n"
@@ -193,8 +194,14 @@ Options parse_options(int argc, char** argv) {
     args.insert(args.end(), profile_args.begin(), profile_args.end());
     args.insert(args.end(), cli_args.begin(), cli_args.end());
 
+    // Whether the command line itself named a prompt or a messages file, rather than a profile.
+    bool cli_prompt   = false;
+    bool cli_messages = false;
+
     for (std::size_t i = 2; i < args.size(); ++i) {
         const std::string_view arg(args[i]);
+        // Profile arguments are expanded first, so everything before this offset came from it.
+        const bool from_profile = i < 2 + profile_args.size();
         const auto value = [&](std::string_view flag) -> const char* {
             if (++i >= args.size()) {
                 throw std::invalid_argument(std::string(flag) + " needs a value");
@@ -204,6 +211,7 @@ Options parse_options(int argc, char** argv) {
 
         if (arg == "--prompt") {
             options.prompt = value(arg);
+            if (!from_profile) { cli_prompt = true; }
         } else if (arg == "--chat-template") {
             options.chat_template_path = value(arg);
         } else if (arg == "--grammar-file") {
@@ -218,6 +226,7 @@ Options parse_options(int argc, char** argv) {
             options.choices.emplace_back(value(arg));
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
+            if (!from_profile) { cli_messages = true; }
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
@@ -315,6 +324,12 @@ Options parse_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+
+    // A profile may carry a prompt or a messages file; a command line that names one of them
+    // replaces the profile's other form instead of colliding with it. A command line that names
+    // both is still rejected below.
+    if (cli_prompt && !cli_messages) { options.messages_path.clear(); }
+    if (cli_messages && !cli_prompt) { options.prompt.clear(); }
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

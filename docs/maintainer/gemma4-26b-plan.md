@@ -292,11 +292,15 @@ measured saturated decodes. That is P0's last bullet.
   unchanged; the ten new Q8 geometries passing `ninfer_linear_q8_a16_test`'s T sweep against the FP64
   oracle; and the 26B itself loading (12118 parameters over 30 layers, 5 global) and generating the
   correct greedy continuation.
-- **Note on the 31B-shaped engine tests**: `ninfer_gemma4_model_test` and `ninfer_gemma4_forward_test`
+- **Note on the 31B-shaped engine tests** (resolved): `ninfer_gemma4_model_test` and `ninfer_gemma4_forward_test` used to
   assert 31B facts (60 layers, 833 bound weights, hidden 5376, layer 59) and fail when pointed at the
-  26B artifact. They are artifact-gated and nothing registers the 26B with them, so CI is unaffected;
-  giving the 26B its own artifact-derived versions is a follow-up, the same way `test_load.cpp` was
-  made to derive from the artifact's config in P1.
+  26B artifact. Every expectation now comes from the artifact's parsed config — the layer count, hidden size, the per-layer attention geometry that
+  gives the query/key/value slice shapes, the sliding/global split, and the last global layer index —
+  and the bound-weight count from the structure in `tests/models/gemma4/expected_weights.h`, which `test_load.cpp` now counts with too ( the shared oracle that P1 gave the load test). Both files also
+  indexed `weights.text.layers[59]` unchecked, which on the 26B read past the end of a 30-entry layer
+  vector and turned garbage bytes into a `WeightId`; that read is now the last global layer. Both
+  artifacts pass (`ctest -R 'gemma4_(model|forward)_test'`: 30 layers / 12118 parameters for the 26B
+  QAT artifact, 60 / 833 for the 31B).
 - **Remaining**: logits agreement against the HF reference at the §11 protocol, then greedy output
   equality on the standard prompt set, then concurrency 1..8 and the KV/state checks the 31B already
   has.

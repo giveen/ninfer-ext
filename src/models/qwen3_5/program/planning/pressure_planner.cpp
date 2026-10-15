@@ -140,7 +140,6 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     const std::size_t private_checkpoint_capacity =
         2U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (private_checkpoint_capacity > std::numeric_limits<std::size_t>::max() - 3U ||
-        private_checkpoint_capacity != 0 &&
             private_checkpoint_capacity >
                 std::numeric_limits<std::size_t>::max() / (private_checkpoint_capacity + 3U)) {
         throw std::overflow_error("pressure recovery alternative capacity overflow");
@@ -229,6 +228,12 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
 PressurePlanningSessionImpl::~PressurePlanningSessionImpl() noexcept {
     if (std::ranges::any_of(assessment_slots,
                             [](const AssessmentSlot& slot) { return slot.leased; })) {
+        std::terminate();
+    }
+    // A leased construction slot means a cursor outlives this session, exactly as a leased
+    // assessment slot means an assessed target does; both would call back into freed memory.
+    if (std::ranges::any_of(construction_slots,
+                            [](const ConstructionSlot& slot) { return slot.leased; })) {
         std::terminate();
     }
     if (program != nullptr) { program->pressure_planning_active_ = false; }
@@ -624,6 +629,7 @@ auto PressurePlanningSessionImpl::construction_slot(
 
 void PressurePlanningSessionImpl::release_construction(const void* owner, std::uint32_t index,
                                                        std::uint32_t lease) noexcept {
+    if (owner == nullptr) { std::terminate(); }
     auto& session = *const_cast<PressurePlanningSessionImpl*>(
         static_cast<const PressurePlanningSessionImpl*>(owner));
     if (index < session.construction_slots.size()) {

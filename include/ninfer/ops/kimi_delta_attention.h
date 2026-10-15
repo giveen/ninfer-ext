@@ -12,7 +12,9 @@ namespace ninfer::ops {
 
 /**
  * Caller-owned transient capacity for every T in [min_tokens,max_tokens]. D=128,
- * Hqk>=1, Hv>=Hqk and Hv%Hqk==0. Returns zero when all calls use scratch-free recurrence.
+ * Hqk>=1, Hv>=Hqk and Hv%Hqk==0. Throws std::invalid_argument for an invalid head profile or
+ * interval. The returned capacity is determined by max_tokens (min_tokens only bounds the admitted
+ * interval); it is zero when every admitted T takes the scratch-free recurrent route.
  */
 [[nodiscard]] std::size_t kimi_delta_attention_workspace_capacity_bytes(std::int32_t qk_heads,
                                                                         std::int32_t value_heads,
@@ -39,7 +41,8 @@ namespace ninfer::ops {
  * beta BF16 [Hv,T], A_log FP32 [Hv], dt_bias FP32 [128,Hv], state FP32 [128,128,Hv].
  * Physical state index is ((h*128+value)*128+key). Hqk>=1, Hv>=Hqk, Hv%Hqk==0, T>=1.
  * lower_bound is finite in [-5,0]; scale is 1/sqrt(128). Inputs/out are non-overlapping.
- * State input/output may be disjoint or exactly alias; no other operand overlaps state.
+ * In the distinct-state overload below, state input/output may be disjoint or exactly alias; this
+ * single-state overload always aliases exactly. No other operand overlaps state.
  *
  * The independent oracle evaluates the complete recurrence naively in FP64 from the represented
  * BF16 inputs and FP32 parameters/state, with no private staging or output rounding. Recurrent
@@ -72,8 +75,9 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
  * Scratch-free one-token update for B independent state-pool slots, using the same head mapping.
  * q/k BF16 [128,Hqk,1,B], v/g/out BF16 [128,Hv,1,B], beta BF16 [Hv,1,B],
  * A_log FP32 [Hv], dt_bias FP32 [128,Hv], states FP32 [128,128,Hv,Slots], device I32 slots [B].
- * B is in [1,8]. Caller-provided active slots are valid and distinct. Each row reads and writes
- * its selected state. Inputs, out, selectors and state do not overlap.
+ * B is in [1,8] and Slots >= 1. Caller-provided active slots are valid indices in [0,Slots) and
+ * distinct. Each row reads and writes its selected state. Inputs, out, selectors and state do not
+ * overlap.
  */
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,

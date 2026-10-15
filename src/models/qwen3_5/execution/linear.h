@@ -1,5 +1,9 @@
 #pragma once
 
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/tensor.h"
+
 #include "models/qwen3_5/execution/parameters.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"

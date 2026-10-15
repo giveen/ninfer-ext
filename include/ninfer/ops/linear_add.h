@@ -37,12 +37,13 @@ namespace ninfer::ops {
  *   ideal[:,t] = residual[:,t] + Linear(x,w)[:,t].
  *
  * Logical shapes:
- *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q4_G64_FP16 RowSplit
- *   [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
+ *   Contiguous, non-null, 16-byte-aligned BF16 x [K,T] and residual [N,T]; the BF16/Q4/Q5/Q8
+ *   branches also require 16-byte-aligned weight planes. Registered weights are Q4_G64_FP16
+ * RowSplit [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
- *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], or BF16 Contiguous [5120,6144]. T may
- *   be any positive value.
+ *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], EXL3_MUL1 TrellisT16 [5120,17408], or BF16
+ *   Contiguous [5120,6144]. T may be any positive value.
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed
@@ -65,13 +66,19 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
- *   the call. A16 routes require no storage; quantized-activation routes use the reported capacity.
+ *   the call. A16 routes require no storage except EXL3_MUL1, whose decode always uses the reported
+ *   capacity; quantized-activation routes use the reported capacity.
  *   There is no persistent state side effect.
  */
-void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
-                cudaStream_t stream);
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
+
+/**
+ * Applies the A16-only form: resolves `policy` to A16Only. All tensor, weight, aliasing, and
+ * workspace requirements of the policy-bearing overload apply.
+ */
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
+                cudaStream_t stream);
 
 } // namespace ninfer::ops

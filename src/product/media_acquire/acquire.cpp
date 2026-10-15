@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -177,6 +178,7 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
 struct CurlBuffer {
     std::vector<std::uint8_t> bytes;
     std::size_t limit = 0;
+    std::exception_ptr failure;
 };
 
 int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
@@ -189,14 +191,19 @@ int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) 
     } catch (...) { return 1; }
 }
 
-std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) {
+std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) noexcept {
     auto& out = *static_cast<CurlBuffer*>(opaque);
+    try {
     if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { return 0; }
     const std::size_t amount = size * count;
     if (amount > out.limit - std::min(out.limit, out.bytes.size())) { return 0; }
     out.bytes.insert(out.bytes.end(), reinterpret_cast<std::uint8_t*>(data),
                      reinterpret_cast<std::uint8_t*>(data) + amount);
     return amount;
+    } catch (...) {
+        out.failure = std::current_exception();
+        return 0;
+    }
 }
 
 std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
@@ -247,6 +254,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
             check_control(policy);
+            if (buffer.failure) { std::rethrow_exception(buffer.failure); }
             if (code == CURLE_OPERATION_TIMEDOUT) {
                 throw Error(ErrorKind::RemoteTimeout,
                             "media URL fetch timed out: " + std::string(curl_easy_strerror(code)));
@@ -263,7 +271,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
             check_control(policy);
             return buffer.bytes;
         }
-        if (status < 300 || status >= 400 || redirect == policy.max_redirects) {
+        if (status < 300 || status >= 400) {
             throw Error(ErrorKind::RemoteUnavailable,
                         "media URL returned HTTP " + std::to_string(status));
         }
@@ -287,7 +295,10 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // Compare the first path component rather than a ".." string prefix: a legitimate file
+        // named
+        // "..hidden" directly under the root would trip the prefix test.
+        if (ec || relative.empty() || * relative.begin() == std::filesystem::path("..")) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

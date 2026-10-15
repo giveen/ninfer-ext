@@ -17,8 +17,13 @@ struct alignas(16) GdnReplayFoldKernelRow {
     std::int32_t reserved = 0;
 };
 
+// One row per active replay record. The core caps a record capacity at eight rows
+// (kMaximumRecordCapacity in src/core/gdn_replay_records.cpp) and the fold packs one entry per
+// active row, so this bound is what the packing loop must not exceed.
+inline constexpr std::int32_t kGdnReplayFoldMaximumRows = 8;
+
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[8];
+    GdnReplayFoldKernelRow row[kGdnReplayFoldMaximumRows];
 };
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

@@ -45,6 +45,11 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    // Qwen4Exp has no draft or proposal path: reject the combination before binding any weights, so
+    // a misconfigured request fails with this message instead of an unrelated binding error.
+    if (out->config.text.qwen4() && (out->config.draft || options.proposal_enabled())) {
+        throw artifact::ArtifactError("Qwen4Exp supports MTP speculation only");
+    }
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
@@ -72,9 +77,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.proposal = loading::bind_proposal(bindings, *proposal, text, options,
                                                        out->resources.public_token_count);
         if (out->config.draft && out->config.draft->dflash2) {
-            const auto domain =
-                proposal->indexed ? proposal->rows : out->resources.public_token_count;
-            if (out->config.draft->dflash2->selector_top_k > domain) {
+            // Only the indexed domain can still fail here: for a non-indexed proposal the loading
+            // layer already rejects selector_top_k above the public token count.
+            if (
+                proposal->indexed &&out->config.draft->dflash2->selector_top_k > proposal->rows) {
                 throw artifact::ArtifactError(
                     "proposal domain is smaller than DFlash2 selector_top_k");
             }
@@ -87,9 +93,6 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->weights.mtp) {
         out->weights.mtp->output_head_use =
             bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
-    }
-    if (text.qwen4() && (out->config.draft || options.proposal_enabled())) {
-        throw artifact::ArtifactError("Qwen4Exp supports MTP speculation only");
     }
     if (out->weights.draft) {
         out->weights.draft->output_head_use =

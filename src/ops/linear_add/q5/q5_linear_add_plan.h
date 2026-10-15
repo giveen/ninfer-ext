@@ -40,7 +40,12 @@ struct Q5LinearAddPlan {
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept;
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept;
+// The admitted catalog is exact: 5120 rows with k (and padded_k) 6144 or 17408, and at least one
+// column. A problem outside it throws std::invalid_argument; q5_linear_add_admits is the
+// non-throwing pre-check.
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem);
+
+// Validates the column interval and resolves both of its endpoints, so it may throw as above.
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
                                                    std::int32_t padded_k, std::int32_t min_cols,

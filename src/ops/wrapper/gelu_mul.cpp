@@ -19,7 +19,6 @@ void gelu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         }
     }
     if (!out.is_contiguous()) { throw std::invalid_argument("gelu_mul: out must be contiguous"); }
-    if (out.numel() == 0) { return; }
     if (gate.data == nullptr || up.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("gelu_mul: gate/up/out data must be non-null");
     }

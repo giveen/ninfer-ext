@@ -2,8 +2,6 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 
 #include "ops/linear/fp8/fp8_geometry.h"
-
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 

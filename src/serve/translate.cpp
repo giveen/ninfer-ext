@@ -50,9 +50,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     }
     if (request.seed) {
         sampling.seed = *request.seed;
-    } else if (server.sampling_overrides.seed) {
-        sampling.seed = *server.sampling_overrides.seed;
-    } else {
+    } else if (!sampling.seed) {
+        // `sampling` already carries the server-default seed when it has one.
         sampling.seed = random_seed();
     }
 
@@ -180,8 +179,12 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
     }
     if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
-        result.enable_thinking == true) {
-        invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
+        result.enable_thinking.value_or( true)) {
+        // Unspecified resolves to the template's own default (Thinking on), so a prefill has to
+        // disable Thinking explicitly -- `enable_thinking: false` or `reasoning_effort: "none"`.
+        invalid_prompt_option(
+            "assistant prefill requires explicitly disabled thinking (enable_thinking: false, or "
+            "reasoning_effort: \"none\")",
                               "messages", "assistant_prefill_not_supported");
     }
     return result;

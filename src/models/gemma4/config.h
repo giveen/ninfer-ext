@@ -73,11 +73,14 @@ struct TextConfig {
     AttentionGeometry sliding;
     GlobalAttentionGeometry global;
 
+    // `layer` must be in [0, layer_types.size()); these are predicate-style accessors and do not
+    // validate the index (an out-of-range one is a programming error, not a checked failure).
+
     [[nodiscard]] bool sliding_attention(std::size_t layer) const {
         return layer_types.at(layer) == MixerKind::SlidingAttention;
     }
 
-    // The geometry layer `layer` attends with.
+    // The geometry layer `layer` attends with (the same index precondition as `sliding_attention`).
     [[nodiscard]] const AttentionGeometry& geometry(std::size_t layer) const {
         return sliding_attention(layer) ? sliding : global.shared;
     }
@@ -121,12 +124,8 @@ struct VisionConfig {
 
     // The most patches one image has: its soft tokens times the pooling cell.
     [[nodiscard]] std::uint32_t max_patches() const noexcept {
-        return soft_tokens_per_image * pooling_kernel_size * pooling_kernel_size;
+        return static_cast<std::uint32_t>(static_cast<std::uint64_t>( soft_tokens_per_image) * pooling_kernel_size * pooling_kernel_size);
     }
-};
-
-struct Config {
-    TextConfig text;
 };
 
 // Parses one text component config. Throws ArtifactError on an unknown member or a violated

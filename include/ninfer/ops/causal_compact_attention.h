@@ -48,6 +48,9 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
                               bool indexed_keys, Tensor& out, const Tensor& workspace,
                               DeviceExecutionView execution);
 
+// Workspace bytes the key split needs for these extents; zero when the route does not split.
+[[nodiscard]]
+
 std::size_t causal_compact_attention_workspace_bytes(AttentionHeadGeometry geometry,
                                                      std::int32_t rotary_dim,
                                                      std::int32_t query_tokens,

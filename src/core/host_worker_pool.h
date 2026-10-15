@@ -1,6 +1,4 @@
 #pragma once
-
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -28,6 +26,14 @@ public:
 
     HostWorkerPool(const HostWorkerPool&)            = delete;
     HostWorkerPool& operator=(const HostWorkerPool&) = delete;
+    HostWorkerPool(HostWorkerPool&&)                 = delete;
+    HostWorkerPool& operator=(HostWorkerPool&&) = delete;
+
+    // Runs `function` on a worker once the queue has room, and returns its future. `enqueue`
+    // blocks while the queue is at capacity (reporting progress through `checkpoint`), so submit
+    // may block for an unbounded time and must not be called from a pool worker; when the pool is
+    // stopping it throws std::runtime_error synchronously, so callers handle both the future and
+    // that exception.
 
     template <class Function>
     [[nodiscard]] auto submit(Function&& function, Checkpoint checkpoint = {})

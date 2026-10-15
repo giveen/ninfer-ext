@@ -16,8 +16,10 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient capacity required by LinearSwiGLU for every T in the inclusive
- * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
- * Invalid profiles or intervals throw; a legal static-zero route returns zero.
+ * [min_tokens,max_tokens] interval under the A16-only policy. The QType and dimensions are the
+ * fixed implementation profile. Invalid profiles or intervals throw; a legal static-zero route
+ * returns zero. Pair this query only with the A16-only linear_swiglu() overload; a policy-bearing
+ * call needs the policy-bearing capacity query with the same policy.
  */
 [[nodiscard]] std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype,
                                                                  std::int32_t gate_up_rows,
@@ -50,7 +52,8 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   - Q8_G32_FP16 weight [12288,2048], x [2048,T], out [6144,T];
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
- *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T].
+ *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T];
+ *   - EXL3_MUL1 TrellisT16 weight [34816,5120], x [5120,T], out [17408,T] (A16Only).
  *   Inputs and output are contiguous BF16. Q4/Q8 scales are FP16, NVFP4 scales are E4M3FN, and
  *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,17408)` precede
  *   their matching up rows `[17408,34816)`.
@@ -68,10 +71,11 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   Writes the full output; x/weight and output must not alias.
  *
  * Workspace:
- *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
- *   caller-owned activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes() using the
+ *   same policy and token interval used for execution; it must not overlap x, any weight plane, or
+ *   out, and is scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8
+ *   routes use caller-owned activation storage and may use private projection storage. There is no
+ *   persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);

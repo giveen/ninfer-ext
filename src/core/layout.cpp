@@ -1,9 +1,12 @@
 #include "core/layout.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ninfer {
 namespace {

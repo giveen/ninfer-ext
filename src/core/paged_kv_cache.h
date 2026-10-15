@@ -205,6 +205,11 @@ private:
     std::uint32_t pages_     = 0;
 };
 
+// Physical page pool for one KV cache: one pool belongs to one thread at a time. Reservation and
+// materialization mutate the free lists and the page accounting, and the const transfer paths
+// share the mutable duplicate-detection scratch below, so concurrent calls on one pool (even
+// const ones) race.
+
 class DeviceKVPagePool {
 public:
     DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout);
@@ -378,7 +383,8 @@ public:
                           cudaStream_t stream = nullptr);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
-    /** The published words of row index `row` (its Host shadow), in logical page order. */
+    /** The whole logical row of row index `row` (its Host shadow), in logical page order: the words
+     *  a publish wrote, followed by the capacity - published tail, which is unspecified. */
     [[nodiscard]] std::span<const std::int32_t> published_words(std::int32_t row) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }

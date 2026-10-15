@@ -1,5 +1,8 @@
 #include "core/host_worker_pool.h"
 
+#include <cassert>
+#include <chrono>
+
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -70,7 +73,9 @@ struct HostWorkerPool::Impl {
             }
             {
                 std::lock_guard lock(mutex);
-                if (active == 0) { std::terminate(); }
+                // This worker incremented `active` before running the task and is the only one
+                // that decrements it again.
+                assert (active > 0);
                 --active;
             }
         }

@@ -28,6 +28,7 @@ namespace ninfer::ops {
  * output rounding are implementation effects covered by the Op's numerical criterion.
  *
  * All three tensors must be non-null, contiguous, 16-byte aligned, and pairwise non-overlapping.
+ * A dtype, alignment, shape, domain, or overlap violation throws `std::invalid_argument`.
  * The Op overwrites every output element, preserves both inputs, owns no workspace, and has no
  * persistent state effect.
  */

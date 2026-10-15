@@ -15,6 +15,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include "real_test_artifact.h"
 
 namespace {
 
@@ -267,7 +268,6 @@ int main(int argc, char** argv) {
             backend == "dflash" ? SpeculativeBackend::DFlash : SpeculativeBackend::DFlash2);
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(error);
     }
 }

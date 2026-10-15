@@ -6,8 +6,12 @@
 #include "core/weight_view.h"
 #include "ninfer/types.h"
 
+#include <cstddef>
+#include <cstdint>
+
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 

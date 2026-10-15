@@ -11,17 +11,17 @@ using Mma  = Bf16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Cache::cg, Cache::cg,
 using C2   = Bf16SimtSchedule<4, 1, 8, 8, 1, 4, Bf16SimtActivationAccess::WarpPacked,
                               Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 1, 2>;
 using C4   = Bf16SimtSchedule<4, 1, 8, 8, 1, 4, Bf16SimtActivationAccess::WarpPacked,
-                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 2, 1, 2>;
+                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 2, 2>;
 using C8   = Bf16SimtSchedule<4, 1, 4, 8, 1, 4, Bf16SimtActivationAccess::WarpPacked,
                               Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 1, 2>;
 using C12  = Bf16SimtSchedule<4, 1, 2, 8, 1, 4, Bf16SimtActivationAccess::DirectStream,
-                              Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 2, 1, 2>;
+                              Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 1, 2, 2>;
 using C16  = Bf16SimtSchedule<4, 1, 2, 8, 1, 4, Bf16SimtActivationAccess::DirectStream,
-                              Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 2, 1, 4>;
+                              Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 1, 2, 4>;
 using C20  = Bf16SimtSchedule<4, 1, 2, 8, 1, 4, Bf16SimtActivationAccess::DirectStream,
-                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 2, 1, 3>;
+                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 2, 3>;
 using C24  = Bf16SimtSchedule<4, 1, 2, 8, 1, 4, Bf16SimtActivationAccess::DirectStream,
-                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 2, 1, 3>;
+                              Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 2, 3>;
 
 } // namespace
 

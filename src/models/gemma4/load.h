@@ -6,8 +6,9 @@
 #include "models/gemma4/weights.h"
 #include "models/load_options.h"
 
-#include <filesystem>
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace ninfer::artifact {
@@ -17,10 +18,7 @@ struct ParameterReference;
 
 namespace ninfer::models::gemma4 {
 
-// Cold load plan. Every declared parameter is resolved against the artifact while planning, so a
-// name, shape or stored format the artifact does not carry is refused here rather than at
-// execution. The plan borrows its Reader until materialization, which is not part of this class
-// yet. The artifact's text resources, which is where the tokenizer lives. The views point into the
+// The artifact's text resources, which is where the tokenizer lives. The views point into the
 // reader's mapped files, so they are valid only while that reader lives: a consumer that outlives
 // the load must copy them, as a Model holds materialized weights rather than the artifact.
 struct TextResources {
@@ -29,6 +27,11 @@ struct TextResources {
     std::string_view generation_config_json;
     std::string_view chat_template_jinja;
 };
+
+// Cold load plan. Every declared parameter is resolved against the artifact while planning, so a
+// name, shape or stored format the artifact does not carry is refused here rather than at
+// execution. The plan borrows its Reader until materialization, which is not part of this class
+// yet.
 
 class LoadPlan {
 public:

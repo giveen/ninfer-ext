@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -94,6 +96,12 @@ template <class Arena>
 SparseMoePrefillWorkspace
 allocate_sparse_moe_prefill_workspace(Arena& arena, std::int32_t capacity_tokens, bool nvfp4) {
     SparseMoePrefillWorkspace out;
+    // 8 * capacity_tokens is the assignment count every routed shape is built from: a non-positive
+    // capacity would make those shapes non-positive, and a capacity above this bound would overflow
+    // the count and under-size the layout the workspace query reports.
+    if (capacity_tokens <= 0 || capacity_tokens > std::numeric_limits<std::int32_t>::max() / 8) {
+        throw std::invalid_argument("sparse_moe prefill workspace: invalid token capacity");
+    }
     const std::int32_t assignments = 8 * capacity_tokens;
     const std::int32_t route_tiles =
         (capacity_tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
@@ -122,11 +130,20 @@ allocate_sparse_moe_prefill_workspace(Arena& arena, std::int32_t capacity_tokens
 
     out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
+    // The BF16 shared SwiGLU plane fits the FP32 router score plane it aliases (1024 bytes a token
+    // against 1040). Asserted rather than trusted: a wider plane has to move the union, not overrun
+    // it.
+    static_assert(512 * 2 <= kSparseMoeRouterScoreRows * 4,
+                  "the shared SwiGLU plane must fit the router score plane it aliases");
 
     out.grouped_io = arena.alloc(DType::BF16, {2048, assignments}, 256);
 
     out.routed_storage = arena.alloc(DType::BF16, {512, assignments}, 256);
     out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {2048, capacity_tokens});
+    // The FP32 token reduction exactly fills the BF16 routed SwiGLU plane it aliases: 8192 bytes a
+    // token either way (2048 * 4 against 512 * 8 * 2). Asserted the same way.
+    static_assert(2048 * 4 <= 512 * 8 * 2,
+                  "the routed token reduction must fit the routed SwiGLU plane it aliases");
 
     if (nvfp4) {
         // The layout builder allocates nothing, so an offset is only formed when there is a
@@ -144,11 +161,12 @@ allocate_sparse_moe_prefill_workspace(Arena& arena, std::int32_t capacity_tokens
         out.nvfp4_routed_scales = carve(32, assignments);
         out.nvfp4_shared_codes  = carve(256, capacity_tokens);
         out.nvfp4_shared_scales = carve(32, capacity_tokens);
-        // 3744 bytes a token, and five alignment gaps of under 256 each, inside the 8192 a token
-        // that `routed_storage` holds for a profile that has a routed SwiGLU plane. Asserted
-        // rather than trusted: a wider staging plane has to move the union, not overrun it. The
-        // eight is `assignments / capacity_tokens`, which is kTopK.
-        static_assert(1024 + 128 + 8 * 256 + 8 * 32 + 256 + 32 + 5 * 255 <= 512 * 8 * 2,
+        // 3744 bytes a token, and six alignment gaps of under 256 each (the last being the final
+        // plane's own rounding), inside the 8192 a token that `routed_storage` holds for a profile
+        // that has a routed SwiGLU plane. Asserted rather than trusted: a wider staging plane has
+        // to move the union, not overrun it. The eight is `assignments / capacity_tokens`, which is
+        // kTopK.
+        static_assert(1024 + 128 + 8 * 256 + 8 * 32 + 256 + 32 + 6 * 255 <= 512 * 8 * 2,
                       "the NVFP4 staging planes must fit the routed SwiGLU plane they alias");
         static_cast<void>(cursor);
     }

@@ -170,7 +170,10 @@ using Clock = std::chrono::steady_clock;
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
-        error.code   = "request_queue_timeout";
+        // The request never waited in the queue: its media fetch/preparation deadline expired, so
+        // it must not be reported as a queue timeout. The media timeout code is also what
+        // make_request_failure classifies as a Timeout.
+        error.code   = "media_fetch_timeout";
         break;
     case ninfer::product::media_acquire::ErrorKind::Cancelled:
         throw_preparation_cancelled();
@@ -437,9 +440,13 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
+    // Counting acquires the request's media and tokenizes through the engine exactly as a
+    // generation preparation does, so it holds the same lifetime: the capacity reservation that
+    // enforces max_concurrency + max_pending_requests, and the deadline that bounds both.
+    const std::shared_ptr<RequestLifetime> lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout);
+    const Clock::time_point deadline = lifetime->deadline;
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);

@@ -67,7 +67,12 @@ public:
             return false;
         }
         if (elapsed < granted_ && next_operation_ns <= granted_ - elapsed) { return true; }
-        if (completion_ns > remaining || completion_ns > economic(gain_ns)) {
+        if (completion_ns > remaining) {
+            boundary_limited_ = true;
+            reason_           = MaterializationStopReason::TimeBudget;
+            return false;
+        }
+        if ( completion_ns > economic(gain_ns)) {
             reason_ = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }

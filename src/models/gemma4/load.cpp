@@ -140,7 +140,7 @@ TextWeights bind_text(Bindings& bindings, const TextConfig& config) {
             weights.moe = std::move(moe);
         }
 
-        out.layers.push_back(weights);
+        out.layers.push_back(std::move(weights));
     }
     return out;
 }
@@ -178,7 +178,7 @@ DraftWeights bind_draft(Bindings& bindings, const TextConfig& target, const Draf
         weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden});
         weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden});
         weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate});
-        out.layers.push_back(weights);
+        out.layers.push_back(std::move(weights));
     }
     return out;
 }
@@ -216,7 +216,7 @@ VisionWeights bind_vision(Bindings& bindings, const VisionConfig& vision) {
         weights.mlp.gate = bindings.parameter(prefix + "mlp/gate", {intermediate, hidden});
         weights.mlp.up   = bindings.parameter(prefix + "mlp/up", {intermediate, hidden});
         weights.mlp.down = bindings.parameter(prefix + "mlp/down", {hidden, intermediate});
-        out.layers.push_back(weights);
+        out.layers.push_back(std::move(weights));
     }
     return out;
 }
@@ -228,7 +228,6 @@ struct LoadPlan::Impl {
     std::optional<DraftConfig> draft;
     std::optional<VisionConfig> vision;
     TextResources resources;
-    LoadOptions options;
     ModelWeights weights;
     artifact::Binder binder;
     std::vector<artifact::ParameterReference> references;
@@ -237,8 +236,9 @@ struct LoadPlan::Impl {
     explicit Impl(const artifact::Reader& reader) : binder(reader) {}
 };
 
-// Every Gemma parameter is Device-resident, so unlike the Qwen loader there is no file-mapped
-// branch here: a plan's reference always resolves to a view over the materialized bytes.
+// Every Gemma parameter is either device- or pinned-host-resident, so unlike the Qwen loader there
+// is no file-mapped branch here: a plan's reference always resolves to a view over the materialized
+// bytes.
 std::vector<BoundWeight>
 resolve_weights(const std::vector<artifact::ParameterReference>& references,
                 const artifact::MaterializedArtifact& materialized) {
@@ -284,7 +284,6 @@ const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>(reader);
-    out->options = options;
     // Both purposes bind the same parameters: the head the scoring route reads is the head
     // generation samples from, and what differs between the two is how a Program is driven, not
     // what is loaded.

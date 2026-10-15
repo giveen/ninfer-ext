@@ -71,6 +71,10 @@ template <class Policy>
     return order;
 }
 
+// Owned by one ResourceManager and driven by the single scheduling path. plan() clears and refills
+// the queue, identity-cost and portfolio scratch below, so one instance is not reentrant and must
+// not be used by two threads at once.
+
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
 public:
@@ -1178,15 +1182,6 @@ private:
         return found == policies.end() ? nullptr : &*found;
     }
 
-    [[nodiscard]] static const MaterializationCheckpointPolicy*
-    checkpoint_policy_for(std::span<const MaterializationCheckpointPolicy> policies,
-                          PlanningOwnerId owner, CheckpointRef checkpoint) noexcept {
-        const auto found = std::ranges::find_if(policies, [&](const auto& policy) {
-            return policy.owner == owner && policy.checkpoint == checkpoint;
-        });
-        return found == policies.end() ? nullptr : &*found;
-    }
-
     [[nodiscard]] FoldedCost
     fold_identity(const CandidateInput& candidate,
                   const IdentityMaterializationAssessment& assessment,
@@ -1293,7 +1288,8 @@ private:
                  .demand_mask          = checkpoint.demand_mask,
                  .rebuild_ns           = checkpoint.rebuild_ns,
                  .baseline_recovery_ns = checkpoint.baseline_recovery_ns,
-                 .target_recovery_ns   = recovery});
+                 .target_recovery_ns   = recovery,
+                 .unreachable          = checkpoint.unreachable});
         }
         const auto value =
             portfolio_value_.fold(portfolio_owner_scratch_, portfolio_checkpoint_scratch_);

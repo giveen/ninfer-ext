@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 
@@ -55,9 +56,16 @@ __host__ __device__ constexpr int square_index(int row, int col) {
     return row * kChunkSize + (col ^ (((row >> 1) & 3) * 4));
 }
 
+// Bytes of the chunked workspace: `value_heads` head-major runs of `chunk_count(tokens)` chunks,
+// matching the kernels' `workspace + head * chunk_count(tokens) + chunk` indexing. The region must
+// start 256-byte aligned because both launch paths reinterpret it as `Chunk*`.
+
 inline std::size_t chunked_workspace_bytes(int value_heads, int tokens) {
+    if (value_heads <= 0 || tokens <= 0) {
+        throw std::invalid_argument("kimi delta attention workspace needs positive geometry");
+    }
     return Tensor(nullptr, DType::U8,
-                  {static_cast<int>(sizeof(Chunk)), chunk_count(tokens), value_heads})
+                  {static_cast<int>(sizeof(Chunk)), value_heads, chunk_count(tokens)})
         .bytes();
 }
 

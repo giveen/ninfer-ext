@@ -46,9 +46,14 @@ static_assert(sizeof(ControlChunk) == 2304);
 
 __host__ __device__ inline int chunk_count(int tokens) { return div_up(tokens, kChunkSize); }
 
+// Swizzle within one row only: requires col < kStateDim and row < kChunkSize, so the row mask
+// 8*row stays inside the row.
+
 __host__ __device__ constexpr int vector_index(int row, int col) {
     return row * kStateDim + (col ^ (row * 8));
 }
+
+// Swizzle within one chunk row only: requires col < kChunkSize.
 
 __host__ __device__ constexpr int square_index(int row, int col) {
     return row * kChunkSize + (col ^ (((row >> 1) & 3) * 4));

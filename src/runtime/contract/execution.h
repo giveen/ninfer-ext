@@ -3,6 +3,9 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
 #include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -13,7 +16,9 @@ public:
     virtual ~TokenMaskProvider()                                           = default;
     [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
-    // device mask. A dead end fails a row only if verification reaches that position.
+    // device mask. A dead end fails a row only if verification reaches that position. `drafts` must
+    // hold at most 32 positions: the result carries one bit per position and callers derive their
+    // mask with `1u << drafts.size()`, which is undefined at 32 or more.
     [[nodiscard]] virtual std::uint32_t fill(std::size_t row, std::span<const TokenId> drafts,
                                              std::span<std::uint32_t> words) = 0;
     // Bytes the round uploaded for this row, for constraint observations.

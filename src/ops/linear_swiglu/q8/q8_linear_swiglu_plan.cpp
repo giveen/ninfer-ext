@@ -116,13 +116,9 @@ const char* q8_linear_swiglu_schedule_name(Q8LinearSwiGluScheduleId schedule) no
     case Q8LinearSwiGluScheduleId::DFlash2MmaR64C96K128:
         return "linear_swiglu.q8.dflash2.mma.r64.c96.k128";
     case Q8LinearSwiGluScheduleId::DFlash2MmaR64C128:
-        return "linear_swiglu.q8.dflash2.mma.pair.r32.c128";
+        return "linear_swiglu.q8.dflash2.mma.r64.c128";
     }
     return "linear_swiglu.q8.unknown";
-}
-
-bool q8_linear_swiglu_schedule_uses_mma(Q8LinearSwiGluScheduleId schedule) noexcept {
-    return schedule != Q8LinearSwiGluScheduleId::DecodePairR16;
 }
 
 bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept {

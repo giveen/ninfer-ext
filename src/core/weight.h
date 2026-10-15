@@ -59,12 +59,13 @@ struct Weight {
     std::uint32_t bitrate_half_bits  = 0;
 
     // An NVFP4 plane assembled from several source matrices carries one divisor per source, in the
-    // payload after the scales. `weight_divisors` addresses them and `weight_divisor_rows` says how
-    // many consecutive rows each covers, so the divisor of row r is element r /
-    // weight_divisor_rows. A plane with one source sets the rows to its own row count, which makes
-    // that index zero for every row, and `weight_scale_divisor` is then the whole story. On a stack
-    // `weight_scale_divisor` holds only the first source's word, so a route that reads it for any
-    // other row is silently wrong by a scale factor.
+    // payload after the scales. `weight_divisors` addresses them — as float elements — and
+    // `weight_divisor_rows` says how many consecutive rows each covers, so the divisor of row r is
+    // element r / weight_divisor_rows; whenever `weight_divisors` is set it must be > 0. A plane
+    // with one source sets the rows to its own row count, which makes that index zero for every
+    // row, and `weight_scale_divisor` is then the whole story. On a stack `weight_scale_divisor`
+    // holds only the first source's word, so a route that reads it for any other row is silently
+    // wrong by a scale factor.
     const void* weight_divisors      = nullptr;
     std::int32_t weight_divisor_rows = 0;
 };

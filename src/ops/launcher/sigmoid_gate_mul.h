@@ -14,6 +14,8 @@ namespace ninfer::ops::detail {
 void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream);
 
 // Fixed-route launch control used by production and qualification benchmarks.
+// `block` must be a positive multiple of 32 (a CUDA-legal warp-multiple block size); 0 or a
+// negative value is invalid and would divide by zero in the launcher.
 void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

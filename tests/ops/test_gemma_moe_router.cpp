@@ -169,7 +169,11 @@ int run_scale_order_case() {
 int main() {
     int failures = 0;
     try {
-        for (const std::int32_t tokens : {1, 5, 8, 300}) { failures += run_real_geometry_case(tokens); }
+        // 8 is one lane's verify width; 12 to 16 are the widths a batched multi-lane verify
+        // reaches, and the router's per-column selection had no oracle over them.
+        for (const std::int32_t tokens : {1, 5, 8, 12, 15, 16, 300}) {
+            failures += run_real_geometry_case(tokens);
+        }
         failures += run_tie_case();
         failures += run_scale_order_case();
     } catch (const std::exception& error) {

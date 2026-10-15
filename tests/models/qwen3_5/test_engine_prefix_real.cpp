@@ -335,7 +335,8 @@ std::string agent_tool_json(std::string_view name, std::string_view description)
     json += name;
     json += "\",\"description\":\"";
     json += description;
-    json += "\",\"parameters\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"]}}}";
+    json += "\",\"parameters\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}"
+            "},\"required\":[\"value\"]}}}";
     return json;
 }
 
@@ -770,11 +771,16 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::string(R"({"type":"function","function":{"name":"bravo","description":")") +
         long_description +
         R"(","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    // The prompt declares a tool, so the artifact's schemas constrain the call, and the frontend
+    // refuses a constrained request whose stop policy drops the checkpoint's own EOS. The tool
+    // requests here therefore keep the model defaults; the plain ones above do not.
+    ninfer::RequestOptions tool_request      = capture_request;
+    tool_request.stop.include_model_defaults = true;
     const ninfer::GenerationResult replacement = engine.generate(
-        engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), capture_request);
+        engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), tool_request);
     const ninfer::RuntimeStats after_replacement = engine.runtime_stats();
-    if (replacement.generated_token_ids.size() != 1) {
-        std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
+    if (replacement.generated_token_ids.empty()) {
+        std::cerr << "shared replacement fixture did not produce a deterministic tool call\n";
         return 1;
     }
     // Remove the exact private endpoint without publishing another shared marker. The following
@@ -786,16 +792,16 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::cerr << "shared replacement fixture did not displace the exact private endpoint\n";
         return 1;
     }
-    ninfer::RequestOptions full_capacity_request = capture_request;
+    // The reservation is what exercises full capacity; the request cannot also carry a caller stop,
+    // because a constrained call keeps the model's own stop tokens and no caller may add its own.
+    ninfer::RequestOptions full_capacity_request = tool_request;
     full_capacity_request.execution.requested_output_tokens =
         std::numeric_limits<std::uint32_t>::max();
-    full_capacity_request.stop.token_ids          = {replacement.generated_token_ids.front()};
-    full_capacity_request.stop.publish_stop_token = true;
     const ninfer::GenerationResult reused         = engine.generate(
         engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), full_capacity_request);
     const ninfer::RuntimeStats after_reuse = engine.runtime_stats();
 
-    if (reused.generated_token_ids.size() != 1) {
+    if (reused.generated_token_ids.empty()) {
         std::cerr << "shared replacement fixture did not complete all requests\n";
         return 1;
     }
@@ -1585,12 +1591,14 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
             R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
         return input;
     };
+    // Every prompt below declares a tool, so the artifact's tool schemas constrain the call, and
+    // the frontend refuses a constrained request whose stop policy drops the checkpoint's own EOS.
+    // Keep the model defaults here; the unconstrained exercises above are free to turn them off.
     auto options = [](bool reuse) {
         ninfer::RequestOptions result;
         result.execution.requested_output_tokens = 4;
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
-        result.stop.include_model_defaults       = false;
         return result;
     };
 
@@ -1735,12 +1743,13 @@ int exercise_rewrite_branch(const char* artifact) {
             R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
         return value;
     };
+    // As in the response-checkpoint exercise, every prompt here declares a tool, so the call is
+    // constrained and has to keep the checkpoint's own EOS tokens.
     const auto options = [](bool reuse) {
         ninfer::RequestOptions value;
         value.execution.requested_output_tokens = 4;
         value.execution.sampling.temperature    = 0.0F;
         value.execution.allow_prefix_reuse      = reuse;
-        value.stop.include_model_defaults       = false;
         return value;
     };
 
@@ -2624,6 +2633,11 @@ int exercise_recency_retention(const char* artifact) {
 // concurrent requests. The deterministic guarantees asserted here are the observable ones:
 // shared-prefix reuse, pressure evictions, and zero leaked shared_active_references after every
 // completed request (the stats-publication fix, d9d110e3).
+//
+// Every request below declares at least one tool, so the artifact's schemas constrain the call and
+// the frontend refuses a stop policy that drops the checkpoint's own EOS. These scenarios keep the
+// model defaults; only the tool-free exercises above turn them off for a strictly deterministic
+// stop.
 
 // 1. A multi-turn agent conversation reuses its shared system + tools prefix on every turn after
 //    the first. The released-lane snapshot is published before the caller wakes, so a fresh
@@ -2644,7 +2658,6 @@ int exercise_agent_multi_turn(const char* artifact) {
     request.execution.requested_output_tokens = 1;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
 
     std::vector<ninfer::ChatMessage> history;
     bool saw_shared_reuse = false;
@@ -2703,7 +2716,6 @@ int exercise_agent_private_continuations(const char* artifact) {
     request.execution.requested_output_tokens = 1;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
 
     // Five long, distinct conversations (each a new private continuation). Their combined KV
     // overflows the 4096 capacity, so the cache runs out of room to merely degrade and must fully
@@ -2782,7 +2794,6 @@ int exercise_agent_concurrent(const char* artifact) {
     request.execution.requested_output_tokens = 1;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
 
     // Two concurrent requests share the same system + tools prefix (the shared stable prefix) but
     // have distinct conversations. Both are submitted before either completes.
@@ -2836,7 +2847,6 @@ int exercise_agent_kv_pressure(const char* artifact) {
     request.execution.requested_output_tokens = 1;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
 
     // The engine requires kv_capacity >= max_context (4096). Four long, distinct conversations
     // (~2000 tokens each, ~8000 total) overflow that 4096-token KV capacity; the pressure path
@@ -2895,7 +2905,6 @@ int exercise_agent_shared_catalog(const char* artifact) {
     request.execution.requested_output_tokens = 1;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
 
     // No explicit shared-prefix marker: the system + tool prefix is an automatic shared candidate
     // (the exact traffic the #251 reclaim serves).

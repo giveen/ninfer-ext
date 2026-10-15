@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -43,9 +42,12 @@ ParameterReference Binder::parameter(std::string_view name, Shape shape, Residen
 
 ParameterReference Binder::binding(std::string name, const Binding& binding, Shape shape,
                                    Residency residency, std::optional<QType> exact_format) {
+    if (binding.whole_object && binding.parts.empty()) {
+        throw ArtifactError(name + ": whole-object Binding has no parts");
+    }
     if (weight_element_count(shape) != binding.elements ||
         (binding.whole_object &&
-         reader_.directory().tensor(binding.parts.at(0).object).shape != shape)) {
+         reader_.directory().tensor(binding.parts.front().object).shape != shape)) {
         throw ArtifactError(name + ": logical shape differs from Binding coverage");
     }
     for (const auto& part : binding.parts) {

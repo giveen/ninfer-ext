@@ -35,6 +35,10 @@ struct QsaGeometry {
     float rms_norm_eps       = 0.0F;
     std::array<std::uint8_t, 64> pair_axes{};
 
+    // Preconditions, validated by qsa_select/qsa_select_workspace_bytes before any use: ratio > 0
+    // and budget % ratio == 0. Both accessors are undefined on an unpopulated geometry, so do not
+    // call them on a default-constructed one.
+
     [[nodiscard]] constexpr std::int32_t block_topk() const noexcept { return budget / ratio; }
 
     [[nodiscard]] constexpr std::int32_t max_selected() const noexcept {

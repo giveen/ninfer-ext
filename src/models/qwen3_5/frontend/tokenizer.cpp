@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <limits>
 #include <queue>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -391,13 +390,18 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
             continue;
         }
         const auto existing_content = occupied_vocab_tokens.find(token.content);
-        if (occupied_vocab_ids.contains(id) &&
-            !(existing_content != occupied_vocab_tokens.end() &&
+        if (occupied_vocab_ids.contains(id)) {
+            const bool restates_vocabulary =existing_content != occupied_vocab_tokens.end() &&
               existing_content->second == id &&
               static_cast<std::size_t>(id) < id_to_token.size() &&
-              id_to_token[static_cast<std::size_t>(id)] == token.content)) {
+              id_to_token[static_cast<std::size_t>(id)] == token.content;
+            if (!restates_vocabulary) {
             throw std::invalid_argument("added_tokens_decoder overlaps vocabulary id " +
                                         std::to_string(id));
+            }
+            // The entry only restates a vocabulary token that is already loaded, so it adds
+            // nothing.
+            continue;
         }
         if (token_by_content.contains(token.content) ||
             occupied_vocab_tokens.contains(token.content)) {
@@ -1107,13 +1111,15 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     while (pos < text.size()) {
         const AddedToken* match_token = nullptr;
         const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
+        // Every candidate here starts with the byte at `pos`, so two that match are prefix-related;
+        // the reference tokenizer resolves that by length, not by the lower token id.
         for (const std::size_t index : candidates) {
             const AddedToken& token = added_tokens_[index];
             if (token.content.size() <= text.size() - pos &&
                 text.compare(pos, token.content.size(), token.content) == 0 &&
-                !text::overlaps(literal_spans, pos, pos + token.content.size())) {
+                !text::overlaps(literal_spans, pos, pos + token.content.size()) &&
+                (match_token == nullptr || token.content.size() > match_token->content.size())) {
                 match_token = &token;
-                break;
             }
         }
 
@@ -1148,7 +1154,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     return encoded;
 }
 
-std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
+std::string Tokenizer::decode(std::span<const int> ids, const DecodeOptions& options) const {
     std::string text;
     const std::size_t terminal_stop_index =
         (!ids.empty() && is_stop_token_id(options.stop_token_ids, ids.back())) ? ids.size() - 1

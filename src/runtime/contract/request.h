@@ -42,7 +42,8 @@ struct OutputDecision {
 };
 
 // Non-owning cancellation observation used while the worker advances a context transaction. The
-// request record owns the flag for longer than Program can retain this view.
+// request record owns the flag for longer than Program can retain this view, and the view is valid
+// only for the duration of the call it is passed to: it must not be stored.
 struct CancellationFlagView {
     const std::atomic<bool>* flag = nullptr;
 

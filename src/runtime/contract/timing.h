@@ -39,7 +39,9 @@ enum class ExecutionTimingPhase : std::uint8_t {
 
 // Fixed-cost coarse recorder used only at Program phase boundaries, never in token/page/layer
 // loops. It starts in Submit, permits explicit Submit -> Wait -> Post transitions, and can resume
-// Submit for a later segment in the same execution unit.
+// Submit for a later segment in the same execution unit. transition() accepts any change and bills
+// the elapsed range to the phase it leaves, so callers must only make the transitions the execution
+// really performs.
 class ExecutionTimingRecorder {
 public:
     using Clock = std::chrono::steady_clock;

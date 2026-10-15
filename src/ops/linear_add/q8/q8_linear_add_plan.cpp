@@ -82,40 +82,6 @@ static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes)
                   routes_are_closed(kN5120Routes),
               "Q8 LinearAdd routes must be exact, contiguous, and closed");
 
-std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
-    switch (schedule) {
-    case Q8LinearAddScheduleId::DecodeR16:
-    case Q8LinearAddScheduleId::MediumSplitK:
-        break;
-    case Q8LinearAddScheduleId::SimtR8C4:
-        return 8;
-    case Q8LinearAddScheduleId::MmaR32C64:
-    case Q8LinearAddScheduleId::MmaR32C80:
-    case Q8LinearAddScheduleId::MmaR32C96:
-    case Q8LinearAddScheduleId::MmaR32C128:
-        return 32;
-    case Q8LinearAddScheduleId::MmaR48C64:
-    case Q8LinearAddScheduleId::MmaR48C96:
-    case Q8LinearAddScheduleId::MmaR48C112:
-    case Q8LinearAddScheduleId::MmaR48C128:
-        return 48;
-    case Q8LinearAddScheduleId::MmaR64C96:
-    case Q8LinearAddScheduleId::MmaR64C112:
-    case Q8LinearAddScheduleId::MmaR64C128:
-        return 64;
-    case Q8LinearAddScheduleId::MmaR128C64:
-    case Q8LinearAddScheduleId::MmaR128C80:
-        return 128;
-    case Q8LinearAddScheduleId::SplitKMmaExactT:
-    case Q8LinearAddScheduleId::SplitKMmaCapacity:
-    case Q8LinearAddScheduleId::GroupedSplitK:
-        break;
-    }
-    throw std::logic_error("q8 linear_add: exact-T schedule has no row tile");
-}
-
-std::int32_t schedule_cols(Q8LinearAddScheduleId schedule);
-
 std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
     switch (schedule) {
     case Q8LinearAddScheduleId::DecodeR16:
@@ -195,11 +161,6 @@ const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept
     return "linear_add.q8.unknown";
 }
 
-bool q8_linear_add_schedule_uses_mma(Q8LinearAddScheduleId schedule) noexcept {
-    return schedule != Q8LinearAddScheduleId::DecodeR16 &&
-           schedule != Q8LinearAddScheduleId::SimtR8C4;
-}
-
 bool q8_linear_add_admits(const Q8LinearAddProblem& problem) noexcept {
     const bool shape = (problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144)) ||
                        (problem.rows == 5120 && (problem.k == 6144 || problem.k == 17408));
@@ -256,7 +217,11 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             switch (plan.schedule) {
             case Q8LinearAddScheduleId::DecodeR16:
             case Q8LinearAddScheduleId::MediumSplitK:
-                break;
+            case Q8LinearAddScheduleId::GroupedSplitK:
+            case Q8LinearAddScheduleId::SplitKMmaCapacity:
+            case Q8LinearAddScheduleId::SplitKMmaExactT:
+                // Every schedule outside the tiled catalog launches above and returns.
+                throw std::logic_error("q8 linear_add: schedule is not token-sliced");
             case Q8LinearAddScheduleId::SimtR8C4:
                 q8_linear_add_simt_r8_c4_launch(x_slice, w, residual_slice, stream);
                 return;
@@ -299,12 +264,7 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             case Q8LinearAddScheduleId::MmaR128C80:
                 q8_linear_add_mma_r128_c80_launch(x_slice, w, residual_slice, stream);
                 return;
-            case Q8LinearAddScheduleId::GroupedSplitK:
-            case Q8LinearAddScheduleId::SplitKMmaCapacity:
-            case Q8LinearAddScheduleId::SplitKMmaExactT:
-                break;
             }
-            throw std::logic_error("q8 linear_add: unknown tiled schedule");
         });
 }
 

@@ -20,6 +20,7 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
     const auto family           = width <= grouped_limit ? Nvfp4KvFamily::Grouped
                                   : width <= kGroupedPrefillMaxWidth ? Nvfp4KvFamily::ParallelGrouped
                                                                      : Nvfp4KvFamily::Tiled;
+    // The tiled kernel consumes neither the query tile nor the partition computed below.
     const int tiles =
         family == Nvfp4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
@@ -46,7 +47,6 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
             make_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
-        if (plan.family == Nvfp4KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, splits, batch);

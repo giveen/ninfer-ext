@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -292,6 +291,11 @@ void require_dflash_row_views(const Weight& first_weight, const Weight& second_w
 void require_pair_operands(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                            const Tensor& first_out, const Tensor& second_out,
                            bool require_scale_16) {
+    // Both kernels write a full [1024, cols] projection at the same column indices, so the two
+    // outputs must share one geometry; a narrower second output is an out-of-bounds write.
+    if (first_out.ne[0] != second_out.ne[0] || first_out.ne[1] != second_out.ne[1]) {
+        throw std::invalid_argument("q8 pair: both outputs must have one geometry");
+    }
     if (!aligned_to(x.data, 16) || !aligned_to(first_out.data, 16) ||
         !aligned_to(second_out.data, 16) || !aligned_to(first_weight.qdata, 16) ||
         !aligned_to(second_weight.qdata, 16) || !aligned_to(first_weight.scales, 4) ||

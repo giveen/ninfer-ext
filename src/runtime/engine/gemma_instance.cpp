@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -248,10 +247,9 @@ GemmaProgram::GemmaProgram(const models::gemma4::Model& model, std::int32_t capa
             std::vector<double> samples;
             for (std::int32_t round = 0; round < kWarm + kTimed; ++round) {
                 const auto started = Clock::now();
-                const auto result  = program_.speculate(
+                (void) program_.speculate(
                     0, context.back(), static_cast<std::int32_t>(ladder[rung]), execution_);
                 program_.commit_round(0, 1, execution_);
-                (void)result;
                 if (round >= kWarm) samples.push_back(seconds_since(started));
             }
             std::sort(samples.begin(), samples.end());
@@ -339,7 +337,16 @@ RequestBasePlan GemmaProgram::plan_request(const PreparedPrompt& prompt,
                                            : FinishReason::ContextCapacity;
     summary.prefix_reuse_path        = PrefixReusePath::Root;
     summary.publish_continuation     = false;
-    base.prefill_work_ = make_prefill_work(0, summary.prompt_tokens, 0, 0, idle_chunk_);
+    // The prompt's images are encoded by the prefill that carries them, so the static prefill cost
+    // carries their item and patch counts the way the text planning path does.
+    std::uint64_t vision_items   = 0;
+    std::uint64_t vision_patches = 0;
+    for (const auto& image : prompt.images) {
+        ++vision_items;
+        vision_patches += static_cast<std::uint64_t>(image.image.grid_width) *
+                          static_cast<std::uint64_t>(image.image.grid_height);
+    }
+    base.prefill_work_ = make_prefill_work(0, summary.prompt_tokens, vision_items, vision_patches, idle_chunk_);
     const std::uint64_t prefill_units =
         1ULL + (static_cast<std::uint64_t>(summary.prompt_tokens) - 1ULL) / prefill_chunk_;
     const std::uint64_t decode_units =
@@ -537,10 +544,21 @@ PendingBatch GemmaProgram::decode(std::span<const SequenceHandle> sequences,
     std::vector<std::int32_t> plain_lanes, plain_ids;
     std::vector<std::int32_t> speculative_lanes, speculative_anchors, speculative_drafts;
     std::vector<bool> full_rung;
-    for (std::size_t row = 0; row < sequences.size(); ++row) {
+    // A row that fails validation must not leave the rows before it marked pending with no
+    // PendingBatch handed out (nothing would then match them in commit/abort_pending), so every row
+    // is validated before any lane is mutated.
+    const auto require_active_row = [&] (std::size_t row) -> Lane* {
         Lane* lane = valid_lane(sequences[row]);
-        if (lane == nullptr || lane->phase != Phase::Active || lane->pending ||
-            lane->next_input < 0 || budgets[row].generated_tokens_remaining == 0) {
+        if (lane == nullptr || lane->phase != Phase::Active || lane->next_input < 0 || budgets[row].generated_tokens_remaining == 0) {
+            throw std::logic_error("decode round row is not an active sequence");
+        }
+        return lane;
+    };
+    for (std::size_t row = 0; row < sequences.size(); ++row) { (void)require_active_row(row); }
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        Lane* lane = require_active_row(row);
+        // Two rows naming one sequence would mark the same lane pending twice.
+        if (lane->pending) {
             throw std::logic_error("decode round row is not an active sequence");
         }
         const std::int32_t lane_index = static_cast<std::int32_t>(sequences[row].lane_);
@@ -685,8 +703,7 @@ qwen::DiscardResult GemmaProgram::abort_pending(PendingBatch&& pending) noexcept
     // A discarded round is an execution failure for its rows: their lanes are released, so the
     // Engine fails those requests rather than resuming a sequence whose round never committed.
     for (std::size_t row = 0; row < pending.row_count_; ++row) {
-        if (Lane* lane = valid_lane(pending.rows_[row])) {
-            (void)lane;
+        if ( valid_lane(pending.rows_[row]) != nullptr) {
             release(pending.rows_[row].lane_);
         }
     }

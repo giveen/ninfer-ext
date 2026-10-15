@@ -2,6 +2,8 @@
 
 #include "ninfer/types.h"
 
+#include <atomic>
+
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -20,7 +22,10 @@ inline constexpr std::string_view kGenerationTokenTraceSchema     = "ninfer_gene
 inline constexpr std::uint32_t kGenerationTokenTraceSchemaVersion = 2;
 
 // `prompt_token_ids` carry the exact Engine prompt (chat template included) so a ledger can be
-// replayed offline; they are recorded only while this trace is enabled.
+// replayed offline; they are recorded only while this trace is enabled. The record is therefore
+// sensitive: it holds raw user prompt tokens in plaintext, and the file is opened for append with
+// the process umask and is never rotated or truncated, so an operator who enables it must choose an
+// access-controlled path and expect the file to grow.
 [[nodiscard]] std::string
 format_generation_token_trace_json(std::uint64_t request_id, std::uint32_t prompt_tokens,
                                    const std::vector<TokenId>& prompt_token_ids,
@@ -36,7 +41,10 @@ public:
     GenerationTokenTraceJsonl(const GenerationTokenTraceJsonl&)            = delete;
     GenerationTokenTraceJsonl& operator=(const GenerationTokenTraceJsonl&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
+    // Also false once a write has failed, so a caller stops collecting prompt tokens for a trace
+    // that can no longer record them. Read before the writer takes `mutex_`, so it stays lock-free.
+
+    [[nodiscard]] bool enabled() const noexcept { return output_.is_open() && !failed_.load(std::memory_order_relaxed); }
 
     [[nodiscard]] bool write(std::uint64_t request_id, std::uint32_t prompt_tokens,
                              const std::vector<TokenId>& prompt_token_ids,
@@ -46,7 +54,9 @@ private:
     std::ofstream output_;
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
-    bool failed_ = false;
+    // Written by the writer thread alone and read by enabled() on any thread.
+    std::atomic<
+    bool> failed_{ false};
 };
 
 } // namespace ninfer::serve

@@ -2,6 +2,9 @@
 
 // Reads the packed calibration trace `tools/exl3/sample_traces.py` writes: a single safetensors
 // file with `input_ids` I64 [rows, row_tokens] and `lengths` I64 [rows]. Pure host code.
+//
+// Both tensors are narrowed to I32 in memory (the model's token-id domain), so the reader rejects
+// token ids and dimensions outside that range rather than letting the cast wrap.
 
 #include <cstdint>
 #include <filesystem>

@@ -3,9 +3,21 @@
 #include "ops/launcher/vision_pool.h"
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
+
+// The contract excludes shared storage: out is completely overwritten while the inputs are read.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
+} // namespace
 
 void vision_pool_standardize(const Tensor& x, int grid_width, int grid_height, int kernel,
                              float multiplier, const Tensor& bias, const Tensor& scale, Tensor& out,
@@ -38,6 +50,10 @@ void vision_pool_standardize(const Tensor& x, int grid_width, int grid_height, i
     }
     if (x.data == nullptr || out.data == nullptr || bias.data == nullptr || scale.data == nullptr) {
         throw std::invalid_argument("vision_pool_standardize: tensor data must be non-null");
+    }
+    if (overlaps(out, x) || overlaps(out, bias) || overlaps(out, scale)) {
+        throw std::invalid_argument(
+            "vision_pool_standardize: out must not overlap x, bias or scale");
     }
     detail::vision_pool_standardize_launch(x, grid_width, kernel, multiplier, bias, scale, out,
                                            stream);

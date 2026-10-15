@@ -3,6 +3,7 @@
 #include <utf8proc/utf8proc.h>
 
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 
 namespace ninfer::text::unicode_internal {
@@ -37,9 +38,9 @@ std::string normalize_nfc(std::string_view text) {
         throw std::invalid_argument(std::string("failed to normalize UTF-8 text as NFC: ") +
                                     utf8proc_errmsg(result));
     }
-    std::string normalized(reinterpret_cast<const char*>(mapped), static_cast<std::size_t>(result));
-    std::free(mapped);
-    return normalized;
+    const std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)> buffer(mapped, &std::free);
+    return
+    std::string(reinterpret_cast<const char*>(buffer.get()), static_cast<std::size_t>(result));
 }
 
 CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
@@ -55,9 +56,6 @@ CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
         throw std::invalid_argument("invalid UTF-8 in " + std::string(context) + ": " +
                                     utf8proc_errmsg(length));
     }
-    if (length == 0) {
-        throw std::invalid_argument("truncated UTF-8 sequence in " + std::string(context));
-    }
     return CodepointSpan{codepoint, offset, static_cast<std::size_t>(length)};
 }
 
@@ -72,9 +70,11 @@ std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_vi
 }
 
 std::string codepoint_to_utf8(std::int32_t codepoint) {
+    if (!utf8proc_codepoint_valid(codepoint)) {
+        throw std::invalid_argument("invalid Unicode codepoint");
+    }
     utf8proc_uint8_t buffer[4];
     const utf8proc_ssize_t length = utf8proc_encode_char(codepoint, buffer);
-    if (length <= 0) { throw std::invalid_argument("invalid Unicode codepoint"); }
     return {reinterpret_cast<const char*>(buffer), static_cast<std::size_t>(length)};
 }
 

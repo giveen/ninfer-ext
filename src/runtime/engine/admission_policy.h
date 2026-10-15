@@ -23,7 +23,9 @@ struct ActiveAdmissionSnapshot {
 
 // Logical half of a blocked-head reservation. Program owns every physical quantity and mints a
 // fresh proof for each borrower; Scheduler freezes only the incumbent identities whose eventual
-// release is allowed to make the FIFO head runnable.
+// release is allowed to make the FIFO head runnable. Only make_admission_protection mints one, and
+// donor_count never exceeds donor_ids.size(): the noexcept accessors below span donor_ids by
+// donor_count.
 struct AdmissionProtection {
     std::uint64_t epoch_id        = 0;
     std::uint64_t head_request_id = 0;
@@ -32,6 +34,13 @@ struct AdmissionProtection {
     std::size_t donor_count = 0;
 };
 
+// Freezes the head's donor partition from the current active set. Throws std::invalid_argument
+// when the epoch, head request id or resource revision is zero, when `active` is empty or exceeds
+// kMaximumConcurrency, or when an active request id is zero, names the head, or repeats.
+// `epoch_id` must be new for each freeze: rebind_admission_protection refuses a frozen donor that
+// reappears as a current-epoch persistent borrower, so a reused epoch would freeze a borrower as a
+// donor.
+
 [[nodiscard]] AdmissionProtection
 make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
                           ProgramResourceRevision resource_revision,
@@ -39,6 +48,9 @@ make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
 
 // Revalidates the frozen donor partition after Program topology changed. Current-epoch persistent
 // borrowers are never promoted to donors, so repeated backfill cannot move the head's frontier.
+// Throws std::invalid_argument on an invalid identity (zero epoch/head/revision) or a zero,
+// repeated or oversized active request set, and std::logic_error when an active request is neither
+// a frozen donor nor a current-epoch persistent borrower, or a frozen donor was relabelled as one.
 void rebind_admission_protection(AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
                                  ProgramResourceRevision resource_revision);

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 
 namespace ninfer::ops::detail {

@@ -13,7 +13,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -75,6 +77,9 @@ struct StreamSink {
     std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    // Streaming cancellation, observed by run() on top of its own argument. prepare() honours only
+    // the argument it is passed, so a caller that must be able to cancel preparation has to pass a
+    // predicate there as well.
     std::function<bool()> is_cancelled;
 };
 

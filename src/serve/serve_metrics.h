@@ -14,6 +14,14 @@
 
 namespace ninfer::serve {
 
+// The constraint meters below are indexed by a settled request's completion outcome (three labels:
+// terminated, complete-interrupted, or an uninterrupted completion) and by ConstraintCacheAccess.
+inline constexpr std::size_t kConstraintOutcomeCount     = 3;
+inline constexpr std::size_t kConstraintCacheAccessCount = 3;
+static_assert(static_cast<std::size_t>(ConstraintCacheAccess::Waited) + 1 ==
+                  kConstraintCacheAccessCount,
+              "ConstraintCacheAccess grew a value the constraint cache meter does not cover");
+
 // Prometheus metrics for GET /metrics. Names follow vLLM's (`vllm:` -> `ninfer:`) and, where vLLM
 // has no counterpart, llama.cpp's. Per-request observations (histograms, finish reasons,
 // speculative decoding) are recorded once when the request reaches its terminal record; token
@@ -25,7 +33,8 @@ public:
 
     // Called once the Engine is ready. `memory` supplies the fixed KV pool size; it is not read
     // per scrape because Engine::memory_summary() waits for the execution lock. Engine counters
-    // are reported relative to `baseline`, which excludes startup warmup.
+    // are reported relative to `baseline`, which excludes startup warmup. attach() writes the
+    // identity and the baseline without the scrape lock, so it must complete before any render().
     void attach(std::string model_name, const MemorySummary& memory, const RuntimeStats& baseline);
 
     void observe_done(const GenerationOutcome& outcome);
@@ -72,8 +81,8 @@ private:
     std::vector<std::uint64_t> spec_accepted_per_position_;
     // Settled constrained requests: completion outcome and compile-cache access, plus the work the
     // constraint itself reported as subintervals of the request's existing timings.
-    std::array<std::uint64_t, 3> constraint_outcomes_{};
-    std::array<std::uint64_t, 3> constraint_cache_{};
+    std::array<std::uint64_t, kConstraintOutcomeCount> constraint_outcomes_{};
+    std::array<std::uint64_t, kConstraintCacheAccessCount> constraint_cache_{};
     double constraint_prepare_seconds_     = 0;
     double constraint_mask_seconds_        = 0;
     double constraint_matcher_seconds_     = 0;

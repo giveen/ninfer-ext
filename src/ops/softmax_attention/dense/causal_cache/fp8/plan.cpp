@@ -53,6 +53,9 @@ std::size_t fp8_kv_workspace_bytes(int heads, int batch, int min_width, int max_
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
             make_fp8_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+        // The loop stops at kGroupedPrefillMaxWidth, below the Tiled threshold, so this guard is
+        // unreachable today. It stays so that raising the bound cannot silently size the workspace
+        // from a Tiled plan's partition.
         if (plan.family == Fp8KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
         WorkspaceLayoutBuilder layout;

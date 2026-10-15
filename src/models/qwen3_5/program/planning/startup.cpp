@@ -65,7 +65,8 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
 }
 
 std::int32_t checked_i32(std::uint64_t value, const char* label) {
-    if (value == 0 ||
+    if (value == 0) { throw std::invalid_argument(label); }
+    if (
         value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);
     }
@@ -81,7 +82,7 @@ template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
     std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-    for (const GraphExecutionProfile profile : profiles) {
+    for (const GraphExecutionProfile& profile : profiles) {
         const std::size_t allowance = profile_allowance(profile);
         const auto existing         = std::ranges::find_if(
             classes, [&](const auto& entry) { return entry.first == profile.topology_class; });
@@ -1270,8 +1271,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
+    // Streaming bounds each request's Device residency by its window instead of max_context, so
+    // this floor matches the planner's (kv_stream_minimum_window_pages): a weaker check would let
+    // an explicit capacity through here only to fail later on the capacity curve.
     const std::uint32_t minimum_pages =
-        options.kv_stream ? options.max_concurrency
+        options.kv_stream ? std::min(
+                  static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                      static_cast<std::uint64_t>( options.max_concurrency) *
+                          kv_stream_window_pages(clamped_prefill_widths(parameters, options).idle,
+                                                 options.speculative.draft_tokens),
+                      std::numeric_limits<std::uint32_t>::max())),
+                  options.max_concurrency * logical_pages)
                           : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
@@ -1347,8 +1357,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (!parameters.draft || !parameters.model.config().draft->eagle3) {
             throw std::invalid_argument("selected EAGLE3 backend is not supported by this target");
         }
-        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
-            throw std::invalid_argument("EAGLE3 draft window must be in [1,15]");
+        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > static_cast<std::uint32_t>(kMtpRoundMaximumDrafts)) {
+            throw std::invalid_argument("EAGLE3 draft window must be in [1," +
+                                        std::to_string(kMtpRoundMaximumDrafts) + "]");
         }
         if (options.speculative.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument("EAGLE3 uses its own draft head, not the proposal head");

@@ -6,6 +6,7 @@
 #include "text/grammar.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -359,7 +360,9 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     }
     if (state.in_reasoning) {
         // A close marker still pending at the end of the turn is the model's implicit close.
-        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true);
+        // Use the same close marker the running feed uses: it differs under exact framing.
+        const std::string_view close_marker = reasoning_close_marker(state.exact_reasoning_framing);
+        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true, close_marker, state.exact_reasoning_framing);
         const std::size_t split =
             scan.close != std::string::npos ? scan.close : state.think_marker_pending.size();
         feed_channel(state, OutputChannel::Reasoning,
@@ -368,10 +371,10 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         close_channel(state, OutputChannel::Reasoning, emitted);
         if (scan.close != std::string::npos) {
             std::string content =
-                state.think_marker_pending.substr(scan.close + kThinkClose.size());
+                state.think_marker_pending.substr(scan.close + close_marker.size());
             state.think_marker_pending.clear();
             state.in_reasoning          = false;
-            state.strip_content_leading = true;
+            state.strip_content_leading = !state.exact_reasoning_framing;
             feed_content(state, std::move(content), policy, emitted, committed_tokens, nullptr);
         } else {
             state.think_marker_pending.clear();
@@ -521,7 +524,7 @@ std::optional<ConstraintObservation> OutputSession::constraint_observation() con
     auto result = impl_->grammar->observation();
     if (impl_->combined) {
         result.branch = impl_->branch;
-    } else if (impl_->tool_call_output.in_tool_region() || !impl_->tool_calls.empty()) {
+    } else if (impl_->tool_call_output.may_be_in_tool_region() || !impl_->tool_calls.empty()) {
         result.branch = ConstraintOutputBranch::Tools;
     } else if (impl_->saw_content || (!impl_->state.in_reasoning && result.complete)) {
         result.branch = ConstraintOutputBranch::Content;
@@ -536,6 +539,7 @@ std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
 }
 
 void OutputSession::discard_preview() {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->grammar) { impl_->grammar->discard(); }
     impl_->preview_ready = false;
     impl_->preview_output.clear();
@@ -770,7 +774,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
 }
 
 PublishedOutput OutputSession::commit_preview() {
-    if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
+    if (impl_ == nullptr || !impl_->preview_ready) { throw std::logic_error("no output preview"); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);

@@ -61,6 +61,12 @@ Coefficients coefficients(int input, int output) {
 
 void resize_bicubic(Image& input, int width, int height, const std::function<void()>& checkpoint) {
     if (width <= 0 || height <= 0) throw std::invalid_argument("resize_bicubic: empty size");
+    if (input.width <= 0 || input.height <= 0) {
+        throw std::invalid_argument("resize_bicubic: empty input size");
+    }
+    if (input.rgb.size() != static_cast<std::size_t>(input.width) * input.height * 3) {
+        throw std::invalid_argument("resize_bicubic: input pixels do not match its size");
+    }
     if (input.width == width && input.height == height) { return; }
 
     const struct {

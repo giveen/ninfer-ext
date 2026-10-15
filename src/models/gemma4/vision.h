@@ -23,17 +23,22 @@
 namespace ninfer::models::gemma4 {
 
 struct ImagePatches {
-    // The patch grid: `grid_width` patches across, `grid_height` down, both multiples of 3.
+    // The patch grid: `grid_width` patches across, `grid_height` down. encode_image accepts only
+    // positive multiples of the tower's pooling kernel (3) and throws std::invalid_argument
+    // otherwise.
     std::int32_t grid_width  = 0;
     std::int32_t grid_height = 0;
     // BF16 [patches, 3 * 16 * 16]: patch p = row * grid_width + column, each patch's pixels in
     // (row, column, channel) order, already mapped to 2 * (u / 255) - 1.
     std::span<const std::uint16_t> pixels;
 
-    [[nodiscard]] std::int32_t patches() const noexcept { return grid_width * grid_height; }
+    [[nodiscard]] std::int32_t patches() const noexcept {
+        const std::int64_t product =
+            static_cast<std::int64_t>(grid_width) * static_cast<std::int64_t>(grid_height); return static_cast<std::int32_t>(product); }
 };
 
-// Arena bytes encode_image needs for an image of `patches` patches.
+// Arena bytes encode_image needs for an image of `patches` patches. Throws std::invalid_argument
+// when `patches` is not positive or the config's pooling kernel is zero.
 [[nodiscard]] std::size_t vision_workspace_bytes(const VisionConfig& config, std::int32_t patches);
 
 // Encodes `image` into `out`, BF16 [text hidden, patches / 9], on the execution stream. The model

@@ -3,8 +3,6 @@
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
-
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -41,7 +39,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    const bool interval_uses_a8 = allows_a8(policy) && max_tokens >= 5;
+    const bool interval_uses_a8 = resolve_route(policy, max_tokens)== Fp8LinearSwiGluRoute::A8;
     return interval_uses_a8 ? fp8_a8_workspace_capacity_bytes(
                                   max_tokens, Fp8N34816K5120::kInputRows,
                                   fp8_linear_swiglu_partial_capacity_bytes(max_tokens))

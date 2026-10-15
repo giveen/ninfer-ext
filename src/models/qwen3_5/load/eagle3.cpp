@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include <stdexcept>
+
 namespace ninfer::models::qwen3_5::loading {
 
 // EAGLE3 draft: one autoregressive decoder layer conditioned on three concatenated target hidden
@@ -8,6 +10,9 @@ namespace ninfer::models::qwen3_5::loading {
 // the integer draft-to-target token-id map.
 DraftWeights bind_eagle3(Bindings& b, const DraftConfig& config, const TextConfig& target,
                          const TextWeights& weights, const std::string& component) {
+    if (!config.eagle3) {
+        throw std::invalid_argument("bind_eagle3: the draft config carries no eagle3 component");
+    }
     const auto& eagle = *config.eagle3;
     const auto h      = target.hidden_size;
     const auto q      = config.attention.query_width();

@@ -35,6 +35,7 @@ inline std::int32_t flash_splits(std::int64_t row_tiles, std::int32_t kv_heads, 
                                  std::int32_t key_tokens, std::int64_t resident) {
     resident                     = std::min(resident, kFlashMaxResident);
     const std::int64_t blocks    = row_tiles * kv_heads * batch;
+    if (blocks <= 0) return 1;
     const std::int32_t key_tiles = (key_tokens + kFlashKeys - 1) / kFlashKeys;
     if (2 * blocks > resident || key_tiles < 4) return 1;
     const std::int64_t wanted = std::min<std::int64_t>(kFlashMaxSplits, resident / blocks);

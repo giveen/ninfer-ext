@@ -68,8 +68,8 @@ struct Bf16GemvSchedule {
 
 template <int WarpsPerCta, int WarpsPerRow, int RowsPerWarp, int ValuesPerLane,
           int AccumulatorChains, int TokenBatch, Bf16SimtActivationAccess ActivationAccess,
-          Bf16WeightCache WeightCache, Bf16PhaseOrder PhaseOrder, int PhaseStride, int PhaseUnroll,
-          int PrefetchDepth, int MinBlocksPerSm>
+          Bf16WeightCache WeightCache, Bf16PhaseOrder PhaseOrder, int PhaseStride, int PrefetchDepth,
+          int PhaseUnroll, int MinBlocksPerSm>
 struct Bf16SimtSchedule {
     static_assert(WarpsPerCta > 0 && WarpsPerCta <= 32);
     static_assert(WarpsPerRow > 0 && WarpsPerRow <= WarpsPerCta);

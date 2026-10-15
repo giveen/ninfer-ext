@@ -109,6 +109,10 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             "q4 linear_swiglu: exact problem or column count is not admitted");
     }
 
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("q4 linear_swiglu: invalid compute policy");
+    }
+
     if (allows_a8(policy) && problem.cols >= kA8MinCols) {
         return Q4LinearSwiGluPlan{Q4LinearSwiGluScheduleId::MmaInt8SplitHalfPair,
                                   q4_a8_workspace_capacity_bytes(problem.cols, problem.k), policy};
@@ -131,8 +135,8 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
             return plan;
         case Q4LinearSwiGluScheduleId::MmaInt8SplitHalfPair:
-            plan.workspace_bytes = q4_a8_workspace_capacity_bytes(problem.cols, problem.k);
-            return plan;
+            // The A8 route is resolved above, so the catalog never selects it.
+            throw std::logic_error("q4 linear_swiglu: A8 schedule is not in the route catalog");
         }
     }
     throw std::logic_error("q4 linear_swiglu: admitted problem has no covering route");
@@ -150,6 +154,11 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols}, policy);
 
     std::size_t maximum = 0;
+    // Each overlapping route is measured at its widest column, which is that sub-interval's widest
+    // workspace only while the size grows with `cols`. A route straddling kA8MinCols would have its
+    // endpoint resolve to the A8 plan instead, hiding whatever the catalog sizes below the
+    // boundary, so such a route must carry zero workspace; the only one that straddles ({225, 256})
+    // does.
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);

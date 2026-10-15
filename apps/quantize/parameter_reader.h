@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::quantize::app {
@@ -19,8 +20,9 @@ struct LinearParameter {
     artifact::Binding binding;
 };
 
-// Every binding that is a rank-two contiguous BF16 matrix with both dimensions 128-aligned and at
-// least one Use. That is exactly the set the EXL3 format can represent and the recipe will assign.
+// Every binding in the Text or MTP namespace that is a rank-two contiguous BF16 matrix with both
+// dimensions 128-aligned and at least one Use. Vision and other namespaces stay at their stored
+// precision, so this is exactly the set the EXL3 format can represent and the recipe will assign.
 [[nodiscard]] std::vector<LinearParameter> enumerate_linear_parameters(const artifact::Reader& reader);
 
 // The model executes a shared-input group as one contiguous parent. A LinearParent is one stored

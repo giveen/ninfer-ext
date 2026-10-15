@@ -22,6 +22,11 @@ struct Nvfp4GdnConvPlan {
     Nvfp4GdnConvScheduleId schedule;
 };
 
+// `nvfp4_gdn_conv_resolve_plan` and `nvfp4_gdn_snapshot_workspace_capacity_bytes` throw
+// std::invalid_argument on an invalid B/T domain (batch_size > 8), an invalid policy or an invalid
+// token interval. The capacity is 0 whenever the maximum plan is not Materialized, i.e. no
+// workspace is needed.
+
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size);
 

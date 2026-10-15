@@ -14,7 +14,8 @@
 namespace ninfer::ops {
 
 inline constexpr int kSamplerBlock               = 256;
-inline constexpr int kSamplerTileItems           = 256;
+// The small route gives every block thread one tile item, so the tile cannot outgrow the block.
+inline constexpr int kSamplerTileItems           = kSamplerBlock;
 inline constexpr int kSamplerItemsPerThread      = 2;
 inline constexpr int kSamplerPartialTileItems    = kSamplerBlock * kSamplerItemsPerThread;
 inline constexpr int kSamplerGroupBlock          = 256;
@@ -90,6 +91,9 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
     out.partial_stride = partial_blocks + groups;
 
     LayoutBuilder layout;
+    // The partial key plane holds one packed ordering key per candidate, (high << 32) | low, and is
+    // read back unsigned (SamplingKeyGreater in sampling_device.cuh): the I64 label names its
+    // width, not a signed ordering domain, so a consumer must not order it through the dtype.
     out.partial_keys =
         layout.add_tensor(DType::I64, {kSamplerCandidateCap, out.partial_stride, columns}, 256,
                           "sampling partial keys");

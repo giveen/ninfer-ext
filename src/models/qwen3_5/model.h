@@ -10,6 +10,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -35,6 +36,9 @@ public:
     [[nodiscard]] const LoadOptions& options() const noexcept { return options_; }
 
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
+
+    // Throws std::out_of_range when `id` does not address a bound weight, including a
+    // default-constructed WeightId (its index is the SIZE_MAX sentinel).
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 

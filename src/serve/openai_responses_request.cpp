@@ -148,6 +148,10 @@ ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
 void apply_shared_breakpoint(ContentPart& part, const Json& wire, std::size_t& breakpoint_count) {
     if (!parse_openai_prompt_cache_breakpoint(wire, "input")) { return; }
     ++breakpoint_count;
+    if (breakpoint_count > ninfer::kMaximumExplicitPromptCacheMarkers) {
+        bad_request("at most four prompt_cache_breakpoint values are supported per request",
+                    "input", "too_many_cache_breakpoints");
+    }
     part.cache_boundary_after = CacheBoundary{};
 }
 

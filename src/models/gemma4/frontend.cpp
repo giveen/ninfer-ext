@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -369,6 +371,13 @@ struct Frontend::Impl {
             }
             for (auto& [key, value] : kwargs.items()) context[key] = value;
         }
+        // The template's boolean parameters arrive straight from the request, so a mistyped keyword
+        // is this frontend's request error rather than a cast failure inside the renderer.
+        for (const char* name : {"enable_thinking", "preserve_thinking"}) {
+            if (context.contains(name) && !context[name].is_boolean()) {
+                throw std::invalid_argument(std::string(name) + " must be a boolean");
+            }
+        }
 
         bool thinking = context.value("enable_thinking", false);
         if (options.enable_thinking) {
@@ -519,6 +528,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                    ? RequestErrorKind::MediaBudgetExceeded
                                    : RequestErrorKind::InvalidMedia,
                                std::string("image: ") + error.what());
+        } catch (const RequestError&) {
+            // RequestError derives from std::invalid_argument, so the handler below would relabel a
+            // cancellation, deadline or queue timeout as invalid media. Its kind and message stand.
+            throw;
         } catch (const std::invalid_argument& error) {
             throw RequestError(RequestErrorKind::InvalidMedia,
                                std::string("image: ") + error.what());

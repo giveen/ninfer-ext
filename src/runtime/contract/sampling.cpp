@@ -6,6 +6,10 @@
 namespace ninfer::runtime {
 namespace {
 
+// The registered sampling pipeline's exact candidate domain (ops::kSamplerCandidateCap). Kept
+// local rather than including the Op's CUDA header.
+constexpr int kResolvedTopKCap = 20;
+
 void validate(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
@@ -15,7 +19,7 @@ void validate(const ResolvedSamplingParameters& sampling) {
     if (sampling.temperature < 0.0F || sampling.temperature > 2.0F) {
         throw std::invalid_argument("temperature must be in [0,2]");
     }
-    if (sampling.top_k < 1 || sampling.top_k > 20) {
+    if (sampling.top_k < 1 || sampling.top_k > kResolvedTopKCap) {
         throw std::invalid_argument("resolved top_k must be in [1,20]");
     }
     if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
@@ -49,7 +53,7 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
     // The registered sampling pipeline has an exact top-20 candidate domain. Preserve the
     // existing public meaning of zero (use the target cap), then expose only concrete values to
     // runtimes.
-    if (resolved.top_k == 0) { resolved.top_k = 20; }
+    if (resolved.top_k == 0) { resolved.top_k = kResolvedTopKCap; }
     validate(resolved);
     return resolved;
 }

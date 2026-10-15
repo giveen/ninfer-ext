@@ -86,6 +86,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
         return;
+    } catch (const std::exception& exception) {
+        // The same guard the sibling handlers keep: an unexpected parse/build failure is recorded
+        // and answered as a structured 500 instead of escaping to cpp-httplib's bare one. The
+        // detail stays in the log.
+        operational_log_.http_failure(
+            "openai_chat_completions",
+            make_internal_request_failure(RequestFailurePhase::Http, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = "internal error";
+        write_openai_error(res, error);
+        return;
     }
 
     const std::uint64_t req_id = ++request_seq_;

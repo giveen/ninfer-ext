@@ -43,6 +43,14 @@ void require_same_shape(const Tensor& a, const Tensor& b, const char* b_label) {
     }
 }
 
+// The contract excludes shared storage; the kernels read x/weight/z while writing out.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 namespace {
@@ -68,11 +76,6 @@ void rmsnorm_impl(const Tensor& x, const Tensor* weight, float eps, bool unit_of
             weight->ne[3] != 1) {
             throw std::invalid_argument("rmsnorm: weight must be 1-D with ne[0] == x.ne[0]");
         }
-    } else if (unit_offset) {
-        throw std::invalid_argument("rmsnorm: the weightless form has no offset to apply");
-    }
-    if (weight == nullptr && z != nullptr) {
-        throw std::invalid_argument("rmsnorm: the weightless form has no gate");
     }
     if (z != nullptr) {
         (void)numel_allow_zero(*z, "z");
@@ -91,6 +94,12 @@ void rmsnorm_impl(const Tensor& x, const Tensor* weight, float eps, bool unit_of
     if (x.data == nullptr || out.data == nullptr || (weight != nullptr && weight->data == nullptr) ||
         (z != nullptr && z->data == nullptr)) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
+    }
+    if (overlaps(x, out) ||
+        (weight != nullptr && (overlaps(*weight, x) || overlaps(*weight, out))) ||
+        (z != nullptr &&
+         (overlaps(*z, x) || overlaps(*z, out) || (weight != nullptr && overlaps(*z, *weight))))) {
+        throw std::invalid_argument("rmsnorm: x/weight/z/out must not overlap");
     }
 
     // The weightless epilogue never reads the weight, so the launch passes an unread placeholder

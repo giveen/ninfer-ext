@@ -6,13 +6,15 @@
 
 namespace ninfer::artifact {
 
+inline constexpr std::byte kFormatVersion{3};
+
 inline constexpr std::array<std::byte, 8> kEntryMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
-    std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{3},
+    std::byte{'E'}, std::byte{'R'}, std::byte{0},   kFormatVersion,
 };
 inline constexpr std::array<std::byte, 8> kPartMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'P'},
-    std::byte{'R'}, std::byte{'T'}, std::byte{0},   std::byte{3},
+    std::byte{'R'}, std::byte{'T'}, std::byte{0},   kFormatVersion,
 };
 inline constexpr std::size_t kHeaderBytes        = 32;
 inline constexpr std::uint64_t kPayloadAlignment = 4096;

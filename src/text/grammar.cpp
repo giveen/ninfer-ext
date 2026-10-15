@@ -110,6 +110,13 @@ std::string quoted(unsigned char c) {
 // A small DFA consumes through the first complete delimiter, including delimiters split across
 // tokens. Concatenation keeps the user's rule names in their own namespace.
 xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
+    // xgrammar reads a GBNF `\xNN` escape as a codepoint and re-encodes it as UTF-8, so a byte
+    // above 0x7f cannot be written as the single byte this byte-wise DFA compares; the grammar
+    // would silently match a different byte sequence. Only ASCII delimiters are expressible.
+    if (std::any_of(delimiter.begin(), delimiter.end(),
+                    [](char byte) { return static_cast<unsigned char>(byte) >= 0x80; })) {
+        throw std::invalid_argument("reasoning delimiter must be ASCII");
+    }
     std::string alphabet(delimiter);
     std::sort(alphabet.begin(), alphabet.end());
     alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
@@ -204,11 +211,10 @@ public:
     int tentative = 0;
     ConstraintObservation observed;
 
+    // Fills the next-token bitmask of a live matcher: masks(), the only caller, handles termination
+    // itself and never reaches here with a terminated matcher.
+
     void fill(std::span<std::uint32_t> target) {
-        if (matcher.IsTerminated()) {
-            std::fill(target.begin(), target.end(), 0);
-            return;
-        }
         std::int64_t shape[] = {1, static_cast<std::int64_t>(words)};
         DLTensor tensor{target.data(), {kDLCPU, 0}, 2, {kDLInt, 32, 1}, shape, nullptr, 0};
         matcher.FillNextTokenBitmask(&tensor);
@@ -219,6 +225,9 @@ public:
 GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std::int32_t> eos,
                                  std::size_t bytes)
     : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes)) {}
+
+GrammarCompiler::GrammarCompiler(GrammarCompiler&&) noexcept            = default;
+GrammarCompiler& GrammarCompiler::operator=(GrammarCompiler&&) noexcept = default;
 
 GrammarCompiler::~GrammarCompiler() = default;
 
@@ -250,7 +259,13 @@ GrammarCompiler::compile_model(std::string_view identity,
 std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
                                                          std::string_view close,
                                                          std::string_view continuation) {
-    const auto error_kind = constraint_error_kind(constraint.kind);
+    // An unknown kind must not escape as a raw std::invalid_argument while every other failure path
+    // reports RequestError. It cannot move inside the try below: the handlers need the kind.
+    RequestErrorKind error_kind = RequestErrorKind::InvalidJsonSchema;
+    try { error_kind = constraint_error_kind(constraint.kind);
+    } catch (const std::invalid_argument& error) {
+        throw RequestError(RequestErrorKind::InvalidJsonSchema, error.what());
+    }
     try {
         auto choices = constraint.choices;
         if (constraint.kind == OutputConstraintKind::Choice) {

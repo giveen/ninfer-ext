@@ -237,7 +237,8 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
                         text::inexact_schema_number(parsed, "/function/parameters")) {
                     throw RequestError(
                         RequestErrorKind::UnsupportedJsonSchema,
-                        "numeric schema value cannot be preserved by the JSON number representation",
+                        "numeric schema value cannot be preserved by the JSON number "
+                        "representation",
                         "/" + std::to_string(i) + "/parameters" +
                             pointer->substr(std::string_view("/function/parameters").size()),
                         RequestErrorSource::Tools);
@@ -293,6 +294,12 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
     auto selected      = std::make_shared<Contract>();
     selected->required = choice.mode == ToolChoiceMode::Required;
     selected->parallel = choice.parallel;
+    // Declaration-scoped, not choice-scoped: selecting tools changes which names are callable, not
+    // whether a call must name a declared tool or may be recovered when its region is malformed.
+    if (declarations) {
+        selected->tolerant               = declarations->tolerant;
+        selected->enforce_declared_names = declarations->enforce_declared_names;
+    }
     if (declarations && choice.mode != ToolChoiceMode::None) {
         for (const auto& tool : declarations->tools) {
             if (!choice.allowed_names ||

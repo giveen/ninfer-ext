@@ -26,7 +26,9 @@ constexpr std::array kShapes{
     ShapeEntry{21504, 5376, select_q6_gemma4_n21504_k5376},
     ShapeEntry{5376, 21504, select_q6_gemma4_k21504},
     ShapeEntry{262144, 5376, select_q6_gemma4_n262144_k5376},
-    // Qwen4Exp dense projections (same list as the Q8 table).
+    // Qwen4Exp dense projections: the Q8 table's list less its K=320 up-projection, which Q6 cannot
+    // serve (K must be 128-aligned, see validate_q6_operands) and the converter therefore stores
+    // Q8.
     ShapeEntry{13312, 2560, select_q6_qwen4_exp},
     ShapeEntry{640, 2560, select_q6_qwen4_exp_small},
     ShapeEntry{2560, 6144, select_q6_qwen4_exp},
@@ -35,7 +37,6 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 640, select_q6_qwen4_exp_small},
     ShapeEntry{324, 10240, select_q6_qwen4_exp_wide_k},
     ShapeEntry{320, 10240, select_q6_qwen4_exp_wide_k},
-    ShapeEntry{10240, 320, select_q6_qwen4_exp},
     ShapeEntry{12800, 2560, select_q6_qwen4_exp},
     ShapeEntry{2560, 2560, select_q6_qwen4_exp},
     ShapeEntry{2560, 4608, select_q6_qwen4_exp},

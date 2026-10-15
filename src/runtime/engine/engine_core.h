@@ -82,6 +82,17 @@ public:
         }
     };
 
+    // The context-cache capacities are optional at the EngineOptions boundary and the factory
+    // normally engages them, so a disengaged value would throw std::bad_optional_access from the
+    // member initializer list, before the constructor body could report the mismatch.
+    [[nodiscard]] static std::uint32_t
+    require_admission_capacity(const std::optional<std::uint32_t>& value) {
+        if (!value) {
+            throw std::logic_error("target admission capacity does not match the Engine");
+        }
+        return *value;
+    }
+
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
@@ -89,18 +100,16 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
-                     options.context_cache.max_shared_prefixes.value(),
+          resources_(max_concurrency_,
+                     require_admission_capacity( options.context_cache.max_private_continuations),
+                     require_admission_capacity(
+                     options.context_cache.max_shared_prefixes),
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
                      std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
-        }
-        if (!options.context_cache.max_private_continuations ||
-            !options.context_cache.max_shared_prefixes) {
-            throw std::logic_error("target admission capacity does not match the Engine");
         }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
@@ -251,19 +260,15 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
                                                 pending_deadline, submitted);
-        } catch (...) {
-            release_reserved_capacity();
-            throw;
-        }
-
-        {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
             pending_.push_back(request);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
         }
         request_admission_check();
         queue_cv_.notify_one();
@@ -974,6 +979,19 @@ private:
         }
     }
 
+    // Settle a request whose slot is already released. The failure sweep only reaches requests that
+    // are still in `slots_`, so a throw here must complete the request with its error anyway: the
+    // consumer is parked in wait_for_request() with no deadline and would otherwise never wake.
+    void complete_released(const std::shared_ptr<Request>& request, FinishReason reason) {
+        try {
+            complete_success(request, reason);
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            complete_error(request, error);
+            throw;
+        }
+    }
+
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
         if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
@@ -1035,7 +1053,7 @@ private:
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
             publish_runtime_stats();
-            complete_success(request, reason);
+            complete_released(request, reason);
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1066,7 +1084,7 @@ private:
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
             publish_runtime_stats();
-            complete_success(request, FinishReason::Cancelled);
+            complete_released(request, FinishReason::Cancelled);
             boundary = begin_host_phase();
         }
     }

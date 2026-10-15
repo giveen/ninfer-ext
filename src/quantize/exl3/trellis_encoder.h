@@ -22,12 +22,17 @@ inline constexpr int kTrellisTileWeights = 256;
 // Concurrent tile blocks that fill the current device (one per SM).
 [[nodiscard]] int trellis_encoder_blocks();
 
-// Device scratch for `blocks` tiles encoded concurrently at this bitrate.
+// Device scratch for `blocks` tiles encoded concurrently at this bitrate. `blocks` must be >= 1
+// and `bitrate_half_bits` in [2, 16]; otherwise throws std::invalid_argument.
 [[nodiscard]] std::size_t trellis_encoder_scratch_bytes(int blocks, int bitrate_half_bits);
 
 // tiles: [count][256] FP32 targets in trellis order. Writes the ring's states and the decoded
-// values (mul1(state) * scale). The scratch must hold trellis_encoder_scratch_bytes(blocks, rate);
-// blocks tiles are encoded concurrently and the launch strides over count.
+// values (mul1(state) * scale). `states` and `decoded` must each hold count * kTrellisTileWeights
+// entries (in trellis order). `bitrate_half_bits` must be in [2, 16] and `blocks` >= 1; invalid
+// arguments (including a too-small `scratch_bytes`) throw std::invalid_argument. The scratch must
+// hold trellis_encoder_scratch_bytes(blocks, rate); blocks tiles are encoded concurrently and the
+// launch strides over count. The launch is asynchronous on `stream`, so tiles, states, decoded and
+// scratch must stay valid until the stream work completes.
 void encode_trellis_tiles(const float* tiles, std::int64_t count, int bitrate_half_bits,
                           float scale, std::uint16_t* states, float* decoded, void* scratch,
                           std::size_t scratch_bytes, int blocks, cudaStream_t stream);

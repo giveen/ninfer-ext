@@ -4,6 +4,7 @@
 #include "ops/hyper_connection/launch.h"
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -15,11 +16,27 @@ void require(bool condition, const char* op, const char* message) {
 }
 
 void require_matrix(const Tensor& t, DType dtype, const char* op, const char* label) {
-    require(t.dtype == dtype, op, (std::string(label) + " dtype mismatch").c_str());
-    require(t.data != nullptr && t.is_contiguous(), op,
-            (std::string(label) + " must be contiguous and non-null").c_str());
-    require(t.ne[0] > 0 && t.ne[1] > 0 && t.ne[2] == 1 && t.ne[3] == 1, op,
-            (std::string(label) + " must be a positive matrix").c_str());
+    // The message is built only on failure: these run once per layer per kernel in the forward
+    // pass.
+    if(t.dtype != dtype) {
+        throw std::invalid_argument (std::string(op) + ": " +label + " dtype mismatch");
+    }
+    if(t.data == nullptr || ! t.is_contiguous()) {
+        throw std::invalid_argument
+            (std::string(op) + ": " +label + " must be contiguous and non-null");
+    }
+    if(!(t.ne[0] > 0 && t.ne[1] > 0 && t.ne[2] == 1 && t.ne[3] == 1)) {
+        throw std::invalid_argument
+            (std::string(op) + ": " +label + " must be a positive matrix");
+    }
+}
+
+// The kernels read their inputs while writing the destination, so shared storage is excluded.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
 }
 
 } // namespace
@@ -77,6 +94,8 @@ void hyper_connection_combine(const Tensor& y, const Tensor& inject, Tensor& res
     require(residual.ne[0] == y.ne[0] * inject.ne[0] && residual.ne[1] == y.ne[1] &&
                 inject.ne[1] == y.ne[1],
             op, "residual must be [S*H,T] for y [H,T] and inject [S,T]");
+    require(!overlaps(residual, y) && !overlaps(residual, inject), op,
+            "residual must not overlap y or inject");
     detail::hyper_connection_combine_launch(y, inject, residual, stream);
 }
 
@@ -87,6 +106,7 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     require_matrix(residual, DType::BF16, op, "residual");
     require(streams > 0 && residual.ne[0] == x.ne[0] * streams && residual.ne[1] == x.ne[1], op,
             "residual must be [S*H,T]");
+    require(!overlaps(residual, x), op, "residual must not overlap x");
     detail::hyper_connection_expand_launch(x, streams, residual, stream);
 }
 

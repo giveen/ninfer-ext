@@ -27,8 +27,11 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
 // no such weight, so the projection is the whole encoder. `features` is [3h, width, batch]; `g` is
 // [h, width, batch].
 void TextContext::eagle3_encode_batch(const Tensor& features, Tensor& g) {
-    const auto& draft       = *parameters_.draft;
-    const std::int32_t h    = dimension(parameters_.model.config().text.hidden_size);
+    if (!parameters_.draft.has_value()) {
+        throw std::runtime_error("EAGLE3 encoder is not enabled");
+    }
+    const auto& draft        = *parameters_.draft;
+    const std::int32_t h     = dimension(parameters_.model.config().text.hidden_size);
     const std::int32_t fused = features.ne[0];
     const std::int32_t width = features.ne[1];
     const std::int32_t batch = features.ne[2];
@@ -38,7 +41,7 @@ void TextContext::eagle3_encode_batch(const Tensor& features, Tensor& g) {
         throw std::invalid_argument("EAGLE3 encoder shapes are invalid");
     }
     const std::int32_t columns = width * batch;
-    Tensor g_flat = g.view({h, columns});
+    Tensor g_flat              = g.view({h, columns});
     project(features.view({fused, columns}), draft.feature_projection, g_flat, work_, ctx_.stream);
 }
 
@@ -47,34 +50,43 @@ void TextContext::eagle3_encode_batch(const Tensor& features, Tensor& g) {
 // has no attention gate and no fused input projection, unlike the MTP layer it is hosted beside.
 // `ids` is [width, batch]; `g`/`hidden` are [h, width, batch]; `cache_positions`/`rope_positions`
 // are [width, batch]. The draft head is applied separately, only at the selected column.
-void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g,
-                                              const Tensor& cache_positions,
-                                              const Tensor& rope_positions,
-                                              const Tensor& valid_columns,
-                                              const Tensor& kv_table_rows,
-                                              ops::CausalAttentionExecutionEnvelope envelope,
-                                              Tensor& hidden) {
+void TextContext::eagle3_forward_decode_batch(
+    const Tensor& ids, const Tensor& g, const Tensor& cache_positions, const Tensor& rope_positions,
+    const Tensor& valid_columns, const Tensor& kv_table_rows,
+    ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden) {
     if (batch_eagle3_kv_ == nullptr) { throw std::runtime_error("EAGLE3 forward is not enabled"); }
-    const auto& config = parameters_.model.config();
-    const auto& draft  = *parameters_.draft;
-    const auto& eagle  = *config.draft->eagle3;
-    const auto& layer  = draft.layers.at(0);
-    const auto& attn   = config.draft->attention;
+    const auto& config          = parameters_.model.config();
+    const auto& draft           = *parameters_.draft;
+    const auto& eagle           = *config.draft->eagle3;
+    const auto& layer           = draft.layers.at(0);
+    const auto& attn            = config.draft->attention;
     const std::int32_t h        = dimension(config_.hidden_size);
     const std::int32_t head_dim = dimension(attn.head_dim);
     const std::int32_t q_heads  = dimension(attn.num_attention_heads);
     const std::int32_t kv_heads = dimension(attn.num_key_value_heads);
     const std::int32_t width    = ids.ne[0];
     const std::int32_t batch    = ids.ne[1];
+    // `width` is the number of positions in this verify batch: the draft window for a linear
+    // schedule, the draft-tree node count when a tree is configured, and the capture frame's
+    // bucket under CUDA graphs (63 and 64 are complete tree and bucket widths). It is bounded by
+    // the plan's frame capacity, not by `kMaximumMtpDraftTokens`, which is the MTP draft-token
+    // maximum: an upper bound of `kMaximumMtpDraftTokens + 1` here rejects legitimate tree and
+    // captured batches. The tensors below carry their own extents, so their shapes are what this
+    // entry point has to check.
+    if (batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument(
+            "EAGLE3 decode batch is outside the supported domain: batch=" + std::to_string(batch) +
+            " (max " + std::to_string(kMaximumConcurrency) + ")");
+    }
     if (ids.dtype != DType::I32 || rope_positions.dtype != DType::I32 ||
         cache_positions.dtype != DType::I32 || valid_columns.dtype != DType::I32 ||
         kv_table_rows.dtype != DType::I32 || width <= 0 || batch <= 0 ||
         cache_positions.ne[0] != width || cache_positions.ne[1] != batch ||
         rope_positions.ne[0] != width || rope_positions.ne[1] != batch ||
-        valid_columns.ne[0] != batch || kv_table_rows.ne[0] != batch ||
-        g.dtype != DType::BF16 || g.ne[0] != h || g.ne[1] != width || g.ne[2] != batch ||
-        hidden.dtype != DType::BF16 || hidden.ne[0] != h || hidden.ne[1] != width ||
-        hidden.ne[2] != batch) {
+        valid_columns.ne[0] != batch || kv_table_rows.ne[0] != batch || g.dtype != DType::BF16 ||
+        g.ne[0] != h || g.ne[1] != width || g.ne[2] != batch || hidden.dtype != DType::BF16 ||
+        hidden.ne[0] != h || hidden.ne[1] != width || hidden.ne[2] != batch ||
+        !hidden.is_contiguous()) {
         throw std::invalid_argument("EAGLE3 decode batch shapes are invalid");
     }
     const std::int32_t columns = width * batch;
@@ -95,9 +107,9 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
     Tensor x = work_.alloc(DType::BF16, {2 * h, columns});
     ops::mtp_pack_fc_input(e, u, x, s);
 
-    Tensor q = work_.alloc(DType::BF16, {head_dim, q_heads, columns});
-    Tensor k = work_.alloc(DType::BF16, {head_dim, kv_heads, columns});
-    Tensor v = work_.alloc(DType::BF16, {head_dim, kv_heads, columns});
+    Tensor q      = work_.alloc(DType::BF16, {head_dim, q_heads, columns});
+    Tensor k      = work_.alloc(DType::BF16, {head_dim, kv_heads, columns});
+    Tensor v      = work_.alloc(DType::BF16, {head_dim, kv_heads, columns});
     Tensor q_flat = q.view({q_heads * head_dim, columns});
     Tensor k_flat = k.view({kv_heads * head_dim, columns});
     Tensor v_flat = v.view({kv_heads * head_dim, columns});
@@ -105,8 +117,7 @@ void TextContext::eagle3_forward_decode_batch(const Tensor& ids, const Tensor& g
     project(x, layer.key, k_flat, work_, s);
     project(x, layer.value, v_flat, work_, s);
 
-    ops::rope(rope_positions.view({columns}), rotary, rotary / 2, config.draft->rope_theta,
-              q, k,
+    ops::rope(rope_positions.view({columns}), rotary, rotary / 2, config.draft->rope_theta, q, k,
               ctx_.execution_view());
 
     Tensor a = work_.alloc(DType::BF16, {head_dim, q_heads, width, batch});

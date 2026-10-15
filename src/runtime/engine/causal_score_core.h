@@ -48,6 +48,10 @@ public:
     }
 
     ~CausalScoreCore() noexcept {
+        // Safety depends on the worker satisfying any pending job before it returns: the wait
+        // predicate admits a pending job even while `stopping_` is set, and `job_` is cleared
+        // before the promise is set, so a caller blocked in result.get() cannot be stranded.
+        // Callers must not invoke score() concurrently with destruction.
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
@@ -72,9 +76,8 @@ public:
         {
             std::lock_guard queue_lock(queue_mutex_);
             if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
-            if (job_ != nullptr) {
-                throw std::logic_error("causal scoring core already has an in-flight job");
-            }
+            // `call_mutex_` is held for this whole call and the worker clears `job_` before it
+            // satisfies the promise, so no other job can be in flight here.
             job_ = std::move(job);
         }
         queue_cv_.notify_one();

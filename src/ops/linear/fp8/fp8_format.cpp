@@ -4,33 +4,10 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops::detail {
-namespace {
-
-std::uint64_t checked_mul(std::uint64_t left, std::uint64_t right, const char* operation) {
-    if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
-        throw std::overflow_error(std::string(operation) + ": FP8 geometry overflows");
-    }
-    return left * right;
-}
-
-std::uint64_t checked_add(std::uint64_t left, std::uint64_t right, const char* operation) {
-    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
-        throw std::overflow_error(std::string(operation) + ": FP8 geometry overflows");
-    }
-    return left + right;
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char* operation) {
-    return checked_mul(checked_add(value, alignment - 1, operation) / alignment, alignment,
-                       operation);
-}
-
-} // namespace
 
 Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation) {
     if (weight.n <= 0 || weight.k <= 0) {
@@ -40,8 +17,8 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
     Fp8WeightGeometry geometry{};
     geometry.code_plane_bytes   = checked_mul(static_cast<std::uint64_t>(weight.n),
                                               static_cast<std::uint64_t>(weight.k), operation);
-    geometry.scale_plane_offset = align_up(geometry.code_plane_bytes, 256, operation);
-    geometry.scale_plane_bytes  = checked_mul(static_cast<std::uint64_t>(weight.n), 2, operation);
+    geometry.scale_plane_offset = align_up<std::uint64_t>(geometry.code_plane_bytes, 256, operation);
+    geometry.scale_plane_bytes  = checked_mul<std::uint64_t>(static_cast<std::uint64_t>(weight.n), 2, operation);
     geometry.required_payload_bytes =
         checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation);
 

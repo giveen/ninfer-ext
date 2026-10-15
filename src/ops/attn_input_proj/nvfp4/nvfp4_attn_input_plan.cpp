@@ -18,11 +18,10 @@ enum class Nvfp4AttnInputRoute : std::uint8_t {
 
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
-    if (!allows_a4(policy)) {
-        return Nvfp4AttnInputRoute::A16;
-    }
-    if (!allows_a4(policy)) {
+    if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
+    }
+    if (!allows_a4(policy)) { return Nvfp4AttnInputRoute::A16;
     }
     return tokens >= 4 ? Nvfp4AttnInputRoute::W4A4 : Nvfp4AttnInputRoute::A16;
 }

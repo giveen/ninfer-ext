@@ -4,9 +4,21 @@
 #include "ops/launcher/scatter.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
+
+// cudaMemcpy2DAsync is undefined for overlapping device regions, so reject any shared storage.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
+} // namespace
 
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
@@ -73,7 +85,7 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
         throw std::invalid_argument(
             "extract_bf16_columns: tensors must be contiguous and non-null");
     }
-    if (source.data == destination.data) {
+    if (overlaps(source, destination)) {
         throw std::invalid_argument("extract_bf16_columns: source and destination must not alias");
     }
     const std::size_t element_bytes = dtype_size(DType::BF16);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/weight.h"
+
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -22,6 +24,9 @@ struct SingleProjectionWeight {
     Weight weight;
     LinearPolicy policy = LinearPolicy::A16Only;
 };
+
+// Paired native forms are consumed by the policy-free (A16-only) overloads, so no policy is
+// carried here.
 
 struct PairedProjectionWeights {
     Weight first, second;

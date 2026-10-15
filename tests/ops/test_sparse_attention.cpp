@@ -149,10 +149,12 @@ struct QuantizedCache {
         return static_cast<std::size_t>(kPage) * kKvHeads * kPages * vector.data_leading_extent *
                dtype_size(vector.data_dtype);
     }
+
     static std::size_t scale_bytes(const PagedKVVectorLayout& vector) {
         return static_cast<std::size_t>(kPage) * kKvHeads * kPages * vector.scale_leading_extent *
                dtype_size(vector.scale_dtype);
     }
+
     static Tensor pages(const DeviceBuffer& buffer, DType dtype, std::int32_t extent) {
         return Tensor(buffer.p, dtype, {extent, kPage, kKvHeads, kPages});
     }
@@ -191,7 +193,8 @@ struct QuantizedCache {
             return half_value(static_cast<std::uint16_t>(scales[2 * i] | (scales[2 * i + 1] << 8)));
         };
         switch (vector.data_dtype) {
-        case DType::FP8_E4M3FN: return e4m3_value(codes[row * kHeadDim + d]) * half_at(row);
+        case DType::FP8_E4M3FN:
+            return e4m3_value(codes[row * kHeadDim + d]) * half_at(row);
         case DType::I8:
             return double(static_cast<std::int8_t>(codes[row * kHeadDim + d])) *
                    half_at(row * 4 + d / 64);
@@ -206,6 +209,7 @@ struct QuantizedCache {
     [[nodiscard]] double key(std::size_t row, int d) const {
         return decode(layout.key, k_host, k_scale_host, row, d);
     }
+
     [[nodiscard]] double value(std::size_t row, int d) const {
         return decode(layout.value, v_host, v_scale_host, row, d);
     }
@@ -521,6 +525,59 @@ int main() {
         }
     }
 
+    // ---- select at one lane: the kernel's pooled-block-key route ----
+    // The kernel guarantees the once-per-call pooled-key precompute and the per-column score path
+    // agree bit for bit, so the same lane-0 columns issued as a one-lane call (lanes == 1, the
+    // route a single-lane decode takes, with the pooled-key workspace) must select exactly what
+    // lane 0 of the two-lane call above did.
+    {
+        const std::size_t head_columns = static_cast<std::size_t>(kIndexHeads) * kIndexDim;
+        std::vector<float> query1(index_query.begin(),
+                                  index_query.begin() +
+                                      static_cast<std::ptrdiff_t>(head_columns * W));
+        std::vector<int> positions1(qcache.begin(), qcache.begin() + W);
+        std::vector<int> rope1(3 * W);
+        for (int a = 0; a < 3; ++a) {
+            for (int w = 0; w < W; ++w) { rope1[a * W + w] = qrope[a * W * kLanes + w]; }
+        }
+        DeviceBuffer dquery1 = to_device(bits(query1));
+        DeviceBuffer dpos1   = to_device_i32(positions1);
+        DeviceBuffer drope1  = to_device_i32(rope1);
+        DeviceBuffer dvalid1 = to_device_i32(std::vector<int>{valid_host[0]});
+        DeviceBuffer drows1 =
+            to_device_i32(std::vector<int>{0}); // row 0 of the one-row table below
+        DeviceBuffer dtable1 = to_device_i32(lanes[0].pages);
+        GuardedDeviceBuffer selected_one(static_cast<std::size_t>(g.max_selected()) * W * 4);
+        GuardedDeviceBuffer counts_one(static_cast<std::size_t>(W) * 4);
+        Tensor tquery1(dquery1.p, DType::BF16, {kIndexHeads * kIndexDim, W, 1});
+        Tensor tpos1(dpos1.p, DType::I32, {W, 1});
+        Tensor trope1(drope1.p, DType::I32, {W, 3});
+        Tensor tvalid1(dvalid1.p, DType::I32, {1});
+        Tensor trows1(drows1.p, DType::I32, {1});
+        Tensor tsel1(selected_one.data(), DType::I32, {g.max_selected(), W, 1});
+        Tensor tcnt1(counts_one.data(), DType::I32, {W, 1});
+        const ops::QsaIndexPlane plane1{
+            .pages = Tensor(records.p, DType::BF16, {ops::kQsaIndexRecordWords, kPage, 1, kPages}),
+            .block_tables = Tensor(dtable1.p, DType::I32, {kPagesPerLane, 1})};
+        WorkspaceArena workspace1(ops::qsa_select_workspace_bytes(g, kTokens, W, 1));
+        ops::qsa_select(tquery1, trope1, tpos1, &tvalid1, trows1, tqn, tkn, plane1, g, kTokens,
+                        workspace1, tsel1, tcnt1, nullptr);
+        cuda_synchronize();
+        failures += selected_one.verify_guards("qsa_select single lane selected") +
+                    counts_one.verify_guards("qsa_select single lane");
+        const auto sel_one =
+            from_device<int>(selected_one.data(), static_cast<std::size_t>(g.max_selected()) * W);
+        const auto cnt_one = from_device<int>(counts_one.data(), static_cast<std::size_t>(W));
+        const std::vector<int> lane0_sel(
+            sel_host.begin(), sel_host.begin() + static_cast<std::ptrdiff_t>(g.max_selected()) * W);
+        const std::vector<int> lane0_cnt(cnt_host.begin(), cnt_host.begin() + W);
+        if (sel_one != lane0_sel || cnt_one != lane0_cnt) {
+            std::cerr << "qsa_select single lane: selection differs from lane 0 of the two-lane "
+                         "call\n";
+            ++failures;
+        }
+    }
+
     // ---- attention: FP64 softmax over each column's selection ----
     // Narrow calls split every selection across CTAs; a call of 256+ (column, KV head) pairs
     // runs one CTA per pair. Both routes are compared with the same oracle.
@@ -531,7 +588,8 @@ int main() {
                             std::uint32_t seed, const QuantizedCache* cache) {
         const auto key = [&](int b, int token, int kvh, int d) {
             const std::size_t at = key_at(b, token, kvh, d);
-            return cache != nullptr ? cache->key(at / kHeadDim, d) : double(bf16_to_f32(k_host[at]));
+            return cache != nullptr ? cache->key(at / kHeadDim, d)
+                                    : double(bf16_to_f32(k_host[at]));
         };
         const auto value = [&](int b, int token, int kvh, int d) {
             const std::size_t at = key_at(b, token, kvh, d);
@@ -699,8 +757,8 @@ int main() {
             const std::size_t record = (index + 1) * host_layout.page_stride;
             for (std::size_t plane = 0; plane < planes.size(); ++plane) {
                 const std::size_t bytes = host_layout.planes[plane].page_payload_bytes;
-                auto* page = static_cast<std::byte*>(copies[plane].p) +
-                             static_cast<std::size_t>(physical) * bytes;
+                auto* page              = static_cast<std::byte*>(copies[plane].p) +
+                                          static_cast<std::size_t>(physical) * bytes;
                 cuda_check(cudaMemcpy(records_base + record + host_layout.planes[plane].offset,
                                       page, bytes, cudaMemcpyDeviceToHost),
                            "stream KV page");
@@ -710,7 +768,7 @@ int main() {
                 KVPageRef(HostPageUnit{static_cast<std::uint32_t>(record / kHostKVPageUnitBytes)})
                     .word();
         }
-        DeviceBuffer dstreamed = to_device_i32(streamed_tables);
+        DeviceBuffer dstreamed          = to_device_i32(streamed_tables);
         PagedKVBatchLayerView host_view = resident;
         host_view.block_tables          = Tensor(dstreamed.p, DType::I32, {kPagesPerLane, kLanes});
         const auto base                 = [&](std::size_t plane) -> const std::byte* {
@@ -743,8 +801,8 @@ int main() {
     // The abandoned Device records are 0xFF-poisoned (NaN keys), so selections must be identical
     // to the resident call at the verify width and at decode width.
     {
-        const std::size_t page_bytes = static_cast<std::size_t>(ops::kQsaIndexRecordWords) * kPage *
-                                       sizeof(std::uint16_t);
+        const std::size_t page_bytes =
+            static_cast<std::size_t>(ops::kQsaIndexRecordWords) * kPage * sizeof(std::uint16_t);
         DeviceBuffer poisoned = to_device(std::vector<std::uint8_t>(page_bytes * kPages, 0));
         cuda_check(cudaMemcpy(poisoned.p, records.p, page_bytes * kPages, cudaMemcpyDeviceToDevice),
                    "copy index records");
@@ -754,12 +812,12 @@ int main() {
         const std::size_t record_stride =
             (page_bytes / kHostKVPageUnitBytes + 2) * kHostKVPageUnitBytes;
         PinnedHostBuffer host_records((tables.size() + 1) * record_stride, PinnedHostPages::Huge);
-        auto* host_base = static_cast<std::byte*>(host_records.data());
+        auto* host_base  = static_cast<std::byte*>(host_records.data());
         std::size_t next = 1; // record 0 unused: words carry a nonzero offset
         for (std::size_t entry = 0; entry < tables.size(); ++entry) {
             if ((entry % kPagesPerLane) % 2 == 0) continue;
-            auto* page = static_cast<std::byte*>(poisoned.p) +
-                         static_cast<std::size_t>(tables[entry]) * page_bytes;
+            auto* page               = static_cast<std::byte*>(poisoned.p) +
+                                       static_cast<std::size_t>(tables[entry]) * page_bytes;
             const std::size_t record = next++ * record_stride;
             cuda_check(cudaMemcpy(host_base + record, page, page_bytes, cudaMemcpyDeviceToHost),
                        "stream index page");
@@ -778,42 +836,45 @@ int main() {
             std::vector<int> rope(3 * width * kLanes);
             for (int c = 0; c < width * kLanes; ++c) {
                 const int position = qcache[(c / width) * W + W - width + c % width];
-                for (int a = 0; a < 3; ++a) { rope[a * width * kLanes + c] = axis_position(position, a); }
+                for (int a = 0; a < 3; ++a) {
+                    rope[a * width * kLanes + c] = axis_position(position, a);
+                }
             }
-            DeviceBuffer drope = to_device_i32(rope);
-            DeviceBuffer dqc_w = to_device_i32([&] {
+            DeviceBuffer drope           = to_device_i32(rope);
+            DeviceBuffer dqc_w           = to_device_i32([&] {
                 std::vector<int> positions(width * kLanes);
                 for (int c = 0; c < width * kLanes; ++c) {
                     positions[c] = qcache[(c / width) * W + W - width + c % width];
                 }
                 return positions;
             }());
-            DeviceBuffer diq_w = to_device(bits([&] {
+            DeviceBuffer diq_w           = to_device(bits([&] {
                 std::vector<float> q;
                 const std::size_t column = static_cast<std::size_t>(kIndexHeads) * kIndexDim;
                 for (int b = 0; b < kLanes; ++b) {
                     for (int w = W - width; w < W; ++w) {
-                        const auto first = index_query.begin() +
-                                           static_cast<std::ptrdiff_t>((b * W + w) * column);
+                        const auto first =
+                            index_query.begin() + static_cast<std::ptrdiff_t>((b * W + w) * column);
                         q.insert(q.end(), first, first + static_cast<std::ptrdiff_t>(column));
                     }
                 }
                 return q;
             }()));
             const std::vector<int> valid = {width, width};
-            DeviceBuffer dvalid_w = to_device_i32(valid);
-            DeviceBuffer out_sel  = to_device_i32(std::vector<int>(g.max_selected() * width * kLanes, 0));
-            DeviceBuffer out_cnt  = to_device_i32(std::vector<int>(width * kLanes, 0));
+            DeviceBuffer dvalid_w        = to_device_i32(valid);
+            DeviceBuffer out_sel =
+                to_device_i32(std::vector<int>(g.max_selected() * width * kLanes, 0));
+            DeviceBuffer out_cnt = to_device_i32(std::vector<int>(width * kLanes, 0));
             WorkspaceArena workspace(ops::qsa_select_workspace_bytes(g, kTokens, width * kLanes));
             Tensor sel(out_sel.p, DType::I32, {g.max_selected(), width, kLanes});
             Tensor cnt(out_cnt.p, DType::I32, {width, kLanes});
             Tensor valid_t(dvalid_w.p, DType::I32, {kLanes});
             ops::qsa_select(Tensor(diq_w.p, DType::BF16, {kIndexHeads * kIndexDim, width, kLanes}),
                             Tensor(drope.p, DType::I32, {width * kLanes, 3}),
-                            Tensor(dqc_w.p, DType::I32, {width, kLanes}), &valid_t, trows, tqn,
-                            tkn, index, g, kTokens, workspace, sel, cnt, nullptr);
+                            Tensor(dqc_w.p, DType::I32, {width, kLanes}), &valid_t, trows, tqn, tkn,
+                            index, g, kTokens, workspace, sel, cnt, nullptr);
             cuda_synchronize();
-            auto result = from_device<int>(out_sel.p, g.max_selected() * width * kLanes);
+            auto result           = from_device<int>(out_sel.p, g.max_selected() * width * kLanes);
             const auto counts_out = from_device<int>(out_cnt.p, width * kLanes);
             result.insert(result.end(), counts_out.begin(), counts_out.end());
             return result;

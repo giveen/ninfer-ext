@@ -11,10 +11,12 @@
 namespace ninfer::quantize::exl3 {
 
 // x[r, 128b:128b+128] <- x[r, 128b:128b+128] * H128 for every row r and block b (cols % 128 == 0).
+// Throws std::invalid_argument when cols <= 0 or cols % 128 != 0.
 void hadamard128_rows(float* data, std::int64_t rows, std::int64_t cols, cudaStream_t stream);
 
 // x[128b:128b+128, c] <- H128 * x[128b:128b+128, c] for every column c and block b
-// (rows % 128 == 0).
+// (rows % 128 == 0). rows / 128 is the grid.y extent, so it must not exceed 65535; throws
+// std::invalid_argument outside that domain.
 void hadamard128_cols(float* data, std::int64_t rows, std::int64_t cols, cudaStream_t stream);
 
 } // namespace ninfer::quantize::exl3

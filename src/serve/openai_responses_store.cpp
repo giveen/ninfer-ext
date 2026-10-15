@@ -135,7 +135,10 @@ void OpenAIResponsesStore::put(StoredOpenAIResponse response) {
         if (lru_.empty()) { throw std::logic_error("response store LRU is empty"); }
         auto victim = std::prev(lru_.end());
         if (*victim == owned->id) {
-            if (victim == lru_.begin()) { throw_store_capacity(); }
+            // Only the record just inserted is left, so it cannot be evicted to make room: drop it
+            // and refuse, leaving the store as the failed put found it.
+            if (victim == lru_.begin()) {
+                erase_locked(owned->id); throw_store_capacity(); }
             --victim;
         }
         const std::string victim_id = *victim;

@@ -185,7 +185,7 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     (void)detail::validate_fp8_weight(table, "embedding");
 }
 
-bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
+bool is_empty_T(const Tensor& ids) { return ids.ne[0] == 0; }
 
 void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
     if (!ids.is_contiguous() || !out.is_contiguous()) {
@@ -212,7 +212,7 @@ void embedding(const Tensor& ids, const Weight& table, float output_scale, Tenso
     switch (table.qtype) {
     case QType::BF16: {
         require_dense_metadata(table, out);
-        if (is_empty_T(ids, out)) { return; }
+        if (is_empty_T(ids)) { return; }
         require_non_empty_tensors(ids, out);
         if (table.qdata == nullptr) {
             throw std::invalid_argument("embedding: dense table data must be non-null");
@@ -222,19 +222,19 @@ void embedding(const Tensor& ids, const Weight& table, float output_scale, Tenso
     } break;
     case QType::Q6_G64_FP16:
         require_q6_metadata(table, out);
-        if (is_empty_T(ids, out)) { return; }
+        if (is_empty_T(ids)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_q6_launch(ids, table, output_scale, out, stream);
         break;
     case QType::Q8_G32_FP16:
         require_q8_metadata(table, out);
-        if (is_empty_T(ids, out)) { return; }
+        if (is_empty_T(ids)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_q8_launch(ids, table, output_scale, out, stream);
         break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
-        if (is_empty_T(ids, out)) { return; }
+        if (is_empty_T(ids)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, output_scale, out, stream);
         break;

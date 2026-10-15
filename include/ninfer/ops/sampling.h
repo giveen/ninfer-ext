@@ -21,8 +21,10 @@ enum SamplePurpose : std::int32_t {
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
-// Each consumed position must have at least one legal token. The caller carries dead-end status
-// separately and supplies a safe filler for dead/unreachable speculative positions.
+// `stride` is the step between position masks in 32-bit words (not bytes), so a non-null `words`
+// with stride <= 0 makes every position alias the first mask. Each consumed position must have at
+// least one legal token. The caller carries dead-end status separately and supplies a safe filler
+// for dead/unreachable speculative positions.
 struct SamplingMask {
     const std::uint32_t* words = nullptr;
     std::int32_t stride        = 0;
@@ -58,10 +60,7 @@ struct SamplingConfig {
  * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
  * consumes mask position zero; speculative acceptance consumes its corresponding verify position.
  *
- * For row b with configs[b].temperature<=0:
- *
- * With either greedy or positive-temperature sampling, let
- * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
+ * For either mode, let c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])
  *                - configs[b].presence_penalty * (c_v > 0)
@@ -73,8 +72,9 @@ struct SamplingConfig {
  * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
- * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn for that row.
+ * top_p times the summed weight of the whole candidate set, before that min_p suffix is removed.
+ * At least the best candidate remains, the support is renormalized, and one id is drawn for that
+ * row.
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the

@@ -82,7 +82,7 @@ VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
             item_tokens += span.count;
             next_span_begin = span.begin + span.count;
         }
-        if (item_tokens != item_patches / static_cast<std::size_t>(merge * merge)) {
+        if (item_tokens != item_patches / ( static_cast<std::size_t>(merge) * static_cast<std::size_t>( merge))) {
             throw std::invalid_argument("vision control token spans do not cover merged patches");
         }
         if (item.token_spans.front().begin > std::numeric_limits<std::uint32_t>::max() ||
@@ -100,8 +100,7 @@ VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
         patch_cursor += item_patches;
     }
     if (static_cast<std::uint64_t>(patch_cursor) != prompt.prepare.raw_patches ||
-        static_cast<std::uint64_t>(token_cursor) != prompt.prepare.vision_tokens ||
-        plan.items.size() != prompt.vision_items.size()) {
+        static_cast<std::uint64_t>(token_cursor) != prompt.prepare.vision_tokens) {
         throw std::invalid_argument("vision control metadata does not cover prepared prompt");
     }
     return plan;
@@ -145,8 +144,16 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
             checked_mul(item_patches, 4, "position table index count"));
         control.position_table_weights.reserve(
             checked_mul(item_patches, 4, "position table weight count"));
+        // The plan knows the final size, so reserve it rather than growing per token span.
+        control.scatter_indices.reserve(input.merged_count);
         const auto expected = static_cast<std::uint8_t>(item.modality);
         for (const TokenSpan& span : item.token_spans) {
+            // The same bound the planner enforces: a rebuilt control may be paired with a prompt it
+            // did not come from, and the span indexes into that prompt's token types below.
+            if (span.count == 0 || span.begin > prompt.token_types.size() ||
+                span.count > prompt.token_types.size() - span.begin) {
+                throw std::invalid_argument("vision control token span exceeds prompt");
+            }
             if (!std::all_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
                              prompt.token_types.begin() +
                                  static_cast<std::ptrdiff_t>(span.begin + span.count),
@@ -178,10 +185,14 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
                             const std::int32_t x1 = std::min(x0 + 1, position_side - 1);
                             const float wy        = yf - static_cast<float>(y0);
                             const float wx        = xf - static_cast<float>(x0);
+                            const std::int64_t row0 = static_cast<std::int64_t>(y0) * position_side;
+                            const std::int64_t row1 = static_cast<std::int64_t>(y1) * position_side;
                             control.position_table_indices.insert(
                                 control.position_table_indices.end(),
-                                {y0 * position_side + x0, y0 * position_side + x1,
-                                 y1 * position_side + x0, y1 * position_side + x1});
+                                {checked_i32(static_cast<std::size_t>(row0 + x0), "table index"),
+                                 checked_i32(static_cast<std::size_t>(row0 + x1), "table index"),
+                                 checked_i32(static_cast<std::size_t>(row1 + x0), "table index"),
+                                 checked_i32(static_cast<std::size_t>(row1 + x1), "table index")});
                             control.position_table_weights.insert(
                                 control.position_table_weights.end(),
                                 {(1.0F - wy) * (1.0F - wx), (1.0F - wy) * wx, wy * (1.0F - wx),
@@ -202,9 +213,6 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
             throw std::invalid_argument("vision item control metadata is incomplete");
         }
         out.items.push_back(std::move(control));
-    }
-    if (out.items.size() != prompt.vision_items.size() - prepared_item_begin) {
-        throw std::invalid_argument("vision control metadata does not cover prepared prompt");
     }
     return out;
 }

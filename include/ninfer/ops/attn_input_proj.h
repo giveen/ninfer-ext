@@ -35,12 +35,28 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      cudaStream_t stream);
 
 /**
- * Computes the single-parent Q/K/output-gate/V projection.
+ * Caller-owned workspace the single-parent Q/K/output-gate/V projection below needs for the parent
+ * form `parent_qtype`/`parent_rows`/`input_rows` under `policy`, over the inclusive token interval
+ * [min_tokens,max_tokens].
+ *
+ * The returned value is the peak byte count over the interval: an EXL3_MUL1 parent decodes into
+ * this storage and the NVFP4 A4 / FP8 A8 routes stage their private quantized activation there,
+ * while every other registered route returns zero. Invalid profiles, policies, or intervals throw
+ * `std::invalid_argument`.
+ */
+[[nodiscard]] std::size_t
+attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                         std::int32_t input_rows, LinearPolicy policy,
+                                         std::int32_t min_tokens, std::int32_t max_tokens);
+
+/**
+ * Computes the single-parent Q/K/output-gate/V projection under `policy`.
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output
- * argument order is q, gate, k, v. Every route writes the four independently contiguous final
- * allocations directly; no packed parent output is materialized. The NVFP4 A4 and FP8 A8
- * profiles may use caller-owned transient storage for their private quantized activation.
+ * argument order is q, gate, k, v. Every route but EXL3_MUL1 writes the four independently
+ * contiguous final allocations directly; EXL3_MUL1 decodes the packed parent `[14336,T]` into
+ * `workspace` and copies the four row bands out of it. The NVFP4 A4 and FP8 A8 profiles may use
+ * caller-owned transient storage for their private quantized activation.
  *
  * Registered parent forms are:
  *
@@ -52,6 +68,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16.
  * - FP8_E4M3FN_ROW_BF16 RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16.
+ * - EXL3_MUL1 TrellisT16 `[14336,5120]`, with the same logical row and tensor shapes as BF16. It
+ *   is A16Only and takes its decoded parent from `workspace`, so only this entry point executes it.
  *
  * `T` is the positive token extent of the Op contract. All three policies permit the BF16
  * and Q8_G32_FP16 A16 implementations. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the
@@ -69,10 +87,6 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * attn_input_proj_workspace_capacity_bytes(). It must not overlap the input, parent weight, or any
  * output. The Op does not allocate device memory internally.
  */
-[[nodiscard]] std::size_t
-attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
-                                         std::int32_t input_rows, LinearPolicy policy,
-                                         std::int32_t min_tokens, std::int32_t max_tokens);
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,

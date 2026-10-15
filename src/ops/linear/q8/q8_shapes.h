@@ -3,6 +3,8 @@
 #include "ops/linear/q8/q8_geometry.h"
 #include "ops/linear/q8/q8_launch.h"
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 using Q8N1024K2048   = Q8LinearGeometry<1024, 2048>;

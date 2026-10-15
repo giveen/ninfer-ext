@@ -21,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <tuple>
+#include <utility>
 
 namespace ninfer::artifact {
 namespace {
@@ -142,7 +143,11 @@ void parallel_read(const Reader& reader, std::uint64_t offset, std::span<std::by
 class FileMapping {
 public:
     FileMapping(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t bytes) {
-        const auto page             = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            throw ArtifactError(path.string() + ": cannot determine the host page size");
+        }
+        const auto page             = static_cast<std::uint64_t>(page_size);
         const std::uint64_t aligned = offset / page * page;
         length_                     = static_cast<std::size_t>(offset - aligned + bytes);
         const int fd                = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -243,7 +248,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.device_capacity_bytes = plan.device_capacity_bytes;
     out.stats_.device_object_count   = plan.device_objects.size();
     out.stats_.host_object_count     = plan.host_objects.size();
-    if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
+    if (std::cmp_greater(plan.device_capacity_bytes, std::numeric_limits<std::size_t>::max())) {
         throw ArtifactError("device backing exceeds size_t");
     }
     if (plan.device_capacity_bytes) {
@@ -279,7 +284,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         auto& storage        = out.objects_.at(handle.index);
         const auto& object   = reader.directory().tensor(handle);
         const auto& geometry = reader.geometry(handle);
-        if (storage.pinned || object.bytes > std::numeric_limits<std::size_t>::max()) {
+        if (storage.pinned ||
+            std::cmp_greater( object.bytes, std::numeric_limits<std::size_t>::max())) {
             throw ArtifactError("invalid or duplicate pinned placement");
         }
         // Host-resident weights (Flash-Next experts) are read over PCIe by SM loads and copies.

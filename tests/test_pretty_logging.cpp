@@ -1,4 +1,5 @@
 #include "product/logging/logging.h"
+#include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 
 #include <spdlog/logger.h>
@@ -74,10 +75,32 @@ std::size_t line_count(std::string_view value) {
     return static_cast<std::size_t>(std::ranges::count(value, '\n'));
 }
 
+int check_rejects_log_level(std::string_view spelling) {
+    try {
+        (void)ninfer::product::parse_log_level(spelling);
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "parse_log_level accepted an invalid spelling\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    using ninfer::product::LogLevel;
+    using ninfer::product::parse_log_level;
+    failures += check(parse_log_level("trace") == LogLevel::Trace, "trace mismatch");
+    failures += check(parse_log_level("debug") == LogLevel::Debug, "debug mismatch");
+    failures += check(parse_log_level("info") == LogLevel::Info, "info mismatch");
+    failures += check(parse_log_level("warning") == LogLevel::Warning, "warning mismatch");
+    failures += check(parse_log_level("warn") == LogLevel::Warning, "warn alias mismatch");
+    failures += check(parse_log_level("error") == LogLevel::Error, "error mismatch");
+    failures += check(parse_log_level("critical") == LogLevel::Critical, "critical mismatch");
+    failures += check(parse_log_level("fatal") == LogLevel::Critical, "fatal alias mismatch");
+    failures += check(parse_log_level("off") == LogLevel::Off, "off mismatch");
+    for (const std::string_view spelling : {"", "verbose", "INFO", "Warning", "off "}) {
+        failures += check_rejects_log_level(spelling);
+    }
     std::string service_output;
     {
         StderrCapture capture;
@@ -168,5 +191,21 @@ int main() {
     }
     failures +=
         check(tool_output == "engine ready\nerror: failed\n", "tool pretty prefix mismatch");
+
+    using ninfer::product::format_pretty_duration;
+    // A sub-unit component that rounds up to its own unit's threshold must carry into that unit.
+    failures += check(format_pretty_duration(119.99) == "2m 0.0s" &&
+                          format_pretty_duration(59.98) == "1m 0.0s" &&
+                          format_pretty_duration(3599.99) == "1h 0m" &&
+                          format_pretty_duration(0.9999) == "1.0s" &&
+                          format_pretty_duration(0.0009999) == "1.00 ms",
+                      "a rounded duration component did not carry into the next unit");
+    // A finite but astronomically large duration must not narrow out of range.
+    failures += check(format_pretty_duration(1.0e30) == "1000000000000000h 0m",
+                      "a huge duration did not clamp before the integer conversion");
+    failures += check(
+        format_pretty_duration(0.0) == "0 us" && format_pretty_duration(59.94) == "59.9s" &&
+            format_pretty_duration(3600.0) == "1h 0m" && format_pretty_duration(-1.0) == "n/a",
+        "ordinary duration formatting changed");
     return failures == 0 ? 0 : 1;
 }

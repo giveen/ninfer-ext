@@ -5,8 +5,13 @@
 #include <jinja/parser.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <memory>
+#include <new>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace ninfer::text {
@@ -75,9 +80,8 @@ struct JinjaTemplate::Impl {
         try {
             unicode_internal::utf8_codepoints(text, "chat template");
             auto tokens   = jinja::lexer().tokenize(text);
+            program     = jinja::parse_from_tokens(tokens);
             source        = std::move(tokens.source);
-            tokens.source = source;
-            program       = jinja::parse_from_tokens(tokens);
         } catch (const std::exception& error) {
             throw std::invalid_argument(source_name + ": " + error.what());
         }
@@ -140,6 +144,9 @@ TemplateOutput JinjaTemplate::render(const nlohmann::ordered_json& input,
         return result;
     } catch (const Interrupted& interrupted) {
         std::rethrow_exception(interrupted.error);
+    } catch (const std::bad_alloc&) {
+        // Resource exhaustion is not a malformed template: it must not become an invalid_argument.
+        throw;
     } catch (const std::exception& error) {
         throw std::invalid_argument(impl_->source_name + ": " + error.what());
     }

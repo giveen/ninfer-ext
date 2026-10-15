@@ -10,6 +10,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,14 @@
 namespace ninfer::models::qwen3_5::detail {
 
 namespace {
+
+// Destroys its event on every exit path, including the exceptions the MTP timing block can throw
+// between create and destroy.
+struct EventDeleter {
+    void operator()(cudaEvent_t event) const noexcept { (void)cudaEventDestroy(event); }
+};
+
+using ScopedEvent = std::unique_ptr<CUevent_st, EventDeleter>;
 
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
                              std::uint32_t max_frontier, const char* label);
@@ -136,6 +145,7 @@ void ProgramImpl::prepare_graphs() {
     std::vector<KVAddressSpaceHandle> text_capture_allocations;
     std::vector<KVAddressSpaceHandle> mtp_capture_allocations;
     std::vector<KVAddressSpaceHandle> dflash_capture_allocations;
+    std::vector<KVAddressSpaceHandle> eagle3_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_5::PagedKVCache& cache,
                                           KVAddressSpaceStore& addresses,
                                           std::vector<KVAddressSpaceHandle>& allocations,
@@ -167,6 +177,12 @@ void ProgramImpl::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
                              "MTP KV cache");
+    } else if (speculative_backend == SpeculativeBackend::Eagle3) {
+        // The EAGLE3 draft KV is its own cache, so its capture rows need the same repeated page
+        // mapping MTP and DFlash get: the warmup and the captured graphs replay rows of this
+        // cache's execution table, and without a published allocation those rows name no page.
+        reserve_capture_rows(*decoder->eagle3_cache(), *backend_kv_addresses,
+                             eagle3_capture_allocations, "EAGLE3 KV cache");
     } else if (dflash && dflash->full) {
         reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
                              "DFlash Full KV cache");
@@ -214,6 +230,10 @@ void ProgramImpl::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
+        }
+        if (speculative_backend == SpeculativeBackend::Eagle3) {
+            zero_capture_pages(*decoder->eagle3_cache(), *backend_kv_addresses,
+                               eagle3_capture_allocations, batch_size);
         }
         if (dflash && dflash->full) {
             zero_capture_pages(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
@@ -331,14 +351,14 @@ void ProgramImpl::prepare_graphs() {
         const std::uint32_t ordinary_batch_limit = max_concurrency;
         // Plain MTP batches run ordinary rounds only for two or more requests.
         const std::uint32_t first_batch = plain_mtp_batches ? 2U : 1U;
-        execution::OrdinaryBatchContext ordinary_state{
-            execution_core(),
-            decoder->text_kv,
-            *io.ordinary,
-            *ordinary_host_ingress,
-            *ordinary_host_egress,
-            state_images->continuation_hidden_store(),
-            plain_mtp_batches ? decoder->mtp_cache() : nullptr};
+        execution::OrdinaryBatchContext ordinary_state{execution_core(),
+                                                       decoder->text_kv,
+                                                       *io.ordinary,
+                                                       *ordinary_host_ingress,
+                                                       *ordinary_host_egress,
+                                                       state_images->continuation_hidden_store(),
+                                                       plain_mtp_batches ? decoder->mtp_cache()
+                                                                         : nullptr};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, first_batch);
         device.synchronize();
@@ -379,7 +399,7 @@ void ProgramImpl::prepare_graphs() {
                 std::ranges::find(batch_rungs, rung_index) != batch_rungs.end();
             const std::uint32_t batch_limit =
                 serves_batches && !plain_mtp_batches ? max_concurrency : 1U;
-            const auto planned_profiles     = mtp_graph_profiles(capacity, k);
+            const auto planned_profiles = mtp_graph_profiles(capacity, k);
             validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
             execution::MtpBatchContext mtp_state{execution_core(&rung.records),
                                                  decoder->text_kv,
@@ -422,10 +442,13 @@ void ProgramImpl::prepare_graphs() {
             const std::uint32_t k       = rung.k;
             const auto planned_profiles = mtp_graph_profiles(capacity, k);
             validate_graph_profiles(planned_profiles, capacity - 1, "EAGLE3");
-            execution::Eagle3BatchContext eagle3_state{
-                execution_core(&rung.records), decoder->text_kv, *decoder->eagle3_cache(),
-                rung.frame, *mtp_host_ingress, *mtp_host_egress,
-                state_images->continuation_hidden_store()};
+            execution::Eagle3BatchContext eagle3_state{execution_core(&rung.records),
+                                                       decoder->text_kv,
+                                                       *decoder->eagle3_cache(),
+                                                       rung.frame,
+                                                       *mtp_host_ingress,
+                                                       *mtp_host_egress,
+                                                       state_images->continuation_hidden_store()};
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, k);
             device.synchronize();
@@ -505,7 +528,8 @@ void ProgramImpl::prepare_graphs() {
     }
     if (speculative_backend == SpeculativeBackend::Mtp ||
         speculative_backend == SpeculativeBackend::Eagle3) {
-        const char* const family = speculative_backend == SpeculativeBackend::Mtp ? "MTP" : "EAGLE3";
+        const char* const family =
+            speculative_backend == SpeculativeBackend::Mtp ? "MTP" : "EAGLE3";
         for (MtpRung& rung : mtp_rungs) {
             instantiate_graph_family(rung.graphs, family, device, true,
                                      [&](std::uint32_t frontier, std::uint32_t batch_size) {
@@ -519,10 +543,13 @@ void ProgramImpl::prepare_graphs() {
             // rather than assumed.
             constexpr int kWarmupReplays = 1;
             constexpr int kTimedReplays  = 8;
-            cudaEvent_t begin = nullptr;
-            cudaEvent_t end   = nullptr;
-            CUDA_CHECK(cudaEventCreate(&begin));
-            CUDA_CHECK(cudaEventCreate(&end));
+            const auto make_event        = [] {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreate(&event));
+                return ScopedEvent(event);
+            };
+            ScopedEvent begin = make_event();
+            ScopedEvent end   = make_event();
             // Identical tokens would route every row of an MoE layer to the same experts and hide
             // the cost of verifying a longer draft. Distinct ids spread the routing the way real
             // text does.
@@ -544,8 +571,7 @@ void ProgramImpl::prepare_graphs() {
                     rung.graphs.topologies, [&](const DecodeGraphTopology& candidate) {
                         return candidate.topology_class == profile->topology_class;
                     });
-                const auto index =
-                    static_cast<std::size_t>(profile - rung.graphs.profiles.begin());
+                const auto index = static_cast<std::size_t>(profile - rung.graphs.profiles.begin());
                 if (topology.installed_profile != index) {
                     topology.executable.update(profile->definition);
                     topology.installed_profile = index;
@@ -563,14 +589,14 @@ void ProgramImpl::prepare_graphs() {
                 for (int i = 0; i < kWarmupReplays; ++i) {
                     topology.executable.launch(device.stream);
                 }
-                CUDA_CHECK(cudaEventRecord(begin, device.stream));
+                CUDA_CHECK(cudaEventRecord(begin.get(), device.stream));
                 for (int i = 0; i < kTimedReplays; ++i) {
                     topology.executable.launch(device.stream);
                 }
-                CUDA_CHECK(cudaEventRecord(end, device.stream));
-                CUDA_CHECK(cudaEventSynchronize(end));
+                CUDA_CHECK(cudaEventRecord(end.get(), device.stream));
+                CUDA_CHECK(cudaEventSynchronize(end.get()));
                 float milliseconds = 0.0F;
-                CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
+                CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin.get(), end.get()));
                 return static_cast<double>(milliseconds) * 1e-3 / kTimedReplays;
             };
             std::vector<double> seconds(mtp_rungs.size(), 0.0);
@@ -593,8 +619,6 @@ void ProgramImpl::prepare_graphs() {
                     }
                 }
             }
-            CUDA_CHECK(cudaEventDestroy(begin));
-            CUDA_CHECK(cudaEventDestroy(end));
             mtp_round_rung = mtp_policy.initial_rung();
             // Timed replays reuse one set of tokens, so after the warmup every routed expert is
             // cached and a longer draft's verify misses never show; learn from real rounds.
@@ -638,6 +662,9 @@ void ProgramImpl::prepare_graphs() {
     }
     if (!mtp_capture_allocations.empty()) {
         release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
+    }
+    if (!eagle3_capture_allocations.empty()) {
+        release_capture_rows(*backend_kv_addresses, eagle3_capture_allocations);
     }
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }

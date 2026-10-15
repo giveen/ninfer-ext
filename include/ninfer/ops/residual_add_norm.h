@@ -13,12 +13,12 @@ namespace ninfer::ops {
  * contiguous BF16 `[d]`, for a positive even `d` that is a multiple of 256 and at most 5376.
  * Dimension zero is stored fastest, so a row is one contiguous feature vector. `accumulator` is
  * updated in place; `x` and `weight` are preserved. For every row `r`, with
- * `inv(i) = rsqrt(FP32(sum_j x[j,r]^2) / d + eps)` and the gain applied to the already-normalized
+ * `inv(r) = rsqrt(FP32(sum_j x[j,r]^2) / d + eps)` and the gain applied to the already-normalized
  * activation -- the order `ops::rmsnorm` uses, `(x * inv) * weight` -- so
- * `norm(i) = FP32(x[i,r]) * inv(i) * FP32(weight[i])`:
+ * `norm(r,i) = FP32(x[i,r]) * inv(r) * FP32(weight[i])`:
  *
  * @f[
- *   \hat{n}_{i,r} = \mathrm{BF16}(norm(i)), \qquad
+ *   \hat{n}_{i,r} = \mathrm{BF16}(norm(r,i)), \qquad
  *   \hat{s}_{i,r} = \mathrm{BF16}(\mathrm{FP32}(accumulator_{i,r}) + \mathrm{FP32}(\hat{n}_{i,r})),
  *   \qquad
  *   accumulator_{i,r} \leftarrow \mathrm{BF16}(\mathrm{FP32}(\hat{s}_{i,r}) \cdot scale)

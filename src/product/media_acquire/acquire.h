@@ -3,6 +3,7 @@
 #include "product/media_acquire/source.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -31,6 +32,10 @@ public:
 private:
     ErrorKind kind_;
 };
+
+// A zero-initialized (epoch) `deadline` is the "no deadline" sentinel; any other value is an
+// absolute steady-clock instant the fetch must finish by. `connect_timeout_ms` and `timeout_ms` are
+// per-request millisecond budgets, and `max_bytes` caps the bytes buffered for one fetch.
 
 struct Policy {
     std::size_t max_bytes      = 256ULL << 20;

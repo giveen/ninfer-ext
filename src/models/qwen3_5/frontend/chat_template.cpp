@@ -13,6 +13,10 @@ namespace {
 
 using Json = nlohmann::ordered_json;
 
+// The wrapper prompt_layout.cpp validates around every media placeholder. It must stay in sync with
+// that file's kVisionEnd; the cache boundary below is published after it.
+constexpr std::string_view kVisionEndWrapper = "<|vision_end|>";
+
 std::string_view role_name(ChatRole role) {
     switch (role) {
     case ChatRole::System:
@@ -160,11 +164,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     Json context = template_parameters(options, special_tokens_);
     if (continuation) {
         const auto& final = messages.back();
+        // The template enables Thinking unless told otherwise (qwen.jinja defaults
+        // enable_thinking to true), so an unset flag means Thinking is on: a continuation must
+        // disable it explicitly rather than rely on the flag being absent.
         if (final.role != ChatRole::Assistant || final.has_media() ||
             !final.reasoning_content.empty() || !final.tool_calls.empty() ||
-            context.value("enable_thinking", false)) {
+            context.value("enable_thinking", true)) {
             throw std::invalid_argument("assistant continuation requires a final text-only "
-                                        "assistant message and disabled thinking");
+                                        "assistant message and explicitly disabled thinking");
         }
     }
     context["continue_final_message"] = continuation;
@@ -408,7 +415,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                                        : RewriteCheckpointKind::TurnClosure,
             .offset = *generation_begin};
     }
-    if (!continuation && !retain_open_turn && first_tail_assistant) {
+    if (!retain_open_turn && first_tail_assistant) {
         const auto begin = layout.messages[*first_tail_assistant].begin;
         if (begin > 0)
             result.rewrite_checkpoint = RewriteCheckpointByteSpec{
@@ -452,7 +459,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                     } else if (origin.part_media[part]) {
                         result.cache_boundaries[i] =
                             layout.media_placeholders[*origin.part_media[part]].bytes.end +
-                            std::string_view("<|vision_end|>").size();
+                            kVisionEndWrapper.size();
                     }
                 }
             }

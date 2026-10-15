@@ -73,7 +73,8 @@ public:
     [[nodiscard]] KvCacheStorage storage() const noexcept { return storage_; }
 
     // Whether sliding `layer` holds a quantized ring rather than BF16 rows.
-    [[nodiscard]] bool quantized(std::size_t layer) const noexcept {
+    // Throws like `sliding_attention` when `layer` is not one of `layer_types`'.
+    [[nodiscard]] bool quantized(std::size_t layer) const {
         return storage_ != KvCacheStorage::BFloat16 && config_.sliding_attention(layer);
     }
 
@@ -135,6 +136,8 @@ private:
 
     void ensure(std::size_t layer);
     void reset_layer(std::size_t layer);
+    // Frees every device allocation this cache owns and forgets them.
+    void release_owned() noexcept;
 
     TextConfig config_{};
     std::vector<Layer> layers_;

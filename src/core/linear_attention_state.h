@@ -46,8 +46,8 @@ struct LinearAttentionStateSlotView {
     Tensor recurrent_layer0;
     std::size_t conv_layer_bytes               = 0;
     std::size_t recurrent_layer_bytes          = 0;
-    std::ptrdiff_t conv_layer_pitch_bytes      = 0;
-    std::ptrdiff_t recurrent_layer_pitch_bytes = 0;
+    std::int64_t conv_layer_pitch_bytes      = 0;
+    std::int64_t recurrent_layer_pitch_bytes = 0;
     std::uint32_t layers                       = 0;
 };
 
@@ -79,6 +79,10 @@ public:
     [[nodiscard]] LinearAttentionStateAllLayersView all_layers_view() const;
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
+
+    // The three mutators below enqueue asynchronous device work on `stream` (nullptr selects the
+    // legacy default stream) and never synchronize. The caller must order `stream` against prior
+    // accesses to the same slots; concurrent calls that touch one slot race.
 
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);

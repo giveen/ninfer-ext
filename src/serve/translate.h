@@ -7,6 +7,8 @@
 #include "serve/serve_options.h"
 
 #include <functional>
+#include <optional>
+#include <string>
 
 namespace ninfer::serve {
 

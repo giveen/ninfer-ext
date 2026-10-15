@@ -70,10 +70,31 @@ void validate_long_anchor_ordinals(std::span<const LongAnchorCheckpoint> anchors
 }
 
 void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
-                          std::uint32_t prefill_chunk) {
+                          std::uint32_t prefill_chunk,
+                          std::optional<std::uint32_t> minted_boundary) {
+    // A generated-prefix commit records at most one rewrite/execution boundary inside the span it
+    // appends, and a fresh rebuild segments at it. The incremental chunk count measures the whole
+    // tail from one anchor, so the boundary is taken in two steps: advance to the boundary (where
+    // the tail still starts at the old anchor), re-anchor the work there, then advance to the span
+    // end. Anchoring first would leave the replaced tail measured from a frontier it does not
+    // reach, which the helper rejects.
+    if (minted_boundary && *minted_boundary <= frontier) {
+        runtime_support::advance_segmented_rebuild_work(
+            sequence.rebuild_work, sequence.rebuild_tail_begin, sequence.execution_frontier,
+            *minted_boundary, prefill_chunk);
+        runtime_support::include_rebuild_boundary(sequence.rebuild_tail_begin, *minted_boundary,
+                                                  frontier);
+    }
     runtime_support::advance_segmented_rebuild_work(
         sequence.rebuild_work, sequence.rebuild_tail_begin, sequence.execution_frontier, frontier,
         prefill_chunk);
+}
+
+std::optional<std::uint32_t>
+recorded_split_frontier(std::uint32_t base_ledger_frontier,
+                        std::optional<std::uint32_t> split_after) noexcept {
+    if (!split_after) { return std::nullopt; }
+    return base_ledger_frontier + *split_after;
 }
 
 std::optional<qwen3_5::TargetKVRequirement>
@@ -297,6 +318,10 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
                                                                       std::uint32_t k,
                                                                       std::uint32_t capacity) {
+    if (k == 0 || k > kLookupDecodeMaximumDrafts) {
+        throw std::invalid_argument("MTP attention envelopes require a round width of at most " +
+                                    std::to_string(kLookupDecodeMaximumDrafts));
+    }
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
@@ -311,10 +336,9 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
 
 execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
                                             std::uint32_t k) {
-    (void)min_frontier;
     return execution::DFlashEnvelopes{
-        .local  = {0, max_frontier},
-        .full   = {0, max_frontier},
+        .local  = {min_frontier, max_frontier},
+        .full   = {min_frontier, max_frontier},
         .append = {0, k + 1},
     };
 }

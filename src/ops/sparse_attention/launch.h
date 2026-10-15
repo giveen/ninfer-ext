@@ -4,6 +4,9 @@
 
 #include "ninfer/ops/sparse_attention.h"
 
+#include <cstddef>
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {

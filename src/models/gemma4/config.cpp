@@ -4,7 +4,6 @@
 #include "models/registry.h"
 
 #include <cmath>
-#include <set>
 #include <string>
 
 namespace ninfer::models::gemma4 {
@@ -44,7 +43,7 @@ AttentionGeometry geometry(const artifact::Json& rope, AttentionGeometry sliding
         fail("rope_parameters must be 'default' for sliding attention and 'proportional' for "
              "global");
     }
-    sliding.rope_theta = rope.contains("rope_theta") ? rope.at("rope_theta").get<float>() : 0.0F;
+    sliding.rope_theta = number(rope, "rope_theta");
     sliding.rotary_dim = positive(rope, "rotary_dim");
     if (sliding.rotary_dim % 2 != 0) { fail("rope_parameters.rotary_dim must be even"); }
     return sliding;

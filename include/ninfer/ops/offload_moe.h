@@ -62,7 +62,8 @@ struct ExpertLayout {
 
     [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
 
-    /** Offset of plane `p` inside a cache slot. */
+    /** Offset of plane `p` inside a cache slot; `p` must be in [0,planes), which is at most
+     * kMaxExpertPlanes. */
     [[nodiscard]] constexpr std::int64_t plane_offset(std::int32_t p) const {
         std::int64_t offset = 0;
         for (std::int32_t i = 0; i < p; ++i) { offset += plane_bytes[i]; }
@@ -143,14 +144,14 @@ struct ExpertWeights {
 
 /** Device-resident mutable state of the expert cache; owned by one Program. */
 struct ExpertCacheState {
-    std::int32_t* slot_of          = nullptr; // [layers*512], -1 when absent
-    std::int32_t* owner            = nullptr; // [slots], layer*512+expert or -1
+    std::int32_t* slot_of          = nullptr; // [layers*kOffloadMoeExperts], -1 when absent
+    std::int32_t* owner            = nullptr; // [slots], layer*kOffloadMoeExperts+expert or -1
     unsigned long long* stamp      = nullptr; // [slots], last use
     unsigned long long* clock      = nullptr; // [1]
     unsigned long long* statistics = nullptr; // [2]: hits, misses
     std::int32_t slots             = 0;
     std::int32_t layers            = 0;
-    std::byte* pool                = nullptr; // [slots, kExpertSlotBytes]
+    std::byte* pool                = nullptr; // [slots, layout.slot_bytes]
 };
 
 /**
@@ -228,6 +229,19 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * call's assignments in shared memory, or counts per slot when the pool has at most 4096 slots.
  */
 [[nodiscard]] std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept;
+struct MoeExpertsPending {
+    const Tensor* misses;
+    cudaEvent_t fetched;
+};
+
+/**
+ * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
+ * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
+ * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
+ * Serving never passes a tap.
+ */
+using MoeActivationTap =
+    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
 
 /**
  * Routed expert SwiGLU and down projections, routing-weight merge and shared expert:
@@ -246,19 +260,6 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * still be filling: the other assignments run first, then `stream` waits on `pending->fetched`
  * before the listed slots are read. The result is identical to a call made after the fetch.
  */
-struct MoeExpertsPending {
-    const Tensor* misses;
-    cudaEvent_t fetched;
-};
-
-/**
- * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
- * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
- * expert ids [10, columns]; both live in the call's workspace and are valid only inside the call.
- * Serving never passes a tap.
- */
-using MoeActivationTap =
-    std::function<void(const Tensor& act, const Tensor& expert_ids, cudaStream_t stream)>;
 
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,

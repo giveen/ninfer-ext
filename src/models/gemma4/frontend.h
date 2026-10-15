@@ -21,6 +21,8 @@
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
 
+#include <cstddef>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -28,10 +30,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-namespace ninfer::models::qwen3_5::frontend {
-class Tokenizer;
-} // namespace ninfer::models::qwen3_5::frontend
 
 namespace ninfer::models::gemma4 {
 

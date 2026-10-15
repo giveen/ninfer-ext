@@ -26,7 +26,10 @@ __host__ __device__ constexpr int tile_n(int t) { return (t >> 5) + 8 * ((t >> 2
 
 // w: [k][n] FP32 (rows are input channels), l: [k][k] unit block-lower. Writes states in
 // trellis_t16_v1 tile order ([n/16][k/16][256], output-major) and the decoded matrix wq [k][n].
-// k % 16 == 0 and n % 128 == 0.
+// k % 16 == 0 and n % 128 == 0. `scratch` must hold at least ldlq_scratch_bytes(k, n,
+// bitrate_half_bits) bytes; otherwise (or on invalid k/n) throws std::invalid_argument. Work is
+// enqueued on `stream` and completes asynchronously, so states and wq are only valid after the
+// stream is synchronized.
 void ldlq_quantize(const float* w, const float* l, std::int64_t k, std::int64_t n,
                    int bitrate_half_bits, float scale, std::uint16_t* states, float* wq,
                    void* scratch, std::size_t scratch_bytes, cudaStream_t stream);

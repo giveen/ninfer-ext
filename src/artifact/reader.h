@@ -4,9 +4,14 @@
 #include "artifact/schema.h"
 #include "core/weight_view.h"
 
+#include <cstddef>
+#include <cstdint>
+
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string_view>
+#include <vector>
 
 namespace ninfer::artifact {
 

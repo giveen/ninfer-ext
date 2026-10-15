@@ -2,6 +2,8 @@
 
 #include "ops/linear/q6/q6_launch.h"
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 [[nodiscard]] Q6Launch select_q6_n248320_k5120(std::int32_t tokens);

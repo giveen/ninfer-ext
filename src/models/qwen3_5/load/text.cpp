@@ -81,7 +81,6 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 
 HyperConnectionWeights bind_hyper_connection(Bindings& b, const TextConfig& config,
                                              const std::string& p, bool inject) {
-    const auto h    = config.hidden_size;
     const auto wide = config.residual_width();
     const auto& hc  = config.hyper_connection.value();
     HyperConnectionWeights out;
@@ -89,7 +88,6 @@ HyperConnectionWeights bind_hyper_connection(Bindings& b, const TextConfig& conf
     out.down = b.parameter(p + "down", {hc.hc_lowrank, wide}, {p + "normed"});
     out.up   = b.parameter(p + "up", {wide, hc.hc_lowrank}, {p + "lowrank"});
     if (inject) { out.inject = b.parameter(p + "inject", {hc.hc_count, wide}, {p + "normed"}); }
-    (void)h;
     return out;
 }
 

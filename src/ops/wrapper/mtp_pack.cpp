@@ -26,6 +26,14 @@ void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, const char
     }
 }
 
+// The contracts exclude shared storage: the kernels read the sources while writing the outputs.
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    if (lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
+}
+
 } // namespace
 
 void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
@@ -41,6 +49,9 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
     require_shape(embedding_norm, rows, tokens, op, "embedding_norm");
     require_shape(hidden_norm, rows, tokens, op, "hidden_norm");
     require_shape(out, 2 * rows, tokens, op, "out");
+    if (overlaps(out, embedding_norm) || overlaps(out, hidden_norm)) {
+        throw std::invalid_argument("mtp_pack_fc_input: out must not alias an input");
+    }
 
     detail::mtp_pack_fc_input_launch(embedding_norm, hidden_norm, out, stream);
 }
@@ -67,6 +78,15 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     }
     if (v.ne[0] != 256 || v.ne[1] != 4 || v.ne[2] != tokens || v.ne[3] != 1) {
         throw std::invalid_argument("mtp_split_attn_in: invalid shape for v");
+    }
+    const Tensor* const tensors[5] = {&attn_in, &q, &k, &gate, &v};
+    for (int lhs = 0; lhs < 5; ++lhs) {
+        for (int rhs = lhs + 1; rhs < 5; ++rhs) {
+            if (overlaps(*tensors[lhs], *tensors[rhs])) {
+                throw std::invalid_argument(
+                    "mtp_split_attn_in: outputs and input must not overlap");
+            }
+        }
     }
 
     detail::mtp_split_attn_in_launch(attn_in, q, k, gate, v, stream);

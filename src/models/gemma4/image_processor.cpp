@@ -3,9 +3,9 @@
 #include "media/decode/resize.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
-#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::models::gemma4 {
@@ -37,14 +37,17 @@ ImageSize gemma_image_size(int height, int width) {
         throw std::invalid_argument("image is too small to resize to a 48-pixel multiple");
     }
     const int max_side = (kMaxPatches / (kPool * kPool)) * kSide;
+    // The width/height ratio of an extreme-aspect image can exceed int, so clamp it to the
+    // widest side the patch budget allows before scaling instead of scaling the product first.
+    const int max_ratio = max_side / kSide;
     if (target_height == 0) {
         target_height = kSide;
         target_width  = std::min(
-            static_cast<int>(std::floor(static_cast<double>(width) / height)) * kSide, max_side);
+            static_cast<int>(std::floor(static_cast<double>(width) / height)), max_ratio) * kSide;
     } else if (target_width == 0) {
         target_width  = kSide;
         target_height = std::min(
-            static_cast<int>(std::floor(static_cast<double>(height) / width)) * kSide, max_side);
+            static_cast<int>(std::floor(static_cast<double>(height) / width)), max_ratio) * kSide;
     }
     if (static_cast<double>(target_height) * target_width > target_px) {
         throw std::invalid_argument("image resize exceeds the patch budget");

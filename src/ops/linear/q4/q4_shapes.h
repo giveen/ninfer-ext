@@ -2,6 +2,8 @@
 
 #include "ops/linear/q4/q4_launch.h"
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 [[nodiscard]] Q4Launch select_q4_n1024_k5120(std::int32_t tokens);

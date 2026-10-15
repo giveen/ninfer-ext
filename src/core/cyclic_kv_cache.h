@@ -53,6 +53,13 @@ struct CyclicKVCacheLayout {
 plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                      std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity);
 
+/**
+ * Non-owning view over caller-provided device backing that holds every layer's cyclic K/V slots.
+ * The cache neither allocates nor frees device memory: `backing` must outlive this object and stay
+ * aligned to the region alignment fixed by plan_cyclic_kv_cache(). All mutations are enqueued
+ * asynchronously on caller-supplied streams and are not internally synchronized.
+ */
+
 class CyclicKVCache {
 public:
     CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layout);
@@ -77,7 +84,9 @@ public:
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
     [[nodiscard]] CyclicKVCacheSlotView slot_view(std::int32_t slot) const;
 
-    // Copies one slot's complete fixed state. Source and destination geometry must match.
+    // Copies one slot's complete fixed state. Source and destination must share the layer count,
+    // capacity, padded capacity, num_kv_heads, head_dim and lane_capacity (std::invalid_argument
+    // otherwise).
     void copy_slot_from(const CyclicKVCache& source, std::int32_t source_slot,
                         std::int32_t destination_slot, cudaStream_t stream);
 

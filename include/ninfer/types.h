@@ -35,6 +35,11 @@ using LogitsSink = std::function<void(const ScoredLogits&)>;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+// The speculative round machinery's draft domain: `mtp_prepare_next_round` accepts a verified frame
+// of at most this many drafts plus one, and the MTP layer drafts at most this many tokens. A
+// prompt-lookup round skips those draft phases and may be wider, but EAGLE3 has no such mode, so
+// this is its window too. Host-visible because the CLI and bench validate the option without CUDA.
+inline constexpr std::int32_t kMtpRoundMaximumDrafts = 7;
 // Explicit markers plus the engine's automatic tool/leading-instruction/full-prompt candidates;
 // one request's shared-prefix opportunities never exceed this (frontend.cpp opportunities.reserve).
 inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
@@ -600,7 +605,7 @@ constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
 }
 
 [[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
-                                                           SharedCandidateEvidence evidence) {
+                                                           SharedCandidateEvidence evidence) noexcept {
     return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
 }
 
@@ -803,8 +808,9 @@ private:
     std::function<bool()> requested_;
 };
 
-// Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
-// unbounded preparation.
+// Deadline and cancellation apply to all host-side prompt preparation work. A default-constructed
+// (`time_point{}`, i.e. the clock epoch) deadline means unbounded preparation; any other value that
+// has already passed aborts preparation.
 struct PreparationControl {
     std::chrono::steady_clock::time_point deadline;
     CancellationView cancellation;

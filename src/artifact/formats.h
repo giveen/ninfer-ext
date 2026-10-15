@@ -6,6 +6,8 @@
 
 namespace ninfer::artifact {
 
+// Both parsers match the stored spelling exactly and throw ArtifactError for an unknown name.
+
 [[nodiscard]] QType parse_format(std::string_view name);
 [[nodiscard]] QuantLayout parse_layout(std::string_view name);
 [[nodiscard]] std::string_view format_name(QType format) noexcept;

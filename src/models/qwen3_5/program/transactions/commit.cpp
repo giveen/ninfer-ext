@@ -413,7 +413,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
 
             commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
                                              prefix_execution_splits[row]);
-            advance_rebuild_work(sequence, end, prefill_chunk);
+            advance_rebuild_work(sequence, end, prefill_chunk,
+                recorded_split_frontier(base_ledger_frontier, prefix_execution_splits[row]));
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;
@@ -449,7 +450,8 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
-    for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
+    const std::size_t copy_rows = std::min<std::size_t>(row_count, kMaximumConcurrency);
+    for (std::size_t row = 0; row < copy_rows; ++row) { members[row] = input_rows[row]; }
     const bool valid = valid_pending(pending);
     ContractAccess::consume(pending);
 
@@ -458,6 +460,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
     std::array<SpeculativeStats, kMaximumConcurrency> speculative{};
     std::array<PendingKind, kMaximumConcurrency> pending_kinds{};
     const auto release_members = [&]() noexcept {
+        if (!valid) { return; }
         std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
         std::size_t failed_count = 0;
         for (std::size_t row = 0; row < row_count; ++row) {
@@ -651,6 +654,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
 bool ProgramImpl::publish_active_continuation(SequenceState& state, RequestControl& request,
                                               std::uint32_t lane, std::uint32_t continuation_index,
                                               qwen3_5::ContinuationSummary& summary) noexcept {
+    if (!state.kv) { return false; }
     try {
         summary.long_anchors.reserve(state.long_anchors.size());
     } catch (...) { return false; }

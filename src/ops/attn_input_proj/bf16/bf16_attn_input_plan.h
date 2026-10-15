@@ -15,6 +15,10 @@ inline constexpr std::int32_t kBf16AttnInputSmallTMinTokens   = 2;
 inline constexpr std::int32_t kBf16AttnInputSmallTMaxTokens   = 32;
 inline constexpr std::int32_t kBf16AttnInputSmallTDispatchEnd = 22;
 
+static_assert(kBf16AttnInputSmallTDispatchEnd >= kBf16AttnInputSmallTMinTokens &&
+                  kBf16AttnInputSmallTDispatchEnd <= kBf16AttnInputSmallTMaxTokens,
+              "small-T dispatch boundary must lie within the supported small-T template range");
+
 void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream);
 void bf16_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,

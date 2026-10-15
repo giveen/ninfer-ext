@@ -1,5 +1,7 @@
 #pragma once
 
+#include "artifact/materializer.h"
+
 #include "models/qwen3_5/model.h"
 
 #include <filesystem>
@@ -15,6 +17,8 @@ namespace ninfer::models::qwen3_5 {
 
 // Cold load plan borrows its Reader until materialization. Its selected Host bytes and parsed
 // resources already have owners; no Program or device allocation is needed for plan_load.
+// materialize_model consumes the plan -- it moves the Impl out and refuses a second call -- so a
+// plan is single-use: the accessors below must not be called after it has been materialized.
 class LoadPlan {
 public:
     ~LoadPlan();

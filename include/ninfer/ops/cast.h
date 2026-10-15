@@ -23,7 +23,8 @@ namespace ninfer::ops {
  *   Each FP32 value is converted independently with round-to-nearest-even.
  *
  * Effects:
- *   Writes the full destination. Source and destination must not alias.
+ *   Writes the full destination. Source and destination must not alias. A dtype, shape, contiguity,
+ *   null-data, or aliasing violation throws `std::invalid_argument`.
  *
  * Workspace:
  *   None. The Op has no state side effect beyond writing destination.

@@ -53,8 +53,9 @@ void ple_dilated_conv(const Tensor& normed, const Tensor& gated, const Tensor& w
     require_dense(weight, DType::BF16, op, "weight");
     require(weight.ne[0] == normed.ne[0] && weight.ne[1] >= 2 && weight.ne[2] == 1, op,
             "weight must be [K,C] stored as ne={C,K}");
+    require(dilation > 0, op, "dilation must be positive");
     const std::int32_t history = (weight.ne[1] - 1) * dilation;
-    require(dilation > 0 && history <= 32, op, "history must be in [1,32] columns");
+    require(history >= 1 && history <= 32, op, "history must be in [1,32] columns");
     require_dense(states, DType::BF16, op, "states");
     require(states.ne[0] == history * normed.ne[0], op, "states must be [history*C, S]");
     require_lanes(source_slots, normed.ne[2], op, "source_slots");

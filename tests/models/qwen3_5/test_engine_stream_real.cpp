@@ -14,6 +14,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "real_test_artifact.h"
 
 namespace {
 
@@ -205,8 +206,7 @@ int main() {
         }
         if (failures != 0) { return 1; }
     } catch (const std::exception& e) {
-        std::cerr << "uncaught exception: " << e.what() << '\n';
-        return 1;
+        return ninfer::test::real_test_error(e);
     }
     std::cout << "ok\n";
     return 0;

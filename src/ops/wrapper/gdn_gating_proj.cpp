@@ -80,6 +80,23 @@ void require_execution(DeviceExecutionView execution, const char* op) {
     }
 }
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+// Contract: all inputs and outputs are mutually non-overlapping.
+void require_nonoverlap(std::initializer_list<const Tensor*> tensors, const char* op) {
+    for (auto lhs = tensors.begin(); lhs != tensors.end(); ++lhs) {
+        for (auto rhs = lhs + 1; rhs != tensors.end(); ++rhs) {
+            if (overlaps(**lhs, **rhs)) {
+                throw std::invalid_argument(std::string(op) + ": operands must not overlap");
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
@@ -110,6 +127,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_bf16_weight(a_weight, 48, 5120, "a_weight");
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
     require_execution(execution, op);
+    require_nonoverlap({&x, &A_log, &dt_bias, &g, &beta}, op);
 
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, execution);
 }
@@ -126,6 +144,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
+    require_nonoverlap({&x, &A_log, &dt_bias, &g, &beta}, op);
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
@@ -151,6 +170,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_bf16_weight(a_weight, 48, 5120, "a_weight");
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
     require_execution(execution, op);
+    require_nonoverlap({&x, &norm_weight, &h, &A_log, &dt_bias, &g, &beta}, op);
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, execution);
@@ -174,6 +194,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
+    require_nonoverlap({&x, &norm_weight, &h, &A_log, &dt_bias, &g, &beta}, op);
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);

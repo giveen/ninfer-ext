@@ -21,6 +21,9 @@
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -325,6 +328,9 @@ PassIndices write_pass_indices(std::span<const PassSegment> segments, DeviceAren
     std::vector<std::int32_t> host(2 * static_cast<std::size_t>(tokens));
     for (const PassSegment& segment : segments) {
         const std::int32_t ring = segment.cache->ring_tokens();
+        if (ring < 1) {
+            throw std::invalid_argument("write_pass_indices: the cache has no ring slots");
+        }
         for (std::int32_t token = 0; token < segment.tokens; ++token) {
             const std::int32_t position = segment.first_position + token;
             const std::size_t column    = static_cast<std::size_t>(segment.column + token);

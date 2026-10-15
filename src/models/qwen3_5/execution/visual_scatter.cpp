@@ -8,12 +8,12 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
+void copy_i32(const std::int32_t* source, std::size_t count, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
-        destination.data == nullptr) {
+        destination.data == nullptr || destination.numel() != static_cast<std::int64_t>(count)) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
-    CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
+    CUDA_CHECK(cudaMemcpyAsync(destination.data, source, count * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
 }
 
@@ -27,7 +27,7 @@ void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& v
         throw std::invalid_argument("shifted visual scatter has invalid destination indices");
     }
     const auto count = static_cast<std::int32_t>(overlap.size());
-    copy_i32(overlap.destination_columns.data(), destination_indices, stream);
+    copy_i32(overlap.destination_columns.data(), overlap.size(), destination_indices, stream);
     Tensor embeddings =
         visual_embeddings.slice(1, static_cast<std::int32_t>(overlap.source_begin), count);
     ops::scatter(embeddings, destination_indices, input_embeddings, stream);

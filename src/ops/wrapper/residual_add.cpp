@@ -13,12 +13,17 @@ namespace ninfer::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t) {
-    std::int64_t total = 1;
+    bool has_zero = false;
     for (int d = 0; d < 4; ++d) {
         if (t.ne[d] < 0) {
             throw std::invalid_argument("residual_add: y/x dimensions must be nonnegative");
         }
-        if (t.ne[d] == 0) { return 0; }
+        if (t.ne[d] == 0) { has_zero = true; }
+    }
+    if (has_zero) { return 0; }
+
+    std::int64_t total = 1;
+    for (int d = 0; d < 4; ++d) {
         if (total > std::numeric_limits<std::int64_t>::max() / t.ne[d]) {
             throw std::overflow_error("residual_add: tensor size overflows int64");
         }

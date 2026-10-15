@@ -90,13 +90,16 @@ public:
     virtual void on_timing(const ninfer::GenerationTimingObservation&) {}
     virtual std::vector<std::string> reasoning_delta(const std::string& text) = 0;
     virtual std::vector<std::string> content_delta(const std::string& text) = 0;
-    // The protocol's error event(s) for an already-normalized error.
+    // The protocol's error event(s) for an already-normalized error. The driver calls this from a
+    // catch handler, so it must not throw.
     virtual std::vector<std::string> error_event(const ApiError& error) = 0;
     // Everything still to write after the engine run, including any store commit.
     virtual SseStreamClose close(const GenerationOutcome& outcome) = 0;
     // The protocol's error normalization for an Engine exception (identity by default).
     virtual ApiError normalize(ApiError error) { return error; }
-    // The protocol's internal (500) error shape.
+
+    // The protocol's internal (500) error shape. Like error_event, the driver calls this from a
+    // catch handler with no recovery path, so it must not throw.
     virtual ApiError internal_error(const std::string& message) const {
         return ApiError{500, "internal_error", message};
     }

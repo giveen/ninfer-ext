@@ -58,6 +58,10 @@ struct StateImageSelectors {
     std::int32_t destination = -1;
 };
 
+// An in-flight State transfer. The store keeps the transfer's slot reserved and this object closes
+// it out on destruction, so a transfer must not outlive the store that minted it: the store is
+// bound in `owner_` and the destructor calls back into it.
+
 class StateImageTransfer {
 public:
     StateImageTransfer() noexcept = default;
@@ -98,9 +102,9 @@ public:
                     std::uint32_t logical_capacity)
         : device_(&device), host_(host), objects_(logical_capacity),
           free_objects_(logical_capacity),
-          free_device_slots_(static_cast<std::size_t>(device.slot_count())),
+          free_device_slots_(validated_device_slots(device)),
           free_object_count_(logical_capacity),
-          free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
+          free_device_count_(static_cast<std::uint32_t>(validated_device_slots(device))) {
         if (logical_capacity == 0 || device.slot_count() <= 0 ||
             logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
             (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
@@ -418,9 +422,7 @@ public:
         if (object.source_pins != 1 || object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
@@ -434,9 +436,7 @@ public:
             object.source_pins != 0 || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
@@ -587,14 +587,16 @@ public:
             source.transfer_id        = 0;
             break;
         case StateTransferDirection::HostToDevice:
-            source.device_slot = source.pending_device_slot;
-            source.pending_device_slot.reset();
+            // The pending slot stays abortable (abort_transfer returns it) until the last
+            // fallible step has succeeded, so a failed release leaves the object untouched.
             if (!keep_source_replica) {
                 if (host_ == nullptr || !host_->release(*source.host_slot)) {
                     throw std::logic_error("StateImage Host replica release failed at publication");
                 }
                 source.host_slot.reset();
             }
+            source.device_slot = source.pending_device_slot;
+            source.pending_device_slot.reset();
             --source.source_pins;
             source.destination_pinned = false;
             source.transfer_id        = 0;
@@ -674,14 +676,22 @@ public:
         if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
-        if (object.host_slot) {
-            if (host_ == nullptr) { return false; }
-            (void)host_->view(*object.host_slot);
+        if (!host_slot_usable(object.host_slot)) { return false;
         }
         return true;
     }
 
 private:
+    // The pool's slot count is signed and sizes containers during member initialization, before the
+    // constructor body can validate it: a negative count would otherwise allocate an enormous
+    // vector instead of naming the bad geometry.
+    [[nodiscard]] static std::size_t
+    validated_device_slots(const qwen3_5::StateImageDevicePool& device) {
+        if (device.slot_count() <= 0) {
+            throw std::invalid_argument("StateImageStore device slot count is not positive");
+        }
+        return static_cast<std::size_t>(device.slot_count());
+    }
     struct Object {
         std::uint32_t generation    = 1;
         std::uint64_t content_epoch = 0;
@@ -699,6 +709,18 @@ private:
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept {
         return object.pending_device_slot.has_value() || object.pending_host_slot.has_value() ||
                object.transfer_id != 0;
+    }
+
+    // The preflight predicates answer `false` for a host replica they cannot read, while
+    // HostStatePool reports a stale slot by throwing.
+    [[nodiscard]] bool
+    host_slot_usable(const std::optional<qwen3_5::HostStateSlotHandle>& slot) const {
+        if (!slot) { return true; }
+        if (host_ == nullptr) { return false; }
+        try {
+            (void)host_->view(*slot);
+        } catch (const std::invalid_argument&) { return false; }
+        return true;
     }
 
     [[nodiscard]] std::optional<StateImageHandle> allocate(StateImageRole role,

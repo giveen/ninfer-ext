@@ -100,7 +100,8 @@ reference's own numbers alongside the model's:
 reference: 79 tokens | mean_nll 2.244805 | ppl_reference 9.438576 | delta_nats -0.000003
 ```
 
-`delta_nats = mean_nll_model - mean_nll_reference`, so a positive value means the candidate is worse
+`delta_nats = mean_nll_model - mean_nll_reference` — both means over the reference's scored positions,
+so the comparison is paired — and a positive value means the candidate is worse
 than the reference. The existing `mean_kl` (per-row KL divergence) answers "how differently
 distributed?"; `delta_nats` answers "how much worse in the unit published numbers use?" — for example
 a "+0.9% perplexity" claim is an NLL delta in nats, recoverable through the exponential.

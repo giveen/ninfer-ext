@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <type_traits>
 #include <stdexcept>
 
@@ -104,11 +105,13 @@ View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
 template <class G, class View>
 void validate_quantized_causal_operands(const CausalAttentionOperands& p, View cache) {
     static_assert(G::kHeadDim == kCausalHeadDim, "Quantized causal templates require D256");
-    if (p.query_heads != G::QHeads || cache.kv_heads != G::KVHeads || !p.q || !p.positions ||
+    if (p.query_heads != G::QHeads || cache.kv_heads != G::KVHeads || p.head_dim != G::kHeadDim || !p.q || !p.positions ||
         !p.out || !cache.keys || !cache.values || !cache.key_scales || !cache.value_scales ||
-        !cache.tables || p.width < 1 || p.batch < 1 || p.visible_capacity < 1 ||
+        !cache.tables || p.width < 1 || p.batch < 1 || p.batch > 65535 ||
+        p.visible_capacity < 1 ||
         static_cast<std::int64_t>(p.visible_capacity) >
-            static_cast<std::int64_t>(cache.table_stride) * kPagedKVPageSize)
+            static_cast<std::int64_t>(cache.table_stride) * kPagedKVPageSize ||
+        (cache.valid_columns && !cache.table_rows))
         throw std::invalid_argument("quantized causal attention: invalid operands");
 }
 

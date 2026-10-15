@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
+
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -10,6 +12,16 @@
 
 namespace ninfer::quantize::app {
 namespace {
+
+// safetensors mandates a little-endian 64-bit header length; decode it byte-wise so the reader is
+// independent of the host's byte order.
+std::uint64_t read_le_u64(const std::byte* bytes) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+        value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(bytes[i])) << (8U * i);
+    }
+    return value;
+}
 
 struct Entry {
     std::string dtype;
@@ -33,8 +45,8 @@ std::vector<std::byte> read_file(const std::filesystem::path& path) {
 std::vector<Entry> parse_header(const std::vector<std::byte>& bytes,
                                 std::uint64_t& data_start) {
     if (bytes.size() < 8) { throw std::invalid_argument("truncated safetensors header"); }
-    std::uint64_t header_size = 0;
-    std::memcpy(&header_size, bytes.data(), sizeof(header_size));
+    const
+    std::uint64_t header_size = read_le_u64( bytes.data());
     if (header_size > bytes.size() - 8) {
         throw std::invalid_argument("safetensors header exceeds the file");
     }
@@ -62,16 +74,6 @@ std::vector<Entry> parse_header(const std::vector<std::byte>& bytes,
     return entries;
 }
 
-const Entry& require(const std::vector<Entry>& entries, const char* name,
-                     const std::vector<std::uint64_t>& shape) {
-    for (const auto& entry : entries) {
-        if (entry.shape == shape && (entry.dtype == "I64")) { return entry; }
-    }
-    std::string expected;
-    for (const auto dim : shape) { expected += " " + std::to_string(dim); }
-    throw std::invalid_argument(std::string(name) + ": expected I64[" + expected + " ]");
-}
-
 } // namespace
 
 CalibrationTrace read_calibration_trace(const std::filesystem::path& path) {
@@ -96,12 +98,18 @@ CalibrationTrace read_calibration_trace(const std::filesystem::path& path) {
     }
     const std::uint64_t rows       = ids->shape[0];
     const std::uint64_t row_tokens = ids->shape[1];
-    if (rows == 0 || row_tokens == 0 || rows > std::numeric_limits<std::uint32_t>::max() ||
-        row_tokens > std::numeric_limits<std::uint32_t>::max()) {
+    // lengths and input_ids are I32 in memory, so a row width or token id beyond that domain would
+    // narrow to a negative value: bound both dimensions by INT32_MAX.
+    constexpr std::uint64_t kMaxDimension = std::numeric_limits<std::int32_t>::max();
+    if (rows == 0 || row_tokens == 0 || rows > kMaxDimension ||
+        row_tokens > kMaxDimension) {
         throw std::invalid_argument("trace dimensions are out of range");
     }
 
     const auto read_i64 = [&](const Entry& entry, std::uint64_t count) {
+        if (count > (entry.end - entry.begin) / sizeof(std::int64_t)) {
+            throw std::invalid_argument("safetensors entry is smaller than the declared shape");
+        }
         std::vector<std::int64_t> out(static_cast<std::size_t>(count));
         std::memcpy(out.data(), bytes.data() + data_start + entry.begin,
                     static_cast<std::size_t>(count) * sizeof(std::int64_t));

@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -129,7 +130,8 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
         std::optional<HostKVPageReplica> previous;
         for (std::uint32_t page = 0; page < required; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-            if (pages.device_resident(logical)) { continue; }
+            if (pages.device_resident(logical)) {
+                previous.reset(); continue; }
             if (!pages.host_resident(logical)) {
                 throw std::logic_error("checkpoint KV page has no restorable replica");
             }
@@ -664,9 +666,10 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_checkpoint
         return std::nullopt;
     }
     if (sequence.kv->backend &&
+        (!backend_kv_addresses || !backend_kv_pages ||
         !append_suffix_effect(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
                               remaining->backend_frontier,
-                              option.effect.removed.device.backend_kv_pages)) {
+                              option.effect.removed.device.backend_kv_pages))) {
         return std::nullopt;
     }
 

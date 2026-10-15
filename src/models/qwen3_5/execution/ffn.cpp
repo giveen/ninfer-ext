@@ -22,8 +22,19 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
+    // The fused gate/up route implements anything but Q6; the down route is chosen separately, so a
+    // Q6 down takes the materialized path ops::linear_add cannot serve.
+    const bool fused_gate_up     = !mtp && gu.qtype != QType::Q6_G64_FP16;
+    const bool materialized_down =mtp || down.qtype == QType::Q6_G64_FP16;
     WorkspaceLayoutBuilder layout;
-    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
+    if (fused_gate_up) {
+        (void)layout.alloc(DType::BF16, {gu.n / 2, last});
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
+                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
+        }
+    } else {
         (void)layout.alloc(DType::BF16, {gu.n, last});
         {
             auto scope = layout.scope();
@@ -31,7 +42,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                 gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
         }
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-        if (mtp) {
+    }
+        if (materialized_down) {
             (void)layout.alloc(DType::BF16, {down.n, last});
             (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
                 down.qtype, down.n, down.k, p.down.policy, first, last));
@@ -39,19 +51,6 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
                 down.qtype, down.n, down.k, p.down.policy, first, last));
-        }
-    } else {
-        (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-        {
-            auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
-        }
-        {
-            auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
-        }
     }
     return layout.peak_bytes(1);
 }
@@ -73,34 +72,34 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
-    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
+    const bool fused_gate_up     = !mtp && gu.qtype != QType::Q6_G64_FP16;
+    const bool materialized_down =mtp || down.qtype == QType::Q6_G64_FP16;
+    Tensor activation            = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+    if (fused_gate_up) {
+        observe_projection(CalibrationSite::MlpInput, layer, hidden, stream);
+        {
+            auto call = workspace.scope();
+            ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+        }
+    } else {
         Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
         observe_projection(CalibrationSite::MlpInput, layer, hidden, stream);
         {
             auto call = workspace.scope();
             ops::linear(hidden, gu, gate_up, p.gate_up.policy, workspace, stream);
         }
-        Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
         ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
                       activation, stream);
+    }
         observe_projection(CalibrationSite::MlpActivation, layer, activation, stream);
-        if (mtp) {
+    // ops::linear_add has no Q6 route, so a Q6 down takes the same materialized route MTP uses.
+        if (materialized_down) {
             Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
             ops::linear(activation, down, delta, p.down.policy, workspace, stream);
             ops::residual_add(delta, residual, stream);
             return;
         }
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
-        return;
-    }
-    Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
-    observe_projection(CalibrationSite::MlpInput, layer, hidden, stream);
-    {
-        auto call = workspace.scope();
-        ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
-    }
-    observe_projection(CalibrationSite::MlpActivation, layer, activation, stream);
-    ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

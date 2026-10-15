@@ -12,7 +12,9 @@ namespace ninfer::ops {
 
 /**
  * Host launch-resource promise for device-selected prefix append. It bounds every device count
- * during capture/replay but neither selects nor publishes a committed frontier.
+ * during capture/replay but neither selects nor publishes a committed frontier. A device count
+ * outside the envelope makes that whole row a no-op: no error is raised and no cache byte is
+ * written.
  */
 struct KVCacheAppendPrefixExecutionEnvelope {
     std::uint32_t min_count = 0;
@@ -76,7 +78,8 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  *
  * The caller guarantees T>0, B=1..8, envelope.min_count <= counts[b] <= envelope.max_count <= T,
  * sequential nonnegative live positions, materialized table entries for every position allowed by
- * the envelope, and pairwise non-aliasing of inputs and cache storage.
+ * the envelope, 16-byte-aligned k, v, and cache planes, and pairwise non-aliasing of inputs and
+ * cache storage.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& table_rows,
@@ -87,7 +90,8 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Append device-selected BF16 prefixes to lane-owned cyclic storage.
  *
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
- * overload; lanes[b] selects the destination lane. The registered profiles have fixed geometry
+ * overload; lanes[b] selects the destination lane and must lie in [0, lane_capacity). The
+ * registered profiles have fixed geometry
  * D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
  * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
  * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot

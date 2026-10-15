@@ -226,7 +226,7 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 releases.push_back(addresses.logical_page(address, selected_begin + offset));
             }
             if (!host_extents->can_release_page_replicas(pages, releases)) {
-                end = begin;
+                end = selected_begin;
                 continue;
             }
             mark_action({
@@ -1143,6 +1143,13 @@ bool ProgramImpl::pressure_decision_valid(const SequenceState& sequence,
         }
         return true;
     };
+    // `mapped_pages` requires a live handle and the stores are optional: a decision that names
+    // an absent or stale KV address is invalid rather than fatal.
+    if (!text_kv_addresses || !text_kv_addresses->valid(sequence.kv->text)) { return false; }
+    if (sequence.kv->backend &&
+        (!backend_kv_addresses || !backend_kv_addresses->valid(*sequence.kv->backend))) {
+        return false;
+    }
     const std::uint32_t main_limit =
         retained ? retained->main_pages : text_kv_addresses->mapped_pages(sequence.kv->text);
     const std::uint32_t backend_limit =

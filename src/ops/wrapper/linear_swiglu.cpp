@@ -99,7 +99,6 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (gate_up_weight.qtype == QType::EXL3_MUL1) {
-        constexpr std::int32_t kInput = 5120;
         constexpr std::int32_t kHalf  = 17408;
         constexpr std::int32_t kRows  = 2 * kHalf;
         if (!large_shape || gate_up_weight.layout != QuantLayout::TrellisT16) {

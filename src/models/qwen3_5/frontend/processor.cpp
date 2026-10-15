@@ -72,11 +72,14 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
 int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
 Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::uint64_t max_pixels) {
-    if (height <= 0 || width <= 0 || min_pixels == 0 || max_pixels < min_pixels) {
+    if ( min_pixels == 0 || max_pixels < min_pixels) {
         throw std::invalid_argument("invalid image resize configuration");
     }
+    if (height <= 0 || width <= 0) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "image has an empty extent");
+    }
     if (static_cast<double>(std::max(height, width)) / std::min(height, width) > 200.0) {
-        throw std::invalid_argument("image aspect ratio must be at most 200");
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,"image aspect ratio must be at most 200");
     }
     int h                    = round_even(static_cast<double>(height) / kFactor) * kFactor;
     int w                    = round_even(static_cast<double>(width) / kFactor) * kFactor;
@@ -96,12 +99,15 @@ Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::ui
 
 Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pixels,
                         std::uint64_t max_pixels) {
-    if (frames <= 0 || height < kFactor || width < kFactor || min_pixels == 0 ||
+    if ( min_pixels == 0 ||
         max_pixels < min_pixels) {
         throw std::invalid_argument("invalid video resize configuration");
     }
+    if (frames <= 0 || height < kFactor || width < kFactor) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "video has an empty extent");
+    }
     if (static_cast<double>(std::max(height, width)) / std::min(height, width) > 200.0) {
-        throw std::invalid_argument("video aspect ratio must be at most 200");
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,"video aspect ratio must be at most 200");
     }
     int h                      = round_even(static_cast<double>(height) / kFactor) * kFactor;
     int w                      = round_even(static_cast<double>(width) / kFactor) * kFactor;
@@ -111,12 +117,12 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
         checked_mul(static_cast<std::uint64_t>(h), static_cast<std::uint64_t>(w), "video area"),
         "video pixels");
     if (volume > max_pixels) {
-        const double beta = std::sqrt(static_cast<double>(frames) * height * width / max_pixels);
+        const double beta = std::sqrt(static_cast<double>(padded_frames) * height * width / max_pixels);
         h = std::max(kFactor, static_cast<int>(std::floor(height / beta / kFactor)) * kFactor);
         w = std::max(kFactor, static_cast<int>(std::floor(width / beta / kFactor)) * kFactor);
     } else if (volume < min_pixels) {
         const double beta = std::sqrt(static_cast<double>(min_pixels) /
-                                      (static_cast<double>(frames) * height * width));
+                                      (static_cast<double>(padded_frames) * height * width));
         h                 = static_cast<int>(std::ceil(height * beta / kFactor)) * kFactor;
         w                 = static_cast<int>(std::ceil(width * beta / kFactor)) * kFactor;
     }
@@ -837,6 +843,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
+    // The builder runs inside the digest-keyed singleflight flight other requests may join, so its
+    // only cancellation is this request's own abort flag; the caller's view is checked on this
+    // thread by check_preparation_control and inside await.
     const PreparationControl worker_control{
         .deadline     = control.deadline,
         .cancellation = CancellationView(

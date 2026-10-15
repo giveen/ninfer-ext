@@ -4,6 +4,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <map>
+#include <vector>
+
 namespace ninfer::models::gemma4 {
 namespace {
 
@@ -29,7 +33,7 @@ std::string prefill_signature(const Model& model) {
         {"global",
          {t.global.shared.num_key_value_heads, t.global.shared.head_dim, t.global.shared.rope_theta,
           t.global.shared.rotary_dim, t.global.rope_angles, t.global.denominator_head_dim}}};
-    Json facts{{"implementation", "gemma4-prefill-1"},
+    Json facts{{"implementation", "gemma4-prefill-2"},
                {"architecture", architecture_name(t.architecture)},
                {"hidden_size", t.hidden_size},
                {"vocab_size", t.vocab_size},
@@ -57,6 +61,40 @@ std::string prefill_signature(const Model& model) {
                            vision->soft_tokens_per_image,
                            vision->output_hidden_size,
                            vision->rope_theta};
+    }
+    // The binding structure: every materialized Text/Vision parameter's role, logical shape and the
+    // encoded parents its regions address. Two artifacts whose configs agree but whose weights are
+    // laid out differently (another format, another group or padding) do different prefill work, so
+    // the signature has to separate them. Gemma binds every input A16-only, so the Use dimension
+    // the signature folds for other models is constant here and carries no discrimination.
+    std::vector<const BoundWeight*> weights;
+    // PrefillWork prices primary Text/Vision reconstruction; an optional drafter does not change
+    // that work's applicability, so its weights stay out of the key.
+    for (const auto& weight : model.weight_data()) {
+        if (weight.name.starts_with("text/") || weight.name.starts_with("vision/")) {
+            weights.push_back(&weight);
+        }
+    }
+    std::ranges::sort(weights, [](const auto* a, const auto* b) { return a->name < b->name; });
+    std::map<const WeightParent*, std::size_t> parents;
+    auto& inventory = facts["weights"] = Json::array();
+    for (const auto* weight : weights) {
+        // A bound Gemma weight always carries resident regions: the loader admits only Device and
+        // pinned-host parameters, and bind_view proves they cover the logical shape. So unlike
+        // Qwen there is no file-mapped case whose geometry would sit outside `parts`, and a weight
+        // that lost its regions would otherwise contribute only its shape.
+        if (weight->view.parts.empty()) {
+            throw artifact::ArtifactError(weight->name + ": bound weight has no resident regions");
+        }
+        Json item{{"role", weight->name}, {"shape", weight->view.shape}, {"parts", Json::array()}};
+        for (const auto& part : weight->view.parts) {
+            const auto [it, inserted] = parents.emplace(part.parent, parents.size());
+            const auto& geometry      = part.parent->geometry;
+            item["parts"].push_back({it->second, part.begin, part.end, geometry.format,
+                                     geometry.layout, geometry.shape, geometry.padded_columns,
+                                     geometry.group_size});
+        }
+        inventory.push_back(std::move(item));
     }
     return qwen3_5::frontend::sha256_hex(qwen3_5::frontend::sha256(facts.dump()));
 }

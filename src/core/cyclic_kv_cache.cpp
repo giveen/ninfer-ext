@@ -151,7 +151,7 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
                                    std::int32_t destination_slot, cudaStream_t stream) {
     if (source.layer_count() != layer_count() || source.capacity_ != capacity_ ||
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
-        source.head_dim_ != head_dim_) {
+        source.head_dim_ != head_dim_ || source.lane_capacity_ != lane_capacity_) {
         throw std::invalid_argument("Cyclic KV copy requires identical component geometry");
     }
     if (source_slot < 0 || source_slot >= source.lane_capacity_) {

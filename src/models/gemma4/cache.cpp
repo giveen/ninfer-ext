@@ -21,11 +21,14 @@ std::int32_t element_count(std::initializer_list<std::int32_t> shape) {
 
 } // namespace
 
-KvCache::~KvCache() {
+void KvCache::release_owned() noexcept {
     for (void* pointer : owned_) {
         if (pointer != nullptr) (void)cudaFree(pointer);
     }
+    owned_.clear();
 }
+
+KvCache::~KvCache() { release_owned(); }
 
 KvCache::KvCache(KvCache&& other) noexcept
     : config_(other.config_), layers_(std::move(other.layers_)), owned_(std::move(other.owned_)),
@@ -38,9 +41,7 @@ KvCache::KvCache(KvCache&& other) noexcept
 
 KvCache& KvCache::operator=(KvCache&& other) noexcept {
     if (this != &other) {
-        for (void* pointer : owned_) {
-            if (pointer != nullptr) (void)cudaFree(pointer);
-        }
+        release_owned();
         config_     = other.config_;
         layers_     = std::move(other.layers_);
         owned_      = std::move(other.owned_);
@@ -76,7 +77,7 @@ void KvCache::configure(const TextConfig& config, std::int32_t capacity, std::in
     storage_    = storage;
     stale_end_  = 0;
     layers_.assign(config.num_hidden_layers, Layer{});
-    std::vector<void*>().swap(owned_);
+    release_owned();
     bytes_ = 0;
 }
 
@@ -215,10 +216,12 @@ Tensor KvCache::value_scales(std::size_t layer) const {
 }
 
 Tensor KvCache::keys(std::size_t layer) const {
+    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
     return existing(layers_.at(layer).keys, layers_.at(layer).allocated);
 }
 
 Tensor KvCache::values(std::size_t layer) const {
+    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
     return existing(layers_.at(layer).values, layers_.at(layer).allocated);
 }
 
@@ -249,6 +252,7 @@ void KvCache::forget_stale(std::size_t layer, std::int32_t from, cudaStream_t st
 
 Tensor KvCache::keys(std::size_t layer) {
     ensure(layer);
+    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
     return layers_[layer].keys;
 }
 
@@ -278,6 +282,7 @@ Tensor KvCache::value_scales(std::size_t layer) {
 
 Tensor KvCache::values(std::size_t layer) {
     ensure(layer);
+    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
     return layers_[layer].values;
 }
 

@@ -3,6 +3,10 @@
 #include "models/qwen3_5/frontend/tool_contract.h"
 #include "text/grammar.h"
 
+#include <memory>
+#include <optional>
+#include <string_view>
+
 namespace ninfer::models::qwen3_5::frontend {
 [[nodiscard]] std::unique_ptr<text::GrammarSession>
 compile_tool_grammar(text::GrammarCompiler& compiler, const ToolCallOutputContract& contract,

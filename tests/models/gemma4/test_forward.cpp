@@ -84,9 +84,9 @@ int main() {
         const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
         const std::size_t bytes   = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
 
-        // The plan's analysis of this checkpoint records the layer scalars as 0.44 to 0.99 with layer
-        // 59 at 0.0364. They scale the whole residual stream once per layer, so they are what explains
-        // the hidden state's final magnitude; the load path is wrong if they leave that band.
+        // The 31B's plan analysis records its layer scalars as 0.44 to 0.99. They scale the whole
+        // residual stream once per layer, so they are what explains the hidden state's final
+        // magnitude; the load path is wrong if they leave that band.
         double scalar_min = 1.0e30;
         double scalar_max = 0.0;
         for (const auto& layer : model->weights().text.layers) {
@@ -126,9 +126,12 @@ int main() {
         for (const auto& layer : model->weights().text.layers) {
             (layer.mixer == gemma::MixerKind::SlidingAttention ? sliding : global) += 1;
         }
-        check(sliding == 50 && global == 10,
+        // The config declares the split, and parse_text_config has already checked it against
+        // `layer_types`; the mixers the loader bound are the independent side of the comparison.
+        check(global == config.global_layers &&sliding == config.num_hidden_layers - config.global_layers,
               "layer kinds: " + std::to_string(sliding) + " sliding, " + std::to_string(global) +
-                  " global");
+                  " global, the config declares " + std::to_string(config.global_layers) + " of " +
+                  std::to_string(config.num_hidden_layers) + " layers global");
 
         // Every layer of the stack, in order, one arena, dispatching on each layer's attention kind.
         // Sliding layers hold the window in a ring, so the cache is sized only for the global layers'
@@ -162,7 +165,8 @@ int main() {
         };
 
         for (std::int32_t position = 0; position < tokens_run; ++position) run_token(position);
-        check(total == 60, "ran " + std::to_string(total) + " layers");
+        check(total == config.num_hidden_layers, "ran " + std::to_string(total) + " of the config's " +
+                  std::to_string(config.num_hidden_layers) + " layers");
         const std::vector<std::uint16_t> rehearsed = read_back();
 
         // The cache makes a pass a function of its state: replaying the last token over the same rows
@@ -226,8 +230,8 @@ int main() {
         std::cout << "gemma4 forward: " << total << " layers (" << sliding << " sliding, " << global
                   << " global) over " << tokens_run << " cached tokens, largest |h| = " << largest
                   << ", smallest |h| = " << smallest << ", layer scalars in [" << scalar_min << ", "
-                  << scalar_max << "], layer 59 = "
-                  << std::fabs(model->layer_scalar(model->weights().text.layers[59].layer_scalar))
+                  << scalar_max << "], layer " << (total - 1) << " = "
+                  << std::fabs(model->layer_scalar(model->weights().text.layers[total - 1].layer_scalar))
                   << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

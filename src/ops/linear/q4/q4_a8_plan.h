@@ -1,6 +1,4 @@
 #pragma once
-
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/layout.h"
 #include "core/tensor.h"
@@ -25,7 +23,7 @@ struct Q4A8Workspace {
 inline std::size_t q4_a8_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {
     if (tokens <= 0) { throw std::invalid_argument("q4 A8 workspace: T must be positive"); }
     const auto count = static_cast<std::size_t>(tokens);
-    if (count > std::numeric_limits<std::size_t>::max() / bytes_per_token) {
+    if (bytes_per_token != 0 &&count > std::numeric_limits<std::size_t>::max() / bytes_per_token) {
         throw std::overflow_error("q4 A8 workspace size overflow");
     }
     return count * bytes_per_token;

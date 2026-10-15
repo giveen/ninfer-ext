@@ -27,6 +27,12 @@ std::int64_t numel_allow_zero(const Tensor& t) {
     return total;
 }
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
 } // namespace
 
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
@@ -44,6 +50,10 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     }
     if (gate.data == nullptr || x.data == nullptr) {
         throw std::invalid_argument("sigmoid_mul: gate/x data must be non-null");
+    }
+    // The contract requires disjoint storage: the Op multiplies x in place while reading gate.
+    if (overlaps(gate, x)) {
+        throw std::invalid_argument("sigmoid_mul: gate and x must not overlap");
     }
 
     detail::sigmoid_gate_mul_launch(gate, x, stream); // single variant -> direct dispatch

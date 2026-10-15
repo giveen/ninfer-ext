@@ -6,6 +6,11 @@
 
 namespace ninfer {
 
+// CUDA decode graphs. Neither wrapper is thread-safe: both hold mutable CUDA handles and their
+// mutators capture, instantiate, or launch on the calling thread's current device and stream, so
+// one instance belongs to one thread at a time. capture() additionally relies on a thread-local
+// CUDA capture mode.
+
 class DecodeGraphDefinition {
 public:
     DecodeGraphDefinition() = default;
@@ -36,6 +41,10 @@ public:
     DecodeGraphExecutable& operator=(DecodeGraphExecutable&& other) noexcept;
 
     void instantiate(const DecodeGraphDefinition& definition);
+    // Updates the executable in place. Both the executable and the definition must be ready
+    // (std::logic_error otherwise), and a rejected update — a topology change or any other
+    // constraint of an in-place update — throws std::runtime_error. Callers that expect a topology
+    // change should prefer try_update() and fall back to instantiate().
     void update(const DecodeGraphDefinition& definition);
     // Attempts the update; returns false, leaving the executable unchanged, when the definition
     // has a different topology or otherwise violates the constraints of an in-place update.

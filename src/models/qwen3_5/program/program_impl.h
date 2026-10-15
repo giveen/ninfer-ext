@@ -46,7 +46,7 @@ using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    return kv_stream_pages (tokens);
 }
 
 [[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
@@ -293,11 +293,6 @@ struct CapturePressureCandidateImpl : ResourceCandidateState {};
 } // namespace ninfer::models::qwen3_5::detail
 
 namespace ninfer::models::qwen3_5::detail {
-
-using AdmissionCandidateImpl       = qwen3_5::detail::AdmissionCandidateImpl;
-using CapturePressureCandidateImpl = qwen3_5::detail::CapturePressureCandidateImpl;
-using ResourceCandidateState       = qwen3_5::detail::ResourceCandidateState;
-using RequestBasePlanImpl          = qwen3_5::detail::RequestBasePlanImpl;
 using CapturePressureCandidate     = qwen3_5::CapturePressureCandidate;
 
 enum class PendingKind : std::uint8_t {
@@ -734,8 +729,6 @@ public:
     [[nodiscard]] ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider* provider,
                                                       std::size_t row,
                                                       std::span<const TokenId> drafts);
-    void require_unmasked_round(runtime::TokenMaskProvider* masks,
-                                std::span<const std::uint32_t> lanes) const;
     Tensor token_counts;
     std::optional<execution::Qwen4ExpertPager> qwen4_experts;
     std::optional<execution::Qwen4Runtime> qwen4_runtime;

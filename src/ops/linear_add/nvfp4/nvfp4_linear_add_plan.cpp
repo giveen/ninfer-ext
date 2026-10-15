@@ -20,10 +20,9 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
-    if (!allows_a4(policy)) {
-        return Nvfp4LinearAddRoute::A16;
+    if (!valid_linear_policy(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
-    if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
+    if (!allows_a4(policy)) { return Nvfp4LinearAddRoute::A16; }
     const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
     return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
 }

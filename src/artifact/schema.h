@@ -5,14 +5,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <flat_map>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 

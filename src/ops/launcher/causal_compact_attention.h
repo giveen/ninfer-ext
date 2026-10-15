@@ -5,6 +5,8 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <cstddef>
+
 #include <cstdint>
 
 #include <cuda_runtime.h>

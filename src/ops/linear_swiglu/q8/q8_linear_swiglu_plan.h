@@ -43,9 +43,12 @@ struct Q8LinearSwiGluPlan {
 };
 
 const char* q8_linear_swiglu_schedule_name(Q8LinearSwiGluScheduleId schedule) noexcept;
-bool q8_linear_swiglu_schedule_uses_mma(Q8LinearSwiGluScheduleId schedule) noexcept;
 bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept;
+
+// Throws std::invalid_argument if the problem is not admitted.
 Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& problem);
+
+// Throws std::invalid_argument if the plan does not match the exact problem.
 
 void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, cudaStream_t stream);

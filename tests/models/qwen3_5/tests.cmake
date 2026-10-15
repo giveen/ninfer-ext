@@ -16,6 +16,12 @@ ninfer_add_test(ninfer_gemma4_kv_quant_footprint_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_kv_quant_footprint.cpp"
   LIBRARIES ninfer_model_loading)
 
+# The frontend digest: FIPS vectors, the padding boundaries at 55/56/63/64/119/120 bytes, and the
+# checkpoint cadence. Host-only, no artifact.
+ninfer_add_test(ninfer_qwen3_5_digest_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_digest.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # Opt-in real-model artifacts, selected by explicit path so a run never depends
 # on glob order or modification time. Configure the ones you have and run
 # `ctest -L real`; an artifact variable left empty makes its test skip (77).
@@ -116,11 +122,16 @@ ninfer_add_test(ninfer_qwen3_5_mtp_draft_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_mtp_envelopes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_envelopes.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_suffix_drafter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_suffix_drafter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
 ninfer_add_test(ninfer_gemma4_tokenizer_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_tokenizer.cpp"
   LIBRARIES ninfer_model_runtime ninfer_artifact)
 set_tests_properties(ninfer_gemma4_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -195,6 +206,30 @@ ninfer_add_test(ninfer_gemma4_score_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_score.cpp"
   LIBRARIES ninfer_model_loading ninfer_engine)
 set_tests_properties(ninfer_gemma4_score_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The Gemma 4 tests that need a checkpoint, an artifact or generated inputs carry the `real` label
+# like their qwen3.5 counterparts, so `ctest -L real` selects them and the parallel `fast` preset
+# leaves them out. They read `NINFER_GEMMA_ARTIFACT`, `NINFER_GEMMA_CHECKPOINT` and their inputs from
+# the environment rather than from a cache variable, and each reports its own skip message when one
+# is missing; docs/maintainer/real-model-tests.md is the reference. `config`, `kv_quant` and
+# `kv_quant_footprint` read only repository fixtures and stay unlabelled.
+set_tests_properties(
+  ninfer_gemma4_tokenizer_test
+  ninfer_gemma4_frontend_test
+  ninfer_gemma4_load_test
+  ninfer_gemma4_model_test
+  ninfer_gemma4_forward_test
+  ninfer_gemma4_layer_test
+  ninfer_gemma4_draft_test
+  ninfer_gemma4_pass_test
+  ninfer_gemma4_mtp_test
+  ninfer_gemma4_vision_test
+  ninfer_gemma4_image_processor_test
+  ninfer_gemma4_image_prompt_test
+  ninfer_gemma4_generate_test
+  ninfer_gemma4_batch_test
+  ninfer_gemma4_score_test
+  PROPERTIES LABELS real)
 
 ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"

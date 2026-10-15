@@ -65,7 +65,7 @@ public:
 
 private:
     struct Slot {
-        std::uint64_t key = 0;               // trigram hash + 1 (0 marks an empty slot)
+        std::uint64_t key = 0; // trigram hash | 1 (0 marks an empty slot)
         std::array<std::uint32_t, kWays> position{};
         std::uint8_t count = 0;
     };

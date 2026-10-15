@@ -157,6 +157,9 @@ public:
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
         out.projection.packed = ops::prepare_linear_weight(inputs);
+        // A fused parent is not built through linear(), so register it for the sensitivity probe
+        // exactly as the main attention path does.
+        register_projection(model_.weight(a.query).name, out.projection.packed);
         // The dense incremental path projects K/V and Q/gate independently through ops::linear_pair,
         // which only implements Q8. Every other format runs the complete packed parent through
         // ops::attn_input_proj instead, so it leaves `rows` empty. Ask the packed parent, not an
@@ -539,6 +542,7 @@ private:
 } // namespace
 
 Parameters::Parameters(const Model& source) : model(source) {
+    clear_probe_targets();
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);

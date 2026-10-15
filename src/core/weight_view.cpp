@@ -341,12 +341,12 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.group            = 16;
         out.scale_dtype      = DType::FP32;
         out.bitrate_half_bits = static_cast<std::uint32_t>(g.bitrate_half_bits);
+        // `scales` is svh, one FP32 per output channel, so the scale plane is 1-D (same convention
+        // as the RowScale branch below); suh is addressed by `input_scales`, which carries no
+        // extent of its own.
         out.scale_ne[0]      = out.n;
-        out.scale_ne[1]      = out.k;
         out.scale_nb[0]      = 4;
-        out.scale_nb[1]      = static_cast<std::int64_t>(out.n) * 4;
-        out.scale_nb[2]      = static_cast<std::int64_t>(out.k) * 4;
-        out.scale_nb[3]      = out.scale_nb[1] + out.scale_nb[2];
+        out.scale_nb[1]      = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 4;
         return out;
     }
     if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {
@@ -385,6 +385,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
+    } else if (g.layout == QuantLayout::RowGroup) {
+        // One binary16 scale per group of 32 columns; see the RowGroup geometry branch.
+        out.scale_dtype = DType::FP16;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype         = DType::FP8_E4M3FN;
         out.weight_divisors     = region.parent->data + g.divisor_offset;

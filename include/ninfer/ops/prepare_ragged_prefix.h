@@ -15,7 +15,9 @@ namespace ninfer::ops {
  * copy source[:,j,lanes[b]], use absolute position starts[b]+j, and publish counts[b]=N. The
  * physical tail j>=N is zero-filled and repeats the final live position (or starts[b] when N=0).
  * The caller guarantees 0<=N<=W and 0<=lanes[b]<C. D must be divisible by eight and all BF16
- * column starts must be 16-byte aligned. Physical W is independent of the live prefix N.
+ * column starts must be 16-byte aligned. B must be at most 65535 (the kernel grid's y extent);
+ * geometry and storage violations throw std::invalid_argument. Physical W is independent of the
+ * live prefix N.
  * The three outputs are pairwise non-overlapping and do not overlap any input. Read-only inputs
  * may alias one another. Inputs remain unchanged; all
  * destination, position and count elements are overwritten exactly. The Op needs no transient

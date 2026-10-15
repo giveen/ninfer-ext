@@ -1,6 +1,6 @@
 // Preconditions, all established by the wrapper: x and out are contiguous BF16 [H,T], expert_ids is
 // I32 [K,T] and expert_weights FP32 [K,T] with 1<=K<=E, both banks carry the geometry's shapes in
-// the same format, and `workspace` is 256-byte aligned and holds the bytes the query below names.
+// the same format, and `workspace` is 16-byte aligned and holds the bytes the query below names.
 #pragma once
 
 #include "core/weight.h" // QType

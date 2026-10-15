@@ -2,6 +2,8 @@
 
 // OpenAI wire objects shared by Chat Completions and Responses HTTP handlers.
 
+#include "ninfer/types.h"
+
 #include "serve/request.h"
 #include "serve/request_json.h"
 
@@ -12,6 +14,11 @@
 #include <string_view>
 
 namespace ninfer::serve {
+
+// Automatic shared-prefix publishing: Default = the client sent no prompt_cache_options; Requested
+// = the client opted in (prompt_cache_options present, mode implicit or absent); Disabled = the
+// client set mode:"explicit" and wants its own boundaries alone. Every state but Disabled lets the
+// server publish automatic candidates (apply_openai_prompt_cache_policy).
 
 enum class OpenAIPromptCacheAutomatic : std::uint8_t {
     Default,

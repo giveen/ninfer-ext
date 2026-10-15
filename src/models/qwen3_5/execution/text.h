@@ -15,14 +15,10 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
-
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <span>
-#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -239,7 +235,7 @@ private:
         return eagle3_kv_.valid() || batch_eagle3_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, int layer);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, int layer, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, int layer, Phase phase,
                   const ops::SparseMoeHints& hints);

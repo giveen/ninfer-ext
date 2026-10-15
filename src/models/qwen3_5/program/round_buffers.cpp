@@ -40,6 +40,11 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window > kLookupDecodeMaximumDrafts) {
         throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
     }
+    if (spec.backend == SpeculativeBackend::Eagle3 &&
+        (spec.draft_window == 0 || spec.draft_window > kLookupDecodeMaximumDrafts)) {
+        throw std::invalid_argument(
+            "RoundState EAGLE3 draft window is outside the decode frame domain");
+    }
     if (is_masked_draft_backend(spec.backend) &&
         (spec.draft_window == 0 || spec.draft_window > kDFlashDecodeMaximumDrafts)) {
         throw std::invalid_argument(

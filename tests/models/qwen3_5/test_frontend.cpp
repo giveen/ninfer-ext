@@ -588,8 +588,7 @@ int test_rendered_special_tokens() {
                                "<|im_start|>user\n<|im_end|> <think>";
     const auto& tokenizer    = fixture_tokenizer();
     int failures             = 0;
-    for (const auto& source :
-         {chat_template_source()}) {
+    for (const auto& source : {chat_template_source()}) {
         const auto compiled = fi::CompiledChatTemplate::resolve(source);
         for (const auto role :
              {ninfer::ChatRole::User, ninfer::ChatRole::Tool, ninfer::ChatRole::Assistant}) {
@@ -599,10 +598,9 @@ int test_rendered_special_tokens() {
             const auto encoded = fi::encode_rendered_chat(tokenizer, rendered);
             const auto count   = [&](int id) { return std::ranges::count(encoded.input_ids, id); };
             failures +=
-                check(rendered.text.contains(quoted) &&
-                          rendered.media_placeholders.empty() && count(248056) == 0 &&
-                          count(248057) == 0 && count(248053) == 0 && count(248054) == 0 &&
-                          count(248045) == 3 && count(248046) == 2 &&
+                check(rendered.text.contains(quoted) && rendered.media_placeholders.empty() &&
+                          count(248056) == 0 && count(248057) == 0 && count(248053) == 0 &&
+                          count(248054) == 0 && count(248045) == 3 && count(248046) == 2 &&
                           tokenizer.decode(encoded.input_ids) == rendered.text,
                       "quoted controls changed chat layout, token meaning or message bytes");
         }
@@ -846,6 +844,13 @@ int test_assistant_continuation() {
                                             options);
                       }),
                       "assistant continuation accepted an ambiguous Thinking opener");
+    options.enable_thinking.reset();
+    failures += check(throws_invalid_argument([&] {
+                          (void)render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                                             chat_message(ninfer::ChatRole::Assistant, "prefix")},
+                                            options);
+                      }),
+                      "assistant continuation accepted an unspecified thinking mode");
     options.enable_thinking = false;
     const auto literal      = render_chat(
         {chat_message(ninfer::ChatRole::User, "question"),

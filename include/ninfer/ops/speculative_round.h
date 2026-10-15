@@ -10,8 +10,11 @@
 namespace ninfer::ops {
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
-    // the general route remains valid for any supported mixture of greedy and stochastic rows.
+    // Execution promise: every row has temperature<=0, both penalties disabled, and no sampling
+    // mask (configs[b].mask.words is null). The raw route's kernel consumes no configs, so a
+    // masked row would be verified against the unmasked argmax; the caller must therefore uphold
+    // the promise. When false, the general route remains valid for any supported mixture of
+    // greedy and stochastic rows.
     bool all_rows_greedy_without_penalties = false;
 };
 
@@ -62,7 +65,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * Algorithm:
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
  *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
- *   bonus column). With both penalties disabled, target_tokens is the exact raw-logit fast path.
+ *   bonus column). With both penalties disabled and no sampling mask, target_tokens is the exact
+ *   raw-logit fast path.
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
  *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft
@@ -146,8 +150,10 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   inputs remain unchanged.
  *
  * Execution:
- *   all_rows_greedy_without_penalties=true promises the matching device configs and enables the
- *   raw target_tokens route. A false flag selects the general route and supports mixed rows.
+ *   all_rows_greedy_without_penalties=true promises matching device configs with temperature<=0,
+ *   both penalties disabled, and no sampling mask, and enables the raw target_tokens route, whose
+ *   kernel consumes no configs and therefore no mask. A false flag selects the general route and
+ *   supports mixed rows.
  *
  * Workspace:
  *   Caller-owned transient storage reported by

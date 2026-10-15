@@ -20,7 +20,8 @@ void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
 bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
     const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
-    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+    if ( lhs_begin <= rhs_begin) { return rhs_begin - lhs_begin < lhs.bytes(); }
+    return lhs_begin - rhs_begin < rhs.bytes();
 }
 
 } // namespace

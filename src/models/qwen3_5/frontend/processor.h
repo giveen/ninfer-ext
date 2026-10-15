@@ -5,6 +5,8 @@
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
+#include <ninfer/types.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -141,8 +143,19 @@ encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
 
 class Processor {
 public:
+    // `tokenizer` and `chat_template` are borrowed and must outlive this Processor; `media_cache`
+    // is shared and kept alive here.
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
+
+    // Both calls render, encode and preprocess against the shared media cache. They are `const` but
+    // not read-only with respect to it: each acquires a request permit and may block on an
+    // in-flight preprocessing of the same media.
+    //
+    // `maximum_prompt_tokens` is the caller's prompt budget: `max()` means unbounded, otherwise the
+    // tokenizer is limited to `maximum_prompt_tokens + 1` tokens and a longer prompt throws
+    // ProcessorError(ContextLengthExceeded). Media and budget failures surface as
+    // ProcessorError(BudgetExceeded) or ProcessorError(InvalidMedia).
 
     [[nodiscard]] std::size_t count_tokens(std::vector<ChatMessage> messages,
                                            ChatRenderOptions render_options  = {},
