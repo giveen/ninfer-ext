@@ -1003,6 +1003,78 @@ Two follow-ups came out of the wave, both same-class duplicates in the slice's o
 
 
 
+## 3m. Eighth batch — the real-model verification, and the regression it found
+
+Three batches (the P3, the maybe and the style subsets) landed without running the
+artifact-dependent model tests. Each recorded that decision with the same reason — "no model
+mathematics changed" — and the reason was wrong in effect. None of the three changed an Op's
+arithmetic, but all three changed files on *model execution paths*: the frontend's constraint
+handling, the EAGLE3 decode bounds, artifact framing, the tokenizer, the gemma4 config, the bf16
+schedules. The fast suite is 188 synthetic tests, and `tests/README.md` warns about exactly this:
+"a green `ctest` does not exercise these tests, and a regression inside them survives an otherwise
+clean sweep."
+
+### What the run found, and how each failure was attributed
+
+| test | symptom | attribution |
+|---|---|---|
+| gemma4 tokenizer / frontend | abort: `cannot read tests/fixtures/gemma4/…` | pre-existing: the fixtures exist, but the test reads a source-relative path while ctest's working directory is `build/tests`. It only runs when `NINFER_GEMMA_CHECKPOINT` is set, which nothing had done here — and it should skip rather than abort |
+| dflash / dflash2 / dflash-prefill | `missing component dflash2` | harness gap: no local artifact carries the qwen draft components, and `real-model-tests.md` says that case must skip. It reports a failure instead |
+| prefix_real | `constraints require default EOS, text output, no custom stops, and one output language` | **pre-existing**: the pre-session commit fails it with the byte-identical message, verified by running both trees alone. My first suspicion — this session's `include_model_defaults` propagation — is refuted, so finding 347's fix stands |
+| gemma4 model / forward, 26B-A4B only | `vector::_M_range_check: __n (1403457) >= size (12118)`; a layer-59 value in a 30-layer run | **pre-existing, and a real defect**: the pre-session commit fails both tests identically — the same range check and the same `layer 59 = 1` line, with a different out-of-range index (95,293,700,405,872, i.e. it reads uninitialised memory). Nothing in the 188-test fast suite runs these tests, so this has been invisible |
+| **EAGLE3 spec residue / concurrency** | `EAGLE3 decode batch is outside the supported domain: width=63 (max 8), batch=1` | **mine.** Finding 367 added upper bounds to `TextContext::eagle3_forward_decode_batch` by copying the MTP ones: `width > kMaximumMtpDraftTokens + 1 \|\| batch > kMaximumConcurrency`. The pre-session commit passes both tests (5 ran, 3 failed: only the dflash pair and prefix). **Resolved**: the width bound is removed, the comment now records what the dimension is, and both tests pass on the current tree (2/2) |
+
+### Outcome
+
+One of the seven failures was mine — the EAGLE3 bound — and it is fixed and verified. The other six
+are pre-existing: one real defect (the gemma4 26B-A4B model and forward paths, which no other
+instrument here covers) and five harness or environment gaps (two fixture-path aborts that should
+skip, three component-missing cases reported as failures rather than skips).
+
+The closing run, strictly serial, is the clean statement of that:
+
+| stage | result |
+|---|---|
+| `ctest --preset real` minus `stream_real` | 13 tests: 9 passed, 3 failed, 1 skipped. The two EAGLE3 tests are among the passes; the three failures are the dflash pair and `prefix_real` |
+| `stream_real` alone | passed (134 s) |
+| gemma4 suite, 26B-A4B QAT | 5 passed, 9 skipped, 4 failed (the two fixture aborts plus `model` and `forward`) |
+| gemma4 suite, 31B | everything runnable passed except the same two fixture aborts |
+
+Attribution is by baseline rather than inference. The pre-session commit `2b4d4d66`, built in a
+scratch worktree at `/tmp/ninfer-baseline`, runs the same tests, and the two trees agree on every
+failure except the EAGLE3 pair. The baseline also refuted my own first suspicion: the `prefix_real`
+constraint failure is identical there, so this session's `include_model_defaults` propagation — the
+one change in that area — is not its cause.
+
+The two harness gaps are worth fixing on their own account, since both turn a legitimately
+not-applicable test into a red one: the dflash tests should return the qualifying skip for
+`missing component dflash2`, and the gemma4 tokenizer and frontend tests should resolve their
+fixtures relative to the source tree (or skip) instead of aborting. The 26B-A4B failure is a real
+defect and deserves its own investigation rather than being folded into a review batch.
+
+### The one that was mine, and why the bound was wrong
+
+`width` in that entry point is `ids.ne[0]`, the number of positions in the *verify batch*. For a
+linear schedule that is the draft window, for a configured tree it is the tree's node count (63 =
+2⁶−1), and under CUDA graphs it is the capture frame's bucket (64). It is bounded by the plan's
+frame capacity, not by `kMaximumMtpDraftTokens`, which is the MTP draft-*token* maximum — MTP has no
+tree, so the same shape carries a different meaning in the two backends. Copying the MTP bound
+therefore rejected legitimate batches and threw on the first round of both tests.
+
+The bound is removed, with a comment recording what the dimension actually is; the batch bound and
+the dtype, shape and contiguity checks stay. The tensors carry their own extents, so those shape
+checks are the real gate — which is why the width bound was not merely wrong but redundant.
+
+This is the trap this batch's own style wave had just written up for `Bf16GemvSchedule` versus
+`Bf16SimtSchedule`: same-typed parameters, different meanings, no compiler complaint.
+
+### Process note
+
+`ctest -L real` belongs in the landing checklist for any batch that touches loading, prefill,
+decode, prefix reuse, the context cache, KV storage, attention, speculative backends, Vision or the
+proposal head. "No model mathematics changed" is not a reason to skip it: these are behaviour tests,
+and the arithmetic suites cannot substitute for them.
+
 ## 4. Full table
 
 `idx | location | band | verdict | note` — sorted by band then path. Use the idx as the key.
@@ -1324,7 +1396,7 @@ Two follow-ups came out of the wave, both same-class duplicates in the slice's o
 | 342 | `src/models/qwen3_5/execution/draft.cpp:78-81` | maintainability·low | P3 | true | FIXED — Same unused binding in batch_feature_sink_impl; no later reference in the function. |
 | 366 | `src/models/qwen3_5/execution/eagle3.cpp:129-129` | bug·medium | P3 | true | FIXED — Shapes are checked but not contiguity (the proposal paths do check `!logits.is_contiguous()`), and only y.bytes() is copied, so a strided hidden would be written dense. |
 | 365 | `src/models/qwen3_5/execution/eagle3.cpp:29-30` | bug·medium | P3 | true | FIXED — parameters_.draft is std::optional (execution/parameters.h:216) and is dereferenced unguarded, unlike the sibling entries that check batch_eagle3_kv_/eagle3_head_. |
-| 367 | `src/models/qwen3_5/execution/eagle3.cpp:67-68` | bug·medium | P3 | true | FIXED — No upper bound on width/batch, while mtp_forward_decode_batch rejects `width > kMaximumMtpDraftTokens + 1` and `batch > kMaximumConcurrency` (text.cpp:866-867). |
+| 367 | `src/models/qwen3_5/execution/eagle3.cpp:67-68` | bug·medium | P3 | true | FIXED — No upper bound on width/batch, while mtp_forward_decode_batch rejects `width > kMaximumMtpDraftTokens + 1` and `batch > kMaximumConcurrency` (text.cpp:866-867). **CORRECTED (model run): the width bound was removed — it copied the MTP draft-token maximum onto the verify/capture dimension** |
 | 294 | `src/models/qwen3_5/execution/ffn.h:3-3` | maintainability·medium | P3 | true | **FIXED (style wave, P3)** — added `core/arena.h` and `core/tensor.h` (WorkspaceArena :11, Tensor :10) plus `<cstddef>`/`<cstdint>`; both previously only via parameters.h:2 -> offload_moe.h.
 | 270 | `src/models/qwen3_5/execution/gdn.h:4-4` | maintainability·low | P3 | true | **FIXED (style wave, P3)** — added `models/qwen3_5/config.h` (GdnConfig, config.h:44) plus `<cstddef>`/`<cstdint>`; both were undeclared here (note: `<cstddef>`/`<cstdint>` also arrive via core/device.h:5-6, the reviewer's "only parameters.h and core/device.h" was half right).
 | 282 | `src/models/qwen3_5/execution/mtp.h:7-8` | documentation·low | P3 | true | FIXED — first/last feed ops workspace-capacity calls (mtp.cpp:15-16) while the projection takes its extent from hidden.ne[1], so sizing must match the call; the header has no comment at all on them. |

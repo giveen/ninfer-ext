@@ -6669,7 +6669,8 @@
    "agent_verdict": "true",
    "dupe_of": [],
    "fixed": true,
-   "fixed_note": "Same upper bounds as MTP: `width > kMaximumMtpDraftTokens + 1` or `batch > kMaximumConcurrency` now throws at the API boundary."
+   "fixed_note": "Same upper bounds as MTP: `width > kMaximumMtpDraftTokens + 1` or `batch > kMaximumConcurrency` now throws at the API boundary.",
+   "correction": "the width bound was removed during the model-verification batch: `width` in eagle3_forward_decode_batch is the verify batch's position count \u2014 a draft window, a draft-tree node count such as 63, or a capture frame's bucket such as 64 \u2014 not the MTP draft-token maximum, so the copied bound rejected legitimate batches. The batch bound and the dtype, shape and contiguity checks stand."
   },
   "368": {
    "path": "src/models/qwen3_5/execution/eagle3.cpp",
