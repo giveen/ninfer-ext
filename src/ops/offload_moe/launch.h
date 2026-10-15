@@ -26,6 +26,7 @@ struct MoeChunk {
     std::int32_t* sorted_slot;
     std::int32_t* jobs;
     std::int32_t* job_count;
+    // NVFP4 paths read/write BF16; the EXL3 paths reinterpret the same buffer as __half (FP16).
     __nv_bfloat16* act;
     float* partial;
     float* gu_partial;          // EXL3: [4][columns*K][2][I] gate/up K-slice partials

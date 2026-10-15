@@ -62,7 +62,6 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
     }
 
     media_acquire::Source source;
-    source.media_type = media_type;
     if (value.starts_with("http://") || value.starts_with("https://")) {
         source.kind = media_acquire::SourceKind::Url;
     } else if (value.starts_with("data:")) {
@@ -72,6 +71,7 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
         source.kind = media_acquire::SourceKind::Path;
         if (value.starts_with("file://")) { value.erase(0, 7); }
     }
+    source.media_type = media_type;
     source.value = value;
 
     media_acquire::Policy policy;

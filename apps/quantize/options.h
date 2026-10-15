@@ -53,9 +53,9 @@ struct QuantizeOptions {
 // std::invalid_argument rather than returning one.
 [[nodiscard]] std::string sanitize_parameter_name(std::string_view name);
 
-// Rate in half bits for one logical parameter: the output head uses head_bits_half, and --hq
-// promotes attention and the two small GDN control projections by one bit per weight (two half
-// bits), matching the plan's promotion set.
+// Rate in half bits for one logical parameter: only `text/output_head` uses head_bits_half — the
+// mtp, draft and proposal heads follow --bits — and --hq promotes attention and the two small GDN
+// control projections by one bit per weight (two half bits), matching the plan's promotion set.
 [[nodiscard]] int bitrate_for_parameter(const QuantizeOptions& options, std::string_view name);
 
 } // namespace ninfer::quantize::app

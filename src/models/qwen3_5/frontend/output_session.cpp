@@ -524,7 +524,7 @@ std::optional<ConstraintObservation> OutputSession::constraint_observation() con
     auto result = impl_->grammar->observation();
     if (impl_->combined) {
         result.branch = impl_->branch;
-    } else if (impl_->tool_call_output.in_tool_region() || !impl_->tool_calls.empty()) {
+    } else if (impl_->tool_call_output.may_be_in_tool_region() || !impl_->tool_calls.empty()) {
         result.branch = ConstraintOutputBranch::Tools;
     } else if (impl_->saw_content || (!impl_->state.in_reasoning && result.complete)) {
         result.branch = ConstraintOutputBranch::Content;

@@ -325,6 +325,16 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         checked_mul(patches64, dimension(config_.patch_width()), "patch elements")) {
         throw std::invalid_argument("Vision processor patch buffer has invalid shape");
     }
+    // The three spans below are copied with the length the workspace layout fixes (2, 4 and 4
+    // elements per patch), never with the source's own size, so the producer contract is checked
+    // here exactly as the patch buffer above is.
+    if (control.position_ids.size() != checked_mul(patches64, 2, "vision position ids") ||
+        control.position_table_indices.size() !=
+            checked_mul(patches64, 4, "vision position table indices") ||
+        control.position_table_weights.size() !=
+            checked_mul(patches64, 4, "vision position table weights")) {
+        throw std::invalid_argument("Vision control position spans have invalid shape");
+    }
     if (output.dtype != DType::BF16 || output.ne[0] != parameters_.merger_fc2.weight.n ||
         output.ne[1] != static_cast<std::int32_t>(tokens64) || output.ne[2] != 1 ||
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {

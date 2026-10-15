@@ -78,6 +78,7 @@ public:
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
+    // Terminal: the last event of a failed stream, which must not be finished afterwards.
     std::string error(const ApiError& api_error) const;
 
 private:

@@ -79,7 +79,8 @@ void context_kv_materialize(
 
 /**
  * Return transient capacity for every registered W in the inclusive interval at the exact batch
- * size, covering every valid count envelope and its selected route.
+ * size, covering every valid count envelope and its selected route. The returned capacity is
+ * determined by max_width (min_width only bounds the admitted interval).
  */
 [[nodiscard]] std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_size,
                                                                           std::int32_t min_width,

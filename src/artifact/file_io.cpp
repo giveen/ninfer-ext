@@ -86,10 +86,10 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         throw ArtifactError(path_.string() + ": unaligned or oversized direct read");
     }
     if (destination.empty()) { return 0; }
-    if (direct_fd_ < 0) {
+    std::call_once (direct_open_once_, [this] {
         direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (direct_fd_ < 0) { fail(path_, "open direct"); }
-    }
+    });
     ssize_t read;
     do {
         read = ::pread(direct_fd_, destination.data(), destination.size(), file_offset(offset));

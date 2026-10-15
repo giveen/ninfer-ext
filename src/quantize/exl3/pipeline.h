@@ -22,6 +22,8 @@ enum class OutScales {
 };
 
 struct TensorOptions {
+    // Stored bits per weight / 2, in [2, 16] (the trellis rate the artifact and the encoder
+    // share); a value outside that range throws std::invalid_argument.
     int bitrate_half_bits      = 8;
     std::uint64_t seed         = 0;
     float damping              = 0.025f; // fraction of the mean Hessian diagonal

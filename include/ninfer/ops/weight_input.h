@@ -23,6 +23,9 @@ struct SingleProjectionWeight {
     LinearPolicy policy = LinearPolicy::A16Only;
 };
 
+// Paired native forms are consumed by the policy-free (A16-only) overloads, so no policy is
+// carried here.
+
 struct PairedProjectionWeights {
     Weight first, second;
 };

@@ -38,6 +38,13 @@ void require_routed(const Tensor& t, DType dtype, std::int32_t columns, const ch
             std::string(label) + " must be [10,T]");
 }
 
+// ExpertLayout::plane_bytes and ExpertWeights::base hold kMaxExpertPlanes entries, so a larger
+// count would index past both as soon as a launcher walks the plane loop.
+void require_expert_planes(const ExpertLayout& layout, const char* op) {
+    require(layout.planes <= kMaxExpertPlanes, op,
+            "an expert layout has at most " + std::to_string(kMaxExpertPlanes) + " planes");
+}
+
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
 
 struct ChunkLayout {
@@ -168,6 +175,7 @@ void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::in
     constexpr const char* op = "expert_cache_fetch";
     require_dense(misses, DType::I32, op, "misses");
     require(max_misses > 0 && misses.numel() >= 2 * max_misses + 1, op, "invalid miss capacity");
+    require_expert_planes(bank.layout, op);
     for (std::int32_t p = 0; p < bank.layout.planes; ++p) {
         require(bank.base[p] != nullptr, op, "bank planes are required");
     }
@@ -186,6 +194,7 @@ void expert_cache_stage(const ExpertCacheState& cache, std::int32_t layer,
     require(layout.format == staged.layout.format && layout.planes == staged.layout.planes &&
                 layout.slot_bytes == staged.layout.slot_bytes,
             op, "bank and staged bank must share one expert layout");
+    require_expert_planes(layout, op);
     for (std::int32_t p = 0; p < layout.planes; ++p) {
         require(bank.base[p] != nullptr && staged.base[p] != nullptr, op,
                 "bank and staged planes are required");
@@ -207,6 +216,8 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
 }
 
 ExpertWeights expert_cache_weights(const ExpertCacheState& cache, const ExpertWeights& bank) {
+    constexpr const char* op = "expert_cache_weights";
+    require_expert_planes(bank.layout, op);
     ExpertWeights out = bank;
     for (std::int32_t p = 0; p < bank.layout.planes; ++p) {
         out.base[p]   = cache.pool + bank.layout.plane_offset(p);

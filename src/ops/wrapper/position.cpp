@@ -42,7 +42,13 @@ void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& des
     if (source.ne[0] != destination.ne[0]) {
         throw std::invalid_argument("offset_i32_positions: source and destination shapes differ");
     }
-    if (delta.data == destination.data) {
+    // The contract excludes any shared storage: delta is a single element, so it aliases a written
+    // destination element whenever it points inside the destination range.
+    const auto delta_begin       = reinterpret_cast<std::uintptr_t> (delta.data);
+    const auto destination_begin = reinterpret_cast<std::uintptr_t>( destination.data);
+    const auto destination_bytes =
+        static_cast<std::uint64_t>(destination.ne[0]) * sizeof(std::int32_t);
+    if (delta_begin >= destination_begin && delta_begin - destination_begin < destination_bytes) {
         throw std::invalid_argument("offset_i32_positions: delta must not alias destination");
     }
     detail::offset_i32_positions_launch(source, delta, destination, stream);

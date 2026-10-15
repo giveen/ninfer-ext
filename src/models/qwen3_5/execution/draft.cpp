@@ -91,6 +91,12 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                          const Tensor& commit_counts, const Tensor& lanes, const Tensor& table_rows,
                          ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
     {
+        // Both the draft config and the draft weights are read below, and neither is validated by
+        // the PrefillContext-only require_dflash_state(), which runs after the first dereference.
+        if (!state.execution.parameters.draft.has_value() ||
+            !state.execution.parameters.model.config().draft.has_value()) {
+            throw std::logic_error("DFlash context append requires draft weights and config");
+        }
         const auto& target         = state.execution.parameters.model.config().text;
         const auto& config         = *state.execution.parameters.model.config().draft;
         const std::int32_t width   = features.ne[1];
@@ -107,23 +113,25 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             table_rows.dtype != DType::I32 || table_rows.ne[0] != batch) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
+        const std::int32_t sliding_window = dimension(config.sliding_window.value_or(0));
+        // An unset window means no layer is sliding, so every layer takes the full-prefix path.
         const bool replace_local_window =
-            batch == 1 && width > dimension(config.sliding_window.value_or(0));
+            batch == 1 && sliding_window > 0 && width > sliding_window;
         if (replace_local_window && (envelope.min_count != static_cast<std::uint32_t>(width) ||
                                      envelope.max_count != static_cast<std::uint32_t>(width))) {
             throw std::invalid_argument(
                 "DFlash oversized local append requires an exact full-prefix commit");
         }
         const int local_offset =
-            replace_local_window ? width - dimension(config.sliding_window.value_or(0)) : 0;
+            replace_local_window ? width -sliding_window : 0;
         const int local_width =
-            replace_local_window ? dimension(config.sliding_window.value_or(0)) : width;
+            replace_local_window ?sliding_window : width;
         const ops::KVCacheAppendPrefixExecutionEnvelope local_envelope{
             replace_local_window
-                ? static_cast<std::uint32_t>(dimension(config.sliding_window.value_or(0)))
+                ? static_cast<std::uint32_t>(sliding_window)
                 : envelope.min_count,
             replace_local_window
-                ? static_cast<std::uint32_t>(dimension(config.sliding_window.value_or(0)))
+                ? static_cast<std::uint32_t>(sliding_window)
                 : envelope.max_count,
         };
         Tensor local_counts = commit_counts;
@@ -132,7 +140,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 throw std::logic_error("DFlash prefill count storage is unavailable");
             }
             local_counts = state.execution.io.dflash_prefill->local_append_count;
-            ops::set_i32_scalar(local_counts, dimension(config.sliding_window.value_or(0)),
+            ops::set_i32_scalar(local_counts,sliding_window,
                                 state.execution.device.stream);
         }
 

@@ -57,6 +57,8 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     auto scope         = workspace->scope();
     const auto scratch = allocate_fp8_a8_workspace(
         *workspace, x.ne[1], weight.k, fp8_a8_partial_bytes(shape, policy, x.ne[1]), pair ? 2 : 1);
+    if (shape.a8 == nullptr)
+        throw std::logic_error("fp8 linear: shape registered for A8 without an A8 route");
     shape.a8(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

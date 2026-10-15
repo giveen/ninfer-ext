@@ -62,7 +62,8 @@ struct ExpertLayout {
 
     [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
 
-    /** Offset of plane `p` inside a cache slot. */
+    /** Offset of plane `p` inside a cache slot; `p` must be in [0,planes), which is at most
+     * kMaxExpertPlanes. */
     [[nodiscard]] constexpr std::int64_t plane_offset(std::int32_t p) const {
         std::int64_t offset = 0;
         for (std::int32_t i = 0; i < p; ++i) { offset += plane_bytes[i]; }

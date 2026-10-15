@@ -33,7 +33,8 @@ public:
 
     // Called once the Engine is ready. `memory` supplies the fixed KV pool size; it is not read
     // per scrape because Engine::memory_summary() waits for the execution lock. Engine counters
-    // are reported relative to `baseline`, which excludes startup warmup.
+    // are reported relative to `baseline`, which excludes startup warmup. attach() writes the
+    // identity and the baseline without the scrape lock, so it must complete before any render().
     void attach(std::string model_name, const MemorySummary& memory, const RuntimeStats& baseline);
 
     void observe_done(const GenerationOutcome& outcome);

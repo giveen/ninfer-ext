@@ -59,6 +59,7 @@ public:
     // Parses and validates the template; malformed source throws std::invalid_argument, whose
     // message is prefixed with `source_name` (used for nothing else).
     explicit JinjaTemplate(std::string source, std::string source_name);
+    [[nodiscard]]
     TemplateOutput render(const nlohmann::ordered_json& context,
                           const TemplateRenderOptions& options = {}) const;
 

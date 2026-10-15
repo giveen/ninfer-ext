@@ -147,7 +147,8 @@ public:
     [[nodiscard]] RoundMembership build_round_membership(const Slots& slots,
                                                          std::uint32_t max_concurrency) const {
         RoundMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const std::uint32_t lanes = std::min<std::uint32_t>(max_concurrency, kMaximumConcurrency);
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
             const auto& request = slots[lane];
             if (request == nullptr || !request->is_decode_ready() || request->capture_pending) {
                 continue;
@@ -176,7 +177,8 @@ public:
     [[nodiscard]] ControlMembership build_control_membership(const Slots& slots,
                                                              std::uint32_t max_concurrency) const {
         ControlMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const std::uint32_t lanes = std::min<std::uint32_t>(max_concurrency, kMaximumConcurrency);
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
             const auto& request = slots[lane];
             if (request == nullptr || !request->is_control_ready() || request->capture_pending) {
                 continue;
@@ -207,7 +209,8 @@ public:
     [[nodiscard]] ActiveAdmissionSet active_admission_set(const Slots& slots,
                                                           std::uint32_t max_concurrency) const {
         ActiveAdmissionSet active;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const std::uint32_t lanes = std::min<std::uint32_t>(max_concurrency, kMaximumConcurrency);
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
             const auto& request = slots[lane];
             if (request == nullptr) { continue; }
             if (request->remaining_service_work == 0) {
@@ -294,6 +297,8 @@ public:
         }
         return std::nullopt;
     }
+
+    // `lane` must be an owned lane index (< kMaximumConcurrency); it only seeds the round-robin.
 
     void record_prefill_served(std::uint32_t lane) noexcept { last_prefill_lane_ = lane; }
 

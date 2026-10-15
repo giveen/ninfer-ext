@@ -82,7 +82,7 @@ template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
     std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-    for (const GraphExecutionProfile profile : profiles) {
+    for (const GraphExecutionProfile& profile : profiles) {
         const std::size_t allowance = profile_allowance(profile);
         const auto existing         = std::ranges::find_if(
             classes, [&](const auto& entry) { return entry.first == profile.topology_class; });

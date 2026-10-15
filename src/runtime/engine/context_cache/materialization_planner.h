@@ -71,6 +71,10 @@ template <class Policy>
     return order;
 }
 
+// Owned by one ResourceManager and driven by the single scheduling path. plan() clears and refills
+// the queue, identity-cost and portfolio scratch below, so one instance is not reentrant and must
+// not be used by two threads at once.
+
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
 public:

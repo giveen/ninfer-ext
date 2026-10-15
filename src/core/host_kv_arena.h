@@ -5,6 +5,8 @@
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
+#include <cassert>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -36,6 +38,9 @@ struct HostKVPageLayout {
     std::size_t page_stride    = 0; // Host bytes of one page, all layers
 
     [[nodiscard]] std::uint32_t layer_of(std::size_t plane) const noexcept {
+        // layer_planes is 0 only for a default-constructed layout, which has no planes; every
+        // planned layout carries a positive count, so a call on the sentinel is a caller error.
+        assert(layer_planes != 0);
         return static_cast<std::uint32_t>(plane / layer_planes);
     }
 
@@ -55,6 +60,10 @@ class HostKVArena;
 class HostKVAllocationHandle {
 public:
     HostKVAllocationHandle() noexcept = default;
+
+    // Bound to an arena, not "still live": only the views' valid() proves the allocation a handle
+    // names has not been released or regenerated, so a handle copied out of a stale allocation
+    // still answers true here.
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
@@ -153,6 +162,8 @@ public:
     HostKVAllocation(HostKVAllocation&& other) noexcept;
     HostKVAllocation& operator=(HostKVAllocation&& other) noexcept;
 
+    // Bound to an arena rather than live; see HostKVAllocationHandle::valid().
+
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
     [[nodiscard]] HostKVAllocationHandle handle() const noexcept;
@@ -192,6 +203,8 @@ public:
 
     HostKVAllocationRecipe(const HostKVAllocationRecipe&)            = delete;
     HostKVAllocationRecipe& operator=(const HostKVAllocationRecipe&) = delete;
+
+    // Bound to an arena rather than live; see HostKVAllocationHandle::valid().
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
@@ -266,7 +279,11 @@ public:
         std::span<const HostKVAllocationRequest> target_allocations) const;
 
     // The caller supplies already-sized empty outputs so successful adoption cannot allocate.
-    // A false return leaves the arena and every input allocation unchanged.
+    // A false return leaves the arena and every input allocation unchanged: it means the recipe
+    // does not belong to this revision, or the inputs/outputs do not correspond to it (outputs must
+    // be empty, in the recipe's request order). The mutation phase then cannot fail while the
+    // revision still matches, so an inconsistency past that point means a broken arena invariant
+    // and terminates the process rather than leaving the recipe half-adopted.
     [[nodiscard]] bool apply_recipe(HostKVAllocationRecipe&& recipe,
                                     std::span<HostKVAllocation* const> proposed_releases,
                                     std::span<HostKVAllocation> target_allocations) noexcept;

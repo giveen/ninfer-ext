@@ -37,7 +37,6 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("add_bias: bias/x must be BF16");
     }
     const std::int64_t n = checked_numel(x);
-    (void)checked_numel(bias);
     if (bias.ne[0] != x.ne[0] || bias.ne[1] != 1 || bias.ne[2] != 1 || bias.ne[3] != 1) {
         throw std::invalid_argument("add_bias: bias must have shape [x.ne[0]]");
     }

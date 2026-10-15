@@ -1014,7 +1014,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             commit_generated_prefix_identity(sequence, pending.base_S,
                                              std::span<const TokenId>(token_base, committed),
                                              prefix_execution_splits[row]);
-            advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
+            advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk,
+                recorded_split_frontier(pending.base_S, prefix_execution_splits[row]));
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;

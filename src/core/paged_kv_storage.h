@@ -40,6 +40,9 @@ struct PagedKVStorageLayout {
                static_cast<std::size_t>(value.has_scale());
     }
 
+    // Logical (decode-domain) sizes, not stored ones: a logical vector is head_dim 16-bit elements
+    // whatever the codec's data_dtype packs, and K and V are taken to be equally wide.
+
     [[nodiscard]] constexpr std::size_t logical_vector_bytes() const noexcept {
         return static_cast<std::size_t>(head_dim) * sizeof(std::uint16_t);
     }

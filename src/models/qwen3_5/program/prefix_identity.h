@@ -25,6 +25,12 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
+    // Compares the resident metadata (token types, positions, vision items, rewrite frontiers) of
+    // the first `count` tokens against `prompt`. Token ids are NOT compared: they live in the
+    // ledger, so this method is only a complete match together with the id comparison performed by
+    // prefix_matches(), its only caller. Call it directly only when the ids are already known
+    // equal.
+
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;
 

@@ -23,7 +23,9 @@
 namespace ninfer::models::gemma4 {
 
 struct ImagePatches {
-    // The patch grid: `grid_width` patches across, `grid_height` down, both multiples of 3.
+    // The patch grid: `grid_width` patches across, `grid_height` down. encode_image accepts only
+    // positive multiples of the tower's pooling kernel (3) and throws std::invalid_argument
+    // otherwise.
     std::int32_t grid_width  = 0;
     std::int32_t grid_height = 0;
     // BF16 [patches, 3 * 16 * 16]: patch p = row * grid_width + column, each patch's pixels in

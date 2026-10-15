@@ -26,7 +26,8 @@ namespace ninfer::ops {
  * the stable top sixteen scores and global token ids per column.
  *
  * @details For any positive column count `U`, `hidden` is contiguous BF16 `[5120,U]`, `head` is
- * either Q8_G32_FP16 or FP8_E4M3FN_ROW_BF16 `[248320,5120]`, and `valid_rows` is 248077. For every
+ * either Q8_G32_FP16 or FP8_E4M3FN_ROW_BF16 `[248320,5120]`, and `valid_rows` must equal the
+ * registered public token count (248077); any other value is rejected. For every
  * `t in [0,U)` and valid vocabulary row `v`, the ideal score is
  *
  * @f[

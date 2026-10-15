@@ -58,6 +58,10 @@ struct StateImageSelectors {
     std::int32_t destination = -1;
 };
 
+// An in-flight State transfer. The store keeps the transfer's slot reserved and this object closes
+// it out on destruction, so a transfer must not outlive the store that minted it: the store is
+// bound in `owner_` and the destructor calls back into it.
+
 class StateImageTransfer {
 public:
     StateImageTransfer() noexcept = default;
@@ -98,9 +102,9 @@ public:
                     std::uint32_t logical_capacity)
         : device_(&device), host_(host), objects_(logical_capacity),
           free_objects_(logical_capacity),
-          free_device_slots_(static_cast<std::size_t>(device.slot_count())),
+          free_device_slots_(validated_device_slots(device)),
           free_object_count_(logical_capacity),
-          free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
+          free_device_count_(static_cast<std::uint32_t>(validated_device_slots(device))) {
         if (logical_capacity == 0 || device.slot_count() <= 0 ||
             logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
             (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
@@ -678,6 +682,16 @@ public:
     }
 
 private:
+    // The pool's slot count is signed and sizes containers during member initialization, before the
+    // constructor body can validate it: a negative count would otherwise allocate an enormous
+    // vector instead of naming the bad geometry.
+    [[nodiscard]] static std::size_t
+    validated_device_slots(const qwen3_5::StateImageDevicePool& device) {
+        if (device.slot_count() <= 0) {
+            throw std::invalid_argument("StateImageStore device slot count is not positive");
+        }
+        return static_cast<std::size_t>(device.slot_count());
+    }
     struct Object {
         std::uint32_t generation    = 1;
         std::uint64_t content_epoch = 0;

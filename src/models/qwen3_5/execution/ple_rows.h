@@ -32,6 +32,8 @@ public:
     };
 
     // Reads every range; afterwards `data(i)` addresses range i. Ranges may repeat or overlap.
+    // Not thread-safe: it rewrites the staging `data()` points into, so it must not run while
+    // another call is reading this reader.
     void read(std::span<const Range> ranges);
 
     [[nodiscard]] const std::byte* data(std::size_t range) const { return located_.at(range); }

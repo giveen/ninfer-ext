@@ -27,7 +27,16 @@ void validate_long_anchor_ordinals(std::span<const LongAnchorCheckpoint> anchors
                                    std::size_t capacity);
 
 void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
-                          std::uint32_t prefill_chunk);
+                          std::uint32_t prefill_chunk,
+                          std::optional<std::uint32_t> minted_boundary = std::nullopt);
+
+// The identity frontier a generated-prefix commit records for `split_after` tokens appended at
+// `base_ledger_frontier` (what ResidentPrefixIdentity::append_generated writes), or nullopt when
+// the commit records none. It is the segment boundary a fresh rebuild at a later frontier would
+// split at, so rebuild work must be anchored there.
+[[nodiscard]] std::optional<std::uint32_t>
+recorded_split_frontier(std::uint32_t base_ledger_frontier,
+                        std::optional<std::uint32_t> split_after) noexcept;
 
 // Exact root rebuild work for a frontier: full prefill from root to the frontier with the
 // prompt's fully consumed vision features and the capture/rewrite segment boundaries.

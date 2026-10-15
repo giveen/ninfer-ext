@@ -44,6 +44,8 @@ public:
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
+    // listen() also owns the stats reporter thread, started and joined there, so the owner must not
+    // destroy the server while listen() is running.
     bool bind();
     void attach(GenerationService& service);
     bool listen();

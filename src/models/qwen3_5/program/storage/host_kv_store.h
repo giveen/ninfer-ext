@@ -301,6 +301,12 @@ public:
         return true;
     }
 
+    // The `can_*` and `release_*` queries below are logically const but they stage their work in
+    // the mutable scratch buffers at the end of this class (release stamps, marks, affected
+    // extents, suballocation releases). They are therefore single-threaded and non-reentrant:
+    // calling one while another of them is in flight on the same store would interleave those
+    // stamps and marks. Callers run them serially from the engine's planning thread.
+
     [[nodiscard]] bool
     can_release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) const noexcept {
         begin_release_marks();

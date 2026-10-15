@@ -20,6 +20,9 @@ void require_positive(std::int32_t value, const char* label) {
 std::int32_t checked_outer_extent(const GdnReplayRecordSpec& spec) {
     const auto layers   = static_cast<std::int64_t>(spec.layers);
     const auto capacity = static_cast<std::int64_t>(spec.record_capacity);
+    if (capacity <= 0) {
+        throw std::invalid_argument("GDN replay record capacity must be positive");
+    }
     if (layers > std::numeric_limits<std::int32_t>::max() / capacity) {
         throw std::overflow_error("GDN replay layer/row extent exceeds int32");
     }

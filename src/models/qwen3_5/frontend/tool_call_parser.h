@@ -36,7 +36,10 @@ public:
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
                           std::size_t max_tool_name_length);
 
-    [[nodiscard]] bool in_tool_region() const noexcept {
+    // True while the decoder is withholding bytes that could belong to a tool-call marker: a
+    // complete marker has been seen, or a partial one (a single trailing `<` is enough) is pending.
+
+    [[nodiscard]] bool may_be_in_tool_region() const noexcept {
         return saw_tool_marker_ || marker_prefix_bytes_ != 0;
     }
 

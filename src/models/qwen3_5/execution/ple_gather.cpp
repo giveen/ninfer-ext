@@ -61,8 +61,14 @@ std::uint16_t float_to_bf16(float value) {
 } // namespace
 
 PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream)
-    : table_(table), config_(config), width_(config.embed_dim), row_width_(config.row_width()) {
-    if (config.ngram_size < 2 || config.ngram_size > kMaximumNgram ||
+    : table_(table), config_(config), width_(config.embed_dim), row_width_(0) {
+    // row_width() is embed_dim / heads(), so heads() must be nonzero before it is evaluated;
+    // a default-constructed PleConfig (ngram_size 0, heads_per_ngram 0) is 0 / 0 otherwise.
+    if (config.ngram_size < 2 || config.heads() == 0) {
+        throw std::invalid_argument("PLE gather configuration is inconsistent");
+    }
+    row_width_ = config.row_width();
+    if ( config.ngram_size > kMaximumNgram ||
         config.multipliers.size() != config.ngram_size ||
         config.head_moduli.size() != config.heads() ||
         config.head_offsets.size() != config.heads() || row_width_ == 0 ||

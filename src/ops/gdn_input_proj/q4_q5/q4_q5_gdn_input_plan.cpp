@@ -127,7 +127,7 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
-        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.qkv_rows - problem.qk_rows);
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }

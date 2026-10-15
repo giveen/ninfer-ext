@@ -766,7 +766,11 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
         std::vector<GeneratedToolCall> calls;
         ToolCallParseDiagnostics diagnostics;
         auto region = std::string_view(tool_region_);
-        region.remove_prefix(region.find(kToolOpen));
+        const auto marker =region.find(kToolOpen);
+        if (marker == std::string_view::npos) {
+            throw std::logic_error("tool region lost its opening marker");
+        }
+        region.remove_prefix(marker);
         const auto status =
             ConstrainedToolRegionParser(region, *contract_).parse(calls, diagnostics);
         if (!calls.empty() || status == ConstrainedToolRegionParser::Status::Invalid)
@@ -792,7 +796,11 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         Terminal result;
         result.diagnostics.marker_seen = true;
         auto region                    = std::string_view(tool_region_);
-        region.remove_prefix(region.find(kToolOpen));
+        const auto marker              =region.find(kToolOpen);
+        if (marker == std::string_view::npos) {
+            throw std::logic_error("tool region lost its opening marker");
+        }
+        region.remove_prefix(marker);
         const auto status      = ConstrainedToolRegionParser(region, *contract_)
                                      .parse(result.tool_calls, result.diagnostics);
         const bool interrupted = reason == FinishReason::OutputLimit ||

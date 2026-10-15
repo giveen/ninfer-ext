@@ -3,11 +3,11 @@
 #include "core/weight.h"
 #include "core/tensor.h"
 
+#include "ops/linear_pair/q8/q8_pair_plan.h" // Q8PairScheduleId
+
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
-
-enum class Q8PairScheduleId;
 
 void q8_pair_decode_r4_launch(const Tensor& x, const Weight& first_weight,
                               const Weight& second_weight, Tensor& first_out, Tensor& second_out,

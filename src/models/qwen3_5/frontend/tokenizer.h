@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -88,17 +89,25 @@ public:
         while (capacity < rule_count * 2U) { capacity <<= 1U; }
         slots_.assign(capacity, BpeMergeEntry{});
         mask_ = capacity - 1U;
+        entries_ = 0;
     }
 
     // Returns false when the key is already present, which is how the loader detects a
-    // duplicate pair in model.merges.
+    // duplicate pair in model.merges. Rejects a rule that would break the probe's termination:
+    // result < 0 is indistinguishable from an empty slot, and a table past half capacity has
+    // no empty slot left for a distinct key to land in.
     bool insert(std::uint64_t key, BpeMergeRule rule) {
+        if (rule.result < 0) { throw std::invalid_argument("BPE merge rule has no result token"); }
+        if (entries_ * 2U >= slots_.size()) {
+            throw std::invalid_argument("BPE merge table holds more rules than reset() sized");
+        }
         std::uint64_t index = mix(key) & mask_;
         while (slots_[index].result >= 0) {
             if (slots_[index].key == key) { return false; }
             index = (index + 1U) & mask_;
         }
         slots_[index] = BpeMergeEntry{.key = key, .rank = rule.rank, .result = rule.result};
+        ++entries_;
         return true;
     }
 
@@ -124,6 +133,7 @@ private:
 
     // One empty slot by default, so find() on a default-constructed table terminates.
     std::vector<BpeMergeEntry> slots_ = std::vector<BpeMergeEntry>(1);
+    std::size_t entries_              = 0;
     std::uint64_t mask_               = 0;
 };
 

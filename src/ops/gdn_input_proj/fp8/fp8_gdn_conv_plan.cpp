@@ -49,7 +49,7 @@ Fp8GdnConvPlan b1_a16_plan(std::int32_t width) {
 
 std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t materialized_columns,
                               std::int32_t maximum_columns) {
-    if (materialized_columns == 0) { return 0; }
+    if (maximum_plan.schedule != Fp8GdnConvScheduleId::MaterializedA8 &&materialized_columns == 0) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, materialized_columns);
     if (maximum_plan.schedule == Fp8GdnConvScheduleId::MaterializedA8) {

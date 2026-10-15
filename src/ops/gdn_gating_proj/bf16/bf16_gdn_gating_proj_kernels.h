@@ -32,7 +32,9 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
                                                  Tensor& beta, cudaStream_t stream);
 
 // Cooperative launchers return false without submitting work only when the selected device cannot
-// make one complete token tile resident. The Op wrapper owns the non-cooperative fallback.
+// make one complete token tile resident, and throw std::invalid_argument for a weight shape or a
+// token domain they cannot serve - as do the small-T, GEMV and SIMT launchers here. The Op wrapper
+// owns the non-cooperative fallback.
 [[nodiscard]] bool bf16_gdn_gating_proj_mma_split8_launch(
     Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
     const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,

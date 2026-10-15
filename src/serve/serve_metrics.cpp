@@ -351,7 +351,7 @@ std::string ServeMetrics::render(const RuntimeStats& runtime) const {
              "Submitted mask payload bytes.", static_cast<double>(constraint_upload_bytes_));
     w.scalar("ninfer:constraint_draft_wait_seconds_total", "counter",
              "Draft-ready wait, counted once per speculative batch.",
-             static_cast<double>(runtime.host_work.constraint_draft_wait_ns -
+             since(runtime.host_work.constraint_draft_wait_ns,
                                  baseline_.host_work.constraint_draft_wait_ns) *
                  1e-9);
     w.scalar("ninfer:spec_decode_num_drafts_total", "counter",

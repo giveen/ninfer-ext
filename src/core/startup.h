@@ -15,9 +15,19 @@ inline void publish_startup_event(const StartupObserver& observer,
     } catch (...) {}
 }
 
+// RAII scope for one startup phase: publishes Begin on construction, Progress/Complete from
+// progress()/complete(), and Failed when it unwinds incomplete. progress()/complete() are called
+// from the thread that owns the scope; the progress counters and the terminal flag are plain
+// members, so reporting a phase from several threads is a data race.
+
 class StartupPhaseScope {
 public:
     using Clock = std::chrono::steady_clock;
+
+    // The observer is captured by address and must outlive the scope, so a temporary is a compile
+    // error rather than a dangling `observer_`.
+    StartupPhaseScope(StartupObserver&&, StartupPhase,
+                      StartupProgressUnit = StartupProgressUnit::None, std::uint64_t = 0) = delete;
 
     StartupPhaseScope(const StartupObserver& observer, StartupPhase phase,
                       StartupProgressUnit unit = StartupProgressUnit::None,
@@ -59,6 +69,9 @@ public:
 
 private:
     void publish(StartupStatus status, std::uint64_t current, std::uint64_t total) const noexcept {
+        // Only terminal events carry timing: Begin/Progress report elapsed_ns == 0 rather than pay
+        // a clock read on every progress callback, and consumers time a phase from its terminal
+        // Complete/Failed event.
         const std::uint64_t elapsed_ns =
             status == StartupStatus::Begin || status == StartupStatus::Progress
                 ? 0

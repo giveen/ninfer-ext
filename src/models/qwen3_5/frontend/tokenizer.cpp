@@ -1111,13 +1111,15 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     while (pos < text.size()) {
         const AddedToken* match_token = nullptr;
         const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
+        // Every candidate here starts with the byte at `pos`, so two that match are prefix-related;
+        // the reference tokenizer resolves that by length, not by the lower token id.
         for (const std::size_t index : candidates) {
             const AddedToken& token = added_tokens_[index];
             if (token.content.size() <= text.size() - pos &&
                 text.compare(pos, token.content.size(), token.content) == 0 &&
-                !text::overlaps(literal_spans, pos, pos + token.content.size())) {
+                !text::overlaps(literal_spans, pos, pos + token.content.size()) &&
+                (match_token == nullptr || token.content.size() > match_token->content.size())) {
                 match_token = &token;
-                break;
             }
         }
 

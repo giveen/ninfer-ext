@@ -3,7 +3,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iterator>
@@ -532,11 +531,16 @@ std::uint64_t price_context_transfer_requirements(
 }
 
 std::string context_cost_hardware_class(std::string_view gpu_name, int major, int minor) {
+    // ASCII classification, not <cctype>: the slug is a persisted preset key, so it must not depend
+    // on the process locale.
     std::string slug;
     slug.reserve(gpu_name.size() + 20);
     for (const unsigned char character : gpu_name) {
-        if (std::isalnum(character)) {
-            slug.push_back(static_cast<char>(std::tolower(character)));
+        if (character >= 'A' && character <= 'Z') {
+            slug.push_back(static_cast<char>(character - 'A' + 'a'));
+        } else if ((character >= 'a' && character <= 'z') ||
+                   (character >= '0' && character <= '9')) {
+            slug.push_back(static_cast<char>(character));
         } else if (!slug.empty() && slug.back() != '-') {
             slug.push_back('-');
         }

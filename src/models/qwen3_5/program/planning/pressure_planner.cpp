@@ -230,6 +230,12 @@ PressurePlanningSessionImpl::~PressurePlanningSessionImpl() noexcept {
                             [](const AssessmentSlot& slot) { return slot.leased; })) {
         std::terminate();
     }
+    // A leased construction slot means a cursor outlives this session, exactly as a leased
+    // assessment slot means an assessed target does; both would call back into freed memory.
+    if (std::ranges::any_of(construction_slots,
+                            [](const ConstructionSlot& slot) { return slot.leased; })) {
+        std::terminate();
+    }
     if (program != nullptr) { program->pressure_planning_active_ = false; }
 }
 
@@ -623,6 +629,7 @@ auto PressurePlanningSessionImpl::construction_slot(
 
 void PressurePlanningSessionImpl::release_construction(const void* owner, std::uint32_t index,
                                                        std::uint32_t lease) noexcept {
+    if (owner == nullptr) { std::terminate(); }
     auto& session = *const_cast<PressurePlanningSessionImpl*>(
         static_cast<const PressurePlanningSessionImpl*>(owner));
     if (index < session.construction_slots.size()) {

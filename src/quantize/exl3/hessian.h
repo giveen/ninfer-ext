@@ -9,13 +9,16 @@
 
 namespace ninfer::quantize::exl3 {
 
-// x: [tokens][k] BF16 activations, row-major with row stride k. h: [k][k] FP32, updated in place
-// (both triangles). k % 128 == 0.
+// x: [tokens][k] BF16 activations, row-major with row stride k. h: [k][k] FP32, accumulated into
+// in place (both triangles), so the caller must zero it before the first call on a matrix and
+// invalid arguments (k <= 0, k % 128 != 0, k beyond the tile grid) throw std::invalid_argument.
+// The launch is asynchronous on `stream`.
 void accumulate_hessian(const __nv_bfloat16* x, std::int64_t tokens, std::int64_t k, float* h,
                         cudaStream_t stream);
 
 // Same reduction for the K x tokens activation a model linear Op takes (row stride tokens):
-// h[i][j] += sum_t x[i][t] * x[j][t]. k % 128 == 0.
+// h[i][j] += sum_t x[i][t] * x[j][t]. k % 128 == 0, h zero-initialized first, invalid arguments
+// throw std::invalid_argument.
 void accumulate_hessian_kt(const __nv_bfloat16* x_kt, std::int64_t tokens, std::int64_t k,
                            float* h, cudaStream_t stream);
 

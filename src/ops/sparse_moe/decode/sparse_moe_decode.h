@@ -34,7 +34,7 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena) {
     SparseMoeDecodeWorkspace out;
     out.ids          = arena.alloc(DType::I32, {8}, 16);
     out.alpha        = arena.alloc(DType::FP32, {8}, 16);
-    out.shared_scale = arena.alloc(DType::FP32, {1}, 4);
+    out.shared_scale = arena.alloc(DType::FP32, {1}, 16);
     // D1 uses the first 257 values as scores. D3 then reuses the same lifetime for [9,512]
     // natural FP32 SwiGLU results consumed by D4.
     out.scratch = arena.alloc(DType::FP32, {9, 512}, 256);

@@ -124,7 +124,7 @@ struct VisionConfig {
 
     // The most patches one image has: its soft tokens times the pooling cell.
     [[nodiscard]] std::uint32_t max_patches() const noexcept {
-        return soft_tokens_per_image * pooling_kernel_size * pooling_kernel_size;
+        return static_cast<std::uint32_t>(static_cast<std::uint64_t>( soft_tokens_per_image) * pooling_kernel_size * pooling_kernel_size);
     }
 };
 

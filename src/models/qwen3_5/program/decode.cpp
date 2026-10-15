@@ -1250,7 +1250,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
         break;
     case PendingKind::Ordinary:
         advance_rebuild_work(sequence, request.pending.base_E + request.pending.produced,
-                             prefill_chunk);
+                             prefill_chunk,
+            recorded_split_frontier(base_ledger_frontier, prefix_execution_split_after));
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
         if (speculative_backend == SpeculativeBackend::Mtp) {

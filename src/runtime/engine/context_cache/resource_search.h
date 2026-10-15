@@ -9,7 +9,8 @@ namespace ninfer::runtime {
 
 // Session-local indexed membership for opaque Program target ordinals. Storage is acquired when a
 // bounded search begins; discovering, assessing, and expanding targets performs no allocation and
-// no linear handle scan.
+// no linear handle scan. One instance belongs to one session and one thread: the marks are
+// unsynchronized, so it must not be shared between threads.
 class BoundedTargetLedger {
 public:
     static constexpr std::uint8_t Discovered = 1U;
@@ -22,9 +23,12 @@ public:
 
     void reset(std::size_t capacity) { states_.assign(capacity, 0); }
 
+    // True when every bit of `mark` has been recorded; marks are combined with `mark()`, so a
+    // membership question must ask for all of them.
+
     [[nodiscard]] bool contains(std::uint32_t ordinal, std::uint8_t mark) const {
         require_ordinal(ordinal);
-        return (states_[ordinal] & mark) != 0;
+        return mark != 0 && (states_[ordinal] & mark)== mark;
     }
 
     void mark(std::uint32_t ordinal, std::uint8_t mark) {

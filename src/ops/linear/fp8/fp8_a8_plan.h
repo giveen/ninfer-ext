@@ -36,6 +36,7 @@ inline constexpr std::int64_t kFp8A8PairResidentBytes = 32 << 20;
 
 // Token width of one pair-route chunk: whole tiles that fit the resident budget.
 inline std::int32_t fp8_a8_pair_token_slice(std::int32_t input_rows) {
+    if (input_rows <= 0) { throw std::invalid_argument("fp8 A8 pair slice: K must be positive"); }
     const std::int64_t per_tile = 2 * std::int64_t(kFp8A8PairBlockTokens) * input_rows;
     const auto tiles =
         static_cast<std::int32_t>(std::max<std::int64_t>(1, kFp8A8PairResidentBytes / per_tile));
@@ -54,6 +55,8 @@ struct Fp8A8Workspace {
 
 inline std::size_t fp8_a8_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 A8 workspace: T must be positive"); }
+    if (bytes_per_token == 0) {
+        throw std::invalid_argument("fp8 A8 workspace: bytes per token must be nonzero"); }
     const auto count = static_cast<std::size_t>(tokens);
     if (count > std::numeric_limits<std::size_t>::max() / bytes_per_token) {
         throw std::overflow_error("fp8 A8 workspace size overflow");

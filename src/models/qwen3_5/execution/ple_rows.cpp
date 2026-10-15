@@ -113,10 +113,13 @@ PleRowReader::Page PleRowReader::page_of(std::uint64_t object_offset, std::uint3
 
 void PleRowReader::reserve(std::size_t pages) {
     if (pages <= staging_pages_) { return; }
+    // Allocate before releasing the old block: a failed allocation leaves the previously read
+    // pages (and the pointers data() handed out) intact instead of freeing them under the caller.
+    std::byte* const grown       = static_cast<std::byte*>(std::aligned_alloc(kPage, pages * kPage));
+    if (grown == nullptr) { throw std::bad_alloc(); }
     std::free(staging_);
-    staging_       = static_cast<std::byte*>(std::aligned_alloc(kPage, pages * kPage));
-    staging_pages_ = staging_ != nullptr ? pages : 0;
-    if (staging_ == nullptr) { throw std::bad_alloc(); }
+    staging_       = grown;
+    staging_pages_ = pages;
 }
 
 void PleRowReader::read(std::span<const Range> ranges) {

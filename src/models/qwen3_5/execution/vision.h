@@ -87,6 +87,9 @@ public:
                          qwen3_5::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
                          std::size_t& handoff_peak_bytes);
 
+    // `begin` must not decrease across the calls of one session: the session consumes the plan's
+    // media uses in prompt order and never rewinds, so a replayed range would skip its items.
+
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
     void retire_handoff() noexcept;

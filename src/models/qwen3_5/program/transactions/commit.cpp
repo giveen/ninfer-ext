@@ -413,7 +413,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
 
             commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
                                              prefix_execution_splits[row]);
-            advance_rebuild_work(sequence, end, prefill_chunk);
+            advance_rebuild_work(sequence, end, prefill_chunk,
+                recorded_split_frontier(base_ledger_frontier, prefix_execution_splits[row]));
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;

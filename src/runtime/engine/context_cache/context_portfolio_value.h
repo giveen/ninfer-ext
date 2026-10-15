@@ -40,6 +40,8 @@ struct ContextPortfolioValueResult {
 // Folds one complete inactive checkpoint portfolio. Empirical demands and explicit shared credit
 // form public portfolio values. A private owner contributes the largest loss of one concrete
 // checkpoint capability, so a surviving later checkpoint cannot mask damage to an earlier one.
+// fold() refills the per-instance owner scratch below, so one instance is not reentrant and must
+// not be called from two threads at once.
 class ContextPortfolioValue {
 public:
     ContextPortfolioValue() { owner_scratch_.reserve(32U); }

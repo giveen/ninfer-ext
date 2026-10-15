@@ -154,6 +154,11 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols}, policy);
 
     std::size_t maximum = 0;
+    // Each overlapping route is measured at its widest column, which is that sub-interval's widest
+    // workspace only while the size grows with `cols`. A route straddling kA8MinCols would have its
+    // endpoint resolve to the A8 plan instead, hiding whatever the catalog sizes below the
+    // boundary, so such a route must carry zero workspace; the only one that straddles ({225, 256})
+    // does.
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);

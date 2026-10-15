@@ -6,6 +6,8 @@
 // The kernel-facing constexpr align_up in ops/common/math.h stays separate: it takes one argument,
 // performs no validation, and is usable on device.
 
+#include <cassert>
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -18,6 +20,7 @@ namespace ninfer {
 
 // True when `pointer` is non-null and its address is a multiple of `alignment` (a power of two).
 [[nodiscard]] inline bool aligned_to(const void* pointer, std::uintptr_t alignment) noexcept {
+    assert(alignment != 0 && (alignment & (alignment - 1)) == 0);
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 

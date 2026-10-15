@@ -36,6 +36,7 @@ std::vector<GraphExecutionProfile> causal_resource_profiles(std::uint32_t capaci
 } // namespace
 
 std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
+    if (capacity == 0) { return {}; }
     // E+1 is the one-token visible window; all tiers share one topology per exact B.
     return causal_resource_profiles(capacity, 1);
 }
