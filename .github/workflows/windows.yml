@@ -1,0 +1,135 @@
+# Windows compile gate.
+#
+# This is the only place the tree is compiled by MSVC, and it deliberately runs no tests: GitHub
+# hosted runners have no GPU, and the hosted GPU runners are T4 (sm_75), which this engine does not
+# target (sm_120a only). Behavior is established by running the packaged build on a Windows machine;
+# docs/maintainer/windows-port.md records what that run has to cover and what is still unverified.
+name: windows
+
+on:
+  push:
+    branches: [master, windows/native-serve]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # vcpkg builds FFmpeg and libcurl from source, which is the long pole of this job. The binary cache
+  # makes that a first-run cost instead of a per-run one.
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\.vcpkg-cache,readwrite
+
+jobs:
+  build:
+    # Visual Studio 2026 18.x, whose toolset is MSVC 195x. The Visual Studio 2022 image cannot build
+    # this tree at all -- <flat_map> landed in MSVC 14.51 -- which is why the image is pinned by name
+    # rather than used through windows-latest.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: pwsh
+        run: |
+          # A CUDA install plus a CUDA C++ build does not otherwise fit the runner's system drive.
+          # Nothing listed here is used by the build.
+          $unused = @(
+            'C:\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\dotnet',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server',
+            'C:\Program Files\Microsoft Visual Studio\2019',
+            'C:\Program Files (x86)\Microsoft Visual Studio\2019'
+          )
+          foreach ($path in $unused) {
+            if (Test-Path $path) { Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue }
+          }
+          Get-PSDrive C | Select-Object Used, Free
+
+      # The image ships the Visual Studio toolset but does not put cl.exe, link.exe or Ninja on the
+      # path of a plain step.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA 13.3
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.3.0'
+          method: 'local'
+
+      - name: vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Report the toolchain, and prove it compiles the standard library this tree needs
+        shell: pwsh
+        run: |
+          cl 2>&1 | Select-Object -First 1
+          cmake --version | Select-Object -First 1
+          ninja --version
+          nvcc --version | Select-Object -Last 2
+
+          # <flat_map> is why the image is pinned to the Visual Studio 2026 label: CMake maps
+          # CMAKE_CXX_STANDARD 23 to /std:c++latest, and the artifact schema includes <flat_map>.
+          @'
+          #include <flat_map>
+          #include <print>
+          int main() {
+              std::flat_map<int, int> map;
+              map[1] = 2;
+              std::println("flat_map and print work: {}", map[1]);
+          }
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\standard_probe.cpp"
+          cl /nologo /std:c++latest /EHsc /Fe:"$env:RUNNER_TEMP\standard_probe.exe" "$env:RUNNER_TEMP\standard_probe.cpp"
+          if ($LASTEXITCODE -ne 0) { throw "the toolset cannot compile <flat_map>" }
+          & "$env:RUNNER_TEMP\standard_probe.exe"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          # Module scanning is off for the same reason the Linux build turns it off: the tree uses no
+          # modules, and the scan is a C++23-only cost that has bitten this build before.
+          # NINFER_BUILD_APPS covers the CLI and server, the two targets this branch ships.
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_CXX_SCAN_FOR_MODULES=OFF `
+            -DNINFER_BUILD_APPS=ON `
+            -DBUILD_TESTING=OFF `
+            -DNINFER_BUILD_BENCHMARKS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --target ninfer ninfer-serve --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Stage a runnable package
+        shell: pwsh
+        run: |
+          # Everything the two executables load has to travel with them: the CUDA runtime, and the
+          # DLLs vcpkg built (FFmpeg, libcurl and their own dependencies). Copying the whole
+          # installed bin directory is deliberate -- resolving the transitive set by hand is exactly
+          # the kind of omission that only shows up on a tester's machine.
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/apps/ninfer.exe, build/apps/ninfer-serve.exe dist/
+          Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll" dist/ -ErrorAction SilentlyContinue
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" dist/ -ErrorAction SilentlyContinue
+          Copy-Item README.md, docs/serving.md dist/ -ErrorAction SilentlyContinue
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-windows-x64
+          path: dist/**
+          if-no-files-found: error
