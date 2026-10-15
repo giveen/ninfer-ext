@@ -268,12 +268,20 @@ exists is `…-Bolt-74B-A9B-24GB` and `…-24GB-LiLiCorr`, the GGUF-derived 24 G
 which is precisely the LiLiCorr draft's base and confirms it. So the NVFP4 conversion for this checkpoint is
 ours to make, from `…-Bolt-74B-A9B-BF16`, using the recipe above.
 
-But `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` does exist: the **same architecture at 30B**, an
-encoded ModelOpt checkpoint with calibrated divisors, around 18 GB. That fits this machine, where the 74B's
-~48 GB artifact and 37 GB of pinned experts do not, and it exercises the whole family path end to end —
-conversion through `import_encoded`, the Engine, the decode loop, and W4A4 rather than W4A16 — which the real
-target cannot do until it has a 64 GB host. Verification on the sibling is how the family gets tested before
-the target is affordable.
+But `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` exists as a *near* sibling rather than the same
+architecture, which its own config settles: it is `NemotronHForCausalLM`/`nemotron_h` with 52 layers at hidden
+2688, top-6 of a uniform bank, and **no `moe_latent_size` and no `block_configs` at all** — so it has no latent
+round trip, which is the newest part of our op set. What it does give us is an encoded ModelOpt checkpoint at
+about 18 GB that fits this machine: the `import_encoded` path against real bytes, the Mamba mixer, the
+attention, an offload pool, the Engine and the decode loop, all exercisable on hardware we have. It is a
+partial end-to-end test and not the family's own shape. The only NVFP4 release that *is* our architecture is
+the Super VL 120B at ~70 GB, which carries the same 64 GB-host requirement as our own conversion will.
+
+Its descriptor also deviates from the recipe in a way worth knowing before we copy it: it leaves the attention
+projections at BF16 — `exclude_modules` names every `[qkvo]_proj`, and its 46 FP8 tensors are exactly the 23
+Mamba layers' in and out projections — whereas the Super VL quantizes them, its 113 being 80 Mamba plus 32
+attention plus the head, which is the recipe exactly. Where the two disagree, we follow the recipe and the
+flagship.
 
 ## What the layout work actually is
 
