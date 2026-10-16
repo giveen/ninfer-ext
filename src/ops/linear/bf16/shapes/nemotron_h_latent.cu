@@ -4,10 +4,12 @@
 // us for the 8 MB of weights either one reads: at one token it is four blocks of 256 threads, one
 // scalar BF16 load per FMA.
 //
-// The parallelism to take is over output rows, which is the shape's own axis: 1024 and 4096 rows
-// are enough blocks for the device once a block is one warp, and 32 rows per warp make every
-// 32-byte weight load a whole sector, so the fallback's over-fetch (one 2-byte element per lane,
-// every lane in a different sector) disappears.
+// The parallelism to take is over output rows, which is the shape's own axis: the more blocks the
+// scheduler can place on distinct SMs, the more outstanding sector requests the partition can hold,
+// and at one token that is the only lever there is. That is why the single-token route's blocks are
+// a quarter warp (`kThreadsPerCtaNarrow` below, measured) and the wide route's are a whole one, and
+// why either way each lane loads a 32-byte pack, a whole sector, so the fallback's over-fetch (one
+// 2-byte element per lane, every lane in a different sector) disappears.
 //
 // What is deliberately *not* taken from the gemv and SIMT schedules beside this file is their
 // reduction. Both hand one row's K axis to the lanes of a warp and sum the lane partials with
@@ -48,12 +50,28 @@ namespace {
 // `Bf16GemvPack<16>` is the widest pack gemv.cuh's loaders know.
 constexpr int kValuesPerStep = 16;
 
-// One warp per block. The whole point of this route at single-token decode is that the 1024 or 4096
-// output rows it has to spread over the device become 1024 or 4096 *lanes*, and the more blocks the
+// One warp per block is the wide route's geometry. Its whole point is that the 1024 or 4096 output
+// rows it has to spread over the device become 1024 or 4096 *lanes*, and the more blocks the
 // scheduler can place on distinct SMs, the more outstanding sector requests the partition can hold.
 // A block wider than a warp would trade that for occupancy this kernel cannot use: it is one
 // dependent FMA chain per lane, so there is nothing to switch to.
 constexpr int kThreadsPerCta = 32;
+
+// The single-token route's blocks are a quarter warp, measured rather than reasoned: at one token
+// there is one row per lane and no second token to amortize anything over, so the only way to raise
+// the request count is more blocks, and a block of 8 threads puts four times as many of them on the
+// device at the cost of three quarters of each warp's lanes sitting idle through a chain they were
+// never given. On the two shapes below, cold, best of 30 with a 256 MiB flush, median-free
+// lower-bound in µs (cta 32 -> cta 8): (1024, 4096) 45.0 -> 40.9 (186 -> 205 GB/s) and (4096, 1024)
+// 17.5 -> 16.4 (480 -> 513 GB/s), reproduced over three separate runs (40.93/40.93/40.96 and
+// 16.38/16.38/16.38). 8 divides both output widths, so no row's chain changes and every sweep
+// variant stayed bit-identical to the fallback.
+//
+// It is deliberately *not* used for the multi-token route: at T = 128 with `TokensPerThread = 4`
+// the block count is already 1024 or 4096, so the extra blocks buy nothing and the idle lanes are
+// pure loss - the same sweep measures (1024, 4096) 137.2 -> 184.3 µs and (4096, 1024) 118.8 ->
+// 149.5 µs when the wide route is given blocks of 8 instead of 32.
+constexpr int kThreadsPerCtaNarrow = 8;
 
 // The two schedule knobs are template parameters rather than literals so a development sweep can
 // instantiate the candidates around them with one compilation; production selects the defaults and
@@ -128,7 +146,7 @@ void launch_bf16_latent_row(const Tensor& x, const Weight& weight, Tensor& out,
 
 template <class Geometry>
 Bf16Launch select_latent(std::int32_t tokens) {
-    if (tokens == 1) return launch_bf16_latent_row<Geometry, 1>;
+    if (tokens == 1) return launch_bf16_latent_row<Geometry, 1, kThreadsPerCtaNarrow>;
     return launch_bf16_latent_row<Geometry, 4>;
 }
 
