@@ -105,6 +105,11 @@ struct BenchEnvironment {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
+    // What the Engine resolved, which is not always what was requested: a family's own
+    // normalization may switch CUDA graphs off. `decode_path` is reported from this value so
+    // the label names the path that ran; `use_cuda_graph` stays the requested one, and the two
+    // differing is itself the signal that a family overrode it.
+    bool effective_use_cuda_graph                  = false;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
     int repetitions                                = 0;

@@ -621,7 +621,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " draft_tokens=" << env.speculative.draft_tokens
         << " tree_width=" << env.speculative.tree_width
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
-        << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << " decode_path=" << decode_path_name(env.effective_use_cuda_graph, env.speculative)
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -742,7 +742,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
-        << "    \"decode_path\": \"" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << "    \"decode_path\": \"" << decode_path_name(env.effective_use_cuda_graph, env.speculative)
         << "\",\n"
         << "    \"decode_graph_prime\": {\"primed\": "
         << (env.decode_graph_primed ? "true" : "false")
@@ -848,7 +848,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << ',' << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ',' << env.speculative.tree_width << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
-            << decode_path_name(env.use_cuda_graph, env.speculative) << ','
+            << decode_path_name(env.effective_use_cuda_graph, env.speculative) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
