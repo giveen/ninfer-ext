@@ -806,6 +806,24 @@ The same recipe on the fixed tree — graphs disabled in the bench so the kernel
 - **The 69.89-versus-46.97 pair is not a graph difference, and this family has no graph to differ with.** `nemotron_engine_options` sets `use_cuda_graph = false` before the instance exists and the engine applies it on the path the benchmark uses; `grep -rni "cuda_graph|decode_graph" src/models/nemotron_h/` returns nothing at all, and the capture machinery (`src/core/decode_graph.*`) is included only by the Gemma 4 and Qwen3.5 programs. What the benchmark's `--no-cuda-graph` removes is its **own untimed warm pass**: `prime_decode_graph` runs a two-token `generate()` when the flag is on, and `resolve_max_context` then asks for 192 tokens instead of 4 — which is the `max_context=192` in the run headers above. So the pair measures the second decode pass against the first: the first pays the staged banks' first copy, the state's first touch and the handle/heuristic init, and that is worth 1.49x. The lesson is in the benchmark's own label — `decode_path` is printed from the *flag* rather than from `Engine::options()`, so the log claimed `cuda_graph` while the engine ran eager, which is how this record came to attribute a warm-up to a graph.
 - That leaves **no dominant decode term**: at steady state the largest is the fp8 gemvs at 3.6 ms and the gather is bounded at 3.0 ms, so the remaining levers are the fp8 projections themselves and prefill — whose wide path is still the per-token kernel at ~5.6 ms per token and is the other half of the work. The first decode pass after a load is 1.49x the steady one, but that is a per-process cost (first bank copy, first state touch, handle init) which a serving run pays once and a steady-rate metric already amortises, so it is not a lever either.
 
+## Concurrency (2026-10-16)
+
+**Decode does not scale.** One fresh server per point, a per-lane window so the attention state's capacity x lanes is constant, and the batch genuinely formed (`average_decode_batch` 8.00 at C=8, with the steady filter requiring `running == decode_ready == C` and `row_rounds == C x rounds`):
+
+| C | window | decode tokens | per-request tok/s | aggregate tok/s | ms per round | x C=1 | TTFT mean / max |
+|---|---|---|---|---|---|---|---|
+| 1 | 262144 | 4095 | 44.3 | 44.3 | 22.6 | 1.00 | 47.4 / 47.4 s |
+| 2 | 131072 | 8190 | 23.9 | 47.8 | 41.8 | 1.85 | 68.7 / 91.8 s |
+| 4 | 65536 | 16380 | 10.7 | 42.9 | 93.1 | 4.12 | 118.1 / 190.6 s |
+| 8 | 32768 | 32760 | 5.3 | **42.5** | 188.3 | 8.33 | 208.6 / 370.5 s |
+
+- A round's cost tracks its row count within ±10%, so there is **no weight read to share**. The read per token is dominated by the routed experts, and a batch of L rows selects L x top-9 *distinct* experts per layer, so the traffic multiplies with L instead of amortising. The engine's one-compact-batch-per-round design is doing exactly what it says; what it cannot amortise is a mixture-of-experts read.
+- C=8 therefore buys **0.96x the C=1 aggregate** and costs about 4.4x the first-token latency, because prefill serializes as well: every request prefills at ~195-204 t/s regardless of C and they queue, the last of eight waiting 4m39s.
+- Nothing here is a lane limit. The batch forms, and the residency difference (4,080 -> 3,888 resident experts, 11.21 -> 10.42 GiB) is 4.7% of the resident set. The per-lane *state* grew 2.16 -> 3.27 GiB because the Mamba frontier is window-independent, which is why resident banks fall slightly at C=8 even though free VRAM rises.
+- The implication is a property of the artifact and the card rather than of the engine: 37.21 GB of experts against ~11 GiB of residency means the majority of every routed read crosses the host link, and concurrency multiplies that instead of dividing it. Two explanations stay distinguishable and both are queued — whether the decode call reaches the row-tiled route (`route_for` forced to `PerToken`, a decode A/B in one session), and whether the per-row cost is host-paged expert traffic rather than device-side, for which the C=8 intervals' 91-117% host exposure at batch 8.00 is what a per-row host or launch cost looks like.
+
+Not comparable with the figures above, and stated so nobody averages them: this C=1 rate (44.3 t/s) is a fresh process decoding from 9,226 tokens of context, while the 69.89 and 46.97 t/s figures are single-process one-token-context runs. The campaign's provenance carries the serve binary's sha256, the gates on the archive it was linked from, a tree note, and a greedy one-word probe on its own server that matched.
+
 ## Prefill attribution (2026-10-16)
 
 A 512-token chunk runs at **110.10 t/s** and the same profiler localizes it to the same kernel decode used to have:
