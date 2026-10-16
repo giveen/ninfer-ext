@@ -22,4 +22,7 @@ extern const Nvfp4LinearShape kNvfp4N5120K17408;
 extern const Nvfp4LinearShape kNvfp4N43008K5376;
 extern const Nvfp4LinearShape kNvfp4N5376K21504;
 extern const Nvfp4LinearShape kNvfp4N21504K5376;
+// Nemotron-H's shared expert, bound as an unfused up matrix and down matrix.
+extern const Nvfp4LinearShape kNvfp4N5376K4096;
+extern const Nvfp4LinearShape kNvfp4N4096K5376;
 } // namespace ninfer::ops::detail

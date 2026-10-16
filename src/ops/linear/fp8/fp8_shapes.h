@@ -30,4 +30,13 @@ extern const Fp8LinearShape kFp8N34816K5120;
 extern const Fp8LinearShape kFp8N5120K6144;
 extern const Fp8LinearShape kFp8N5120K17408;
 extern const Fp8LinearShape kFp8N248320K5120;
+// Nemotron-H's dense FP8 projections: the mamba mixer's two, the attention mixer's four, and the
+// head. n = 256 for the key/value pair, 4096 for query/output and the mamba output, 18560 for the
+// mamba input, and the vocabulary's 131072 for the head; k = 4096 everywhere but the mamba output's
+// 8192.
+extern const Fp8LinearShape kFp8N256K4096;
+extern const Fp8LinearShape kFp8N4096K4096;
+extern const Fp8LinearShape kFp8N4096K8192;
+extern const Fp8LinearShape kFp8N18560K4096;
+extern const Fp8LinearShape kFp8N131072K4096;
 } // namespace ninfer::ops::detail

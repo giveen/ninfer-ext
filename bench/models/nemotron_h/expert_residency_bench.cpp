@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
         // Warm-up: the first pass pays the in-place reads' page faults and the staged route's first
         // reclaim, neither of which is a steady-state cost.
         nemotron::forward_model(*model, token_ids, arena, logits_view, execution, nullptr,
-                                pool ? &*pool : nullptr);
+                                nemotron::HeadColumns::Every, nullptr, pool ? &*pool : nullptr);
         device.synchronize();
         // Taken *after* the warm-up: the pool's count is cumulative, so a snapshot before it would
         // charge the warm-up's traffic to the report. What follows is the timed passes' own bytes.
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
         for (std::int32_t run = 0; run < passes; ++run) {
             const auto start = std::chrono::steady_clock::now();
             nemotron::forward_model(*model, token_ids, arena, logits_view, execution, nullptr,
-                                    pool ? &*pool : nullptr);
+                                    nemotron::HeadColumns::Every, nullptr, pool ? &*pool : nullptr);
             device.synchronize();
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

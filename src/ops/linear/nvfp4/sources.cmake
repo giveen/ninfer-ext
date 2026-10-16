@@ -10,6 +10,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n43008_k5376.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5376_k21504.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n21504_k5376.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5376_k4096.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k5376.cu"
 )
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
