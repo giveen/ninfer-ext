@@ -42,8 +42,16 @@ tree's state pool counts mamba and attention blocks separately rather than by ab
 The step's token is dumped with them (`decode_token`), since a step means nothing without it, and a
 control forward of the same token through an empty cache must differ from the dumped step: a decode
 that never read the prefix's state still produces perfectly reasonable numbers, so reading it is shown
-rather than assumed. The default prefix length is the default sequence length, so the decode dump's
-prefix is the same tokens the whole-sequence dump carries, token for token.
+rather than assumed.
+
+The default prefix is 64 tokens, not the sequence length: a decoder's recurring state decays with the
+sequence while the composition's operands are BF16, so past that length the plane falls to the
+representation's own magnitude and a comparator's relative figure measures rounding over rounding --
+measured 5.2e-3 to 7.1e-3 relative for prefixes of 2 to 65 tokens against 0.61 at 131, where the
+plane's RMS is 6.4e-7. That is the "short prefix (≤ 64 tokens)" the decode design's state comparison
+asks for (§3.2), and `tests/models/nemotron_h/test_forward.cpp` compares at whatever this dump
+states. Pass `--prefix 130` (the sequence length) for the whole-sequence variant, where the decode
+dump's prefix is the sequence dump's tokens, token for token.
 
 Requires the SYSTEM interpreter, not the project venv: /usr/bin/python3 here has transformers 5.14.1
 and torch 2.13, while the venv predates NemotronH entirely (the same split the Gemma 4 references
@@ -53,7 +61,7 @@ Usage:
     /usr/bin/python3 tools/verify/nemotron_h_reference.py dump --tiny --out /tmp/nemo_ref
     /usr/bin/python3 tools/verify/nemotron_h_reference.py dump --model /mnt/storage/models/nemo/74B \\
         --out /tmp/nemo_ref_full --tokens 130
-    /usr/bin/python3 tools/verify/nemotron_h_reference.py dump --tiny --decode --prefix 130 \\
+    /usr/bin/python3 tools/verify/nemotron_h_reference.py dump --tiny --decode \\
         --out /tmp/nemo_ref --weights
 """
 
@@ -277,11 +285,20 @@ def dump_states(cache, config, out: pathlib.Path, manifest: list[str]) -> None:
         )
 
 
+# The default `--prefix`: the length the decode design asks a state comparison to run at ("run the
+# state comparison after a short prefix (≤ 64 tokens) or use the weak-decay bound", §3.2), and the
+# length that keeps the plane's magnitude above the composition's operand floor. A longer prefix
+# decays the state into that floor's own magnitude, where a comparator's relative figure measures
+# rounding over rounding: measured 5.2e-3 to 7.1e-3 relative for prefixes of 2 to 65 tokens against
+# 0.61 at 131.
+kDecodePrefix = 64
+
+
 def run_decode(model, config, arguments, out: pathlib.Path) -> int:
     """Prefill `--prefix` tokens, dump the single-token step after them, and dump the state it left."""
     from transformers import DynamicCache
 
-    prefix = arguments.tokens if arguments.prefix is None else arguments.prefix
+    prefix = kDecodePrefix if arguments.prefix is None else arguments.prefix
     if prefix < 1:
         sys.exit("--prefix must name at least one prefilled token")
     # The same seeded stream the whole-sequence dump draws from, so the default prefix is that dump's
@@ -370,7 +387,12 @@ def main() -> int:
         help="prefill --prefix tokens, dump the single-token step after them and the state it left, "
         "into OUT/decode",
     )
-    parser.add_argument("--prefix", type=int, help="tokens prefilled before the step (default: --tokens)")
+    parser.add_argument(
+        "--prefix",
+        type=int,
+        help=f"tokens prefilled before the step (default: {kDecodePrefix}, the state comparison's own "
+        "bound of the decode design)",
+    )
     parser.add_argument(
         "--step",
         type=int,

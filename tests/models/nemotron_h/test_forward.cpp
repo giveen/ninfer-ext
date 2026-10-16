@@ -987,8 +987,9 @@ private:
 //  * two chunks versus one pass: a state that is *written* but never *read*, or read but never
 //    written, agrees with a single-call test and fails only at a boundary -- so every stage of the
 //    second chunk is compared *including its first tokens*, where a chunk that started from a zero
-//    state differs, and the same tokens are then decoded one at a time from the state two chunks
-//    left, which is the property `Program` relies on;
+//    state differs, and the frontier the chunks advanced past is required to refuse the pass a
+//    decode of the same tokens from it would need, because the composition has no rewind and a
+//    state may not be re-entered at a position it has already moved past;
 //  * a lane reused across the reset `Program::create` performs: the convolution Op always reads the
 //    state it is handed, so a frontier that was not emptied makes the *next* sequence's first pass
 //    silently wrong rather than merely different -- and a reset is only worth performing if it
@@ -1001,20 +1002,46 @@ private:
 // Every comparison is against the *same* stage's column at the same absolute position. Every stage
 // this composition reports keeps its innermost extent -- the channels, the experts, the ranks --
 // fastest with the token axis strided, so column `t` is `columns` contiguous values at
-// `t * columns`, which is also what a one-token pass writes as its only column.
+// `t * columns`, which is also what a one-token pass writes as its only column. The router's three
+// stages are the one exception: `forward.cpp` allocates them in its Op's own order, expert or rank
+// major with the token innermost, and the capture below rearranges them once, to `[token][column]`,
+// so that this stays the rule every comparison reads by. Two of them are then compared by the
+// walk's own rules rather than element by element, because the reference's `topk(sorted=False)`
+// defines no rank order: the ids as a set per token, and the weights against the id each was
+// emitted beside.
 
 // The floors the state itself is compared at, from the decode design
 // (local://nemotron-decode-design.md §3.2): the convolution window is a copy of the composition's
 // own BF16 operands (the walk's measured floor is 0.0016 to 0.008, so 0.01 is the operand
-// representation with headroom), and the recurrent plane is FP32 on both sides but *built* from
-// BF16 operands here and FP32 ones there, so its difference is the representation (~1e-3) rather
-// than FP32 drift. The decisive part of the comparison is not its upper bound but its lower one: a
-// state image of the wrong width or dtype is far outside both.
-constexpr double kStateConvRelL2      = 0.01;
-constexpr double kStateRecurrentRelL2 = 1e-3;
+// representation with headroom), and the recurrent plane, though FP32 on both sides, is *built*
+// from BF16 operands here and FP32 ones there, so what it shows is that same operand floor rather
+// than FP32 drift. Measured against the reference's own post-decode state it is 5.15e-3 at 2
+// tokens, 5.80e-3 at 9, 5.63e-3 at 17, 5.83e-3 at 33 and 7.13e-3 at 65 -- the walk's band -- while
+// the same dump's convolution window sits at 0.0032 to 0.0036 against its own 0.01. Its criterion
+// is therefore that same operand floor with headroom, not the design's ~1e-3 estimate: 1e-3 is
+// below the 1.6e-3 to 8e-3 floor every stage of this composition measures, so it cannot hold for a
+// state built from BF16 operands at any prefix length.
+//
+// The absolute bound beside it is what decides when the state has decayed. The plane's own RMS
+// falls to 6.4e-7 over the 130-token fixture (the convolution window of the same block holds
+// operands of ~0.15), so past ~64 tokens a *relative* figure measures rounding against a state that
+// has decayed to the rounding's own magnitude: 0.61 relative at 131 tokens is 2.68e-6 absolute,
+// which is this composition's correctness rather than its arithmetic. The measured absolute
+// difference is 1.7e-8 to 4.7e-8 at 2 to 65 tokens and 2.68e-6 at 131, so 1e-5 keeps 3.7x headroom
+// against the worst of those and stays three orders below the block's own operand noise (the
+// window's 1.6e-3 to 1.9e-3 absolute): a difference that large is a state that is wrong rather than
+// rounded. §3.2 asks for a prefix of 64 tokens or fewer for the same reason, which is what the
+// reference tool now defaults to; a state image of the wrong width or dtype is what this check
+// exists to see, and it lands far outside both bounds wherever the plane has not decayed below
+// them.
+constexpr double kStateConvRelL2       = 0.01;
+constexpr double kStateRecurrentRelL2  = 0.01;
+constexpr double kStateRecurrentMaxAbs = 1e-5;
 
 // One pass's stage, read back to the host: `columns` is what one token owns and `values` holds
-// `columns` per column, in the tensor's own memory order.
+// `columns` per column, one column after another -- the tensor's own memory order for every stage
+// but the router's three, which the capture rearranges to that order because the Op writes them
+// expert- or rank-major with the token innermost.
 struct CapturedStage {
     std::int32_t columns = 0;
     std::vector<double> values;
@@ -1033,6 +1060,24 @@ std::string stage_label(const StageKey& key) {
     return stage_text(key.second) + " (block " + std::to_string(key.first) + ")";
 }
 
+// The router's three stages are the composition's one reported order that is not its declared one:
+// `forward.cpp` allocates them in the Op's layout -- expert- or rank-major with the token innermost
+// (`logits[expert * tokens + token]`) -- while the extents they declare are the shapes the Op's
+// wrapper validates. A consumer that reads them column by column therefore has to read them the
+// Op's way, which is what the rearrangement below answers: the same rearrangement the walk's dump
+// comparison applies to its expectation, and what lets every comparison here stay a per-token read
+// of contiguous values.
+bool router_stage(nemotron::BlockStage stage) {
+    switch (stage) {
+    case nemotron::BlockStage::MoeRouterLogits:
+    case nemotron::BlockStage::MoeRouterIds:
+    case nemotron::BlockStage::MoeRouterWeights:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Every stage one pass writes, read back as it is reported: a stage borrows the pass's arena or
 // workspace and is valid for the callback only, so the read has to happen inside it.
 class CaptureObserver : public nemotron::BlockObserver {
@@ -1042,8 +1087,31 @@ public:
     void on_stage(std::size_t layer, nemotron::BlockStage stage,
                   const Tensor& tensor) const override {
         CapturedStage captured;
-        captured.columns = tensor.ne[0];
-        captured.values  = host_values(tensor);
+        const std::vector<double> flat = host_values(tensor);
+        if (router_stage(stage)) {
+            // Read as `[token][column]`, with the rank's or the expert's axis striding: the token
+            // innermost is the Op's order, whatever the declared extents say.
+            const std::int32_t columns = tensor.ne[0];
+            const std::int32_t tokens  = tensor.ne[1];
+            const std::size_t expected =
+                static_cast<std::size_t>(columns) * static_cast<std::size_t>(tokens);
+            if (columns <= 0 || tokens <= 0 || flat.size() != expected) {
+                throw std::runtime_error("nemotron_h decode: block " + std::to_string(layer) +
+                                         "'s " + stage_text(stage) + " stage is not " +
+                                         std::to_string(columns) + "x" + std::to_string(tokens));
+            }
+            captured.columns = columns;
+            captured.values.resize(flat.size());
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                for (std::int32_t column = 0; column < columns; ++column) {
+                    captured.values[static_cast<std::size_t>(token) * columns + column] =
+                        flat[static_cast<std::size_t>(column) * tokens + token];
+                }
+            }
+        } else {
+            captured.columns = tensor.ne[0];
+            captured.values  = flat;
+        }
         if (captured.columns <= 0 ||
             captured.values.size() % static_cast<std::size_t>(captured.columns) != 0) {
             throw std::runtime_error("nemotron_h decode: block " + std::to_string(layer) + "'s " +
@@ -1142,12 +1210,116 @@ ColumnStat compare_column(const StageKey& key, const CapturedStage& reference,
                       worst};
 }
 
+// One column of a run's ids, as integers, in the order that run emitted them.
+std::vector<std::int32_t> id_column(const CapturedStage& stage, std::int32_t token) {
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(stage.columns));
+    const double* const at = stage.values.data() + static_cast<std::size_t>(token) * stage.columns;
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        ids[index] = static_cast<std::int32_t>(std::lround(at[index]));
+    }
+    return ids;
+}
+
+// What one rank column's comparison found, in the walk's own terms: `stat` is the line its report
+// writes for that stage, `ok` the criterion applied to it, and `reordered` the fact the walk counts
+// rather than fails.
+struct RankColumn {
+    ColumnStat stat;
+    bool ok        = true;
+    bool reordered = false;
+};
+
+// The router's ids, as a set per token. The reference's top-k is `sorted=False`, whose rank order
+// it does not define, so the two runs' columns are matched as *sets*: an order difference is
+// counted rather than failed, exactly as the walk counts it, and only a set difference is a
+// failure. The largest element-wise id difference is reported beside it in the walk's own style.
+RankColumn compare_rank_column(const StageKey& key, const CapturedStage& reference,
+                               std::int32_t reference_token, const CapturedStage& actual,
+                               std::int32_t actual_token) {
+    if (reference.columns != actual.columns) {
+        throw std::runtime_error("nemotron_h decode: " + stage_label(key) + " is " +
+                                 std::to_string(reference.columns) +
+                                 " ranks wide in the reference run and " +
+                                 std::to_string(actual.columns) + " in the state-driven one");
+    }
+    std::vector<std::int32_t> want = id_column(reference, reference_token);
+    std::vector<std::int32_t> got  = id_column(actual, actual_token);
+    RankColumn column;
+    column.stat.name = stage_label(key);
+    column.reordered = want != got;
+    double worst     = 0.0;
+    for (std::size_t index = 0; index < want.size(); ++index) {
+        worst = std::max(worst, std::abs(static_cast<double>(want[index] - got[index])));
+    }
+    column.stat.max_abs = worst;
+    std::sort(want.begin(), want.end());
+    std::sort(got.begin(), got.end());
+    column.ok               = want == got;
+    column.stat.relative_l2 = column.ok ? 0.0 : 1.0;
+    return column;
+}
+
+// The router's weights, each paired to the id it was emitted beside in its *own* run and then
+// sorted by that id: the set of pairs is what the reference defines, so both sides are reads of the
+// same pairs and the weights are compared within the walk's criterion, as its own `record` compares
+// the whole stage.
+RankColumn compare_rank_weights_column(const StageKey& key, const Capture& reference,
+                                       std::int32_t reference_token, const Capture& actual,
+                                       std::int32_t actual_token) {
+    const StageKey ids_key{key.first, nemotron::BlockStage::MoeRouterIds};
+    const auto want_ids     = reference.find(ids_key);
+    const auto got_ids      = actual.find(ids_key);
+    const auto want_weights = reference.find(key);
+    const auto got_weights  = actual.find(key);
+    if (want_ids == reference.end() || got_ids == actual.end() || want_weights == reference.end() ||
+        got_weights == actual.end()) {
+        throw std::runtime_error("nemotron_h decode: the router's weights were compared without "
+                                 "its ids, which are what pairs them");
+    }
+    const std::int32_t ranks = want_weights->second.columns;
+    if (want_ids->second.columns != ranks || got_ids->second.columns != ranks ||
+        got_weights->second.columns != ranks) {
+        throw std::runtime_error("nemotron_h decode: the router's ids and weights disagree about "
+                                 "the ranks one token owns");
+    }
+    std::vector<std::int32_t> want = id_column(want_ids->second, reference_token);
+    std::vector<std::int32_t> got  = id_column(got_ids->second, actual_token);
+    const double* const want_at =
+        want_weights->second.values.data() + static_cast<std::size_t>(reference_token) * ranks;
+    const double* const got_at =
+        got_weights->second.values.data() + static_cast<std::size_t>(actual_token) * ranks;
+    std::vector<std::pair<std::int32_t, double>> wanted(static_cast<std::size_t>(ranks));
+    std::vector<std::pair<std::int32_t, double>> emitted(static_cast<std::size_t>(ranks));
+    for (std::size_t rank = 0; rank < wanted.size(); ++rank) {
+        wanted[rank]  = {want[rank], want_at[rank]};
+        emitted[rank] = {got[rank], got_at[rank]};
+    }
+    std::sort(wanted.begin(), wanted.end());
+    std::sort(emitted.begin(), emitted.end());
+    RankColumn column;
+    column.stat.name     = stage_label(key);
+    double worst         = 0.0;
+    double energy_actual = 0.0;
+    double energy_error  = 0.0;
+    for (std::size_t rank = 0; rank < wanted.size(); ++rank) {
+        const double difference = std::abs(emitted[rank].second - wanted[rank].second);
+        worst                   = std::max(worst, difference);
+        energy_actual += emitted[rank].second * emitted[rank].second;
+        energy_error += difference * difference;
+    }
+    column.stat.relative_l2 = std::sqrt(energy_error / std::max(energy_actual, 1e-30));
+    column.stat.max_abs     = worst;
+    column.ok = column.stat.relative_l2 <= kStageRelL2 && column.stat.max_abs <= kStageMaxAbs;
+    return column;
+}
+
 // What one comparison found. `loosest` is the stage with the largest relative L2 among those
 // compared and `logits` is the head's own stage beside it: the logits are one stage among many, and
 // naming them separately is what says whether a difference is the model's own arithmetic or the
 // state's.
 struct OracleVerdict {
     int failures            = 0;
+    int reordered           = 0;
     std::size_t comparisons = 0;
     ColumnStat loosest;
     ColumnStat logits;
@@ -1155,7 +1327,10 @@ struct OracleVerdict {
 
 // Every stage a state-driven run wrote, against the reference run's own column at the same absolute
 // position, for `count` positions starting at `reference_first`. Fatal on a stage outside the
-// walk's criterion, in the walk's own reporting style.
+// walk's criterion, in the walk's own reporting style -- except for the router's two rank stages,
+// where the walk's own rule replaces the criterion: its ids are matched as a set per token and its
+// weights against the id each was emitted beside. The router's logits, rearranged by the capture
+// above, and every other stage are compared element by element.
 OracleVerdict compare_positions(const Capture& reference, std::int32_t reference_first,
                                 const Capture& actual, std::int32_t count,
                                 const std::string& label) {
@@ -1171,19 +1346,42 @@ OracleVerdict compare_positions(const Capture& reference, std::int32_t reference
             throw std::runtime_error("nemotron_h decode: " + label + " reported " +
                                      stage_label(key) + ", which the reference run did not");
         }
+        const bool rank_sets    = key.second == nemotron::BlockStage::MoeRouterIds;
+        const bool rank_weights = key.second == nemotron::BlockStage::MoeRouterWeights;
         for (std::int32_t token = 0; token < count; ++token) {
-            const ColumnStat stat =
-                compare_column(key, found->second, reference_first + token, stage, token);
             ++verdict.comparisons;
+            ColumnStat stat;
+            bool ok = true;
+            if (rank_sets) {
+                const RankColumn ranks =
+                    compare_rank_column(key, found->second, reference_first + token, stage, token);
+                stat = ranks.stat;
+                ok   = ranks.ok;
+                if (ranks.reordered) { ++verdict.reordered; }
+            } else if (rank_weights) {
+                const RankColumn weights = compare_rank_weights_column(
+                    key, reference, reference_first + token, actual, token);
+                stat = weights.stat;
+                ok   = weights.ok;
+            } else {
+                stat = compare_column(key, found->second, reference_first + token, stage, token);
+                ok   = stat.relative_l2 <= kStageRelL2 && stat.max_abs <= kStageMaxAbs;
+            }
             if (verdict.loosest.name.empty() || stat.relative_l2 > verdict.loosest.relative_l2) {
                 verdict.loosest = stat;
             }
             if (key.second == nemotron::BlockStage::Logits) { verdict.logits = stat; }
-            if (stat.relative_l2 > kStageRelL2 || stat.max_abs > kStageMaxAbs) {
+            if (!ok) {
                 ++verdict.failures;
-                std::cerr << label << ": " << stat.name << " at position "
-                          << (reference_first + token) << ": rel_l2=" << stat.relative_l2
-                          << " max_abs=" << stat.max_abs << '\n';
+                if (rank_sets) {
+                    std::cerr << label << ": " << stat.name << " at position "
+                              << (reference_first + token)
+                              << " selects a different expert set than the reference run\n";
+                } else {
+                    std::cerr << label << ": " << stat.name << " at position "
+                              << (reference_first + token) << ": rel_l2=" << stat.relative_l2
+                              << " max_abs=" << stat.max_abs << '\n';
+                }
             }
         }
     }
@@ -1491,19 +1689,23 @@ int check_decoded_state(const std::string& directory, const nemotron::Model& mod
         std::printf(
             "nemotron_h decode: the reference's state at %d tokens, Mamba block %zu: conv "
             "rel_l2=%.6g max_abs=%.6g (limit %.1e), recurrent rel_l2=%.6g max_abs=%.6g over %d of "
-            "%d keys (limit %.1e), %lld of %d zero-tail keys not exactly zero\n",
+            "%d keys (limits %.1e and %.1e), %lld of %d zero-tail keys not exactly zero\n",
             length, layer, conv_rel, conv_worst, kStateConvRelL2, plane_rel, plane_worst,
-            state_size, keys, kStateRecurrentRelL2, static_cast<long long>(tail_nonzero),
-            keys - state_size);
+            state_size, keys, kStateRecurrentRelL2, kStateRecurrentMaxAbs,
+            static_cast<long long>(tail_nonzero), keys - state_size);
         if (conv_rel > kStateConvRelL2) {
             ++failures;
             std::cerr << "nemotron_h decode: Mamba block " << layer << "'s convolution window at "
                       << conv_rel << " relative L2 against the reference's own\n";
         }
-        if (plane_rel > kStateRecurrentRelL2) {
+        if (plane_rel > kStateRecurrentRelL2 || plane_worst > kStateRecurrentMaxAbs) {
             ++failures;
-            std::cerr << "nemotron_h decode: Mamba block " << layer << "'s recurrent plane at "
-                      << plane_rel << " relative L2 against the reference's own\n";
+            std::cerr << "nemotron_h decode: Mamba block " << layer << "'s recurrent plane is "
+                      << plane_rel << " relative L2 and " << plane_worst
+                      << " absolute against the reference's own, where the composition's operand "
+                         "floor is "
+                      << kStateRecurrentRelL2 << " relative and " << kStateRecurrentMaxAbs
+                      << " absolute\n";
         }
         if (tail_nonzero != 0) {
             ++failures;
@@ -1546,6 +1748,12 @@ int program_check(DeviceContext& context, DeviceExecutionView execution,
     options.max_context     = static_cast<std::uint32_t>(total);
     options.max_concurrency = 1;
     options.kv_cache        = KvCacheStorage::BFloat16;
+    // A hand-bound model's banks are device-resident views this harness uploaded, so no bank of it
+    // is host-pinned and there is nothing for the staging pool to hold: the explicit request for no
+    // staging is what keeps `Program` from building one and reading the banks in place instead,
+    // which is the route the walk above takes with `experts = nullptr`. It is the same option the
+    // family's own Program test builds its hand-bound model with.
+    options.expert_cache = ExpertCachePolicy::explicit_cache(0);
     nemotron::Program program(model, options, context);
 
     int failures = 0;
@@ -1655,15 +1863,25 @@ int decode_oracle(const std::string& directory, const nemotron::Model& model,
                 compare_positions(reference, prefix, decoded_run, decoded, label);
             failures += verdict.failures;
             std::printf(
-                "nemotron_h decode: %s one at a time from a %d-token prefill: %zu comparisons, "
-                "loosest %s (rel_l2=%.6g, max_abs=%.6g), logits rel_l2=%.6g max_abs=%.6g\n",
-                label.c_str(), prefix, verdict.comparisons, verdict.loosest.name.c_str(),
-                verdict.loosest.relative_l2, verdict.loosest.max_abs, verdict.logits.relative_l2,
-                verdict.logits.max_abs);
+                "nemotron_h decode: %s one at a time from a %d-token prefill: %zu comparisons (%d "
+                "rank tensors reordered), loosest %s (rel_l2=%.6g, max_abs=%.6g), logits "
+                "rel_l2=%.6g max_abs=%.6g\n",
+                label.c_str(), prefix, verdict.comparisons, verdict.reordered,
+                verdict.loosest.name.c_str(), verdict.loosest.relative_l2, verdict.loosest.max_abs,
+                verdict.logits.relative_l2, verdict.logits.max_abs);
         }
         {
-            // Run 3: the same split as two *passes*, then the same tokens decoded one at a time
-            // from the state those chunks left.
+            // Run 3: the same split as two *passes*, whose second chunk's own columns are compared
+            // below, and then the state those chunks left. That state has consumed every token of
+            // the fixture, and there is no rewind to the 122-token frontier to decode from: neither
+            // the pool's slot nor the attention state can be truncated (a lane's `filled` is only
+            // advanced or reset), so decoding the same tokens one at a time from the two-chunk
+            // state is not a call this composition can make -- `forward_model` refuses it at its
+            // frontier guard rather than attending at positions no token of the lane occupied.
+            // That refusal is what this check establishes; the decode itself would be Run 2 above,
+            // whose prefix pass leaves exactly the frontier this state would have to be rewound to,
+            // and it is Run 2 that proves a chunked prefill's state drives the same one-token
+            // steps.
             FamilyState state = make_family_state(config, total);
             state.reset(execution);
             Tensor first(wide_logits.p, DType::BF16, {vocabulary, prefix});
@@ -1683,30 +1901,32 @@ int decode_oracle(const std::string& directory, const nemotron::Model& model,
             failures += chunk_verdict.failures;
             std::printf(
                 "nemotron_h decode: the second chunk of %d+%d against the one-shot run: %zu "
-                "comparisons, loosest %s (rel_l2=%.6g, max_abs=%.6g), logits rel_l2=%.6g "
-                "max_abs=%.6g\n",
-                prefix, decoded, chunk_verdict.comparisons, chunk_verdict.loosest.name.c_str(),
-                chunk_verdict.loosest.relative_l2, chunk_verdict.loosest.max_abs,
-                chunk_verdict.logits.relative_l2, chunk_verdict.logits.max_abs);
-
-            Capture decoded_run;
-            Tensor step(step_logits.p, DType::BF16, {vocabulary, 1});
-            for (std::int32_t token = prefix; token < total; ++token) {
-                nemotron::PassState step_pass = state.pass(token);
-                append_capture(decoded_run, run_pass(model, ids_view(token, 1), step, &step_pass,
-                                                     arena, execution));
-                state.advance();
-            }
-            const std::string label = "the decode from the two-chunk state";
-            const OracleVerdict verdict =
-                compare_positions(reference, prefix, decoded_run, decoded, label);
-            failures += verdict.failures;
-            std::printf(
-                "nemotron_h decode: %s: %zu comparisons, loosest %s (rel_l2=%.6g, max_abs=%.6g), "
+                "comparisons (%d rank tensors reordered), loosest %s (rel_l2=%.6g, max_abs=%.6g), "
                 "logits rel_l2=%.6g max_abs=%.6g\n",
-                label.c_str(), verdict.comparisons, verdict.loosest.name.c_str(),
-                verdict.loosest.relative_l2, verdict.loosest.max_abs, verdict.logits.relative_l2,
-                verdict.logits.max_abs);
+                prefix, decoded, chunk_verdict.comparisons, chunk_verdict.reordered,
+                chunk_verdict.loosest.name.c_str(), chunk_verdict.loosest.relative_l2,
+                chunk_verdict.loosest.max_abs, chunk_verdict.logits.relative_l2,
+                chunk_verdict.logits.max_abs);
+
+            try {
+                Tensor step(step_logits.p, DType::BF16, {vocabulary, 1});
+                nemotron::PassState step_pass = state.pass(prefix);
+                (void)run_pass(model, ids_view(prefix, 1), step, &step_pass, arena, execution);
+                std::cerr << "nemotron_h decode: a pass at position " << prefix
+                          << " was accepted over the " << total
+                          << "-token state the two chunks advanced to, where the frontier guard "
+                             "refuses a pass that does not start where the state ends\n";
+                ++failures;
+            } catch (const std::invalid_argument& error) {
+                const std::string why = error.what();
+                const bool frontier =
+                    why.find("holds " + std::to_string(total) + " tokens") != std::string::npos &&
+                    why.find("position " + std::to_string(prefix)) != std::string::npos;
+                std::printf("nemotron_h decode: the %d-token state the two chunks left refuses a "
+                            "pass at position %d%s: %s\n",
+                            total, prefix, frontier ? "" : ", but for another reason", why.c_str());
+                if (!frontier) { ++failures; }
+            }
         }
     }
 
