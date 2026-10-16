@@ -513,9 +513,14 @@ keys this family's parser reads, so the artifact's `text/config` carries **neith
 `model_type`**, and the registry's `NemotronHPuzzle` arm — keyed on the *source* checkpoint's
 `NemotronHPuzzleForCausalLM`/`nemotron_h_puzzle` — is unreachable from the artifact. The probe therefore keys on
 what this family does emit and no other does: the per-layer `block_configs` list, with `mamba` and `router`
-beside it. Carrying `architectures`/`model_type` through the converter as well would make dispatch uniform with
-every other family; that is worth doing at the next conversion, and it is not worth re-converting 45 GB to get
-now.
+beside it. Carrying `architectures`/`model_type` in the artifact would not fix that, and the reason is worth recording, because
+it says how dispatch in this tree really works: **it is bespoke per family.** `artifact_is_gemma` is itself nothing
+but a config-key sniff of the artifact's own `text/config`, and `resolve_architecture` is called only from family
+config parsers — the qwen one on the artifact's strings, and Gemma's as a self-consistency check on the constants
+it synthesizes — so no family is *dispatched* through the registry's enum. Meanwhile this family's parser
+validates an **exact key set** by design and its converter emits exactly that set, so adding the two fields would
+mean loosening the parser *and* re-converting 45 GB to reach a mechanism nothing else dispatches through. The probe
+therefore keys on `block_configs`, which is the same shape as the probe beside it.
 
 A family plugs in through a fixed, small seam: `plan_load` → `materialize_model` returning the family's `Model`;
 a runtime contract bundle naming the Program and the request/prompt/output types; an instance holding the model,
@@ -556,6 +561,30 @@ either running the 141 GB BF16 checkpoint on the CPU or converting the GGUF with
 latter now possible because that implementation shipped. Choosing that oracle is a decision to make deliberately
 before quoting a perplexity, not to assume.
 
+### The decode path, and the one op it is missing
+
+The decode design is settled: what matters here is its verdict. The convolution and the scan need **no signature
+change and no new kernel** — both already have distinct-state forms, `T=1` is validated and tested, and the state
+pool's convolution and recurrent slots are already contiguous views in the ops' exact layouts and dtypes, with the
+reference's own semantics (`S <- exp(dt*A)*S + dt*outer(x,B)`, read *after* the update; the last four raw conv
+inputs, taps innermost) matching what the op reads. `D*x` and the gating stay inside the scan and the gated grouped
+norm. Carrying state through the composition is a nullable `BlockState*`/`PassState`, so a null state remains
+bit-for-bit today's zero-state pass. One detail is a trap worth stating twice: the reference's convolution window is
+taps innermost (`c*4+k`) while the op's state is tap-major and three wide (`w*C+c`), so the two are a transpose of
+each other rather than the same buffer.
+
+**Attention is the piece with a real gap.** This family needs unbounded causal K/V — no window, no rotation,
+positions absolute from the K/V length, scale `1/sqrt(128)` — at head width 128 with two key/value heads, and no
+landed op writes or reads that geometry's K/V state: the registered paged, ring and materialize profiles are built
+for D=256 or eight key/value heads, and the wrapper refuses `window == 0` even though the flash kernel underneath
+already implements causal-only visibility. So the Program has to decide that route explicitly rather than inherit
+one, which is what it is being asked for.
+
+The oracle is the landed prefill itself: a stateful decode must reproduce the zero-state pass's logits at the same
+position — per stage against the dump, and at the logits, using the criteria the op tests already quote. The
+two-chunk equivalence check has to compare the *second* chunk's **first** tokens; comparing the wrong columns is
+how that check would pass while proving nothing.
+
 ## Open items
 
 - The draft pairs with the **24GB NVFP4** target, not the BF16 one, so its qualification belongs on our
@@ -577,6 +606,18 @@ before quoting a perplexity, not to assume.
   make a reduction deterministic — that is what sank the Gemma 4 gather inversion — so the check is a D2H compare
   plus bit-identity across cold, warm and lent states, and the staged result must match the direct route's bit for
   bit rather than within a tolerance.
+- **The tokenizer's Unicode class tables are a version behind the reference, and this is a cross-cutting decision
+  rather than a family fix.** `src/text` classifies through utf8proc 17.0.0, whose tables call 4,699 code points
+  letters, marks or numbers that the reference's Rust `regex` tables call unassigned — 28 ranges (Tolong Siki,
+  U+11DB0..11DDB and others) plus U+0295, with zero cases in the opposite direction. It affects only exotic
+  scripts, and it is shared with Qwen and Gemma, so fixing it means a Unicode-version table in `src/text` rather
+  than a change here. It is recorded so the divergence is never mistaken for a porting bug.
+- **The frontend refuses four things by name rather than approximating them**, each with its reason in the code:
+  a thinking budget (this model's thought block is closed by the model, not by an Engine-injected control token, so
+  Qwen's canned control sentence is not injected), output constraints (the Program consumes no token masks), any
+  forced or restricted tool call (the wire format is the in-tree parser's, but only `tool_choice` auto or none is
+  supported), and vision (the artifact has no vision component and this family's `TextConfig` has no field for
+  one). The first three are the pieces a later milestone pays for; the fourth is phase 2.
 - **The state's key/value index is ambiguous, and both extents are 128 today**, so a swap would be
   silent: `LinearAttentionStatePool` plans `ne[0] = key_head_dim` while the GDN and KDA kernels index
   the state as `value * kStateDim + key`. Mamba-2's 128 (state size) against 64 (head_dim) makes it a
@@ -607,6 +648,10 @@ against an FP64 oracle plus — where one exists — the reference dump or the r
 | Composition | `src/models/nemotron_h/forward.cpp` composes the three mixers and the block. The tiny model is walked block by block against the dump: 37 stages compared with a per-stage rel L2, everything at the 0.0016–0.008 BF16-operand floor and the logits at 0.00633, five refusal cases, and coverage asserted (37 compared, 3 reported but not in the dump). Its loosest stage, block 1's `fc2_latent_proj` at 0.0498, is explained by a measured near-tie: 2 of 130 tokens sit where the reference's K-th and (K+1)-th corrected scores differ by 0.002x the BF16 logit perturbation, so their expert pair moves while the other 128 ids match exactly and block 3 moves not at all. Two runs agreed to every printed digit. |
 | Artifact | `nemotron_h_74b_nvfp4` converts the BF16 checkpoint in 2067 s to 767 objects and **45.28 GB** (a 32.00 GB file plus a 13.28 GB part), of which the routed expert banks are **37.21 GB** — within 0.03% of what this document predicted from the checkpoint's config alone. The dense side is FP8 at 5.21 GB of a converted 8.06 GB, which is why the total is below the ~46 GB predicted when that side was assumed to be Q8. Every design choice is measured rather than asserted: one divisor per bank costs at most 0.0001 rel L2 against per-expert divisors, the BF16 and FP32 sets are bit-exact, the conv payload is bit-exact tap-major, and the experts' 0.081 rel L2 is the *format* floor — established by running the same independent check against the existing Gemma NVFP4 artifact first, where it reads 0.070. |
 | Artifact completeness | `tests/convert/test_nemotron_h_artifact.py` proves the parameter set from metadata alone in about 1.3 s: 28,331 language tensors map to exactly one parameter each and every parameter is explained — 0 unmappable, 0 absent, 0 duplicate, 0 unexplained — shapes agree except for the one transform the container makes (the depthwise convolution's stored `[10240,1,4]` becoming the tap-major `[10240,4]`), format classes agree exactly (27,728 NVFP4 as 27,648 routed and 80 shared, 113 FP8, 330 BF16, 160 FP32 — the 120 per-head state vectors and the 40 correction biases), and all 40 MoE layers have their expert count confirmed **from the checkpoint's own tensors** rather than from the config: 240 in 12 layers, 304 in 6, 368 in 9, 432 in 10, 496 in 3. The artifact's stored `block_configs` agrees with what the tensors say everywhere, so this release's config does not lie. Eleven one-at-a-time perturbations of the fixture — a lost expert, a removed parameter, a vision tensor renamed into the language set, the head re-classed to BF16, the tap-major transform dropped, a bank range shifted by 1024 rows, a config claiming 304 experts for a 240-expert layer — are each caught with the expected message, which is what makes the eight passing cases evidence rather than ceremony. |
+| Loader | `materialize_model` binds 763 parameters from the artifact, with **37,206,098,240 pinned bytes** — exactly the 80 routed bank parents, which are declared as whole packing groups rather than per expert, because a row range of a quantized parent cannot re-derive its own scale plane — and **8,061,946,116 device bytes**, matching the dense-side figure above independently. The plan takes 7.5 ms and materialization 14–37 s depending on page cache, with no file mapping (`mapped_file_bytes == 0`). It refuses a bank whose expert count disagrees with its router or the config, checked on all 40 MoE layers, with the message: *layer 7: the artifact's bank holds 304 experts and its router 240, where this layer's config says 240; a global expert count must not reach a layer's bank*. The loading library carries no `Model` reference at all (proven with `nm` on the archive, and by a target that links only it), so planning and execution stay on their own sides of the split. |
+| Engine path | `ninfer out/nemotron_h_74b_nvfp4.ninfer --prompt hi --max-new 1` reaches **`engine ready`** for `nemotron_h_74b_nvfp4` with `total 15.5s` and `weights 7.51 GiB` — 7.51 GiB uploaded in 6.2 s at 1.22 GiB/s out of the 45.28 GB artifact — and reports the family's own `vocab 131072`, `hidden 4096` and `native context 262144` read from its config, with state 178 MiB, weights 7688 MiB and an 824 MiB runtime reservation. Generation then refuses with the reason instead of computing: *the landed forward is the zero-state prefill ... the state itself is here — the Mamba pool's slot and `AttentionState`, whose append/attend route runs the attention over a lane's own K/V — and what is missing is the composition wiring it into `forward.{h,cpp}`*. The engine stays alive and available after the refusal, which the test asserts. |
+| Engine boundary | Dispatch is a third bespoke probe beside `artifact_is_gemma`, keying on this family's `block_configs`, and `NemotronProgram` implements the whole contract over the family's Program — nothing reached the Program's own surface as a missing signature. Three limits are recorded rather than smoothed over: that refusal arrives through the shared worker's `logic_error` recovery, so one `[engine] WORKER RECOVER:` line precedes the CLI's own message; `causal_score` refuses for a different reason, because the zero-state forward *would* serve scoring but the Program exposes no scoring entry point yet; and the 37.21 GB of pinned host residency is absent from the shared `MemorySummary`, which has no host-weights field for any family, so it is read from `model->storage_stats().pinned_host_bytes`. |
+| Tokenizer | The family's own split is implemented and checked against the reference tokenizer itself: 47 fixture cases with 0 failures (boundaries, token ids and the decode round-trip, all exact), and full-corpus id agreement on the artifact's own `tokenizer.json` — 66,262/66,262 on a wikitext excerpt and 2,796,879/2,796,879 on a 10.78 MB mixed-source corpus. A 974,342-code-point Unicode sweep differs at 13 of 4.5M ids and is isolated to **table versions rather than logic**: utf8proc 17.0.0 classifies 4,699 code points as letters/marks/numbers that the reference's older Rust `regex` tables call unassigned (28 ranges, Tolong Siki and others), with zero cases in the opposite direction, which a validated Python mirror of the algorithm pinned piece-for-piece. |
 
 One caveat the conversion reports in its own right, and belongs on the prefill work list rather than being
 rediscovered: NVFP4 weights under an `A16Only` input policy — which is what a full-precision source produces —
