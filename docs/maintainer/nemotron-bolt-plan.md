@@ -16,7 +16,43 @@ this repository's own quantization routes, with the
 |---|---|
 | `transformers` 5.14.1, `models/nemotron_h/modeling_nemotron_h.py` (1259 lines) | the canonical mathematics, line numbers cited below. The checkpoint's own `modeling_nemotron_h_puzzle.py` is 37 lines and subclasses it. |
 | The checkpoint's `configuration_nemotron_h_puzzle.py` (151 lines) | how per-layer values are threaded: `get_nemotron_h_config_for_layer` builds one `NemotronHConfig` per block. |
-| llama.cpp `cd0a5b6` | a second implementation: `src/models/nemotron-h.cpp` (352 lines) and `conversion/nemotron.py` (815 lines, including `LiLiCorrDraftModel(DFlashModel)`). It reads the **per-layer expert count from the router tensor's shape**, and its `d_in_proj` matches the reference exactly. |
+| llama.cpp | a second implementation: `src/models/nemotron-h.cpp`, `conversion/nemotron.py` (including `LiLiCorrDraftModel(DFlashModel)`) and `tools/mtmd/models/nemotron-omni.cpp`. It reads the **per-layer expert count from the router tensor's shape**, and its `d_in_proj` matches the reference exactly. PR [#30520](https://github.com/ggml-org/llama.cpp/pull/30520) adds `NemotronH_Omni_Reasoning_V3` — this checkpoint's own architecture string — for Super 3.5 VL and Bolt 74B A9B, and was fast-tracked into their v0.7.0 release, so master is the authority to read. |
+
+What that PR settles, and what it hands us, checked against this document's own decisions:
+
+- **The per-layer bank is the confirmed reading, and reading it globally is a real bug.** The PR exists
+  largely to stop using the config's `n_expert` (512, a bound) for the expert tensors: it now takes
+  `n_expert_layer` from the router's own shape, validates `n_expert_used <= n_expert_layer <= n_expert`
+  and throws `Invalid per-layer Nemotron expert count` otherwise, and passes that width to the MoE op. Its
+  tensor shapes are `{latent, expert_width, experts}` for `up` and `{expert_width, latent, experts}` for
+  `down`, which is our `[experts*intermediate, latent]` and `[experts*latent, intermediate]` expert-major
+  banks with the axes reversed for ggml's order.
+- **The MoE is non-gated relu², with a sigmoid router, a correction bias and normalised top-k.** Their
+  MoE op is called with no gate and `LLM_FFN_RELU_SQR`; the router is
+  `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` with `ffn_exp_probs_b` (the correction bias) and
+  `expert_weights_norm`/`expert_weights_scale` carrying `norm_topk_prob`/`routed_scaling_factor`. That is
+  every one of this family's own choices, arrived at independently.
+- **`vision_model.summary_idxs` is dropped deliberately**, with the comment that it is only used by
+  `RadioModel.summary` while the projector consumes `RadioModel.features`. This is what the 394 unplaced
+  source tensors are: the RADIO tower, that buffer, and the projector — and dropping that buffer is the
+  same choice we made, now with a reason rather than an omission.
+- **An NVFP4 route for these banks exists there**, with optional per-expert `scale` and `input_scale`
+  tensors (`{n_expert}`, and `{1}` for the shared expert). Two consequences: our per-bank divisor is
+  justified by measurement (at most 0.0001 rel L2 against per-expert divisors), so the difference is not a
+  gap; and their `input_scale` is the shape of the lead for this document's prefill item — an A4 route needs
+  a calibrated activation scale, which a full-precision source does not carry. Calibrating one is the way to
+  get the experts off the decode-only prefill path.
+- **The LiLiCorr draft is already modelled there** (`lilicorr_vector_eps`, `lilicorr_logit_scale`,
+  draft layers laid out at `block_count + index`, a `feature_norm`/`feature_mlp` at
+  `block_count + num_layers`), which makes it a reference for milestone 5 rather than a from-scratch port.
+  The PR also fixes that draft's hidden-projection scoring to run **only when the batch is exactly one
+  draft block per sequence** (`n_tokens == dflash_block_size * n_seqs_unq`), a shape constraint our own
+  route has to respect.
+- **Vision, for phase 2**: the Omni model's tensors are reshaped to `(hidden, 3, patch, patch)` for images
+  and `(hidden, 6, patch, patch)` for video with a temporal patch of 2, `vision_model.embeddings.
+  position_embedding` is squeezed, `.layer_scale…lambda1` renames to `.weight`, the projector's
+  `mlp1.{0,1,2}` are its norm, `linear1` and `linear2`, the image mean and std come from the preprocessor's
+  `norm_mean`/`norm_std`, and the position table is kept whole for runtime interpolation.
 
 ## The target
 
@@ -439,14 +475,68 @@ variation is carried entirely by the config.
 
 1. **Oracle — done.** `tools/verify/nemotron_h_reference.py` dumps every stage an op has to reproduce
    (29 stages on the tiny config), from a scaled-down config or a downloaded checkpoint.
-2. **Config and artifact — config done, the rest next.** The per-layer block descriptor is parsed and
-   tested; what remains here is the loader threading and the converter's per-layer loops. The artifact
-   format does not change.
+2. **Config and artifact — done.** The per-layer block descriptor is parsed and tested, `load.{h,cpp}`
+   binds every declared parameter from the artifact, and the converter's per-layer loops produce it.
+   The artifact format did not change.
 3. **Ops, one at a time, each against the oracle**: `relu2` + RMSNorm → Mamba-2 (selective scan, fp32
    state) → router + non-gated experts → the latent round trip → the new latent-MoE op → attention →
    the block → the 88-block forward.
-4. **Converter and Engine path**, then the host-offload cache work above, then the decode loop.
+4. **Converter and Engine path** — the artifact is converted and independently checked, the loader and the
+   Program are landing; then the host-offload cache work above, then the decode loop.
 5. **Draft** (LiLiCorr) after the target runs, qualified against an NVFP4-family artifact.
+
+### The load path, and what it stops at
+
+The Engine keeps no architecture registry to consult. It **sniffs the artifact**: `artifact_is_gemma` is the only
+family predicate, and everything else falls through to the qwen3_5 loader, which then rejects what it does not
+recognize. So this family needs its own probe and its own branch — and the probe cannot go through
+`models::resolve_architecture`, which an earlier version of this section claimed. The converter stores only the
+keys this family's parser reads, so the artifact's `text/config` carries **neither `architectures` nor
+`model_type`**, and the registry's `NemotronHPuzzle` arm — keyed on the *source* checkpoint's
+`NemotronHPuzzleForCausalLM`/`nemotron_h_puzzle` — is unreachable from the artifact. The probe therefore keys on
+what this family does emit and no other does: the per-layer `block_configs` list, with `mamba` and `router`
+beside it. Carrying `architectures`/`model_type` through the converter as well would make dispatch uniform with
+every other family; that is worth doing at the next conversion, and it is not worth re-converting 45 GB to get
+now.
+
+A family plugs in through a fixed, small seam: `plan_load` → `materialize_model` returning the family's `Model`;
+a runtime contract bundle naming the Program and the request/prompt/output types; an instance holding the model,
+the frontend, the program and the capacity resolution; and arms in the Engine's variant and in its
+`if constexpr` visits, which each currently end in a qwen-shaped `else`. Gemma's bundle shows how little has to
+be family-specific: it reuses most of the qwen contract types, implements the rest thinly over its own Program,
+and switches off the features it does not support in its engine options rather than accepting and ignoring them.
+
+**The frontend is the one piece that had to be decided by evidence rather than by reuse, and the evidence says
+reuse is impossible.** The qwen3_5 frontend cannot even construct against this artifact: it validates the
+tokenizer's `pre_tokenizer` against the Qwen split regex and refuses the checkpoint's own Nanotron-v2 split, and
+its tokenizer-config check requires a `pad_token` of `` that this checkpoint's vocabulary does not contain — so
+there is no honest resource rewrite that would let it through. This is not a validation quibble: the split is
+*implemented* per family, the converter measured the Qwen and Nemotron splits disagreeing on real text (97 ids
+in 605k), and the converter itself recorded that the artifact cannot load until a runtime family implements the
+checkpoint's split. So the family gets its own frontend over the two format-neutral pieces this tree already
+shares — the tokenizer implementation and the Jinja engine — exactly as Gemma's does, plus one arm on the shared
+`TokenizerFamily` enum, and its sampling defaults come from the artifact's own `generation_config.json`
+(temperature 1.0, top_p 0.95, the vendor's own recommendation) rather than from a table.
+
+This stage stops at **loading**, and that is a decision rather than an unfinished edge. The landed forward is a
+zero-state prefill that keeps nothing between calls, so a Program that drove it through prefill and decode would
+compute a *wrong* model rather than report a missing feature: the convolution history, the recurrent plane and
+the attention K/V would all silently restart. The Program therefore owns that state — attention K/V for the 8
+attention layers, and convolution history plus an fp32 recurrent plane for each of the 40 Mamba layers — reports
+its capacity and its bytes honestly, and refuses to execute until the forward can persist what it computes.
+`engine ready` is the observable end of this milestone; the decode loop is the next one.
+
+One thing is cheaper than the decode loop and should come first: **CausalScoring needs no state at all.** It is a
+single pass over a token sequence returning per-token logits, which is exactly what the landed forward already
+computes, so the Program can serve `causal_score` with the composition as it stands — arena sizing from
+`model_workspace_bytes`, the execution view, and the head. That makes scoring the first real execution of the
+loaded model, and it is worth more as evidence than any name-or-shape check: it is the only thing that exercises
+the materialized pointers, including the routed banks read over UVA from page-locked host memory. What it does
+*not* come with is an independent oracle for the real 74B: the composition's oracle is the tiny-config dump, and
+the weights' oracle is the checkpoint, but a second implementation of the full model at this size would mean
+either running the 141 GB BF16 checkpoint on the CPU or converting the GGUF with llama.cpp's own converter — the
+latter now possible because that implementation shipped. Choosing that oracle is a decision to make deliberately
+before quoting a perplexity, not to assume.
 
 ## Open items
 
@@ -487,6 +577,7 @@ against an FP64 oracle plus — where one exists — the reference dump or the r
 | Latent expert dispatch and `relu2` | non-gated `down(relu2(up(x)))` in the 1024-wide latent space, with `E` and `I` as runtime arguments because the banks differ per layer; fp32 accumulation per expert and per token in rank order, one BF16 rounding, and a single shared definition of the activation so the two ops cannot drift |
 | Composition | `src/models/nemotron_h/forward.cpp` composes the three mixers and the block. The tiny model is walked block by block against the dump: 37 stages compared with a per-stage rel L2, everything at the 0.0016–0.008 BF16-operand floor and the logits at 0.00633, five refusal cases, and coverage asserted (37 compared, 3 reported but not in the dump). Its loosest stage, block 1's `fc2_latent_proj` at 0.0498, is explained by a measured near-tie: 2 of 130 tokens sit where the reference's K-th and (K+1)-th corrected scores differ by 0.002x the BF16 logit perturbation, so their expert pair moves while the other 128 ids match exactly and block 3 moves not at all. Two runs agreed to every printed digit. |
 | Artifact | `nemotron_h_74b_nvfp4` converts the BF16 checkpoint in 2067 s to 767 objects and **45.28 GB** (a 32.00 GB file plus a 13.28 GB part), of which the routed expert banks are **37.21 GB** — within 0.03% of what this document predicted from the checkpoint's config alone. The dense side is FP8 at 5.21 GB, which is why the total is below the ~48 GB predicted when that side was assumed to be Q8. Every design choice is measured rather than asserted: one divisor per bank costs at most 0.0001 rel L2 against per-expert divisors, the BF16 and FP32 sets are bit-exact, the conv payload is bit-exact tap-major, and the experts' 0.081 rel L2 is the *format* floor — established by running the same independent check against the existing Gemma NVFP4 artifact first, where it reads 0.070. |
+| Artifact completeness | `tests/convert/test_nemotron_h_artifact.py` proves the parameter set from metadata alone in about 1.3 s: 28,331 language tensors map to exactly one parameter each and every parameter is explained — 0 unmappable, 0 absent, 0 duplicate, 0 unexplained — shapes agree except for the one transform the container makes (the depthwise convolution's stored `[10240,1,4]` becoming the tap-major `[10240,4]`), format classes agree exactly (27,728 NVFP4 as 27,648 routed and 80 shared, 113 FP8, 330 BF16, 160 FP32 — the 120 per-head state vectors and the 40 correction biases), and all 40 MoE layers have their expert count confirmed **from the checkpoint's own tensors** rather than from the config: 240 in 12 layers, 304 in 6, 368 in 9, 432 in 10, 496 in 3. The artifact's stored `block_configs` agrees with what the tensors say everywhere, so this release's config does not lie. Eleven one-at-a-time perturbations of the fixture — a lost expert, a removed parameter, a vision tensor renamed into the language set, the head re-classed to BF16, the tap-major transform dropped, a bank range shifted by 1024 rows, a config claiming 304 experts for a 240-expert layer — are each caught with the expected message, which is what makes the eight passing cases evidence rather than ceremony. |
 
 One caveat the conversion reports in its own right, and belongs on the prefill work list rather than being
 rediscovered: NVFP4 weights under an `A16Only` input policy — which is what a full-precision source produces —
