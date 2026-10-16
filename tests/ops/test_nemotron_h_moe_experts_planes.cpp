@@ -408,10 +408,55 @@ void require_identical(const std::vector<std::uint16_t>& left,
     require(differing == 0 && worst == 0.0 && rel_l2 == 0.0, what + measured);
 }
 
+// The fixture's own control, and what makes "0 differing words" mean something rather than nothing:
+// two accumulation orders over the same stored bytes have to disagree somewhere, or *any* order
+// would pass and the identity case would be vacuous.
+//
+// The weights are products of an E2M1 nibble, an E4M3 scale and a reciprocal divisor -- about six
+// significand bits spanning the whole exponent range those two formats carry -- and the activations
+// are BF16, so a row's `latent`- or `intermediate`-term sum is not an exactly representable FP32
+// value and the association is observable. That is an argument; this counts it: `rows` rows of the
+// bank's expert `expert` are dotted with `activation` in the per-token kernel's four-chain order
+// and again in one ascending chain, both in FP32.
+//
+// It counts two things: rows whose two FP32 results differ at all, and rows where even the *BF16*
+// rounding of those results differs -- the second being the property that would make
+// `identity_case` fail, and the reason a difference of one FP32 ulp is worth counting at all: it
+// propagates through the squared ReLU and the second projection before it reaches the output grid,
+// which is where the identity case compares.
+struct OrderSensitivity {
+    int rows           = 0;
+    int fp32_differing = 0;
+    int bf16_differing = 0;
+};
+
+OrderSensitivity order_sensitive_rows(const StoredBank& bank, bool up, int expert,
+                                      int rows_per_expert, const std::vector<float>& activation,
+                                      int rows) {
+    const int columns  = static_cast<int>(activation.size());
+    const int base_row = expert * rows_per_expert;
+    OrderSensitivity counted;
+    counted.rows = rows;
+    for (int row = 0; row < rows; ++row) {
+        const int at    = base_row + row % rows_per_expert;
+        float chain[4]  = {0.0F, 0.0F, 0.0F, 0.0F};
+        float ascending = 0.0F;
+        for (int column = 0; column < columns; ++column) {
+            const float value = static_cast<float>(bank.element(up, at, column));
+            chain[column & 3] += value * activation[static_cast<std::size_t>(column)];
+            ascending += value * activation[static_cast<std::size_t>(column)];
+        }
+        // The wide kernel's own association, against one chain over the same products.
+        const float four_chain = (chain[0] + chain[1]) + (chain[2] + chain[3]);
+        if (four_chain != ascending) { ++counted.fp32_differing; }
+        if (f32_to_bf16(four_chain) != f32_to_bf16(ascending)) { ++counted.bf16_differing; }
+    }
+    return counted;
+}
+
 // The token count the per-token route is reached at. Any count above the row-tiled route's own
 // maximum works; 16 is above it for every token count these cases use.
-constexpr std::int32_t kWideTokens   = 16;
-constexpr std::int32_t kNarrowTokens = 8;
+constexpr std::int32_t kWideTokens = 16;
 
 std::int32_t copies_for(std::int32_t tokens) { return (kWideTokens + tokens - 1) / tokens; }
 
@@ -509,6 +554,46 @@ void identity_case() {
         static_cast<const std::byte*>(device_bank.data()) + staged.offsets[3]};
     const ops::ExpertWeights bank = base.bank.addressing();
 
+    // The fixture can tell two accumulation orders apart, or the comparison below would be vacuous.
+    // The up bank is dotted with token 0's own activation row. The down bank's real activation is
+    // the up projection's squared-ReLU result, which this case never materializes on the host, so
+    // it is dotted with the squared ReLU of that same row instead: what the control needs of it is
+    // the row's own length and the same BF16 precision, not the Op's exact vector.
+    std::vector<float> up_activation(static_cast<std::size_t>(kLatent));
+    for (std::int32_t h = 0; h < kLatent; ++h) {
+        up_activation[static_cast<std::size_t>(h)] =
+            bf16_to_f32(base.x[static_cast<std::size_t>(h)]);
+    }
+    std::vector<float> down_activation(static_cast<std::size_t>(kIntermediate));
+    for (std::int32_t i = 0; i < kIntermediate; ++i) {
+        const float value = up_activation[static_cast<std::size_t>(i % kLatent)];
+        down_activation[static_cast<std::size_t>(i)] = value > 0.0F ? value * value : 0.0F;
+    }
+    const int expert                      = base.ids[0];
+    constexpr int kSampled                = 256;
+    const OrderSensitivity up_sensitivity = order_sensitive_rows(
+        base.bank, /*up*/ true, expert, kIntermediate, up_activation, kSampled);
+    const OrderSensitivity down_sensitivity =
+        order_sensitive_rows(base.bank, /*up*/ false, expert, kLatent, down_activation, kSampled);
+    std::printf("nemotron_h_moe_experts planes: of the sampled rows, %d of %d up and %d of %d down "
+                "change value under a different association; %d and %d of them change at BF16\n",
+                up_sensitivity.fp32_differing, up_sensitivity.rows, down_sensitivity.fp32_differing,
+                down_sensitivity.rows, up_sensitivity.bf16_differing,
+                down_sensitivity.bf16_differing);
+    require(up_sensitivity.fp32_differing > 0 && down_sensitivity.fp32_differing > 0,
+            "the fixture's row sums are order-sensitive in FP32, so an association the Op did not "
+            "choose would compute different rows");
+    // The BF16-visible count is reported rather than required, and the reason is arithmetic rather
+    // than a weak fixture: two orders that differ inside a row differ by about one ulp of that
+    // row's *sum* (6e-8 relative), while BF16's grid is 2e-3 relative, so the row's own rounding
+    // absorbs the difference unless the sum lands within 1.5e-5 of a rounding boundary -- and that
+    // probability does not move when the magnitudes do, because both sides scale together. What
+    // makes the comparison below able to fail is instead the *propagation*: a row that moves feeds
+    // the squared ReLU and then every one of the next projection's 2560-term sums, and a coarser
+    // association change than this one -- the warp-reduced row split this design rejected -- moves
+    // about 0.05% of the model's output elements by one BF16 ulp, which is the measurement that
+    // says the criterion is not vacuous.
+
     for (std::int32_t tokens = 1; tokens <= kTokens; ++tokens) {
         const Call narrow_call = prefix_call(base, tokens);
         // Above the row-tiled route's token count, and every column a repetition of the first
@@ -567,12 +652,39 @@ void workspace_case() {
     }
 }
 
+// The width the row-tiled route's chunked loops are exact at, and the refusal a width outside it
+// earns. Both of its staging loops are unguarded -- the activation staging moves 16-byte packs and
+// the product staging `float4`s -- so a width the route accepts has to be one where those loops end
+// exactly on the row's own end. 192 is a multiple of the 64-column chunk, so a guard written
+// against the chunk alone would let them run past the row; it is also not a whole number of the 128
+// rows a K16M128x4 scale block covers, which is why the plane-addressed wrapper refuses it before a
+// kernel could stage anything at all. This asserts that refusal rather than the arithmetic of the
+// kernels in its absence.
+void width_case() {
+    constexpr std::int32_t kExperts = 4;
+    constexpr std::int32_t kLatent  = 192; // three 64-column chunks, one and a half 128-row blocks
+    constexpr std::int32_t kIntermediate = 256;
+    constexpr std::int32_t kTopK         = 2;
+    const Call call = synth_call(kExperts, kLatent, kIntermediate, kTopK, 2, false, 191U);
+    const ops::ExpertWeights bank = call.bank.addressing();
+    const std::array<const void*, 4> planes{call.bank.codes_up.data(), call.bank.scales_up.data(),
+                                            call.bank.codes_down.data(),
+                                            call.bank.scales_down.data()};
+    try {
+        (void)run_with_planes(call, planes, kExperts, bank);
+        require(false, "a width that is not a whole number of 128-row scale blocks is refused");
+    } catch (const std::invalid_argument&) {
+        require(true, "a width that is not a whole number of 128-row scale blocks is refused");
+    }
+}
+
 } // namespace
 
 int main() {
     // The workspace query, the route it dispatches, and the two routes' agreement at this family's
     // own widths and rank count before the geometries below put them both against the oracle.
     workspace_case();
+    width_case();
     identity_case();
 
     // The family's real pairing is a latent width and four intermediate widths, all multiples of
