@@ -1,6 +1,9 @@
 #include "models/nemotron_h/forward.h"
 
+#include "artifact/views.h" // bind_view
 #include "core/layout.h"
+#include "core/weight_view.h" // as_dense, native_weight, weight_tensor
+#include "models/nemotron_h/load.h"
 #include "ninfer/ops/attention_geometry.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -325,6 +328,9 @@ void plan_pass(const TextConfig& config, std::int32_t tokens, Allocator& allocat
 Model::Model(TextConfig config, ModelWeights weights)
     : config_(std::move(config)), weights_(std::move(weights)) {}
 
+Model::Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing)
+    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)) {}
+
 void Model::bind(WeightId id, std::string name, Tensor tensor, Weight weight) {
     if (id.index == std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("nemotron_h model: parameter '" + name +
@@ -362,6 +368,110 @@ const Weight& Model::matrix(WeightId id) const {
                                     "' is bound as a tensor rather than as a matrix");
     }
     return parameter.weight;
+}
+
+namespace {
+
+// A dense parameter's payload is also its tensor. A quantized matrix has no single-typed tensor at
+// all -- its codes, scales and high plane are the Weight's own -- so it stays unset rather than
+// being misrepresented.
+Tensor matrix_tensor(const Weight& weight) {
+    if (weight.qtype == QType::FP32 || weight.qtype == QType::BF16) { return as_dense(weight); }
+    return Tensor{};
+}
+
+// A dense parameter's resident tensor, in the rank-1 or rank-2 form the Ops read.
+Tensor direct_tensor(const WeightView& view) {
+    if (view.shape.empty() || view.shape.size() > 2) {
+        throw artifact::ArtifactError("a dense parameter must have rank 1 or 2");
+    }
+    const auto extent = [](std::uint64_t value) {
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw artifact::ArtifactError("a parameter extent exceeds int32");
+        }
+        return static_cast<std::int32_t>(value);
+    };
+    if (view.shape.size() == 1) { return weight_tensor(view, {extent(view.shape[0]), 1, 1, 1}); }
+    return weight_tensor(view, {extent(view.shape[0]), extent(view.shape[1]), 1, 1});
+}
+
+// Every id the config's block list implies, read back through the model's own `bound()`, so a hole
+// -- a layer whose kind and whose bound set disagree -- is refused here rather than by a kernel
+// reading an unbound id at the first token.
+void verify_complete(const Model& model) {
+    const ModelWeights& weights = model.weights();
+    const TextConfig& config    = model.config();
+    const auto require          = [&model](WeightId id) { (void)model.bound(id); };
+
+    require(weights.text.token_embedding);
+    require(weights.text.output_head);
+    require(weights.text.final_norm);
+    if (weights.text.layers.size() != config.num_hidden_layers()) {
+        throw artifact::ArtifactError("the bound layer count differs from the config's block list");
+    }
+    for (std::size_t layer = 0; layer < weights.text.layers.size(); ++layer) {
+        const LayerWeights& bound = weights.text.layers[layer];
+        const BlockKind kind      = config.block_kind(static_cast<std::uint32_t>(layer));
+        require(bound.block_norm);
+        if (bound.kind != kind) {
+            throw artifact::ArtifactError(
+                "layer " + std::to_string(layer) +
+                " is bound as a different kind than the config's block list");
+        }
+        if (kind == BlockKind::Mamba && bound.mamba) {
+            const MambaWeights& mamba = *bound.mamba;
+            for (const WeightId id : {mamba.in_proj, mamba.out_proj, mamba.conv, mamba.conv_bias,
+                                      mamba.a_log, mamba.d_skip, mamba.dt_bias, mamba.norm}) {
+                require(id);
+            }
+        } else if (kind == BlockKind::Attention && bound.attention) {
+            const AttentionWeights& attention = *bound.attention;
+            for (const WeightId id :
+                 {attention.query, attention.key, attention.value, attention.output}) {
+                require(id);
+            }
+        } else if (kind == BlockKind::Moe && bound.moe) {
+            const MoeWeights& moe = *bound.moe;
+            for (const WeightId id :
+                 {moe.router, moe.correction_bias, moe.fc1_latent, moe.fc2_latent, moe.shared_up,
+                  moe.shared_down, moe.experts_up, moe.experts_down}) {
+                require(id);
+            }
+        } else {
+            throw artifact::ArtifactError("layer " + std::to_string(layer) +
+                                          " is bound without the parameters its config's kind "
+                                          "implies");
+        }
+    }
+}
+
+} // namespace
+
+// The materializer lives on this side because it constructs `Model`: the loading library plans and
+// declares, this side uploads the bytes those declarations name and binds them to the model's own
+// ids. The plan hands its content over and is left spent, so the 45 GB it resolved is uploaded
+// once.
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+                                         const StartupObserver* observer) {
+    auto content                   = plan.release();
+    const artifact::Reader& source = *content.materialization.source;
+    auto backing =
+        artifact::materialize(source, std::move(content.materialization), device, observer);
+    auto model = std::unique_ptr<Model>(
+        new Model(std::move(content.config), std::move(content.weights), std::move(backing)));
+    for (std::size_t index = 0; index < content.declarations.size(); ++index) {
+        const DeclaredParameter& declared = content.declarations[index];
+        const WeightId id{index};
+        const WeightView view = artifact::bind_view(declared.reference, model->backing_);
+        if (!declared.matrix) {
+            model->bind(id, declared.name, direct_tensor(view));
+            continue;
+        }
+        const Weight weight = native_weight(view, declared.activation_divisor);
+        model->bind(id, declared.name, matrix_tensor(weight), weight);
+    }
+    verify_complete(*model);
+    return model;
 }
 
 std::size_t block_workspace_bytes(const TextConfig& config, std::int32_t tokens) {

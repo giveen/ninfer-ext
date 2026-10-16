@@ -52,6 +52,7 @@
 // set does not match its config's kind, and each mixer refuses a parameter whose shape disagrees
 // with the config's own values before it hands it to an Op.
 
+#include "artifact/materializer.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -61,6 +62,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,11 +78,17 @@ struct BoundWeight {
     Weight weight;
 };
 
+class LoadPlan;
+
 // The parameters a model's config names, bound by id. A model with no artifact loader yet is built
 // by binding each parameter by hand, which is also what a verification harness does from a
-// reference dump; a loader binds the same ids from materialized artifact parts.
+// reference dump; the loader binds the same ids from the artifact's materialized bytes.
+//
+// The bound views borrow the model's backing store, so a Model must outlive every view taken from
+// it, and `backing_` is declared first so it is destroyed last.
 class Model {
 public:
+    // The hand-bound model: no backing store, so every tensor and weight must be the caller's.
     Model(TextConfig config, ModelWeights weights);
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
@@ -88,7 +96,9 @@ public:
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
 
     // Binds one parameter. `weight` is engaged for a matrix the Ops consume; `tensor` is the
-    // resident view either way, and a matrix's `tensor` is its logical `[N,K]` row-major view.
+    // resident view either way, and a matrix's `tensor` is its logical `[N,K]` row-major view. A
+    // quantized matrix has its planes in `weight` and no single-typed tensor, so its `tensor` stays
+    // unset (`data == nullptr`) rather than being misrepresented as a payload it is not.
     void bind(WeightId id, std::string name, Tensor tensor, Weight weight = {});
 
     // The bound parameter. Throws std::invalid_argument when the id was never bound, which is the
@@ -99,12 +109,32 @@ public:
 
     [[nodiscard]] const Weight& matrix(WeightId id) const;
 
+    // What the model's own bytes cost, which is where the routed banks' pinned host residency shows
+    // up: `pinned_host_bytes` is 37.21 GB of NVFP4 experts that no 32 GB card holds.
+    [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
+        return backing_.stats();
+    }
+
 private:
+    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
+                                                    const StartupObserver*);
+    // The loader's constructor: the model owns the bytes every bound view borrows.
+    Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing);
+
+    // Destroyed last: every BoundWeight view borrows these bytes.
+    artifact::MaterializedArtifact backing_;
     TextConfig config_;
     ModelWeights weights_;
     std::vector<BoundWeight> parameters_;
     std::vector<bool> bound_;
 };
+
+// Uploads the plan's selected bytes and binds every parameter the plan declared, which is why it is
+// defined here rather than in the loader: it constructs `Model`, and the loading library links no
+// part of the execution side. The plan is consumed; its Reader must outlive this call, and the
+// returned model owns the materialized bytes rather than the artifact, so it outlives the Reader.
+[[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+                                                       const StartupObserver* observer = nullptr);
 
 // The stages a block produces, reported after each one is written. A stage is named by identity
 // rather than by the reference's dotted path, so a consumer maps it to whatever it compares against
