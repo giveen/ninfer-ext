@@ -69,10 +69,19 @@ RoutedExpertPool::RoutedExpertPool(const Model& model, std::int32_t top_k,
     }
     geometry_                = std::make_unique<ops::ExpertPoolGeometry>(banks_);
     const std::int32_t slots = execution::ExpertPager::bank_slots(*geometry_);
+    if (top_k <= 0) {
+        throw std::invalid_argument("nemotron_h routed experts: a pool routes at least one expert");
+    }
     if (slots < top_k) {
         throw std::invalid_argument("nemotron_h routed experts: the staged banks hold fewer slots "
                                     "than one call assigns");
     }
+    // The width at which a call touches every expert of the pool's widest bank, so staging a whole
+    // bank can never copy more than the call reads: `top_k * width >= max_experts`. Below it the
+    // call routes a fraction of the bank and the pool gathers instead. A caller that names a width
+    // keeps it.
+    const std::int32_t staged_width =
+        staged_columns > 0 ? staged_columns : (geometry_->max_experts() + top_k - 1) / top_k;
     // The one mapping from a pool layer to its stored bank: the same `expert_pool_layer` the loader
     // planned with, walked in block order, so a pool whose layers drifted from the model's is
     // refused here rather than reading another layer's experts.
@@ -135,9 +144,11 @@ RoutedExpertPool::RoutedExpertPool(const Model& model, std::int32_t top_k,
                                       .slot_entries = geometry_->slot_entries(),
                                       .pool_stride  = geometry_->pool_stride(),
                                       .pool         = static_cast<std::byte*>(pool_.p)};
-    // The staged banks are the whole slot range, so the pager's cache route has no slots of its own
-    // and `resolve` is never called: this family stages a bank whole and has no per-expert cache.
-    pager_.emplace(*geometry_, cache, staged_columns, top_k, 0, slots);
+    // The staged banks are the top of the cache's slots and, with no lend range, they are the whole
+    // of them: a gather call's cache and a staged call's two banks are one region, which is what
+    // lets the two routes share one allocation. A staged pass reclaims it at its first staged
+    // layer, so the cache a gather left there cannot be mistaken for staged bytes.
+    pager_.emplace(*geometry_, cache, staged_width, top_k, 0, slots);
 }
 
 RoutedExpertPool::~RoutedExpertPool() = default;
@@ -166,6 +177,39 @@ RoutedExpertPool::Placed RoutedExpertPool::acquire(std::int32_t layer, cudaStrea
 
 void RoutedExpertPool::release(std::int32_t layer, cudaStream_t stream) {
     pager_->release_staged(layer, stream);
+}
+
+RoutedExpertPool::Cached RoutedExpertPool::acquire_cached(std::int32_t layer, const Tensor& ids,
+                                                          Tensor& slot_ids, Tensor& misses,
+                                                          cudaStream_t stream) {
+    if (layer < 0 || layer >= geometry_->layers()) {
+        throw std::out_of_range("nemotron_h routed experts: no such pool layer");
+    }
+    // A resident bank was uploaded once and is read where it lives: there is no host copy of it to
+    // gather from and no slot to gather it into.
+    if (resident_[layer]) {
+        throw std::logic_error("nemotron_h routed experts: a resident bank is read where it was "
+                               "uploaded, so it has nothing to gather");
+    }
+    // The resolve maps the layer's own expert ids to pool slots and the fetch copies every miss
+    // from the layer's pinned bank; the returned event is what makes the called slots readable.
+    // The Op reads the layer's weight divisors by the id it is handed, and this route hands it slot
+    // ids, which name the same divisor only when the bank carries one divisor for the whole matrix
+    // -- a per-expert divisor array would be indexed with another expert's slot. This checkpoint
+    // stores one per matrix (see `plan_experts.h`); a bank that did not is refused here rather than
+    // run with the wrong weights.
+    const ops::ExpertBankShape& shape = banks_[static_cast<std::size_t>(layer)];
+    if (host_[static_cast<std::size_t>(layer)].gate_up_divisor_rows < shape.gate_up_rows ||
+        host_[static_cast<std::size_t>(layer)].down_divisor_rows < shape.down_rows) {
+        throw std::logic_error("nemotron_h routed experts: the gather route needs a bank with one "
+                               "weight divisor per matrix");
+    }
+    const cudaEvent_t fetched = pager_->resolve(ids, layer, host_[layer], slot_ids, misses, stream);
+    Cached cached;
+    cached.weights = pager_->slot_weights(host_[layer]);
+    cached.span    = geometry_->span(layer);
+    cached.fetched = fetched;
+    return cached;
 }
 
 std::size_t RoutedExpertPool::allocated_bytes() const noexcept {

@@ -1,16 +1,28 @@
 #pragma once
 
 // The routed experts of one Nemotron-H model: the pool its 40 heterogeneous banks form, the device
-// residency they are given, and the staged route the non-resident ones take.
+// residency they are given, and the two routes the non-resident ones take.
 //
 // This family's routed banks are 37.21 GB of block-scaled NVFP4, which no 32 GB card holds, so the
-// work is a split rather than a placement: some banks live on the device and are read in place,
-// the rest stay in pinned host memory and are copied into a two-bank device staging buffer as the
-// pass reaches them. Residency granularity is one *bank* -- a whole 240-to-496-expert parent, 0.42
-// to 1.46 GB -- because the Op reads a bank whole and, at any chunk width this family runs, a chunk
-// already touches every expert of the layer it is on (`top_k * width >= experts` holds from 56
-// columns on). There is therefore no per-expert cache here: a slot cache would copy the same bytes
-// and add a compaction pass to discover which experts to copy.
+// work is a split rather than a placement: some banks live on the device and are read in place, the
+// rest stay in pinned host memory and reach the device one of two ways. Which one is a question
+// about the *width of the call*, not about the layer:
+//
+//  * A call of `staged_columns` columns or more touches every expert of the layer it is on:
+//    `top_k * width >= experts` holds from 56 columns for this artifact's widest bank (496
+//    experts), and for a narrow bank it holds earlier still because the bank holds fewer experts
+//    than the call touches. Such a call stages the layer's *whole bank* into a two-bank device
+//    staging buffer as the pass reaches it, the next layer's fill overlapping this one's compute.
+//    Staging cannot copy more than the call reads: every expert of the bank is used.
+//  * A narrower call routes `top_k` of the bank's 240-to-496 experts. Staging a whole parent for
+//    the 9 experts a one-column call reads is about 27 times the routed bytes (496 against 9 on
+//    the widest bank, 27 on the narrowest), so those calls take the pager's per-expert slot cache
+//    and gather only the experts they routed to.
+//
+// Both routes read the same stored bytes through the same decoder -- a slot pool is the layer's own
+// planes at the pool's own stride -- so which one ran cannot move a result. The choice is
+// `ExpertPager::stages`'s, exposed here as `RoutedExpertPool::stages`; there is no option, flag or
+// policy mode for it, and both routes share the one slot pool and allocate nothing per call.
 //
 // This is the *execution* half. The planning half -- the pool's geometry, its size, and the split
 // that decides which banks are uploaded -- is `plan_experts.h`, which the loader calls while
@@ -22,6 +34,7 @@
 //    not in it at all -- it was uploaded once and the forward reads it where it lives.
 
 #include "core/arena.h"
+#include "core/tensor.h"
 #include "core/weight.h"
 #include "models/execution/expert_pager.h"
 #include "models/nemotron_h/config.h"
@@ -56,16 +69,16 @@ class Model;
                                                         std::int32_t intermediate,
                                                         const char* label);
 
-
 /**
- * The device side of a pool: two staged banks, the pager's tables, the pager that fills them, and
- * the one mapping from a pool layer to the bank it reads.
+ * The device side of a pool: the pager's slot pool with its tables, the pager that fills and
+ * gathers it, and the one mapping from a pool layer to the bank it reads.
  *
  * Owned by the Program (or by a harness that runs the forward itself). A *resident* layer is not in
  * the pool's staging at all -- it was uploaded once at bind time and `acquire` answers with its own
- * binding, so the caller reads it in place. A non-resident layer is staged whole into the bank the
- * layer being read is not using, and the *next* non-resident layer's fill is issued at the same
- * time, so it overlaps this layer's compute rather than following it.
+ * binding, so the caller reads it in place. A non-resident layer takes `acquire`'s staged route
+ * when the call is `stages(columns)` wide and `acquire_cached`'s gather route below that; the two
+ * routes are the same pool, so a pass may switch between them from one width to the next without
+ * reallocating anything.
  *
  * Not thread-safe: one execution thread drives it.
  */
@@ -74,17 +87,18 @@ public:
     // The pool is built from the model itself: its banks come from the config, its split from the
     // plan the loader bound the banks with, and its per-layer addressing from the bound weights --
     // so a pool cannot disagree with the model it serves. `staged_columns` is the width at or above
-    // which a call stages; the pager's other route (a per-expert slot cache) is not built for this
-    // family, so the pool stages every call it is given and the value is only a floor.
-    RoutedExpertPool(const Model& model, std::int32_t top_k, std::int32_t staged_columns = 1);
+    // which a call stages; zero takes the pool's own, `ceil(max_experts / top_k)`, which is the
+    // narrowest width at which a call touches every expert of the widest bank and staging therefore
+    // copies no more than the call reads. A harness may pass a width of its own.
+    RoutedExpertPool(const Model& model, std::int32_t top_k, std::int32_t staged_columns = 0);
     ~RoutedExpertPool();
     RoutedExpertPool(const RoutedExpertPool&)            = delete;
     RoutedExpertPool& operator=(const RoutedExpertPool&) = delete;
     RoutedExpertPool(RoutedExpertPool&&)                 = delete;
     RoutedExpertPool& operator=(RoutedExpertPool&&)      = delete;
 
-    // One layer's bank for one call: the addressing to hand the Op, and whether it is a staged copy
-    // the caller must release after the layer's last reader.
+    // One layer's bank for one staged call: the addressing to hand the Op, and whether it is a
+    // staged copy the caller must release after the layer's last reader.
     struct Placed {
         ops::ExpertWeights weights;
         ops::ExpertBankSpan span;
@@ -92,11 +106,35 @@ public:
         bool staged        = false;
     };
 
+    // One layer's bank for one gathered call: the slot pool addressed with the layer's own plane
+    // offsets at the pool's stride (so the Op indexes it by slot id), the layer's span in that
+    // pool, and the event that completes the gather the pager enqueued on its own stream.
+    struct Cached {
+        ops::ExpertWeights weights;
+        ops::ExpertBankSpan span;
+        cudaEvent_t fetched = nullptr;
+    };
+
+    // True when a call of `columns` columns takes the staged route. Below it the same call gathers
+    // the experts it routed to through the pager's slot cache instead.
+    [[nodiscard]] bool stages(std::int32_t columns) const { return pager_->stages(columns); }
+
     // Opens a pass: the next staged fill reclaims the banks from whatever the cache left in them.
     void begin_forward() noexcept { forward_start_ = true; }
 
     [[nodiscard]] Placed acquire(std::int32_t layer, cudaStream_t stream);
     void release(std::int32_t layer, cudaStream_t stream);
+
+    // The narrow route: resolve `ids` -- the layer's own routed expert ids, I32 `[top_k, columns]`
+    // -- to slots of the pool in `slot_ids` (I32 `[top_k, columns]`), gather the misses from the
+    // layer's pinned bank on the pager's stream, and answer the addressing to hand the Op with
+    // `slot_ids` in place of `ids`. `misses` is the pager's own scratch and its contents belong to
+    // the pager until the next resolve; `fetched` completes the gather, so the caller's stream must
+    // wait on it before reading a slot the gather filled. Nothing is released here -- the slots
+    // outlive the call and the next resolve owns their eviction. A *resident* layer is refused: it
+    // is read where it was uploaded and has nothing to gather.
+    [[nodiscard]] Cached acquire_cached(std::int32_t layer, const Tensor& ids, Tensor& slot_ids,
+                                        Tensor& misses, cudaStream_t stream);
 
     [[nodiscard]] std::int32_t layers() const noexcept { return geometry_->layers(); }
 
@@ -112,6 +150,12 @@ public:
     [[nodiscard]] std::size_t staged_layers() const noexcept { return pager_->staged_layers(); }
 
     [[nodiscard]] std::size_t allocated_bytes() const noexcept;
+
+    // The pager's cache state: what the gathered route resolves into and gathers from. A harness
+    // reads its counters (hits, misses, ids outside the bank) back after a pass it has
+    // synchronized, the same way the staged route's `staged_bytes` needs no such read; both
+    // counters are Device memory, which is why this answers with the state rather than numbers.
+    [[nodiscard]] const ops::ExpertCacheState& cache() const noexcept { return pager_->cache(); }
 
     [[nodiscard]] const ops::ExpertPoolGeometry& geometry() const noexcept { return *geometry_; }
 

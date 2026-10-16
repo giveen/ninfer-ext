@@ -129,8 +129,9 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
     // its neighbour, and its planes would not be addressable as `base + e*stride`.
     if (latent % 128 != 0 || intermediate % 128 != 0) {
         fail("the plane-addressed route needs a latent and an intermediate width that are both "
-             "multiples of 128, where a bank of " + std::to_string(experts) + " experts at " +
-             std::to_string(latent) + "x" + std::to_string(intermediate) + " is neither");
+             "multiples of 128, where a bank of " +
+             std::to_string(experts) + " experts at " + std::to_string(latent) + "x" +
+             std::to_string(intermediate) + " is neither");
     }
 
     if (x.dtype != DType::BF16) { fail("x must be BF16"); }
@@ -151,14 +152,24 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
     if (bank.layout.format != ExpertFormat::Nvfp4 || bank.layout.planes != want.planes) {
         fail("the bank must be block-scaled NVFP4 with four planes");
     }
+    // One expert's planes are read at `base[p] + e*stride[p]`. A stored or staged bank strides by
+    // the layer's own per-expert plane size; the expert cache's slot pool strides every plane by
+    // the pool's own -- one expert per slot, as wide as the pool's widest bank -- which is how a
+    // gathered call reads the expert it routed to by slot id. Both are this layer's addressing,
+    // and the layout check beside them pins the plane sizes either way, so a stride of either form
+    // is admitted. Anything else is another layer's or another pool's geometry and is refused.
     for (std::int32_t plane = 0; plane < want.planes; ++plane) {
         if (bank.base[plane] == nullptr) {
             fail("bank plane " + std::to_string(plane) + " is unbound");
         }
-        if (bank.layout.plane_bytes[plane] != want.plane_bytes[plane] ||
-            bank.stride[plane] != want.plane_bytes[plane] || bank.stride[plane] % 16 != 0) {
+        const std::int64_t stride = bank.stride[plane];
+        const bool own_plane      = stride == want.plane_bytes[plane];
+        const bool pool_slot      = stride == bank.stride[0] && stride >= want.slot_bytes;
+        if (bank.layout.plane_bytes[plane] != want.plane_bytes[plane] || stride % 16 != 0 ||
+            !(own_plane || pool_slot)) {
             fail("bank plane " + std::to_string(plane) +
-                 " must be this layer's own per-expert plane size, 16-byte aligned");
+                 " must stride by this layer's own per-expert plane size, or by a slot pool that "
+                 "holds one of its experts, 16-byte aligned");
         }
     }
     if (bank.layout.slot_bytes != want.slot_bytes) {

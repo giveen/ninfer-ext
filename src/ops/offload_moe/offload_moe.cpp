@@ -38,6 +38,16 @@ void require_routed(const Tensor& t, DType dtype, std::int32_t columns, const ch
             std::string(label) + " must be [10,T]");
 }
 
+// Rank-major ids of the *caller's* own rank count: an assignment list is `[K,T]` with the token
+// innermost whatever K is, and the route that resolves it works from the assignment count rather
+// than from this file's family constant. The cache-route family this Op was written for routes 10
+// experts; a family that routes 9 passes 9 columns of ids and is the same call.
+void require_rank_major(const Tensor& t, DType dtype, std::int32_t columns, const char* op,
+                        const char* label) {
+    require_dense(t, dtype, op, label);
+    require(t.ne[0] >= 1 && t.ne[1] == columns, op, std::string(label) + " must be [K,T]");
+}
+
 // ExpertLayout::plane_bytes and ExpertWeights::base hold kMaxExpertPlanes entries, so a larger
 // count would index past both as soon as a launcher walks the plane loop.
 void require_expert_planes(const ExpertLayout& layout, const char* op) {
@@ -216,10 +226,16 @@ void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int3
 void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCacheState& cache,
                           Tensor& slot_ids, Tensor& misses, cudaStream_t stream) {
     constexpr const char* op = "expert_cache_resolve";
-    require_routed(ids, DType::I32, ids.ne[1], op, "ids");
-    require_routed(slot_ids, DType::I32, ids.ne[1], op, "slot ids");
+    // The rank count is the caller's own -- `ids.ne[0]` -- and only the column count is shared
+    // with the slot-id tensor, because a resolve is a per-assignment call whichever family makes
+    // it.
+    require_rank_major(ids, DType::I32, static_cast<std::int32_t>(ids.ne[1]), op, "ids");
+    require_rank_major(slot_ids, DType::I32, static_cast<std::int32_t>(ids.ne[1]), op, "slot ids");
+    // The kernel writes one slot id per assignment, so the output must hold exactly the ids' own
+    // count whatever shape either was declared with.
+    require(slot_ids.numel() == ids.numel(), op, "slot ids must hold one entry per assignment");
     require_dense(misses, DType::I32, op, "misses");
-    require(misses.numel() >= 2 * ids.numel() + 1, op, "misses must hold 2*(10*T)+1 words");
+    require(misses.numel() >= 2 * ids.numel() + 1, op, "misses must hold 2*(K*T)+1 words");
     require(bank.first_expert >= 0 && bank.experts > 0 && bank.experts <= kMaxBankExperts &&
                 bank.first_expert + bank.experts <= cache.slot_entries, op, "bank span outside the pool's experts");
     require(cache.slots >= ids.numel(), op, "the cache must hold every assignment of one call");

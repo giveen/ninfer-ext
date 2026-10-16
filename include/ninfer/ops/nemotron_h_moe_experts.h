@@ -106,12 +106,16 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
  * (block-scaled NVFP4) form of one layer's routed experts.
  *
  * `bank` is the layer's bank as `ExpertWeights` addresses it -- plane 0 the gate/up codes, plane 1
- * the gate/up scales, plane 2 the down codes, plane 3 the down scales, expert `e` of plane `p` at
- * `base[p] + e * stride[p]`, and the weight divisors in `gate_up_divisors`/`down_divisors` -- and
- * `source` is that bank's expert count and the offset of its first expert in the pool it came from.
- * Where the bytes live is the caller's business and the Op's contract does not distinguish it: a
- * device-resident upload, a staging buffer a whole layer was copied into, and the artifact's own
- * pinned host mapping read over UVA are the same bank at three addresses. What the Op does require
+ * the gate/up scales, plane 2 the down codes, plane 3 the down scales, expert (or slot) `i` of
+ * plane `p` at `base[p] + i * stride[p]`, and the weight divisors in
+ * `gate_up_divisors`/`down_divisors` -- and `source` is that bank's expert count and the offset of
+ * its first expert in the pool it came from. Where the bytes live is the caller's business and the
+ * Op's contract does not distinguish it: a device-resident upload, a staging buffer a whole layer
+ * was copied into, the artifact's own pinned host mapping read over UVA, and the expert cache's
+ * slot pool are the same bank at four addresses. The slot pool differs in one way -- its stride is
+ * the pool's own (one expert per slot, as wide as the pool's widest bank) rather than the layer's
+ * per-expert plane size, because a slot holds one expert of whichever layer was gathered into it,
+ * and `expert_cache_weights` rebases the layer's planes onto it. What the Op does require
  * is that the count is *the layer's*, so the two mistakes the offload path makes possible are
  * refused rather than read past:
  *

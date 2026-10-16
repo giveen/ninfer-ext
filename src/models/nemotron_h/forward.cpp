@@ -224,6 +224,9 @@ struct MambaScratch {
 struct MoeScratch {
     Tensor router_logits, expert_ids, expert_weights, latent_in, experts_out, shared_hidden,
         shared_out, experts_workspace;
+    // The gather route's own scratch, unused by a staged-width call: the routed experts' cache
+    // slots, and the pager's miss list -- a count followed by (slot, expert) pairs.
+    Tensor slot_ids, misses;
 };
 
 struct AttentionScratch {
@@ -294,6 +297,12 @@ Scratch allocate_block(const TextConfig& config, const MoeBankConfig* bank, std:
         scratch.moe.experts_out    = allocator.alloc(DType::BF16, {latent, tokens});
         scratch.moe.shared_hidden  = allocator.alloc(DType::BF16, {shared, tokens});
         scratch.moe.shared_out     = allocator.alloc(DType::BF16, {hidden, tokens});
+        // The gather route's scratch: one slot id per routed assignment, and a miss list of that
+        // many (slot, expert) pairs plus its count, which is what `ExpertPager::resolve` writes.
+        // Both are allocated for every MoE block -- a width is a property of the pass, not of the
+        // layer -- and a staged-width pass simply leaves them alone.
+        scratch.moe.slot_ids = allocator.alloc(DType::I32, {ranks, tokens});
+        scratch.moe.misses   = allocator.alloc(DType::I32, {2 * ranks * tokens + 1});
         // A BF16 bank's route needs no scratch, which is what the Op's own query reports; a
         // registered (quantized) route would have to be allocated here to the size that query
         // names. The composition requires BF16 banks, so the Op's call checks the workspace rather
@@ -730,7 +739,8 @@ void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights
     Tensor& routed = bank.latent() ? scratch.moe.experts_out : mixer_out;
     // The bank's representation decides the route: a BF16 bank is read whole and in place, and a
     // block-scaled NVFP4 one is read through its planes, either where it was bound (host-pinned
-    // over UVA, or device-resident) or from the pool's staged copy of it.
+    // over UVA, or device-resident), from the pool's staged copy of it, or from the pool's slot
+    // cache of the experts this call routed to -- the pool's width rule picks between the last two.
     const Weight& up   = model.matrix(weights.experts_up);
     const Weight& down = model.matrix(weights.experts_down);
     if (up.qtype == QType::BF16) {
@@ -747,7 +757,21 @@ void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights
         }
         const ops::ExpertWeights stored =
             expert_bank_addressing(up, down, experts, latent, intermediate, "routed experts");
-        if (pool != nullptr) {
+        // The route is the *width's*: a call narrow enough to route a fraction of the bank gathers
+        // exactly the experts it routed to through the pager's slot cache, and a call wide enough
+        // to touch every expert of the layer stages its whole bank. A resident layer is neither --
+        // it was uploaded once and is read where it lives.
+        if (pool != nullptr && !pool->resident(pool_layer) && !pool->stages(tokens)) {
+            const RoutedExpertPool::Cached cached =
+                pool->acquire_cached(pool_layer, scratch.moe.expert_ids, scratch.moe.slot_ids,
+                                     scratch.moe.misses, stream);
+            // The gather runs on the pager's own stream, so the Op's stream waits for it. Nothing
+            // is released: the slots outlive the call and the next resolve owns their eviction.
+            CUDA_CHECK(cudaStreamWaitEvent(stream, cached.fetched));
+            ops::nemotron_h_moe_experts(latent_in, scratch.moe.slot_ids, scratch.moe.expert_weights,
+                                        cached.weights, cached.span, expert_geometry, routed,
+                                        stream);
+        } else if (pool != nullptr) {
             const RoutedExpertPool::Placed placed = pool->acquire(pool_layer, stream);
             ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids,
                                         scratch.moe.expert_weights, placed.weights, placed.span,
@@ -1058,8 +1082,9 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
 
     DeviceArena::Scope scope = arena.scope();
     PassBuffers buffers      = allocate_pass(config, tokens, arena);
-    // A staged pass reclaims the staged banks once, at its first staged layer: whatever the
-    // previous pass left in them is not this one's data.
+    // A pass opens the pool once, before its first expert layer: a staged pass reclaims the staged
+    // banks there, so whatever the previous pass left in them -- staged bytes or the slot cache a
+    // narrow pass gathered into, which is the same region -- is not this one's data.
     if (expert_pool != nullptr) { expert_pool->begin_forward(); }
 
     ops::embedding(token_ids, model.matrix(model.weights().text.token_embedding), 1.0F,

@@ -324,11 +324,12 @@ void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int3
 
 /**
  * Resolve routed experts of one layer to cache slots, choosing least-recently-used victims for
- * misses. `ids` I32 `[10,T]` in; `slot_ids` I32 `[10,T]` out; `misses` I32 `[2*(10*T) + 1]`
- * receives the miss count followed by (slot, expert) pairs. `bank` is the layer's span in the pool
- * (`ExpertPoolGeometry::span`), which is what places its experts and what an `owner` records. The
- * cache must hold at least 10*T slots. Every slot touched by this call is protected from eviction
- * within it.
+ * misses. `ids` I32 `[K,T]` in; `slot_ids` I32 `[K,T]` out; `misses` I32 `[2*(K*T) + 1]` receives
+ * the miss count followed by (slot, expert) pairs. K is the caller's own rank count -- the route
+ * works per assignment and `moe_experts` is the call that fixes 10 -- and `bank` is the layer's
+ * span in the pool (`ExpertPoolGeometry::span`), which is what places its experts and what an
+ * `owner` records. The cache must hold at least K*T slots. Every slot touched by this call is
+ * protected from eviction within it.
  */
 void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCacheState& cache,
                           Tensor& slot_ids, Tensor& misses, cudaStream_t stream);

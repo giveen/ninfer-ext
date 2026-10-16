@@ -41,10 +41,11 @@ void nemotron_h_moe_experts_launch(const void* x, const void* expert_ids,
                                    void* out, cudaStream_t stream);
 
 // The plane-addressed route: one whole layer's NVFP4 bank at `staged` (planes 0/1 gate-up and 2/3
-// down, expert e at `base[p] + e*stride[p]`), with `span.experts` the layer's own expert count.
-// `staged` may address a device-resident upload, a staging buffer or the artifact's pinned host
-// mapping read over UVA; this route reads whatever it is given, which is what makes the in-place
-// and the staged configurations the same code.
+// down, expert or slot i at `base[p] + i*stride[p]`), with `span.experts` the layer's own expert
+// count. `staged` may address a device-resident upload, a staging buffer, the artifact's pinned
+// host mapping read over UVA, or the expert cache's slot pool at the pool's own stride; this route
+// reads whatever it is given, which is what makes the in-place, the staged and the gathered
+// configurations the same code.
 void nemotron_h_moe_experts_planar_launch(const void* x, const void* expert_ids,
                                           const void* expert_weights, const ExpertWeights& staged,
                                           ExpertBankSpan span, std::int32_t latent,
