@@ -732,11 +732,15 @@ Four measurements, three of which corrected the first hypothesis that the host l
   records; a kernel reading pinned memory sustains 22.7–29.2 GB/s (`profiles/nsys/nemotron_p0/h2d_probe.cu`).
   Staging is 17.44 GB per step, which is 23.8 GB/s effective — below the link, and still not the cost, for the
   next reason.
-- **Gathering only the routed experts buys no time.** With the pager's cache route at T=1 the step moves
+- **Gathering the routed experts buys no time while the Op is the wall.** With the pager's cache route at T=1 the step moves
   **632.8 MiB instead of 22,059 MiB (34.9×)** and its output is **bit-identical** to the in-place route
   (131072 logits, max_abs 0, rel_l2 0), yet end-to-end decode moved only 1.36 → 1.42 output tokens/s, and the
   residency bench reports 704.9 ms/pass against ~730 staged. The prefetch already hides the staging behind the
-  Op. The route is therefore worth keeping for its host-link traffic, not for its speed.
+  Op — and that hiding is what makes the ordering below matter: with the Op at 654 ms it masks a 364 ms
+  staging copy, and with the Op at ~2 ms the same copy is exposed, so a staged pass would then be
+  copy-bound at ~364 ms (2.7 output tokens/s). The gather route and the Op fix are complements, not
+  alternatives, and the staged-versus-gather choice must be re-measured once the Op is fast rather than
+  settled by the numbers above.
 - **CUDA Graph buys nothing at decode**: 1.36 t/s with and 1.36 without, so the pager's capture-blocking
   `snapshot_residency` synchronize is not a speed lever either.
 - The dose curve (`--expert-cache 0` in-place against `auto` staged) is 0.7 against 1.4 output tokens/s;
