@@ -25,5 +25,9 @@ bool is_letter(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
 bool is_whitespace(std::int32_t codepoint) noexcept;
+// The two case classes a pretokenizer's letter branches distinguish: `Ll` alone, and `Lu` with
+// `Lt`. Both are strict subsets of is_letter, which spans the whole `L` category.
+bool is_lowercase_letter(std::int32_t codepoint) noexcept;
+bool is_uppercase_letter(std::int32_t codepoint) noexcept;
 
 } // namespace ninfer::text::unicode_internal

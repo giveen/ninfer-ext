@@ -143,7 +143,8 @@ def validate_nemotron_tokenizer(tokenizer: dict) -> None:
     Mirrors the checks the runtime's tokenizer loader makes and pins the one description that is
     this checkpoint's own: a byte-level BPE behind the Nanotron-v2 split, with no normalizer and no
     byte fallback. The pipeline is not rewritten, because its semantics are part of the checkpoint;
-    a runtime family that implements this split still has to be added for the artifact to load.
+    the runtime family that implements this split is `TokenizerFamily::Nemotron` in
+    src/models/qwen3_5/frontend/tokenizer.h, which makes the same refusals against the same pattern.
     """
 
     def fail(message: str) -> None:
