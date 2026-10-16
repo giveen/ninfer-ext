@@ -44,8 +44,12 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
     }
-    if (window == 0 || window > kMaximumWindow) {
-        throw std::invalid_argument("sliding_causal_attention: window must be in [1,4096]");
+    // `window == 0` is the kernel's unbounded causal sentinel: the window test disappears and only
+    // the upper bound decides, so the visible set is exactly the keys at or before `high` however
+    // many keys the context holds. Every value in [1,4096] keeps the finite-window meaning.
+    if (window > kMaximumWindow) {
+        throw std::invalid_argument(
+            "sliding_causal_attention: window must be 0 (unbounded causal) or in [1,4096]");
     }
     if (!(scale > 0.0F) || !std::isfinite(scale)) {
         throw std::invalid_argument("sliding_causal_attention: scale must be positive and finite");

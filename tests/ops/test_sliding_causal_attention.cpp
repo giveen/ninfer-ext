@@ -69,6 +69,21 @@ std::size_t kv_index(const Case& c, std::int32_t d, std::int32_t kv_head, std::i
            d;
 }
 
+// The harness's pointwise criterion reports the worst element; the RMS over the same comparison is
+// printed beside it when NINFER_OP_REPORT_STATS is set, so a case's accuracy is visible without
+// rerunning anything.
+void report_rms(const std::string& label, const std::vector<double>& got,
+                const std::vector<double>& expected) {
+    if (!error_stats_enabled()) return;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double difference = got[i] - expected[i];
+        sum += difference * difference;
+    }
+    std::printf("OP_RMS_ERROR count=%zu rms=%.17g case=%s\n", got.size(),
+                std::sqrt(sum / static_cast<double>(got.size())), label.c_str());
+}
+
 int run_case(const Case& c, std::uint32_t seed) {
     const std::size_t q_count = count(c, c.query_heads, c.query_tokens);
     const std::size_t k_count = count(c, c.kv_heads, c.key_tokens);
@@ -97,6 +112,14 @@ int run_case(const Case& c, std::uint32_t seed) {
         }
     }
 
+    // The Op's visibility rule. `window == 0` is the unbounded causal sentinel: the window term
+    // disappears, so the visible set is exactly the keys at or before the query's upper bound and
+    // no key count can widen it.
+    const auto visible_from = [&](std::int32_t at, std::int32_t pk) {
+        return pk <= position_high[at] &&
+               (c.window == 0 || position_q[at] - pk < static_cast<std::int32_t>(c.window));
+    };
+
     const ops::AttentionHeadGeometry geometry{c.head_dim, c.query_heads, c.kv_heads};
     std::vector<double> expected(q_count, 0.0);
     for (std::int32_t b = 0; b < c.batch; ++b) {
@@ -112,10 +135,7 @@ int run_case(const Case& c, std::uint32_t seed) {
                 return static_cast<double>(v[kv_index(c, d, kv_head, key, b)]);
             },
             [&](int query, int key) {
-                const std::int32_t at = query + c.query_tokens * b;
-                const std::int32_t pk = position_k[key + c.key_tokens * b];
-                return pk <= position_high[at] &&
-                       position_q[at] - pk < static_cast<std::int32_t>(c.window);
+                return visible_from(query + c.query_tokens * b, position_k[key + c.key_tokens * b]);
             },
             [&](int d, int head, int token, double value) {
                 expected[index(c, d, head, token, b)] = value;
@@ -128,10 +148,8 @@ int run_case(const Case& c, std::uint32_t seed) {
         for (std::int32_t key = 0; key < c.key_tokens; ++key) {
             bool seen = false;
             for (std::int32_t t = 0; t < c.query_tokens; ++t) {
-                const std::int32_t at = t + c.query_tokens * b;
-                const std::int32_t pk = position_k[key + c.key_tokens * b];
-                seen = seen || (pk <= position_high[at] &&
-                                position_q[at] - pk < static_cast<std::int32_t>(c.window));
+                seen = seen ||
+                       visible_from(t + c.query_tokens * b, position_k[key + c.key_tokens * b]);
             }
             if (seen) continue;
             for (std::int32_t h = 0; h < c.kv_heads; ++h) {
@@ -247,11 +265,18 @@ int run_case(const Case& c, std::uint32_t seed) {
                                   (route == 0 ? " (one pass)" : route == 1 ? " (split)" : " (two key sets)");
         got = from_device_bf16(device_out.data(), q_count);
         failures += verify_pointwise(label.c_str(), got, expected, sliding_causal_criterion());
+        report_rms(label, got, expected);
     }
 
-    // Where no key at all is visible the contract is exact zero, not a Softmax of nothing.
-    if (c.first_query_position - (c.first_key_position + (c.key_tokens - 1) * c.key_step) >=
-        static_cast<std::int32_t>(c.window)) {
+    // Where no key at all is visible the contract is exact zero, not a Softmax of nothing. With the
+    // unbounded sentinel the window term cannot say this, so it is the whole key range lying past
+    // every query's upper bound instead.
+    const bool none_visible =
+        c.window == 0
+            ? c.first_key_position > c.first_query_position + (c.query_tokens - 1)
+            : c.first_query_position - (c.first_key_position + (c.key_tokens - 1) * c.key_step) >=
+                  static_cast<std::int32_t>(c.window);
+    if (none_visible) {
         for (std::size_t i = 0; i < q_count; ++i) {
             if (got[i] != 0.0) {
                 std::cerr << c.label << ": a query with no visible key is not zero\n";
@@ -319,6 +344,21 @@ int main() {
                           1, 1024, 300, 100, 356},
                          7114U);
     failures += run_case({"tiled two batches", 64, 8, 4, 700, 300, 2, 0, 400, 1, 45, 51}, 7115U);
+
+    // The unbounded causal sentinel. `window == 0` must visit exactly the keys at or before the
+    // query's upper bound: 8001-8064 of them here in the first case and 5001-5002 in the second,
+    // all past 4096, with the keys ahead of the queries NaN-poisoned so a sentinel that widened the
+    // window to admit future keys cannot pass. The first is Gemma 4's own 32 query heads over 2 KV
+    // heads at width 128 and takes the tiled kernel; the second has too few rows for it and takes
+    // the decode kernel with its 64-way key split.
+    failures += run_case(
+        {"unbounded causal, gemma heads", 128, 32, 2, 8192, 64, 1, 1000, 9000, 1, 0}, 7116U);
+    failures +=
+        run_case({"unbounded causal, decode", 128, 32, 2, 8192, 2, 1, 0, 5000, 1, 0}, 7117U);
+    // Every key ahead of every query: the sentinel's empty visible set must be exact zero, and the
+    // NaN keys must never be read.
+    failures += run_case(
+        {"unbounded causal, no visible key", 128, 32, 2, 8192, 2, 1, 6000, 100, 1, 0}, 7118U);
 
     std::cout << (failures ? "FAIL" : "OK") << " sliding_causal_attention\n";
     return failures ? 1 : 0;
