@@ -16,7 +16,7 @@
 #include "artifact/materializer.h" // MaterializationPlan
 #include "models/load_options.h"
 #include "models/nemotron_h/config.h"
-#include "models/nemotron_h/experts.h" // ExpertResidencyPlan
+#include "models/nemotron_h/plan_experts.h" // ExpertResidencyPlan
 #include "models/nemotron_h/weights.h"
 
 #include <cstddef>

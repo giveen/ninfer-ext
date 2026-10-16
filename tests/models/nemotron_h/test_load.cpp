@@ -1,9 +1,15 @@
 // The Nemotron-H artifact loader: the plan resolves every name, shape and stored representation
 // before any byte is uploaded, and materialization binds every id the config's block list implies.
 //
-// With NINFER_NEMOTRON_ARTIFACT unset this skips -- the artifact is 45.28 GB, of which 37.21 GB of
-// routed experts are pinned in host memory, and a routine run should not pay for that. The refusal
-// path needs no artifact, so it always runs.
+// With NINFER_NEMOTRON_ARTIFACT unset this skips -- the artifact is 45.28 GB, of which 37.21 GB are
+// routed experts, and a routine run should not pay for that. The refusal path needs no artifact, so
+// it always runs.
+//
+// The experts themselves are a *split*: the plan makes the banks the card can hold device-resident
+// and leaves the rest pinned for the staging route, so the case checks each bank's declared
+// residency against the plan's own and checks that the pinned and resident halves are exactly the
+// banks. A request for no device expert bytes is planned too, and it must pin every bank -- the
+// route this family ran before the split existed.
 
 #include "artifact/binder.h" // ParameterReference, Residency
 #include "artifact/reader.h"
@@ -277,6 +283,9 @@ int main() {
         // Every layer's own set, with its own bank width and expert count, and the residency the
         // 45 GB artifact forces: the routed banks cannot live in VRAM beside the dense side.
         std::uint64_t bank_bytes = 0;
+        std::uint64_t resident_parent_bytes = 0;
+        std::uint64_t resident_experts      = 0;
+        std::uint64_t resident_banks        = 0;
         for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
             const nemotron::LayerWeights& weights = text.layers[layer];
             const auto index                      = static_cast<std::uint32_t>(layer);
@@ -330,15 +339,30 @@ int main() {
                                 artifact::Residency::Device, what + " shared/up");
                 check_reference(plan, ids.shared_down, {hidden, bank.shared_intermediate_size},
                                 artifact::Residency::Device, what + " shared/down");
-                // The bank is the layer's own expert count and width, and it is pinned host memory.
+                // The bank is the layer's own expert count and width. Whether it is VRAM or pinned
+                // host memory is the loader's residency split, so it is checked against the plan the
+                // loader produced for this layer rather than assumed: a bank the plan calls
+                // resident was uploaded once, and the rest stay page-locked for the staging route.
+                const std::int32_t pool_layer = nemotron::expert_pool_layer(config, index);
+                check(pool_layer >= 0, what + ": pool layer");
+                const bool resident =
+                    plan.expert_residency().resident.at(static_cast<std::size_t>(pool_layer));
                 check_reference(
                     plan, ids.experts_up,
                     {static_cast<std::uint64_t>(bank.num_experts) * bank.intermediate_size, latent},
-                    artifact::Residency::HostPinned, what + " experts/up");
+                    resident ? artifact::Residency::Device : artifact::Residency::HostPinned,
+                    what + " experts/up");
                 check_reference(
                     plan, ids.experts_down,
                     {static_cast<std::uint64_t>(bank.num_experts) * latent, bank.intermediate_size},
-                    artifact::Residency::HostPinned, what + " experts/down");
+                    resident ? artifact::Residency::Device : artifact::Residency::HostPinned,
+                    what + " experts/down");
+                if (resident) {
+                    resident_parent_bytes += parent_bytes(reader, plan, ids.experts_up) +
+                                            parent_bytes(reader, plan, ids.experts_down);
+                    resident_experts += bank.num_experts;
+                    ++resident_banks;
+                }
                 check_stored_format(reader, plan, ids.experts_up, QType::NVFP4,
                                     what + " experts/up");
                 check_stored_format(reader, plan, ids.experts_down, QType::NVFP4,
@@ -351,6 +375,9 @@ int main() {
 
         DeviceContext device;
         const std::size_t parameter_count = plan.parameter_count();
+        // Taken before the plan is consumed: the split the loader bound the banks with is what the
+        // pinned accounting below is checked against.
+        const nemotron::ExpertResidencyPlan residency = plan.expert_residency();
         const auto load_started           = std::chrono::steady_clock::now();
         auto model                        = nemotron::materialize_model(std::move(plan), device);
         const double load_seconds =
@@ -373,16 +400,44 @@ int main() {
                      vocabulary, wide, "output_head");
         check_tensor(*model, model->weights().text.final_norm, DType::BF16, "final_norm");
 
-        // The pinned set is exactly the routed banks, and the device side is the rest: that is the
-        // residency split the 32 GB card's VRAM forces.
+        // The pinned set is the routed banks the plan did not make resident, and the resident set
+        // is what the card could hold: together they are exactly the banks, which is the split the
+        // 32 GB card's VRAM forces. The plan counts a bank's experts' planes; the materializer also
+        // counts the bank's weight divisors, so the two agree to the tails.
         const auto& stats = model->storage_stats();
-        check(stats.pinned_host_bytes == bank_bytes,
-              "pinned bytes are " + std::to_string(stats.pinned_host_bytes) +
-                  " where the routed banks are " + std::to_string(bank_bytes));
+        check(stats.pinned_host_bytes + resident_parent_bytes == bank_bytes,
+              "pinned bytes " + std::to_string(stats.pinned_host_bytes) + " plus resident " +
+                  std::to_string(resident_parent_bytes) + " are not the routed banks " +
+                  std::to_string(bank_bytes));
         check(stats.device_capacity_bytes < stats.pinned_host_bytes,
               "the device side should hold less than the pinned banks");
         check(stats.mapped_file_bytes == 0, "no parameter should be file-mapped");
         check(stats.pinned_host_bytes != 0, "the routed banks should be pinned");
+        // The plan counts a resident bank's planes; the materializer counts its weight-divisor
+        // words as well, of which a bank has one per matrix.
+        check(resident_parent_bytes >= residency.resident_bytes &&
+                  resident_parent_bytes - residency.resident_bytes <= resident_banks * 16,
+              "the plan's resident bytes are not the resident banks' planes (up to the two "
+              "divisor words per bank)");
+        check(residency.resident_experts == static_cast<std::int32_t>(resident_experts),
+              "the plan's resident expert count is not the resident banks' experts");
+        check(residency.staging_bytes != 0,
+              "a split that leaves banks in host memory needs the staging buffer");
+        check(residency.resident_bytes <= residency.budget_bytes,
+              "the resident set cannot exceed the budget it was planned under");
+
+        // And the configuration that asks for no device expert bytes pins every bank: that is the
+        // route this family ran before the split, and it is what the request's floor has to mean.
+        const auto all_pinned =
+            nemotron::plan_load(reader, {},
+                                nemotron::ExpertResidencyRequest{.automatic = false,
+                                                                  .explicit_bytes = 0});
+        const nemotron::ExpertResidencyPlan& none = all_pinned.expert_residency();
+        check(none.resident_bytes == 0 && none.resident_experts == 0,
+              "a zero-byte expert request must not make a bank resident");
+        check(none.staging_bytes == 0 && none.budget_bytes == 0,
+              "a zero-byte expert request must not reserve a staging buffer");
+        check(!none.resident[0], "a zero-byte expert request must leave every bank in host memory");
 
         std::cout << "nemotron_h load: resources tokenizer.json " << resources.tokenizer_json.size()
                   << " B, tokenizer_config.json " << resources.tokenizer_config_json.size()
