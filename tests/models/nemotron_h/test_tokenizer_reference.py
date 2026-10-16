@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -32,9 +33,14 @@ try:
 except ImportError:
     raise SystemExit(77)
 
+# The repository root, so `tools.*` imports resolve when ctest runs this file directly as a script.
+# Other interop scripts under tests/ do the same, and without it a missing environment variable cannot
+# even reach the skip in setUp -- the import fails first, and the test reports a crash instead of a skip.
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
 from tools.artifact.reader import Artifact
 
-ROOT = Path(__file__).resolve().parents[3]
 ARTIFACT_ENV = "NINFER_NEMOTRON_ARTIFACT"
 CORPUS_ENV = "NINFER_NEMOTRON_CORPUS"
 SOURCE_ENV = "NINFER_NEMOTRON_SOURCE"
@@ -65,12 +71,16 @@ def first_divergence(left: list[int], right: list[int]) -> int:
 
 class TokenizerReference(unittest.TestCase):
     def setUp(self):
-        if os.environ.get(ARTIFACT_ENV) is None:
-            self.skipTest(f"{ARTIFACT_ENV} is not set")
-        if os.environ.get(CORPUS_ENV) is None:
-            self.skipTest(f"{CORPUS_ENV} is not set")
+        # A missing input exits 77 rather than calling unittest's own skipTest: a skipped case leaves
+        # unittest exiting 0, and ctest would then report a test that ran nothing as a success. The C++
+        # tests in this directory skip the same way, through the same SKIP_RETURN_CODE.
+        for name in (ARTIFACT_ENV, CORPUS_ENV):
+            if os.environ.get(name) is None:
+                print(f"SKIP: {name} is not set", file=sys.stderr)
+                raise SystemExit(77)
         if not PROBE.exists():
-            self.skipTest(f"the probe binary is not built: {PROBE}")
+            print(f"SKIP: the probe binary is not built: {PROBE}", file=sys.stderr)
+            raise SystemExit(77)
 
     def test_corpus_ids_match_the_reference_pipeline(self):
         artifact_path = os.environ[ARTIFACT_ENV]
