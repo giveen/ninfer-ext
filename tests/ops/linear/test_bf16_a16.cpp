@@ -4,10 +4,13 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/direct_bf16_weight.h"
+#include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -43,6 +46,104 @@ std::vector<float> materialize(std::span<const std::uint16_t> bits) {
         result[index] = bf16_to_f32(bits[index]);
     }
     return result;
+}
+
+// BF16 bit patterns with one implied and seven explicit significand bits and an exponent drawn from
+// a decaying distribution, so a value spans about sixteen binades and a row's partial sums round.
+//
+// The two generators above cannot do that: their values are integer multiples of 2^-10 over a
+// narrow range, so K = 4096 terms need about twenty significand bits, every partial sum is exactly
+// representable, and two accumulation orders of such a row agree *by construction*. That is
+// inaudible where the comparison is an FP64 oracle within a criterion, which is what they are for,
+// and fatal for the block below, which would report max_abs = 0 for a kernel that reassociated K.
+//
+// Host-measured sensitivity of one such block (a four-way reassociation against the ascending
+// chain, run on the host over this same generator): 0.049% of the (1024, 4096) shape's outputs and
+// 0.021% of the (4096, 1024) shape's move by one BF16 ulp, and at T = 1 a pass moves something in
+// about half of seeds and nothing in the rest. That is arithmetic rather than data: the two orders
+// differ by ~2^-20 relative where a BF16 ulp is 2^-8, so a single pass over 1024 or 4096 elements
+// is a weak detector by nature. At T = 1024 the same rates are ~510 differing elements of 1.0M and
+// ~900 of 4.2M, which is decisive, and that point -- not the single-token one -- is this block's
+// guard on the single-token route: the wide routes use their own launcher, so a reassociation
+// confined to T = 1 is caught here only through the token-count sweep and through the model walk's
+// latent stages (~5200 calls over 26.6M elements per pass, asserted to stay at exactly zero).
+std::vector<std::uint16_t> latent_pattern(std::size_t count, std::uint32_t seed) {
+    std::vector<std::uint16_t> result(count);
+    std::uint32_t state = seed * 0x9e3779b9U + 1U;
+    for (std::uint16_t& bits : result) {
+        state                        = state * 1664525U + 1013904223U;
+        const std::uint32_t draw     = state * 22695477U + 1U;
+        const int leading            = std::countl_zero(draw | 1U);
+        const std::uint16_t exponent = static_cast<std::uint16_t>(124 - (leading & 15));
+        const std::uint16_t mantissa = static_cast<std::uint16_t>((state >> 3) & 0x7fU);
+        const std::uint16_t sign     = static_cast<std::uint16_t>((state >> 16) & 0x8000U);
+        // Exponent fields 109..124: normal, never zero, so no row is trivially equal for every
+        // order.
+        bits = static_cast<std::uint16_t>(sign | (exponent << 7) | mantissa);
+    }
+    return result;
+}
+
+HostWeight make_latent_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    HostWeight result;
+    result.n    = n;
+    result.k    = k;
+    result.bits = latent_pattern(static_cast<std::size_t>(n) * k, seed);
+    return result;
+}
+
+// The host control the single-token point needs, because a fixture can fail the identity check in
+// two ways and only the first is visible in the output. An exactly-summable fixture cannot express
+// an order difference at all (argued at the generator above). A fixture that is inexact but well
+// conditioned can, and the *rate* is what makes it marginal: the two orders differ by
+// ~sqrt(K)*2^-24 relative where a BF16 output ulp is 2^-8, so 1024 or 4096 output elements carry
+// well under one expected move, and a single-token pass would then report max_abs = 0 for a
+// reassociating route in most runs.
+//
+// So the exact T = 1 operands are walked here, on the host, in the fallback's own order and in the
+// two chain counts the gemv schedule actually uses -- `AccumulatorChains` 4 and 8, each taking
+// every C-th column and summing the chains in ascending order -- and the elements that move are
+// counted. The block below requires the total to be nonzero: if it ever reaches zero, the identity
+// assertion has stopped being able to fail on this fixture, and the fixture is what has to change
+// rather than the kernel. BF16 operands make every product exact, so `product + acc` here is the
+// same single rounding `fmaf(w, x, acc)` performs in the kernel, whatever the host compiler
+// contracts to.
+float chained_dot(const std::uint16_t* row_bits, std::span<const std::uint16_t> activation,
+                  std::int32_t k, int chains) {
+    std::array<float, 8> partials{};
+    for (std::int32_t column = 0; column < k; ++column) {
+        const float product = bf16_to_f32(row_bits[column]) *
+                              bf16_to_f32(activation[static_cast<std::size_t>(column)]);
+        const auto slot     = static_cast<std::size_t>(column & (chains - 1));
+        partials[slot]      = product + partials[slot];
+    }
+    float total = partials[0];
+    for (int chain = 1; chain < chains; ++chain) {
+        total = partials[static_cast<std::size_t>(chain)] + total;
+    }
+    return total;
+}
+
+struct OrderSensitivity {
+    std::size_t four_chain  = 0;
+    std::size_t eight_chain = 0;
+};
+
+OrderSensitivity measure_order_sensitivity(const HostWeight& weight,
+                                           std::span<const std::uint16_t> activation) {
+    OrderSensitivity counts;
+    for (std::int32_t row = 0; row < weight.n; ++row) {
+        const std::uint16_t* row_bits =
+            weight.bits.data() + static_cast<std::size_t>(row) * weight.k;
+        const std::uint16_t ascending = f32_to_bf16(chained_dot(row_bits, activation, weight.k, 1));
+        if (f32_to_bf16(chained_dot(row_bits, activation, weight.k, 4)) != ascending) {
+            ++counts.four_chain;
+        }
+        if (f32_to_bf16(chained_dot(row_bits, activation, weight.k, 8)) != ascending) {
+            ++counts.eight_chain;
+        }
+    }
+    return counts;
 }
 
 std::vector<double> oracle_all_rows(const HostWeight& weight, std::span<const float> activation) {
@@ -302,10 +403,11 @@ int run_bf16_linear() {
     return failures;
 }
 
-// The dense fallback, over the shapes no registered kernel covers. Today that is every projection
-// of the Nemotron-H family, whose K is 4096 or 1024 (or 64 at the scaled-down reference config) and
-// whose N is 18560 or 164 -- no registered pair carries either, so before this route existed not
-// one of that family's projections computed at all.
+// The dense fallback, over the shapes no registered kernel covers. That is now the Nemotron-H
+// family's *other* BF16 widths -- its two latent projections have their own registered route, which
+// the block after this one exercises -- whose K is 4096 or 1024 (or 64 at the scaled-down reference
+// config) and whose N is 18560 or 164: no registered pair carries those, so before this route
+// existed not one of that family's projections computed at all.
 //
 // 164 is deliberate and is the case the fallback's own indexing has to survive: it is not a
 // multiple of any tile, so the row tail is predicated rather than padded. K is deliberately odd in
@@ -344,6 +446,111 @@ int run_bf16_generic() {
     return failures;
 }
 
+// The Nemotron-H latent projections the registry now carries, (1024, 4096) = `fc1_latent` and
+// (4096, 1024) = `fc2_latent`, and the contract their routes have to keep: agreement with the dense
+// fallback they displace, element for element, not within a criterion.
+//
+// The fallback's arithmetic is one FP32 accumulator per output element, K ascending, with a single
+// BF16 rounding at the store, and the reference this family's forward walk compares against holds
+// those values -- which is why both routes here are called on one input and their two outputs are
+// compared *as bits*. A schedule that hands a row's K axis to the lanes of a warp and reduces the
+// lane partials (what the gemv and SIMT cores beside them do) produces the same values almost
+// everywhere and a different BF16 value wherever a partial sum lands the other side of a rounding
+// boundary, so `max_abs` and `rel_l2` below are reported at full precision and expected to be
+// exactly zero; a nonzero difference is a failure rather than a tolerance.
+//
+// Both routes are exercised: T=1 takes the one-token-per-thread launcher and T=2, 8 and 1024 take
+// the four-token one, whose tail group has to drop its extra tokens and still agree. The operands
+// come from `latent_pattern` rather than the file's other generators, and why that matters is
+// argued at its definition: without it this block reports 0 for a kernel that reassociates K.
+int run_bf16_latent_bit_identity() {
+    int failures = 0;
+    constexpr std::array<std::array<std::int32_t, 2>, 2> kLatentShapes{{
+        {1024, 4096},
+        {4096, 1024},
+    }};
+    std::uint32_t seed = 9101U;
+    for (const auto& [n, k] : kLatentShapes) {
+        const std::uint32_t weight_seed = seed++;
+        const std::uint32_t input_seed  = seed++;
+        DeviceWeight weight(make_latent_weight(n, k, weight_seed));
+        // The control runs on the exact T = 1 input, before the routes are called.
+        const OrderSensitivity sensitivity =
+            measure_order_sensitivity(weight.host, latent_pattern(k, input_seed));
+        std::printf("BF16 latent [%d,%d] T=1 control: a four-chain order moves %zu elements and an "
+                    "eight-chain one %zu, of %d\n",
+                    n, k, sensitivity.four_chain, sensitivity.eight_chain, n);
+        if (sensitivity.four_chain + sensitivity.eight_chain == 0) {
+            std::cerr
+                << "BF16 latent [" << n << "," << k
+                << "]: the fixture cannot express an accumulation-order difference at T=1, so "
+                   "the identity assertion below cannot fail there\n";
+            ++failures;
+        }
+        for (const std::int32_t tokens : {1, 2, 8, 1024}) {
+            const std::string label = "BF16 latent [" + std::to_string(n) + "," +
+                                      std::to_string(k) + "] T=" + std::to_string(tokens);
+            if (ops::detail::select_bf16_a16_launch(n, k, tokens) ==
+                &ops::detail::bf16_generic_launch) {
+                std::cerr << label
+                          << ": the shape is not registered, so this is the fallback "
+                             "against itself\n";
+                ++failures;
+            }
+            const std::vector<std::uint16_t> activation_bits =
+                latent_pattern(static_cast<std::size_t>(k) * tokens, input_seed);
+            DeviceBuffer device_activation = to_device(activation_bits);
+            const std::size_t elements     = static_cast<std::size_t>(n) * tokens;
+            GuardedDeviceBuffer registered(elements * sizeof(std::uint16_t));
+            GuardedDeviceBuffer fallback(elements * sizeof(std::uint16_t));
+            registered.fill(0xff);
+            fallback.fill(0xff);
+
+            Tensor x(device_activation.p, DType::BF16, {k, tokens});
+            Tensor registered_out(registered.data(), DType::BF16, {n, tokens});
+            Tensor fallback_out(fallback.data(), DType::BF16, {n, tokens});
+            DeviceArena workspace(256);
+            ops::linear(x, weight.view(), registered_out, ops::LinearPolicy::A16Only, workspace,
+                        nullptr);
+            ops::detail::bf16_generic_launch(x, weight.view(), fallback_out, nullptr);
+            cuda_synchronize();
+
+            failures += registered.verify_guards(label + " registered");
+            failures += fallback.verify_guards(label + " fallback");
+            const std::vector<std::uint16_t> got =
+                from_device<std::uint16_t>(registered.data(), elements);
+            const std::vector<std::uint16_t> want =
+                from_device<std::uint16_t>(fallback.data(), elements);
+
+            std::size_t differing = 0;
+            double worst          = 0.0;
+            double energy_actual  = 0.0;
+            double energy_error   = 0.0;
+            for (std::size_t index = 0; index < elements; ++index) {
+                const double actual   = bf16_to_f32(got[index]);
+                const double expected = bf16_to_f32(want[index]);
+                if (got[index] != want[index]) { ++differing; }
+                const double difference = std::abs(actual - expected);
+                worst                   = std::max(worst, difference);
+                energy_actual += actual * actual;
+                energy_error += difference * difference;
+            }
+            const double relative_l2 = std::sqrt(energy_error / std::max(energy_actual, 1e-30));
+            std::printf("%s: max_abs=%.17g rel_l2=%.17g (%zu of %zu elements differ)\n",
+                        label.c_str(), worst, relative_l2, differing, elements);
+            if (differing != 0) { ++failures; }
+
+            failures += weight.verify_preserved(label + " weight");
+            if (from_device<std::uint16_t>(device_activation, static_cast<std::size_t>(k) *
+                                                                  tokens) != activation_bits) {
+                std::cerr << label << ": modified its activation\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -353,7 +560,8 @@ int main() {
     }
 
     try {
-        const int failures = run_bf16_linear() + run_bf16_generic();
+        const int failures =
+            run_bf16_linear() + run_bf16_generic() + run_bf16_latent_bit_identity();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -13,6 +13,9 @@
 // positive token count and is *only* reached when the registry has already declined the problem,
 // so no existing model's route changes. The shapes a family actually runs are still expected to
 // get hand-written kernels; this is what lets the mathematics be checked before those land.
+// Nemotron-H is the family that first needed it: no pair the registry carried matched a width of
+// it, and the two latent projections among them now have their own route in
+// shapes/nemotron_h_latent.cu while the rest still arrive here.
 //
 // Arithmetic: FP32 accumulation in ascending K order with one BF16 rounding at the output, which
 // is the Linear Op's numeric contract for its dense routes.

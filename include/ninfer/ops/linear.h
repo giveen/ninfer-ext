@@ -136,6 +136,12 @@ enum class LinearPolicy : std::uint8_t {
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
  * registered problem and T.
  *
+ * @par Alignment
+ * `x` and `out` must be 16-byte aligned, and so must `w`'s payload planes. Every registered route
+ * reads the weight with 16-byte vector loads, so a misaligned plane faults rather than degrading.
+ * The artifact reader aligns bound objects to 256 bytes, which satisfies this by construction; a
+ * hand-built Weight has to align its own payload.
+ *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
  * linear_workspace_capacity_bytes(). It must not overlap x, any weight plane, or out. Linear does

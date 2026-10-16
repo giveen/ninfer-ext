@@ -284,6 +284,18 @@ cmake --build build --parallel --target ninfer_linear_bench
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
+A shape production dispatch registers can no longer be measured on the route it replaced, since the
+benchmark calls the public Op. The route that lost is still reachable at the same problem with one row
+fewer, which is how the before/after of a newly registered shape is measured; the two must also agree
+bit for bit, which `tests/ops/linear/test_bf16_a16.cpp` asserts rather than the benchmark.
+
+```bash
+./build/bench/ninfer_linear_bench --qtype bf16 --n 1024 --k 4096 --t 1   # fc1_latent, registered
+./build/bench/ninfer_linear_bench --qtype bf16 --n 1023 --k 4096 --t 1   # the fallback, ~same bytes
+./build/bench/ninfer_linear_bench --qtype bf16 --n 4096 --k 1024 --t 1   # fc2_latent, registered
+./build/bench/ninfer_linear_bench --qtype bf16 --n 4095 --k 1024 --t 1   # the fallback, ~same bytes
+```
+
 Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024.
 [Linear tuning and performance reports](../docs/maintainer/linear-tuning.md) defines workload
 priorities, dispatch tradeoffs, and the final curve and metric tables. Respect each Op's extent
