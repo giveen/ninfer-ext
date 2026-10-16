@@ -705,3 +705,48 @@ Q8/Q6 for the artifact route, are in_proj (18560, 4096), out_proj (4096, 8192), 
 v (256, 4096), the router (up to 496, 4096), fc1 (1024, 4096), fc2 (4096, 1024), the shared expert's up and
 down (5376, 4096) and (4096, 5376), and the head (131072, 4096) — none of which the registry carries, since
 no registered pair has k = 4096 or k = 1024.
+
+## Decode attribution (2026-10-16)
+
+A single-token decode step costs 0.73 s (1.36 output tokens/s on the public route). nsys and ncu localize it
+completely, and it is not where the design expected it.
+
+| kernel | total | instances | avg |
+|---|---|---|---|
+| `nemotron_h_moe_experts_kernel<Nvfp4BankReader>` | 1,307.8 ms — **94.4%** | 80 | **16.35 ms** |
+| `bf16_generic_kernel` | 40.4 ms — 2.9% | 160 | 253 µs |
+| `expert_cache_fetch_kernel` | 24.6 ms — 1.8% | 56 | 439 µs |
+| fp8 `gemv`, router, mamba scan, attention, norms | < 0.5% each | | |
+
+80 instances is 40 MoE layers × 2 passes, so one MoE layer is 16.35 ms of a one-token pass. ncu on two
+instances: **grid 1, block 128, waves per SM 0.00, achieved occupancy 8.34% (4 of 64 warps), SM throughput
+0.43%, DRAM 0.06%, L2 0.04%, L1/TEX 51.13%, IPC 0.46, no-eligible 88.6%**. The launcher is
+`<<<tokens, kThreads>>>` — one block per token — and the kernel loops `for (rank = 0; rank < top_k; ++rank)`
+with `__syncthreads()` between each rank's up and down GEMV, so a one-token step runs ~37.7M MACs in 4 warps on
+one SM, latency-bound on scalar 4-bit loads. The Op's work at T=1 is memory-bound — ~21.6 MB of routed expert
+weights per layer, about 20 µs at DRAM rate — so the gap is ~1000×.
+
+Four measurements, three of which corrected the first hypothesis that the host link was the wall:
+
+- **The link is not the wall.** Pinned H2D `cudaMemcpyAsync` sustains 47.8 GB/s, and 42.6 GB/s at 600 KiB
+  records; a kernel reading pinned memory sustains 22.7–29.2 GB/s (`profiles/nsys/nemotron_p0/h2d_probe.cu`).
+  Staging is 17.44 GB per step, which is 23.8 GB/s effective — below the link, and still not the cost, for the
+  next reason.
+- **Gathering only the routed experts buys no time.** With the pager's cache route at T=1 the step moves
+  **632.8 MiB instead of 22,059 MiB (34.9×)** and its output is **bit-identical** to the in-place route
+  (131072 logits, max_abs 0, rel_l2 0), yet end-to-end decode moved only 1.36 → 1.42 output tokens/s, and the
+  residency bench reports 704.9 ms/pass against ~730 staged. The prefetch already hides the staging behind the
+  Op. The route is therefore worth keeping for its host-link traffic, not for its speed.
+- **CUDA Graph buys nothing at decode**: 1.36 t/s with and 1.36 without, so the pager's capture-blocking
+  `snapshot_residency` synchronize is not a speed lever either.
+- The dose curve (`--expert-cache 0` in-place against `auto` staged) is 0.7 against 1.4 output tokens/s;
+  in-place is the same Op plus ~744 ms of *unoverlapped* UVA reads, which is the one place bytes do show up.
+
+The next wall is registered here before it is hit. `bf16_generic_kernel` is the fallback for "a problem no
+registered shape matches" — the paragraph above — and both of this family's latent projections, (1024, 4096) and
+(4096, 1024), land on it at 253 µs for 8 MB of weights (32 GB/s), with `bf16_gemv.cuh` sitting beside it.
+
+Also recorded so nobody repeats the attempt: `nsys profile` cannot be used on this workload as it stands. It
+stalls after the application's own report — 240 s and 1800 s observed, with `--stats=false` and graph tracing at
+its default — and only a killed run's partial report was readable, which is what produced the table above.
+`--cuda-graph-trace=none` is not a valid argument; `node` is what makes the post-processing explode.
