@@ -319,15 +319,17 @@ int main(int argc, char** argv) {
     // rather than as time. The three times below are the measurement of exactly that, and they are
     // reported together precisely so the traffic claim cannot be read as a speedup.
     const std::int32_t vocabulary = static_cast<std::int32_t>(config.vocab_size);
-    // One column's pass over a materialized configuration: its wall time, and -- when the caller
-    // asked for them -- the logits it wrote, so two configurations can be compared on one input.
+    // One pass over a materialized configuration: its wall time, and -- when the caller asked for
+    // them -- the logits it wrote, so two configurations can be compared on one input at the same
+    // column count. `columns` defaults to one, which is what most of this section measures.
     const auto column_pass = [&](nemotron::Model& subject, nemotron::RoutedExpertPool* subject_pool,
                                  const std::int32_t* token, double& ms,
-                                 std::vector<std::uint16_t>* logits_out) {
+                                 std::vector<std::uint16_t>* logits_out,
+                                 std::int32_t columns = 1) {
         // The ids are uploaded per pass, so a pointer into the host vector is all the pass needs.
-        const Tensor token_ids(const_cast<std::int32_t*>(token), DType::I32, {1});
-        DeviceBuffer logits(nemotron::pass_output_bytes(config, 1));
-        Tensor logits_view(logits.p, DType::BF16, {vocabulary, 1});
+        const Tensor token_ids(const_cast<std::int32_t*>(token), DType::I32, {columns});
+        DeviceBuffer logits(nemotron::pass_output_bytes(config, columns));
+        Tensor logits_view(logits.p, DType::BF16, {vocabulary, columns});
         const auto start = std::chrono::steady_clock::now();
         nemotron::forward_model(subject, token_ids, arena, logits_view, execution, nullptr,
                                 nemotron::HeadColumns::Every, nullptr, subject_pool);
@@ -335,7 +337,8 @@ int main(int argc, char** argv) {
         ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                  .count();
         if (logits_out != nullptr) {
-            logits_out->resize(static_cast<std::size_t>(vocabulary));
+            logits_out->resize(static_cast<std::size_t>(vocabulary) *
+                               static_cast<std::size_t>(columns));
             CUDA_CHECK(cudaMemcpy(logits_out->data(), logits.p,
                                   logits_out->size() * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost));
@@ -385,6 +388,19 @@ int main(int argc, char** argv) {
         }
         read_counters();
         const unsigned long long timed_misses = counters[1] - misses_before - cold_misses;
+
+        // The widths this route serves in production are one to eight columns -- the engine's lanes
+        // -- and the resolve contract is per call: its slot protection covers one call, and the
+        // misses it lists may not be read again before the next resolve. Neither can be seen at one
+        // column, so identity is checked at every width a lane set produces, cold each time, with
+        // only the pass's output compared.
+        const std::int32_t widths[3]      = {2, 4, 8};
+        std::vector<std::uint16_t> gathered_wide[3];
+        for (int index = 0; index < 3; ++index) {
+            double wide_ms = 0.0;
+            column_pass(*model, &*pool, ids.data(), wide_ms, &gathered_wide[index], widths[index]);
+            (void)wide_ms;
+        }
 
         // The control the change has to be read beside: the *same* one-column pass over the staged
         // route, which is what every decode step did before the width rule existed. A second pool
@@ -437,6 +453,13 @@ int main(int argc, char** argv) {
             column_pass(*pinned_model, nullptr, ids.data(), ms, nullptr);
             inplace_ms = std::min(inplace_ms, ms);
         }
+        std::vector<std::uint16_t> pinned_wide[3];
+        for (int index = 0; index < 3; ++index) {
+            double wide_ms = 0.0;
+            column_pass(*pinned_model, nullptr, ids.data(), wide_ms, &pinned_wide[index],
+                        widths[index]);
+            (void)wide_ms;
+        }
         pinned_model.reset();
 
         // The two routes read the same stored bytes, so the claim is identity: the same words in
@@ -488,6 +511,32 @@ int main(int argc, char** argv) {
         if (staged_logits != gathered_logits) {
             std::cerr << "the staged route and the gathered one disagree on one column's logits\n";
             ++failures;
+        }
+        // And the same comparison at the widths a lane set actually produces, where the pager's
+        // per-call slot protection and miss list are what a mistake would show up in.
+        std::printf("\n  columns     words  differ    max_abs    rel_l2\n");
+        for (int index = 0; index < 3; ++index) {
+            std::size_t wide_differing = 0;
+            double wide_max_abs        = 0.0;
+            double wide_error          = 0.0;
+            double wide_reference      = 0.0;
+            for (std::size_t at = 0; at < pinned_wide[index].size(); ++at) {
+                if (gathered_wide[index][at] != pinned_wide[index][at]) { ++wide_differing; }
+                const double left  = bf16_to_float(gathered_wide[index][at]);
+                const double right = bf16_to_float(pinned_wide[index][at]);
+                wide_max_abs       = std::max(wide_max_abs, std::abs(left - right));
+                wide_error += (left - right) * (left - right);
+                wide_reference += right * right;
+            }
+            const double wide_relative_l2 =
+                wide_reference > 0.0 ? std::sqrt(wide_error / wide_reference) : 0.0;
+            std::printf("  %7d  %8zu  %6zu  %9.6g  %8.6g\n", widths[index],
+                        pinned_wide[index].size(), wide_differing, wide_max_abs, wide_relative_l2);
+            if (wide_differing != 0) {
+                std::cerr << "the narrow route and the in-place route disagree at " << widths[index]
+                          << " columns\n";
+                ++failures;
+            }
         }
     }
     return failures == 0 ? 0 : 1;
