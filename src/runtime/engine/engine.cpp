@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include "artifact/materializer.h"
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
@@ -11,6 +12,7 @@
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/gemma_instance.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/nemotron_instance.h"
 
 #include <memory>
 #include <stdexcept>
@@ -66,11 +68,18 @@ public:
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
+    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
+         runtime::NemotronPreparedPrompt prepared)
+        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
+          value(std::move(prepared)) {}
+
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     // A prompt belongs to the model that prepared it, and only that model's core can consume it.
-    std::variant<models::qwen3_5::PreparedPrompt, runtime::GemmaPreparedPrompt> value;
+    std::variant<models::qwen3_5::PreparedPrompt, runtime::GemmaPreparedPrompt,
+                 runtime::NemotronPreparedPrompt>
+        value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -97,6 +106,9 @@ std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
     }
     if (const auto* gemma = std::get_if<runtime::GemmaPreparedPrompt>(&impl_->value)) {
         return gemma->tokens();
+    }
+    if (const auto* nemotron = std::get_if<runtime::NemotronPreparedPrompt>(&impl_->value)) {
+        return nemotron->tokens();
     }
     return {};
 }
@@ -167,15 +179,19 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using GenerationCore      = runtime::EngineCore<runtime::ModelInstance>;
-    using ScoringCore         = runtime::CausalScoreCore<runtime::ModelInstance>;
-    using GemmaGenerationCore = runtime::EngineCore<runtime::GemmaInstance>;
-    using GemmaScoringCore    = runtime::CausalScoreCore<runtime::GemmaInstance>;
+    using GenerationCore         = runtime::EngineCore<runtime::ModelInstance>;
+    using ScoringCore            = runtime::CausalScoreCore<runtime::ModelInstance>;
+    using GemmaGenerationCore    = runtime::EngineCore<runtime::GemmaInstance>;
+    using GemmaScoringCore       = runtime::CausalScoreCore<runtime::GemmaInstance>;
+    using NemotronGenerationCore = runtime::EngineCore<runtime::NemotronInstance>;
+    using NemotronScoringCore    = runtime::CausalScoreCore<runtime::NemotronInstance>;
     using Core =
         std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                     std::unique_ptr<GemmaGenerationCore>, std::unique_ptr<GemmaScoringCore>>;
+                     std::unique_ptr<GemmaGenerationCore>, std::unique_ptr<GemmaScoringCore>,
+                     std::unique_ptr<NemotronGenerationCore>, std::unique_ptr<NemotronScoringCore>>;
     using Active = std::variant<std::unique_ptr<runtime::ModelInstance>,
-                                std::unique_ptr<runtime::GemmaInstance>>;
+                                std::unique_ptr<runtime::GemmaInstance>,
+                                std::unique_ptr<runtime::NemotronInstance>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
@@ -198,6 +214,28 @@ public:
             model_metadata.native_context = text.max_position_embeddings;
             load.model_name               = model_metadata.model_id;
             active.emplace<std::unique_ptr<runtime::GemmaInstance>>(std::move(instance));
+        } else if (runtime::artifact_is_nemotron(options.artifact_path)) {
+            // This model runs root-only, without speculation, Vision or CUDA graphs; the options
+            // say so rather than carrying settings the Engine would silently ignore.
+            options           = runtime::nemotron_engine_options(std::move(options));
+            auto instance     = runtime::load_nemotron_instance(options, device);
+            load.architecture = "nemotron_h";
+            // What the load itself moved and held: the artifact's own counters, so the ready line's
+            // byte figures describe this model rather than nothing.
+            const artifact::MaterializationStats& storage = instance->model->storage_stats();
+            load.artifact_bytes_read                      = storage.read_bytes;
+            load.host_to_device_bytes                     = storage.h2d_bytes;
+            load.peak_staging_bytes                       = storage.peak_staging_bytes;
+            load.upload_seconds                           = storage.upload_seconds;
+            load.device_object_count                      = storage.device_object_count;
+            load.host_object_count                        = storage.host_object_count;
+            const auto& text                              = instance->model->config();
+            model_metadata.model_id                       = options.artifact_path.stem().string();
+            model_metadata.vocab_size                     = text.vocab_size;
+            model_metadata.embedding_size                 = text.hidden_size;
+            model_metadata.native_context                 = text.max_position_embeddings;
+            load.model_name                               = model_metadata.model_id;
+            active.emplace<std::unique_ptr<runtime::NemotronInstance>>(std::move(instance));
         } else {
             auto constructed = runtime::construct_model(options, device);
             // construct_model returns the resolved options for this instance. Anything the model
@@ -224,6 +262,12 @@ public:
                     }
                     return std::make_unique<GemmaGenerationCore>(*instance, device, options,
                                                                  std::move(context_cost));
+                } else if constexpr (std::is_same_v<Backend, runtime::NemotronInstance>) {
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<NemotronScoringCore>(*instance, device);
+                    }
+                    return std::make_unique<NemotronGenerationCore>(*instance, device, options,
+                                                                    std::move(context_cost));
                 } else if (options.purpose == EnginePurpose::CausalScoring) {
                     return std::make_unique<ScoringCore>(*instance, device);
                 } else {
@@ -276,6 +320,14 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
         [&](auto& instance) -> PreparedPrompt {
             using Backend = typename std::remove_cvref_t<decltype(instance)>::element_type;
             if constexpr (std::is_same_v<Backend, runtime::GemmaInstance>) {
+                auto prepared            = instance->frontend.prepare(std::move(input), control);
+                const PromptSummary info = prepared.summary();
+                const SamplingMode sampling_mode =
+                    info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+                const PromptPreparationStats preparation = prepared.preparation_stats();
+                return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+                    info, preparation, sampling_mode, std::move(prepared)));
+            } else if constexpr (std::is_same_v<Backend, runtime::NemotronInstance>) {
                 auto prepared            = instance->frontend.prepare(std::move(input), control);
                 const PromptSummary info = prepared.summary();
                 const SamplingMode sampling_mode =
@@ -358,6 +410,11 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
                                                 std::unique_ptr<Impl::GemmaScoringCore>>) {
                 return core->score(
                     std::get<runtime::GemmaPreparedPrompt>(std::move(prompt.impl_->value)),
+                    first_target, logits);
+            } else if constexpr (std::is_same_v<CoreState,
+                                                std::unique_ptr<Impl::NemotronScoringCore>>) {
+                return core->score(
+                    std::get<runtime::NemotronPreparedPrompt>(std::move(prompt.impl_->value)),
                     first_target, logits);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -447,9 +504,20 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                                 std::unique_ptr<Impl::GemmaScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else if constexpr (std::is_same_v<CoreState,
+                                                std::unique_ptr<Impl::NemotronScoringCore>>) {
+                throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState,
                                                 std::unique_ptr<Impl::GemmaGenerationCore>>) {
                 auto submission = core->submit(
                     std::get<runtime::GemmaPreparedPrompt>(std::move(prompt.impl_->value)),
+                    prompt_summary, prepare_seconds, std::move(resolved_options), consumer_mode,
+                    observation, pending_deadline);
+                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                    impl_, std::move(submission), resolved_sampling));
+            } else if constexpr (std::is_same_v<CoreState,
+                                                std::unique_ptr<Impl::NemotronGenerationCore>>) {
+                auto submission = core->submit(
+                    std::get<runtime::NemotronPreparedPrompt>(std::move(prompt.impl_->value)),
                     prompt_summary, prepare_seconds, std::move(resolved_options), consumer_mode,
                     observation, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
