@@ -2,7 +2,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
-#include "models/qwen3_5/execution/qwen4_expert_pager.h"
+#include "models/execution/expert_pager.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
@@ -351,7 +351,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // own expert count and width are what its slot table and slot stride use.
         const ops::ExpertPoolGeometry& pool = *parameters.qwen4->expert_pool;
         q.cache_layers = pool.layers();
-        const std::int32_t bank_slots       = execution::Qwen4ExpertPager::bank_slots(pool);
+        const std::int32_t bank_slots       = models::execution::ExpertPager::bank_slots(pool);
         // The cache pool holds the decode-time cache (the planned slots plus the lent idle-prefill
         // slots) followed by the staged banks. A wide idle step reclaims the lent top range and
         // uses it as the wide prefill arena; the banks live past both, so their offset never moves.
@@ -369,7 +369,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                     "expert cache slot table");
         q.owner        = add_tensor(builder, DType::I32, {q.slots}, "expert cache owners");
         q.stamp        = add_tensor(builder, DType::I64, {q.slots}, "expert cache stamps");
-        q.counters     = add_tensor(builder, DType::I64, {3}, "expert cache counters");
+        q.counters     = add_tensor(builder, DType::I64, {4}, "expert cache counters");
         // Two staged banks (so the next layer's copy overlaps this layer's compute) overlay the
         // last bank_slots slots; each bank also stores its layer's divisors past its experts.
         const auto pool_stride = static_cast<std::size_t>(pool.pool_stride());
@@ -598,7 +598,7 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     const std::uint32_t wide_width   = std::max(plan.prefill_width, narrow_width);
     const auto slots_for = [&](std::int32_t lend_slots) {
         return checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots) + lend_slots +
-                execution::Qwen4ExpertPager::bank_slots(*plan.parameters->qwen4->expert_pool),
+                models::execution::ExpertPager::bank_slots(*plan.parameters->qwen4->expert_pool),
                            "expert cache slot count");
     };
     std::int32_t slots = slots_for(0);

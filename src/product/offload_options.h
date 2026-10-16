@@ -12,7 +12,11 @@
 
 namespace ninfer::product {
 
-// `auto` or a positive MiB count for the routed-expert device cache.
+// `auto`, a positive MiB count, or 0 for the routed-expert device cache. Zero is not the same as a
+// small cache: it asks for no device expert bytes at all, so every bank stays in host memory and is
+// read in place -- the family's route before a device split existed, which is what makes it the
+// honest "before" configuration to measure against. A family that cannot run without a cache
+// refuses it as it would a too-small one.
 [[nodiscard]] inline ExpertCachePolicy parse_expert_cache(std::string_view value) {
     if (value == "auto") { return ExpertCachePolicy{}; }
     const std::string text(value);
@@ -21,7 +25,7 @@ namespace ninfer::product {
     const unsigned long long mebis = std::strtoull(text.c_str(), &end, 10);
     constexpr std::uint64_t kMiB   = 1024ULL * 1024ULL;
     if (text.empty() || text.front() == '-' || errno == ERANGE || end == text.c_str() ||
-        *end != '\0' || mebis == 0 || mebis > std::numeric_limits<std::size_t>::max() / kMiB) {
+        *end != '\0' || mebis > std::numeric_limits<std::size_t>::max() / kMiB) {
         throw std::invalid_argument("invalid expert-cache: " + text);
     }
     return ExpertCachePolicy::explicit_cache(static_cast<std::size_t>(mebis * kMiB));

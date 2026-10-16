@@ -3,7 +3,8 @@
 // the same format, and `workspace` is 16-byte aligned and holds the bytes the query below names.
 #pragma once
 
-#include "core/weight.h" // QType
+#include "core/weight.h"            // QType
+#include "ninfer/ops/offload_moe.h" // ExpertBankSpan, ExpertWeights
 
 #include <cuda_runtime.h>
 
@@ -24,8 +25,9 @@ struct NemotronHMoeBankLaunch {
     std::int32_t columns      = 0;
 };
 
-// The workspace a call over T tokens takes for this format and geometry: none for the per-token
-// route, and the staged experts' bytes for a registered-format route.
+// The workspace a call over T tokens takes for this format and geometry: none for either landed
+// route, because the per-token route keeps the activation row in shared memory and the
+// plane-addressed route reads a bank that is already staged.
 [[nodiscard]] std::size_t nemotron_h_moe_experts_workspace(QType qtype, std::int32_t latent,
                                                            std::int32_t experts,
                                                            std::int32_t intermediate,
@@ -37,5 +39,16 @@ void nemotron_h_moe_experts_launch(const void* x, const void* expert_ids,
                                    std::int32_t experts, std::int32_t intermediate,
                                    std::int32_t top_k, std::int32_t tokens, void* workspace,
                                    void* out, cudaStream_t stream);
+
+// The plane-addressed route: one whole layer's NVFP4 bank at `staged` (planes 0/1 gate-up and 2/3
+// down, expert e at `base[p] + e*stride[p]`), with `span.experts` the layer's own expert count.
+// `staged` may address a device-resident upload, a staging buffer or the artifact's pinned host
+// mapping read over UVA; this route reads whatever it is given, which is what makes the in-place
+// and the staged configurations the same code.
+void nemotron_h_moe_experts_planar_launch(const void* x, const void* expert_ids,
+                                          const void* expert_weights, const ExpertWeights& staged,
+                                          ExpertBankSpan span, std::int32_t latent,
+                                          std::int32_t intermediate, std::int32_t top_k,
+                                          std::int32_t tokens, void* out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

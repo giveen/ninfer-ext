@@ -146,6 +146,19 @@ public:
     // The state, by class, as the layouts planned it.
     [[nodiscard]] StateMemorySummary memory_summary() const noexcept;
 
+    // How the routed banks were split between device-resident uploads and pinned host memory, and
+    // the numbers that follow from it. Reported by the loader and carried here so a caller can see
+    // the residency beside the state it shared the card with.
+    [[nodiscard]] const ExpertResidencyPlan& expert_residency() const noexcept {
+        return model_->expert_residency();
+    }
+
+    // The staged expert banks, or null when the cache policy asked for none. A forward this Program
+    // drives stages its non-resident banks through it.
+    [[nodiscard]] const RoutedExpertPool* expert_pool() const noexcept {
+        return experts_ ? &*experts_ : nullptr;
+    }
+
     // The model whose mixers this state belongs to.
     [[nodiscard]] const Model& model() const noexcept { return *model_; }
 
@@ -229,6 +242,9 @@ private:
     // planned rather than re-derive it.
     LinearAttentionStatePoolLayout mamba_layout_{};
     std::vector<Lane> lanes_state_;
+    // The staged expert banks and their split, when the cache policy affords them. Declared after
+    // the state so a partially built Program destroys the pool before the state it was staged into.
+    std::optional<RoutedExpertPool> experts_;
     const Model* model_                 = nullptr;
     std::size_t workspace_bytes_        = 0;
     std::size_t state_allocation_bytes_ = 0;

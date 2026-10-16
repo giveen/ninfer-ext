@@ -102,4 +102,83 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
                                           workspace.data, out.data, stream);
 }
 
+void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
+                            const ExpertWeights& bank, ExpertBankSpan source,
+                            const NemotronHMoeExpertGeometry& geometry, Tensor& out,
+                            cudaStream_t stream) {
+    const std::int32_t latent       = geometry.latent_size;
+    const std::int32_t experts      = geometry.num_experts;
+    const std::int32_t top_k        = geometry.top_k;
+    const std::int32_t intermediate = geometry.intermediate_size;
+    if (latent <= 0 || experts <= 0 || intermediate <= 0) { fail("the geometry must be positive"); }
+    if (top_k <= 0 || top_k > experts) { fail("top_k must lie in [1, num_experts]"); }
+    // The bank's own expert count, not the geometry's: the two are required to be the same number,
+    // so a caller that took one layer's count and another layer's width -- or a global count --
+    // is refused here rather than by a kernel reading past the bank.
+    if (source.experts != experts || source.first_expert < 0) {
+        fail("the bank span must be this layer's own: " + std::to_string(source.experts) +
+             " experts against a geometry of " + std::to_string(experts));
+    }
+    if (source.experts > kMaxBankExperts) {
+        fail("a bank of more than " + std::to_string(kMaxBankExperts) +
+             " experts has no resolve table");
+    }
+    // One expert's rows are read as a contiguous run of both planes, which the K16M128x4 scale
+    // tiling only allows when a run covers whole 128-row blocks: a bank whose latent width or
+    // intermediate width is not a multiple of 128 would have an expert sharing a scale block with
+    // its neighbour, and its planes would not be addressable as `base + e*stride`.
+    if (latent % 128 != 0 || intermediate % 128 != 0) {
+        fail("the plane-addressed route needs a latent and an intermediate width that are both "
+             "multiples of 128, where a bank of " + std::to_string(experts) + " experts at " +
+             std::to_string(latent) + "x" + std::to_string(intermediate) + " is neither");
+    }
+
+    if (x.dtype != DType::BF16) { fail("x must be BF16"); }
+    const std::int32_t tokens = x.ne[1];
+    require_matrix(x, latent, tokens, "x");
+    if (out.dtype != DType::BF16) { fail("out must be BF16"); }
+    require_matrix(out, latent, tokens, "out");
+    if (expert_ids.dtype != DType::I32) { fail("expert_ids must be I32"); }
+    require_matrix(expert_ids, top_k, tokens, "expert_ids");
+    if (expert_weights.dtype != DType::FP32) { fail("expert_weights must be FP32"); }
+    require_matrix(expert_weights, top_k, tokens, "expert_weights");
+
+    // The layout this bank must be: one expert of this layer, stated once by the same helper the
+    // planner and the pager size the pool from. A bank bound with another layer's width, another
+    // format or a plane count of its own cannot match it.
+    const ExpertBankShape expected = nvfp4_expert_bank(experts, latent, intermediate, 1);
+    const ExpertLayout& want       = expected.layout;
+    if (bank.layout.format != ExpertFormat::Nvfp4 || bank.layout.planes != want.planes) {
+        fail("the bank must be block-scaled NVFP4 with four planes");
+    }
+    for (std::int32_t plane = 0; plane < want.planes; ++plane) {
+        if (bank.base[plane] == nullptr) {
+            fail("bank plane " + std::to_string(plane) + " is unbound");
+        }
+        if (bank.layout.plane_bytes[plane] != want.plane_bytes[plane] ||
+            bank.stride[plane] != want.plane_bytes[plane] || bank.stride[plane] % 16 != 0) {
+            fail("bank plane " + std::to_string(plane) +
+                 " must be this layer's own per-expert plane size, 16-byte aligned");
+        }
+    }
+    if (bank.layout.slot_bytes != want.slot_bytes) {
+        fail("the bank's expert size is not this layer's");
+    }
+    if (bank.gate_up_divisors == nullptr || bank.down_divisors == nullptr ||
+        bank.gate_up_divisor_rows <= 0 || bank.down_divisor_rows <= 0 ||
+        expected.gate_up_rows % bank.gate_up_divisor_rows != 0 ||
+        expected.down_rows % bank.down_divisor_rows != 0) {
+        fail("the bank's weight divisors must cover its rows");
+    }
+    // This conversion is W4A16: the *activation* divisors select the A4 route, which is a different
+    // entry point. Conflating the two would run A16 as if the inputs had been quantized.
+    if (bank.gate_up_input_divisor != 0.0F || bank.down_input_divisor != 0.0F) {
+        fail("this entry point is the A16 route; a bank with activation divisors takes the A4 one");
+    }
+
+    detail::nemotron_h_moe_experts_planar_launch(x.data, expert_ids.data, expert_weights.data, bank,
+                                                 source, latent, intermediate, top_k, tokens,
+                                                 out.data, stream);
+}
+
 } // namespace ninfer::ops

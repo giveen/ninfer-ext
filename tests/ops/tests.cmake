@@ -54,6 +54,13 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+# The plane-addressed route of the same Op: the registered-format (block-scaled NVFP4) entry point
+# the offload path stages a bank into, with the staged and in-place placements required to agree
+# bit for bit.
+ninfer_add_op_test(ninfer_nemotron_h_moe_experts_planes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nemotron_h_moe_experts_planes.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)

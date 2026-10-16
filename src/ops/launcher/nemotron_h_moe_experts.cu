@@ -6,7 +6,11 @@
 // banks this family actually serves (240 to 496 experts at 1536 to 2560 intermediate) are large
 // enough that a streamed route, where one CTA per (row, token) walks the selected experts over
 // every SM, is the next step. That route adds a Route and a case below rather than reshaping the
-// Op: the workspace query already exists for it, and `Route::PerToken` stays the fallback.
+// Op: the workspace query already exists for it, and the per-token route stays the fallback.
+//
+// Two bank forms share the route. `NemotronHMoeBankLaunch` is a whole BF16 matrix read in place;
+// the plane-addressed launch below is a block-scaled NVFP4 bank read through `Nvfp4BankReader`,
+// which is the form a stored expert bank, a device-resident upload and a staged bank all take.
 #include "ops/launcher/nemotron_h_moe_experts.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -62,6 +66,11 @@ void launch_route(const UpReader& up, const DownReader& down, const void* x, con
 std::size_t nemotron_h_moe_experts_workspace(QType qtype, std::int32_t latent, std::int32_t experts,
                                              std::int32_t intermediate, std::int32_t top_k,
                                              std::int32_t tokens) {
+    (void)latent;
+    (void)experts;
+    (void)intermediate;
+    (void)top_k;
+    (void)tokens;
     switch (route_for(qtype, tokens)) {
     case Route::PerToken:
         break;
@@ -98,6 +107,37 @@ void nemotron_h_moe_experts_launch(const void* x, const void* expert_ids,
     (void)workspace;
     (void)experts;
     throw std::invalid_argument("nemotron_h_moe_experts: unsupported bank format");
+}
+
+void nemotron_h_moe_experts_planar_launch(const void* x, const void* expert_ids,
+                                          const void* expert_weights, const ExpertWeights& staged,
+                                          ExpertBankSpan span, std::int32_t latent,
+                                          std::int32_t intermediate, std::int32_t top_k,
+                                          std::int32_t tokens, void* out, cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    // Planes: 0 gate/up codes, 1 gate/up scales, 2 down codes, 3 down scales. The up bank is
+    // `experts * intermediate` rows of `latent` columns and the down bank `experts * latent` rows
+    // of `intermediate` columns, so an expert's plane run is `stride[p]` bytes in both.
+    const Nvfp4BankReader up{reinterpret_cast<const std::uint8_t*>(staged.base[0]),
+                             reinterpret_cast<const std::uint8_t*>(staged.base[1]),
+                             staged.gate_up_divisors,
+                             staged.stride[0],
+                             staged.stride[1],
+                             intermediate,
+                             span.experts,
+                             staged.gate_up_divisor_rows,
+                             latent};
+    const Nvfp4BankReader down{reinterpret_cast<const std::uint8_t*>(staged.base[2]),
+                               reinterpret_cast<const std::uint8_t*>(staged.base[3]),
+                               staged.down_divisors,
+                               staged.stride[2],
+                               staged.stride[3],
+                               latent,
+                               span.experts,
+                               staged.down_divisor_rows,
+                               intermediate};
+    launch_route(up, down, x, expert_ids, expert_weights, latent, intermediate, top_k, tokens, out,
+                 stream);
 }
 
 } // namespace ninfer::ops::detail

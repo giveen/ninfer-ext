@@ -144,6 +144,20 @@ StatePlan plan_state(const StateGeometry& geometry, LayoutBuilder& builder) {
 // The refusal every computing entry point makes. It names the entry point, so a log or a test can
 // tell which one was driven, and the missing piece in the same words kMissingStatePersistence
 // documents.
+// The staged expert banks and the pager's tables, when the caller's cache policy can afford them.
+// The cache is the elastic term of a load, so this is what a Program holds on its behalf and what a
+// cache request must not eat into: `device_bytes` accounts it beside the state and the workspace,
+// and a policy that asks for no cache at all -- an explicit zero -- asks for no staging either,
+// which is the in-place host route this family ran before the split existed.
+std::size_t staged_expert_bytes(const TextConfig& config, const EngineOptions& options) {
+    const std::size_t pool = expert_pool_bytes(config);
+    if (pool == 0) { return 0; }
+    if (options.expert_cache.mode == ExpertCacheMode::Automatic) { return pool; }
+    return options.expert_cache.explicit_bytes >= expert_staging_bytes(expert_bank_geometry(config))
+               ? pool
+               : 0;
+}
+
 [[noreturn]] void refuse_missing_state(std::string_view entry) {
     throw std::logic_error(std::string("nemotron_h Program: ") + std::string(entry) +
                            " cannot run: " + std::string(kMissingStatePersistence));
@@ -160,7 +174,8 @@ std::size_t Program::device_bytes(const TextConfig& config, const EngineOptions&
                 ? AttentionState::device_bytes(*config.attention, geometry.attention_layers,
                                                geometry.capacity, geometry.lanes)
                 : 0) +
-           model_workspace_bytes(config, geometry.workspace_tokens);
+           model_workspace_bytes(config, geometry.workspace_tokens) +
+           staged_expert_bytes(config, options);
 }
 
 Program::Program(const Model& model, const EngineOptions& options, DeviceContext& device)
@@ -190,6 +205,13 @@ Program::Program(const Model& model, const EngineOptions& options, DeviceContext
     // the landed forward's prefill begins from, and positions no token has written.
     if (mamba_) { mamba_->zero_all(device.stream); }
     if (attention_) { attention_->reset_all(device.stream); }
+
+    // The staged banks. They are allocated here rather than at bind time because the split that
+    // decided the resident banks did not: what a *resident* bank costs was uploaded with the
+    // weights, and what staging costs is this pool.
+    if (staged_expert_bytes(model.config(), options) != 0) {
+        experts_.emplace(model, expert_top_k(model.config()));
+    }
 }
 
 // The two device allocations are RAII members and the pools borrow them, so destruction is the

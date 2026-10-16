@@ -46,13 +46,13 @@ enum class ExpertFormat : std::uint8_t {
  * own (see `ExpertBankShape`): this table describes one expert of it.
  */
 struct ExpertLayout {
-    ExpertFormat format                          = ExpertFormat::Nvfp4;
-    std::int32_t planes                          = 0;
-    std::int64_t plane_bytes[kMaxExpertPlanes]   = {}; // per expert
-    std::int64_t slot_bytes                      = 0;  // sum of plane_bytes
-    std::int64_t tail_bytes                      = 0;  // per staged layer, after the planes
-    std::int32_t gate_up_half_bits               = 0;  // EXL3 trellis rates; 0 for NVFP4
-    std::int32_t down_half_bits                  = 0;
+    ExpertFormat format                        = ExpertFormat::Nvfp4;
+    std::int32_t planes                        = 0;
+    std::int64_t plane_bytes[kMaxExpertPlanes] = {}; // per expert
+    std::int64_t slot_bytes                    = 0;  // sum of plane_bytes
+    std::int64_t tail_bytes                    = 0;  // per staged layer, after the planes
+    std::int32_t gate_up_half_bits             = 0;  // EXL3 trellis rates; 0 for NVFP4
+    std::int32_t down_half_bits                = 0;
 
     [[nodiscard]] bool operator==(const ExpertLayout&) const = default;
 
@@ -63,6 +63,7 @@ struct ExpertLayout {
         for (std::int32_t i = 0; i < p; ++i) { offset += plane_bytes[i]; }
         return offset;
     }
+
     /** One staged layer of `experts` experts. */
     [[nodiscard]] constexpr std::int64_t staged_layer_bytes(std::int32_t experts) const {
         return std::int64_t(experts) * slot_bytes + tail_bytes;
@@ -108,8 +109,8 @@ struct ExpertBankShape {
                                                           std::int32_t intermediate,
                                                           std::int32_t gate_up_matrices) {
     ExpertBankShape out;
-    out.experts          = experts;
-    ExpertLayout& layout = out.layout;
+    out.experts           = experts;
+    ExpertLayout& layout  = out.layout;
     layout.format         = ExpertFormat::Nvfp4;
     layout.planes         = 4;
     layout.plane_bytes[0] = std::int64_t(gate_up_matrices) * intermediate * input_width / 2;
@@ -147,8 +148,8 @@ inline constexpr std::int64_t kExpertDivisorBytes     = kQwen4ExpertBank.layout.
 [[nodiscard]] constexpr ExpertLayout exl3_expert_layout(std::int32_t gate_up_half_bits,
                                                         std::int32_t down_half_bits) {
     ExpertLayout layout;
-    layout.format           = ExpertFormat::Exl3;
-    layout.planes           = 6;
+    layout.format            = ExpertFormat::Exl3;
+    layout.planes            = 6;
     layout.gate_up_half_bits = gate_up_half_bits;
     layout.down_half_bits    = down_half_bits;
     const std::int64_t gate_up_tiles =
@@ -181,15 +182,15 @@ inline constexpr std::int64_t kExpertStagedLayerBytes =
  * divisors of gate/up and down, positive when the checkpoint permits A4 inputs and zero otherwise.
  */
 struct ExpertWeights {
-    ExpertLayout layout               = nvfp4_expert_layout();
+    ExpertLayout layout                     = nvfp4_expert_layout();
     const std::byte* base[kMaxExpertPlanes] = {};
     std::int64_t stride[kMaxExpertPlanes]   = {};
-    const float* gate_up_divisors     = nullptr;
-    std::int32_t gate_up_divisor_rows = 0;
-    const float* down_divisors        = nullptr;
-    std::int32_t down_divisor_rows    = 0;
-    float gate_up_input_divisor       = 0.0F;
-    float down_input_divisor          = 0.0F;
+    const float* gate_up_divisors           = nullptr;
+    std::int32_t gate_up_divisor_rows       = 0;
+    const float* down_divisors              = nullptr;
+    std::int32_t down_divisor_rows          = 0;
+    float gate_up_input_divisor             = 0.0F;
+    float down_input_divisor                = 0.0F;
 };
 
 /**
@@ -286,12 +287,12 @@ struct ExpertCacheState {
     std::int32_t* owner            = nullptr; // [slots], an index into slot_of, or -1
     unsigned long long* stamp      = nullptr; // [slots], last use
     unsigned long long* clock      = nullptr; // [1]
-    unsigned long long* statistics = nullptr; // [2]: hits, misses
+    unsigned long long* statistics = nullptr; // [3]: hits, misses, ids outside the bank
     std::int32_t slots             = 0;
     std::int32_t layers            = 0;
     std::int32_t slot_entries      = 0; // experts over the pool's layers: the length of slot_of
     std::int64_t pool_stride = 0; // bytes between two slots; the widest bank's per-expert size
-    std::byte* pool                = nullptr; // [slots, pool_stride]
+    std::byte* pool          = nullptr; // [slots, pool_stride]
 };
 
 /**
@@ -382,6 +383,7 @@ void expert_cache_reclaim(const ExpertCacheState& cache, std::int32_t first_slot
  * call's assignments in shared memory, or counts per slot when the pool has at most 4096 slots.
  */
 [[nodiscard]] std::int32_t moe_experts_max_columns(std::int32_t slots) noexcept;
+
 struct MoeExpertsPending {
     const Tensor* misses;
     cudaEvent_t fetched;

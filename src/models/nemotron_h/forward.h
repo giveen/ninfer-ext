@@ -58,6 +58,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "models/nemotron_h/config.h"
+#include "models/nemotron_h/experts.h"
 #include "models/nemotron_h/weights.h"
 
 #include <cstddef>
@@ -88,12 +89,21 @@ class LoadPlan;
 // it, and `backing_` is declared first so it is destroyed last.
 class Model {
 public:
-    // The hand-bound model: no backing store, so every tensor and weight must be the caller's.
+    // The hand-bound model: no backing store, so every tensor and weight must be the caller's. Its
+    // routed banks carry no residency split -- a hand-bound model binds each bank where the caller
+    // put it.
     Model(TextConfig config, ModelWeights weights);
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
 
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
+
+    // How the loader split the routed banks between device-resident uploads and pinned host memory,
+    // which is what the pool stages the non-resident ones against. A hand-bound model reports an
+    // empty plan: no bank of it was uploaded by us.
+    [[nodiscard]] const ExpertResidencyPlan& expert_residency() const noexcept {
+        return residency_;
+    }
 
     // Binds one parameter. `weight` is engaged for a matrix the Ops consume; `tensor` is the
     // resident view either way, and a matrix's `tensor` is its logical `[N,K]` row-major view. A
@@ -118,13 +128,16 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
-    // The loader's constructor: the model owns the bytes every bound view borrows.
-    Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing);
+    // The loader's constructor: the model owns the bytes every bound view borrows, and the split
+    // its banks were bound with.
+    Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing,
+          ExpertResidencyPlan residency);
 
     // Destroyed last: every BoundWeight view borrows these bytes.
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     ModelWeights weights_;
+    ExpertResidencyPlan residency_{};
     std::vector<BoundWeight> parameters_;
     std::vector<bool> bound_;
 };
@@ -191,10 +204,14 @@ public:
  * `hidden_in` and `hidden_out` are contiguous BF16 `[hidden_size, tokens]` and must not overlap;
  * the block reads the residual stream and writes its updated self. `arena` supplies the block's
  * transient storage and must hold `block_workspace_bytes` for this config and `tokens`.
+ *
+ * `expert_pool` places the routed banks: null reads each MoE block's bank where it is bound (over
+ * UVA when it is host-pinned, in place when it is device-resident), and a pool stages the banks
+ * that are not resident into its device buffers instead. See `RoutedExpertPool`.
  */
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   const BlockObserver* observer = nullptr);
+                   const BlockObserver* observer = nullptr, RoutedExpertPool* experts = nullptr);
 
 /**
  * Runs a whole text pass: the token embedding, every block in order, the final norm and the head.
@@ -202,8 +219,10 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
  * `token_ids` is contiguous I32 `[tokens]` and every id must be in `[0, vocabulary)`. `logits` is
  * contiguous BF16 `[vocabulary_size, tokens]` and must not overlap the arena. `arena` must hold
  * `model_workspace_bytes` for this config and `tokens`, which is one block's peak plus the head's.
+ * `expert_pool` is as `forward_block`'s.
  */
 void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& arena, Tensor& logits,
-                   DeviceExecutionView execution, const BlockObserver* observer = nullptr);
+                   DeviceExecutionView execution, const BlockObserver* observer = nullptr,
+                   RoutedExpertPool* expert_pool = nullptr);
 
 } // namespace ninfer::models::nemotron_h

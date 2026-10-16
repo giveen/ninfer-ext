@@ -84,15 +84,42 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 // Flags a `ninfer_serve_profile` may carry that the one-shot CLI also understands. Serve-only
 // options (concurrency, prefix caching, host tiers) are dropped when a profile is loaded here.
 constexpr std::string_view kCliProfileFlags[] = {
-    "prompt",           "messages",         "chat-template",      "max-new",
-    "max-context",      "kv-capacity",      "expert-cache",       "ngram-residency",
-    "prefill-chunk",    "device",           "kv-dtype",           "spec",
-    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "draft-tree",
-    "lookup-drafts",    "lookup-min-match", "raw-output",         "print-token-ids",
-    "no-thinking",      "thinking-budget",  "reasoning-effort",   "vision",
-    "no-cuda-graph",    "stop-token-id",    "stop",               "reasoning-stop",
-    "temperature",      "top-p",            "top-k",              "min-p",
-    "presence-penalty", "frequency-penalty", "seed",             "greedy",
+    "prompt",
+    "messages",
+    "chat-template",
+    "max-new",
+    "max-context",
+    "kv-capacity",
+    "expert-cache",
+    "ngram-residency",
+    "prefill-chunk",
+    "device",
+    "kv-dtype",
+    "spec",
+    "draft-tokens",
+    "lm-head-draft",
+    "fixed-draft",
+    "draft-tree",
+    "lookup-drafts",
+    "lookup-min-match",
+    "raw-output",
+    "print-token-ids",
+    "no-thinking",
+    "thinking-budget",
+    "reasoning-effort",
+    "vision",
+    "no-cuda-graph",
+    "stop-token-id",
+    "stop",
+    "reasoning-stop",
+    "temperature",
+    "top-p",
+    "top-k",
+    "min-p",
+    "presence-penalty",
+    "frequency-penalty",
+    "seed",
+    "greedy",
     "log-level",
 };
 
@@ -151,8 +178,10 @@ std::string usage_text(const char* argv0) {
            "commit more than the MTP drafts; always uses every proposal (measurement).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
-           "--expert-cache sizes the device cache of host-resident routed experts (Qwen4Exp);\n"
-           "auto gives it the device memory left after the KV floor.\n"
+           "--expert-cache sizes the device cache of host-resident routed experts; auto gives it\n"
+           "           the device memory left after the lane states, the pass's workspace and the\n"
+           "           K/V floor, which the cache never takes from. 0 keeps every expert in host\n"
+           "           memory and reads them in place.\n"
            "--ngram-residency reads the Qwen4Exp n-gram table through the page cache (mapped) or\n"
            "with batched direct I/O (stream); auto maps it when free host memory covers it.\n"
            "--kv-capacity auto leaves " +
@@ -202,7 +231,7 @@ Options parse_options(int argc, char** argv) {
         const std::string_view arg(args[i]);
         // Profile arguments are expanded first, so everything before this offset came from it.
         const bool from_profile = i < 2 + profile_args.size();
-        const auto value = [&](std::string_view flag) -> const char* {
+        const auto value        = [&](std::string_view flag) -> const char* {
             if (++i >= args.size()) {
                 throw std::invalid_argument(std::string(flag) + " needs a value");
             }

@@ -17,6 +17,7 @@ target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
 include(gemma4/loading_sources.cmake)
 include(gemma4/frontend_sources.cmake)
 include(gemma4/runtime_sources.cmake)
+include(execution_sources.cmake)
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)

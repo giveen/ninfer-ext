@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/offload_moe.h" // ExpertBankSpan, ExpertWeights (the plane-addressed route)
 
 #include <cuda_runtime.h>
 
@@ -99,5 +100,42 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
                             const NemotronHMoeExpertWeights& weights,
                             const NemotronHMoeExpertGeometry& geometry, Tensor& out,
                             Tensor& workspace, cudaStream_t stream);
+
+/**
+ * The same Op over a bank addressed as planes rather than as two whole matrices: the registered
+ * (block-scaled NVFP4) form of one layer's routed experts.
+ *
+ * `bank` is the layer's bank as `ExpertWeights` addresses it -- plane 0 the gate/up codes, plane 1
+ * the gate/up scales, plane 2 the down codes, plane 3 the down scales, expert `e` of plane `p` at
+ * `base[p] + e * stride[p]`, and the weight divisors in `gate_up_divisors`/`down_divisors` -- and
+ * `source` is that bank's expert count and the offset of its first expert in the pool it came from.
+ * Where the bytes live is the caller's business and the Op's contract does not distinguish it: a
+ * device-resident upload, a staging buffer a whole layer was copied into, and the artifact's own
+ * pinned host mapping read over UVA are the same bank at three addresses. What the Op does require
+ * is that the count is *the layer's*, so the two mistakes the offload path makes possible are
+ * refused rather than read past:
+ *
+ *  - `source.experts` must equal `geometry.num_experts` exactly. A bank of 240 experts read with
+ *    the pool's widest 496 bound (or with a global 512) would index `base[p] + e*stride[p]` past
+ *    the row slice the layer owns, into the next layer's experts or the divisor tail.
+ *  - `bank.layout` must be the layer's own layout: `nvfp4_expert_bank(source.experts, H, I, 1)`
+ *    with `H = geometry.latent_size` and `I = geometry.intermediate_size`. A stride taken from
+ *    another layer's bank mis-addresses every expert but the one it was taken from.
+ *
+ * The activation divisors must be zero: this checkpoint is W4A16, and a bank carrying calibrated
+ * activation divisors is the A4 route (`moe_experts_a4`), which quantizes an activation once per
+ * chunk and is not this Op.
+ *
+ * Numeric: identical to the whole-matrix entry point. Each expert's contribution is computed in
+ * FP32 and a token's ranks are accumulated in ascending rank order with one BF16 rounding at the
+ * output, so where the bank's bytes were read from cannot move a result.
+ *
+ * Workspace: none. The bank is already staged when this route is taken, which is the property that
+ * makes it worth taking, so the Op allocates and takes nothing.
+ */
+void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
+                            const ExpertWeights& bank, ExpertBankSpan source,
+                            const NemotronHMoeExpertGeometry& geometry, Tensor& out,
+                            cudaStream_t stream);
 
 } // namespace ninfer::ops

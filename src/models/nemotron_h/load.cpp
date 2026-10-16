@@ -2,11 +2,14 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/device.h"       // CUDA_CHECK: the residency budget measures the card
 #include "core/weight_view.h" // weight_element_count
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,7 +32,13 @@ constexpr QType kScalarFormat = QType::FP32;
 
 class Declarations {
 public:
-    explicit Declarations(artifact::Binder& binder) : binder_(binder) {}
+    // `resident` answers, per MoE block, whether that block's bank is device-resident: the split the
+    // caller's request resolved. The bank is declared with it, because residency is a property of
+    // the binding -- a resident bank is uploaded once and read where it lives, a non-resident one is
+    // page-locked host memory a kernel addresses over UVA -- and a parameter demanded both ways
+    // would be materialized twice.
+    Declarations(artifact::Binder& binder, const ExpertResidencyPlan& residency)
+        : binder_(binder), residency_(residency) {}
 
     // A parameter the Ops consume as a matrix. `input` names the mathematical input that reads it,
     // when the artifact declares one, which is where its activation divisor lives.
@@ -60,7 +69,7 @@ public:
     // bindable. `first_expert` is a name the artifact does declare, whose object is the parent the
     // declared bank shape is checked against.
     WeightId bank(std::string name, std::string first_expert, const artifact::Shape& shape,
-                  std::string_view input) {
+                  std::string_view input, std::int32_t pool_layer) {
         const float divisor  = activation_divisor(first_expert, input);
         const auto& bindings = binder_.reader().directory().bindings;
         const auto found     = bindings.find(first_expert);
@@ -77,9 +86,14 @@ public:
         whole.elements     = weight_element_count(shape);
         whole.parts.push_back({found->second.parts.front().object, 0, whole.elements});
 
+        const bool device =
+            pool_layer >= 0 && pool_layer < static_cast<std::int32_t>(residency_.resident.size())
+                ? residency_.resident[static_cast<std::size_t>(pool_layer)]
+                : false;
         DeclaredParameter pending;
-        pending.reference          = binder_.binding(name, whole, shape, Residency::HostPinned, {});
-        pending.name               = std::move(name);
+        pending.reference = binder_.binding(name, whole, shape,
+                                            device ? Residency::Device : Residency::HostPinned, {});
+        pending.name      = std::move(name);
         pending.matrix             = true;
         pending.activation_divisor = divisor;
         return push(std::move(pending));
@@ -139,6 +153,7 @@ private:
     }
 
     artifact::Binder& binder_;
+    const ExpertResidencyPlan& residency_;
     std::vector<DeclaredParameter> pending_;
 };
 
@@ -182,7 +197,7 @@ AttentionWeights declare_attention(Declarations& declare, const AttentionConfig&
 }
 
 MoeWeights declare_moe(Declarations& declare, const MoeBankConfig& bank, std::uint64_t hidden,
-                       const std::string& prefix, std::size_t layer) {
+                       const std::string& prefix, std::size_t layer, std::int32_t pool_layer) {
     const std::uint64_t latent  = bank.expert_input_width(hidden);
     const std::uint64_t experts = bank.num_experts;
     const std::uint64_t width   = bank.intermediate_size;
@@ -201,9 +216,10 @@ MoeWeights declare_moe(Declarations& declare, const MoeBankConfig& bank, std::ui
     // One bank per direction, expert-major with one divisor for the whole parent: expert `e` is the
     // rows `[e * width, (e + 1) * width)` of `up` and `[e * latent, (e + 1) * latent)` of `down`.
     out.experts_up   = declare.bank(moe + "experts/up", moe + "experts/0/up",
-                                    {experts * width, latent}, moe + "expert_input");
+                                    {experts * width, latent}, moe + "expert_input", pool_layer);
     out.experts_down = declare.bank(moe + "experts/down", moe + "experts/0/down",
-                                    {experts * latent, width}, moe + "experts/0/product");
+                                    {experts * latent, width}, moe + "experts/0/product",
+                                    pool_layer);
     // The bank's and the router's expert counts come from the artifact, not from the config value
     // both were declared with, and have to agree with it and with each other.
     declare.check_expert_count(layer, prefix, bank, out.router);
@@ -244,7 +260,8 @@ TextWeights bind_text(Declarations& declare, const TextConfig& config) {
             break;
         case BlockKind::Moe:
             weights.moe = declare_moe(declare, config.moe_bank(static_cast<std::uint32_t>(layer)),
-                                      hidden, prefix, layer);
+                                      hidden, prefix, layer,
+                                      expert_pool_layer(config, static_cast<std::uint32_t>(layer)));
             break;
         }
         out.layers.push_back(std::move(weights));
@@ -277,6 +294,7 @@ struct LoadPlan::Impl {
     artifact::Binder binder;
     std::vector<DeclaredParameter> pending;
     artifact::MaterializationPlan plan;
+    ExpertResidencyPlan residency;
 
     explicit Impl(const artifact::Reader& reader) : binder(reader) {}
 };
@@ -295,6 +313,8 @@ const TextResources& LoadPlan::resources() const { return impl_->resources; }
 
 const artifact::MaterializationPlan& LoadPlan::materialization() const { return impl_->plan; }
 
+const ExpertResidencyPlan& LoadPlan::expert_residency() const { return impl_->residency; }
+
 std::size_t LoadPlan::parameter_count() const { return impl_->pending.size(); }
 
 const ParameterReference& LoadPlan::parameter(WeightId id) const {
@@ -308,12 +328,50 @@ LoadPlan::Content LoadPlan::release() {
                    std::move(data->plan)};
 }
 
-LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+namespace {
+
+// The device bytes the routed banks' *residents* may have: free device memory less the dense side
+// and less everything the caller reserved. The dense side is taken as the artifact's payload less
+// the banks themselves, which over-states it by the container's framing and the text resources --
+// and over-stating it only shrinks the cache, so the direction is safe.
+std::size_t expert_residency_budget(const artifact::Reader& reader,
+                                    std::span<const ops::ExpertBankShape> banks,
+                                    const ExpertResidencyRequest& request) {
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    std::uint64_t bank_bytes = 0;
+    for (const ops::ExpertBankShape& bank : banks) {
+        bank_bytes += static_cast<std::uint64_t>(expert_bank_bytes(bank));
+    }
+    const std::uint64_t payload = reader.file_bytes();
+    const std::uint64_t dense   = payload > bank_bytes ? payload - bank_bytes : 0;
+    const std::uint64_t needed  = dense + request.reserve_bytes;
+    if (needed >= free_bytes) {
+        throw ArtifactError(
+            "the dense weights and the state/KV reservation need " + std::to_string(needed) +
+            " bytes of device memory but only " + std::to_string(free_bytes) +
+            " are free; lower --max-ctx or --max-concurrency");
+    }
+    return static_cast<std::size_t>(free_bytes - needed);
+}
+
+} // namespace
+
+LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
+                   ExpertResidencyRequest request) {
     // The family carries the text tower alone: no artifact component or option selects anything
     // else, so every input plans the same set of parameters.
     (void)options;
     auto out    = std::make_unique<LoadPlan::Impl>(reader);
     out->config = parse_config(reader.directory()).text;
+    // The routed banks' split is decided before anything is declared, because it *is* a property of
+    // the declaration: the same request that a resident bank is uploaded once under is the one a
+    // non-resident bank stays page-locked under.
+    const std::vector<ops::ExpertBankShape> banks = expert_bank_geometry(out->config);
+    out->residency = plan_expert_residency(
+        banks, expert_residency_budget(reader, banks, request), !request.automatic,
+        request.explicit_bytes);
     // The tokenizer's and the chat template's bytes are artifact resources rather than weights, and
     // this is where a frontend reads them. They borrow the reader's mapped bytes, and the Binder
     // must still be alive to hand them over, so this comes before it is finished.
@@ -325,7 +383,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources.tokenizer_config_json  = resource("tokenizer_config.json");
     out->resources.generation_config_json = resource("generation_config.json");
     out->resources.chat_template_jinja    = resource("chat_template.jinja");
-    Declarations declarations(out->binder);
+    Declarations declarations(out->binder, out->residency);
     out->weights.text = bind_text(declarations, out->config);
     out->pending      = declarations.take();
     // Finishing consumes the Binder, so it must come after every parameter request.

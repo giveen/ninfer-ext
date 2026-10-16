@@ -491,6 +491,9 @@ struct NemotronInstance {
     std::unique_ptr<nemotron_contract::NemotronProgram> program;
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
+    // How the routed experts were split between device-resident uploads and pinned host memory, and
+    // what that implies: the residency in experts and bytes, and the pinned remainder beside it.
+    models::nemotron_h::ExpertResidencyPlan expert_residency;
 
     NemotronInstance(std::unique_ptr<models::nemotron_h::Model> model,
                      const models::nemotron_h::FrontendResources& resources,

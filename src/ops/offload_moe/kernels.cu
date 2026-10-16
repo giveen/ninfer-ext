@@ -231,12 +231,37 @@ __global__ void __launch_bounds__(kResolveThreads)
     __shared__ int miss_count_s;
     __shared__ int emitted_s;
     __shared__ int ties_s;
+    __shared__ int outside_s;
     const int tid = static_cast<int>(threadIdx.x);
-    if (tid == 0) { now_s = atomicAdd(cache.clock, 1ULL) + 1ULL; }
-    for (int e = tid; e < bank.experts; e += blockDim.x) { used[e] = 0; }
+    if (tid == 0) {
+        now_s     = atomicAdd(cache.clock, 1ULL) + 1ULL;
+        outside_s = 0;
+    }
+    for (int e = tid; e < bank.experts; e += blockDim.x) {
+        used[e]     = 0;
+        slot_for[e] = -1;
+    }
     __syncthreads();
-    for (int i = tid; i < assignments; i += blockDim.x) { used[ids[i]] = 1; }
+    // An id outside the resolved layer's own bank has no entry, so it is counted and left to
+    // resolve to -1 rather than written into a table that covers only `bank.experts` entries. The
+    // offload path takes the expert count from the layer's descriptor; this guard keeps a wrong one
+    // from corrupting the shared tables or handing a consumer a slot that does not exist. The count
+    // lands in `statistics[2]` so a caller can refuse rather than run on.
+    int outside = 0;
+    for (int i = tid; i < assignments; i += blockDim.x) {
+        const int id = ids[i];
+        if (id >= 0 && id < bank.experts) {
+            used[id] = 1;
+        } else {
+            ++outside;
+        }
+    }
+    // One block-wide count, so the counter is the call's and not one thread's slice of it.
+    if (outside > 0) { atomicAdd(&outside_s, outside); }
     __syncthreads();
+    if (tid == 0 && outside_s > 0) {
+        atomicAdd(&cache.statistics[2], static_cast<unsigned long long>(outside_s));
+    }
     const unsigned long long now = now_s;
     // Hits refresh their stamp; misses are listed in ascending expert order.
     int miss = 0;
@@ -353,7 +378,10 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
     __syncthreads();
     if (tid == 0) { misses[0] = min(need_total, emitted_s); }
-    for (int i = tid; i < assignments; i += blockDim.x) { slot_ids[i] = slot_for[ids[i]]; }
+    for (int i = tid; i < assignments; i += blockDim.x) {
+        const int id = ids[i];
+        slot_ids[i]  = (id >= 0 && id < bank.experts) ? slot_for[id] : -1;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -210,6 +210,11 @@ MemorySummary NemotronProgram::memory_summary() const {
     summary.weights.peak_used_bytes  = storage.h2d_bytes;
     summary.prefill_chunk            = prefill_chunk_;
     summary.idle_prefill_chunk       = prefill_chunk_;
+    // The routed-expert split: the resident banks in experts and bytes. The pinned remainder beside
+    // them moves in the opposite direction and is reported by the model's storage stats, which is
+    // where the 37.21 GB side of the trade lives.
+    summary.expert_cache_slots = static_cast<std::uint32_t>(program_.expert_residency().resident_experts);
+    summary.expert_cache_bytes = program_.expert_residency().resident_bytes;
     // The pass's transient arena is not allocated here: the landed forward takes one from its
     // caller, and this Program allocates none. What a request needs beside the state is reported by
     // the instance's KvCapacityResolution.runtime_reservation_bytes, which is exactly the state
@@ -505,7 +510,7 @@ NemotronInstance::NemotronInstance(std::unique_ptr<models::nemotron_h::Model> so
                                    const models::nemotron_h::FrontendResources& resources,
                                    const EngineOptions& options, DeviceContext& device)
     : model(std::move(source)), frontend(resources, options.max_context), program(nullptr),
-      capacity(options.max_context) {
+      capacity(options.max_context), expert_residency(model->expert_residency()) {
     const std::size_t needed = models::nemotron_h::Program::device_bytes(model->config(), options);
     std::size_t free_bytes   = 0;
     std::size_t total_bytes  = 0;
@@ -538,7 +543,27 @@ NemotronInstance::~NemotronInstance() = default;
 std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& options,
                                                         DeviceContext& device) {
     artifact::Reader reader(options.artifact_path);
-    auto plan = models::nemotron_h::plan_load(reader, models::load_options(options));
+    // What the expert cache must leave free, resolved from the *engine's own* plan rather than from
+    // a constant: the family's state for the configured lanes and windows, one pass's workspace,
+    // the staging buffer and its tables, the runtime's reservation and the capacity headroom. The
+    // K/V is part of that state and never gives way to the cache -- a cache request that would eat
+    // into it is re-derived smaller and reported.
+    const models::nemotron_h::Config artifact_config =
+        models::nemotron_h::parse_config(reader.directory());
+    models::nemotron_h::ExpertResidencyRequest residency;
+    residency.automatic = options.expert_cache.mode == ExpertCacheMode::Automatic;
+    residency.explicit_bytes = options.expert_cache.explicit_bytes;
+    residency.reserve_bytes =
+        models::nemotron_h::Program::device_bytes(artifact_config.text, options) +
+        models::nemotron_h::pass_output_bytes(
+            artifact_config.text,
+            static_cast<std::int32_t>(options.prefill_chunk.value_or(
+                models::nemotron_h::kDefaultPrefillChunk))) +
+        models::nemotron_h::kRuntimeReservationBytes +
+        (options.kv_capacity.mode == KvCapacityMode::Automatic
+             ? options.kv_capacity.automatic_headroom_bytes
+             : 0);
+    auto plan = models::nemotron_h::plan_load(reader, models::load_options(options), residency);
     // The resources are views into the reader's mapping, which does not outlive this load.
     const models::nemotron_h::TextResources& views = plan.resources();
     models::nemotron_h::FrontendResources resources{

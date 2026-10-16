@@ -3,6 +3,7 @@
 #include "artifact/views.h" // bind_view
 #include "core/layout.h"
 #include "core/weight_view.h" // as_dense, native_weight, weight_tensor
+#include "models/nemotron_h/experts.h"
 #include "models/nemotron_h/load.h"
 #include "ninfer/ops/attention_geometry.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -88,6 +89,18 @@ void require_tensor(const BoundWeight& parameter, DType dtype,
 // weight has to describe the same problem, because a weight registered at another shape is read
 // out of range rather than refused by the Op that consumes it.
 void require_matrix(const BoundWeight& parameter, std::int32_t rows, std::int32_t columns) {
+    // A quantized matrix has its planes in `weight` and no single-typed tensor, so its resident
+    // view is unset by design. The logical shape is then the Weight's own, and it is the same
+    // check: a parameter bound one expert short or at another layer's width is refused either way.
+    if (parameter.tensor.data == nullptr) {
+        if (parameter.weight.payload == nullptr || parameter.weight.n != rows ||
+            parameter.weight.k != columns) {
+            throw std::invalid_argument("nemotron_h forward: parameter '" + parameter.name +
+                                        "' is not bound as a " + extent_text(rows, columns) +
+                                        " matrix");
+        }
+        return;
+    }
     require_tensor(parameter, DType::BF16, {rows, columns});
     if (parameter.weight.qtype != QType::BF16 || parameter.weight.n != rows ||
         parameter.weight.k != columns) {
@@ -101,9 +114,11 @@ void require_matrix(const BoundWeight& parameter, std::int32_t rows, std::int32_
 // width instead of the latent width is the mistake this family invites and the message has to say
 // which of the two numbers is wrong.
 void require_bank_latent(const BoundWeight& parameter, std::int32_t latent_width) {
-    if (parameter.tensor.ne[1] != latent_width) {
+    const std::int32_t bound =
+        parameter.tensor.data == nullptr ? parameter.weight.k : parameter.tensor.ne[1];
+    if (bound != latent_width) {
         throw std::invalid_argument("nemotron_h forward: the expert bank '" + parameter.name +
-                                    "' is bound at " + std::to_string(parameter.tensor.ne[1]) +
+                                    "' is bound at " + std::to_string(bound) +
                                     " columns where the config's MoE layer runs its experts at " +
                                     std::to_string(latent_width));
     }
@@ -328,8 +343,10 @@ void plan_pass(const TextConfig& config, std::int32_t tokens, Allocator& allocat
 Model::Model(TextConfig config, ModelWeights weights)
     : config_(std::move(config)), weights_(std::move(weights)) {}
 
-Model::Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing)
-    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)) {}
+Model::Model(TextConfig config, ModelWeights weights, artifact::MaterializedArtifact backing,
+             ExpertResidencyPlan residency)
+    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
+      residency_(std::move(residency)) {}
 
 void Model::bind(WeightId id, std::string name, Tensor tensor, Weight weight) {
     if (id.index == std::numeric_limits<std::size_t>::max()) {
@@ -453,12 +470,16 @@ void verify_complete(const Model& model) {
 // once.
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                          const StartupObserver* observer) {
+    // The split the loader decided travels with the model: it is what the pool stages the
+    // non-resident banks against, and it is not recoverable from the bound weights alone.
+    ExpertResidencyPlan residency  = plan.expert_residency();
     auto content                   = plan.release();
     const artifact::Reader& source = *content.materialization.source;
     auto backing =
         artifact::materialize(source, std::move(content.materialization), device, observer);
-    auto model = std::unique_ptr<Model>(
-        new Model(std::move(content.config), std::move(content.weights), std::move(backing)));
+    auto model =
+        std::unique_ptr<Model>(new Model(std::move(content.config), std::move(content.weights),
+                                         std::move(backing), std::move(residency)));
     for (std::size_t index = 0; index < content.declarations.size(); ++index) {
         const DeclaredParameter& declared = content.declarations[index];
         const WeightId id{index};
@@ -467,7 +488,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             model->bind(id, declared.name, direct_tensor(view));
             continue;
         }
-        const Weight weight = native_weight(view, declared.activation_divisor);
+        // The declaration is zero when the artifact declares no activation input divisor, which is
+        // this family's A16 case: the kernel reads the raw activation and quantizes nothing. The
+        // native NVFP4 ABI validates that field even when nothing reads it, so an undeclared
+        // divisor is bound as the neutral 1 rather than as 0 -- the same mapping the Qwen path
+        // applies where it turns an artifact's optional use auxiliaries into a Weight
+        // (src/ops/weight_input.cpp).
+        const float input_divisor =
+            declared.activation_divisor == 0.0F ? 1.0F : declared.activation_divisor;
+        const Weight weight = native_weight(view, input_divisor);
         model->bind(id, declared.name, matrix_tensor(weight), weight);
     }
     verify_complete(*model);
@@ -604,7 +633,8 @@ void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor
 // The latent-MoE mixer.
 void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights& weights,
                  const Tensor& mixer_input, Scratch& scratch, Tensor& mixer_out,
-                 DeviceExecutionView execution, const BlockObserver* observer, std::size_t layer) {
+                 DeviceExecutionView execution, const BlockObserver* observer, std::size_t layer,
+                 RoutedExpertPool* pool) {
     const TextConfig& config   = model.config();
     const std::int32_t hidden  = static_cast<std::int32_t>(config.hidden_size);
     const std::int32_t tokens  = mixer_input.ne[1];
@@ -657,13 +687,41 @@ void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights
     const Tensor& latent_in = bank.latent() ? scratch.moe.latent_in : mixer_input;
     observe(observer, layer, BlockStage::MoeLatentIn, latent_in);
 
-    const ops::NemotronHMoeExpertWeights banks{model.matrix(weights.experts_up),
-                                               model.matrix(weights.experts_down)};
     const ops::NemotronHMoeExpertGeometry expert_geometry{latent, experts, ranks, intermediate};
     Tensor& routed = bank.latent() ? scratch.moe.experts_out : mixer_out;
-    ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids, scratch.moe.expert_weights,
-                                banks, expert_geometry, routed, scratch.moe.experts_workspace,
-                                stream);
+    // The bank's representation decides the route: a BF16 bank is read whole and in place, and a
+    // block-scaled NVFP4 one is read through its planes, either where it was bound (host-pinned
+    // over UVA, or device-resident) or from the pool's staged copy of it.
+    const Weight& up   = model.matrix(weights.experts_up);
+    const Weight& down = model.matrix(weights.experts_down);
+    if (up.qtype == QType::BF16) {
+        const ops::NemotronHMoeExpertWeights banks{up, down};
+        ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids, scratch.moe.expert_weights,
+                                    banks, expert_geometry, routed, scratch.moe.experts_workspace,
+                                    stream);
+    } else {
+        const std::int32_t pool_layer =
+            expert_pool_layer(config, static_cast<std::uint32_t>(layer));
+        if (pool_layer < 0) {
+            throw std::invalid_argument("nemotron_h forward: block " + std::to_string(layer) +
+                                        " has a registered-format bank but no pool layer");
+        }
+        const ops::ExpertWeights stored =
+            expert_bank_addressing(up, down, experts, latent, intermediate, "routed experts");
+        if (pool != nullptr) {
+            const RoutedExpertPool::Placed placed = pool->acquire(pool_layer, stream);
+            ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids,
+                                        scratch.moe.expert_weights, placed.weights, placed.span,
+                                        expert_geometry, routed, stream);
+            // The release is recorded even on the way out of a throw: the bank's next fill waits on
+            // it, so a pass that abandons a layer must not leave the bank looking busy.
+            if (placed.staged) { pool->release(pool_layer, stream); }
+        } else {
+            ops::nemotron_h_moe_experts(
+                latent_in, scratch.moe.expert_ids, scratch.moe.expert_weights, stored,
+                ops::ExpertBankSpan{0, experts}, expert_geometry, routed, stream);
+        }
+    }
     observe(observer, layer, BlockStage::MoeExperts, routed);
 
     // 3. Back out of the latent space, straight into the mixer's output buffer.
@@ -793,7 +851,7 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
 
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   const BlockObserver* observer) {
+                   const BlockObserver* observer, RoutedExpertPool* expert_pool) {
     const TextConfig& config  = model.config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
     if (layer >= config.num_hidden_layers()) {
@@ -857,7 +915,7 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
         break;
     case BlockKind::Moe:
         forward_moe(model, *bank, weights.moe.value(), scratch.normed, scratch, hidden_out,
-                    execution, observer, layer);
+                    execution, observer, layer, expert_pool);
         break;
     case BlockKind::Attention:
         forward_attention(model, weights.attention.value(), scratch.normed, scratch, hidden_out,
@@ -872,7 +930,8 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
 }
 
 void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& arena, Tensor& logits,
-                   DeviceExecutionView execution, const BlockObserver* observer) {
+                   DeviceExecutionView execution, const BlockObserver* observer,
+                   RoutedExpertPool* expert_pool) {
     const TextConfig& config  = model.config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
     const std::int32_t tokens = token_ids.ne[0];
@@ -891,6 +950,9 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
 
     DeviceArena::Scope scope = arena.scope();
     PassBuffers buffers      = allocate_pass(config, tokens, arena);
+    // A staged pass reclaims the staged banks once, at its first staged layer: whatever the
+    // previous pass left in them is not this one's data.
+    if (expert_pool != nullptr) { expert_pool->begin_forward(); }
 
     ops::embedding(token_ids, model.matrix(model.weights().text.token_embedding), 1.0F,
                    buffers.hidden_a, execution.stream);
@@ -899,7 +961,7 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
     Tensor current = buffers.hidden_a;
     for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
         Tensor next = current.data == buffers.hidden_a.data ? buffers.hidden_b : buffers.hidden_a;
-        forward_block(model, layer, current, arena, next, execution, observer);
+        forward_block(model, layer, current, arena, next, execution, observer, expert_pool);
         current = next;
     }
 
