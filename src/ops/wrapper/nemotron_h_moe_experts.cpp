@@ -105,7 +105,7 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
 void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
                             const ExpertWeights& bank, ExpertBankSpan source,
                             const NemotronHMoeExpertGeometry& geometry, Tensor& out,
-                            cudaStream_t stream) {
+                            Tensor& workspace, cudaStream_t stream) {
     const std::int32_t latent       = geometry.latent_size;
     const std::int32_t experts      = geometry.num_experts;
     const std::int32_t top_k        = geometry.top_k;
@@ -187,9 +187,21 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
         fail("this entry point is the A16 route; a bank with activation divisors takes the A4 one");
     }
 
+    // The same check the whole-matrix entry point makes, against this format's own query: a call
+    // narrow enough for the row-tiled route needs the two buffers the query reports, and a wide one
+    // needs nothing and is handed whatever the caller has.
+    const std::size_t required =
+        nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, tokens);
+    if (required > 0 &&
+        (workspace.data == nullptr || !workspace.is_contiguous() || workspace.bytes() < required ||
+         reinterpret_cast<std::uintptr_t>(workspace.data) % 16 != 0)) {
+        fail("workspace must be a contiguous, 16-byte aligned buffer of at least " +
+             std::to_string(required) + " bytes");
+    }
+
     detail::nemotron_h_moe_experts_planar_launch(x.data, expert_ids.data, expert_weights.data, bank,
                                                  source, latent, intermediate, top_k, tokens,
-                                                 out.data, stream);
+                                                 workspace.data, out.data, stream);
 }
 
 } // namespace ninfer::ops

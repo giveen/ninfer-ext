@@ -171,4 +171,176 @@ __global__ void nemotron_h_moe_experts_kernel(UpReader up, DownReader down, int 
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The narrow route: one block per (token, rank, output-row tile), and the token's ranks summed
+// afterwards in ascending order.
+//
+// The per-token route above is one CTA per token walking the K selected experts serially, so a
+// single-token call occupies one SM: at this family's geometry that is ~37.7M MACs over ~21.6 MB of
+// bank bytes on one 128-thread block, latency-bound on a one-element-at-a-time read of a 4-bit
+// bank. The narrow route hands the same arithmetic to one block per (rank, row tile) instead, which
+// is legal because no output row depends on another: an expert's `intermediate` up rows and its
+// `latent` down rows are each independent, so splitting on rows needs no cross-block reduction.
+//
+// What it does need is somewhere for a rank's activation to live between the two projections: every
+// row tile of a (token, rank) down projection reads that rank's whole up result. That buffer and
+// each rank's raw down partial are the caller's workspace, both reported by the query.
+//
+// The numerics are the per-token route's own, exactly -- not to a tolerance:
+//
+//  * a row's dot product is four accumulator chains, chain `c` taking the columns congruent to `c`
+//    modulo 4 in ascending order, combined as `(a0+a1)+(a2+a3)`, and each element is
+//    `((code * scale) * inverse) * activation` -- the same association and the same per-element
+//    expression the per-token kernel writes, so the two agree bit for bit;
+//  * the down partial is the raw FP32 result and the routing weight is applied by the summing
+//    kernel, because the per-token kernel's expression is `accumulator += weight * acc` inside its
+//    rank loop: writing the partial scaled would introduce a rounding the wide route does not have;
+//  * the summing kernel adds a token's K partials in ascending rank order in FP32 with one
+//    BF16 rounding at the output, which is the per-token kernel's own order.
+//
+// Both banks are read in bulk rather than element by element: one iteration covers a 64-column
+// chunk, whose codes are two 16-byte loads and whose four 16-column E4M3 scale bytes are one 32-bit
+// load, so the loop is bound by the bytes it streams rather than by the latency of one accessor
+// call per weight.
+inline constexpr int kNarrowChunkColumns = 64;
+
+// One expert row of an NVFP4 bank against one activation row, in the per-token kernel's own order.
+// `bank_row` is the row's index in the whole bank (so the weight divisor and the expert it belongs
+// to both resolve the way the reader resolves them), `columns` its own column count -- `latent` for
+// an up row, `intermediate` for a down one -- and `activation(pair)` the two represented activation
+// values of columns `2*pair`, `2*pair+1`. `columns` must be a multiple of the chunk width, which
+// the plane-addressed route's own multiple-of-128 requirement gives.
+template <class Activation>
+__device__ __forceinline__ float narrow_bank_row(const Nvfp4BankReader& bank, int bank_row,
+                                                 const Activation& activation, int columns) {
+    const int expert          = bank_row / bank.rows_per_expert;
+    const int local           = bank_row - expert * bank.rows_per_expert;
+    const float inverse       = bank.inverse_divisor(bank_row);
+    const std::uint8_t* codes = bank.codes + static_cast<std::int64_t>(expert) * bank.code_stride +
+                                static_cast<std::int64_t>(local) * (columns / 2);
+    const std::uint8_t* scales =
+        bank.scales + static_cast<std::int64_t>(expert) * bank.scale_stride;
+    const int scale_tiles = columns / 64;
+
+    float a0 = 0.0F, a1 = 0.0F, a2 = 0.0F, a3 = 0.0F;
+    for (int chunk = 0; chunk < columns; chunk += kNarrowChunkColumns) {
+        const uint4 lo = load_vec<uint4>(codes + (chunk >> 1));
+        const uint4 hi = load_vec<uint4>(codes + (chunk >> 1) + 16);
+        // One 32-bit load covers the chunk's four 16-column scale groups: the K16M128x4 tiling puts
+        // a row's four consecutive groups in one aligned word, and a 64-column chunk starts on a
+        // group boundary four groups wide.
+        const std::uint32_t packed_scales = load_vec<std::uint32_t>(
+            scales + nvfp4_scale_byte_runtime(local, chunk / 16, scale_tiles));
+        const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+        for (int byte = 0; byte < 32; ++byte) {
+            const std::uint8_t packed =
+                static_cast<std::uint8_t>(byte_of_word(words[byte >> 2], byte & 3U));
+            const float scale = decode_nvfp4_e4m3(
+                static_cast<std::uint8_t>((packed_scales >> (8 * (byte >> 3))) & 0xFFU));
+            const float2 code            = decode_nvfp4_e2m1x2(packed);
+            const float2 activation_pair = activation((chunk >> 1) + byte);
+            // `byte` carries columns `chunk+2*byte` and `chunk+2*byte+1`: an even byte's pair is
+            // congruent to 0 and 1 modulo 4 and an odd byte's to 2 and 3, which is the wide
+            // kernel's chain assignment, and the bytes of a chunk are visited in ascending order,
+            // which is that kernel's ascending order inside every chain.
+            const float low  = (code.x * scale) * inverse;
+            const float high = (code.y * scale) * inverse;
+            if ((byte & 1) == 0) {
+                a0 += low * activation_pair.x;
+                a1 += high * activation_pair.y;
+            } else {
+                a2 += low * activation_pair.x;
+                a3 += high * activation_pair.y;
+            }
+        }
+    }
+    return (a0 + a1) + (a2 + a3);
+}
+
+// The token's activation row, staged for the block's rows to share: `latent` BF16 values, 8 per
+// 16-byte load, which the plane-addressed route's multiple-of-128 width makes exact.
+template <int kThreads>
+__device__ __forceinline__ void narrow_stage_activation(const __nv_bfloat16* __restrict__ row,
+                                                        int latent,
+                                                        __nv_bfloat16* __restrict__ stage) {
+    for (int h = static_cast<int>(threadIdx.x) * 8; h < latent; h += kThreads * 8) {
+        store_vec(stage + h, load_vec<uint4>(row + h));
+    }
+    __syncthreads();
+}
+
+// One rank's up projection: `intermediate` rows, each a `latent`-wide dot product with the token's
+// activation row, squared and rectified into the workspace's product buffer.
+//
+// Grid: x the up-row tile, y the token, z the rank. Shared: `latent` BF16, the staged activation.
+template <int kThreads>
+__global__ __launch_bounds__(kThreads) void nemotron_h_moe_experts_narrow_up_kernel(
+    Nvfp4BankReader up, int latent, int intermediate, int tokens, int top_k,
+    const std::int32_t* __restrict__ expert_ids, const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ product) {
+    extern __shared__ __nv_bfloat16 stage_activation[]; // [latent]
+    const int token = static_cast<int>(blockIdx.y);
+    narrow_stage_activation<kThreads>(x + static_cast<std::size_t>(token) * latent, latent,
+                                      stage_activation);
+
+    const int local = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+    if (local >= intermediate) { return; }
+    const std::size_t slot  = static_cast<std::size_t>(blockIdx.z) * tokens + token;
+    const int expert        = expert_ids[slot];
+    const auto* const pairs = reinterpret_cast<const std::uint32_t*>(stage_activation);
+    const auto activation   = [pairs](int pair) { return bf16x2_bits_to_float2(pairs[pair]); };
+    const float acc = narrow_bank_row(up, expert * intermediate + local, activation, latent);
+    product[slot * intermediate + local] = relu2_one(acc);
+}
+
+// One rank's down projection: `latent` rows over the rank's staged activation, each written to the
+// workspace's partial buffer unscaled (see the numeric note above).
+//
+// Grid: x the latent-row tile, y the token, z the rank. Shared: `intermediate` FP32, the rank's
+// activation, which every row of the tile reads.
+template <int kThreads>
+__global__ __launch_bounds__(kThreads) void nemotron_h_moe_experts_narrow_down_kernel(
+    Nvfp4BankReader down, int latent, int intermediate, int tokens, int top_k,
+    const std::int32_t* __restrict__ expert_ids, const float* __restrict__ product,
+    float* __restrict__ partial) {
+    extern __shared__ float stage_product[]; // [intermediate]
+    const int token        = static_cast<int>(blockIdx.y);
+    const std::size_t slot = static_cast<std::size_t>(blockIdx.z) * tokens + token;
+    const float* source    = product + slot * intermediate;
+    for (int i = static_cast<int>(threadIdx.x) * 4; i < intermediate; i += kThreads * 4) {
+        store_vec(stage_product + i, load_vec<float4>(source + i));
+    }
+    __syncthreads();
+
+    const int local = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+    if (local >= latent) { return; }
+    const int expert                  = expert_ids[slot];
+    const float* const activation_row = stage_product;
+    const auto activation             = [activation_row](int pair) {
+        return load_vec<float2>(activation_row + 2 * pair);
+    };
+    partial[slot * latent + local] =
+        narrow_bank_row(down, expert * latent + local, activation, intermediate);
+}
+
+// A token's K partials summed in ascending rank order in FP32, with the routing weight applied
+// where the per-token kernel applies it, and the Op's one BF16 rounding.
+//
+// Grid: x the latent-column tile, y the token.
+template <int kThreads>
+__global__ __launch_bounds__(kThreads) void nemotron_h_moe_experts_narrow_rank_sum_kernel(
+    const float* __restrict__ partial, const float* __restrict__ expert_weights, int latent,
+    int top_k, int tokens, __nv_bfloat16* __restrict__ out) {
+    const int token = static_cast<int>(blockIdx.y);
+    const int h     = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+    if (h >= latent) { return; }
+    float accumulator = 0.0F;
+    for (int rank = 0; rank < top_k; ++rank) {
+        const std::size_t slot = static_cast<std::size_t>(rank) * tokens + token;
+        accumulator += expert_weights[slot] * partial[slot * latent + h];
+    }
+    out[static_cast<std::size_t>(token) * latent + h] = __float2bfloat16_rn(accumulator);
+}
+
 } // namespace ninfer::ops::detail

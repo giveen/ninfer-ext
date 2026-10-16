@@ -25,9 +25,17 @@ struct NemotronHMoeBankLaunch {
     std::int32_t columns      = 0;
 };
 
-// The workspace a call over T tokens takes for this format and geometry: none for either landed
-// route, because the per-token route keeps the activation row in shared memory and the
-// plane-addressed route reads a bank that is already staged.
+// The workspace a call over T tokens takes for this format and geometry: none for the per-token
+// route, which keeps a token's activation and its product in shared memory and reads a bank that
+// is already addressed where it lies, and the narrow route's two buffers -- each selected
+// (token, rank)'s activation product and its raw down partial, both FP32 -- for a call narrow
+// enough to take it.
+//
+// The reported size is non-decreasing in T: a wide call needs none of it, but a caller sizes one
+// arena for every call it makes -- the engine plans its pass arena at the prefill width and then
+// runs its decode calls through that storage -- so above the narrow route's token count it reports
+// the widest narrow call's size rather than zero. A caller that sizes at T and then calls at a
+// narrower T is therefore covered.
 [[nodiscard]] std::size_t nemotron_h_moe_experts_workspace(QType qtype, std::int32_t latent,
                                                            std::int32_t experts,
                                                            std::int32_t intermediate,
@@ -46,10 +54,15 @@ void nemotron_h_moe_experts_launch(const void* x, const void* expert_ids,
 // host mapping read over UVA, or the expert cache's slot pool at the pool's own stride; this route
 // reads whatever it is given, which is what makes the in-place, the staged and the gathered
 // configurations the same code.
+//
+// `workspace` is the caller's graph-stable storage, holding the bytes `nemotron_h_moe_experts_
+// workspace` reports for this geometry and T: a call that takes the narrow route reads and writes
+// it and refuses an unbound one, and a wide call neither reads it nor cares.
 void nemotron_h_moe_experts_planar_launch(const void* x, const void* expert_ids,
                                           const void* expert_weights, const ExpertWeights& staged,
                                           ExpertBankSpan span, std::int32_t latent,
                                           std::int32_t intermediate, std::int32_t top_k,
-                                          std::int32_t tokens, void* out, cudaStream_t stream);
+                                          std::int32_t tokens, void* workspace, void* out,
+                                          cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

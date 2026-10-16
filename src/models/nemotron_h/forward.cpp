@@ -303,10 +303,15 @@ Scratch allocate_block(const TextConfig& config, const MoeBankConfig* bank, std:
         // layer -- and a staged-width pass simply leaves them alone.
         scratch.moe.slot_ids = allocator.alloc(DType::I32, {ranks, tokens});
         scratch.moe.misses   = allocator.alloc(DType::I32, {2 * ranks * tokens + 1});
-        // A BF16 bank's route needs no scratch, which is what the Op's own query reports; a
-        // registered (quantized) route would have to be allocated here to the size that query
-        // names. The composition requires BF16 banks, so the Op's call checks the workspace rather
-        // than an unbound one being waved through.
+        // The experts' Op keeps each selected (token, rank)'s activation product and its raw down
+        // partial here when the call is narrow enough to run its row-tiled route, and reads none of
+        // it on the per-token route a wide call takes. The registered form is the one that reports
+        // a size, and it is asked at the pass's own width: the query never falls as T does, so the
+        // storage a prefill-sized pass reserves covers the T=1 calls that run through it.
+        const ops::NemotronHMoeExpertGeometry geometry{latent, experts, ranks, intermediate};
+        scratch.moe.experts_workspace = allocator.alloc(
+            DType::U8, {static_cast<std::int32_t>(ops::nemotron_h_moe_experts_workspace_bytes(
+                           geometry, QType::NVFP4, tokens))});
     }
 
     if (kind == BlockKind::Attention) {
@@ -770,19 +775,20 @@ void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights
             CUDA_CHECK(cudaStreamWaitEvent(stream, cached.fetched));
             ops::nemotron_h_moe_experts(latent_in, scratch.moe.slot_ids, scratch.moe.expert_weights,
                                         cached.weights, cached.span, expert_geometry, routed,
-                                        stream);
+                                        scratch.moe.experts_workspace, stream);
         } else if (pool != nullptr) {
             const RoutedExpertPool::Placed placed = pool->acquire(pool_layer, stream);
-            ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids,
-                                        scratch.moe.expert_weights, placed.weights, placed.span,
-                                        expert_geometry, routed, stream);
+            ops::nemotron_h_moe_experts(
+                latent_in, scratch.moe.expert_ids, scratch.moe.expert_weights, placed.weights,
+                placed.span, expert_geometry, routed, scratch.moe.experts_workspace, stream);
             // The release is recorded even on the way out of a throw: the bank's next fill waits on
             // it, so a pass that abandons a layer must not leave the bank looking busy.
             if (placed.staged) { pool->release(pool_layer, stream); }
         } else {
-            ops::nemotron_h_moe_experts(
-                latent_in, scratch.moe.expert_ids, scratch.moe.expert_weights, stored,
-                ops::ExpertBankSpan{0, experts}, expert_geometry, routed, stream);
+            ops::nemotron_h_moe_experts(latent_in, scratch.moe.expert_ids,
+                                        scratch.moe.expert_weights, stored,
+                                        ops::ExpertBankSpan{0, experts}, expert_geometry, routed,
+                                        scratch.moe.experts_workspace, stream);
         }
     }
     observe(observer, layer, BlockStage::MoeExperts, routed);
