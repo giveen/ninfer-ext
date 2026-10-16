@@ -7,9 +7,13 @@
 //
 // The experts themselves are a *split*: the plan makes the banks the card can hold device-resident
 // and leaves the rest pinned for the staging route, so the case checks each bank's declared
-// residency against the plan's own and checks that the pinned and resident halves are exactly the
-// banks. A request for no device expert bytes is planned too, and it must pin every bank -- the
-// route this family ran before the split existed.
+// residency against the plan's own, checks that the pinned and resident halves are exactly the
+// banks, and checks that the device side is the dense parameters plus the resident banks plus the
+// arena's own alignment tails. How far the split goes is free VRAM's call -- a busy card leaves
+// more of the pool pinned -- so the split is reported as data and never asserted as a threshold;
+// what is asserted is the arithmetic, which holds whichever way it lands. A request for no device
+// expert bytes is planned too, and it must pin every bank -- the route this family ran before the
+// split existed.
 
 #include "artifact/binder.h" // ParameterReference, Residency
 #include "artifact/reader.h"
@@ -286,6 +290,13 @@ int main() {
         std::uint64_t resident_parent_bytes = 0;
         std::uint64_t resident_experts      = 0;
         std::uint64_t resident_banks        = 0;
+        // The dense side's own bytes: every parameter that is not a routed bank, summed from the
+        // plan's own references. This is the term that does not move -- what the card's free memory
+        // decides is how much of the pool sits beside it, and that is read off the plan's residency
+        // rather than assumed, so the accounting below holds on a busy card as well as a quiet one.
+        std::uint64_t dense_parent_bytes = parent_bytes(reader, plan, text.token_embedding) +
+                                           parent_bytes(reader, plan, text.output_head) +
+                                           parent_bytes(reader, plan, text.final_norm);
         for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
             const nemotron::LayerWeights& weights = text.layers[layer];
             const auto index                      = static_cast<std::uint32_t>(layer);
@@ -293,6 +304,7 @@ int main() {
             check(weights.kind == config.block_kind(index), what + ": declared kind");
             check_reference(plan, weights.block_norm, {hidden}, artifact::Residency::Device,
                             what + " block_norm");
+            dense_parent_bytes += parent_bytes(reader, plan, weights.block_norm);
             if (weights.kind == nemotron::BlockKind::Mamba) {
                 check(weights.mamba.has_value(), what + ": mamba parameters");
                 if (!weights.mamba) { continue; }
@@ -308,6 +320,13 @@ int main() {
                 check_stored_format(reader, plan, ids.a_log, QType::FP32, what + " a_log");
                 check_stored_format(reader, plan, ids.d_skip, QType::FP32, what + " d_skip");
                 check_stored_format(reader, plan, ids.dt_bias, QType::FP32, what + " dt_bias");
+                dense_parent_bytes +=
+                    parent_bytes(reader, plan, ids.in_proj) +
+                    parent_bytes(reader, plan, ids.out_proj) +
+                    parent_bytes(reader, plan, ids.conv) +
+                    parent_bytes(reader, plan, ids.conv_bias) +
+                    parent_bytes(reader, plan, ids.a_log) + parent_bytes(reader, plan, ids.d_skip) +
+                    parent_bytes(reader, plan, ids.dt_bias) + parent_bytes(reader, plan, ids.norm);
             } else if (weights.kind == nemotron::BlockKind::Attention) {
                 check(weights.attention.has_value(), what + ": attention parameters");
                 if (!weights.attention) { continue; }
@@ -321,6 +340,9 @@ int main() {
                                 artifact::Residency::Device, what + " value");
                 check_stored_format(reader, plan, ids.output, QType::FP8_E4M3FN_ROW_BF16,
                                     what + " attention output");
+                dense_parent_bytes +=
+                    parent_bytes(reader, plan, ids.query) + parent_bytes(reader, plan, ids.key) +
+                    parent_bytes(reader, plan, ids.value) + parent_bytes(reader, plan, ids.output);
             } else {
                 check(weights.moe.has_value(), what + ": MoE parameters");
                 if (!weights.moe) { continue; }
@@ -339,6 +361,12 @@ int main() {
                                 artifact::Residency::Device, what + " shared/up");
                 check_reference(plan, ids.shared_down, {hidden, bank.shared_intermediate_size},
                                 artifact::Residency::Device, what + " shared/down");
+                dense_parent_bytes += parent_bytes(reader, plan, ids.router) +
+                                      parent_bytes(reader, plan, ids.correction_bias) +
+                                      parent_bytes(reader, plan, ids.fc1_latent) +
+                                      parent_bytes(reader, plan, ids.fc2_latent) +
+                                      parent_bytes(reader, plan, ids.shared_up) +
+                                      parent_bytes(reader, plan, ids.shared_down);
                 // The bank is the layer's own expert count and width. Whether it is VRAM or pinned
                 // host memory is the loader's residency split, so it is checked against the plan the
                 // loader produced for this layer rather than assumed: a bank the plan calls
@@ -378,6 +406,29 @@ int main() {
         // Taken before the plan is consumed: the split the loader bound the banks with is what the
         // pinned accounting below is checked against.
         const nemotron::ExpertResidencyPlan residency = plan.expert_residency();
+        // Also taken before the plan is consumed: the placement table the arena is laid out from.
+        // It holds the device parameters and the arena's own alignment tails and nothing else --
+        // every placement starts on a 256-byte boundary, so an object whose declared size is not a
+        // multiple of 256 leaves a tail no parameter owns before the next one: every NVFP4 plane,
+        // which carries its one weight-divisor word past the scales, and every router's 240-word
+        // FP32 correction bias. The last placement's tail is the end of the arena rather than an
+        // interval, so it is not paid and comes off the sum.
+        std::uint64_t device_parameter_bytes = 0;
+        std::uint64_t device_placements      = 0;
+        std::uint64_t device_slack_bytes     = 0;
+        std::uint64_t last_placement_bytes   = 0;
+        for (const artifact::DevicePlacement& placement : plan.materialization().device_objects) {
+            device_parameter_bytes += placement.bytes;
+            ++device_placements;
+            device_slack_bytes += (256 - placement.bytes % 256) % 256;
+            last_placement_bytes = placement.bytes;
+        }
+        device_slack_bytes -= (256 - last_placement_bytes % 256) % 256;
+        // What the split sized itself against: the free VRAM the plan found, reported because it is
+        // what decides how much of the pool could stay on the device.
+        std::size_t free_vram  = 0;
+        std::size_t total_vram = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_vram, &total_vram));
         const auto load_started           = std::chrono::steady_clock::now();
         auto model                        = nemotron::materialize_model(std::move(plan), device);
         const double load_seconds =
@@ -401,16 +452,33 @@ int main() {
         check_tensor(*model, model->weights().text.final_norm, DType::BF16, "final_norm");
 
         // The pinned set is the routed banks the plan did not make resident, and the resident set
-        // is what the card could hold: together they are exactly the banks, which is the split the
-        // 32 GB card's VRAM forces. The plan counts a bank's experts' planes; the materializer also
-        // counts the bank's weight divisors, so the two agree to the tails.
+        // is what the card could hold. Which way that split lands is the free VRAM's call -- a busy
+        // card leaves more of the pool pinned -- so it is reported as data and never asserted as a
+        // threshold. What has to hold either way is the arithmetic: the two halves are exactly the
+        // banks, and the device side is the dense parameters plus the resident banks plus the
+        // arena's own alignment tails. The plan counts a bank's experts' planes; the materializer
+        // also counts the bank's weight divisors, so the two agree to the tails.
         const auto& stats = model->storage_stats();
         check(stats.pinned_host_bytes + resident_parent_bytes == bank_bytes,
               "pinned bytes " + std::to_string(stats.pinned_host_bytes) + " plus resident " +
                   std::to_string(resident_parent_bytes) + " are not the routed banks " +
                   std::to_string(bank_bytes));
-        check(stats.device_capacity_bytes < stats.pinned_host_bytes,
-              "the device side should hold less than the pinned banks");
+        // The device side is the dense side and the resident banks and nothing else: the plan's own
+        // placement table has to name exactly those parameters, which is what keeps the split from
+        // silently dropping or double-counting a bank.
+        check(device_parameter_bytes == dense_parent_bytes + resident_parent_bytes,
+              "the plan places " + std::to_string(device_parameter_bytes) +
+                  " device parameter bytes, where the dense side is " +
+                  std::to_string(dense_parent_bytes) + " and the resident banks are " +
+                  std::to_string(resident_parent_bytes));
+        // And the arena adds only the tails its own 256-byte placement leaves behind: every byte on
+        // the device side is one of those parameters or one of those tails, and none of it depends
+        // on what else is on the card.
+        check(stats.device_capacity_bytes == device_parameter_bytes + device_slack_bytes,
+              "device bytes " + std::to_string( stats.device_capacity_bytes) + " are not the " +
+                  std::to_string(device_placements) + " device placements' " +
+                  std::to_string(device_parameter_bytes) + " bytes plus " +
+                  std::to_string(device_slack_bytes) + " bytes of alignment slack");
         check(stats.mapped_file_bytes == 0, "no parameter should be file-mapped");
         check(stats.pinned_host_bytes != 0, "the routed banks should be pinned");
         // The plan counts a resident bank's planes; the materializer counts its weight-divisor
@@ -445,8 +513,17 @@ int main() {
                   << " B, chat_template.jinja " << resources.chat_template_jinja.size() << " B\n";
         std::cout << "nemotron_h load: " << parameter_count << " parameters, "
                   << stats.pinned_host_bytes << " pinned bytes, " << stats.device_capacity_bytes
-                  << " device bytes, plan " << plan_seconds << " s, materialize " << load_seconds
+                  << " device bytes (" << device_parameter_bytes << " B of parameters over "
+                  << device_placements << " placements, " << device_slack_bytes
+                  << " B of alignment slack), plan " << plan_seconds << " s, materialize " << load_seconds
                   << " s\n";
+        std::cout << "nemotron_h load: " << resident_banks << " of " << residency.resident.size()
+                  << " banks device-resident: " << resident_parent_bytes << " B of the "
+                  << bank_bytes << " B pool, " << resident_experts << " experts of "
+                  << residency.pool_experts << " (plan " << residency.resident_bytes
+                  << " B), budget " << residency.budget_bytes << " B, staging "
+                  << residency.staging_bytes << " B, free VRAM at load " << free_vram << " of "
+                  << total_vram << " B\n";
     } catch (const std::exception& error) {
         std::cerr << "nemotron_h load: " << error.what() << '\n';
         return 1;

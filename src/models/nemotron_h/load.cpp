@@ -347,12 +347,13 @@ std::size_t expert_residency_budget(const artifact::Reader& reader,
     const std::uint64_t payload = reader.file_bytes();
     const std::uint64_t dense   = payload > bank_bytes ? payload - bank_bytes : 0;
     const std::uint64_t needed  = dense + request.reserve_bytes;
-    if (needed >= free_bytes) {
-        throw ArtifactError(
-            "the dense weights and the state/KV reservation need " + std::to_string(needed) +
-            " bytes of device memory but only " + std::to_string(free_bytes) +
-            " are free; lower --max-ctx or --max-concurrency");
-    }
+    // Nothing to plan when the card cannot cover the dense weights and the reservation beside them:
+    // zero is the honest answer, and *this* is not the place to refuse the load -- the residency
+    // planner's subject is the experts, and the side that measured the state, the workspace and the
+    // runtime's own reservation is the instance, whose own check names those numbers. Refusing here
+    // would also make a request for no device expert bytes -- which asks for nothing at all -- fail
+    // for a reason that is not its own.
+    if (needed >= free_bytes) { return 0; }
     return static_cast<std::size_t>(free_bytes - needed);
 }
 
