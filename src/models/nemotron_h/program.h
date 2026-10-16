@@ -33,14 +33,20 @@
 //    page rounding. The capacity a lane is sized for is one request window,
 //    `EngineOptions::max_context`, as the sibling families' instances also resolve it.
 //
-// Execution: the landed forward is a *zero-state prefill* -- a Mamba mixer starts from a zero state
-// and the pass keeps no state between calls (forward.h) -- so the tokens a lane consumes are not
-// reflected in the state this Program owns. Every entry point that would compute therefore refuses
-// (`kMissingStatePersistence`) instead of returning: a prefill or decode driven through the landed
-// forward would produce the output of a zero-state model and quietly discard every token's
-// contribution, which is a wrong model rather than a missing feature. The state the composition
-// would have to write into is here, and the lane lifecycle (create, finish, abort) and the capacity
-// reporting do work, because they touch only state this Program owns.
+// Execution: a pass is one sequence's tokens over the composition, and its state is this Program's.
+// `prefill` consumes a prompt and leaves the lane advanced, `decode` consumes one token per lane,
+// and `sample` draws the next token from the logits the lane's last pass left -- so a lane's
+// generation is a decode pass per token, each advancing the same state the prefill wrote. The
+// composition itself is `models/nemotron_h/forward.h`: a state-driven pass appends every attention
+// block's K/V before its query runs and leaves every Mamba block's convolution history and FP32
+// recurrent plane advanced in place.
+//
+// The state lives in three places and this Program owns the binding between them: the Mamba pool's
+// slot (one lane per slot), `AttentionState`'s per-layer planes, and the lane cursor
+// (`Lane::position`, the tokens the lane has consumed, which is the absolute position of its next
+// token). A pass is handed the three through `PassState`, and `forward_model` refuses a pass whose
+// stated first position disagrees with the attention state's own frontier, so a cursor that drifts
+// is an error rather than attention at a position no token occupied.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -48,6 +54,7 @@
 #include "models/nemotron_h/attention_state.h"
 #include "models/nemotron_h/config.h"
 #include "models/nemotron_h/forward.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/types.h" // EngineOptions
 
 #include <cstddef>
@@ -69,19 +76,6 @@ inline constexpr std::int32_t kMambaScanStateExtent = 128;
 // `EngineOptions::prefill_chunk`). Nothing here allocates it: it sizes the reported workspace.
 inline constexpr std::uint32_t kDefaultPrefillChunk = 4096;
 
-// What the state this Program owns cannot do yet, and the reason every computing entry point names
-// it. Public so a caller (the runtime, a test) identifies the gap without matching free-form text.
-inline constexpr std::string_view kMissingStatePersistence =
-    "the landed forward is the zero-state prefill of models/nemotron_h/forward.h: a Mamba mixer "
-    "starts from a zero state and writes nothing back, and no attention K/V is written, so driving "
-    "a "
-    "lane through it would compute a wrong model rather than refuse a missing feature. The state "
-    "itself is here -- the Mamba pool's slot and AttentionState, whose append/attend route runs "
-    "the "
-    "attention over a lane's own K/V -- and what is missing is the composition wiring it into "
-    "forward.{h,cpp}: each Mamba layer's convolution history and fp32 recurrent plane saved into "
-    "the lane's slot, and each attention layer's K/V appended before its query";
-
 // The device bytes this Program's state costs, by class. The three class values are the planner's
 // own region bytes -- the cost of the geometry, with no inter-region or inter-allocation padding --
 // while `state_allocation_bytes` is what the two allocations actually hold.
@@ -90,10 +84,15 @@ struct StateMemorySummary {
     std::size_t mamba_conv_bytes      = 0;
     std::size_t attention_kv_bytes    = 0;
     // The forward's transient arena for one pass of `kDefaultPrefillChunk` tokens (or the
-    // configured chunk), from `model_workspace_bytes`. Not allocated here: the pass's caller owns
-    // the arena (forward.h takes one). It is reported because a caller admitting a request has to
-    // hold it beside the state.
+    // configured chunk), from `model_workspace_bytes`. It is allocated here now, because this
+    // Program drives the passes: it is the arena every `prefill`/`decode` call runs against.
     std::size_t workspace_bytes = 0;
+    // One pass's operands and output this Program owns: the `[chunk]` token ids it uploads and the
+    // `[vocabulary, lanes]` logits the head writes, one column per lane.
+    std::size_t pass_bytes = 0;
+    // The sampler's own storage: one device `ops::SamplingConfig` per lane, its `[vocabulary]`
+    // occurrence counts, the drawn/position vectors and the Op's workspace.
+    std::size_t sampling_bytes = 0;
     // The device allocations the three state classes live in: the Mamba pool's backing and the
     // attention state's, each rounded up to its own alignment.
     std::size_t state_allocation_bytes = 0;
@@ -102,9 +101,10 @@ struct StateMemorySummary {
         return mamba_recurrent_bytes + mamba_conv_bytes + attention_kv_bytes;
     }
 
-    // What the Engine must have free for the state and one pass's workspace together.
+    // What the Engine must have free for the state, one pass's transient storage and the sampler
+    // together.
     [[nodiscard]] std::size_t device_bytes() const noexcept {
-        return state_allocation_bytes + workspace_bytes;
+        return state_allocation_bytes + workspace_bytes + pass_bytes + sampling_bytes;
     }
 };
 
@@ -181,14 +181,21 @@ public:
         return attention_ ? &*attention_ : nullptr;
     }
 
-    // ---- Request lifecycle. These touch only state this Program owns. ----
+    // ---- Request lifecycle. ----
 
     // Occupies `lane` for one request and empties its state on `execution.stream`: the Mamba
-    // frontier is zeroed (the zero state the landed prefill forward starts from) and the lane's
+    // frontier is zeroed (the zero state a sequence's first pass starts from) and the lane's
     // attention positions become unwritten, so a lane reissued to a new sequence never inherits the
-    // previous one's convolution history, recurrent plane or K/V. Refuses a lane that already holds
-    // a request.
+    // previous one's convolution history, recurrent plane or K/V. The lane's cursor returns to
+    // zero. Refuses a lane that already holds a request.
     void create(std::int32_t lane, DeviceExecutionView execution);
+
+    // Installs the sampler a lane draws with, and clears the occurrence counts its penalties read.
+    // `create` does this implicitly with a greedy sampler; a request that samples installs its own
+    // here, before its first pass. The `token_counts` the caller's struct names are replaced by the
+    // lane's own count array, so two lanes' counts can never alias.
+    void configure(std::int32_t lane, const ops::SamplingConfig& sampling,
+                   DeviceExecutionView execution);
 
     // The request completed: the lane is free for the next one.
     void finish(std::int32_t lane);
@@ -197,29 +204,41 @@ public:
     // because nothing of a request survives outside its lane state.
     void abort(std::int32_t lane);
 
-    // ---- Execution. Every one of these refuses: see kMissingStatePersistence. ----
+    // ---- Execution. ----
 
-    // Consumes the tokens of a prefill pass and leaves the lane advanced.
+    // Consumes the tokens of a prefill pass and leaves the lane advanced: every block's state is
+    // written, the lane's cursor moves past the tokens, and the logits of the last token are left
+    // for `sample`. The tokens are run in passes of at most the configured prefill chunk, so a
+    // prompt wider than one pass is the same computation in more calls. Synchronizes.
     void prefill(std::int32_t lane, std::span<const std::int32_t> ids,
                  DeviceExecutionView execution);
 
-    // Consumes one token for each of `lanes` (distinct, one id each) in one pass.
+    // Consumes one token for each of `lanes` (distinct, one id each) in one pass, leaving each
+    // lane's logits for `sample`. Synchronizes.
     void decode(std::span<const std::int32_t> lanes, std::span<const std::int32_t> ids,
                 DeviceExecutionView execution);
     void decode(std::int32_t lane, std::int32_t id, DeviceExecutionView execution);
 
-    // Keeps the first `kept` tokens of the lane's uncommitted round, exactly as the sibling
-    // family's commit_round does for speculation.
-    void commit(std::int32_t lane, std::int32_t kept, DeviceExecutionView execution);
+    // Draws the token after the one each of `lanes` consumed last, from the logits its last pass
+    // left, with the lane's sampler: the counter-based RNG is keyed by the lane's position, so a
+    // draw is reproducible from the sequence and the seed alone. Synchronizes.
+    [[nodiscard]] std::vector<std::int32_t> sample(std::span<const std::int32_t> lanes,
+                                                   DeviceExecutionView execution);
+    [[nodiscard]] std::int32_t sample(std::int32_t lane, DeviceExecutionView execution);
 
-    // Drops the lane's uncommitted round.
-    void discard(std::int32_t lane);
+    // Tokens the lane has consumed, which is also the absolute position its next token occupies.
+    [[nodiscard]] std::int32_t position(std::int32_t lane) const;
+
+    // The BF16 [vocabulary, 1] logits the lane's last pass left, which `sample` draws from.
+    [[nodiscard]] Tensor logits(std::int32_t lane) const;
 
 private:
-    // One lane's mutable bookkeeping: whether a request holds it. The frontier lives in the state
-    // pool and in AttentionState, not here.
+    // One lane's mutable bookkeeping: whether a request holds it, where its logits column is, and
+    // the tokens it has consumed. The frontier itself lives in the state pool and in
+    // AttentionState, not here.
     struct Lane {
-        bool in_use = false;
+        bool in_use           = false;
+        std::int32_t position = 0;
     };
 
     [[nodiscard]] Lane& lane_at(std::int32_t lane);
@@ -233,6 +252,26 @@ private:
     // Frees the lane for the next request, or refuses when it was never in use.
     void release_lane(std::int32_t lane);
 
+    // The lane's state, as the pass that consumes tokens from the lane's own cursor takes it: one
+    // entry per block, the Mamba pool's slot for each Mamba layer and `AttentionState`'s binding
+    // for each attention layer. The vector is the caller's scratch, reused so a pass binds no
+    // storage.
+    void bind_state(std::int32_t lane, std::vector<BlockState>& blocks);
+
+    // The Op's key-split workspace a stateful attention call may use, sized for a one-token step.
+    // A wider pass that would prefer a larger one takes the Op's one-pass route instead, which
+    // computes the same result; empty when the Op reports it needs none.
+    [[nodiscard]] Tensor attention_workspace() const { return attention_workspace_; }
+
+    // The lane's logits column: the head's `[vocabulary, 1]` output for the token the lane's last
+    // pass consumed. One column per lane, so a batched round leaves every row's draw available.
+    [[nodiscard]] Tensor logits_column(std::int32_t lane) const;
+
+    // Runs `tokens` tokens of `lane` as one pass from the lane's current cursor, uploading `ids`.
+    // Leaves the logits of the pass's last token in the lane's column.
+    void run_pass(std::int32_t lane, const std::int32_t* ids, std::int32_t tokens,
+                  DeviceExecutionView execution);
+
     // The Mamba pool's backing, then the pools that bind into it. `mamba_backing_` is declared
     // first so it outlives every non-owning pool bound to its storage.
     DeviceBuffer mamba_backing_;
@@ -242,14 +281,39 @@ private:
     // planned rather than re-derive it.
     LinearAttentionStatePoolLayout mamba_layout_{};
     std::vector<Lane> lanes_state_;
+    // The pass's block bindings, reused so a pass allocates none: the vector is written by
+    // `bind_state` and read through `PassState`, and the passes of one Program are sequential.
+    std::vector<BlockState> pass_blocks_;
     // The staged expert banks and their split, when the cache policy affords them. Declared after
     // the state so a partially built Program destroys the pool before the state it was staged into.
     std::optional<RoutedExpertPool> experts_;
+
+    // The pass's own storage. `arena_` is the transient workspace every pass runs against and
+    // `ids_`/`logits_` are what a pass reads and writes: a lane's logits are its own column, so one
+    // batched decode leaves every row's draw available to `sample`.
+    DeviceArena arena_;
+    DeviceBuffer ids_backing_;
+    DeviceBuffer logits_backing_;
+    DeviceBuffer attention_workspace_backing_;
+    Tensor ids_;
+    Tensor logits_;
+    Tensor attention_workspace_;
+    // The sampler: one device `ops::SamplingConfig` per lane (with the lane's own occurrence
+    // counts beside it), a drawn-token and a position vector for one call, and the Op's workspace.
+    DeviceBuffer sampling_backing_;
+    DeviceBuffer counts_backing_;
+    DeviceBuffer drawn_backing_;
+    DeviceBuffer positions_backing_;
+    DeviceArena sampling_workspace_;
+    std::vector<std::int32_t> sampled_host_;
     const Model* model_                 = nullptr;
     std::size_t workspace_bytes_        = 0;
+    std::size_t pass_bytes_             = 0;
+    std::size_t sampling_bytes_         = 0;
     std::size_t state_allocation_bytes_ = 0;
     std::int32_t capacity_              = 0;
     std::int32_t lanes_                 = 0;
+    std::int32_t chunk_                 = 0;
 };
 
 } // namespace ninfer::models::nemotron_h

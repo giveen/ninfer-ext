@@ -9,7 +9,9 @@
 // Program planned. The classes are also checked to be linear in the lane count, which is the
 // property admission depends on: a lane costs the same whether it is the first or the eighth. The
 // config used for it is deliberately unlike the checkpoint's in every extent, so a number that came
-// from a constant rather than from the config cannot pass.
+// from a constant rather than from the config cannot pass. The same block checks the storage that
+// is not state: one pass's ids and logits column, the attention route's own workspace and the
+// sampler, all of which `StateMemorySummary` reports and `device_bytes` folds in beside the state.
 //
 // The second is the state's own identity: the recurrent plane's key extent is the one
 // `ops::mamba2_scan` pins (128), not the config's narrower `state_size`, because a narrower state
@@ -17,21 +19,33 @@
 // lane's frontier is the *zero* state after `create`, which is what the landed prefill forward
 // starts from. Both are asserted against the state on the device, not against a comment.
 //
-// The third is that every entry point that would compute refuses with the declared message. The
-// landed forward is a zero-state prefill: it keeps no state between calls, so driving a lane
-// through it would compute a wrong model rather than lose a feature. That has to be a refusal
-// naming the missing piece, never a successful return -- and an argument the caller can fix has to
-// be refused as the argument error it is, before the missing piece.
+// The third is a lane's life, and what the Program refuses is the other half of it. The passes
+// compute: `prefill` consumes a prompt and leaves the lane advanced with the last token's logits,
+// `decode` consumes one token per lane, and `sample` draws from the logits the lane's last pass
+// left, each keyed by the lane's own cursor, so the state this Program owns is advanced by real
+// passes rather than by the caller. The lifecycle around them is real too -- create, configure,
+// finish, abort, and a lane reissued to a new sequence starting at the first position again. What
+// is left to refuse is the caller's own mistakes: an empty pass, a decode set whose lengths differ
+// or that names one lane twice, a lane beyond the Program or one that holds no request, a token
+// outside the model's vocabulary, a pass that would take the lane past its window. Each of those is
+// refused as the argument error it is, and refused before a pass runs, so a refused call has moved
+// nothing the state holds.
 //
 // The Program is driven by a hand-bound `Model` -- the config's own shape with no weights, since
-// nothing in the state's construction reads a parameter -- so this needs no artifact. The one case
-// that needs the real checkpoint's config reads it from the artifact's cold directory without
-// materializing its 45 GB, and prints a skip when NINFER_NEMOTRON_ARTIFACT is unset.
+// nothing in the state's construction reads a parameter -- so this needs no artifact. Every pass
+// this file makes is a refused one: a pass that ran would read weights the hand-bound model does
+// not have, and neither the arithmetic, the state's identity nor the lifecycle needs a token to
+// move. The one case that needs the real checkpoint's config reads it from the artifact's cold
+// directory without materializing its 45 GB, and prints a skip when NINFER_NEMOTRON_ARTIFACT is
+// unset.
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "models/nemotron_h/attention_state.h"
 #include "models/nemotron_h/config.h"
 #include "models/nemotron_h/forward.h"
 #include "models/nemotron_h/program.h"
+#include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/sliding_causal_attention.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -143,6 +157,13 @@ EngineOptions options_for(const Shape& shape) {
     options.prefill_chunk   = shape.chunk;
     options.kv_cache        = KvCacheStorage::BFloat16;
     options.kv_capacity     = KvCapacityPolicy::explicit_capacity(shape.capacity);
+    // No staged expert pool. `Program::device_bytes` accounts it beside the state -- it is what the
+    // constructor would hold and what a cache request must not eat into -- while `memory_summary()`
+    // reports the deterministic half of a Program instead: the state, one pass's storage and the
+    // sampler. Asking for an explicit zero makes the two reports the same number, which is what
+    // this file asserts, and keeps a checkpoint-shaped case from allocating a stage it only
+    // measures. A zero here is the in-place host route, not an unsupported one.
+    options.expert_cache = ExpertCachePolicy::explicit_cache(0);
     return options;
 }
 
@@ -184,10 +205,15 @@ ExpectedState expected_state(const nemotron::TextConfig& config, const Shape& sh
         const nemotron::AttentionConfig& attention = *config.attention;
         // The attention state is the config's own geometry with no padding and no page rounding:
         // contiguous BF16 [head_dim, kv_heads, capacity, 1] keys and the same for values, per
-        // attention layer per lane, plus one I32 position row of `capacity` per lane.
-        const std::uint64_t plane_bytes = std::uint64_t(attention.head_dim) *
-                                          attention.num_key_value_heads * shape.capacity *
-                                          sizeof(std::uint16_t);
+        // attention layer per lane, plus one I32 position row of `capacity` per lane. The plane's
+        // head axis is the width the Op is handed, `carried_attention_head`, which is the config's
+        // own `head_dim` when the Op admits it and the narrowest width it does admit that holds the
+        // head otherwise -- the state carries a narrow head in the head's start and zeros, and this
+        // config's 16-wide head is carried in a 32-wide plane.
+        const std::uint64_t plane_head =
+            static_cast<std::uint64_t>(nemotron::carried_attention_head(attention));
+        const std::uint64_t plane_bytes =
+            plane_head * attention.num_key_value_heads * shape.capacity * sizeof(std::uint16_t);
         expected.keys   = static_cast<std::size_t>(attention_layers * slots * plane_bytes);
         expected.values = static_cast<std::size_t>(attention_layers * slots * plane_bytes);
         expected.positions =
@@ -196,11 +222,55 @@ ExpectedState expected_state(const nemotron::TextConfig& config, const Shape& sh
     return expected;
 }
 
+// The head geometry the attention route is handed for this config: the carried width with the
+// config's own head counts. `AttentionState` plans its planes at the same width and reports the
+// same geometry for the Op, so the route this test sizes is the route a pass takes.
+ops::AttentionHeadGeometry route_geometry(const nemotron::AttentionConfig& attention) {
+    return ops::AttentionHeadGeometry{nemotron::carried_attention_head(attention),
+                                      static_cast<std::int32_t>(attention.num_attention_heads),
+                                      static_cast<std::int32_t>(attention.num_key_value_heads)};
+}
+
+// One pass's own operands and output, as the Program plans them: the `[chunk]` ids it uploads, the
+// `[vocabulary, lanes]` logits the head leaves (one column per lane) and, when the config has an
+// attention block, the Op's own key-split workspace for a one-token step -- the step whose visible
+// span is what makes the split worth taking. A wider pass's own shape gives the Op one split
+// anyway, so the one-token figure is the Op's own report for a pass this Program drives. The term
+// is gated on the *blocks*, not on the shape: a config may carry an attention shape and no
+// attention block, and then the pass has no route to size a workspace for.
+std::size_t expected_pass_bytes(const nemotron::TextConfig& config, const Shape& shape) {
+    const std::uint64_t chunk      = shape.chunk.value_or(nemotron::kDefaultPrefillChunk);
+    const std::uint64_t logits     = std::uint64_t(config.vocab_size) * shape.lanes;
+    std::uint64_t bytes            = chunk * sizeof(std::int32_t) + logits * sizeof(std::uint16_t);
+    std::uint32_t attention_layers = 0;
+    for (const nemotron::BlockKind kind : config.block_kinds) {
+        if (kind == nemotron::BlockKind::Attention) { ++attention_layers; }
+    }
+    if (attention_layers != 0) {
+        bytes += ops::sliding_causal_attention_workspace_bytes(
+            route_geometry(*config.attention), 1, static_cast<std::int32_t>(shape.capacity), 1);
+    }
+    return static_cast<std::size_t>(bytes);
+}
+
+// The sampler's own arrays, which are exact: one device `ops::SamplingConfig` per lane, the lane's
+// own `[vocabulary]` occurrence counts and one round's drawn tokens and logical positions. The Op's
+// own workspace is planned for every lane count in [1, lanes], so it is checked as a remainder
+// rather than stated here.
+std::size_t sampling_array_bytes(const nemotron::TextConfig& config, const Shape& shape) {
+    const std::uint64_t vocabulary = config.vocab_size;
+    const std::uint64_t lanes      = shape.lanes;
+    return static_cast<std::size_t>(lanes * sizeof(ops::SamplingConfig) +
+                                    lanes * vocabulary * sizeof(std::int32_t) +
+                                    2 * lanes * sizeof(std::int32_t));
+}
+
 void report(const std::string& label, const nemotron::StateMemorySummary& summary) {
     std::cout << label << ": mamba recurrent " << summary.mamba_recurrent_bytes << " B, mamba conv "
               << summary.mamba_conv_bytes << " B, attention KV " << summary.attention_kv_bytes
               << " B, state allocation " << summary.state_allocation_bytes << " B, workspace "
-              << summary.workspace_bytes << " B, device total " << summary.device_bytes() << " B\n";
+              << summary.workspace_bytes << " B, one pass " << summary.pass_bytes << " B, sampler "
+              << summary.sampling_bytes << " B, device total " << summary.device_bytes() << " B\n";
 }
 
 // The Program's own numbers against the config's arithmetic, and the classes against a lane count
@@ -240,6 +310,16 @@ void state_arithmetic(const nemotron::TextConfig& config, DeviceContext& context
         check(summary.state_allocation_bytes - summary.state_bytes() <= 256 * regions,
               "the allocation's alignment padding is bounded by one alignment per region");
 
+        // One pass's own storage, which is the ids a pass uploads plus the head's column per lane
+        // plus the attention route's own workspace -- this config has attention, so a planner that
+        // left it out would be short by exactly that. The sampler's arrays are exact and its
+        // workspace rides on top of them.
+        check_bytes(summary.pass_bytes, expected_pass_bytes(config, one),
+                    "one lane: one pass's operands and output");
+        check(summary.sampling_bytes > 0, "one lane: the sampler owns storage");
+        check(summary.sampling_bytes >= sampling_array_bytes(config, one),
+              "one lane: the sampler's own config, counts and round vectors");
+
         check(program.lanes() == 1 && program.admission_capacity() == 1,
               "one lane is one admission");
         check_bytes(static_cast<std::size_t>(program.capacity()), one.capacity,
@@ -272,8 +352,16 @@ void state_arithmetic(const nemotron::TextConfig& config, DeviceContext& context
                     "three lanes: the convolution history");
         check_bytes(summary.attention_kv_bytes, three_expected.kv(),
                     "three lanes: the attention K/V");
+        // The pass's own storage follows the lanes in its logits column and in the sampler's
+        // arrays, and both are planned from the same lane count the state is.
+        check_bytes(summary.pass_bytes, expected_pass_bytes(config, three),
+                    "three lanes: one pass's operands and output");
+        check(summary.sampling_bytes >= sampling_array_bytes(config, three),
+              "three lanes: the sampler's arrays follow the lane count");
     }
-    // A wider prefill chunk widens only the reported workspace.
+    // A wider prefill chunk widens the pass's own ids and the arena it runs against, and nothing
+    // else: the state's classes, the logits column and the sampler are sized by the window and the
+    // lanes rather than by the chunk.
     {
         Shape wide;
         wide.chunk = 512;
@@ -284,6 +372,8 @@ void state_arithmetic(const nemotron::TextConfig& config, DeviceContext& context
         check_bytes(nemotron::Program::device_bytes(config, options), summary.device_bytes(),
                     "a wider chunk's device total");
         check(summary.workspace_bytes > 0, "a configured chunk reports a workspace");
+        check_bytes(summary.pass_bytes, expected_pass_bytes(config, wide),
+                    "a wider chunk's pass storage, whose ids are the chunk itself");
         check_bytes(summary.state_bytes(),
                     summary.mamba_recurrent_bytes + summary.mamba_conv_bytes +
                         summary.attention_kv_bytes,
@@ -441,8 +531,8 @@ void absent_state_classes(const nemotron::TextConfig& config, DeviceContext& con
     }
 }
 
-// Every geometry the state cannot hold exactly, and every entry point that would compute, refuses
-// by name.
+// Every geometry the state cannot hold exactly, every argument a caller can get wrong and every
+// lane the Program was not asked for, refused by name.
 void refusals(const nemotron::TextConfig& config, DeviceExecutionView execution,
               DeviceContext& context) {
     {
@@ -488,46 +578,62 @@ void refusals(const nemotron::TextConfig& config, DeviceExecutionView execution,
             [&] { nemotron::Program(model, options_for(Shape{}), context); },
             "requires the attention shape");
     }
-    // The computing entry points. Each names itself and the missing piece in full, so a caller --
-    // or a log -- can tell which one was driven and what is absent.
+    // The arguments a caller can get wrong. Each is refused as the argument error it is, before a
+    // pass runs, so a refused call has moved nothing the lane holds -- which is the property that
+    // makes a refusal at a call site a diagnosis rather than a maybe. The words are the
+    // implementation's own: `expect_refusal` matches a substring.
     {
         nemotron::Model model(config, {});
         nemotron::Program program(model, options_for(Shape{}), context);
         program.create(0, execution);
         const std::vector<std::int32_t> ids{1, 2, 3};
-        const std::vector<std::int32_t> lanes{0};
         const std::vector<std::int32_t> one{7};
-        const std::string gap(nemotron::kMissingStatePersistence);
-        std::cout << "a computing entry point refuses with: nemotron_h Program: <entry> cannot "
-                     "run: "
-                  << gap << '\n';
-        expect_refusal(
-            "prefill", [&] { program.prefill(0, ids, execution); },
-            "nemotron_h Program: prefill cannot run: " + gap);
-        expect_refusal(
-            "decode by lane set", [&] { program.decode(lanes, one, execution); },
-            "nemotron_h Program: decode cannot run: " + gap);
-        expect_refusal(
-            "decode by lane", [&] { program.decode(0, 7, execution); },
-            "nemotron_h Program: decode cannot run: " + gap);
-        expect_refusal(
-            "commit", [&] { program.commit(0, 1, execution); },
-            "nemotron_h Program: commit cannot run: " + gap);
-        expect_refusal(
-            "discard", [&] { program.discard(0); },
-            "nemotron_h Program: discard cannot run: " + gap);
-        // An argument the caller can fix is refused as that argument error, before the missing
-        // piece: a driver that cannot be called is not evidence that the state is right.
         expect_refusal(
             "an empty prefill",
             [&] { program.prefill(0, std::span<const std::int32_t>(), execution); },
-            "at least one token");
+            "a prefill pass needs at least one token");
+        expect_refusal(
+            "an empty decode pass",
+            [&] {
+                program.decode(std::span<const std::int32_t>(), std::span<const std::int32_t>(),
+                               execution);
+            },
+            "a decode pass needs one id per lane");
         expect_refusal(
             "a decode set of mismatched length", [&] { program.decode(ids, one, execution); },
-            "one id per lane");
+            "a decode pass needs one id per lane");
         expect_refusal(
-            "a lane beyond the Program", [&] { program.decode(7, 1, execution); },
+            "a prefill on a lane beyond the Program", [&] { program.prefill(1, one, execution); },
             "is not one of this Program's 1 lanes");
+        expect_refusal(
+            "a decode on a lane beyond the Program", [&] { program.decode(7, 1, execution); },
+            "is not one of this Program's 1 lanes");
+        // The vocabulary is the model's, and a token below zero is as far outside it as one past
+        // the last id.
+        expect_refusal(
+            "a prefill token below the vocabulary",
+            [&] { program.prefill(0, std::vector<std::int32_t>{5, -1}, execution); },
+            "is outside the model's vocabulary of 256");
+        expect_refusal(
+            "a decode token past the vocabulary", [&] { program.decode(0, 256, execution); },
+            "is outside the model's vocabulary of 256");
+        // One lane per decode pass: two rows for one lane would write the lane's state twice from
+        // one sequence's position.
+        expect_refusal(
+            "a decode pass naming one lane twice",
+            [&] {
+                program.decode(std::vector<std::int32_t>{0, 0}, std::vector<std::int32_t>{1, 2},
+                               execution);
+            },
+            "a decode pass names each lane once");
+        // A pass that would take the lane past its window. The cursor is at zero and no pass here
+        // can advance it, so the pass that passes the window is one wider than the window itself.
+        expect_refusal(
+            "a prefill wider than the lane's window",
+            [&] {
+                program.prefill(0, std::vector<std::int32_t>(program.capacity() + 1, 1), execution);
+            },
+            "and the pass would take it past that");
     }
     // A lane that holds no request cannot be driven: the state it would read is not a sequence's.
     {
@@ -536,26 +642,43 @@ void refusals(const nemotron::TextConfig& config, DeviceExecutionView execution,
         expect_refusal(
             "a prefill on a lane with no request",
             [&] { program.prefill(0, std::vector<std::int32_t>{1}, execution); },
-            "holds no request");
+            "holds no request, so there is no sequence to drive");
+        expect_refusal(
+            "a decode on a lane with no request", [&] { program.decode(0, 1, execution); },
+            "holds no request, so there is no sequence to drive");
+        expect_refusal(
+            "a sampler installed on a lane with no request",
+            [&] { program.configure(0, ops::SamplingConfig{}, execution); },
+            "holds no request, so there is no sequence to drive");
     }
-    // The lane lifecycle: one request per lane, and a lane that holds none cannot be finished.
+    // The lane lifecycle: one request per lane, a lane that holds none cannot be finished, and a
+    // lane reissued to a new sequence starts at the sequence's first position rather than where the
+    // last one stopped.
     {
         nemotron::Model model(config, {});
         nemotron::Program program(model, options_for(Shape{}), context);
         expect_refusal(
             "finishing a lane that holds no request", [&] { program.finish(0); },
-            "holds no request");
+            "holds no request, so there is nothing to release");
         expect_refusal(
-            "aborting a lane that holds no request", [&] { program.abort(0); }, "holds no request");
+            "aborting a lane that holds no request", [&] { program.abort(0); },
+            "holds no request, so there is nothing to release");
         program.create(0, execution);
+        check(program.position(0) == 0, "a created lane starts at the first position");
         expect_refusal(
             "creating a second request on one lane", [&] { program.create(0, execution); },
             "already holds a request");
         program.finish(0);
         expect_refusal(
-            "finishing the same request twice", [&] { program.finish(0); }, "holds no request");
+            "finishing the same request twice", [&] { program.finish(0); },
+            "holds no request, so there is nothing to release");
         program.create(0, execution);
+        check(program.position(0) == 0,
+              "a lane reissued after finish starts at the first position again");
         program.abort(0);
+        program.create(0, execution);
+        check(program.position(0) == 0,
+              "a lane reissued after abort starts at the first position again");
         expect_refusal(
             "a negative lane", [&] { program.create(-1, execution); },
             "is not one of this Program's 1 lanes");
@@ -666,14 +789,19 @@ void checkpoint_numbers(DeviceContext& context, const nemotron::TextConfig& conf
 
     // The full context costs 2 GiB of K/V planes for one lane, which is the plan's figure and is
     // checked through the pure planner rather than by allocating it: the state is the one-lane cost
-    // at a 262144-token window, and the workspace is the same for any window of the same chunk.
+    // at a 262144-token window, and the arena and the pass's ids are the same for any window of the
+    // same chunk. The pass's logits column and the sampler are sized by the lanes and the
+    // vocabulary, so the admitted Program's sampler figure is this one's as well, while the
+    // attention route's own workspace inside the pass is the one term the wider window changes and
+    // is therefore planned at `full` rather than read from the admitted state.
     Shape full;
     full.capacity                     = 262144;
     full.chunk                        = admitted.chunk;
     const ExpectedState full_expected = expected_state(config, full);
     check_bytes(nemotron::Program::device_bytes(config, options_for(full)),
                 full_expected.conv + full_expected.recurrent + full_expected.kv() +
-                    summary.workspace_bytes,
+                    summary.workspace_bytes + expected_pass_bytes(config, full) +
+                    summary.sampling_bytes,
                 source + ": the full-context footprint");
     check_bytes(full_expected.keys + full_expected.values, (1ULL << 31),
                 source + ": 2 GiB of attention K/V at the full 262144-token context");

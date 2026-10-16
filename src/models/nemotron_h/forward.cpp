@@ -39,13 +39,15 @@ namespace {
 // scale argument that a shorter state would need compensating for.
 constexpr std::int32_t kScanKeyExtent = 128;
 
-// The head widths `ops::sliding_causal_attention` admits -- 32, 64, 128 and this. The real
-// checkpoint's own 128 is one of them; a config whose head is narrower is carried at the narrowest
-// width that is, and a head wider than this has no route.
-constexpr std::int32_t kWideHeadExtent = 256;
+// The head widths `ops::sliding_causal_attention` admits -- and therefore the widths a config's
+// head is stored at, since the state keeps the rows at the carried width -- live with the state
+// that stores them (`carried_attention_head`).
 
-// The widest visible span `ops::sliding_causal_attention` admits. A prefill wider than this would
-// silently attend causally over only its last 4096 tokens, so it is refused instead.
+// The widest visible span a *zero-state* pass may have. Such a pass hands the Op its own tokens as
+// the only key set, and the Op's finite window is 4096 wide, so a wider one would silently attend
+// causally over only its last 4096 tokens: it is refused instead. A state-driven pass has no such
+// bound -- it attends with the Op's unbounded causal route (`kUnboundedWindow`, `window == 0`),
+// which is the route this model's own context needs.
 constexpr std::int32_t kAttentionWindowMaximum = 4096;
 
 [[nodiscard]] std::string extent_text(std::int32_t first, std::int32_t second) {
@@ -108,6 +110,35 @@ void require_matrix(const BoundWeight& parameter, std::int32_t rows, std::int32_
                                     "' is not bound as a " + extent_text(rows, columns) +
                                     " BF16 matrix");
     }
+}
+
+// A state plane, against the extents the Op that consumes it declares. A state bound at another
+// shape is a wrong model rather than a tolerance question -- the kernel would read it out of range
+// -- so it is refused by name, before any token is consumed. State storage is the caller's and has
+// no default: an unbound plane is an error, not a zero state.
+void require_state_tensor(const Tensor& tensor, DType dtype,
+                          std::initializer_list<std::int32_t> shape, const char* role,
+                          std::size_t layer) {
+    std::int32_t want[4] = {1, 1, 1, 1};
+    std::size_t axis     = 0;
+    for (const std::int32_t extent : shape) { want[axis++] = extent; }
+    bool matches = tensor.data != nullptr && tensor.dtype == dtype && tensor.is_contiguous();
+    for (int index = 0; index < 4 && matches; ++index) {
+        matches = tensor.ne[index] == want[index];
+    }
+    if (matches) { return; }
+    std::string got = "unset";
+    if (tensor.data != nullptr) {
+        got = extent_text(tensor.ne[0], tensor.ne[1]);
+        if (tensor.ne[2] != 1 || tensor.ne[3] != 1) {
+            got += "x" + std::to_string(tensor.ne[2]) + "x" + std::to_string(tensor.ne[3]);
+        }
+        got += " " + std::string(dtype_text(tensor.dtype));
+        if (!tensor.is_contiguous()) { got += " and not contiguous"; }
+    }
+    throw std::invalid_argument("nemotron_h forward: block " + std::to_string(layer) + "'s " +
+                                std::string(role) + " is " + got + " where the Op consuming it " +
+                                "declares " + extent_text(want[0], want[1]));
 }
 
 // The expert bank's own width, checked before its shape because a bank bound at the block's hidden
@@ -174,30 +205,12 @@ void copy_grouped_rows(const Tensor& destination, const Tensor& source, std::int
     }
 }
 
-// The head widths `ops::sliding_causal_attention` admits. Nothing here rotates: this model has no
-// rotation to carry (see forward.h), so the only property the carried width has to preserve is the
-// Op's own domain, and its `scale` argument carries the config's own `1/sqrt(head_dim)`.
-[[nodiscard]] constexpr bool attention_head_supported(std::int32_t head) {
-    return head == 32 || head == 64 || head == 128 || head == kWideHeadExtent;
-}
-
-// The width this config's head is carried at: the head's own width when the Op admits it, and
-// otherwise the narrowest width the Op does admit, with the head's real dims contiguous inside it.
-[[nodiscard]] std::int32_t carried_head(const AttentionConfig& attention) {
-    const std::int32_t head = static_cast<std::int32_t>(attention.head_dim);
-    if (head <= 0) {
-        throw std::invalid_argument("nemotron_h forward: the config's attention head is " +
-                                    std::to_string(head) + " wide, which is not a head");
-    }
-    if (attention_head_supported(head)) { return head; }
-    if (head < 32) { return 32; }
-    if (head < 64) { return 64; }
-    if (head < 128) { return 128; }
-    if (head < kWideHeadExtent) { return kWideHeadExtent; }
-    throw std::invalid_argument(
-        "nemotron_h forward: no landed route for a " + std::to_string(head) +
-        "-wide attention head: ops::sliding_causal_attention admits 32, 64, 128 and 256");
-}
+// The head widths `ops::sliding_causal_attention` admits, and the width this config's head is
+// carried at, live with the state that stores the rows (`carried_attention_head`): the carry is a
+// property of the state rather than of one pass, so the composition asks the state module for it.
+// Nothing here rotates: this model has no rotation to carry (see forward.h), so the only property
+// the carried width has to preserve is the Op's own domain, and the Op's `scale` argument carries
+// the config's own `1/sqrt(head_dim)`.
 
 // ---------------------------------------------------------------------------------------------
 // Workspace. One planner, called with the real arena by the pass and with a dry-run layout builder
@@ -297,8 +310,8 @@ Scratch allocate_block(const TextConfig& config, const MoeBankConfig* bank, std:
         scratch.attention.value          = allocator.alloc(DType::BF16, {keys, tokens});
         scratch.attention.projected      = allocator.alloc(DType::BF16, {queries, tokens});
         scratch.attention.positions      = allocator.alloc(DType::I32, {tokens});
-        if (carried_head(attention) != head) {
-            const std::int32_t carried   = carried_head(attention);
+        if (carried_attention_head(attention) != head) {
+            const std::int32_t carried   = carried_attention_head(attention);
             const std::int32_t heads     = static_cast<std::int32_t>(attention.num_attention_heads);
             const std::int32_t key_heads = static_cast<std::int32_t>(attention.num_key_value_heads);
             scratch.attention.wide_query = allocator.alloc(DType::BF16, {carried * heads, tokens});
@@ -534,10 +547,13 @@ std::size_t model_workspace_bytes(const TextConfig& config, std::int32_t tokens)
 namespace {
 
 // The Mamba-2 mixer. `mixer_input` is the block norm's output and `mixer_out` receives the mixer's
-// output, which is `[hidden, tokens]` and is added to the residual by the caller.
+// output, which is `[hidden, tokens]` and is added to the residual by the caller. `state` is this
+// layer's state, or null for a zero-state pass; either way the two stateplanes `ops::` consume are
+// handed to the Ops' own single-state overloads, which read and write them in place, so a
+// state-driven pass leaves the frontier the next pass starts from.
 void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor& mixer_input,
                    Scratch& scratch, Tensor& mixer_out, DeviceExecutionView execution,
-                   const BlockObserver* observer, std::size_t layer) {
+                   BlockState* state, const BlockObserver* observer, std::size_t layer) {
     const TextConfig& config    = model.config();
     const MambaConfig& mamba    = config.mamba.value();
     const std::int32_t hidden   = static_cast<std::int32_t>(config.hidden_size);
@@ -584,11 +600,22 @@ void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor
     // 2. The depthwise convolution over x, B and C together, with its bias and its activation
     //    fused. The activation applies to B and C as well as to x because the reference splits them
     //    *after* the convolution, so the split above is the projection's, not the convolution's.
-    //    The history starts empty: a pass is a sequence's prompt.
-    zero_fill(scratch.mamba.conv_state, stream);
+    //    The history is the lane's own slot when a state is engaged, and an otherwise-unread
+    //    scratch buffer the Op starts from zero when it is not (a prefill's first pass): the Op
+    //    always reads the state it is handed, so the zero-state route must hand it zeros rather
+    //    than whatever the previous pass left in the block's scratch.
     const Tensor* bias = mamba.conv_bias ? &model.bound(weights.conv_bias).tensor : nullptr;
-    ops::causal_conv1d_silu(scratch.mamba.conv_in, model.bound(weights.conv).tensor, bias,
-                            scratch.mamba.conv_state, scratch.mamba.conv_out, stream);
+    if (state != nullptr) {
+        require_state_tensor(state->conv, DType::BF16,
+                             {channels, static_cast<std::int32_t>(mamba.conv_kernel) - 1},
+                             "the convolution history", layer);
+        ops::causal_conv1d_silu(scratch.mamba.conv_in, model.bound(weights.conv).tensor, bias,
+                                state->conv, scratch.mamba.conv_out, stream);
+    } else {
+        zero_fill(scratch.mamba.conv_state, stream);
+        ops::causal_conv1d_silu(scratch.mamba.conv_in, model.bound(weights.conv).tensor, bias,
+                                scratch.mamba.conv_state, scratch.mamba.conv_out, stream);
+    }
     observe(observer, layer, BlockStage::MambaConv, scratch.mamba.conv_out);
 
     // 3. The scan's operands: the convolution's rows regrouped, and B and C zero-extended along the
@@ -602,17 +629,29 @@ void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor
                       groups, static_cast<std::int32_t>(mamba.state_size), kScanKeyExtent, tokens,
                       stream);
 
-    // 4. The scan itself, from a zero state, adding `D*x` to its own readout. The operands are
-    //    views of the contiguous buffers above; the state and the output are the Op's own
-    //    [key, value, head] and [value, head, token] layouts.
+    // 4. The scan itself, from this layer's frontier (or from a zero state, which is what the scan
+    //    starts a sequence from), adding `D*x` to its own readout. The operands are views of the
+    //    contiguous buffers above; the state and the output are the Op's own [key, value, head] and
+    //    [value, head, token] layouts.
     Tensor scan_out = scratch.mamba.scan_out.view({values, heads, tokens});
-    zero_fill(scratch.mamba.scan_state, stream);
-    ops::mamba2_scan(scratch.mamba.scan_x.view({values, heads, tokens}),
-                     scratch.mamba.scan_b.view({kScanKeyExtent, groups, tokens}),
-                     scratch.mamba.scan_c.view({kScanKeyExtent, groups, tokens}), scratch.mamba.dt,
-                     model.tensor(weights.dt_bias), model.tensor(weights.a_log),
-                     model.tensor(weights.d_skip), mamba.time_step_min, scratch.mamba.scan_state,
-                     scan_out, stream);
+    if (state != nullptr) {
+        require_state_tensor(state->recurrent, DType::FP32, {kScanKeyExtent, values, heads},
+                             "the recurrent plane", layer);
+        ops::mamba2_scan(scratch.mamba.scan_x.view({values, heads, tokens}),
+                         scratch.mamba.scan_b.view({kScanKeyExtent, groups, tokens}),
+                         scratch.mamba.scan_c.view({kScanKeyExtent, groups, tokens}),
+                         scratch.mamba.dt, model.tensor(weights.dt_bias),
+                         model.tensor(weights.a_log), model.tensor(weights.d_skip),
+                         mamba.time_step_min, state->recurrent, scan_out, stream);
+    } else {
+        zero_fill(scratch.mamba.scan_state, stream);
+        ops::mamba2_scan(scratch.mamba.scan_x.view({values, heads, tokens}),
+                         scratch.mamba.scan_b.view({kScanKeyExtent, groups, tokens}),
+                         scratch.mamba.scan_c.view({kScanKeyExtent, groups, tokens}),
+                         scratch.mamba.dt, model.tensor(weights.dt_bias),
+                         model.tensor(weights.a_log), model.tensor(weights.d_skip),
+                         mamba.time_step_min, scratch.mamba.scan_state, scan_out, stream);
+    }
 
     // 5. The gated grouped norm, then the output projection. The gate is z and it is applied
     //    *before* the group reduction, which is what `ops::gated_group_rmsnorm` does and
@@ -741,11 +780,15 @@ void forward_moe(const Model& model, const MoeBankConfig& bank, const MoeWeights
     observe(observer, layer, BlockStage::MoeMixer, mixer_out);
 }
 
-// The GQA attention mixer.
+// The GQA attention mixer. `state` is this block's binding into the lane's attention state, or null
+// for a zero-state block. A state-driven block appends its own K/V to the state *before* its query
+// runs -- the reference's order, so a token's own key and value are in its own output -- and
+// attends over the lane's whole state with the Op's unbounded causal route; a zero-state block
+// attends over its own tokens only.
 void forward_attention(const Model& model, const AttentionWeights& weights,
                        const Tensor& mixer_input, Scratch& scratch, Tensor& mixer_out,
-                       DeviceExecutionView execution, const BlockObserver* observer,
-                       std::size_t layer) {
+                       DeviceExecutionView execution, BlockState* state,
+                       const BlockObserver* observer, std::size_t layer) {
     const TextConfig& config         = model.config();
     const AttentionConfig& attention = config.attention.value();
     const std::int32_t hidden        = static_cast<std::int32_t>(config.hidden_size);
@@ -762,13 +805,23 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
     require_matrix(model.bound(weights.value), keys, hidden);
     require_matrix(model.bound(weights.output), hidden, queries);
     // The route the head takes, resolved before any work: it decides the width of the operands the
-    // attention Op is handed.
-    const std::int32_t carried = carried_head(attention);
-    if (tokens > kAttentionWindowMaximum) {
+    // attention Op is handed, and it is the width the state stores its rows at, so a state bound at
+    // another width is refused rather than read out of range.
+    const std::int32_t carried = carried_attention_head(attention);
+    AttentionState* const kv   = state == nullptr ? nullptr : state->attention.state;
+    if (state != nullptr && state->attention.state != nullptr &&
+        state->attention.state->carried_head() != carried) {
         throw std::invalid_argument(
-            "nemotron_h forward: a pass of " + std::to_string(tokens) +
+            "nemotron_h forward: block " + std::to_string(layer) +
+            "'s attention state stores its rows at a different head width than this config's " +
+            "carry (" + std::to_string(state->attention.state->carried_head()) + " against " +
+            std::to_string(carried) + ")");
+    }
+    if (kv == nullptr && tokens > kAttentionWindowMaximum) {
+        throw std::invalid_argument(
+            "nemotron_h forward: a zero-state pass of " + std::to_string(tokens) +
             " tokens exceeds the landed attention Op's 4096-wide visible span, and this model has "
-            "no window of its own: a longer pass needs the engine's attention state");
+            "no window of its own: a longer pass needs the lane's attention state");
     }
 
     // 1. The three projections, whose outputs are the stages the reference exposes and are the
@@ -780,37 +833,14 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
     observe(observer, layer, BlockStage::AttentionKey, scratch.attention.key);
     observe(observer, layer, BlockStage::AttentionValue, scratch.attention.value);
 
-    // The positions are this pass's own: a prefill is the sequence's first `tokens` tokens. They
-    // are what bounds the Op causally -- with `window` at the pass's own token count, every key at
-    // or before a query is visible and no later one is, which is plain causal attention without a
-    // window of its own.
-    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t token = 0; token < tokens; ++token) { positions[token] = token; }
-    CUDA_CHECK(cudaMemcpyAsync(scratch.attention.positions.data, positions.data(),
-                               static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
-
-    // The width the landed attention Op is given, and this config's own scale. The Op takes the
-    // scale instead of deriving it from its operand's width, which is what lets a carried head be
-    // attended at another width without the scores changing.
-    const ops::AttentionHeadGeometry geometry{carried, heads, key_heads};
-    const float scale = 1.0F / std::sqrt(static_cast<float>(head));
-
-    if (carried == head) {
-        Tensor projected_view = scratch.attention.projected.view({head, heads, tokens, 1});
-        ops::sliding_causal_attention(
-            scratch.attention.query.view({head, heads, tokens, 1}),
-            scratch.attention.key.view({head, key_heads, tokens, 1}),
-            scratch.attention.value.view({head, key_heads, tokens, 1}), scratch.attention.positions,
-            Tensor{}, scratch.attention.positions, Tensor{}, Tensor{}, Tensor{}, geometry,
-            static_cast<std::uint32_t>(tokens), scale, projected_view, Tensor{}, execution);
-    } else {
-        // The carried head: the Op admits neither this config's own width nor a scale baked into
-        // its kernel. Each head's real dims stay contiguous at its carried head's start and the
-        // rest of the head is zero, which is exact -- a zero query or key dim adds nothing to a
-        // score and a zero value dim contributes `probability * 0` to every output -- so the
-        // config's own `scale`, which the Op takes as an argument, is the only thing the carry has
-        // to preserve.
+    // The operands the Op takes, at the width it admits. The Op can neither admit this config's own
+    // width nor bake a scale into its kernel, so for a carried head each head's real dims stay
+    // contiguous at its carried head's start and the rest of the head is zero. That is exact -- a
+    // zero query or key dim adds nothing to a score and a zero value dim contributes
+    // `probability * 0` to every output -- and the config's own `scale`, which the Op takes as an
+    // argument, is the only thing the carry has to preserve. The zeros are what the state's rows
+    // are appended from, so a stored row's pad dims are exactly zero for the life of the state.
+    if (carried != head) {
         zero_fill(scratch.attention.wide_query, stream);
         zero_fill(scratch.attention.wide_key, stream);
         zero_fill(scratch.attention.wide_value, stream);
@@ -824,15 +854,49 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
             copy_blocks(scratch.attention.wide_value, index * carried, carried * key_heads,
                         scratch.attention.value, index * head, keys, head, tokens, stream);
         }
-        Tensor wide_projected_view =
-            scratch.attention.wide_projected.view({carried, heads, tokens, 1});
+    }
+    const Tensor query_operand =
+        carried == head ? scratch.attention.query.view({head, heads, tokens, 1})
+                        : scratch.attention.wide_query.view({carried, heads, tokens, 1});
+    const Tensor key_operand =
+        carried == head ? scratch.attention.key.view({head, key_heads, tokens, 1})
+                        : scratch.attention.wide_key.view({carried, key_heads, tokens, 1});
+    const Tensor value_operand =
+        carried == head ? scratch.attention.value.view({head, key_heads, tokens, 1})
+                        : scratch.attention.wide_value.view({carried, key_heads, tokens, 1});
+    Tensor projected_operand =
+        carried == head ? scratch.attention.projected.view({head, heads, tokens, 1})
+                        : scratch.attention.wide_projected.view({carried, heads, tokens, 1});
+
+    // The width the landed attention Op is given, and this config's own scale.
+    const ops::AttentionHeadGeometry geometry{carried, heads, key_heads};
+    const float scale = 1.0F / std::sqrt(static_cast<float>(head));
+
+    if (kv != nullptr) {
+        // The lane's state, which is the whole (absolute) causal context this token attends over:
+        // the append comes first, so the step's own key and value participate in its own output,
+        // and the query's absolute position is the state's own frontier -- the same counter the
+        // keys' positions are written from, so the two cannot disagree.
+        kv->append(state->attention.lane, state->attention.layer, key_operand, value_operand,
+                   tokens, stream);
+        kv->attend(state->attention.lane, state->attention.layer, query_operand, projected_operand,
+                   state->attention.workspace, execution);
+    } else {
+        // The positions are this pass's own: a zero-state pass is the sequence's first `tokens`
+        // tokens. They are what bounds the Op causally -- with `window` at the pass's own token
+        // count, every key at or before a query is visible and no later one is, which is plain
+        // causal attention without a window of its own.
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+        for (std::int32_t token = 0; token < tokens; ++token) { positions[token] = token; }
+        CUDA_CHECK(cudaMemcpyAsync(scratch.attention.positions.data, positions.data(),
+                                   static_cast<std::size_t>(tokens) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
         ops::sliding_causal_attention(
-            scratch.attention.wide_query.view({carried, heads, tokens, 1}),
-            scratch.attention.wide_key.view({carried, key_heads, tokens, 1}),
-            scratch.attention.wide_value.view({carried, key_heads, tokens, 1}),
-            scratch.attention.positions, Tensor{}, scratch.attention.positions, Tensor{}, Tensor{},
-            Tensor{}, geometry, static_cast<std::uint32_t>(tokens), scale, wide_projected_view,
-            Tensor{}, execution);
+            query_operand, key_operand, value_operand, scratch.attention.positions, Tensor{},
+            scratch.attention.positions, Tensor{}, Tensor{}, Tensor{}, geometry,
+            static_cast<std::uint32_t>(tokens), scale, projected_operand, Tensor{}, execution);
+    }
+    if (carried != head) {
         for (std::int32_t index = 0; index < heads; ++index) {
             copy_blocks(scratch.attention.projected, index * head, queries,
                         scratch.attention.wide_projected, index * carried, carried * heads, head,
@@ -851,7 +915,8 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
 
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   const BlockObserver* observer, RoutedExpertPool* expert_pool) {
+                   BlockState* state, const BlockObserver* observer,
+                   RoutedExpertPool* expert_pool) {
     const TextConfig& config  = model.config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
     if (layer >= config.num_hidden_layers()) {
@@ -911,7 +976,7 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
     switch (kind) {
     case BlockKind::Mamba:
         forward_mamba(model, weights.mamba.value(), scratch.normed, scratch, hidden_out, execution,
-                      observer, layer);
+                      state, observer, layer);
         break;
     case BlockKind::Moe:
         forward_moe(model, *bank, weights.moe.value(), scratch.normed, scratch, hidden_out,
@@ -919,7 +984,7 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
         break;
     case BlockKind::Attention:
         forward_attention(model, weights.attention.value(), scratch.normed, scratch, hidden_out,
-                          execution, observer, layer);
+                          execution, state, observer, layer);
         break;
     }
 
@@ -930,23 +995,66 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
 }
 
 void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& arena, Tensor& logits,
-                   DeviceExecutionView execution, const BlockObserver* observer,
-                   RoutedExpertPool* expert_pool) {
-    const TextConfig& config  = model.config();
-    const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
-    const std::int32_t tokens = token_ids.ne[0];
+                   DeviceExecutionView execution, const PassState* state, HeadColumns columns,
+                   const BlockObserver* observer, RoutedExpertPool* expert_pool) {
+    const TextConfig& config       = model.config();
+    const std::int32_t hidden      = static_cast<std::int32_t>(config.hidden_size);
+    const std::int32_t tokens      = token_ids.ne[0];
+    const std::int32_t vocabulary  = static_cast<std::int32_t>(config.vocab_size);
+    const std::int32_t columns_out = columns == HeadColumns::Every ? tokens : 1;
     if (token_ids.dtype != DType::I32 || token_ids.ne[1] != 1 || !token_ids.is_contiguous() ||
         tokens < 1) {
         throw std::invalid_argument("nemotron_h forward: token ids must be a contiguous I32 "
                                     "[tokens] vector");
     }
-    if (logits.dtype != DType::BF16 ||
-        logits.ne[0] != static_cast<std::int32_t>(config.vocab_size) || logits.ne[1] != tokens ||
+    if (logits.dtype != DType::BF16 || logits.ne[0] != vocabulary || logits.ne[1] != columns_out ||
         !logits.is_contiguous()) {
-        throw std::invalid_argument(
-            "nemotron_h forward: logits must be contiguous BF16 " +
-            extent_text(static_cast<std::int32_t>(config.vocab_size), tokens));
+        throw std::invalid_argument("nemotron_h forward: logits must be contiguous BF16 " +
+                                    extent_text(vocabulary, columns_out) + " for " +
+                                    (columns == HeadColumns::Every ? "every column of the pass"
+                                                                   : "the pass's last column"));
     }
+    // A state-driven pass states where its first token sits, and the attention state's own frontier
+    // is what the keys' and queries' positions are actually written from. The two must agree, or
+    // the pass would attend at positions no token of the lane ever occupied: a caller whose own
+    // cursor is off by a token is caught here rather than producing plausible logits at the wrong
+    // position.
+    if (state != nullptr && !state->per_layer.empty()) {
+        if (state->per_layer.size() != config.num_hidden_layers()) {
+            throw std::invalid_argument(
+                "nemotron_h forward: a pass's state has one entry per block, and this config has " +
+                std::to_string(config.num_hidden_layers()) + " blocks where the state has " +
+                std::to_string(state->per_layer.size()));
+        }
+        if (state->first_position < 0) {
+            throw std::invalid_argument("nemotron_h forward: a pass's first position is the tokens "
+                                        "the lane already consumed, so it cannot be negative");
+        }
+        for (std::size_t layer = 0; layer < state->per_layer.size(); ++layer) {
+            const BlockState& entry = state->per_layer[layer];
+            if (config.block_kind(static_cast<std::uint32_t>(layer)) != BlockKind::Attention) {
+                continue;
+            }
+            if (entry.attention.state == nullptr) {
+                throw std::invalid_argument(
+                    "nemotron_h forward: block " + std::to_string(layer) +
+                    " is an attention block and a state-driven pass must bind its K/V state");
+            }
+            if (entry.attention.state->filled(entry.attention.lane) != state->first_position) {
+                throw std::invalid_argument(
+                    "nemotron_h forward: block " + std::to_string(layer) +
+                    "'s attention state "
+                    "holds " +
+                    std::to_string(entry.attention.state->filled(entry.attention.lane)) +
+                    " tokens where the pass says its first token is at position " +
+                    std::to_string(state->first_position) +
+                    ", so the two disagree about where the "
+                    "pass starts");
+            }
+        }
+    }
+    BlockState* const per_layer =
+        state != nullptr && !state->per_layer.empty() ? state->per_layer.data() : nullptr;
 
     DeviceArena::Scope scope = arena.scope();
     PassBuffers buffers      = allocate_pass(config, tokens, arena);
@@ -961,14 +1069,29 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
     Tensor current = buffers.hidden_a;
     for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
         Tensor next = current.data == buffers.hidden_a.data ? buffers.hidden_b : buffers.hidden_a;
-        forward_block(model, layer, current, arena, next, execution, observer, expert_pool);
+        forward_block(model, layer, current, arena, next, execution,
+                      per_layer == nullptr ? nullptr : per_layer + layer, observer, expert_pool);
         current = next;
     }
 
-    ops::rmsnorm(current, model.tensor(model.weights().text.final_norm), config.rms_norm_eps, false,
-                 buffers.normed, execution.stream);
-    observe(observer, 0, BlockStage::FinalNorm, buffers.normed);
-    ops::linear(buffers.normed, model.matrix(model.weights().text.output_head), logits,
+    // The head over the pass's last position, or over every position. The state the layers advanced
+    // is this pass's whole contribution: the head reads the residual stream and touches none of it.
+    Tensor head_input = current;
+    if (columns == HeadColumns::LastOnly && tokens > 1) {
+        // The last column of a `[hidden, tokens]` buffer, which is contiguous on its own because
+        // the row axis is the slow one.
+        head_input = Tensor(static_cast<std::uint8_t*>(current.data) +
+                                static_cast<std::size_t>(tokens - 1) *
+                                    static_cast<std::size_t>(hidden) * sizeof(std::uint16_t),
+                            DType::BF16, {hidden, 1});
+    }
+    Tensor normed_out = columns == HeadColumns::LastOnly && tokens > 1
+                            ? Tensor(buffers.normed.data, DType::BF16, {hidden, 1})
+                            : buffers.normed;
+    ops::rmsnorm(head_input, model.tensor(model.weights().text.final_norm), config.rms_norm_eps,
+                 false, normed_out, execution.stream);
+    observe(observer, 0, BlockStage::FinalNorm, normed_out);
+    ops::linear(normed_out, model.matrix(model.weights().text.output_head), logits,
                 execution.stream);
     observe(observer, 0, BlockStage::Logits, logits);
 }

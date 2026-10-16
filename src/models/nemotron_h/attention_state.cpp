@@ -41,12 +41,32 @@ std::int32_t positive_count(std::int32_t value, std::string_view what) {
     return value;
 }
 
-// The head widths the Op's launcher admits. A config outside them needs the zero-carry the
-// composition implements for its passes, which pads each head and copies the real dims into the
-// carried head's start rather than repacking the state.
+// The head widths the Op's launcher admits.
 bool admitted_head_width(std::int32_t head_dim) {
     return head_dim == 32 || head_dim == 64 || head_dim == 128 || head_dim == 256;
 }
+
+} // namespace
+
+std::int32_t carried_attention_head(const AttentionConfig& attention) {
+    const std::int32_t head = static_cast<std::int32_t>(attention.head_dim);
+    if (head <= 0) {
+        throw std::invalid_argument("nemotron_h attention state: the config's attention head is " +
+                                    std::to_string(head) + " wide, which is not a head");
+    }
+    if (admitted_head_width(head)) { return head; }
+    // The narrowest width the Op admits that holds the head's real dims, so the pad is the smallest
+    // the domain allows rather than a fixed 256.
+    if (head < 32) { return 32; }
+    if (head < 64) { return 64; }
+    if (head < 128) { return 128; }
+    if (head < 256) { return 256; }
+    throw std::invalid_argument(
+        "nemotron_h attention state: no landed route for a " + std::to_string(head) +
+        "-wide attention head: ops::sliding_causal_attention admits 32, 64, 128 and 256");
+}
+
+namespace {
 
 // The three regions of one allocation, planned once so `device_bytes` and the constructor cannot
 // disagree.
@@ -112,17 +132,18 @@ void require_query_operand(const Tensor& tensor, const char* role, std::int32_t 
 
 std::size_t AttentionState::device_bytes(const AttentionConfig& attention, std::uint32_t layers,
                                          std::int32_t capacity, std::int32_t lanes) {
-    const auto head_dim = positive(attention.head_dim, "the attention head width");
+    const auto carried  = carried_attention_head(attention);
     const auto kv_heads = positive(attention.num_key_value_heads, "the attention KV head count");
     (void)positive_count(lanes, "the lane count");
     const AttentionStatePlan plan =
-        plan_state(head_dim, kv_heads, positive_count(capacity, "the capacity"), lanes, layers);
+        plan_state(carried, kv_heads, positive_count(capacity, "the capacity"), lanes, layers);
     return plan.bytes;
 }
 
 AttentionState::AttentionState(const AttentionConfig& attention, std::uint32_t layers,
                                std::int32_t capacity, std::int32_t lanes)
     : head_dim_(positive(attention.head_dim, "the attention head width")),
+      carried_head_(carried_attention_head(attention)),
       kv_heads_(positive(attention.num_key_value_heads, "the attention KV head count")),
       query_heads_(positive(attention.num_attention_heads, "the attention query head count")),
       capacity_(positive_count(capacity, "the capacity")), layers_(layers) {
@@ -130,14 +151,14 @@ AttentionState::AttentionState(const AttentionConfig& attention, std::uint32_t l
         throw std::invalid_argument("nemotron_h attention state: layers must be nonzero");
     }
     if (!ops::valid_attention_head_geometry(
-            ops::AttentionHeadGeometry{head_dim_, query_heads_, kv_heads_})) {
+            ops::AttentionHeadGeometry{carried_head_, query_heads_, kv_heads_})) {
         throw std::invalid_argument(
             "nemotron_h attention state: the query head count must be a multiple of the KV head "
             "count");
     }
     positive_count(lanes, "the lane count");
 
-    const AttentionStatePlan plan = plan_state(head_dim_, kv_heads_, capacity_, lanes, layers_);
+    const AttentionStatePlan plan = plan_state(carried_head_, kv_heads_, capacity_, lanes, layers_);
     state_                        = DeviceBuffer(plan.bytes);
     const DeviceSpan backing{state_.p, state_.bytes};
     keys_      = plan.keys.bind(backing);
@@ -158,15 +179,9 @@ std::size_t AttentionState::workspace_bytes(std::int32_t tokens) const {
 }
 
 ops::AttentionHeadGeometry AttentionState::route_geometry() const {
-    if (!admitted_head_width(head_dim_)) {
-        throw std::invalid_argument(
-            "nemotron_h attention state: ops::sliding_causal_attention admits a " +
-            std::to_string(head_dim_) +
-            "-wide head not at all, and the zero-carry the composition uses for its passes is not "
-            "part of the state route: a config whose head is 32, 64, 128 or 256 attends, and this "
-            "one does not");
-    }
-    return ops::AttentionHeadGeometry{head_dim_, query_heads_, kv_heads_};
+    // The carried width is what the Op is handed; `carried_attention_head` already refused a head
+    // with no route, so the width is one the launcher admits.
+    return ops::AttentionHeadGeometry{carried_head_, query_heads_, kv_heads_};
 }
 
 void AttentionState::reset_all(cudaStream_t stream) {
@@ -208,9 +223,9 @@ AttentionStateView AttentionState::layer(std::int32_t lane, std::uint32_t layer)
     const std::size_t plane_bytes = plane_elements() * sizeof(std::uint16_t);
     return AttentionStateView{
         .keys   = Tensor(static_cast<std::uint8_t*>(keys_.data) + index * plane_bytes, DType::BF16,
-                         {head_dim_, kv_heads_, capacity_, 1}),
+                         {carried_head_, kv_heads_, capacity_, 1}),
         .values = Tensor(static_cast<std::uint8_t*>(values_.data) + index * plane_bytes,
-                         DType::BF16, {head_dim_, kv_heads_, capacity_, 1}),
+                         DType::BF16, {carried_head_, kv_heads_, capacity_, 1}),
         .positions = Tensor(static_cast<std::uint8_t*>(positions_.data) +
                                 static_cast<std::size_t>(lane) * capacity_ * sizeof(std::int32_t),
                             DType::I32, {capacity_, 1}),
@@ -245,15 +260,16 @@ void AttentionState::append(std::int32_t lane, std::uint32_t layer, const Tensor
                                     " tokens, and appending " + std::to_string(count) + " to its " +
                                     std::to_string(state.filled) + " exceeds that");
     }
-    require_kv_operand(keys, "keys", head_dim_, kv_heads_, count);
-    require_kv_operand(values, "values", head_dim_, kv_heads_, count);
+    require_kv_operand(keys, "keys", carried_head_, kv_heads_, count);
+    require_kv_operand(values, "values", carried_head_, kv_heads_, count);
 
-    // The source is the projection's own output for this layer, in the Op's element order, so the
-    // tokens are one contiguous run in both the source and this lane's plane.
+    // The source is the projection's own output for this layer, already at the stored width, in the
+    // Op's element order, so the tokens are one contiguous run in both the source and this lane's
+    // plane.
     const std::size_t block_bytes =
-        static_cast<std::size_t>(count) * head_dim_ * kv_heads_ * sizeof(std::uint16_t);
+        static_cast<std::size_t>(count) * carried_head_ * kv_heads_ * sizeof(std::uint16_t);
     const std::size_t offset =
-        static_cast<std::size_t>(state.filled) * head_dim_ * kv_heads_ * sizeof(std::uint16_t);
+        static_cast<std::size_t>(state.filled) * carried_head_ * kv_heads_ * sizeof(std::uint16_t);
     const std::size_t index       = layer_index(lane, layer);
     const std::size_t plane_bytes = plane_elements() * sizeof(std::uint16_t);
     CUDA_CHECK(
@@ -318,8 +334,8 @@ void AttentionState::attend(std::int32_t lane, std::uint32_t layer, const Tensor
             " has not appended this step, and the reference appends a token's key and value before "
             "its query runs");
     }
-    require_query_operand(query, "query", head_dim_, query_heads_, state.pending);
-    require_query_operand(out, "out", head_dim_, query_heads_, state.pending);
+    require_query_operand(query, "query", carried_head_, query_heads_, state.pending);
+    require_query_operand(out, "out", carried_head_, query_heads_, state.pending);
 
     const AttentionStateView view = this->layer(lane, layer);
     // The query's own positions are the appended ones; the keys' are the lane's whole row, whose
@@ -328,6 +344,9 @@ void AttentionState::attend(std::int32_t lane, std::uint32_t layer, const Tensor
                                 static_cast<std::size_t>(state.filled) * sizeof(std::int32_t),
                             DType::I32, {state.pending, 1});
     const Tensor nothing;
+    // The config's own head width, not the stored one: the carry is exact only because the pad dims
+    // are zero, and the scale is what keeps a padded query or key from moving a score by anything
+    // other than the zeros it contributes.
     const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
     ops::sliding_causal_attention(query, view.keys, view.values, position_q, nothing,
                                   view.positions, nothing, nothing, nothing, route_geometry(),
@@ -357,7 +376,7 @@ std::size_t AttentionState::layer_index(std::int32_t lane, std::uint32_t layer) 
 }
 
 std::size_t AttentionState::plane_elements() const {
-    return static_cast<std::size_t>(head_dim_) * kv_heads_ * capacity_;
+    return static_cast<std::size_t>(carried_head_) * kv_heads_ * capacity_;
 }
 
 } // namespace ninfer::models::nemotron_h

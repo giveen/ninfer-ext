@@ -22,10 +22,13 @@
 //    decorator is inert and no `position_embeddings` argument reaches the body), and the config has
 //    no `rope_theta` at all, so this mixer has no rotation to compose and none is applied.
 //
-// Scope: this is the *prefill* pass. A block attends over the tokens it is handed, and a Mamba
-// mixer starts from a zero state, so a pass is one sequence's prompt. Mamba's convolution history
-// and recurrent plane and the attention K/V are the engine's sequence state, and are not modelled
-// here; nothing in this header keeps state between calls.
+// Scope: this is the *whole* pass -- prefill and decode are the same composition, differing only in
+// how many tokens it is handed and in where its state is. A pass is one sequence's tokens over the
+// blocks in order, and the state it advances is the engine's: a Mamba mixer's convolution history
+// and FP32 recurrent plane and each attention block's K/V, all of them the caller's storage
+// (`BlockState`). A pass driven with no state is the same computation from a zero state, which is
+// what a prompt's first prefill is, so the two are one function with a branch rather than two
+// functions that can drift.
 //
 // Two op domains the composition answers for, established by reading the Ops rather than this
 // family's checkpoint:
@@ -57,6 +60,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "models/nemotron_h/attention_state.h"
 #include "models/nemotron_h/config.h"
 #include "models/nemotron_h/experts.h"
 #include "models/nemotron_h/weights.h"
@@ -64,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -192,6 +197,63 @@ public:
     virtual void on_stage(std::size_t layer, BlockStage stage, const Tensor& tensor) const = 0;
 };
 
+// One attention block's state, engaged by a state-driven pass. It is the caller's storage -- the
+// family's `AttentionState` -- and this is the binding of one lane's one attention layer into it,
+// so the pass appends this block's K/V to it and attends over it without knowing how the state is
+// laid out or indexed.
+struct AttentionPassState {
+    // Null means this block runs without a state, which is a zero-state pass's attention: it
+    // attends over its own tokens only and appends nothing.
+    AttentionState* state = nullptr;
+    std::int32_t lane     = 0;
+    // The block's own index among the state's attention layers -- not its block index, which a
+    // config whose block kinds interleave (this family's do) maps to another layer.
+    std::uint32_t layer = 0;
+    // The Op's key-split workspace, or empty for its one-pass route, which computes the same
+    // result: `AttentionState::workspace_bytes` sizes it for a pass's token count, and a pass
+    // handed less than it would prefer takes the one-pass route instead.
+    Tensor workspace;
+};
+
+// One block's mutable state, bound by the caller for one lane and one layer. A block engages the
+// members its kind has; every tensor is the caller's storage and the pass reads and writes it *in
+// place*, so the frontier a pass leaves behind is the state the next pass starts from. A null
+// `PassState` is a zero-state pass, and then none of this exists: a Mamba mixer starts from a zero
+// history and a zero plane, and an attention block attends over its own tokens.
+struct BlockState {
+    // Mamba layers: the convolution history, BF16 [conv_channels, conv_kernel - 1], oldest tap
+    // first, in `ops::causal_conv1d_silu`'s own state order (tap outermost, channel innermost --
+    // which is *not* the reference's own `[conv_dim, kernel]` cached window; the two are a
+    // transpose); and the selective scan's FP32 plane [128, value_head_dim, value_heads] in
+    // `ops::mamba2_scan`'s own state order (key extent fastest, the key extent being the scan
+    // kernel's own constant 128 rather than the config's `state_size`).
+    Tensor conv;
+    Tensor recurrent;
+    // Attention layers: the lane's K/V state for this block's own layer.
+    AttentionPassState attention{};
+};
+
+// The state one pass advances: one entry per block, in the config's block order. The entries are
+// mutable -- a pass reads and writes the state it is handed -- and the span is the caller's.
+struct PassState {
+    // Empty is a zero-state pass, bit for bit: nothing is read and nothing is written back.
+    std::span<BlockState> per_layer{};
+    // The absolute position of the pass's first token -- the tokens this lane consumed before it,
+    // which is the reference's `past_seen_tokens`. The attention state's own frontier is where the
+    // positions actually come from (so the two cannot disagree about what a key's position is);
+    // this is the pass's statement of it, and a state-driven pass refuses one that disagrees with
+    // the state.
+    std::int32_t first_position = 0;
+};
+
+// Which columns of a pass the head runs over. A generation step draws the token after the pass's
+// last position, and the head costs `vocabulary` outputs per column, so a caller that only draws
+// asks for the logits of one column and sizes its buffer for one.
+enum class HeadColumns : std::uint8_t {
+    Every,    // logits [vocabulary, tokens]: every position of the pass
+    LastOnly, // logits [vocabulary, 1]: the pass's last position only
+};
+
 // Transient capacity one block needs for `tokens` tokens of one kind, and the whole pass needs for
 // the widest block plus the head. Both are the exact peak of the real allocation sequence, taken
 // from the same planner the pass runs against a dry-run layout.
@@ -199,11 +261,16 @@ public:
 [[nodiscard]] std::size_t model_workspace_bytes(const TextConfig& config, std::int32_t tokens);
 
 /**
- * Runs one decoder block for `tokens` tokens at once.
+ * Runs one decoder block for `tokens` tokens at once, advancing this block's state.
  *
  * `hidden_in` and `hidden_out` are contiguous BF16 `[hidden_size, tokens]` and must not overlap;
  * the block reads the residual stream and writes its updated self. `arena` supplies the block's
  * transient storage and must hold `block_workspace_bytes` for this config and `tokens`.
+ *
+ * `state` is this layer's entry of the pass's state, or null for a zero-state block. An attention
+ * block appends its own K/V to the state *before* its query runs, which is the reference's order,
+ * and does not advance the state's frontier -- the pass's caller does that once, after every
+ * attention block has appended (`AttentionState::advance`).
  *
  * `expert_pool` places the routed banks: null reads each MoE block's bank where it is bound (over
  * UVA when it is host-pinned, in place when it is device-resident), and a pool stages the banks
@@ -211,18 +278,30 @@ public:
  */
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   const BlockObserver* observer = nullptr, RoutedExpertPool* experts = nullptr);
+                   BlockState* state = nullptr, const BlockObserver* observer = nullptr,
+                   RoutedExpertPool* experts = nullptr);
 
 /**
  * Runs a whole text pass: the token embedding, every block in order, the final norm and the head.
  *
  * `token_ids` is contiguous I32 `[tokens]` and every id must be in `[0, vocabulary)`. `logits` is
- * contiguous BF16 `[vocabulary_size, tokens]` and must not overlap the arena. `arena` must hold
+ * contiguous BF16, `[vocabulary_size, tokens]` for `HeadColumns::Every` and `[vocabulary_size, 1]`
+ * for `HeadColumns::LastOnly`, and must not overlap the arena. `arena` must hold
  * `model_workspace_bytes` for this config and `tokens`, which is one block's peak plus the head's.
+ *
+ * `state` is the lane's state -- one entry per block, the tokens starting at
+ * `state->first_position` -- or null for a zero-state pass, whose result is the same computation
+ * from a zero state. A state-driven pass leaves every Mamba block's history and plane advanced by
+ * its tokens in place and every attention block's K/V appended; it does *not* advance the attention
+ * state's own frontier, so a caller that drives one pass after another calls
+ * `AttentionState::advance(lane)` once between them.
+ *
  * `expert_pool` is as `forward_block`'s.
  */
 void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& arena, Tensor& logits,
-                   DeviceExecutionView execution, const BlockObserver* observer = nullptr,
+                   DeviceExecutionView execution, const PassState* state = nullptr,
+                   HeadColumns columns           = HeadColumns::Every,
+                   const BlockObserver* observer = nullptr,
                    RoutedExpertPool* expert_pool = nullptr);
 
 } // namespace ninfer::models::nemotron_h

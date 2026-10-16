@@ -81,10 +81,11 @@ ninfer_add_test(ninfer_nemotron_h_frontend_test
 set_tests_properties(ninfer_nemotron_h_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # The Engine's load path for this family: the artifact is dispatched to this family's own instance,
-# the Engine reports ready with the metadata it derived from the artifact's own config, and the
-# generation the landed forward cannot serve fails through the family Program's refusal while the
-# Engine stays usable. It needs the artifact (NINFER_NEMOTRON_ARTIFACT) and skips (77) without it,
-# and links the Engine, the artifact reader and the family's config parser, which is what it uses.
+# the Engine reports ready with the metadata it derived from the artifact's own config, and a
+# generation is served: the prompt is prefilled into the lane's state, one token is drawn, and each
+# later round decodes one token against the state the prefill left. It needs the artifact
+# (NINFER_NEMOTRON_ARTIFACT) and skips (77) without it, and links the Engine, the artifact reader and
+# the family's config parser, which is what it uses.
 ninfer_add_test(ninfer_nemotron_h_engine_load_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_load.cpp"
   LIBRARIES ninfer_engine ninfer_artifact ninfer_model_loading)

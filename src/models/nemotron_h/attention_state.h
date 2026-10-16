@@ -8,9 +8,20 @@
 // is at or before the query. That is what decides this state's shape:
 //
 //  * One buffer per lane per attention layer, dense and unbounded: keys and values are contiguous
-//    BF16 `[head_dim, kv_heads, capacity, 1]`, exactly the operand `ops::sliding_causal_attention`
+//    BF16 `[carried, kv_heads, capacity, 1]`, exactly the operand `ops::sliding_causal_attention`
 //    declares, so the route hands the state to the Op without a copy, a transpose or a repacking.
 //    Nothing aliases between lanes, and a lane's slots are its own.
+//  * The rows are stored at the width the Op admits, not at the config's own head width. A config
+//    whose head is one of the Op's 32, 64, 128 or 256 is stored at its own width; a narrower one is
+//    *carried* at the narrowest width the Op does admit, with each head's real dims contiguous at
+//    its carried head's start and zeros elsewhere (`carried_attention_head`). The decision is made
+//    once, here, because the alternative -- re-padding the whole history on every step -- is an
+//    O(capacity) scatter per token. The carry is exact: a zero query or key dim adds nothing to a
+//    score, a zero value dim contributes `probability * 0` to every output, and `attend` passes the
+//    config's own `1/sqrt(head_dim)` rather than one derived from the stored width. What is
+//    load-bearing is that the pad dims stay *exactly* zero for the life of the state: the planes
+//    are zeroed at allocation and `append` only ever writes the real dims (with the query and key
+//    pads zero on both sides), so no token can move them.
 //  * Causality is by position, not by a window: the route passes `window == 0`, the Op's unbounded
 //    causal route, because a finite window is not a substitute for this family -- its context is
 //    262144 and its mask is causal -- and the Op's finite span is 4096.
@@ -24,7 +35,8 @@
 //    has not happened, so the order is enforced rather than documented.
 //
 // The layout arithmetic, for `A` attention layers, `L` lanes and `C` tokens of capacity, with
-// `D = head_dim` and `Hkv = num_key_value_heads`:
+// `D = carried_attention_head(attention)` (the config's `head_dim` when the Op admits it, as it
+// does for this family) and `Hkv = num_key_value_heads`:
 //
 //   keys      = A * L * C * Hkv * D * 2 bytes   (BF16)
 //   values    = A * L * C * Hkv * D * 2 bytes   (BF16)
@@ -34,11 +46,9 @@
 // so one lane of the 74B checkpoint's geometry (A = 8, D = 128, Hkv = 2) holds 2 * 8 * C * 2 * 128
 // * 2 = 8192 * C bytes: 8 KB per token, 2 GiB at the family's 262144-token context.
 //
-// What this state does not hold, deliberately: a quantized K/V (the Op's operands are BF16, so a
-// codec would have to be decoded into BF16 scratch per call, which is a different route and is not
-// wired) and a carried head width (a config whose `head_dim` is not one of the Op's 32, 64, 128 or
-// 256 needs the zero-carry the composition implements for its passes, `attend` refuses that width
-// by name rather than padding the state). Neither is this family's geometry: its head is 128.
+// What this state does not hold, deliberately: a quantized K/V. The Op's operands are BF16, so a
+// codec would have to be decoded into BF16 scratch on every call, which is a different route and is
+// not wired. This family's own geometry is the stored one: its head is 128, one of the Op's.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -62,12 +72,25 @@ inline constexpr std::int32_t kUnwrittenPosition = 1 << 30;
 // window of its own, so every key at or before the query is visible.
 inline constexpr std::uint32_t kUnboundedWindow = 0;
 
+/**
+ * The head width this state stores its rows at: the config's own `head_dim` when
+ * `ops::sliding_causal_attention` admits it (32, 64, 128 or 256), and otherwise the narrowest width
+ * the Op does admit, with each head's real dims contiguous at its carried head's start.
+ *
+ * The width is a property of the state rather than of one pass because the rows are stored once and
+ * read by every later step, so re-padding them per step would be an O(capacity) scatter per token.
+ * The carry is exact -- see the header comment -- and `attend` scales by the *config's* head width,
+ * which is what makes the padded dims unable to move a result. A head wider than 256 has no route
+ * and is refused.
+ */
+[[nodiscard]] std::int32_t carried_attention_head(const AttentionConfig& attention);
+
 // One lane's K/V state for one attention layer, as the Op takes it. `filled` is the number of
 // tokens written (slots `[0, filled)` hold their own position); the rest hold `kUnwrittenPosition`
 // and are invisible.
 struct AttentionStateView {
-    Tensor keys;      // contiguous BF16 [head_dim, kv_heads, capacity, 1]
-    Tensor values;    // contiguous BF16 [head_dim, kv_heads, capacity, 1]
+    Tensor keys;      // contiguous BF16 [carried, kv_heads, capacity, 1]
+    Tensor values;    // contiguous BF16 [carried, kv_heads, capacity, 1]
     Tensor positions; // contiguous I32 [capacity, 1]
     std::int32_t filled = 0;
 };
@@ -99,6 +122,10 @@ public:
     }
 
     [[nodiscard]] std::int32_t capacity() const noexcept { return capacity_; }
+
+    // The width the K/V rows are stored at, which is the width `append`'s and `attend`'s operands
+    // must have: the config's own head when the Op admits it, a carried width otherwise.
+    [[nodiscard]] std::int32_t carried_head() const noexcept { return carried_head_; }
 
     [[nodiscard]] std::size_t allocated_bytes() const noexcept { return state_.bytes; }
 
@@ -134,10 +161,12 @@ public:
 
     /**
      * Appends `tokens` tokens of one layer's K and V at the lane's cursor, and writes their
-     * positions. `keys` and `values` are contiguous BF16 `[head_dim, kv_heads, tokens, 1]` -- the
-     * projections' own output for this layer, in the Op's own element order, so the append is one
-     * contiguous copy. Every attention layer of a step must append the same token count before the
-     * step is advanced, and a layer may append once per step.
+     * positions. `keys` and `values` are contiguous BF16 `[carried_head(), kv_heads, tokens, 1]` --
+     * the projections' own output for this layer, already at the stored width (a narrow config's
+     * head is zero-carried before it arrives, so the pad dims of a stored row are exactly zero),
+     * in the Op's own element order, so the append is one contiguous copy. Every attention layer of
+     * a step must append the same token count before the step is advanced, and a layer may append
+     * once per step.
      *
      * The caller orders `stream` against prior state accesses; the state enqueues nothing else.
      */
@@ -152,9 +181,11 @@ public:
      * One layer's attention over the lane's whole state, for the step's `pending` tokens: exactly
      * the causal attention this model has, with the scale it has and no window.
      *
-     * `query` and `out` are contiguous BF16 `[head_dim, query_heads, pending, 1]`. The layer's K/V
-     * must have been appended first (`append`), so the step's own key and value are in its own
-     * output; the positions are the lane's own, absolute from the sequence's length.
+     * `query` and `out` are contiguous BF16 `[carried_head(), query_heads, pending, 1]`. The
+     * layer's K/V must have been appended first (`append`), so the step's own key and value are in
+     * its own output; the positions are the lane's own, absolute from the sequence's length, and
+     * the scale is the config's own `1/sqrt(head_dim)` rather than one derived from the stored
+     * width.
      *
      * `workspace` may be empty, or `workspace_bytes(pending)` bytes for the Op's key-split route.
      */
@@ -185,11 +216,12 @@ private:
     std::vector<Lane> lanes_state_;
     // Host staging for one append's positions, reused so an append allocates nothing.
     std::vector<std::int32_t> positions_host_;
-    std::int32_t head_dim_    = 0;
-    std::int32_t kv_heads_    = 0;
-    std::int32_t query_heads_ = 0;
-    std::int32_t capacity_    = 0;
-    std::uint32_t layers_     = 0;
+    std::int32_t head_dim_     = 0;
+    std::int32_t carried_head_ = 0;
+    std::int32_t kv_heads_     = 0;
+    std::int32_t query_heads_  = 0;
+    std::int32_t capacity_     = 0;
+    std::uint32_t layers_      = 0;
 };
 
 } // namespace ninfer::models::nemotron_h

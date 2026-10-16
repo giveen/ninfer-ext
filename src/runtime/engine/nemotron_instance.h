@@ -5,29 +5,26 @@
 // EngineCore, CausalScoreCore and the ResourceManager under them are templated on an instance and
 // its ModelContract. runtime::ModelInstance is the Qwen implementation and runtime::GemmaInstance
 // the second one; this is the third, for models::nemotron_h. Everything the common machinery can
-// reach is mirrored from the Gemma side, with one property stated up front because it decides what
-// this file does and does not implement:
+// reach is mirrored from the Gemma side, and this is what a generation does here:
 //
-//  - The family's forward is a *zero-state prefill*: a Mamba mixer starts from a zero state and the
-//    pass writes nothing back, and no attention K/V is appended (models/nemotron_h/forward.h). A
-//    lane driven through it would therefore compute the output of a zero-state model, which is a
-//    wrong model rather than a missing feature, so `models::nemotron_h::Program` refuses every
-//    entry point that would consume or commit tokens and names the missing piece in the same words
-//    (kMissingStatePersistence). This wrapper implements the request lifecycle -- planning,
-//    admission, the lane, the state transaction -- over that Program and lets its refusal surface
-//    where the tokens would be consumed, at `advance_prefill`: a generation submitted to this
-//    Engine reaches the family's own refusal rather than a crash or a silently wrong answer.
-//  - Admission is root-only. The Engine runs this model with the context cache disabled, so the
-//    identity candidate is always feasible, is never expandable, and seals directly. No prefix is
-//    reused and no capture is ever offered, so the prefix-cache machinery the ResourceManager can
-//    reach in principle refuses by name and is never reached.
-//  - The family has no speculation and no vision component, so no token masks, drafts or images
-//    reach the Program; `nemotron_engine_options` switches those off rather than carrying settings
-//    the Engine would silently ignore.
+//  - A lane is admitted root-only and then prefilled in one call: the whole prompt goes to
+//    `models::nemotron_h::Program::prefill`, which chunks it internally into passes of the
+//    configured width, writes the Mamba and attention state the composition owns, and leaves the
+//    last token's logits. The response's first token is drawn from them and committed like any
+//    other, so the prefill costs one service unit per chunk of the prompt and the lane is active
+//    when the call returns.
+//  - Every round after that decodes one token per lane and draws the next with the lane's sampler:
+//    `decode` and `commit` are the Gemma plain-row path with the speculative branch removed, so a
+//    row licenses exactly one token (`row_stride_ == 1`) and a commit either resumes its lane or
+//    makes it finishable. The state belongs to the family Program and a pass leaves it at its new
+//    frontier, so a round holds nothing to roll back and there is no uncommitted round to discard.
+//  - The context cache, prefix reuse, speculation and vision are all switched off
+//    (`nemotron_engine_options`), so the prefix-cache machinery the ResourceManager can reach in
+//    principle refuses by name and is never reached, and no token mask, draft or image ever
+//    reaches the Program.
 //
 // Contract types this model never constructs (continuations, shared prefixes, capture offers and
-// their assessments, the result aggregates of commit/finish/abort) are the Qwen contract's own
-// pure-data types, exactly as on the Gemma side.
+// their assessments) are the Qwen contract's own pure-data types, exactly as on the Gemma side.
 
 #include "core/device.h"
 #include "models/nemotron_h/forward.h"
@@ -288,14 +285,10 @@ struct MaterializationResult {
 using ContextTransactionProgress =
     std::variant<ContextTransactionInProgress, MaterializationResult, qwen::ActiveCaptureResult>;
 
-// The Engine-facing Program: lanes, admission transactions and the one refusal the family's forward
-// forces. The lane bookkeeping is real -- a lane holds one request, `create` empties its state
-// through the family Program, and `abort`/`fail_all_cleanup` release it -- while every entry point
-// that would consume or commit tokens is the family Program's own refusal. The prefill step hands
-// the lane's whole prompt to `models::nemotron_h::Program::prefill`, which refuses: that is the
-// boundary the next milestone replaces when the composition persists the Mamba and attention state.
-// A sequence can therefore never reach a terminal state, which is why `finish` has nothing to
-// report and `decode`/`commit` refuse.
+// The Engine-facing Program: lanes, admission transactions, rounds and commits over the family
+// Program's state. A lane is admitted root-only -- `create` empties its state through the family
+// Program and `configure` installs the request's sampler -- prefilled in one call, and then decoded
+// one token per round, each round drawn with the lane's own sampler and committed by the Engine.
 class NemotronProgram {
 public:
     NemotronProgram(const models::nemotron_h::Model& model, const EngineOptions& options,
@@ -371,15 +364,15 @@ public:
     [[noreturn]] ContextTransactionReserveStatus reserve_active_capture_with_pressure(
         qwen::CaptureOffer&&, const qwen::SharedPrefixHandle*, const qwen::SharedPrefixHandle*,
         std::optional<CheckpointRef>, bool, qwen::CapturePressurePlan&&, CancellationFlagView);
-    [[noreturn]] PendingBatch decode(std::span<const SequenceHandle> sequences,
-                                     std::span<const RoundBudget> budgets,
-                                     ExecutionTiming* failed_timing = nullptr,
-                                     TokenMaskProvider* masks       = nullptr);
+    [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
+                                      std::span<const RoundBudget> budgets,
+                                      ExecutionTiming* failed_timing = nullptr,
+                                      TokenMaskProvider* masks       = nullptr);
     [[noreturn]] ExecutionTiming append_forced_tokens(std::span<const SequenceHandle>,
                                                       std::span<const TokenId>, std::uint32_t,
                                                       std::span<const std::optional<std::uint32_t>>,
                                                       ExecutionTiming* = nullptr);
-    [[noreturn]] qwen::CommitResult
+    [[nodiscard]] qwen::CommitResult
     commit(PendingBatch&& pending, std::span<const CommitDecision> decisions,
            CommitObservation observation  = CommitObservation::AllRows,
            ExecutionTiming* failed_timing = nullptr);
@@ -410,14 +403,19 @@ public:
     [[nodiscard]] qwen::PhysicalUsageSnapshot physical_usage() const noexcept;
 
 private:
-    // A lane is free, or holds one request being prefilled. There is no third state: a lane becomes
-    // active only when a round commits, and no round can complete while the forward keeps no state.
-    enum class Phase : std::uint8_t { Free, Prefill };
+    // A lane is free, holding a request whose prompt is being prefilled, decoding rounds, or
+    // holding the last token its request will produce and waiting for `finish` to release it.
+    enum class Phase : std::uint8_t { Free, Prefill, Active, Finishable };
 
     struct Lane {
         Phase phase         = Phase::Free;
         std::uint64_t epoch = 0;
         std::vector<TokenId> prompt;
+        // The token the next decode round feeds: the one the prefill or the last commit drew. Its
+        // key and value are written by the pass that consumes it, not before.
+        TokenId next_input = -1;
+        // True between this lane joining a PendingBatch and that batch's commit or discard.
+        bool pending = false;
         GenerationTimings timings;
         SpeculativeStats speculative;
     };
@@ -439,8 +437,12 @@ private:
     models::nemotron_h::Program program_;
     std::vector<Lane> lanes_;
     std::optional<Transaction> transaction_;
-    std::uint64_t revision_      = 1;
-    std::uint64_t next_epoch_    = 1;
+    std::uint64_t revision_   = 1;
+    std::uint64_t next_epoch_ = 1;
+    // Round capabilities: `next_pending_` names the batch a round hands out and `open_pending_`
+    // the one the Engine still owes a commit or a discard for.
+    std::uint64_t next_pending_  = 1;
+    std::uint64_t open_pending_  = 0;
     std::uint32_t prefill_chunk_ = 0;
 };
 

@@ -1,10 +1,11 @@
-// The Nemotron-H Engine's load path and its one refusal.
+// The Nemotron-H Engine's load path and its generation path, end to end.
 //
 // The Engine dispatches this family by the artifact's own config, binds the 45.28 GB artifact into
-// the model's parameters, and reports ready with the metadata it derived from that config. Its
-// generation path then fails through the family Program's own refusal -- the landed forward is a
-// zero-state prefill, so a lane driven through it would compute a wrong model -- and the Engine has
-// to stay usable afterwards rather than crash.
+// the model's parameters, reports ready with the metadata it derived from that config, and then
+// serves a generation: the prompt is prefilled into the lane's state, one token is drawn, and each
+// later round decodes one token against the state the prefill left. The tokens the Engine returns
+// are the family's own -- the last stage of a path whose first stage is the composition's forward --
+// so a returned token is evidence that the whole wiring ran, not that a stub answered.
 //
 // NINFER_NEMOTRON_ARTIFACT unset skips (77): the artifact is 45 GB and a routine run must not pay
 // for it. A machine without a CUDA device skips too, because the Engine initializes one.
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace ninfer;
 
@@ -51,7 +53,8 @@ int main() {
         return 77;
     }
 
-    std::string refusal;
+    std::string failure;
+    std::vector<std::int32_t> generated;
     try {
         // The artifact's own text config, which is what the Engine's metadata has to agree with:
         // parsed here by the family's parser rather than restated, so a metadata field that is
@@ -123,27 +126,33 @@ int main() {
         std::cout << "prepared " << prompt.summary().prompt_tokens << " prompt tokens\n";
 
         RequestOptions request;
-        request.execution.requested_output_tokens = 1;
+        // Four tokens rather than one: a single token could come from the prefill's own draw, while
+        // every token after the first is a decode round that had to carry the state forward.
+        request.execution.requested_output_tokens = 4;
         try {
             const GenerationResult result = engine.generate(std::move(prompt), std::move(request));
-            expect(false, "generation returned " +
-                              std::to_string(result.generated_token_ids.size()) +
-                              " tokens instead of refusing");
-        } catch (const std::exception& error) { refusal = error.what(); }
-        // The Engine stays usable after the refusal: this is a request error, not a crash.
-        expect(engine.is_available(), "the Engine is unavailable after the refused request");
+            generated                       = result.generated_token_ids;
+            for (const std::int32_t id : generated) {
+                if (id < 0 || id >= static_cast<std::int32_t>(expected.vocab_size)) {
+                    expect(false, "a generated token is outside the model's vocabulary");
+                }
+            }
+        } catch (const std::exception& error) { failure = error.what(); }
+        // The Engine stays usable after a request: whatever the request did, the next one may run.
+        expect(engine.is_available(), "the Engine is unavailable after the request");
     } catch (const std::exception& error) {
         std::cerr << "FAIL: the Engine load path threw " << error.what() << '\n';
         return 1;
     }
 
-    std::cout << "refusal | " << refusal << '\n';
-    // The refusal is the family Program's own, naming the entry point it refused and the missing
-    // piece in its own words; a wrapper-level failure would carry neither.
-    expect(refusal.find(std::string(nemotron::kMissingStatePersistence)) != std::string::npos,
-           "the refusal does not quote the family Program's missing state persistence");
-    expect(refusal.find("prefill") != std::string::npos,
-           "the refusal does not name the entry point it refused");
+    if (!failure.empty()) {
+        std::cerr << "FAIL: the generation threw " << failure << '\n';
+        ++failures;
+    }
+    std::cout << "generated " << generated.size() << " token(s):";
+    for (const std::int32_t id : generated) { std::cout << ' ' << id; }
+    std::cout << '\n';
+    expect(generated.size() == 4, "the Engine did not return the four tokens it was asked for");
 
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";

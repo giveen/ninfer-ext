@@ -41,7 +41,11 @@
 // latent width.
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/layout.h"
+#include "core/linear_attention_state.h"
+#include "models/nemotron_h/attention_state.h"
 #include "models/nemotron_h/forward.h"
+#include "models/nemotron_h/program.h"
 #include "models/nemotron_h/weights.h"
 #include "ninfer/ops/mamba2_scan.h"
 #include "ninfer/ops/sliding_causal_attention.h"
@@ -57,6 +61,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -139,11 +144,16 @@ const DumpTensor& need(const Dump& dump, const std::string& name) {
     return found->second;
 }
 
-std::vector<std::int32_t> read_tokens(const std::string& directory) {
-    const std::vector<char> bytes = read_bytes(directory + "/tokens.i32");
+// The i32 vector one file holds, exactly as the reference wrote it.
+std::vector<std::int32_t> read_tokens_file(const std::string& path) {
+    const std::vector<char> bytes = read_bytes(path);
     std::vector<std::int32_t> tokens(bytes.size() / sizeof(std::int32_t));
     std::memcpy(tokens.data(), bytes.data(), bytes.size());
     return tokens;
+}
+
+std::vector<std::int32_t> read_tokens(const std::string& directory) {
+    return read_tokens_file(directory + "/tokens.i32");
 }
 
 // ----------------------------------------------------------------------------------- the config
@@ -514,6 +524,93 @@ struct StageStat {
 
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
 
+// One stage's name, as every report below writes it: the identity the composition reports a stage
+// by rather than the reference's dotted path, so this harness carries no reference naming outside
+// the `dump_name` mapping further down.
+std::string stage_text(nemotron::BlockStage stage) {
+    switch (stage) {
+    case nemotron::BlockStage::BlockNorm:
+        return "BlockNorm";
+    case nemotron::BlockStage::MambaInProj:
+        return "MambaInProj";
+    case nemotron::BlockStage::MambaConv:
+        return "MambaConv";
+    case nemotron::BlockStage::MambaNorm:
+        return "MambaNorm";
+    case nemotron::BlockStage::MambaOutProj:
+        return "MambaOutProj";
+    case nemotron::BlockStage::MambaMixer:
+        return "MambaMixer";
+    case nemotron::BlockStage::MoeRouterInput:
+        return "MoeRouterInput";
+    case nemotron::BlockStage::MoeRouterLogits:
+        return "MoeRouterLogits";
+    case nemotron::BlockStage::MoeRouterIds:
+        return "MoeRouterIds";
+    case nemotron::BlockStage::MoeRouterWeights:
+        return "MoeRouterWeights";
+    case nemotron::BlockStage::MoeLatentIn:
+        return "MoeLatentIn";
+    case nemotron::BlockStage::MoeExperts:
+        return "MoeExperts";
+    case nemotron::BlockStage::MoeLatentOut:
+        return "MoeLatentOut";
+    case nemotron::BlockStage::MoeShared:
+        return "MoeShared";
+    case nemotron::BlockStage::MoeMixer:
+        return "MoeMixer";
+    case nemotron::BlockStage::AttentionQuery:
+        return "AttentionQuery";
+    case nemotron::BlockStage::AttentionKey:
+        return "AttentionKey";
+    case nemotron::BlockStage::AttentionValue:
+        return "AttentionValue";
+    case nemotron::BlockStage::AttentionProjected:
+        return "AttentionProjected";
+    case nemotron::BlockStage::AttentionOutProj:
+        return "AttentionOutProj";
+    case nemotron::BlockStage::AttentionMixer:
+        return "AttentionMixer";
+    case nemotron::BlockStage::Block:
+        return "Block";
+    case nemotron::BlockStage::Embedding:
+        return "Embedding";
+    case nemotron::BlockStage::FinalNorm:
+        return "FinalNorm";
+    case nemotron::BlockStage::Logits:
+        return "Logits";
+    }
+    return "?";
+}
+
+// A tensor's values on the host, read back while the caller's own stream is still running them, so
+// the read has to be ordered after the work already enqueued: this is the one place this harness
+// may not rely on the default stream's implicit ordering.
+std::vector<double> host_values(const Tensor& tensor) {
+    cuda_synchronize();
+    const std::int64_t count = tensor.numel();
+    std::vector<double> values(static_cast<std::size_t>(count));
+    if (tensor.dtype == DType::BF16) {
+        const auto bits = from_device<std::uint16_t>(tensor.data, count);
+        for (std::int64_t index = 0; index < count; ++index) {
+            values[static_cast<std::size_t>(index)] =
+                bf16_to_f32(bits[static_cast<std::size_t>(index)]);
+        }
+    } else if (tensor.dtype == DType::FP32) {
+        const auto host = from_device<float>(tensor.data, count);
+        for (std::int64_t index = 0; index < count; ++index) {
+            values[static_cast<std::size_t>(index)] = host[static_cast<std::size_t>(index)];
+        }
+    } else {
+        const auto host = from_device<std::int32_t>(tensor.data, count);
+        for (std::int64_t index = 0; index < count; ++index) {
+            values[static_cast<std::size_t>(index)] =
+                static_cast<double>(host[static_cast<std::size_t>(index)]);
+        }
+    }
+    return values;
+}
+
 class Comparator : public nemotron::BlockObserver {
 public:
     Comparator(const Dump& dump, const nemotron::TextConfig& config)
@@ -581,62 +678,6 @@ public:
     [[nodiscard]] int failures() const { return failures_; }
 
 private:
-    static std::string stage_text(nemotron::BlockStage stage) {
-        switch (stage) {
-        case nemotron::BlockStage::BlockNorm:
-            return "BlockNorm";
-        case nemotron::BlockStage::MambaInProj:
-            return "MambaInProj";
-        case nemotron::BlockStage::MambaConv:
-            return "MambaConv";
-        case nemotron::BlockStage::MambaNorm:
-            return "MambaNorm";
-        case nemotron::BlockStage::MambaOutProj:
-            return "MambaOutProj";
-        case nemotron::BlockStage::MambaMixer:
-            return "MambaMixer";
-        case nemotron::BlockStage::MoeRouterInput:
-            return "MoeRouterInput";
-        case nemotron::BlockStage::MoeRouterLogits:
-            return "MoeRouterLogits";
-        case nemotron::BlockStage::MoeRouterIds:
-            return "MoeRouterIds";
-        case nemotron::BlockStage::MoeRouterWeights:
-            return "MoeRouterWeights";
-        case nemotron::BlockStage::MoeLatentIn:
-            return "MoeLatentIn";
-        case nemotron::BlockStage::MoeExperts:
-            return "MoeExperts";
-        case nemotron::BlockStage::MoeLatentOut:
-            return "MoeLatentOut";
-        case nemotron::BlockStage::MoeShared:
-            return "MoeShared";
-        case nemotron::BlockStage::MoeMixer:
-            return "MoeMixer";
-        case nemotron::BlockStage::AttentionQuery:
-            return "AttentionQuery";
-        case nemotron::BlockStage::AttentionKey:
-            return "AttentionKey";
-        case nemotron::BlockStage::AttentionValue:
-            return "AttentionValue";
-        case nemotron::BlockStage::AttentionProjected:
-            return "AttentionProjected";
-        case nemotron::BlockStage::AttentionOutProj:
-            return "AttentionOutProj";
-        case nemotron::BlockStage::AttentionMixer:
-            return "AttentionMixer";
-        case nemotron::BlockStage::Block:
-            return "Block";
-        case nemotron::BlockStage::Embedding:
-            return "Embedding";
-        case nemotron::BlockStage::FinalNorm:
-            return "FinalNorm";
-        case nemotron::BlockStage::Logits:
-            return "Logits";
-        }
-        return "?";
-    }
-
     // The dumped stage a reported one corresponds to, or the empty string when the reference does
     // not expose it. Every other stage's memory order is the dump's own, because both are
     // feature-fastest with the tokens outside.
@@ -919,34 +960,6 @@ private:
         record(dump_name(layer, nemotron::BlockStage::MoeRouterWeights), want, got);
     }
 
-    // The stages are read back while the caller's own stream is still running them, so the read has
-    // to be ordered after the work already enqueued: this is the one place the test may not rely on
-    // the default stream's implicit ordering.
-    [[nodiscard]] static std::vector<double> host_values(const Tensor& tensor) {
-        cuda_synchronize();
-        const std::int64_t count = tensor.numel();
-        std::vector<double> values(static_cast<std::size_t>(count));
-        if (tensor.dtype == DType::BF16) {
-            const auto bits = from_device<std::uint16_t>(tensor.data, count);
-            for (std::int64_t index = 0; index < count; ++index) {
-                values[static_cast<std::size_t>(index)] =
-                    bf16_to_f32(bits[static_cast<std::size_t>(index)]);
-            }
-        } else if (tensor.dtype == DType::FP32) {
-            const auto host = from_device<float>(tensor.data, count);
-            for (std::int64_t index = 0; index < count; ++index) {
-                values[static_cast<std::size_t>(index)] = host[static_cast<std::size_t>(index)];
-            }
-        } else {
-            const auto host = from_device<std::int32_t>(tensor.data, count);
-            for (std::int64_t index = 0; index < count; ++index) {
-                values[static_cast<std::size_t>(index)] =
-                    static_cast<double>(host[static_cast<std::size_t>(index)]);
-            }
-        }
-        return values;
-    }
-
     const Dump& dump_;
     const nemotron::TextConfig& config_;
     mutable std::vector<StageStat> stats_;
@@ -959,6 +972,780 @@ private:
     mutable int unexplained_       = 0;
     mutable double tightest_ratio_ = 0.0;
 };
+
+// ------------------------------------------------------------------------------- the decode oracle
+//
+// The walk above is a *zero-state* prefill and it is the oracle for decode: a stateful decode of a
+// prefix is the same computation from the state the prefill left, so it has to report the same
+// stages, at the same absolute positions, with the same logits. Four runs establish that, and each
+// one exists for a failure the others cannot see:
+//
+//  * decode ≡ prefill, one token at a time (`K = 8`, and `K = 1`, one step being what
+//    `Program` drives per generated token): the state is read and written per token, and a
+//    comparison of the logits alone would let a wrong mixer stage be absorbed by a later
+//    norm before it shows;
+//  * two chunks versus one pass: a state that is *written* but never *read*, or read but never
+//    written, agrees with a single-call test and fails only at a boundary -- so every stage of the
+//    second chunk is compared *including its first tokens*, where a chunk that started from a zero
+//    state differs, and the same tokens are then decoded one at a time from the state two chunks
+//    left, which is the property `Program` relies on;
+//  * a lane reused across the reset `Program::create` performs: the convolution Op always reads the
+//    state it is handed, so a frontier that was not emptied makes the *next* sequence's first pass
+//    silently wrong rather than merely different -- and a reset is only worth performing if it
+//    reproduces the run exactly, which is why that comparison is bit for bit rather than within the
+//    walk's criterion;
+//  * the reference's own post-decode state, when the dump's second mode wrote one: a state that is
+//    subtly wrong (an axis transposed, a key tail that is not exactly zero) is invisible in the
+//    logits until it propagates.
+//
+// Every comparison is against the *same* stage's column at the same absolute position. Every stage
+// this composition reports keeps its innermost extent -- the channels, the experts, the ranks --
+// fastest with the token axis strided, so column `t` is `columns` contiguous values at
+// `t * columns`, which is also what a one-token pass writes as its only column.
+
+// The floors the state itself is compared at, from the decode design
+// (local://nemotron-decode-design.md §3.2): the convolution window is a copy of the composition's
+// own BF16 operands (the walk's measured floor is 0.0016 to 0.008, so 0.01 is the operand
+// representation with headroom), and the recurrent plane is FP32 on both sides but *built* from
+// BF16 operands here and FP32 ones there, so its difference is the representation (~1e-3) rather
+// than FP32 drift. The decisive part of the comparison is not its upper bound but its lower one: a
+// state image of the wrong width or dtype is far outside both.
+constexpr double kStateConvRelL2      = 0.01;
+constexpr double kStateRecurrentRelL2 = 1e-3;
+
+// One pass's stage, read back to the host: `columns` is what one token owns and `values` holds
+// `columns` per column, in the tensor's own memory order.
+struct CapturedStage {
+    std::int32_t columns = 0;
+    std::vector<double> values;
+
+    [[nodiscard]] std::int32_t tokens() const {
+        return columns == 0
+                   ? 0
+                   : static_cast<std::int32_t>(values.size() / static_cast<std::size_t>(columns));
+    }
+};
+
+using StageKey = std::pair<std::size_t, nemotron::BlockStage>;
+using Capture  = std::map<StageKey, CapturedStage>;
+
+std::string stage_label(const StageKey& key) {
+    return stage_text(key.second) + " (block " + std::to_string(key.first) + ")";
+}
+
+// Every stage one pass writes, read back as it is reported: a stage borrows the pass's arena or
+// workspace and is valid for the callback only, so the read has to happen inside it.
+class CaptureObserver : public nemotron::BlockObserver {
+public:
+    explicit CaptureObserver(Capture& capture) : capture_(&capture) {}
+
+    void on_stage(std::size_t layer, nemotron::BlockStage stage,
+                  const Tensor& tensor) const override {
+        CapturedStage captured;
+        captured.columns = tensor.ne[0];
+        captured.values  = host_values(tensor);
+        if (captured.columns <= 0 ||
+            captured.values.size() % static_cast<std::size_t>(captured.columns) != 0) {
+            throw std::runtime_error("nemotron_h decode: block " + std::to_string(layer) + "'s " +
+                                     stage_text(stage) +
+                                     " stage has no per-token column: its innermost extent does "
+                                     "not divide its element count");
+        }
+        if (!capture_->emplace(StageKey{layer, stage}, std::move(captured)).second) {
+            throw std::runtime_error("nemotron_h decode: block " + std::to_string(layer) + "'s " +
+                                     stage_text(stage) + " stage was reported twice in one pass");
+        }
+    }
+
+private:
+    Capture* capture_;
+};
+
+// One pass over a slice of the fixture's own tokens, with every stage it writes captured. The
+// logits are one of those stages, so a comparison covers them with the rest rather than beside
+// them.
+Capture run_pass(const nemotron::Model& model, const Tensor& ids, Tensor& logits,
+                 const nemotron::PassState* state, DeviceArena& arena,
+                 DeviceExecutionView execution) {
+    Capture capture;
+    const CaptureObserver observer(capture);
+    nemotron::forward_model(model, ids, arena, logits, execution, state,
+                            nemotron::HeadColumns::Every, &observer);
+    cuda_synchronize();
+    return capture;
+}
+
+// The decode steps arrive one token at a time, so their captures are single-column passes; a
+// comparison against a multi-token run wants those columns beside each other, which is what the
+// same tokens as one pass would have written.
+void append_capture(Capture& into, const Capture& one) {
+    for (const auto& [key, stage] : one) {
+        if (stage.tokens() != 1) {
+            throw std::runtime_error("nemotron_h decode: " + stage_label(key) + " reported " +
+                                     std::to_string(stage.tokens()) +
+                                     " columns for a one-token pass");
+        }
+        auto found = into.find(key);
+        if (found == into.end()) {
+            found = into.emplace(key, CapturedStage{stage.columns, {}}).first;
+        }
+        if (found->second.columns != stage.columns) {
+            throw std::runtime_error("nemotron_h decode: " + stage_label(key) +
+                                     " changed its innermost extent between decode steps");
+        }
+        found->second.values.insert(found->second.values.end(), stage.values.begin(),
+                                    stage.values.end());
+    }
+    if (into.size() != one.size()) {
+        throw std::runtime_error("nemotron_h decode: a decode step did not report every stage the "
+                                 "others did");
+    }
+}
+
+// One stage's column against another's, in the same shape the walk above reports a whole stage in:
+// relative L2 against the actual column's own energy, and the largest absolute difference.
+struct ColumnStat {
+    std::string name;
+    double relative_l2 = 0.0;
+    double max_abs     = 0.0;
+};
+
+ColumnStat compare_column(const StageKey& key, const CapturedStage& reference,
+                          std::int32_t reference_token, const CapturedStage& actual,
+                          std::int32_t actual_token) {
+    if (reference.columns != actual.columns) {
+        throw std::runtime_error("nemotron_h decode: " + stage_label(key) + " is " +
+                                 std::to_string(reference.columns) +
+                                 " values wide in the reference run and " +
+                                 std::to_string(actual.columns) + " in the state-driven one");
+    }
+    if (reference_token < 0 || reference_token >= reference.tokens() || actual_token < 0 ||
+        actual_token >= actual.tokens()) {
+        throw std::runtime_error("nemotron_h decode: " + stage_label(key) +
+                                 " was asked for a column it does not hold");
+    }
+    const std::size_t columns = static_cast<std::size_t>(reference.columns);
+    const double* const want =
+        reference.values.data() + static_cast<std::size_t>(reference_token) * columns;
+    const double* const got =
+        actual.values.data() + static_cast<std::size_t>(actual_token) * columns;
+    double worst         = 0.0;
+    double energy_actual = 0.0;
+    double energy_error  = 0.0;
+    for (std::size_t index = 0; index < columns; ++index) {
+        const double difference = std::abs(got[index] - want[index]);
+        worst                   = std::max(worst, difference);
+        energy_actual += got[index] * got[index];
+        energy_error += difference * difference;
+    }
+    return ColumnStat{stage_label(key), std::sqrt(energy_error / std::max(energy_actual, 1e-30)),
+                      worst};
+}
+
+// What one comparison found. `loosest` is the stage with the largest relative L2 among those
+// compared and `logits` is the head's own stage beside it: the logits are one stage among many, and
+// naming them separately is what says whether a difference is the model's own arithmetic or the
+// state's.
+struct OracleVerdict {
+    int failures            = 0;
+    std::size_t comparisons = 0;
+    ColumnStat loosest;
+    ColumnStat logits;
+};
+
+// Every stage a state-driven run wrote, against the reference run's own column at the same absolute
+// position, for `count` positions starting at `reference_first`. Fatal on a stage outside the
+// walk's criterion, in the walk's own reporting style.
+OracleVerdict compare_positions(const Capture& reference, std::int32_t reference_first,
+                                const Capture& actual, std::int32_t count,
+                                const std::string& label) {
+    OracleVerdict verdict;
+    if (actual.size() != reference.size()) {
+        throw std::runtime_error(
+            "nemotron_h decode: " + label + " reported " + std::to_string(actual.size()) +
+            " stages where the reference run reported " + std::to_string(reference.size()));
+    }
+    for (const auto& [key, stage] : actual) {
+        const auto found = reference.find(key);
+        if (found == reference.end()) {
+            throw std::runtime_error("nemotron_h decode: " + label + " reported " +
+                                     stage_label(key) + ", which the reference run did not");
+        }
+        for (std::int32_t token = 0; token < count; ++token) {
+            const ColumnStat stat =
+                compare_column(key, found->second, reference_first + token, stage, token);
+            ++verdict.comparisons;
+            if (verdict.loosest.name.empty() || stat.relative_l2 > verdict.loosest.relative_l2) {
+                verdict.loosest = stat;
+            }
+            if (key.second == nemotron::BlockStage::Logits) { verdict.logits = stat; }
+            if (stat.relative_l2 > kStageRelL2 || stat.max_abs > kStageMaxAbs) {
+                ++verdict.failures;
+                std::cerr << label << ": " << stat.name << " at position "
+                          << (reference_first + token) << ": rel_l2=" << stat.relative_l2
+                          << " max_abs=" << stat.max_abs << '\n';
+            }
+        }
+    }
+    if (verdict.logits.name.empty()) {
+        throw std::runtime_error("nemotron_h decode: " + label + " reported no logits stage");
+    }
+    return verdict;
+}
+
+// Two captures of the same computation, value for value. The reported doubles are the operands
+// themselves (a BF16 or FP32 bit pattern maps to one double), so equality here is equality of the
+// computation's own output rather than a tolerance on it.
+int compare_exact(const Capture& first, const Capture& second, const std::string& label) {
+    if (first.size() != second.size()) {
+        throw std::runtime_error("nemotron_h decode: " + label + " reported " +
+                                 std::to_string(second.size()) +
+                                 " stages where the first run of "
+                                 "the same passes reported " +
+                                 std::to_string(first.size()));
+    }
+    int failures = 0;
+    for (const auto& [key, stage] : first) {
+        const auto found = second.find(key);
+        if (found == second.end()) {
+            throw std::runtime_error("nemotron_h decode: " + label + " did not report " +
+                                     stage_label(key));
+        }
+        if (found->second.values.size() != stage.values.size()) {
+            throw std::runtime_error("nemotron_h decode: " + stage_label(key) + " holds " +
+                                     std::to_string(found->second.values.size()) +
+                                     " values in one run and " +
+                                     std::to_string(stage.values.size()) + " in the other");
+        }
+        for (std::size_t index = 0; index < stage.values.size(); ++index) {
+            if (found->second.values[index] != stage.values[index]) {
+                ++failures;
+                std::cerr << label << ": " << stage_label(key) << " value " << index << " is "
+                          << stage.values[index] << " before the reset and "
+                          << found->second.values[index] << " after it\n";
+                break;
+            }
+        }
+    }
+    return failures;
+}
+
+// The family's state over storage this walk owns: the Mamba pool (one slot), the attention state
+// (one lane) and the per-block binding a pass takes, which is the same three pieces `Program`
+// assembles. Nothing here is a second layout: the pool's extents are the config's own except the
+// scan's key axis, which is a constant of that Op's kernel (program.h) and carries a narrower
+// configured state by zero extension.
+struct FamilyState {
+    DeviceBuffer backing;
+    LinearAttentionStatePoolLayout layout;
+    std::unique_ptr<nemotron::AttentionState> attention;
+    std::unique_ptr<LinearAttentionStatePool> pool;
+    std::vector<nemotron::BlockState> blocks;
+
+    // The empty state a lane starts a request from, which is `Program::create`'s own pair of calls:
+    // the Mamba frontier zeroed -- the zero history and plane a sequence's first pass begins from
+    // -- and the attention positions made unwritten, because an unwritten slot is invisible while
+    // an *initialized* one is what makes it so. A lane whose step has not been advanced is refused
+    // by the attention state, so this follows the pass it resets after.
+    void reset(DeviceExecutionView execution) {
+        pool->zero_slot(0, execution.stream);
+        attention->reset(0, execution.stream);
+    }
+
+    // A pass appends every attention block's K/V before its query runs and does not advance the
+    // frontier; the caller advances once between passes, so a step's own key and value participate
+    // in its own output and the next pass starts where this one ended.
+    void advance() { attention->advance(0); }
+
+    [[nodiscard]] nemotron::PassState pass(std::int32_t first_position) {
+        return nemotron::PassState{blocks, first_position};
+    }
+};
+
+std::uint32_t count_kind(const nemotron::TextConfig& config, nemotron::BlockKind kind) {
+    std::uint32_t count = 0;
+    for (std::uint32_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
+        if (config.block_kind(layer) == kind) { ++count; }
+    }
+    return count;
+}
+
+FamilyState make_family_state(const nemotron::TextConfig& config, std::int32_t capacity) {
+    const nemotron::MambaConfig& mamba = *config.mamba;
+    FamilyState state;
+    LinearAttentionStatePoolSpec spec{};
+    spec.layers         = count_kind(config, nemotron::BlockKind::Mamba);
+    spec.conv_channels  = static_cast<std::int32_t>(mamba.conv_channels());
+    spec.conv_width     = static_cast<std::int32_t>(mamba.conv_kernel) - 1;
+    spec.value_heads    = static_cast<std::int32_t>(mamba.num_heads);
+    spec.value_head_dim = static_cast<std::int32_t>(mamba.head_dim);
+    spec.key_head_dim   = nemotron::kMambaScanStateExtent;
+    spec.slot_count     = 1;
+    spec.conv_dtype     = DType::BF16;
+    LayoutBuilder builder;
+    state.layout  = plan_linear_attention_state_pool(builder, spec);
+    state.backing = DeviceBuffer(builder.finish(256, "nemotron_h decode state"));
+    state.pool    = std::make_unique<LinearAttentionStatePool>(
+        DeviceSpan{state.backing.p, state.backing.bytes}, state.layout);
+    state.attention = std::make_unique<nemotron::AttentionState>(
+        *config.attention, count_kind(config, nemotron::BlockKind::Attention), capacity, 1);
+    // One entry per block, as `Program::bind_state` binds it: the pool's layers are the Mamba
+    // blocks in their own order and the attention state's are the attention blocks', because a
+    // block index handed to either pool unchanged would bind another block's state on a config
+    // whose block kinds interleave -- which this one's do.
+    state.blocks.assign(config.num_hidden_layers(), nemotron::BlockState{});
+    std::uint32_t mamba_layer     = 0;
+    std::uint32_t attention_layer = 0;
+    for (std::size_t layer = 0; layer < state.blocks.size(); ++layer) {
+        switch (config.block_kind(static_cast<std::uint32_t>(layer))) {
+        case nemotron::BlockKind::Mamba:
+            state.blocks[layer].conv      = state.pool->conv_slot(mamba_layer, 0);
+            state.blocks[layer].recurrent = state.pool->recurrent_slot(mamba_layer, 0);
+            ++mamba_layer;
+            break;
+        case nemotron::BlockKind::Attention:
+            state.blocks[layer].attention.state = state.attention.get();
+            state.blocks[layer].attention.lane  = 0;
+            state.blocks[layer].attention.layer = attention_layer++;
+            // The Op's key-split workspace stays unset: its one-pass route computes the same result
+            // (forward.h), and a walk that needs no second allocation to say so should not make
+            // one.
+            break;
+        case nemotron::BlockKind::Moe:
+            break;
+        }
+    }
+    return state;
+}
+
+// The reference's own post-decode state, from the dump's second mode (`<dump>/decode/`,
+// tools/verify/nemotron_h_reference.py). That mode states the sequence it is of --
+// `prefix_tokens.i32` consumed from position zero and `decode_token.i32` stepped at the prefix's
+// length -- which is the same call this walk makes through the state. The check is guarded because
+// the mode is a second dump, and reported either way: a comparison that did not run is a fact about
+// this run, not a silent pass. What it adds over the stage comparisons is the stored state itself,
+// which no stage exposes -- an axis transposed, a width carried wrongly or a key tail that is not
+// exactly zero is invisible in the logits until it propagates.
+int check_decoded_state(const std::string& directory, const nemotron::Model& model,
+                        DeviceArena& arena, DeviceExecutionView execution) {
+    const nemotron::TextConfig& config = model.config();
+    const std::string decode_directory = directory + "/decode";
+    if (!std::ifstream(decode_directory + "/manifest.txt")) {
+        std::printf("nemotron_h decode: no %s/manifest.txt, so the reference's own post-decode "
+                    "state was not compared\n",
+                    decode_directory.c_str());
+        return 0;
+    }
+    const Dump reference          = read_dump(decode_directory);
+    const std::string prefix_file = decode_directory + "/prefix_tokens.i32";
+    const std::string step_file   = decode_directory + "/decode_token.i32";
+    // The sequence the reference decodes, from the dump rather than from this fixture: the state
+    // compared is then the state of the sequence the reference ran, whatever the fixture beside it
+    // holds.
+    const std::vector<std::int32_t> prefix = read_tokens_file(prefix_file);
+    const std::vector<std::int32_t> step   = read_tokens_file(step_file);
+    // The reference's own length -- its attention layer's cached length -- has to be what its
+    // prefix and its step together account for, or the dump states no state of a sequence this walk
+    // can reach and there is nothing to compare against.
+    const auto length_entry = reference.find("state.attention_length.0");
+    if (prefix.empty() || step.empty() || length_entry == reference.end() ||
+        length_entry->second.values.size() != 1) {
+        std::printf("nemotron_h decode: %s does not state a prefix, a step and a length together, "
+                    "so its state was not compared\n",
+                    decode_directory.c_str());
+        return 0;
+    }
+    const auto length = static_cast<std::int32_t>(std::lround(length_entry->second.values.front()));
+    if (length != static_cast<std::int32_t>(prefix.size() + step.size())) {
+        std::printf(
+            "nemotron_h decode: the decode dump's length of %d is neither its prefix of %zu nor "
+            "that prefix plus its step of %zu, so its state was not compared\n",
+            length, prefix.size(), step.size());
+        return 0;
+    }
+    const auto require = [&](const std::string& name,
+                             std::initializer_list<std::int32_t> shape) -> const DumpTensor& {
+        const DumpTensor& tensor = need(reference, name);
+        if (tensor.shape != std::vector<std::int32_t>(shape)) {
+            std::ostringstream got;
+            for (const std::int32_t extent : tensor.shape) { got << extent << 'x'; }
+            throw std::runtime_error("nemotron_h decode: the decode dump's " + name + " is " +
+                                     got.str() + " rather than this config's state shape");
+        }
+        return tensor;
+    };
+
+    const nemotron::MambaConfig& mamba = *config.mamba;
+    const std::int32_t channels        = static_cast<std::int32_t>(mamba.conv_channels());
+    const std::int32_t width           = static_cast<std::int32_t>(mamba.conv_kernel) - 1;
+    const std::int32_t heads           = static_cast<std::int32_t>(mamba.num_heads);
+    const std::int32_t head_dim        = static_cast<std::int32_t>(mamba.head_dim);
+    const std::int32_t state_size      = static_cast<std::int32_t>(mamba.state_size);
+    const std::int32_t keys            = nemotron::kMambaScanStateExtent;
+    const std::int32_t vocabulary      = static_cast<std::int32_t>(config.vocab_size);
+
+    // The state the reference's own decode left: its prefix as one state-driven pass from position
+    // zero, then its step at the prefix's length, which is the call the dump's second mode makes.
+    const std::int32_t prompt_tokens = static_cast<std::int32_t>(prefix.size());
+    const std::int32_t step_tokens   = static_cast<std::int32_t>(step.size());
+    FamilyState state                = make_family_state(config, length);
+    state.reset(execution);
+    std::vector<std::int32_t> ids;
+    ids.reserve(prefix.size() + step.size());
+    ids.insert(ids.end(), prefix.begin(), prefix.end());
+    ids.insert(ids.end(), step.begin(), step.end());
+    DeviceBuffer ids_buffer(ids.size() * sizeof(std::int32_t));
+    ids_buffer.copy_from_host(ids.data(), ids_buffer.bytes);
+    DeviceBuffer logits(static_cast<std::size_t>(vocabulary) * static_cast<std::size_t>(length) *
+                        sizeof(std::uint16_t));
+    const auto ids_view = [&ids_buffer](std::int32_t first, std::int32_t count) {
+        return Tensor(static_cast<std::int32_t*>(ids_buffer.p) + first, DType::I32, {count});
+    };
+    Tensor prompt_logits(logits.p, DType::BF16, {vocabulary, prompt_tokens});
+    nemotron::PassState prompt_pass = state.pass(0);
+    (void)run_pass(model, ids_view(0, prompt_tokens), prompt_logits, &prompt_pass, arena,
+                   execution);
+    state.advance();
+    Tensor step_logits_buffer(logits.p, DType::BF16, {vocabulary, step_tokens});
+    nemotron::PassState step_pass = state.pass(prompt_tokens);
+    (void)run_pass(model, ids_view(prompt_tokens, step_tokens), step_logits_buffer, &step_pass,
+                   arena, execution);
+    state.advance();
+
+    int failures = 0;
+    if (state.attention->filled(0) != length) {
+        std::cerr << "nemotron_h decode: the attention state holds " << state.attention->filled(0)
+                  << " tokens where the reference's own counts " << length << '\n';
+        ++failures;
+    }
+    // The two planes the pool holds, per Mamba block, against the reference's own post-decode
+    // state. The attention planes' *values* are covered by the stage comparison above; what this
+    // adds is the stored state itself, which no stage exposes.
+    std::uint32_t mamba_layer = 0;
+    for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
+        if (config.block_kind(static_cast<std::uint32_t>(layer)) != nemotron::BlockKind::Mamba) {
+            continue;
+        }
+        const std::string suffix = std::to_string(mamba_layer++);
+
+        // The convolution window: the reference stores `[1, conv_dim, conv_kernel]` with the taps
+        // innermost and keeps one tap more than the convolution reads, so the tree's `[C,
+        // W-column]`
+        // -- its own order is taps outermost, `w * C + c` -- is the reference's last `W` taps
+        // transposed rather than relabelled. Both are the same raw convolution inputs, so the
+        // difference between them is this composition's operand representation.
+        const DumpTensor& want_conv    = require("state.conv." + suffix, {1, channels, width + 1});
+        const std::vector<double> conv = host_values(state.blocks[layer].conv);
+        double conv_worst              = 0.0;
+        double conv_energy             = 0.0;
+        double conv_error              = 0.0;
+        for (std::int32_t channel = 0; channel < channels; ++channel) {
+            for (std::int32_t tap = 0; tap < width; ++tap) {
+                const double got = conv[static_cast<std::size_t>(tap) * channels + channel];
+                const double want =
+                    want_conv.values[static_cast<std::size_t>(channel) * (width + 1) + tap + 1];
+                const double difference = std::abs(got - want);
+                conv_worst              = std::max(conv_worst, difference);
+                conv_energy += got * got;
+                conv_error += difference * difference;
+            }
+        }
+        const double conv_rel = std::sqrt(conv_error / std::max(conv_energy, 1e-30));
+
+        // The recurrent plane: the reference stores `[1, H, head_dim, state]` with the state
+        // innermost, the tree `[key, head_dim, H]` with the key axis fastest, so tree
+        // `(key, d, h)` is the reference's `[0, h, d, key]`. The tree's plane is wider than this
+        // config's state -- the scan's key extent is a constant of its kernel and a narrower state
+        // is carried by zero-extending the axis -- so every key past the configured state is
+        // required to be *exactly* zero: the carry is the same computation only while a zero key
+        // stays zero.
+        const DumpTensor& want_plane =
+            require("state.recurrent." + suffix, {1, heads, head_dim, state_size});
+        const std::vector<double> plane = host_values(state.blocks[layer].recurrent);
+        double plane_worst              = 0.0;
+        double plane_energy             = 0.0;
+        double plane_error              = 0.0;
+        std::int64_t tail_nonzero       = 0;
+        for (std::int32_t head = 0; head < heads; ++head) {
+            for (std::int32_t dim = 0; dim < head_dim; ++dim) {
+                const std::size_t row = static_cast<std::size_t>(head) * head_dim * keys +
+                                        static_cast<std::size_t>(dim) * keys;
+                for (std::int32_t key = 0; key < keys; ++key) {
+                    const double got = plane[row + static_cast<std::size_t>(key)];
+                    if (key >= state_size) {
+                        if (got != 0.0) { ++tail_nonzero; }
+                        continue;
+                    }
+                    const double want =
+                        want_plane.values[static_cast<std::size_t>(head) * head_dim * state_size +
+                                          static_cast<std::size_t>(dim) * state_size + key];
+                    const double difference = std::abs(got - want);
+                    plane_worst             = std::max(plane_worst, difference);
+                    plane_energy += got * got;
+                    plane_error += difference * difference;
+                }
+            }
+        }
+        const double plane_rel = std::sqrt(plane_error / std::max(plane_energy, 1e-30));
+
+        std::printf(
+            "nemotron_h decode: the reference's state at %d tokens, Mamba block %zu: conv "
+            "rel_l2=%.6g max_abs=%.6g (limit %.1e), recurrent rel_l2=%.6g max_abs=%.6g over %d of "
+            "%d keys (limit %.1e), %lld of %d zero-tail keys not exactly zero\n",
+            length, layer, conv_rel, conv_worst, kStateConvRelL2, plane_rel, plane_worst,
+            state_size, keys, kStateRecurrentRelL2, static_cast<long long>(tail_nonzero),
+            keys - state_size);
+        if (conv_rel > kStateConvRelL2) {
+            ++failures;
+            std::cerr << "nemotron_h decode: Mamba block " << layer << "'s convolution window at "
+                      << conv_rel << " relative L2 against the reference's own\n";
+        }
+        if (plane_rel > kStateRecurrentRelL2) {
+            ++failures;
+            std::cerr << "nemotron_h decode: Mamba block " << layer << "'s recurrent plane at "
+                      << plane_rel << " relative L2 against the reference's own\n";
+        }
+        if (tail_nonzero != 0) {
+            ++failures;
+            std::cerr << "nemotron_h decode: Mamba block " << layer << "'s recurrent plane holds "
+                      << tail_nonzero
+                      << " nonzero key values past the configured state, where the "
+                         "scan's zero-extended carry requires exactly zero\n";
+        }
+    }
+    return failures;
+}
+
+// The family's own entry point over the same hand-bound model: a `Program` driven through the
+// request lifecycle and compared against the same zero-state columns. The walk above proves the
+// composition's state arithmetic; this proves the Program *binds* that state -- the pool's slots,
+// the block-to-pool-layer mapping, the attention layer binding and the lane's first position -- and
+// that it drives it. A pass leaves the logits of the token it consumed, so a prefill of `M` tokens
+// leaves column `M - 1` and the one-token decode after it leaves column `M` of the fixture.
+int program_check(DeviceContext& context, DeviceExecutionView execution,
+                  const nemotron::Model& model, const std::vector<std::int32_t>& tokens,
+                  const Capture& reference) {
+    const nemotron::TextConfig& config = model.config();
+    const std::int32_t vocabulary      = static_cast<std::int32_t>(config.vocab_size);
+    const std::int32_t total           = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t prefix          = total - 1;
+    const StageKey logits_key{0, nemotron::BlockStage::Logits};
+    const auto logits_stage = reference.find(logits_key);
+    if (logits_stage == reference.end()) {
+        throw std::runtime_error("nemotron_h decode: the zero-state prefill reported no logits "
+                                 "stage, so the Program has no column to be compared against");
+    }
+    const auto as_column = [](const Tensor& tensor) {
+        CapturedStage stage;
+        stage.columns = tensor.ne[0];
+        stage.values  = host_values(tensor);
+        return stage;
+    };
+
+    EngineOptions options;
+    options.max_context     = static_cast<std::uint32_t>(total);
+    options.max_concurrency = 1;
+    options.kv_cache        = KvCacheStorage::BFloat16;
+    nemotron::Program program(model, options, context);
+
+    int failures = 0;
+    program.create(0, execution);
+    if (program.position(0) != 0) {
+        std::cerr << "nemotron_h Program: a lane just created is at position "
+                  << program.position(0) << " rather than the sequence's first\n";
+        ++failures;
+    }
+    program.prefill(0,
+                    std::span<const std::int32_t>(tokens.data(), static_cast<std::size_t>(prefix)),
+                    execution);
+    if (program.position(0) != prefix) {
+        std::cerr << "nemotron_h Program: a " << prefix << "-token prefill left the lane at "
+                  << program.position(0) << '\n';
+        ++failures;
+    }
+    const ColumnStat prefilled = compare_column(logits_key, logits_stage->second, prefix - 1,
+                                                as_column(program.logits(0)), 0);
+    program.decode(0, tokens[static_cast<std::size_t>(prefix)], execution);
+    if (program.position(0) != total) {
+        std::cerr << "nemotron_h Program: a decode step left the lane at " << program.position(0)
+                  << " rather than " << total << '\n';
+        ++failures;
+    }
+    const ColumnStat decoded =
+        compare_column(logits_key, logits_stage->second, prefix, as_column(program.logits(0)), 0);
+    // A draw is a token, and the greedy sampler `create` installs draws the column's own maximum --
+    // reported beside it rather than asserted, because how a sampler breaks a tie is the sampling
+    // Op's business and its own test's.
+    const std::int32_t drawn = program.sample(0, execution);
+    const std::size_t column =
+        static_cast<std::size_t>(prefix) * static_cast<std::size_t>(vocabulary);
+    std::int32_t argmax = 0;
+    for (std::int32_t id = 1; id < vocabulary; ++id) {
+        if (logits_stage->second.values[column + static_cast<std::size_t>(id)] >
+            logits_stage->second.values[column + static_cast<std::size_t>(argmax)]) {
+            argmax = id;
+        }
+    }
+    if (drawn < 0 || drawn >= vocabulary) {
+        std::cerr << "nemotron_h Program: a draw returned " << drawn
+                  << ", which is outside the model's vocabulary of " << vocabulary << '\n';
+        ++failures;
+    }
+    program.finish(0);
+
+    std::printf(
+        "nemotron_h Program: prefill %d then decode 1, against the forward's columns %d and %d: "
+        "rel_l2=%.6g max_abs=%.6g and rel_l2=%.6g max_abs=%.6g; the draw is %d, %s the decoded "
+        "column's argmax %d\n",
+        prefix, prefix - 1, prefix, prefilled.relative_l2, prefilled.max_abs, decoded.relative_l2,
+        decoded.max_abs, drawn, drawn == argmax ? "which is" : "which is not", argmax);
+    return failures;
+}
+
+// The decode oracle, over `K = 8` and `K = 1`, plus the reused-lane, reference-state and Program
+// checks.
+int decode_oracle(const std::string& directory, const nemotron::Model& model,
+                  const std::vector<std::int32_t>& tokens, DeviceArena& arena,
+                  DeviceExecutionView execution, DeviceContext& context) {
+    const nemotron::TextConfig& config = model.config();
+    const std::int32_t vocabulary      = static_cast<std::int32_t>(config.vocab_size);
+    const std::int32_t total           = static_cast<std::int32_t>(tokens.size());
+    int failures                       = 0;
+
+    // The fixture's tokens once, and every pass a view of its own slice: a one-token decode is the
+    // same call with a one-wide view, so no step copies the prompt or the prefix.
+    DeviceBuffer ids(tokens.size() * sizeof(std::int32_t));
+    ids.copy_from_host(tokens.data(), ids.bytes);
+    const auto ids_view = [&ids](std::int32_t first, std::int32_t count) {
+        return Tensor(static_cast<std::int32_t*>(ids.p) + first, DType::I32, {count});
+    };
+    DeviceBuffer wide_logits(static_cast<std::size_t>(vocabulary) *
+                             static_cast<std::size_t>(total) * sizeof(std::uint16_t));
+    DeviceBuffer step_logits(static_cast<std::size_t>(vocabulary) * sizeof(std::uint16_t));
+
+    // Run 1: the walk above's own call -- a zero-state pass over the whole fixture with the head on
+    // every column. Every comparison below is against one of its columns, so it is the oracle for
+    // every position and every stage at once.
+    Tensor wide(wide_logits.p, DType::BF16, {vocabulary, total});
+    const Capture reference = run_pass(model, ids_view(0, total), wide, nullptr, arena, execution);
+    std::printf("nemotron_h decode: the zero-state prefill reported %zu stages over %d positions\n",
+                reference.size(), total);
+
+    for (const std::int32_t decoded : {8, 1}) {
+        const std::int32_t prefix = total - decoded;
+        {
+            // Run 2: the prefix as one state-driven pass, then one token at a time -- the decode
+            // `Program` drives per generated token.
+            FamilyState state = make_family_state(config, total);
+            state.reset(execution);
+            Tensor chunk(wide_logits.p, DType::BF16, {vocabulary, prefix});
+            nemotron::PassState chunk_pass = state.pass(0);
+            (void)run_pass(model, ids_view(0, prefix), chunk, &chunk_pass, arena, execution);
+            state.advance();
+            Capture decoded_run;
+            Tensor step(step_logits.p, DType::BF16, {vocabulary, 1});
+            for (std::int32_t token = prefix; token < total; ++token) {
+                nemotron::PassState step_pass = state.pass(token);
+                append_capture(decoded_run, run_pass(model, ids_view(token, 1), step, &step_pass,
+                                                     arena, execution));
+                state.advance();
+            }
+            const std::string label = "the decode of " + std::to_string(decoded) + " token(s)";
+            const OracleVerdict verdict =
+                compare_positions(reference, prefix, decoded_run, decoded, label);
+            failures += verdict.failures;
+            std::printf(
+                "nemotron_h decode: %s one at a time from a %d-token prefill: %zu comparisons, "
+                "loosest %s (rel_l2=%.6g, max_abs=%.6g), logits rel_l2=%.6g max_abs=%.6g\n",
+                label.c_str(), prefix, verdict.comparisons, verdict.loosest.name.c_str(),
+                verdict.loosest.relative_l2, verdict.loosest.max_abs, verdict.logits.relative_l2,
+                verdict.logits.max_abs);
+        }
+        {
+            // Run 3: the same split as two *passes*, then the same tokens decoded one at a time
+            // from the state those chunks left.
+            FamilyState state = make_family_state(config, total);
+            state.reset(execution);
+            Tensor first(wide_logits.p, DType::BF16, {vocabulary, prefix});
+            nemotron::PassState first_pass = state.pass(0);
+            (void)run_pass(model, ids_view(0, prefix), first, &first_pass, arena, execution);
+            state.advance();
+            Tensor second_logits(wide_logits.p, DType::BF16, {vocabulary, decoded});
+            nemotron::PassState second_pass = state.pass(prefix);
+            const Capture second = run_pass(model, ids_view(prefix, decoded), second_logits,
+                                            &second_pass, arena, execution);
+            state.advance();
+            // The second chunk's own columns, *including its first tokens*: that is where a chunk
+            // that started from a zero state differs from the one-shot run, so a comparison of the
+            // last column alone would not see the state it is supposed to be reading.
+            const OracleVerdict chunk_verdict = compare_positions(
+                reference, prefix, second, decoded, "the second half of two chunks");
+            failures += chunk_verdict.failures;
+            std::printf(
+                "nemotron_h decode: the second chunk of %d+%d against the one-shot run: %zu "
+                "comparisons, loosest %s (rel_l2=%.6g, max_abs=%.6g), logits rel_l2=%.6g "
+                "max_abs=%.6g\n",
+                prefix, decoded, chunk_verdict.comparisons, chunk_verdict.loosest.name.c_str(),
+                chunk_verdict.loosest.relative_l2, chunk_verdict.loosest.max_abs,
+                chunk_verdict.logits.relative_l2, chunk_verdict.logits.max_abs);
+
+            Capture decoded_run;
+            Tensor step(step_logits.p, DType::BF16, {vocabulary, 1});
+            for (std::int32_t token = prefix; token < total; ++token) {
+                nemotron::PassState step_pass = state.pass(token);
+                append_capture(decoded_run, run_pass(model, ids_view(token, 1), step, &step_pass,
+                                                     arena, execution));
+                state.advance();
+            }
+            const std::string label = "the decode from the two-chunk state";
+            const OracleVerdict verdict =
+                compare_positions(reference, prefix, decoded_run, decoded, label);
+            failures += verdict.failures;
+            std::printf(
+                "nemotron_h decode: %s: %zu comparisons, loosest %s (rel_l2=%.6g, max_abs=%.6g), "
+                "logits rel_l2=%.6g max_abs=%.6g\n",
+                label.c_str(), verdict.comparisons, verdict.loosest.name.c_str(),
+                verdict.loosest.relative_l2, verdict.loosest.max_abs, verdict.logits.relative_l2,
+                verdict.logits.max_abs);
+        }
+    }
+
+    {
+        // A lane reused for a new sequence: the same prefix and the same one-token step twice, with
+        // the reset `Program::create` performs between them. The convolution Op always reads the
+        // state it is handed, so a frontier that was not emptied would make the second sequence's
+        // first pass silently wrong -- and it is only emptied if the reset reproduces the run,
+        // which is why this comparison is exact rather than within the walk's criterion.
+        FamilyState state        = make_family_state(config, total);
+        const std::int32_t reuse = total - 1;
+        const auto run_twice     = [&] {
+            state.reset(execution);
+            Tensor prompt(wide_logits.p, DType::BF16, {vocabulary, reuse});
+            nemotron::PassState prompt_pass = state.pass(0);
+            Capture run =
+                run_pass(model, ids_view(0, reuse), prompt, &prompt_pass, arena, execution);
+            state.advance();
+            Tensor step(step_logits.p, DType::BF16, {vocabulary, 1});
+            nemotron::PassState step_pass = state.pass(reuse);
+            append_capture(run,
+                           run_pass(model, ids_view(reuse, 1), step, &step_pass, arena, execution));
+            state.advance();
+            return run;
+        };
+        const Capture before = run_twice();
+        const Capture after  = run_twice();
+        const int mismatches = compare_exact(before, after, "a lane reused after its reset");
+        failures += mismatches;
+        std::printf("nemotron_h decode: a %d-token prefix plus one step, twice across the reset "
+                    "Program::create performs: %zu stages, %s\n",
+                    reuse, before.size(),
+                    mismatches == 0 ? "identical value for value" : "not identical");
+    }
+
+    failures += program_check(context, execution, model, tokens, reference);
+    failures += check_decoded_state(directory, model, arena, execution);
+    return failures;
+}
 
 // ------------------------------------------------------------------------- the op domain probes
 
@@ -1151,7 +1938,8 @@ int main() {
         Tensor ids_t(ids.p, DType::I32, {kTokens});
         Tensor logits_t(logits.data(), DType::BF16,
                         {static_cast<std::int32_t>(config.vocab_size), kTokens});
-        nemotron::forward_model(*built.model, ids_t, arena, logits_t, execution, &comparator);
+        nemotron::forward_model(*built.model, ids_t, arena, logits_t, execution, nullptr,
+                                nemotron::HeadColumns::Every, &comparator);
         cuda_synchronize();
         failures += comparator.failures();
         if (arena.used() != 0) {
@@ -1210,6 +1998,10 @@ int main() {
             "%d outside the token's own logit perturbation (tightest gap/perturbation %.3f)\n",
             comparator.reordered(), comparator.set_mismatch(), comparator.unexplained(),
             comparator.tightest_ratio());
+        // The oracle above is a zero-state pass; this is the same composition driven with the state
+        // that pass leaves, against the same columns. It runs after the walk so a state defect is
+        // reported beside the walk's own verdict rather than instead of it.
+        failures += decode_oracle(directory, *built.model, tokens, arena, execution, context);
         if (failures != 0) {
             std::cerr << "nemotron_h forward: " << failures << " failure(s)\n";
             return 1;

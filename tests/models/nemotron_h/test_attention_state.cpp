@@ -403,14 +403,65 @@ void refusals(DeviceExecutionView execution) {
         "a lane beyond the state", [&] { (void)state.filled(2); },
         "is not one of this state's 2 lanes");
 
-    // A head width the launcher does not admit: the state owns it, the route refuses it, and the
-    // message names the carry the composition uses for its passes.
+    // A head width the launcher does not admit: the state *carries* it, storing each head's real
+    // dims contiguous at the carried head's start. The decision is made once, here, because the
+    // rows are stored once and read by every later step -- re-padding the whole history per token
+    // would be an O(capacity) scatter. The route is the Op's, at the carried width, scaled by the
+    // config's own head.
     nemotron::AttentionState narrow(attention_config(16), 1, kCapacity, 1);
-    check_bytes(narrow.keys_bytes(), static_cast<std::size_t>(16) * kKvHeads * kCapacity * 2,
-                "a non-admitted head width is still ownable");
+    check(narrow.carried_head() == 32, "a 16-wide head is carried at the narrowest admitted width");
+    check_bytes(narrow.keys_bytes(), static_cast<std::size_t>(32) * kKvHeads * kCapacity * 2,
+                "the carried width is what the planes cost");
+    check(nemotron::carried_attention_head(attention_config()) == kHeadDim,
+          "an admitted head is stored at its own width");
+    check(nemotron::carried_attention_head(attention_config(20)) == 32 &&
+              nemotron::carried_attention_head(attention_config(48)) == 64 &&
+              nemotron::carried_attention_head(attention_config(100)) == 128 &&
+              nemotron::carried_attention_head(attention_config(200)) == 256,
+          "a narrower head takes the narrowest admitted width that holds it");
     expect_refusal(
-        "a head width the launcher does not admit", [&] { (void)narrow.workspace_bytes(1); },
-        "zero-carry");
+        "a head wider than the launcher's widest",
+        [&] { (void)nemotron::carried_attention_head(attention_config(300)); },
+        "admits 32, 64, 128 and 256");
+    // The operands are the stored width's, so a config's own 16-wide operand is refused rather than
+    // read past: the composition is what pads it.
+    const std::vector<float> narrow_values =
+        pattern(static_cast<std::size_t>(16) * kKvHeads * kTokens, 2.5F);
+    DeviceBuffer narrow_k = test::to_device_bf16(narrow_values);
+    DeviceBuffer narrow_v = test::to_device_bf16(narrow_values);
+    const Tensor unpadded(narrow_k.p, DType::BF16, {16, kKvHeads, kTokens, 1});
+    narrow.reset_all(execution.stream);
+    expect_refusal(
+        "an operand at the config's own head width",
+        [&] { narrow.append(0, 0, unpadded, unpadded, kTokens, execution.stream); },
+        "must be contiguous BF16 [32, 2, 3, 1]");
+}
+
+// The carried head's append and attend run: a state whose head the Op does not admit still
+// attends, at the carried width and with the config's own scale.
+void carried_head_attends(DeviceExecutionView execution) {
+    nemotron::AttentionState state(attention_config(16), 1, kCapacity, 1);
+    state.reset_all(execution.stream);
+    const std::vector<float> q =
+        pattern(static_cast<std::size_t>(32) * kQueryHeads * kTokens, 1.5F);
+    const std::vector<float> k = pattern(static_cast<std::size_t>(32) * kKvHeads * kTokens, 3.5F);
+    DeviceBuffer dq            = test::to_device_bf16(q);
+    DeviceBuffer dk            = test::to_device_bf16(k);
+    DeviceBuffer dout(static_cast<std::size_t>(32) * kQueryHeads * kTokens * sizeof(std::uint16_t));
+    const Tensor query(dq.p, DType::BF16, {32, kQueryHeads, kTokens, 1});
+    const Tensor keys(dk.p, DType::BF16, {32, kKvHeads, kTokens, 1});
+    Tensor out(dout.p, DType::BF16, {32, kQueryHeads, kTokens, 1});
+    state.append(0, 0, keys, keys, kTokens, execution.stream);
+    state.attend(0, 0, query, out, Tensor{}, execution);
+    test::cuda_synchronize(execution.stream);
+    const std::vector<double> produced =
+        test::from_device_bf16(dout.p, static_cast<std::size_t>(32) * kQueryHeads * kTokens);
+    double energy = 0.0;
+    for (const double value : produced) { energy += std::fabs(value); }
+    check(energy > 0.0, "a carried-head attend produces a non-zero output");
+    check(state.filled(0) == 0, "and the frontier does not move until the step is advanced");
+    state.advance(0);
+    check(state.filled(0) == kTokens, "advanced past the step's tokens");
 }
 
 // A full lane's capacity is refused rather than wrapped, and a step's advance is what makes the
@@ -456,6 +507,7 @@ int main() {
         route_matches_the_reference(execution);
         lanes_do_not_alias(execution);
         refusals(execution);
+        carried_head_attends(execution);
         capacity_and_advance(execution);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -6,6 +6,7 @@
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -26,13 +27,25 @@ namespace {
                            " is not implemented for it");
 }
 
-// The refusal for execution entry points the family Program owns but a lane that never completed a
-// pass cannot reach: the tokens a decode or a commit would carry do not exist yet, so there is
-// nothing to hand the family Program and no second refusal to invent. The missing piece is quoted
-// in the family's own words.
-[[noreturn]] void refuse_execution(const char* entry) {
-    throw std::logic_error(std::string("nemotron_h Engine Program: ") + entry + " cannot run: " +
-                           std::string(models::nemotron_h::kMissingStatePersistence));
+using Clock = std::chrono::steady_clock;
+
+double seconds_since(Clock::time_point start) {
+    return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+// The request's sampling parameters as the Op's config. The occurrence counts the penalties read
+// and the mask are the family Program's own to place per lane, so this leaves both at the caller's
+// defaults; this family has no token mask to pass.
+ops::SamplingConfig translate(const ResolvedSamplingParameters& source) {
+    ops::SamplingConfig out;
+    out.temperature       = source.temperature;
+    out.top_k             = source.top_k;
+    out.top_p             = source.top_p;
+    out.min_p             = source.min_p;
+    out.presence_penalty  = source.presence_penalty;
+    out.frequency_penalty = source.frequency_penalty;
+    out.seed              = source.seed;
+    return out;
 }
 
 } // namespace
@@ -338,11 +351,16 @@ ContextTransactionProgress NemotronProgram::progress_context_transaction(Cancell
     Lane& lane               = lanes_[transaction.lane];
     // A root materialization is an empty lane. The family Program owns what "empty" means for this
     // model -- the Mamba frontier and the recurrent plane of its slot zeroed, and the attention
-    // positions of its K/V unwritten -- so the lane is handed to it rather than zeroed here.
+    // positions of its K/V unwritten -- so the lane is handed to it rather than zeroed here, and
+    // the request's sampler is installed on top of the greedy one `create` leaves.
     program_.create(static_cast<std::int32_t>(transaction.lane), execution_);
+    program_.configure(static_cast<std::int32_t>(transaction.lane), translate(transaction.sampling),
+                       execution_);
     lane.phase       = Phase::Prefill;
     lane.epoch       = next_epoch_++;
     lane.prompt      = std::move(transaction.prompt.ids);
+    lane.next_input  = -1;
+    lane.pending     = false;
     lane.timings     = {};
     lane.speculative = {};
     bump_revision();
@@ -355,28 +373,107 @@ ContextTransactionProgress NemotronProgram::progress_context_transaction(Cancell
 void NemotronProgram::finalize_context_transaction() noexcept { transaction_.reset(); }
 
 PrefillProgress NemotronProgram::advance_prefill(SequenceHandle sequence, PrefillPace,
-                                                 ExecutionTiming*, TokenMaskProvider*) {
+                                                 ExecutionTiming* failed_timing,
+                                                 TokenMaskProvider*) {
     Lane* lane = valid_lane(sequence);
-    if (lane == nullptr || lane->phase != Phase::Prefill) {
+    if (lane == nullptr || lane->phase != Phase::Prefill || lane->pending) {
         throw std::logic_error("prefill advanced on a sequence that is not prefilling");
     }
-    // The lane's whole prompt goes to the family Program in one call: chunking exists to bound a
-    // pass's width, and the pass never runs, so no cursor is advanced here. `prefill` refuses
-    // because the landed forward keeps no state -- a lane driven through it would compute a
-    // zero-state model -- and that refusal is the one the caller must see, in its own words.
+    ExecutionTimingRecorder timing(ExecutionTimingPhase::Submit, failed_timing);
+    const auto started            = Clock::now();
+    const std::uint32_t total     = static_cast<std::uint32_t>(lane->prompt.size());
     const std::int32_t lane_index = static_cast<std::int32_t>(sequence.lane_);
+    // The lane's whole prompt goes to the family Program in one call: it chunks the prompt into
+    // passes of its own configured width, so no cursor lives here and the state at the end of the
+    // call is the state after the prompt rather than after a slice of it. The call synchronizes.
     program_.prefill(lane_index, std::span<const std::int32_t>(lane->prompt), execution_);
-    // Unreachable while the forward keeps no state; present so this entry point's contract is
-    // complete on the day it does.
-    throw std::logic_error(
-        "nemotron_h Engine Program: the family Program returned from a prefill pass, which the "
-        "landed zero-state forward does not do");
+
+    PrefillProgress progress;
+    progress.summary                 = BeginSummary{.prompt_tokens        = total,
+                                                    .reused_prompt_tokens = 0,
+                                                    .prefix_reuse_path    = PrefixReusePath::Root};
+    progress.processed_prompt_tokens = total;
+    progress.service_units = static_cast<std::uint32_t>(1U + (total - 1U) / prefill_chunk_);
+    progress.complete      = true;
+    // The prefill leaves the last token's logits, so the response's first token is drawn here and
+    // committed by the round that follows, exactly as every later token is.
+    timing.begin_wait();
+    const TokenId token = program_.sample(lane_index, execution_);
+    timing.end_wait();
+    PendingBatch pending;
+    pending.transaction_ = next_pending_++;
+    pending.rows_[0]     = sequence;
+    pending.tokens_[0]   = token;
+    pending.counts_[0]   = 1;
+    pending.row_count_   = 1;
+    pending.row_stride_  = 1;
+    lane->phase          = Phase::Active;
+    lane->next_input     = token;
+    lane->pending        = true;
+    open_pending_        = pending.transaction_;
+    // Everything the request spent prefilling, this call included, is its latency to first token.
+    lane->timings.first_token_seconds = lane->timings.prefill_seconds + seconds_since(started);
+    lane->timings.prefill_seconds += seconds_since(started);
+    progress.pending.emplace(std::move(pending));
+    progress.timing           = timing.finish();
+    progress.pending->timing_ = progress.timing;
+    return progress;
 }
 
-PendingBatch NemotronProgram::decode(std::span<const SequenceHandle>,
-                                     std::span<const RoundBudget>, ExecutionTiming*,
-                                     TokenMaskProvider*) {
-    refuse_execution("decode");
+PendingBatch NemotronProgram::decode(std::span<const SequenceHandle> sequences,
+                                     std::span<const RoundBudget> budgets,
+                                     ExecutionTiming* failed_timing, TokenMaskProvider*) {
+    if (sequences.empty() || sequences.size() > kMaximumConcurrency ||
+        budgets.size() != sequences.size()) {
+        throw std::invalid_argument("decode round shape is invalid");
+    }
+    ExecutionTimingRecorder timing(ExecutionTimingPhase::Submit, failed_timing);
+    PendingBatch pending;
+    pending.transaction_ = next_pending_++;
+    // This family has no drafter, so every row is a plain one-token row.
+    pending.row_stride_ = 1;
+    std::vector<std::int32_t> plain_lanes;
+    std::vector<std::int32_t> plain_ids;
+    // A row that fails validation must not leave the rows before it marked pending with no
+    // PendingBatch handed out (nothing would then match them in commit/abort_pending), so every row
+    // is validated before any lane is mutated.
+    const auto require_active_row = [&](std::size_t row) -> Lane* {
+        Lane* lane = valid_lane(sequences[row]);
+        if (lane == nullptr || lane->phase != Phase::Active || lane->next_input < 0 ||
+            budgets[row].generated_tokens_remaining == 0) {
+            throw std::logic_error("decode round row is not an active sequence");
+        }
+        return lane;
+    };
+    for (std::size_t row = 0; row < sequences.size(); ++row) { (void)require_active_row(row); }
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        Lane* lane = require_active_row(row);
+        // Two rows naming one sequence would mark the same lane pending twice, and the family
+        // Program refuses a pass that names a lane twice for the same reason.
+        if (lane->pending) { throw std::logic_error("decode round row is not an active sequence"); }
+        plain_lanes.push_back(static_cast<std::int32_t>(sequences[row].lane_));
+        plain_ids.push_back(lane->next_input);
+        pending.rows_[row]   = sequences[row];
+        pending.counts_[row] = 1;
+        lane->pending        = true;
+    }
+    // The round is one batched pass: the lanes share the weights' reads while each attends to its
+    // own state. Both calls synchronize, and the draw reads the logits the pass left.
+    const auto started = Clock::now();
+    program_.decode(plain_lanes, plain_ids, execution_);
+    timing.begin_wait();
+    const std::vector<std::int32_t> drawn = program_.sample(plain_lanes, execution_);
+    timing.end_wait();
+    timing.resume_submit();
+    const double seconds = seconds_since(started);
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        pending.tokens_[row * pending.row_stride_] = drawn[row];
+        valid_lane(sequences[row])->timings.decode_seconds += seconds;
+    }
+    pending.row_count_ = sequences.size();
+    open_pending_      = pending.transaction_;
+    pending.timing_    = timing.finish();
+    return pending;
 }
 
 ExecutionTiming NemotronProgram::append_forced_tokens(std::span<const SequenceHandle>,
@@ -384,30 +481,84 @@ ExecutionTiming NemotronProgram::append_forced_tokens(std::span<const SequenceHa
                                                       std::span<const std::optional<std::uint32_t>>,
                                                       ExecutionTiming*) {
     // The forced span is the thinking budget's channel close, which this checkpoint has no target
-    // control token for; nothing can reach a forced span, and no token could be appended to a lane
-    // whose prefill refuses.
-    refuse_execution("append_forced_tokens");
+    // control token for: its frontend emits no forced span, so nothing reaches this entry point.
+    throw std::logic_error("nemotron_h Engine Program: append_forced_tokens is not implemented: "
+                           "this family has no forced control span");
 }
 
-qwen::CommitResult NemotronProgram::commit(PendingBatch&&, std::span<const CommitDecision>,
-                                           CommitObservation, ExecutionTiming*) {
-    refuse_execution("commit");
-}
-
-qwen::DiscardResult NemotronProgram::abort_pending(PendingBatch&& pending) noexcept {
-    // No round can be open: a decode round refuses, so this Program never handed out a pending
-    // batch and has no lane state to roll back. The row count is reported so the caller sees which
-    // batch was dropped.
-    qwen::DiscardResult out;
-    out.row_count = pending.row_count();
+qwen::CommitResult NemotronProgram::commit(PendingBatch&& pending,
+                                           std::span<const CommitDecision> decisions,
+                                           CommitObservation observation,
+                                           ExecutionTiming* failed_timing) {
+    ExecutionTimingRecorder timing(ExecutionTimingPhase::Post, failed_timing);
+    if (pending.transaction_ == 0 || pending.transaction_ != open_pending_ ||
+        decisions.size() != pending.row_count_) {
+        throw std::logic_error("pending transaction capability or decision shape is invalid");
+    }
+    qwen::CommitResult out;
+    out.row_count = pending.row_count_;
+    for (std::size_t row = 0; row < pending.row_count_; ++row) {
+        const CommitDecision& decision = decisions[row];
+        Lane* lane                     = valid_lane(pending.rows_[row]);
+        if (lane == nullptr || !lane->pending ||
+            (decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
+            (!decision.cancelled && !decision.failed &&
+             (decision.accepted_tokens == 0 ||
+              decision.accepted_tokens > static_cast<std::uint32_t>(pending.counts_[row])))) {
+            throw std::logic_error("pending transaction decision is invalid");
+        }
+        // The split marks a prefix-identity boundary for the context cache, which this model does
+        // not keep, and this family's frontend never sets one.
+        if (decision.prefix_execution_split_after) {
+            throw std::logic_error("Nemotron-H keeps no prefix identity to split");
+        }
+        lane->pending = false;
+        if (decision.cancelled || decision.failed) {
+            out.rows[row].disposition = decision.cancelled ? CommitDisposition::CancelledReleased
+                                                           : CommitDisposition::FailedReleased;
+            out.rows[row].timings     = lane->timings;
+            out.rows[row].speculative = lane->speculative;
+            release(pending.rows_[row].lane_);
+            continue;
+        }
+        // A row licensed exactly one token and the round's pass has consumed it, so the lane's
+        // state already sits at the frontier after it and the next round feeds that same token.
+        const auto kept  = static_cast<std::int32_t>(decision.accepted_tokens);
+        lane->next_input = pending.tokens_[row * pending.row_stride_ + (kept - 1)];
+        lane->phase      = decision.terminal ? Phase::Finishable : Phase::Active;
+        out.rows[row].disposition =
+            decision.terminal ? CommitDisposition::Finishable : CommitDisposition::Active;
+        if (observation == CommitObservation::AllRows) out.rows[row].timings = lane->timings;
+    }
+    open_pending_ = 0;
+    out.timing    = timing.finish();
     return out;
 }
 
-qwen::FinishResult NemotronProgram::finish(SequenceHandle) noexcept {
-    // A lane that never committed a token has no finished sequence to release. The Engine's
-    // terminal settlement only reaches a sequence this Program reported Finishable, and it reports
-    // none: the family's forward refuses before a round can complete.
-    return {};
+qwen::DiscardResult NemotronProgram::abort_pending(PendingBatch&& pending) noexcept {
+    qwen::DiscardResult out;
+    out.row_count = pending.row_count();
+    if (pending.transaction_ == 0 || pending.transaction_ != open_pending_) return out;
+    // A discarded round is an execution failure for its rows: their lanes are released, so the
+    // Engine fails those requests rather than resuming a sequence whose round never committed.
+    for (std::size_t row = 0; row < pending.row_count_; ++row) {
+        if (valid_lane(pending.rows_[row]) != nullptr) { release(pending.rows_[row].lane_); }
+    }
+    open_pending_ = 0;
+    out.status    = ConsumeStatus::Consumed;
+    return out;
+}
+
+qwen::FinishResult NemotronProgram::finish(SequenceHandle sequence) noexcept {
+    qwen::FinishResult out;
+    Lane* lane = valid_lane(sequence);
+    if (transaction_ || lane == nullptr || lane->phase != Phase::Finishable) return out;
+    out.timings     = lane->timings;
+    out.speculative = lane->speculative;
+    out.disposition = FinishDisposition::Released;
+    out.status      = ConsumeStatus::Consumed;
+    release(sequence.lane_);
+    return out;
 }
 
 qwen::AbortResult NemotronProgram::abort(SequenceHandle sequence) noexcept {
@@ -433,7 +584,8 @@ qwen::PhysicalUsageSnapshot NemotronProgram::physical_usage() const noexcept {
     qwen::PhysicalUsageSnapshot snapshot;
     snapshot.resource_revision = resource_revision();
     // One lane holds one request, and a lane's state is one slot of the Mamba pool and one K/V
-    // plane per attention layer, so the occupied lane count is the occupied state-slot count.
+    // plane per attention layer. That state is taken at `create` and given back at `release`, so a
+    // lane counts here whenever it is not free: prefilling, decoding or waiting to be finished.
     std::uint32_t occupied = 0;
     for (const Lane& lane : lanes_) {
         if (lane.phase != Phase::Free) ++occupied;
@@ -462,7 +614,9 @@ void NemotronProgram::release(std::uint32_t lane) noexcept {
         } catch (...) {}
         entry.phase = Phase::Free;
     }
-    entry.prompt = {};
+    entry.prompt     = {};
+    entry.next_input = -1;
+    entry.pending    = false;
     bump_revision();
 }
 
@@ -544,10 +698,14 @@ std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& op
                                                         DeviceContext& device) {
     artifact::Reader reader(options.artifact_path);
     // What the expert cache must leave free, resolved from the *engine's own* plan rather than from
-    // a constant: the family's state for the configured lanes and windows, one pass's workspace,
-    // the staging buffer and its tables, the runtime's reservation and the capacity headroom. The
-    // K/V is part of that state and never gives way to the cache -- a cache request that would eat
-    // into it is re-derived smaller and reported.
+    // a constant: the family's state for the configured lanes and windows -- which carries one
+    // pass's workspace and the pass's own operands and logits, since the family Program owns and
+    // allocates them -- the staging buffer and its tables, the runtime's reservation and the
+    // capacity headroom. The K/V is part of that state and never gives way to the cache -- a cache
+    // request that would eat into it is re-derived smaller and reported. The pass's output is not
+    // added again beside `device_bytes`: a head writing one column per lane
+    // (`HeadColumns::LastOnly`) is already counted there, and the `[vocabulary, chunk]` logits a
+    // second term would reserve are not an allocation the family makes.
     const models::nemotron_h::Config artifact_config =
         models::nemotron_h::parse_config(reader.directory());
     models::nemotron_h::ExpertResidencyRequest residency;
@@ -555,10 +713,6 @@ std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& op
     residency.explicit_bytes = options.expert_cache.explicit_bytes;
     residency.reserve_bytes =
         models::nemotron_h::Program::device_bytes(artifact_config.text, options) +
-        models::nemotron_h::pass_output_bytes(
-            artifact_config.text,
-            static_cast<std::int32_t>(options.prefill_chunk.value_or(
-                models::nemotron_h::kDefaultPrefillChunk))) +
         models::nemotron_h::kRuntimeReservationBytes +
         (options.kv_capacity.mode == KvCapacityMode::Automatic
              ? options.kv_capacity.automatic_headroom_bytes
