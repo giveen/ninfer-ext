@@ -188,8 +188,8 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
     }
 
     // The same check the whole-matrix entry point makes, against this format's own query: a call
-    // narrow enough for the row-tiled route needs the two buffers the query reports, and a wide one
-    // needs nothing and is handed whatever the caller has.
+    // the row-tiled route takes needs the two buffers the query reports -- one token tile's, at any
+    // width -- and the per-token route a wider call takes needs nothing.
     const std::size_t required =
         nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, tokens);
     if (required > 0 &&

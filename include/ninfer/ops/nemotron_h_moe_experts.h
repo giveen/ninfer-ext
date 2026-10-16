@@ -72,11 +72,12 @@ namespace ninfer::ops {
  *   `nemotron_h_moe_experts_workspace_bytes` for the call's geometry, bank format and T, carrying
  *   no state beyond the call. The Op allocates nothing. A route that needs no scratch reports zero
  *   and then accepts an unbound workspace. The query is a function of the format, the geometry and
- *   T alone, and the size it reports never falls as T does: the per-token route holds a token's
- *   activation and its product in shared memory, while the narrow route -- one block per (rank,
- *   output-row tile), which needs each selected (token, rank)'s activation and its raw down partial
- *   in storage the caller owns -- reports the widest narrow call's size at every T, so a caller
- *   that sizes one arena at its widest call serves every narrower one through it.
+ *   T alone, and the size it reports never falls as T grows and never exceeds one token tile's: the
+ *   per-token route holds a token's activation and its product in shared memory, while the
+ *   row-tiled route -- one block per (rank, output-row tile), which needs each selected
+ *   (token, rank)'s activation and its raw down partial in storage the caller owns -- walks a
+ *   call's token axis in tiles through one tile's buffers, so a caller that sizes one arena at its
+ *   widest call serves every narrower one through it.
  *
  * Execution:
  *   The caller's stream; graph-capturable (no host synchronization, no allocation). The output is
@@ -138,13 +139,15 @@ void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Ten
  * output, so where the bank's bytes were read from cannot move a result.
  *
  * Workspace: the whole-matrix entry point's, taken by reference rather than left out because this
- * route has a narrow form as well. A call narrow enough that a per-token CTA would occupy a single
- * SM runs the same arithmetic in one block per (rank, output-row tile) and keeps each selected
- * (token, rank)'s activation and its raw down partial in the caller's storage; a wide call -- the
- * prefill case, where a per-token grid is already the whole GPU -- reads and writes none of it, and
- * the query still reports the narrow route's size for it so that one arena sized at the widest call
- * serves the narrower ones. Either way the bank is addressed where it already lies: this route
- * stages nothing and allocates nothing of its own.
+ * route has a row-tiled form as well. A call this family's scheduler issues -- the whole decode
+ * lane count up to its widest prefill chunk -- runs the same arithmetic in one block per (rank,
+ * output-row tile), with the call's tokens walked in tiles through one tile's buffers, and keeps
+ * each selected (token, rank)'s activation and its raw down partial in the caller's storage. The
+ * query reports that storage at every T, and a call wider than the widest chunk the row-tiled route
+ * takes keeps the per-token route, whose grid of one CTA per token needs none of it but is still
+ * handed the arena so that one arena sized at the widest call serves the narrower ones. Either way
+ * the bank is addressed where it already lies: this route stages nothing and allocates nothing of
+ * its own.
  */
 void nemotron_h_moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
                             const ExpertWeights& bank, ExpertBankSpan source,

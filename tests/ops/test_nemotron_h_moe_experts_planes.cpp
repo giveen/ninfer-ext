@@ -43,6 +43,11 @@ namespace {
 
 constexpr PointwiseCriterion kCriterion = {/*absolute*/ 2e-3, /*relative*/ 3e-2};
 
+// The byte `run_with_planes` fills a workspace with when a case asks for a readback. No route
+// writes it, so "every byte still holds it" is the per-token route's signature -- see
+// `workspace_untouched`.
+constexpr int kWorkspacePattern = 0xAB;
+
 constexpr std::array<float, 16> kE2m1 = {0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
                                          -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
 
@@ -232,10 +237,16 @@ Call synth_call(std::int32_t experts, std::int32_t latent, std::int32_t intermed
 // Runs one call with the bank planes at `base` (host memory or device memory: the Op reads whatever
 // it is handed) and a workspace of `workspace_bytes`, which defaults to zero meaning the Op's own
 // query. Returns the output as BF16 bits, the latent axis the fastest.
-std::vector<std::uint16_t> run_with_planes(const Call& call,
-                                           const std::array<const void*, 4>& codes_and_scales,
+//
+// `workspace_readback`, when given, is filled with the workspace as the call left it, over a buffer
+// that was filled with `kWorkspacePattern` first. The row-tiled route reads and writes that storage
+// and the per-token route never touches it, so what this hands back is how a case tells which route
+// a call took -- from the outside, with no second entry point and no override.
+std::vector<std::uint16_t>
+run_with_planes(const Call& call, const std::array<const void*, 4>& codes_and_scales,
                                            std::int32_t experts_in_span, ops::ExpertWeights bank,
-                                           std::size_t workspace_bytes = 0) {
+                std::size_t workspace_bytes                   = 0,
+                std::vector<std::uint8_t>* workspace_readback = nullptr) {
     GuardedDeviceBuffer x_device(call.x.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer ids_device(call.ids.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer routing_device(call.routing.size() * sizeof(float));
@@ -255,18 +266,24 @@ std::vector<std::uint16_t> run_with_planes(const Call& call,
     const ops::NemotronHMoeExpertGeometry geometry{call.latent, call.experts, call.top_k,
                                                    call.intermediate};
     // The Op's own storage, sized by its own query for this call: the row-tiled route reads and
-    // writes it, and the per-token route ignores it.
+    // writes it, and the per-token route ignores it. A readback asks for it to be visibly not what
+    // it was found as.
     if (workspace_bytes == 0) {
         workspace_bytes =
             ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, call.tokens);
     }
     GuardedDeviceBuffer workspace_device(std::max<std::size_t>(workspace_bytes, 16));
+    if (workspace_readback != nullptr) { workspace_device.fill(kWorkspacePattern); }
     Tensor workspace_tensor(workspace_device.data(), DType::U8,
                             {static_cast<std::int32_t>(workspace_device.bytes())});
     ops::nemotron_h_moe_experts(x_tensor, ids_tensor, routing_tensor, bank,
                                 ops::ExpertBankSpan{0, experts_in_span}, geometry, out_tensor,
                                 workspace_tensor, nullptr);
     cuda_synchronize();
+    if (workspace_readback != nullptr) {
+        workspace_readback->resize(workspace_device.bytes());
+        workspace_device.copy_to_host(workspace_readback->data(), workspace_readback->size());
+    }
     std::vector<std::uint16_t> bits(call.x.size());
     cuda_check(
         cudaMemcpy(bits.data(), out_device.data(), out_device.bytes(), cudaMemcpyDeviceToHost),
@@ -408,6 +425,17 @@ void require_identical(const std::vector<std::uint16_t>& left,
     require(differing == 0 && worst == 0.0 && rel_l2 == 0.0, what + measured);
 }
 
+// True when a call left its workspace holding every byte `run_with_planes` filled it with. The
+// per-token route reads none of the caller's storage and the row-tiled route reads and writes it,
+// so this is how a case shows which of the two a width took rather than assuming it -- with no
+// second entry point, no route override and nothing the Op has to expose.
+bool workspace_untouched(const std::vector<std::uint8_t>& workspace) {
+    for (const std::uint8_t byte : workspace) {
+        if (byte != kWorkspacePattern) { return false; }
+    }
+    return true;
+}
+
 // The fixture's own control, and what makes "0 differing words" mean something rather than nothing:
 // two accumulation orders over the same stored bytes have to disagree somewhere, or *any* order
 // would pass and the identity case would be vacuous.
@@ -454,9 +482,11 @@ OrderSensitivity order_sensitive_rows(const StoredBank& bank, bool up, int exper
     return counted;
 }
 
-// The token count the per-token route is reached at. Any count above the row-tiled route's own
-// maximum works; 16 is above it for every token count these cases use.
-constexpr std::int32_t kWideTokens = 16;
+// The token count the per-token route is reached at: above the row-tiled route's own maximum, which
+// is this family's widest prefill chunk (4096, see the launcher). Any count above that works; a
+// case reaches this one by repeating its own call, and the leading columns of a repeated call are
+// its own answer, so one wide run carries the reference for every narrower width.
+constexpr std::int32_t kWideTokens = 8192;
 
 std::int32_t copies_for(std::int32_t tokens) { return (kWideTokens + tokens - 1) / tokens; }
 
@@ -516,31 +546,44 @@ Call prefix_call(const Call& call, std::int32_t tokens) {
     return narrow;
 }
 
-// The row-tiled route against the per-token one, bit for bit, at every token count the row-tiled
-// route covers and on the real bank geometry: 240 experts -- this family's narrower bank, at the
-// latent width every one of its MoE layers projects into and its widest intermediate width -- nine
-// ranks, and the bank staged on the device, so the case is about addressing and arithmetic rather
-// than about a pinned-host read. The oracle is not consulted here (the scaled geometries in `main`
-// carry that); what this case establishes is exactly the identity the Op claims: the two routes
-// produce the same BF16 words, at max_abs and rel_l2 of zero.
+// The row-tiled route against the per-token one, bit for bit, on the real bank geometry and at the
+// widths that matter: this family's own bank (240 experts at the latent width every one of its MoE
+// layers projects into and its widest intermediate width, nine ranks), the bank staged on the
+// device, and both routes driven through the public entry point alone.
+//
+// The reference is one per-token call, and the reason it can serve every width is the per-token
+// route's own shape: its block computes a token from that token's column -- activation, ids and
+// weight alike -- so a call whose columns repeat another call's *is* that call's answer in the
+// columns it repeats. The base call is the widest one the row-tiled route takes and the reference
+// repeats it once, which puts the per-token route above the row-tiled route's maximum without a
+// second entry point, a route override or a tolerance; every width below that compares against the
+// same reference's own leading columns.
+//
+// Which route a width took is not assumed: the row-tiled route reads and writes the caller's
+// storage and the per-token route never touches it, so the two widths the comparison rests on are
+// probed before anything is compared.
 void identity_case() {
     constexpr std::int32_t kExperts      = 240;
     constexpr std::int32_t kLatent       = 1024;
     constexpr std::int32_t kIntermediate = 2560;
     constexpr std::int32_t kTopK         = 9;
-    constexpr std::int32_t kTokens       = 8;
-    std::printf("nemotron_h_moe_experts planes: %d experts at %dx%d, top_k %d, tokens 1..%d\n",
-                kExperts, kLatent, kIntermediate, kTopK, kTokens);
+    // The widest call the row-tiled route takes -- this family's own prefill chunk -- and the width
+    // the per-token reference is built at, above that maximum.
+    constexpr std::int32_t kBaseTokens      = 4096;
+    constexpr std::int32_t kReferenceTokens = 2 * kBaseTokens;
+    std::printf("nemotron_h_moe_experts planes: %d experts at %dx%d, top_k %d, tokens 1..8 and "
+                "%d, per-token reference at %d\n",
+                kExperts, kLatent, kIntermediate, kTopK, kBaseTokens, kReferenceTokens);
 
-    Call base = synth_call(kExperts, kLatent, kIntermediate, kTopK, kTokens, false, 9001U);
+    Call base = synth_call(kExperts, kLatent, kIntermediate, kTopK, kBaseTokens, false, 9001U);
     // Spread the selection over the whole bank rather than over the first sixteen experts, which is
     // where `synth_call`'s own `(rank + token) % experts` lands: this case is about an expert's
     // plane offset as much as about a row, and the last 224 of 240 experts going unnamed would
     // leave the offset arithmetic -- the one place a real bank differs from a small fixture --
     // untested.
-    for (std::int32_t token = 0; token < kTokens; ++token) {
+    for (std::int32_t token = 0; token < kBaseTokens; ++token) {
         for (std::int32_t rank = 0; rank < kTopK; ++rank) {
-            const std::size_t at = static_cast<std::size_t>(rank) * kTokens + token;
+            const std::size_t at = static_cast<std::size_t>(rank) * kBaseTokens + token;
             base.ids[at]         = (rank * 37 + token * 53) % kExperts;
         }
     }
@@ -594,31 +637,53 @@ void identity_case() {
     // about 0.05% of the model's output elements by one BF16 ulp, which is the measurement that
     // says the criterion is not vacuous.
 
-    for (std::int32_t tokens = 1; tokens <= kTokens; ++tokens) {
-        const Call narrow_call = prefix_call(base, tokens);
-        // Above the row-tiled route's token count, and every column a repetition of the first
-        // `tokens`: the per-token route's own answer at `tokens` is its first `tokens` columns.
-        const Call wide_call = repeated(narrow_call, copies_for(tokens));
-        const std::vector<std::uint16_t> narrow =
-            run_with_planes(narrow_call, planes, kExperts, bank);
-        const std::vector<std::uint16_t> wide = run_with_planes(wide_call, planes, kExperts, bank);
-        const std::vector<std::uint16_t> wide_first(
-            wide.begin(), wide.begin() + static_cast<std::ptrdiff_t>(narrow.size()));
-        require_identical(narrow, wide_first,
+    // The reference run, and the probe that says which route each of the two widths behind the
+    // comparison below took.
+    const Call reference_call = repeated(base, 2);
+    std::vector<std::uint8_t> reference_workspace;
+    const std::vector<std::uint16_t> reference =
+        run_with_planes(reference_call, planes, kExperts, bank, 0, &reference_workspace);
+    require(workspace_untouched(reference_workspace),
+            "nemotron_h_moe_experts planes: the reference width runs the per-token route, which "
+            "leaves the caller's workspace alone");
+
+    std::vector<std::uint8_t> widest_workspace;
+    const std::vector<std::uint16_t> widest =
+        run_with_planes(base, planes, kExperts, bank, 0, &widest_workspace);
+    require(!workspace_untouched(widest_workspace),
+            "nemotron_h_moe_experts planes: the widest width runs the row-tiled route, which "
+            "writes the caller's workspace");
+
+    // Every width the row-tiled route takes, against the reference's own leading columns: the
+    // narrow lane counts it was written for, the widths a chunked prefill steps through, and the
+    // prefill chunk itself.
+    const std::int32_t widths[] = {1, 2, 3, 4, 5, 6, 7, 8, 64, 512, kBaseTokens};
+    for (const std::int32_t tokens : widths) {
+        const std::vector<std::uint16_t> row_tiled =
+            tokens == kBaseTokens
+                ? widest
+                : run_with_planes(prefix_call(base, tokens), planes, kExperts, bank);
+        const std::vector<std::uint16_t> per_token(
+            reference.begin(), reference.begin() + static_cast<std::ptrdiff_t>(row_tiled.size()));
+        require_identical(row_tiled, per_token,
                           "nemotron_h_moe_experts planes: row-tiled == per token at tokens " +
                               std::to_string(tokens));
     }
 }
 
 // The workspace query, and the refusal a size that disagrees with it earns. A caller sizes one
-// arena for every call it makes -- the engine plans its pass arena at the prefill width and then
-// runs its decode calls through that storage -- so the reported size must not fall as T does, and a
-// call that needs storage must be refused storage that is too small rather than read past it.
+// arena for every call it makes -- the engine plans its pass arena at the prefill chunk and then
+// runs its decode calls through that storage -- so the reported size must not fall as T grows, must
+// not grow past the storage one token tile needs, and a call that needs storage must be refused
+// storage that is too small rather than read past it.
 void workspace_case() {
     constexpr std::int32_t kExperts      = 8;
     constexpr std::int32_t kLatent       = 128;
     constexpr std::int32_t kIntermediate = 256;
     constexpr std::int32_t kTopK         = 2;
+    // The tile the row-tiled route walks a call's token axis in, which is also the width its
+    // storage stops growing at (the launcher's `kRowTiledTileTokens`).
+    constexpr std::int32_t kTile = 64;
     const ops::NemotronHMoeExpertGeometry geometry{kLatent, kExperts, kTopK, kIntermediate};
     const std::size_t per_token =
         static_cast<std::size_t>(kTopK) * (kIntermediate + kLatent) * sizeof(float);
@@ -626,14 +691,20 @@ void workspace_case() {
         ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, 1);
     const std::size_t at_eight =
         ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, 8);
-    const std::size_t at_wide =
+    const std::size_t at_tile =
+        ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, kTile);
+    // Both the widest call the row-tiled route takes and a call above it, which keeps the per-token
+    // route: the arena a caller sizes for either covers the other.
+    const std::size_t at_widest =
         ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, 4096);
+    const std::size_t at_over =
+        ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, 8192);
     require(at_one == per_token,
             "the workspace at T=1 is one token's activation product and partial");
     require(at_eight == 8 * per_token, "the workspace at T=8 is eight tokens' worth");
-    require(at_one < at_eight && at_eight == at_wide,
-            "the workspace query never falls as T grows, so an arena sized at the widest call "
-            "covers a narrower one");
+    require(at_one < at_eight && at_eight < at_tile && at_tile == at_widest && at_widest == at_over,
+            "the workspace grows with T up to one token tile and is flat from there, so an arena "
+            "sized at the widest call covers every narrower one");
     require(ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::BF16, 8) == 0,
             "a BF16 bank reports no workspace on either route");
 
@@ -649,6 +720,23 @@ void workspace_case() {
         require(false, "a workspace smaller than the query reports is refused");
     } catch (const std::invalid_argument&) {
         require(true, "a workspace smaller than the query reports is refused");
+    }
+
+    // A wide call is not exempt: the row-tiled route takes the widest call as well, so storage a
+    // tile short of the query is refused there too -- which is what says the tiled requirement is
+    // really reserved rather than assumed.
+    const Call wide = synth_call(kExperts, kLatent, kIntermediate, kTopK, 4096, false, 78U);
+    const ops::ExpertWeights wide_bank = wide.bank.addressing();
+    const std::array<const void*, 4> wide_planes{
+        wide.bank.codes_up.data(), wide.bank.scales_up.data(), wide.bank.codes_down.data(),
+        wide.bank.scales_down.data()};
+    const std::size_t wide_required =
+        ops::nemotron_h_moe_experts_workspace_bytes(geometry, QType::NVFP4, wide.tokens);
+    try {
+        (void)run_with_planes(wide, wide_planes, kExperts, wide_bank, wide_required - 16);
+        require(false, "a wide call a tile short of the query is refused");
+    } catch (const std::invalid_argument&) {
+        require(true, "a wide call a tile short of the query is refused");
     }
 }
 

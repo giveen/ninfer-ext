@@ -303,11 +303,13 @@ Scratch allocate_block(const TextConfig& config, const MoeBankConfig* bank, std:
         // layer -- and a staged-width pass simply leaves them alone.
         scratch.moe.slot_ids = allocator.alloc(DType::I32, {ranks, tokens});
         scratch.moe.misses   = allocator.alloc(DType::I32, {2 * ranks * tokens + 1});
-        // The experts' Op keeps each selected (token, rank)'s activation product and its raw down
-        // partial here when the call is narrow enough to run its row-tiled route, and reads none of
-        // it on the per-token route a wide call takes. The registered form is the one that reports
-        // a size, and it is asked at the pass's own width: the query never falls as T does, so the
-        // storage a prefill-sized pass reserves covers the T=1 calls that run through it.
+        // The experts' Op keeps one token tile's selected (token, rank) activation products and
+        // their raw down partials here: the row-tiled route, which takes every call this family's
+        // scheduler issues, walks a call's token axis in tiles through them, and the per-token
+        // route a wider call takes reads none of it. The registered form is the one that reports a
+        // size, and it is asked at the pass's own width: the query never falls as T does and never
+        // exceeds a tile's, so the storage a prefill-sized pass reserves covers the T=1 calls that
+        // run through it.
         const ops::NemotronHMoeExpertGeometry geometry{latent, experts, ranks, intermediate};
         scratch.moe.experts_workspace = allocator.alloc(
             DType::U8, {static_cast<std::int32_t>(ops::nemotron_h_moe_experts_workspace_bytes(
