@@ -213,13 +213,20 @@ the earlier estimate in this document of 25 GB of experts and a 33 GB artifact: 
 these are computed from the checkpoint's own `block_configs`.
 
 Which makes the host side load-bearing rather than incidental. Flash-Next's mechanism pins the expert set in
-Host memory behind a device cache, and **37.2 GB does not fit this machine's 32 GiB** — the pinned route is
-unavailable here at NVFP4, where at EXL3's 28.9 GB it was already marginal. Two things follow. The artifact
-is identical either way, because this is a property of the serving host and not of the format; and the route
-needs either NVMe-resident experts streamed into the device cache instead of pinned — about 24 MB per token
-(9 experts x up+down x 1024 latent x ~2300 intermediate x 0.5625 B), so ~1.2 GB/s at 50 tok/s, which makes
-NVMe a requirement rather than a preference — or a host with at least 64 GB. That is a serving decision and
-it does not change the converter.
+Host memory behind a device cache, and the sizes decide whether that is possible. **This machine hosts it
+comfortably**: 37.21 GB of pinned banks against 247 GiB of RAM, of which 206 GiB is free. A 32 GiB host could
+not, and that is the constraint the vendor's own guide is answering when it asks for about 65 GiB — but it is
+not this machine's constraint, and an earlier version of this section mistook the card's 32 GB for the host's.
+The scarce resource here is VRAM: the dense side is 8.06 GB of a 32.6 GB card, leaving roughly 20 GB for the
+device expert cache, about 59% of the 13,824 expert slots, with the remainder necessarily streamed from the
+pinned copy. The route's viability is therefore a *bandwidth* question rather than a capacity one, and that
+arithmetic is unforgiving. One routed layer's token pulls 9 experts x up+down x 1024 latent x ~2300 intermediate
+x 0.5625 B, about 24 MB — **per layer**, and 40 such layers make **952.9 MB per token**, or 3.9 TB for a
+4096-token chunk. At this tree's measured in-place SM band of 20–35 GB/s that is 27.2 ms per decode token
+(36.7 tok/s) and **111.5 s of pure PCIe for a single prefill chunk**, which is not viable at any width. Decode
+over UVA is a fallback, roughly 3x off the cached route's headroom. So pinning is what this machine does, and
+the device cache is what makes the route *usable* rather than what rescues an impossible one; NVMe-resident
+experts remain the answer only for a host that cannot pin them.
 
 Two properties the recipe inherits from `qwen3_8_flash_next_nvfp4`: each layer's bank becomes one parent per
 matrix, so an expert is a fixed row range addressed as contiguous spans; and a full-precision source carries
@@ -233,14 +240,25 @@ Sized in bytes, the split above is two independent budgets:
 
 | Side | Holds | Size |
 |---|---|---|
-| **Host RAM** | the routed expert banks, pinned | **37.2 GB** at NVFP4 — so at least 64 GB of RAM, and a 32 GiB box cannot serve this route at all |
-| **VRAM** | everything else | dense side 8.8 B parameters at Q8/Q6 (~9 GB); Mamba-2 recurrent state 4 MiB per layer plus 2.34 MiB of convolution history per sequence (162 MiB across the 40 layers); attention KV at 8 KB per token across the 8 attention layers (2.1 GB at the full 262144-token context in BF16, ~0.6 GB at NVFP4) |
-| **VRAM, remainder** | the device expert cache | roughly 20 GB on a 32 GB card, i.e. about half the bank resident, with the rest streamed from the pinned copy |
+| **Host RAM** | the routed expert banks, pinned | **37.21 GB** at NVFP4 against this machine's 247 GiB (206 GiB free), so the pinned route is available here; a 32 GiB host could not hold it above EXL3 |
+| **VRAM** | everything else | dense side **8.06 GB as converted** (FP8 5.21, BF16 1.74, FP32 0.12); Mamba-2 recurrent state 4 MiB per layer plus 2.34 MiB of convolution history per sequence (162 MiB across the 40 layers); attention KV at 8 KB per token across the 8 attention layers (2.1 GB at the full 262144-token context in BF16, ~0.6 GB at NVFP4) |
+| **VRAM, remainder** | the device expert cache | roughly 20 GB on a 32.6 GB card, i.e. about 59% of the expert slots resident, with the rest streamed from the pinned copy |
 
-The 64 GB host requirement is not a preference: the pinned expert set is not optional in this design, and 37.2 GB
-of it does not fit 32 GiB. Everything the device holds besides the cache is small — 9 GB of dense weights plus
-memory that scales with context, not with the model — which is why the expert cache is where the remaining VRAM
-goes and why its size is a Program decision rather than a fixed number.
+The pinned expert set is not optional in this design, but the host requirement it implies is 37.21 GB of *free*
+RAM rather than 64 GB of total: with 206 GiB available, the load is bounded by reading 45.28 GB from disk and
+uploading 8.06 GB to the card, not by capacity. Everything the device holds besides the cache is small — 8.06 GB
+of dense weights plus memory that scales with context rather than with the model — which is why the expert cache
+is where the remaining VRAM goes and why its size is a Program decision rather than a fixed number.
+
+**The device cache is a cache by construction, and the staged route is what makes prefill possible.** The 80 banks
+sum to 40.77 GB against the roughly 20 GB a 32.6 GB card can give them, and the landed pool geometry already fits
+them without change: 13,824 slot entries at a 2,949,120-byte stride, `bank_slots` 992 reserving 2.926 GB against
+1.46 GB used per bank, and the banks' excess over that reservation is exactly `2 * max_tail_bytes`, which the
+pool allocation's own term covers. What is missing is one entry point on `ops::nemotron_h_moe_experts` that reads
+plane-addressed staged slots instead of a whole-bank `Weight`; the Qwen4 route's staged branch transfers nearly
+verbatim, but onto its **A16** path, because this conversion carries no activation divisor. Staging is per bank
+rather than per expert for a measured reason: the engine stages 103 columns at the wide-prefill threshold, and a
+chunk that wide already touches every expert in any of these banks (9 * 103 >= E).
 
 A correction from the draft's own tensors, because this argument was overstated: the draft's stated base is
 the *24GB* variant, whose mixer projections are NVFP4 but whose 27,728 expert tensors are `IQ2_XXS` at
@@ -543,11 +561,22 @@ before quoting a perplexity, not to assume.
 - The draft pairs with the **24GB NVFP4** target, not the BF16 one, so its qualification belongs on our
   NVFP4 route; the cheap decisive check is ranking the draft's token inside the target's own next-token
   distribution, the diagnostic that exposed the Gemma 4 QAT mismatch.
-- The host-offload cache pins the expert set, so the maintenance machine's 32 GiB of RAM is itself a
-  constraint: the pinned experts at EXL3 3.5 are roughly 25 GB, which leaves little for the host KV
-  arena, the state images and the OS. Flash-Next's guide asks for about 65 GiB for a larger model; this
-  one sits under that only because the model is smaller. Reducing the pinned set, or a smaller expert
-  route, is the escape if it does not fit — neither is needed to start.
+- The host-offload cache pins the expert set, and this machine answers that requirement: 37.21 GB of pinned
+  banks against 247 GiB of RAM with 206 GiB free. An earlier version of this item called it a 32 GiB host and
+  treated the pinned route as unavailable — the figure was the card's, not the host's. The real constraint is
+  the 32.6 GB of VRAM, which is why the device cache is a cache by construction (the full 80-bank pool would be
+  40.77 GB) and why the staged route exists at all. Reducing the pinned set, or a smaller expert route, remains
+  the escape for a smaller host; neither is needed here.
+- **Two count paths on the offload route are unchecked, and one of them is a real over-read.**
+  `ops::moe_experts` bounds its `slots` argument by the compile-time `kOffloadMoeExperts` (512), which is larger
+  than this family's *smallest* bank (240), so a wrong count silently reads past the bank instead of failing; and
+  the resolve kernel indexes `used[ids[i]]` and `slot_for[ids[i]]` without validating an id against the bank's
+  own width. Both need the per-layer count checked — the same class of bug llama.cpp shipped a fix for in this
+  very model, and the reason the loader now validates the router's width against the bank's.
+- **The staged route must be proven a byte-exact copy, not merely a fixed order.** A fixed staging order does not
+  make a reduction deterministic — that is what sank the Gemma 4 gather inversion — so the check is a D2H compare
+  plus bit-identity across cold, warm and lent states, and the staged result must match the direct route's bit for
+  bit rather than within a tolerance.
 - **The state's key/value index is ambiguous, and both extents are 128 today**, so a swap would be
   silent: `LinearAttentionStatePool` plans `ne[0] = key_head_dim` while the GDN and KDA kernels index
   the state as `value * kStateDim + key`. Mamba-2's 128 (state size) against 64 (head_dim) makes it a
@@ -576,7 +605,7 @@ against an FP64 oracle plus — where one exists — the reference dump or the r
 | MoE router | the correction bias selects experts while the emitted weights stay uncorrected — 130 of 130 tokens change their expert set with it — and the group mask can exclude the bank's largest score outright |
 | Latent expert dispatch and `relu2` | non-gated `down(relu2(up(x)))` in the 1024-wide latent space, with `E` and `I` as runtime arguments because the banks differ per layer; fp32 accumulation per expert and per token in rank order, one BF16 rounding, and a single shared definition of the activation so the two ops cannot drift |
 | Composition | `src/models/nemotron_h/forward.cpp` composes the three mixers and the block. The tiny model is walked block by block against the dump: 37 stages compared with a per-stage rel L2, everything at the 0.0016–0.008 BF16-operand floor and the logits at 0.00633, five refusal cases, and coverage asserted (37 compared, 3 reported but not in the dump). Its loosest stage, block 1's `fc2_latent_proj` at 0.0498, is explained by a measured near-tie: 2 of 130 tokens sit where the reference's K-th and (K+1)-th corrected scores differ by 0.002x the BF16 logit perturbation, so their expert pair moves while the other 128 ids match exactly and block 3 moves not at all. Two runs agreed to every printed digit. |
-| Artifact | `nemotron_h_74b_nvfp4` converts the BF16 checkpoint in 2067 s to 767 objects and **45.28 GB** (a 32.00 GB file plus a 13.28 GB part), of which the routed expert banks are **37.21 GB** — within 0.03% of what this document predicted from the checkpoint's config alone. The dense side is FP8 at 5.21 GB, which is why the total is below the ~48 GB predicted when that side was assumed to be Q8. Every design choice is measured rather than asserted: one divisor per bank costs at most 0.0001 rel L2 against per-expert divisors, the BF16 and FP32 sets are bit-exact, the conv payload is bit-exact tap-major, and the experts' 0.081 rel L2 is the *format* floor — established by running the same independent check against the existing Gemma NVFP4 artifact first, where it reads 0.070. |
+| Artifact | `nemotron_h_74b_nvfp4` converts the BF16 checkpoint in 2067 s to 767 objects and **45.28 GB** (a 32.00 GB file plus a 13.28 GB part), of which the routed expert banks are **37.21 GB** — within 0.03% of what this document predicted from the checkpoint's config alone. The dense side is FP8 at 5.21 GB of a converted 8.06 GB, which is why the total is below the ~46 GB predicted when that side was assumed to be Q8. Every design choice is measured rather than asserted: one divisor per bank costs at most 0.0001 rel L2 against per-expert divisors, the BF16 and FP32 sets are bit-exact, the conv payload is bit-exact tap-major, and the experts' 0.081 rel L2 is the *format* floor — established by running the same independent check against the existing Gemma NVFP4 artifact first, where it reads 0.070. |
 | Artifact completeness | `tests/convert/test_nemotron_h_artifact.py` proves the parameter set from metadata alone in about 1.3 s: 28,331 language tensors map to exactly one parameter each and every parameter is explained — 0 unmappable, 0 absent, 0 duplicate, 0 unexplained — shapes agree except for the one transform the container makes (the depthwise convolution's stored `[10240,1,4]` becoming the tap-major `[10240,4]`), format classes agree exactly (27,728 NVFP4 as 27,648 routed and 80 shared, 113 FP8, 330 BF16, 160 FP32 — the 120 per-head state vectors and the 40 correction biases), and all 40 MoE layers have their expert count confirmed **from the checkpoint's own tensors** rather than from the config: 240 in 12 layers, 304 in 6, 368 in 9, 432 in 10, 496 in 3. The artifact's stored `block_configs` agrees with what the tensors say everywhere, so this release's config does not lie. Eleven one-at-a-time perturbations of the fixture — a lost expert, a removed parameter, a vision tensor renamed into the language set, the head re-classed to BF16, the tap-major transform dropped, a bank range shifted by 1024 rows, a config claiming 304 experts for a 240-expert layer — are each caught with the expected message, which is what makes the eight passing cases evidence rather than ceremony. |
 
 One caveat the conversion reports in its own right, and belongs on the prefill work list rather than being
