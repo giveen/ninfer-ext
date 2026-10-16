@@ -743,8 +743,10 @@ Four measurements, three of which corrected the first hypothesis that the host l
   copy-bound at ~364 ms (2.7 output tokens/s). The gather route and the Op fix are complements, not
   alternatives, and the staged-versus-gather choice must be re-measured once the Op is fast rather than
   settled by the numbers above.
-- **CUDA Graph buys nothing at decode**: 1.36 t/s with and 1.36 without, so the pager's capture-blocking
-  `snapshot_residency` synchronize is not a speed lever either.
+- **CUDA Graph buys nothing at decode *in the pre-fix state***: 1.36 t/s with and 1.36 without. That is a
+  property of a step whose cost was 94% one kernel, not of the graph — with the Op fixed the same pair
+  reads 69.89 against 46.97, so the graph is worth 1.49x and the pager's capture-blocking
+  `snapshot_residency` synchronize is worth revisiting (see the section below).
 - The dose curve (`--expert-cache 0` in-place against `auto` staged) is 0.7 against 1.4 output tokens/s;
   in-place is the same Op plus ~744 ms of *unoverlapped* UVA reads, which is the one place bytes do show up.
 
@@ -781,3 +783,24 @@ Also recorded so nobody repeats the attempt: `nsys profile` cannot be used on th
 stalls after the application's own report — 240 s and 1800 s observed, with `--stats=false` and graph tracing at
 its default — and only a killed run's partial report was readable, which is what produced the table above.
 `--cuda-graph-trace=none` is not a valid argument; `node` is what makes the post-processing explode.
+
+## Decode after the fixes (2026-10-16)
+
+The same recipe on the fixed tree — graphs disabled in the bench so the kernels trace, bounded with `--stats=false`, then `nsys stats` on the partial report — over a `-n 4` run with the in-domain corpus, five passes counted. Per-pass times are the totals divided by five:
+
+| kernel | per pass | share |
+|---|---|---|
+| `expert_cache_fetch_kernel` (the gather) | **10.0 ms** | **47.6%** |
+| `fp8_a16_gemv` (4096-wide) | 2.7 ms | 12.8% |
+| `bf16_latent_row_kernel<1024,4096>` (new) | 1.8 ms | 8.4% |
+| `narrow_down<32>` | 1.1 ms | 5.4% |
+| `fp8_a16_gemv` (8192-wide) | 0.9 ms | 4.4% |
+| `nemotron_router_select` | 0.8 ms | 3.7% |
+| `narrow_up<64>` | 0.8 ms | 3.6% |
+| everything else (nvfp4 gemvs, `bf16_latent_row<4096,1024>`, rmsnorm, router logits) | ~2.5 ms | ~12% |
+
+- **The expert Op is fixed by measurement, not by assertion**: `narrow_up<64>` at 19 µs and `narrow_down<32>` at 28 µs per layer against the per-token kernel's 16.3 ms — about 350x per layer — so the layer's entire expert computation now costs less than one gather kernel, and the Op's share of GPU time falls from 94.4% to 9%.
+- **The new first cost is the thing that feeds it.** The gather is 345 µs per instance and 29-30 instances per pass, i.e. 10.0 ms. At 632.8 MiB per pass that is about 66 GB/s, essentially this board's link rate, so it cannot be improved by making the copy faster — only by missing less, which is a cache-sizing question (`RoutedExpertPool`'s slot pool is `2 x max_bank_experts` and is not currently tunable) rather than a kernel one.
+- **The registered latent shapes are 5.75x and 23x**: 44 µs for `(1024, 4096)` and 11 µs for `(4096, 1024)` against the dense fallback's 253 µs, measured on the real model rather than in isolation. That also settles a figure that looked impossible earlier in this record — the fallback really was ~20 ms of a pass — the error was comparing it against the fixed step's 14.3 ms instead of the 730 ms step it actually lived in.
+- **CUDA Graph becomes a lever exactly when the Op stops hiding the launches**: 69.89 output tokens/s with it against 46.97 with it disabled, i.e. about 7 ms per pass of launch and gap time. Before the fix the same pair was 1.36 against 1.36, which is why the graph was written off above; that write-off held only while a single kernel owned the step.
+- The remaining order is therefore: the gather's miss rate, the fp8 projection gemvs (12.8% and 4.4%), and the launch/gap term the graph already covers — with prefill, whose wide path is still the per-token kernel at ~5.6 ms per token, as the other half.
