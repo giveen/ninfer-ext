@@ -47,6 +47,25 @@ SOURCE_ENV = "NINFER_NEMOTRON_SOURCE"
 DEFAULT_SOURCE = "/mnt/storage/models/nemo/74B"
 PROBE = Path(os.environ.get("NINFER_TOKEN_PROBE", ROOT / "build/tests/ninfer_nemotron_h_tokenizer_test"))
 
+# A missing input is a skip, and this has to happen at module level. unittest catches SystemExit from a
+# test body or setUp (it uses a bare except), so raising 77 there would be reported as an error rather
+# than a skip; and unittest's own skipTest leaves the process exiting 0, which ctest reads as a test that
+# ran nothing having passed. Exiting 77 here is what the registration's SKIP_RETURN_CODE maps to, and it
+# matches the C++ tests in this directory. Under pytest the same condition is a module-level skip.
+_missing = next(
+    (f"{name} is not set" for name in (ARTIFACT_ENV, CORPUS_ENV) if os.environ.get(name) is None),
+    None,
+)
+if _missing is None and not PROBE.exists():
+    _missing = f"the probe binary is not built: {PROBE}"
+if _missing is not None:
+    if "pytest" in sys.modules:
+        import pytest
+
+        pytest.skip(_missing, allow_module_level=True)
+    print(f"SKIP: {_missing}", file=sys.stderr)
+    raise SystemExit(77)
+
 
 def artifact_tokenizer(artifact_path: str) -> str:
     with Artifact(artifact_path) as artifact:
@@ -70,18 +89,6 @@ def first_divergence(left: list[int], right: list[int]) -> int:
 
 
 class TokenizerReference(unittest.TestCase):
-    def setUp(self):
-        # A missing input exits 77 rather than calling unittest's own skipTest: a skipped case leaves
-        # unittest exiting 0, and ctest would then report a test that ran nothing as a success. The C++
-        # tests in this directory skip the same way, through the same SKIP_RETURN_CODE.
-        for name in (ARTIFACT_ENV, CORPUS_ENV):
-            if os.environ.get(name) is None:
-                print(f"SKIP: {name} is not set", file=sys.stderr)
-                raise SystemExit(77)
-        if not PROBE.exists():
-            print(f"SKIP: the probe binary is not built: {PROBE}", file=sys.stderr)
-            raise SystemExit(77)
-
     def test_corpus_ids_match_the_reference_pipeline(self):
         artifact_path = os.environ[ARTIFACT_ENV]
         corpus_path = os.environ[CORPUS_ENV]
