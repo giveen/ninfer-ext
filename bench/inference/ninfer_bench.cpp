@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
+        engine_options.expert_cache  = options.expert_cache;
         engine_options.context_cache.enabled = false;
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;

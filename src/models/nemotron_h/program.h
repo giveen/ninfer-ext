@@ -134,6 +134,15 @@ public:
     [[nodiscard]] static std::size_t device_bytes(const TextConfig& config,
                                                   const EngineOptions& options);
 
+    // The routed experts' own device bytes under these options' cache policy: the pool the
+    // constructor allocates for them, and the elastic half of a load. It is included in
+    // `device_bytes` and it is *inside* the budget `plan_load` spends, so a caller deriving that
+    // budget subtracts this term from `device_bytes` -- reserving it in both places reserves it
+    // twice and hands the resident banks one pool's worth less than the card can afford. Zero when
+    // the policy asks for no pool at all.
+    [[nodiscard]] static std::size_t expert_pool_device_bytes(const TextConfig& config,
+                                                  const EngineOptions& options);
+
     // Sequences that can be admitted at once: one per lane, because a lane owns a state slot and
     // its own K/V planes.
     [[nodiscard]] std::int32_t admission_capacity() const noexcept { return lanes(); }

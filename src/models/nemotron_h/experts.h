@@ -24,6 +24,13 @@
 // `ExpertPager::stages`'s, exposed here as `RoutedExpertPool::stages`; there is no option, flag or
 // policy mode for it, and both routes share the one slot pool and allocate nothing per call.
 //
+// The pool's *size* is the residency plan's, not the geometry's: the two staged banks are the
+// floor, and the per-expert slot cache a caller's `ExpertCachePolicy::cache_slots` asks for sits
+// below them, paid for out of the same device budget as the resident banks (`plan_experts.h`). A
+// bigger cache is therefore fewer resident banks -- one slot's bytes for one slot's worth of bank
+// not uploaded -- and a smaller one is more banks. Zero extra slots is the pool this family ran
+// before the split was tunable, which is what every recorded number was taken with.
+//
 // This is the *execution* half. The planning half -- the pool's geometry, its size, and the split
 // that decides which banks are uploaded -- is `plan_experts.h`, which the loader calls while
 // resolving the artifact and this side consumes. What is left here is the device side itself:
@@ -84,12 +91,16 @@ class Model;
  */
 class RoutedExpertPool {
 public:
-    // The pool is built from the model itself: its banks come from the config, its split from the
-    // plan the loader bound the banks with, and its per-layer addressing from the bound weights --
-    // so a pool cannot disagree with the model it serves. `staged_columns` is the width at or above
-    // which a call stages; zero takes the pool's own, `ceil(max_experts / top_k)`, which is the
-    // narrowest width at which a call touches every expert of the widest bank and staging therefore
-    // copies no more than the call reads. A harness may pass a width of its own.
+    // The pool is built from the model itself: its banks come from the config, its split and its
+    // slot cache from the plan the loader bound the banks with, and its per-layer addressing from
+    // the bound weights -- so a pool cannot disagree with the model it serves. `staged_columns` is
+    // the width at or above which a call stages; zero takes the pool's own,
+    // `ceil(max_experts / top_k)`, which is the narrowest width at which a call touches every
+    // expert of the widest bank and staging therefore copies no more than the call reads. A
+    // harness may pass a width of its own. The pool's *size* is not an argument: it is the
+    // residency plan's (`ExpertResidencyPlan::cache_slots` below the geometry's two staged banks),
+    // because the one budget that pays for the cache and for the resident banks is spent in one
+    // place.
     RoutedExpertPool(const Model& model, std::int32_t top_k, std::int32_t staged_columns = 0);
     ~RoutedExpertPool();
     RoutedExpertPool(const RoutedExpertPool&)            = delete;

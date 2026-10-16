@@ -45,8 +45,16 @@ namespace ninfer::models::nemotron_h {
 [[nodiscard]] std::size_t expert_staging_bytes(std::span<const ops::ExpertBankShape> banks);
 
 // The device bytes a `RoutedExpertPool` for `config` allocates, which is what a caller that has to
-// keep room for it adds to its own reservation. Zero when the config has no MoE block.
-[[nodiscard]] std::size_t expert_pool_bytes(const TextConfig& config);
+// keep room for it adds to its own reservation: the two staged banks, `cache_slots` slot-cache
+// slots beside them, and the pager's tables that describe both. Zero when the config has no MoE
+// block. `cache_slots` zero is the structural pool -- the two staged banks and nothing else, which
+// is the size every recorded number was taken with -- and a positive count is that many extra slots
+// of per-expert cache.
+[[nodiscard]] std::size_t expert_pool_bytes(const TextConfig& config, std::int32_t cache_slots = 0);
+
+// The same over a pool's own geometry, which is what the residency planner has in hand.
+[[nodiscard]] std::size_t expert_pool_bytes(std::span<const ops::ExpertBankShape> banks,
+                                            std::int32_t cache_slots);
 
 // The routed rank of the pool's layers: the most experts one token of any layer selects, which is
 // the assignment count the pool is sized against. Zero when the config has no MoE block.
@@ -76,16 +84,25 @@ inline constexpr std::size_t kRuntimeReservationBytes = 824ULL * 1024 * 1024;
 // family ran before this split existed.
 struct ExpertResidencyPlan {
     std::size_t budget_bytes      = 0; // device bytes the routed experts occupy in total
-    std::size_t staging_bytes     = 0; // the two staged banks and the pager's tables
+    std::size_t staging_bytes     = 0; // the pool: the two staged banks, the slot cache, the tables
     std::size_t resident_bytes    = 0; // the banks bound device-resident
     std::int32_t resident_experts = 0; // experts resident: the cache's "slots"
     std::int32_t pool_experts     = 0; // expert count of the whole pool
+    // The slot-cache slots granted beside the two staged banks: the part of the pool that is a
+    // per-expert cache rather than a staging buffer, and the half of the split a caller can move.
+    // The pool's total slot count is these plus `2 * widest_bank_experts`.
+    std::int32_t cache_slots     = 0;
+    std::int32_t requested_slots = 0; // what the request asked for, before the card's own cap
     std::vector<bool> resident{};      // one flag per pool layer
     // An explicit size was larger than the card can afford, so it was re-derived smaller. The
     // request is never honoured by starving the state and K/V reservation, and never by
     // over-committing the card: both numbers are reported for the caller to see.
     bool clamped                = false;
     std::size_t requested_bytes = 0;
+    // The slot cache was re-derived smaller than the request: what the card could afford once the
+    // staged banks and the bank it would have displaced are counted. A slot request is a *share* of
+    // the expert budget rather than a demand, so this is a grant rather than a refusal.
+    bool slots_clamped = false;
 
     [[nodiscard]] double resident_fraction() const noexcept {
         return pool_experts == 0
@@ -102,21 +119,29 @@ struct ExpertResidencyPlan {
 /**
  * Spend the device memory the routed experts may have.
  *
- * `available_bytes` is what the card has free for *resident* banks: free device memory less the
- * dense weights, less the lane states and one pass's workspace, less the runtime's own reservation
- * and its headroom, less the staging buffer. It is derived by the caller from the engine's own
- * resolved plan (contexts, lanes, K/V dtype, chunk) rather than from a constant, because it is the
- * K/V that must not give way: a cache sized before the K/V resolution would take the memory the
- * K/V needs and fail a request later.
+ * `available_bytes` is the whole expert footprint the card can give -- the pool and the resident
+ * banks together: free device memory less the dense weights, less the lane states and one pass's
+ * workspace, less the runtime's own reservation and its headroom. It is derived by the caller from
+ * the engine's own resolved plan (contexts, lanes, K/V dtype, chunk) rather than from a constant,
+ * because it is the K/V that must not give way: a cache sized before the K/V resolution would take
+ * the memory the K/V needs and fail a request later. The pool is *inside* this figure, so a caller
+ * that also reserved it beside this budget would reserve it twice and hand the resident banks one
+ * pool's worth less than the card can afford.
  *
  * `explicit_size` marks a caller-set cap, which is clamped to `available_bytes` rather than
  * over-committed. Banks are taken largest first, so the resident set is the one that keeps the most
  * bytes off the host link; the order is a total order on (bytes, pool index) and therefore
  * reproducible run to run.
+ *
+ * `requested_slots` is the slot-cache share of that footprint: the pool taken first is the two
+ * staged banks plus this many per-expert slots, and the rest is the resident banks' -- so a slot
+ * costs the bank bytes it displaces one for one, and the plan reports the count it could grant
+ * rather than refusing an over-large one.
  */
 [[nodiscard]] ExpertResidencyPlan plan_expert_residency(std::span<const ops::ExpertBankShape> banks,
                                                         std::size_t available_bytes,
                                                         bool explicit_size,
-                                                        std::size_t explicit_bytes);
+                                                        std::size_t explicit_bytes,
+                                                        std::int32_t requested_slots = 0);
 
 } // namespace ninfer::models::nemotron_h

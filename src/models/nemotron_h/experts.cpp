@@ -68,7 +68,18 @@ RoutedExpertPool::RoutedExpertPool(const Model& model, std::int32_t top_k,
             "nemotron_h routed experts: the residency plan does not describe this pool's layers");
     }
     geometry_                = std::make_unique<ops::ExpertPoolGeometry>(banks_);
-    const std::int32_t slots = execution::ExpertPager::bank_slots(*geometry_);
+    // The pool's size is the *plan's*, not the geometry's: the two staged banks are the floor, and
+    // the slot-cache slots the residency plan granted sit below them as the gather route's own
+    // cache -- the region a staged fill's reclaim never touches. A caller moves that split through
+    // its cache policy, and the plan is the one place the budget is spent, so the pool cannot
+    // disagree with the split it was loaded under.
+    const std::int32_t cache_slots = model.expert_residency().cache_slots;
+    if (cache_slots < 0) {
+        throw std::invalid_argument(
+            "nemotron_h routed experts: the residency plan granted a negative slot cache");
+    }
+    const std::int32_t bank_slot = cache_slots;
+    const std::int32_t slots = bank_slot + execution::ExpertPager::bank_slots(*geometry_);
     if (top_k <= 0) {
         throw std::invalid_argument("nemotron_h routed experts: a pool routes at least one expert");
     }
@@ -114,7 +125,8 @@ RoutedExpertPool::RoutedExpertPool(const Model& model, std::int32_t top_k,
             "nemotron_h routed experts: the pool has a bank no MoE block of the model owns");
     }
     // Two whole-layer banks: bank b holds (or is being filled with) the layer the pass is on, while
-    // the other bank takes the next staged layer's copy. The divisor tails past the slot region are
+    // the other bank takes the next staged layer's copy. They are the top of the slot range -- the
+    // slot cache the plan granted is below them -- and the divisor tails past the slot region are
     // what keep the second bank's divisors in bounds.
     const std::size_t pool_bytes =
         static_cast<std::size_t>(slots) * static_cast<std::size_t>(geometry_->pool_stride()) +
@@ -144,11 +156,12 @@ RoutedExpertPool::RoutedExpertPool(const Model& model, std::int32_t top_k,
                                       .slot_entries = geometry_->slot_entries(),
                                       .pool_stride  = geometry_->pool_stride(),
                                       .pool         = static_cast<std::byte*>(pool_.p)};
-    // The staged banks are the top of the cache's slots and, with no lend range, they are the whole
-    // of them: a gather call's cache and a staged call's two banks are one region, which is what
-    // lets the two routes share one allocation. A staged pass reclaims it at its first staged
-    // layer, so the cache a gather left there cannot be mistaken for staged bytes.
-    pager_.emplace(*geometry_, cache, staged_width, top_k, 0, slots);
+    // The staged banks are the top of the cache's slots and the slot cache is the rest of them: a
+    // gather call's cache and a staged call's two banks are one region, which is what lets the two
+    // routes share one allocation. A staged pass reclaims the bank slots at its first staged layer,
+    // so the cache a gather left there cannot be mistaken for staged bytes -- and with a granted
+    // slot cache those slots are below `bank_slot` and are not the reclaim's at all.
+    pager_.emplace(*geometry_, cache, staged_width, top_k, bank_slot, slots);
 }
 
 RoutedExpertPool::~RoutedExpertPool() = default;

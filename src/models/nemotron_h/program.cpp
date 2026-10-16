@@ -142,16 +142,19 @@ StatePlan plan_state(const StateGeometry& geometry, LayoutBuilder& builder) {
     return plan;
 }
 
-// The staged expert banks and the pager's tables, when the caller's cache policy can afford them.
-// The cache is the elastic term of a load, so this is what a Program holds on its behalf and what a
-// cache request must not eat into: `device_bytes` accounts it beside the state and the workspace,
-// and a policy that asks for no cache at all -- an explicit zero -- asks for no staging either,
-// which is the in-place host route this family ran before the split existed.
+// The staged expert pool's device bytes under the caller's cache policy: the two staged banks,
+// the slot-cache slots the policy asks for beside them, and the pager's tables. It is what a
+// Program holds for the routed experts, and it is the *elastic* half of a load -- the part a cache
+// request sizes. The pool is not, however, reserved beside the residency budget: it is inside it,
+// because the plan that decides the resident banks spends the same figure on both halves. A caller
+// deriving that budget from `device_bytes` therefore takes this term out again, through
+// `expert_pool_device_bytes`, or it reserves the pool twice and hands the resident banks one pool's
+// worth less than the card can afford.
 std::size_t staged_expert_bytes(const TextConfig& config, const EngineOptions& options) {
-    const std::size_t pool = expert_pool_bytes(config);
+    const std::size_t pool = expert_pool_bytes(config, options.expert_cache.cache_slots);
     if (pool == 0) { return 0; }
     if (options.expert_cache.mode == ExpertCacheMode::Automatic) { return pool; }
-    return options.expert_cache.explicit_bytes >= expert_staging_bytes(expert_bank_geometry(config))
+    return options.expert_cache.explicit_bytes >= pool
                ? pool
                : 0;
 }
@@ -223,6 +226,12 @@ std::size_t Program::device_bytes(const TextConfig& config, const EngineOptions&
            staged_expert_bytes(config, options);
 }
 
+std::size_t Program::expert_pool_device_bytes(const TextConfig& config,
+                                              const EngineOptions& options) {
+    return
+           staged_expert_bytes(config, options);
+}
+
 Program::Program(const Model& model, const EngineOptions& options, DeviceContext& device)
     : model_(&model), arena_(pass_arena_bytes(model.config(), options)),
       sampling_workspace_(sampling_arena_bytes(model.config(), options)) {
@@ -285,8 +294,11 @@ Program::Program(const Model& model, const EngineOptions& options, DeviceContext
 
     // The staged banks. They are allocated here rather than at bind time because the split that
     // decided the resident banks did not: what a *resident* bank costs was uploaded with the
-    // weights, and what staging costs is this pool.
-    if (staged_expert_bytes(model.config(), options) != 0) {
+    // weights, and what staging costs is this pool. The plan decides both whether there is a pool
+    // and how big it is -- a card that could not afford the staged banks planned none, and one that
+    // could not afford the slot cache it was asked for planned a smaller one -- so the pool follows
+    // the model's own residency rather than re-deriving it from the options.
+    if(model.expert_residency().staging_bytes != 0) {
         experts_.emplace(model, expert_top_k(model.config()));
     }
 }

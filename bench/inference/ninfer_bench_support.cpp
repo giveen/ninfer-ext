@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/offload_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -316,6 +317,10 @@ std::string usage_text(std::string_view program) {
         << " (default: model; 4096 for Qwen4Exp, else 1024 beside\n"
         << "                              decode and 4096 alone; an explicit value fixes both)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
+        << "  --expert-cache <auto|MiB>   device cache of host-resident routed experts (default: "
+           "auto)\n"
+        << "  --expert-cache-slots <n>    per-expert slot-cache slots beside the family's staged\n"
+        << "                              banks (default: 0, the structural pool)\n"
         << "  --spec <mtp|dflash|dflash2|eagle3> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"
         << "                              DFlash/DFlash2/Eagle3 1..15\n"
@@ -372,6 +377,11 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--expert-cache") {
+            options.expert_cache = product::parse_expert_cache(value("--expert-cache"));
+        } else if (arg == "--expert-cache-slots") {
+            options.expert_cache.cache_slots =
+                parse_nonnegative(value("--expert-cache-slots"), "expert-cache-slots");
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {

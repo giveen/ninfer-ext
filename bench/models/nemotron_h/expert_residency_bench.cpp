@@ -48,7 +48,7 @@ namespace nemotron = ninfer::models::nemotron_h;
 
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0 << " <model.ninfer> [--tokens N,N,...] [--cache auto|0|MiB]\n"
-              << "       [--lanes N] [--context N] [--chunk N] [--repeats N]\n";
+              << "       [--slots N] [--lanes N] [--context N] [--chunk N] [--repeats N]\n";
 }
 
 std::vector<std::int32_t> parse_tokens(std::string_view text) {
@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
     const std::string artifact = argv[1];
     std::vector<std::int32_t> widths{512, 1024, 4096};
     std::string cache     = "auto";
+    std::int32_t slots    = 0;
     std::uint32_t lanes   = 1;
     std::uint32_t context = 2048;
     std::uint32_t chunk   = 4096;
@@ -106,6 +107,9 @@ int main(int argc, char** argv) {
             widths = parse_tokens(next("--tokens"));
         } else if (arg == "--cache") {
             cache = next("--cache");
+        } else if (arg == "--slots") {
+            slots = std::stoi(next("--slots"));
+            if (slots < 0) { throw std::runtime_error("--slots must not be negative"); }
         } else if (arg == "--lanes") {
             lanes = static_cast<std::uint32_t>(std::stoul(next("--lanes")));
         } else if (arg == "--context") {
@@ -136,11 +140,15 @@ int main(int argc, char** argv) {
 
     // The same reservation the Engine's instance resolves, so the two configurations differ only in
     // the split: the family's state and one pass's workspace, the pass's own output buffer, the
-    // runtime's reservation and its headroom all stay out of the cache's way.
+    // runtime's reservation and its headroom all stay out of the cache's way. The pool is *inside*
+    // the budget the residency plan spends, so it comes out of the reservation here rather than
+    // being counted in both places.
     nemotron::ExpertResidencyRequest request;
     request.automatic      = options.expert_cache.mode == ExpertCacheMode::Automatic;
     request.explicit_bytes = options.expert_cache.explicit_bytes;
-    request.reserve_bytes  = nemotron::Program::device_bytes(config, options) +
+    request.cache_slots    = slots;
+    request.reserve_bytes  = nemotron::Program::device_bytes(config, options) -
+                             nemotron::Program::expert_pool_device_bytes(config, options) +
                              nemotron::pass_output_bytes(config, static_cast<std::int32_t>(chunk)) +
                              nemotron::kRuntimeReservationBytes;
     std::size_t free_bytes = 0;
@@ -182,6 +190,13 @@ int main(int argc, char** argv) {
                       : "")
               << "\n"
               << "staging              " << mib(residency.staging_bytes) << " MiB\n"
+              << "slot cache           " << slots << " slots requested, " << residency.cache_slots
+              << " granted"
+              << (residency.slots_clamped ? "  (clamped to what the card affords)" : "") << "\n"
+              << "pool slots           "
+              << (pool ? static_cast<std::size_t>(pool->cache().slots) : 0) << " = two staged "
+              << (pool ? static_cast<std::size_t>(2) * pool->geometry().max_experts() : 0)
+              << "-expert banks + " << residency.cache_slots << " cached\n"
               << "pool device bytes    " << mib(pool ? pool->allocated_bytes() : 0) << " MiB\n"
               << "resident banks       "
               << std::count(residency.resident.begin(), residency.resident.end(), true) << " of "
@@ -479,17 +494,26 @@ int main(int argc, char** argv) {
         const double relative_l2 =
             reference_squared > 0.0 ? std::sqrt(error_squared / reference_squared) : 0.0;
 
+        // Every miss copies one expert of its own layer, and a layer's expert is its own width, so
+        // the cache route's traffic is the miss count times the mean non-resident expert. The cold
+        // pass's figure is exact -- all `assignments` missed -- and the warm one is that mean
+        // applied to the misses counted over the timed passes, which is what makes the two routes'
+        // host-link traffic comparable without a profile.
+        const double mean_expert_mib =
+            assignments != 0 ? mib(routed_bytes) / static_cast<double>(assignments) : 0.0;
+        const double warm_misses = static_cast<double>(timed_misses) / static_cast<double>(runs);
+
         std::printf("\n  narrow   1 column  %9.1f ms/pass   (best of %d)\n"
                     "  staged   1 column  %9.1f ms/pass   (%.1f MiB staged: the route decode used "
                     "before)\n"
                     "  in-place 1 column  %9.1f ms/pass   (best of %d; every bank pinned)\n"
                     "  narrow vs in-place: %zu logits, %zu differ, max_abs %.6g, rel_l2 %.6g\n"
                     "  one column routes %d assignments: %.1f MiB gathered on the cold pass\n"
-                    "  (%llu of %d missed), %.0f missed per warm column\n",
+                    "  (%llu of %d missed), %.0f missed per warm column, %.1f MiB gathered\n",
                     narrow_ms, runs, staged_column_ms, mib(staged_column_bytes), inplace_ms,
                     runs + 1, pinned_logits.size(), differing, max_abs, relative_l2, assignments,
-                    mib(routed_bytes), cold_misses, assignments,
-                    static_cast<double>(timed_misses) / static_cast<double>(runs));
+                    mib(routed_bytes), cold_misses, assignments, warm_misses,
+                    warm_misses * mean_expert_mib);
         std::cout << std::flush;
 
         // The evidence the gather happened at all: a route that silently gathered nothing would

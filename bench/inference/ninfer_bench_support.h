@@ -62,6 +62,10 @@ struct BenchOptions {
     std::optional<std::uint32_t> prefill_chunk; // empty: model default
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // The routed experts' device cache: how much of it is per-expert slot cache and how large the
+    // whole cache may be. Defaults to the family's own policy, which is what every recorded number
+    // was taken with.
+    ExpertCachePolicy expert_cache;
     int device            = 0;
     bool use_cuda_graph   = true;
     bool profile_measured = false;

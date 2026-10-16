@@ -54,20 +54,29 @@ struct DeclaredParameter {
  * Where the routed experts' device memory comes from, as the caller resolved it.
  *
  * The cache is the elastic term and the K/V is not, so this is spent *after* the caller has
- * resolved contexts, lanes, K/V dtype and chunk: `reserve_bytes` is everything that must stay on the
- * card beside the resident banks -- the family's state for those lanes and windows, one pass's
- * workspace, the staging buffer and its tables, the runtime's own reservation and its headroom --
- * and the resident banks take only what free memory is left over. A cache request that would eat
- * into that reservation is re-derived smaller and reported (`ExpertResidencyPlan::clamped`), never
- * honoured by shrinking the K/V and never over-committed.
+ * resolved contexts, lanes, K/V dtype and chunk: `reserve_bytes` is everything that must stay on
+ * the card beside the routed experts -- the family's state for those lanes and windows, one pass's
+ * workspace, the runtime's own reservation and its headroom -- and the experts' own device bytes,
+ * the pool and the resident banks together, take only what free memory is left over. A cache
+ * request that would eat into that reservation is re-derived smaller and reported
+ * (`ExpertResidencyPlan::clamped`), never honoured by shrinking the K/V and never over-committed.
  */
 struct ExpertResidencyRequest {
     // Automatic takes everything the card has left; otherwise `explicit_bytes` caps the resident
     // banks and is clamped to the same figure.
     bool automatic             = true;
     std::size_t explicit_bytes = 0;
+    // The slot-cache share of that expert budget: per-expert cache slots the pool keeps beside the
+    // two staged banks, which are the pool's structural floor. Zero takes that floor -- the pool
+    // every recorded number was taken with -- and a positive count is granted out of the same
+    // budget as the resident banks, one slot's bytes for one slot's worth of bank not uploaded. The
+    // plan reports the count it could grant, so an over-large request costs cache rather than a
+    // failed load.
+    std::int32_t cache_slots = 0;
     // The non-expert device bytes, summed as described above. Zero is a valid request for "plan no
-    // residency", not for "assume nothing else is resident".
+    // residency", not for "assume nothing else is resident". The expert pool is *not* part of this:
+    // it is the routed experts' own device side, which the plan spends its budget on, and counting
+    // it here as well would reserve it twice.
     std::size_t reserve_bytes = 0;
 };
 

@@ -711,8 +711,14 @@ std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& op
     models::nemotron_h::ExpertResidencyRequest residency;
     residency.automatic = options.expert_cache.mode == ExpertCacheMode::Automatic;
     residency.explicit_bytes = options.expert_cache.explicit_bytes;
+    residency.cache_slots    = options.expert_cache.cache_slots;
+    // The expert pool is *inside* the budget the plan spends on the pool and the resident banks
+    // together, so it is taken out of the reservation here rather than counted in both places: a
+    // reservation that included it would reserve it twice and leave one pool's worth of the card
+    // idle, which is exactly the memory a bigger cache or one more resident bank would have used.
     residency.reserve_bytes =
-        models::nemotron_h::Program::device_bytes(artifact_config.text, options) +
+        models::nemotron_h::Program::device_bytes(artifact_config.text, options) -
+        models::nemotron_h::Program::expert_pool_device_bytes(artifact_config.text, options) +
         models::nemotron_h::kRuntimeReservationBytes +
         (options.kv_capacity.mode == KvCapacityMode::Automatic
              ? options.kv_capacity.automatic_headroom_bytes

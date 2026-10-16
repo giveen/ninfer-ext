@@ -107,6 +107,13 @@ enum class ExpertCacheMode : std::uint8_t {
 struct ExpertCachePolicy {
     ExpertCacheMode mode       = ExpertCacheMode::Automatic;
     std::size_t explicit_bytes = 0;
+    // Slot-cache slots a family that keeps a per-expert device cache should hold *beside* the
+    // slots it stages whole banks into. Zero -- the default -- is the pool such a family sized from
+    // its own geometry before this was a policy, which is what every recorded number was taken
+    // with. A positive count is granted out of the same expert budget as the resident banks, one
+    // slot's device bytes for one slot's worth of bank not uploaded, and a card that cannot afford
+    // the request is given a smaller cache rather than a failed load.
+    std::int32_t cache_slots = 0;
 
     [[nodiscard]] static constexpr ExpertCachePolicy explicit_cache(std::size_t bytes) noexcept {
         return ExpertCachePolicy{ExpertCacheMode::Explicit, bytes};

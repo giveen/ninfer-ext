@@ -372,7 +372,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     const std::vector<ops::ExpertBankShape> banks = expert_bank_geometry(out->config);
     out->residency = plan_expert_residency(
         banks, expert_residency_budget(reader, banks, request), !request.automatic,
-        request.explicit_bytes);
+        request.explicit_bytes, request.cache_slots);
     // The tokenizer's and the chat template's bytes are artifact resources rather than weights, and
     // this is where a frontend reads them. They borrow the reader's mapped bytes, and the Binder
     // must still be alive to hand them over, so this comes before it is finished.
