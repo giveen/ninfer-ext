@@ -91,3 +91,26 @@ ninfer_add_test(ninfer_nemotron_h_engine_load_test
   LIBRARIES ninfer_engine ninfer_artifact ninfer_model_loading)
 
 set_tests_properties(ninfer_nemotron_h_engine_load_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The draft's conditioning: the six residual-stream taps a LiLiCorr drafter consumes, captured on the
+# real artifact for every position of a real sequence, checked against the same sequence read in one
+# pass from a zero state (the incremental capture and the one-pass one must be the same bytes), and
+# dumped beside the target's own greedy stream for the acceptance probe. It needs the artifact
+# (NINFER_NEMOTRON_ARTIFACT) and skips (77) without it; NINFER_TAP_DUMP names the directory it writes.
+ninfer_add_test(ninfer_nemotron_h_draft_taps_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_taps.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_artifact)
+
+set_tests_properties(ninfer_nemotron_h_draft_taps_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The round itself: the drafter proposes, the target verifies a whole block, the longest matching
+# prefix is accepted and the bonus token published -- measured as accepted drafts per round on the
+# real artifact, with the round's wall time split between the draft's forward and the target's
+# verify pass. The bar is 1.5 drafts per round against the reference implementation's 2.122, and a
+# number far below it names the round rather than the drafter. It needs the draft-carrying artifact
+# (NINFER_NEMOTRON_ARTIFACT) and skips (77) without it.
+ninfer_add_test(ninfer_nemotron_h_draft_round_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_round.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_artifact)
+
+set_tests_properties(ninfer_nemotron_h_draft_round_test PROPERTIES SKIP_RETURN_CODE 77)

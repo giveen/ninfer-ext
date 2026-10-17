@@ -2,7 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
-#include "core/device.h"       // CUDA_CHECK: the residency budget measures the card
+#include "core/device.h"      // CUDA_CHECK: the residency budget measures the card
 #include "core/weight_view.h" // weight_element_count
 
 #include <cmath>
@@ -32,11 +32,11 @@ constexpr QType kScalarFormat = QType::FP32;
 
 class Declarations {
 public:
-    // `resident` answers, per MoE block, whether that block's bank is device-resident: the split the
-    // caller's request resolved. The bank is declared with it, because residency is a property of
-    // the binding -- a resident bank is uploaded once and read where it lives, a non-resident one is
-    // page-locked host memory a kernel addresses over UVA -- and a parameter demanded both ways
-    // would be materialized twice.
+    // `resident` answers, per MoE block, whether that block's bank is device-resident: the split
+    // the caller's request resolved. The bank is declared with it, because residency is a property
+    // of the binding -- a resident bank is uploaded once and read where it lives, a non-resident
+    // one is page-locked host memory a kernel addresses over UVA -- and a parameter demanded both
+    // ways would be materialized twice.
     Declarations(artifact::Binder& binder, const ExpertResidencyPlan& residency)
         : binder_(binder), residency_(residency) {}
 
@@ -94,7 +94,7 @@ public:
         pending.reference = binder_.binding(name, whole, shape,
                                             device ? Residency::Device : Residency::HostPinned, {});
         pending.name      = std::move(name);
-        pending.matrix             = true;
+        pending.matrix    = true;
         pending.activation_divisor = divisor;
         return push(std::move(pending));
     }
@@ -208,21 +208,165 @@ MoeWeights declare_moe(Declarations& declare, const MoeBankConfig& bank, std::ui
     out.router          = declare.matrix(moe + "router", {experts, hidden}, prefix + "ffn_input");
     out.correction_bias = declare.tensor(moe + "correction_bias", {experts}, kScalarFormat);
     // The two latent projections bracket the bank, and the shared expert is a relu2 MLP at the
-    // block's own hidden width, because the reference adds it outside the latent round trip.
-    out.fc1_latent  = declare.matrix(moe + "latent_in", {latent, hidden}, prefix + "ffn_input");
-    out.fc2_latent  = declare.matrix(moe + "latent_out", {hidden, latent}, moe + "expert_product");
+    // block's own hidden width, because the reference adds it outside the latent round trip. A zero
+    // latent (Lightning 30B) means a direct bank: no projections, and the experts read the block's
+    // residual, so their input is the block's own `ffn_input` rather than the latent's output.
+    if (bank.latent()) {
+        out.fc1_latent = declare.matrix(moe + "latent_in", {latent, hidden}, prefix + "ffn_input");
+        out.fc2_latent =
+            declare.matrix(moe + "latent_out", {hidden, latent}, moe + "expert_product");
+    }
+    const std::string expert_input = bank.latent() ? moe + "expert_input" : prefix + "ffn_input";
     out.shared_up   = declare.matrix(moe + "shared/up", {shared, hidden}, prefix + "ffn_input");
     out.shared_down = declare.matrix(moe + "shared/down", {hidden, shared}, moe + "shared/product");
     // One bank per direction, expert-major with one divisor for the whole parent: expert `e` is the
     // rows `[e * width, (e + 1) * width)` of `up` and `[e * latent, (e + 1) * latent)` of `down`.
-    out.experts_up   = declare.bank(moe + "experts/up", moe + "experts/0/up",
-                                    {experts * width, latent}, moe + "expert_input", pool_layer);
-    out.experts_down = declare.bank(moe + "experts/down", moe + "experts/0/down",
-                                    {experts * latent, width}, moe + "experts/0/product",
-                                    pool_layer);
+    out.experts_up = declare.bank(moe + "experts/up", moe + "experts/0/up",
+                                  {experts * width, latent}, expert_input, pool_layer);
+    out.experts_down =
+        declare.bank(moe + "experts/down", moe + "experts/0/down", {experts * latent, width},
+                     moe + "experts/0/product", pool_layer);
     // The bank's and the router's expert counts come from the artifact, not from the config value
     // both were declared with, and have to agree with it and with each other.
     declare.check_expert_count(layer, prefix, bank, out.router);
+    return out;
+}
+
+// The draft's parameters, walked from its spec rather than listed: every shape is a function of the
+// draft's own geometry, so a spec that differs in width, depth or tap count moves the declarations
+// with it instead of leaving a stale table. All of them are dense and device-resident.
+// The plain DFlash companion: the same six-layer qwen3 block over the tower's taps, without the
+// correlation head, the conv taps or the sink bias. Its context keys/values come from projections
+// of its own (`context_key`/`context_value`, bound to the same weights the companion stores).
+DraftWeights bind_dflash(Declarations& declare, const draft::Spec& spec) {
+    const std::uint64_t hidden = spec.hidden_size;
+    const std::uint64_t taps   = spec.target_layer_ids.size();
+    const std::uint64_t query =
+        static_cast<std::uint64_t>(spec.num_attention_heads) * spec.head_dim;
+    const std::uint64_t kv   = static_cast<std::uint64_t>(spec.num_key_value_heads) * spec.head_dim;
+    const std::uint64_t inner = spec.intermediate_size;
+
+    DraftWeights out;
+    out.feature_projection = declare.matrix("dflash/feature_projection", {hidden, taps * hidden});
+    out.context_norm       = declare.tensor("dflash/context_norm", {hidden});
+    out.final_norm         = declare.tensor("dflash/final_norm", {hidden});
+    out.mask_embedding     = declare.tensor("dflash/mask_embedding", {1, hidden});
+    out.layers.reserve(spec.num_hidden_layers);
+    for (std::uint32_t layer = 0; layer < spec.num_hidden_layers; ++layer) {
+        const std::string p = "dflash/layers/" + std::to_string(layer) + "/";
+        DraftLayerWeights w;
+        w.input_norm          = declare.tensor(p + "input_norm", {hidden});
+        w.post_attention_norm = declare.tensor(p + "post_attention_norm", {hidden});
+        w.query               = declare.matrix(p + "attention/query", {query, hidden});
+        w.key                 = declare.matrix(p + "attention/key", {kv, hidden});
+        w.value               = declare.matrix(p + "attention/value", {kv, hidden});
+        w.context_key         = declare.matrix(p + "attention/context_key", {kv, hidden});
+        w.context_value       = declare.matrix(p + "attention/context_value", {kv, hidden});
+        w.query_norm          = declare.tensor(p + "attention/query_norm", {spec.head_dim});
+        w.key_norm            = declare.tensor(p + "attention/key_norm", {spec.head_dim});
+        w.output              = declare.matrix(p + "attention/output", {hidden, query});
+        w.mlp_gate            = declare.matrix(p + "mlp/gate", {inner, hidden});
+        w.mlp_up              = declare.matrix(p + "mlp/up", {inner, hidden});
+        w.mlp_down            = declare.matrix(p + "mlp/down", {hidden, inner});
+        out.layers.push_back(std::move(w));
+    }
+    return out;
+}
+
+DraftWeights bind_draft(Declarations& declare, const draft::Spec& spec) {
+    const std::uint64_t hidden = spec.hidden_size;
+    const std::uint64_t taps   = spec.target_layer_ids.size();
+    const std::uint64_t query =
+        static_cast<std::uint64_t>(spec.num_attention_heads) * spec.head_dim;
+    const std::uint64_t kv = static_cast<std::uint64_t>(spec.num_key_value_heads) * spec.head_dim;
+    const std::uint64_t inner  = spec.intermediate_size;
+    const std::uint64_t groups = hidden / spec.conv_group_size;
+    // Both sides of both taps, one row per side/tap/group.
+    const std::uint64_t coeff = 2 * spec.conv_kernel_size * groups;
+    const std::uint64_t head  = spec.head.hidden_size;
+    const std::uint64_t head_mlp =
+        static_cast<std::uint64_t>(static_cast<double>(head) * spec.head.mlp_ratio);
+    const std::uint64_t blocks = spec.block_size;
+
+    DraftWeights out;
+    out.feature_projection = declare.matrix("dflash2/feature_projection", {hidden, taps * hidden});
+    out.context_norm       = declare.tensor("dflash2/context_norm", {hidden});
+    out.final_norm         = declare.tensor("dflash2/final_norm", {hidden});
+    out.layers.reserve(spec.num_hidden_layers);
+    for (std::uint32_t layer = 0; layer < spec.num_hidden_layers; ++layer) {
+        const std::string p = "dflash2/layers/" + std::to_string(layer) + "/";
+        DraftLayerWeights w;
+        w.input_norm          = declare.tensor(p + "input_norm", {hidden});
+        w.post_attention_norm = declare.tensor(p + "post_attention_norm", {hidden});
+        w.query               = declare.matrix(p + "attention/query", {query, hidden});
+        w.key                 = declare.matrix(p + "attention/key", {kv, hidden});
+        w.value               = declare.matrix(p + "attention/value", {kv, hidden});
+        // The cached-context rows come out of the same projections; they are bound once.
+        w.query_norm = declare.tensor(p + "attention/query_norm", {spec.head_dim});
+        w.key_norm   = declare.tensor(p + "attention/key_norm", {spec.head_dim});
+        w.sink_bias  = declare.tensor(p + "attention/sink_bias", {spec.num_attention_heads});
+        w.output     = declare.matrix(p + "attention/output", {hidden, query});
+        w.attention_conv_base =
+            declare.tensor(p + "attention_conv/base_kernel", {2, spec.conv_kernel_size * hidden});
+        w.attention_conv_projection =
+            declare.matrix(p + "attention_conv/kernel_projection", {coeff, hidden});
+        w.mlp_gate = declare.matrix(p + "mlp/gate", {inner, hidden});
+        w.mlp_up   = declare.matrix(p + "mlp/up", {inner, hidden});
+        w.mlp_down = declare.matrix(p + "mlp/down", {hidden, inner});
+        w.mlp_conv_base =
+            declare.tensor(p + "mlp_conv/base_kernel", {2, spec.conv_kernel_size * hidden});
+        w.mlp_conv_projection = declare.matrix(p + "mlp_conv/kernel_projection", {coeff, hidden});
+        out.layers.push_back(std::move(w));
+    }
+
+    const std::string hp    = "dflash2/lilicorr/";
+    DraftHeadWeights& hd    = out.head;
+    hd.anchor_norm          = declare.tensor(hp + "anchor_norm", {head});
+    hd.output_norm          = declare.tensor(hp + "output_norm", {head});
+    hd.feature_norm_weight  = declare.tensor(hp + "feature_norm/weight", {5});
+    hd.feature_norm_bias    = declare.tensor(hp + "feature_norm/bias", {5});
+    hd.in_head              = declare.matrix(hp + "in_head", {head, head});
+    hd.in_head_bias         = declare.tensor(hp + "in_head_bias", {head});
+    hd.out_head             = declare.matrix(hp + "out_head", {head, head});
+    hd.out_head_bias        = declare.tensor(hp + "out_head_bias", {head});
+    hd.anchor_out_head      = declare.matrix(hp + "anchor_out_head", {head, head});
+    hd.anchor_out_head_bias = declare.tensor(hp + "anchor_out_head_bias", {head});
+    // Three views of the head's input space: the candidate tokens, the tower's context and the
+    // pass-through hidden state.
+    hd.token_projection       = declare.matrix(hp + "token_projection", {head, hidden});
+    hd.token_bias             = declare.tensor(hp + "token_bias", {head});
+    hd.context_projection     = declare.matrix(hp + "context_projection", {head, hidden});
+    hd.context_bias           = declare.tensor(hp + "context_bias", {head});
+    hd.pass_hidden_projection = declare.matrix(hp + "pass_hidden_projection", {head, hidden});
+    hd.pass_hidden_bias       = declare.tensor(hp + "pass_hidden_bias", {head});
+    hd.feature_mlp_up         = declare.matrix(hp + "feature_mlp/up", {head, 5});
+    hd.feature_mlp_up_bias    = declare.tensor(hp + "feature_mlp/up_bias", {head});
+    hd.feature_mlp_down       = declare.matrix(hp + "feature_mlp/down", {head, head});
+    hd.feature_mlp_down_bias  = declare.tensor(hp + "feature_mlp/down_bias", {head});
+    hd.factor_input_projection =
+        declare.matrix(hp + "factor_input_projection", {spec.head.factor_dim, 3 * head});
+    hd.factor_input_bias = declare.tensor(hp + "factor_input_bias", {spec.head.factor_dim});
+    // Structural embeddings: one row per block slot and the pair-bias tables the head adds.
+    hd.rank_embedding     = declare.tensor(hp + "rank_embedding", {blocks, head});
+    hd.slot_embedding     = declare.tensor(hp + "slot_embedding", {blocks - 1, head});
+    hd.relative_slot_bias = declare.tensor(hp + "relative_slot_bias", {blocks, 2 * blocks - 1});
+    hd.same_slot_bias     = declare.tensor(hp + "same_slot_bias", {blocks});
+    hd.layers.reserve(spec.head.num_layers);
+    for (std::uint32_t layer = 0; layer < spec.head.num_layers; ++layer) {
+        const std::string p = hp + "layers/" + std::to_string(layer) + "/";
+        DraftHeadLayerWeights w;
+        w.norm               = declare.tensor(p + "norm", {head});
+        w.mlp_norm           = declare.tensor(p + "mlp_norm", {head});
+        w.attention_in       = declare.matrix(p + "attention/in_projection", {3 * head, head});
+        w.attention_in_bias  = declare.tensor(p + "attention/in_projection_bias", {3 * head});
+        w.attention_out      = declare.matrix(p + "attention/output", {head, head});
+        w.attention_out_bias = declare.tensor(p + "attention/output_bias", {head});
+        w.mlp_up             = declare.matrix(p + "mlp/up", {head_mlp, head});
+        w.mlp_up_bias        = declare.tensor(p + "mlp/up_bias", {head_mlp});
+        w.mlp_down           = declare.matrix(p + "mlp/down", {head, head_mlp});
+        w.mlp_down_bias      = declare.tensor(p + "mlp/down_bias", {head});
+        hd.layers.push_back(std::move(w));
+    }
     return out;
 }
 
@@ -295,6 +439,7 @@ struct LoadPlan::Impl {
     std::vector<DeclaredParameter> pending;
     artifact::MaterializationPlan plan;
     ExpertResidencyPlan residency;
+    std::optional<draft::Spec> draft;
 
     explicit Impl(const artifact::Reader& reader) : binder(reader) {}
 };
@@ -325,7 +470,7 @@ LoadPlan::Content LoadPlan::release() {
     if (!impl_) { throw ArtifactError("load plan was already consumed"); }
     auto data = std::move(impl_);
     return Content{std::move(data->config), std::move(data->weights), std::move(data->pending),
-                   std::move(data->plan)};
+                   std::move(data->plan), std::move(data->draft)};
 }
 
 namespace {
@@ -365,14 +510,19 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     // else, so every input plans the same set of parameters.
     (void)options;
     auto out    = std::make_unique<LoadPlan::Impl>(reader);
-    out->config = parse_config(reader.directory()).text;
+    auto parsed = parse_config(reader.directory());
+    out->config = std::move(parsed.text);
+    // The draft's own config rides the artifact beside the tower's; the loader keeps it so the
+    // weights it binds and the execution that reads them agree on the taps, the block size and the
+    // head's geometry without either re-reading the artifact.
+    out->draft = std::move(parsed.draft);
     // The routed banks' split is decided before anything is declared, because it *is* a property of
     // the declaration: the same request that a resident bank is uploaded once under is the one a
     // non-resident bank stays page-locked under.
     const std::vector<ops::ExpertBankShape> banks = expert_bank_geometry(out->config);
-    out->residency = plan_expert_residency(
-        banks, expert_residency_budget(reader, banks, request), !request.automatic,
-        request.explicit_bytes, request.cache_slots);
+    out->residency =
+        plan_expert_residency(banks, expert_residency_budget(reader, banks, request),
+                              !request.automatic, request.explicit_bytes, request.cache_slots);
     // The tokenizer's and the chat template's bytes are artifact resources rather than weights, and
     // this is where a frontend reads them. They borrow the reader's mapped bytes, and the Binder
     // must still be alive to hand them over, so this comes before it is finished.
@@ -386,7 +536,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     out->resources.chat_template_jinja    = resource("chat_template.jinja");
     Declarations declarations(out->binder, out->residency);
     out->weights.text = bind_text(declarations, out->config);
-    out->pending      = declarations.take();
+    if (out->draft) {
+        // A plain DFlash stores no block length; the LiLiCorr draft always does.
+        out->weights.draft = out->draft->block_size == 0 ? bind_dflash(declarations, *out->draft)
+                                                        : bind_draft(declarations, *out->draft);
+    }
+    out->pending = declarations.take();
     // Finishing consumes the Binder, so it must come after every parameter request.
     out->plan = std::move(out->binder).finish();
     return LoadPlan(std::move(out));

@@ -7,4 +7,5 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/attention_state.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/experts.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/experts.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/draft.cpp")

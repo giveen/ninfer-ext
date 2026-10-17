@@ -91,4 +91,28 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void silu_and_mul_fp32_kernel(const float* __restrict__ gate,
+                                         const float* __restrict__ up, float* __restrict__ out,
+                                         std::int64_t n) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) { out[i] = silu(gate[i]) * up[i]; }
+}
+
+} // namespace
+
+void silu_and_mul_fp32_launch(const Tensor& gate, const Tensor& up, Tensor& out,
+                              cudaStream_t stream) {
+    constexpr int kBlock = 128;
+    const std::int64_t n = out.numel();
+    const int grid       = static_cast<int>(std::min<std::int64_t>(
+        std::numeric_limits<int>::max(), div_up(n, static_cast<std::int64_t>(kBlock))));
+    silu_and_mul_fp32_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const float*>(gate.data),
+                                                          static_cast<const float*>(up.data),
+                                                          static_cast<float*>(out.data), n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

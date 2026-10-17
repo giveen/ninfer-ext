@@ -225,7 +225,8 @@ inline constexpr int kRowTiledChunkColumns = 64;
 // the plane-addressed route's own multiple-of-128 requirement gives.
 template <class Activation>
 __device__ __forceinline__ float row_tiled_bank_row(const Nvfp4BankReader& bank, int bank_row,
-                                                    const Activation& activation, int columns) {
+                                                    const Activation& activation, int columns,
+                                                    int lane = 0, int lanes = 1) {
     const int expert          = bank_row / bank.rows_per_expert;
     const int local           = bank_row - expert * bank.rows_per_expert;
     const float inverse       = bank.inverse_divisor(bank_row);
@@ -236,7 +237,8 @@ __device__ __forceinline__ float row_tiled_bank_row(const Nvfp4BankReader& bank,
     const int scale_tiles = columns / 64;
 
     float a0 = 0.0F, a1 = 0.0F, a2 = 0.0F, a3 = 0.0F;
-    for (int chunk = 0; chunk < columns; chunk += kRowTiledChunkColumns) {
+    for (int chunk = lane * kRowTiledChunkColumns; chunk < columns;
+         chunk += lanes * kRowTiledChunkColumns) {
         const uint4 lo = load_vec<uint4>(codes + (chunk >> 1));
         const uint4 hi = load_vec<uint4>(codes + (chunk >> 1) + 16);
         // One 32-bit load covers the chunk's four 16-column scale groups: the K16M128x4 tiling puts
@@ -245,12 +247,20 @@ __device__ __forceinline__ float row_tiled_bank_row(const Nvfp4BankReader& bank,
         const std::uint32_t packed_scales = load_vec<std::uint32_t>(
             scales + nvfp4_scale_byte_runtime(local, chunk / 16, scale_tiles));
         const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        // One E4M3 scale covers a group of eight consecutive bytes, so the chunk's four groups are
+        // decoded once here instead of once per byte. Bit-identical: the same scale value reaches
+        // the same products, only fewer times.
+        float group_scale[4];
+#pragma unroll
+        for (int group = 0; group < 4; ++group) {
+            group_scale[group] = decode_nvfp4_e4m3(
+                static_cast<std::uint8_t>((packed_scales >> (8 * group)) & 0xFFU));
+        }
 #pragma unroll
         for (int byte = 0; byte < 32; ++byte) {
             const std::uint8_t packed =
                 static_cast<std::uint8_t>(byte_of_word(words[byte >> 2], byte & 3U));
-            const float scale = decode_nvfp4_e4m3(
-                static_cast<std::uint8_t>((packed_scales >> (8 * (byte >> 3))) & 0xFFU));
+            const float scale = group_scale[byte >> 3];
             const float2 code            = decode_nvfp4_e2m1x2(packed);
             const float2 activation_pair = activation((chunk >> 1) + byte);
             // `byte` carries columns `chunk+2*byte` and `chunk+2*byte+1`: an even byte's pair is
@@ -340,6 +350,70 @@ __global__ __launch_bounds__(kThreads) void nemotron_h_moe_experts_row_tiled_dow
     };
     partial[tile_slot * latent + local] =
         row_tiled_bank_row(down, expert * latent + local, activation, intermediate);
+}
+
+// Decode width: one warp per output row, its 32 lanes covering the row's 64-column chunks, with one
+// warp reduction at the end. At one token the row-per-thread route has only `intermediate * top_k`
+// threads in flight -- 11,520 for this model -- which is why it runs at a third of the bandwidth a
+// filled device reaches. This route multiplies that by 32.
+//
+// Numerics: the row's chain is reassociated here (32 lane partials summed), which is the one place
+// this route differs from the per-token kernel's order; every per-element expression is the same and
+// the op's reference test states the resulting tolerance.
+template <int kRowsPerCta>
+__global__ __launch_bounds__(kRowsPerCta * 32) void nemotron_h_moe_experts_warp_up_kernel(
+    Nvfp4BankReader up, int latent, int intermediate, int tokens, int top_k,
+    const std::int32_t* __restrict__ expert_ids, const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ product) {
+    extern __shared__ __nv_bfloat16 stage_activation[]; // [latent]
+    const int token = static_cast<int>(blockIdx.y);
+    row_tiled_stage_activation<kRowsPerCta * 32>(x + static_cast<std::size_t>(token) * latent,
+                                                 latent, stage_activation);
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int local = static_cast<int>(blockIdx.x) * kRowsPerCta +
+                      (static_cast<int>(threadIdx.x) >> 5);
+    if (local >= intermediate) { return; }
+    const std::size_t slot      = static_cast<std::size_t>(blockIdx.z) * tokens + token;
+    const std::size_t tile_slot = static_cast<std::size_t>(blockIdx.z) * gridDim.y + token;
+    const int expert            = expert_ids[slot];
+    const auto* const pairs     = reinterpret_cast<const std::uint32_t*>(stage_activation);
+    const auto activation       = [pairs](int pair) { return bf16x2_bits_to_float2(pairs[pair]); };
+    float acc = row_tiled_bank_row(up, expert * intermediate + local, activation, latent, lane, 32);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) { product[tile_slot * intermediate + local] = relu2_one(acc); }
+}
+
+template <int kRowsPerCta>
+__global__ __launch_bounds__(kRowsPerCta * 32) void nemotron_h_moe_experts_warp_down_kernel(
+    Nvfp4BankReader down, int latent, int intermediate, int tokens, int top_k,
+    const std::int32_t* __restrict__ expert_ids, const float* __restrict__ product,
+    float* __restrict__ partial) {
+    extern __shared__ float stage_product[]; // [intermediate]
+    const int token             = static_cast<int>(blockIdx.y);
+    const std::size_t slot      = static_cast<std::size_t>(blockIdx.z) * tokens + token;
+    const std::size_t tile_slot = static_cast<std::size_t>(blockIdx.z) * gridDim.y + token;
+    const float* source         = product + tile_slot * intermediate;
+    for (int i = static_cast<int>(threadIdx.x) * 4; i < intermediate; i += kRowsPerCta * 32 * 4) {
+        store_vec(stage_product + i, load_vec<float4>(source + i));
+    }
+    __syncthreads();
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int local = static_cast<int>(blockIdx.x) * kRowsPerCta +
+                      (static_cast<int>(threadIdx.x) >> 5);
+    if (local >= latent) { return; }
+    const int expert                  = expert_ids[slot];
+    const float* const activation_row = stage_product;
+    const auto activation             = [activation_row](int pair) {
+        return load_vec<float2>(activation_row + 2 * pair);
+    };
+    float acc =
+        row_tiled_bank_row(down, expert * latent + local, activation, intermediate, lane, 32);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) { partial[tile_slot * latent + local] = acc; }
 }
 
 // A token's K partials summed in ascending rank order in FP32, with the routing weight applied

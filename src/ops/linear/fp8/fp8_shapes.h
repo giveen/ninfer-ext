@@ -39,4 +39,13 @@ extern const Fp8LinearShape kFp8N4096K4096;
 extern const Fp8LinearShape kFp8N4096K8192;
 extern const Fp8LinearShape kFp8N18560K4096;
 extern const Fp8LinearShape kFp8N131072K4096;
+// The Lightning 30B: hidden width 2688 (mamba in/out, attention q/k/v/o, the shared expert) and
+// its 131072-row head.
+extern const Fp8LinearShape kFp8N10304K2688;
+extern const Fp8LinearShape kFp8N2688K4096;
+extern const Fp8LinearShape kFp8N4096K2688;
+extern const Fp8LinearShape kFp8N256K2688;
+extern const Fp8LinearShape kFp8N3712K2688;
+extern const Fp8LinearShape kFp8N2688K3712;
+extern const Fp8LinearShape kFp8N131072K2688;
 } // namespace ninfer::ops::detail

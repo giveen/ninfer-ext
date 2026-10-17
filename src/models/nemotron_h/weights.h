@@ -91,8 +91,58 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// One draft layer: two block norms, GQA with its own q/k norms and the sink that makes the draft's
+// attention LiLiCorr's, the finish convolution on each side of the mixer, and the gated MLP. The
+// projections that supply the cached context rows are the same tensors as the block's, bound once.
+struct DraftLayerWeights {
+    WeightId input_norm, post_attention_norm;
+    WeightId query, key, value, query_norm, key_norm, sink_bias, output;
+    WeightId attention_conv_base, attention_conv_projection;
+    WeightId mlp_gate, mlp_up, mlp_down;
+    WeightId mlp_conv_base, mlp_conv_projection;
+    // A plain DFlash conditions on the tower's context through its own K/V projections (the
+    // companion stores them; the LiLiCorr body has no such pair and leaves these unbound).
+    WeightId context_key, context_value;
+};
+
+// The correlation head's own layer: a fused-QKV attention block and a gated MLP, both at the head's
+// width rather than the tower's.
+struct DraftHeadLayerWeights {
+    WeightId norm, mlp_norm;
+    WeightId attention_in, attention_in_bias, attention_out, attention_out_bias;
+    WeightId mlp_up, mlp_up_bias, mlp_down, mlp_down_bias;
+};
+
+struct DraftHeadWeights {
+    WeightId anchor_norm, output_norm;
+    WeightId feature_norm_weight, feature_norm_bias;
+    WeightId in_head, in_head_bias, out_head, out_head_bias;
+    WeightId anchor_out_head, anchor_out_head_bias;
+    WeightId token_projection, token_bias, context_projection, context_bias;
+    WeightId pass_hidden_projection, pass_hidden_bias;
+    WeightId feature_mlp_up, feature_mlp_up_bias, feature_mlp_down, feature_mlp_down_bias;
+    WeightId factor_input_projection, factor_input_bias;
+    WeightId rank_embedding, slot_embedding, relative_slot_bias, same_slot_bias;
+    std::vector<DraftHeadLayerWeights> layers;
+};
+
+// The draft: the tap fusion, the two body-wide norms, the five body layers, then the head.
+struct DraftWeights {
+    WeightId feature_projection, context_norm, final_norm;
+    // A plain DFlash's own mask-token embedding `[1, hidden]`: the companion's `embed_tokens` is
+    // the tower's matrix except for this row, and this row is the entire input of every proposal
+    // column. LiLiCorr has none (its block carries the tower's mask row).
+    WeightId mask_embedding{};
+    std::vector<DraftLayerWeights> layers;
+    DraftHeadWeights head;
+};
+
 struct ModelWeights {
     TextWeights text;
+    // The speculative draft, when the artifact carries one: engaged as a whole, because a partially
+    // bound draft is not a model. Its parameters are dense and device-resident -- the draft runs on
+    // every round -- and none is read by a declared input, so none carries an activation divisor.
+    std::optional<DraftWeights> draft;
 };
 
 } // namespace ninfer::models::nemotron_h

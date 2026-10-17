@@ -17,7 +17,13 @@ import torch
 
 from tools.convert.methods import fp8_row_maxabs, nvfp4_mse
 from tools.convert.model import Model, Parameter
-from tools.convert.nemotron_h import _tap_major, is_nemotron_h, text_config
+from tools.convert.nemotron_h import (
+    _tap_major,
+    is_lilicorr_draft,
+    is_nemotron_h,
+    lilicorr_config,
+    text_config,
+)
 from tools.convert.official_recipes import RECIPES, nemotron_h_74b_nvfp4
 from tools.convert.recipe import Recipe
 from tools.convert.resources import (
@@ -59,6 +65,63 @@ _ROUTER_KEYS = {"routed_scaling_factor", "norm_topk_prob", "n_group", "topk_grou
 
 def _llm() -> dict:
     return json.loads((_FIXTURES / "llm_config.json").read_text())
+
+
+def _draft() -> dict:
+    return json.loads((_FIXTURES / "lilicorr_config.json").read_text())
+
+
+def test_the_lilicorr_draft_is_recognized_and_normalized_against_the_tower() -> None:
+    target = text_config({"llm_config": _llm()})
+    draft = lilicorr_config(_draft(), target)
+    assert is_lilicorr_draft(_draft())
+    assert not is_lilicorr_draft({"architectures": ["DFlashDraftModel"]})
+    # The release's own structure: five sliding-attention blocks over six of this tower's taps.
+    assert draft["num_hidden_layers"] == 5
+    assert draft["layer_types"] == ["sliding_attention"] * 5
+    assert draft["block_size"] == 8
+    assert draft["sliding_window"] == 1024
+    assert draft["rope_parameters"]["rope_theta"] == 10000.0
+    assert draft["max_position_embeddings"] == 262144
+    assert draft["hidden_size"] == target["hidden_size"]
+    assert draft["dflash_config"]["target_layer_ids"] == [1, 18, 35, 51, 68, 85]
+    assert draft["dflash_config"]["mask_token_id"] == 990
+    assert draft["dflash_config"]["attention_sink_bias"] is True
+    assert draft["dflash_config"]["conv_kernel_size"] == 2
+    assert draft["dflash_config"]["conv_group_size"] == 16
+    assert draft["dflash_config"]["lilicorr_candidate_topk"] == 8
+    assert draft["dflash_config"]["lilicorr_hidden_size"] == 1024
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("hidden_size", 2048),
+        ("num_hidden_layers", 4),
+        ("rope_theta", 1e7),
+        ("sliding_window", 4096),
+        ("attention_sink_bias", False),
+    ],
+)
+def test_a_draft_that_disagrees_with_the_family_is_refused(field, value) -> None:
+    target = text_config({"llm_config": _llm()})
+    raw = _draft()
+    raw[field] = value
+    with pytest.raises(ValueError):
+        lilicorr_config(raw, target)
+
+
+def test_a_draft_over_other_taps_is_refused() -> None:
+    target = text_config({"llm_config": _llm()})
+    raw = _draft()
+    raw["dflash_config"]["target_layer_ids"] = [1, 18, 35]
+    with pytest.raises(ValueError):
+        lilicorr_config(raw, target)
+    # A tap past the tower's blocks is refused as well, not silently accepted.
+    raw = _draft()
+    raw["dflash_config"]["target_layer_ids"] = [1, 18, 35, 51, 68, 88]
+    with pytest.raises(ValueError):
+        lilicorr_config(raw, target)
 
 
 def test_emitted_config_matches_the_committed_fixture() -> None:

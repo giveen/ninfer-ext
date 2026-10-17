@@ -871,6 +871,43 @@ A decode step's ~3.0 ms warm gather exists because 27 GB of experts live on the 
 **Read the residency figures elsewhere in this document as pre-fix.** Every one of them — the 4,080 of 13,824 in the concurrency section, the 11 of 40 banks and 12.87 GiB in the prefill rows, the 11 of 40 and 13.11 GiB in the narrow-route row — was taken with the double count in. They are correct for what they measured and understated relative to the current tree by the amounts above.
 - **And that fix's end-to-end effect is measured, phase-dependent, and explained.** One binary, one build, two budgets (`--expert-cache auto` against the recorded 16,012 MiB), fingerprints byte-identical before and after, gates green, the greedy sentence identical on both arms, and the B arm's ledger reproducing the recorded figures to the digit — which is what makes it a comparator rather than a differently-loaded card. Result: **+10.8% warm prefill (1083.49 against 978.18 t/s), +2.9% cold decode, +0.8% warm decode, and nothing at a 4096-token chunk** (3311.3 against 3309.5 ms). The mechanism is that the rate followed the *staged traffic*, not the residency percentage: the larger budget unloads two more banks (29 → 27 staged, 22,306.5 → 20,322.0 MiB per pass, −8.9%), and at 512 tokens the pass *is* the copy — 20.3 GiB at 44.1 GB/s inside 483 ms — so the win tracks that (−7.6% pass time) and vanishes where the Op dominates. An in-band check that the arms genuinely differ: the throughput bench uploaded 23.38 GiB of device weights in A against 20.38 in B.
 
+## Route-dependent per-token numerics (2026-10-16)
+
+A stateful decode and a one-pass prefill of the same sequence do **not** agree bit for bit, and the
+reason is route selection rather than any op being wrong. Measured by capturing the draft's six tap
+residuals along both paths on the real artifact (128 tokens generated from a 512-token prompt of
+`docs/serving.md`, one Program, one configuration):
+
+| | |
+|---|---|
+| First difference | position 512, the first column a *decode* pass processes |
+| Block 0 (a Mamba block) at that column | max abs 0.00195 = 2^-9, rel L2 0.0064 |
+| Block 85, later in the state | max abs 30, rel L2 0.0689 |
+| Prompt region (512 wide in both arms) | bit-identical, every tap, every column |
+| Two captures of the same pass | bit-identical (the capture itself is deterministic) |
+
+The mechanism: a one-column call reaches the narrow expert route and a wide one the row-tiled route,
+and each format's GEMV and MMA reduce K in a different order -- which the ops' own contracts allow
+("RMS reduction order, Tensor Core operand staging, projection factorization, split-K reduction, and
+private intermediate precision are implementation choices"). A mixture-of-experts router then turns
+that last bit into a *discrete* expert-selection difference: once one token's expert set moves, the
+Mamba state carries it for the rest of the sequence, which is why block 0 stays at 2^-9 while block
+85 reaches order 1. Router near-ties are not rare here -- this document already records the tiny
+model's 2-of-130 case.
+
+Two consequences, both load-bearing:
+
+- **The Decode row's bit-for-bit claim holds for equal routes only.** It was measured when a
+  multi-token pass and a one-token step took the same kernels; after the wide row-tiled route landed,
+  a 512-token pass does not take the one-token route, and this is the end-to-end evidence item that
+  the wide route's own note ("its arithmetic is still unverified end to end") was waiting for. The
+  check itself remains right and non-vacuous -- the two-chunk comparison compares equal widths, and
+  the capture test now asserts exactly where equal widths stop agreeing.
+- **A speculative verify pass computes its columns at a different width than the decode it replaces**,
+  so near a router tie its decisions can differ from a sequential decode's by one expert's worth.
+  That is not a defect of either path, and it is the reason acceptance has to be measured on this
+  pair rather than assumed from the drafter's card.
+
 ## Artifact sizes, and two numbers that look wrong but are not (2026-10-16)
 
 A reader who compares the file against the residency figures will hit the same two apparent contradictions this record did, so both are resolved here.

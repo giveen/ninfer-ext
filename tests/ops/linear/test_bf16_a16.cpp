@@ -465,9 +465,13 @@ int run_bf16_generic() {
 // argued at its definition: without it this block reports 0 for a kernel that reassociates K.
 int run_bf16_latent_bit_identity() {
     int failures = 0;
-    constexpr std::array<std::array<std::int32_t, 2>, 2> kLatentShapes{{
+    constexpr std::array<std::array<std::int32_t, 2>, 5> kLatentShapes{{
         {1024, 4096},
         {4096, 1024},
+        // The Lightning 30B's DFlash companion: the tap fusion, the body's MLP and its down.
+        {2688, 16128},
+        {6144, 2688},
+        {2688, 6144},
     }};
     std::uint32_t seed = 9101U;
     for (const auto& [n, k] : kLatentShapes) {

@@ -109,7 +109,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase = kWarpSize * Schedule::kValuesPerLane;
     static_assert(!PairRows || (Schedule::kRowsPerWarp % 2) == 0);
-    const int kPhases = K / kValuesPerPhase;
+    // A K that is not a whole number of phases leaves one final, partial phase: the lanes whose
+    // first value is already past K contribute nothing and -- this is the part that matters -- read
+    // nothing, because the codes past a row's end belong to the next row and the activation past
+    // its end does not exist. `launch_fp8_a16_gemv` requires K to divide by `kValuesPerLane`, so a
+    // lane is either wholly inside K or wholly outside it; the complete phases keep the unguarded
+    // walk, so no shape that divides evenly pays for the tail.
+    const int kPhases   = K / kValuesPerPhase;
+    const bool kHasTail = K % kValuesPerPhase != 0;
     constexpr int kStoredRowsPerWarp =
         PairRows ? Schedule::kRowsPerWarp / 2 : Schedule::kRowsPerWarp;
     constexpr int kStoredRowsPerCta = Schedule::kWarpsPerCta * kStoredRowsPerWarp;
@@ -121,9 +128,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
 
-#pragma unroll Schedule::kPhaseUnroll
-    for (int phase = 0; phase < kPhases; ++phase) {
+    const auto run_phase = [&](int phase, bool guarded) {
         const int value_begin = phase * kValuesPerPhase + lane * Schedule::kValuesPerLane;
+        if (guarded && value_begin >= K) { return; }
         Fp8CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -138,7 +145,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
                     load_fp8_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(source);
         }
         accumulate_rows(row_codes, activation_pairs + value_begin / 2, accumulators);
-    }
+    };
+
+#pragma unroll Schedule::kPhaseUnroll
+    for (int phase = 0; phase < kPhases; ++phase) { run_phase(phase, false); }
+    if (kHasTail) { run_phase(kPhases, true); }
 
     const auto destination = linear_output_tile<kStoredRowsPerCta>(
         output, static_cast<int>(blockIdx.x) * kStoredRowsPerCta);

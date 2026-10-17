@@ -314,6 +314,22 @@ void AttentionState::advance(std::int32_t lane) {
     std::fill(state.appended.begin(), state.appended.end(), false);
 }
 
+void AttentionState::rewind(std::int32_t lane, std::int32_t tokens) {
+    Lane& state = lane_at(lane);
+    if (state.pending != 0) {
+        throw std::invalid_argument("nemotron_h attention state: lane " + std::to_string(lane) +
+                                    " has a step in progress, so its frontier cannot move back "
+                                    "before that step is advanced");
+    }
+    if (tokens < 0 || tokens > state.filled) {
+        throw std::invalid_argument(
+            "nemotron_h attention state: lane " + std::to_string(lane) + " holds " +
+            std::to_string(state.filled) + " tokens and cannot be rolled back to " +
+            std::to_string(tokens) + "; a rewind only ever moves the frontier back");
+    }
+    state.filled = tokens;
+}
+
 void AttentionState::attend(std::int32_t lane, std::uint32_t layer, const Tensor& query,
                             Tensor& out, const Tensor& workspace,
                             DeviceExecutionView execution) const {

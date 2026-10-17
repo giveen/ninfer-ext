@@ -25,4 +25,9 @@ extern const Nvfp4LinearShape kNvfp4N21504K5376;
 // Nemotron-H's shared expert, bound as an unfused up matrix and down matrix.
 extern const Nvfp4LinearShape kNvfp4N5376K4096;
 extern const Nvfp4LinearShape kNvfp4N4096K5376;
+// The Lightning 30B DFlash companion's tap fusion and its MLP down projection, preserved as the
+// ModelOpt NVFP4 the checkpoint stores.
+extern const Nvfp4LinearShape kNvfp4N2688K16128;
+extern const Nvfp4LinearShape kNvfp4N2688K6144;
+extern const Nvfp4LinearShape kNvfp4N6144K2688;
 } // namespace ninfer::ops::detail

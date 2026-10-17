@@ -123,7 +123,7 @@ MoeBankConfig moe_bank(const Json& block, const Json& config) {
     out.num_experts              = dimension(block, "n_routed_experts");
     out.experts_per_token        = dimension(block, "num_experts_per_tok");
     out.intermediate_size        = dimension(block, "moe_intermediate_size");
-    out.latent_size              = dimension(config, "moe_latent_size");
+    out.latent_size              = integer(config.at("moe_latent_size"), "moe_latent_size", false);
     out.shared_intermediate_size = dimension(config, "moe_shared_expert_intermediate_size");
     // A bank must be wide enough to route to the experts it asks for.
     if (out.experts_per_token > out.num_experts) {
@@ -241,7 +241,24 @@ BlockKind TextConfig::block_kind(std::uint32_t layer) const {
 }
 
 Config parse_config(const artifact::Directory& directory) {
-    return Config{parse_text(directory.component("text").config)};
+    Config out{parse_text(directory.component("text").config)};
+    // A draft rides the artifact as its own component, so the tower's duty is to read and validate
+    // it when it is there rather than to decide whether it exists.
+    if (const auto found = directory.components.find("dflash2");
+        found != directory.components.end()) {
+        if (found->second.target != "text") { throw ArtifactError("dflash2: target must be text"); }
+        out.draft = models::draft::parse_lilicorr(
+            found->second.config, out.text.hidden_size, out.text.vocab_size,
+            static_cast<std::uint32_t>(out.text.block_kinds.size()));
+    } else if (const auto found = directory.components.find("dflash");
+               found != directory.components.end()) {
+        // A plain DFlash companion: the same tower-side validation, without the correlation head.
+        if (found->second.target != "text") { throw ArtifactError("dflash: target must be text"); }
+        out.draft = models::draft::parse_dflash(
+            found->second.config, out.text.hidden_size, out.text.vocab_size,
+            static_cast<std::uint32_t>(out.text.block_kinds.size()));
+    }
+    return out;
 }
 
 } // namespace ninfer::models::nemotron_h

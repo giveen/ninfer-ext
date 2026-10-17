@@ -47,6 +47,18 @@ int run_fp8_a16() {
         failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                               {n, 5376, seed, Comparison::Sampled, true, invocations});
     }
+    // Nemotron-Lightning 30B's own widths. Its K = 2688 and K = 3712 shapes are the ones a one-row
+    // call used to send into the MMA schedule (the GEMV route was gated on K dividing by 256);
+    // they now take the GEMV route's guarded tail phase, and the T > 1 calls beside T = 1 keep the
+    // MMA routes they always had.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 5> lightning_shapes{
+        std::tuple{10304, 2688, 841U}, std::tuple{3712, 2688, 842U}, std::tuple{2688, 3712, 843U},
+        std::tuple{4096, 2688, 844U}, std::tuple{256, 2688, 845U}};
+    for (const auto& [n, k, seed] : lightning_shapes) {
+        const std::vector<Invocation> invocations{Invocation{1}, Invocation{2}, Invocation{8}};
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
+    }
     // The output projections and the vocabulary head: k becomes the wide side here.
     const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 3> wide_shapes{
         std::tuple{5376, 8192, 829U}, std::tuple{5376, 16384, 830U},

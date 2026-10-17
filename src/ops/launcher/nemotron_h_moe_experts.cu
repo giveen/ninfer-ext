@@ -50,6 +50,9 @@ std::size_t expert_shared_bytes(std::int32_t latent, std::int32_t intermediate) 
 constexpr int kRowTiledUpThreads   = 64;
 constexpr int kRowTiledDownThreads = 32;
 constexpr int kRowTiledSumThreads  = 128;
+// Decode: one warp per output row. Four rows per block keeps a 128-thread CTA and the shared
+// activation stage unchanged while giving the row's 32 lanes the whole chain.
+constexpr int kRowTiledWarpRowsPerCta = 4;
 
 // The tile the row-tiled route walks a call's token axis in, and the widest call it takes.
 //
@@ -176,6 +179,19 @@ void launch_row_tiled(const Nvfp4BankReader& up, const Nvfp4BankReader& down, co
             nemotron_h_moe_experts_row_tiled_down_kernel<kRowTiledDownThreads>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(down_shared)));
     }
+    const bool warp_route = tokens == 1;
+    if (warp_route) {
+        if (up_shared > kStaticSharedBytes) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                nemotron_h_moe_experts_warp_up_kernel<kRowTiledWarpRowsPerCta>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(up_shared)));
+        }
+        if (down_shared > kStaticSharedBytes) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                nemotron_h_moe_experts_warp_down_kernel<kRowTiledWarpRowsPerCta>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(down_shared)));
+        }
+    }
 
     for (std::int32_t base = 0; base < tokens; base += kRowTiledTileTokens) {
         const std::int32_t count      = std::min(kRowTiledTileTokens, tokens - base);
@@ -184,19 +200,37 @@ void launch_row_tiled(const Nvfp4BankReader& up, const Nvfp4BankReader& down, co
         const auto* const tile_x      = input + static_cast<std::size_t>(base) * latent;
         auto* const tile_out          = output + static_cast<std::size_t>(base) * latent;
 
-        const dim3 up_grid(static_cast<unsigned>(tile_count(intermediate, kRowTiledUpThreads)),
-                           static_cast<unsigned>(count), static_cast<unsigned>(top_k));
-        nemotron_h_moe_experts_row_tiled_up_kernel<kRowTiledUpThreads>
-            <<<up_grid, kRowTiledUpThreads, up_shared, stream>>>(up, latent, intermediate, tokens,
-                                                                 top_k, tile_ids, tile_x, product);
-        CUDA_CHECK(cudaGetLastError());
+        if (warp_route) {
+            constexpr int kThreads = kRowTiledWarpRowsPerCta * 32;
+            const dim3 up_grid(
+                static_cast<unsigned>(tile_count(intermediate, kRowTiledWarpRowsPerCta)),
+                static_cast<unsigned>(count), static_cast<unsigned>(top_k));
+            nemotron_h_moe_experts_warp_up_kernel<kRowTiledWarpRowsPerCta>
+                <<<up_grid, kThreads, up_shared, stream>>>(up, latent, intermediate, tokens, top_k,
+                                                           tile_ids, tile_x, product);
+            CUDA_CHECK(cudaGetLastError());
 
-        const dim3 down_grid(static_cast<unsigned>(tile_count(latent, kRowTiledDownThreads)),
-                             static_cast<unsigned>(count), static_cast<unsigned>(top_k));
-        nemotron_h_moe_experts_row_tiled_down_kernel<kRowTiledDownThreads>
-            <<<down_grid, kRowTiledDownThreads, down_shared, stream>>>(
-                down, latent, intermediate, tokens, top_k, tile_ids, product, partial);
-        CUDA_CHECK(cudaGetLastError());
+            const dim3 down_grid(static_cast<unsigned>(tile_count(latent, kRowTiledWarpRowsPerCta)),
+                                 static_cast<unsigned>(count), static_cast<unsigned>(top_k));
+            nemotron_h_moe_experts_warp_down_kernel<kRowTiledWarpRowsPerCta>
+                <<<down_grid, kThreads, down_shared, stream>>>(
+                    down, latent, intermediate, tokens, top_k, tile_ids, product, partial);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            const dim3 up_grid(static_cast<unsigned>(tile_count(intermediate, kRowTiledUpThreads)),
+                               static_cast<unsigned>(count), static_cast<unsigned>(top_k));
+            nemotron_h_moe_experts_row_tiled_up_kernel<kRowTiledUpThreads>
+                <<<up_grid, kRowTiledUpThreads, up_shared, stream>>>(
+                    up, latent, intermediate, tokens, top_k, tile_ids, tile_x, product);
+            CUDA_CHECK(cudaGetLastError());
+
+            const dim3 down_grid(static_cast<unsigned>(tile_count(latent, kRowTiledDownThreads)),
+                                 static_cast<unsigned>(count), static_cast<unsigned>(top_k));
+            nemotron_h_moe_experts_row_tiled_down_kernel<kRowTiledDownThreads>
+                <<<down_grid, kRowTiledDownThreads, down_shared, stream>>>(
+                    down, latent, intermediate, tokens, top_k, tile_ids, product, partial);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         const dim3 sum_grid(static_cast<unsigned>(tile_count(latent, kRowTiledSumThreads)),
                             static_cast<unsigned>(count));

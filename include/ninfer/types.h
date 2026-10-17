@@ -20,7 +20,8 @@ using TokenId = std::int32_t;
 
 // Per-position next-token logits from causal scoring: BF16, column-major over [vocab, columns].
 // Column j is the distribution predicting the token at global target index `first_target + j`, so
-// `values` holds `vocab_size * columns` entries. The view is only valid for the duration of the call.
+// `values` holds `vocab_size * columns` entries. The view is only valid for the duration of the
+// call.
 struct ScoredLogits {
     std::span<const std::uint16_t> values;
     std::uint32_t vocab_size   = 0;
@@ -113,7 +114,11 @@ struct ExpertCachePolicy {
     // with. A positive count is granted out of the same expert budget as the resident banks, one
     // slot's device bytes for one slot's worth of bank not uploaded, and a card that cannot afford
     // the request is given a smaller cache rather than a failed load.
-    std::int32_t cache_slots = 0;
+    // Per-expert slot-cache slots beside the family's staged banks. The default covers the routed
+    // working set of a verify-shaped call (a speculative round's eight columns): measured on
+    // Nemotron-H 74B, 256 slots turn an 8-row pass from 86.8 ms into 25.1 ms while every other
+    // regime moves by at most 4% (`docs/maintainer/lilicorr-draft.md`, "What a verify pass costs").
+    std::int32_t cache_slots = 256;
 
     [[nodiscard]] static constexpr ExpertCachePolicy explicit_cache(std::size_t bytes) noexcept {
         return ExpertCachePolicy{ExpertCacheMode::Explicit, bytes};
@@ -486,15 +491,15 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                              = false;
-    std::uint32_t structured_call_count           = 0;
-    std::uint32_t empty_arguments_omitted         = 0;
-    std::uint32_t schema_mismatch_arguments       = 0;
-    std::uint32_t duplicate_parameters_repaired   = 0;
-    ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
+    bool marker_seen                            = false;
+    std::uint32_t structured_call_count         = 0;
+    std::uint32_t empty_arguments_omitted       = 0;
+    std::uint32_t schema_mismatch_arguments     = 0;
+    std::uint32_t duplicate_parameters_repaired = 0;
+    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
     // A tolerant parse kept the region's complete calls and discarded a malformed trailing
     // segment; false means the strict structure was accepted as-is.
-    bool tolerant_recovered                        = false;
+    bool tolerant_recovered = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -611,8 +616,9 @@ constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
     return left;
 }
 
-[[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
-                                                           SharedCandidateEvidence evidence) noexcept {
+[[nodiscard]] constexpr bool
+has_shared_candidate_evidence(SharedCandidateEvidence value,
+                              SharedCandidateEvidence evidence) noexcept {
     return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
 }
 
@@ -846,19 +852,19 @@ struct GenerationTimings {
 // elapsed time, so values from concurrent requests must not be summed. Device wait is reported
 // separately from Host-active work.
 struct GenerationEngineTiming {
-    double queue_wait_seconds                   = 0.0;
-    double engine_boundary_exposed_seconds      = 0.0;
-    double program_submit_exposed_seconds       = 0.0;
-    double program_post_exposed_seconds         = 0.0;
-    double engine_commit_output_exposed_seconds = 0.0;
-    double engine_maintenance_exposed_seconds   = 0.0;
+    double queue_wait_seconds                    = 0.0;
+    double engine_boundary_exposed_seconds       = 0.0;
+    double program_submit_exposed_seconds        = 0.0;
+    double program_post_exposed_seconds          = 0.0;
+    double engine_commit_output_exposed_seconds  = 0.0;
+    double engine_maintenance_exposed_seconds    = 0.0;
     double device_wait_exposed_seconds           = 0.0;
     double constraint_draft_wait_exposed_seconds = 0.0;
     double decode_host_exposed_seconds           = 0.0;
-    double decode_device_wait_exposed_seconds   = 0.0;
-    std::uint64_t prefill_units                 = 0;
-    std::uint64_t decode_rounds                 = 0;
-    std::uint64_t control_units                 = 0;
+    double decode_device_wait_exposed_seconds    = 0.0;
+    std::uint64_t prefill_units                  = 0;
+    std::uint64_t decode_rounds                  = 0;
+    std::uint64_t control_units                  = 0;
 };
 
 struct SpeculativeStats {
@@ -899,15 +905,15 @@ enum class ConstraintOutputBranch : std::uint8_t { Undecided, Content, Tools };
 // includes speculative lookahead that was subsequently rolled back. Times are subintervals of
 // existing request timings, not extra latency to add to them.
 struct ConstraintObservation {
-    ConstraintOutputBranch branch = ConstraintOutputBranch::Undecided;
-    bool complete                 = false;
-    bool terminated               = false;
-    ConstraintCacheAccess cache   = ConstraintCacheAccess::Hit;
-    bool timings_collected        = false;
-    double prepare_seconds        = 0.0;
-    double mask_seconds           = 0.0;
-    double matcher_seconds        = 0.0;
-    std::uint64_t mask_positions  = 0;
+    ConstraintOutputBranch branch   = ConstraintOutputBranch::Undecided;
+    bool complete                   = false;
+    bool terminated                 = false;
+    ConstraintCacheAccess cache     = ConstraintCacheAccess::Hit;
+    bool timings_collected          = false;
+    double prepare_seconds          = 0.0;
+    double mask_seconds             = 0.0;
+    double matcher_seconds          = 0.0;
+    std::uint64_t mask_positions    = 0;
     std::uint64_t mask_upload_bytes = 0;
 };
 
@@ -1077,10 +1083,10 @@ struct MemorySummary {
     // Host retention-tier unit costs. Every Host StateImage slot pins image_bytes regardless of
     // the prefix depth it resumes, and Host KV pins bytes per page group, so the split of a
     // budget between the two is the depth-versus-positions trade made visible.
-    std::size_t host_state_image_bytes            = 0;
-    std::size_t host_kv_page_group_bytes          = 0;
+    std::size_t host_state_image_bytes   = 0;
+    std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
-    std::size_t host_cache_budget_bytes           = 0;
+    std::size_t host_cache_budget_bytes = 0;
     // Routed-expert device cache of host-resident experts (zero when experts are device-resident).
     std::uint32_t expert_cache_slots = 0;
     std::size_t expert_cache_bytes   = 0;
@@ -1095,10 +1101,10 @@ struct MemorySummary {
 // device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
 // are subsets of a top-level phase and must not be added to Host-active time again.
 struct RuntimeHostWorkStats {
-    std::uint64_t engine_boundary_ns      = 0;
-    std::uint64_t program_submit_ns       = 0;
-    std::uint64_t program_post_ns         = 0;
-    std::uint64_t engine_commit_output_ns = 0;
+    std::uint64_t engine_boundary_ns       = 0;
+    std::uint64_t program_submit_ns        = 0;
+    std::uint64_t program_post_ns          = 0;
+    std::uint64_t engine_commit_output_ns  = 0;
     std::uint64_t engine_maintenance_ns    = 0;
     std::uint64_t device_wait_ns           = 0;
     std::uint64_t constraint_draft_wait_ns = 0;
@@ -1142,7 +1148,7 @@ struct RuntimeStats {
     std::uint64_t active_captures_aborted   = 0;
     // A capture the Program declined because the offer was not physically feasible. Unlike an
     // abort this is a silent retention loss, so it needs its own counter to be observable.
-    std::uint64_t active_captures_skipped   = 0;
+    std::uint64_t active_captures_skipped = 0;
 
     std::uint64_t root_selections                    = 0;
     std::uint64_t private_endpoint_selections        = 0;
@@ -1153,7 +1159,7 @@ struct RuntimeStats {
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
     // Aborted requests whose live state was published as a continuation endpoint.
-    std::uint64_t salvaged_continuations             = 0;
+    std::uint64_t salvaged_continuations = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;
@@ -1187,12 +1193,12 @@ struct RuntimeStats {
     double backend_kv_h2d_seconds      = 0.0;
     double backend_kv_d2d_seconds      = 0.0;
 
-    std::uint64_t pressure_spill_pages                 = 0;
-    std::uint64_t partial_tail_cow_pages               = 0;
-    std::uint32_t device_state_occupied_slots          = 0;
-    std::uint32_t host_state_occupied_slots            = 0;
-    std::uint32_t device_main_kv_occupied_pages        = 0;
-    std::uint32_t device_backend_kv_occupied_pages     = 0;
+    std::uint64_t pressure_spill_pages             = 0;
+    std::uint64_t partial_tail_cow_pages           = 0;
+    std::uint32_t device_state_occupied_slots      = 0;
+    std::uint32_t host_state_occupied_slots        = 0;
+    std::uint32_t device_main_kv_occupied_pages    = 0;
+    std::uint32_t device_backend_kv_occupied_pages = 0;
     // Un-written growth reservation held by active requests, split out of the occupied totals
     // above. Occupancy alone cannot distinguish KV that exists from KV a request is merely still
     // entitled to, which is what made context-cache starvation invisible in the request log.
@@ -1217,7 +1223,7 @@ struct RuntimeStats {
     std::uint32_t expert_cache_resident_slots = 0;
     std::uint32_t expert_cache_layer_min      = 0;
     std::uint32_t expert_cache_layer_max      = 0;
-    double actual_context_transfer_seconds             = 0.0;
+    double actual_context_transfer_seconds    = 0.0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1254,8 +1260,8 @@ struct ContextCostSummary {
 // renders these into the OpenAI-compatible /v1/models model object and its llama.cpp-compatible
 // `meta` field.
 struct ModelMetadata {
-    std::string model_id;    // Artifact model name (directory metadata "name").
-    std::string weights_id;  // Encoded formats of the artifact tensors (meta ftype).
+    std::string model_id;             // Artifact model name (directory metadata "name").
+    std::string weights_id;           // Encoded formats of the artifact tensors (meta ftype).
     std::uint64_t vocab_size     = 0; // Tokenizer token domain (meta n_vocab).
     std::uint64_t embedding_size = 0; // Model embedding width (meta n_embd).
     std::uint64_t native_context = 0; // Model native/training context (meta n_ctx_train).

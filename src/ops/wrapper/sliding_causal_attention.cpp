@@ -21,12 +21,14 @@ void require_bf16(const Tensor& tensor, const char* role) {
     }
 }
 
-void require_positions(const Tensor& tensor, const char* role, std::int32_t extents, std::int32_t batch) {
+void require_positions(const Tensor& tensor, const char* role, std::int32_t extents,
+                       std::int32_t batch) {
     if (tensor.dtype != DType::I32) {
         throw std::invalid_argument(std::string("sliding_causal_attention: ") + role +
                                     " must be I32");
     }
-    if (tensor.ne[0] != extents || tensor.ne[1] != batch || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
+    if (tensor.ne[0] != extents || tensor.ne[1] != batch || tensor.ne[2] != 1 ||
+        tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("sliding_causal_attention: ") + role +
                                     " must be [tokens,batch]");
     }
@@ -39,8 +41,8 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_k, const Tensor& k_extra,
                               const Tensor& v_extra, const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, const Tensor& workspace,
-                              DeviceExecutionView execution) {
+                              Tensor& out, const Tensor& workspace, DeviceExecutionView execution,
+                              const Tensor& sink) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
     }
@@ -106,18 +108,29 @@ void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor* tensors[] = {&q, &k, &v, &position_q, &position_k, &out};
     for (const Tensor* tensor : tensors) {
         if (!tensor->is_contiguous()) {
-            throw std::invalid_argument("sliding_causal_attention: every tensor must be contiguous");
+            throw std::invalid_argument(
+                "sliding_causal_attention: every tensor must be contiguous");
         }
         if (tensor->data == nullptr) {
-            throw std::invalid_argument("sliding_causal_attention: every tensor data must be non-null");
+            throw std::invalid_argument(
+                "sliding_causal_attention: every tensor data must be non-null");
         }
     }
 
     const Tensor none;
+    if (sink.data != nullptr) {
+        require_bf16(sink, "sink");
+        if (sink.ne[0] != geometry.query_heads || sink.ne[1] != 1 || sink.ne[2] != 1 ||
+            sink.ne[3] != 1 || !sink.is_contiguous()) {
+            throw std::invalid_argument(
+                "sliding_causal_attention: sink must be contiguous BF16 [Hq,1,1,1]");
+        }
+    }
     detail::sliding_causal_attention_launch(
         q, k, v, position_q, has_high ? position_q_high : none, position_k,
         has_extra ? k_extra : none, has_extra ? v_extra : none, has_extra ? position_extra : none,
-        head_dim, geometry.query_heads, geometry.kv_heads, window, scale, out, workspace, execution);
+        head_dim, geometry.query_heads, geometry.kv_heads, window, scale, out, workspace, execution,
+        sink);
 }
 
 std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geometry,
@@ -127,8 +140,8 @@ std::size_t sliding_causal_attention_workspace_bytes(AttentionHeadGeometry geome
         throw std::invalid_argument("sliding_causal_attention: invalid head geometry");
     }
     return detail::sliding_causal_attention_workspace_bytes(geometry.head_dim, query_tokens,
-                                                            geometry.query_heads,
-                                                            geometry.kv_heads, key_tokens, batch);
+                                                            geometry.query_heads, geometry.kv_heads,
+                                                            key_tokens, batch);
 }
 
 } // namespace ninfer::ops

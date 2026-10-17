@@ -23,13 +23,13 @@ void bf16_generic_launch(const Tensor& x, const Weight& weight, Tensor& out, cud
     const std::int32_t k      = weight.k;
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
+    const std::int32_t per_thread = kBf16GenericTokensPerThread;
     const std::int64_t owners =
-        static_cast<std::int64_t>(n) *
-        ((tokens + kBf16GenericTokensPerThread - 1) / kBf16GenericTokensPerThread);
+        static_cast<std::int64_t>(n) * ((tokens + per_thread - 1) / per_thread);
     const std::int64_t blocks = (owners + kThreads - 1) / kThreads;
     bf16_generic_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-        static_cast<__nv_bfloat16*>(out.data), n, k, tokens);
+        static_cast<__nv_bfloat16*>(out.data), n, k, tokens, per_thread);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -23,8 +23,11 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 } // namespace
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
-    if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("silu_mul: gate/up/out must be BF16");
+    const bool fp32 =
+        gate.dtype == DType::FP32 && up.dtype == DType::FP32 && out.dtype == DType::FP32;
+    if (!fp32 &&
+        (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16)) {
+        throw std::invalid_argument("silu_mul: gate/up/out must all be BF16 or all be F32");
     }
     for (int d = 0; d < 4; ++d) {
         if (gate.ne[d] != up.ne[d] || gate.ne[d] != out.ne[d]) {
@@ -39,6 +42,10 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         throw std::invalid_argument("silu_mul: out must not overlap gate or up");
     }
 
+    if (fp32) {
+        detail::silu_and_mul_fp32_launch(gate, up, out, stream);
+        return;
+    }
     detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
 }
 

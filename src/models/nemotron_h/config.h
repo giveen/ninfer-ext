@@ -4,6 +4,8 @@
 #include <optional>
 #include <vector>
 
+#include "models/draft/draft_spec.h"
+
 // Nemotron-H text configuration, for Nemotron-3.5-Bolt-74B-A9B.
 //
 // This family is a hybrid: an 88-entry block list interleaves Mamba-2 state-space blocks, LatentMoE
@@ -148,6 +150,10 @@ struct TextConfig {
 
 struct Config {
     TextConfig text;
+    // The LiLiCorr draft the artifact carries alongside the tower, when it carries one: absent
+    // means this artifact has no speculative draft, since nothing supplies weights it does not
+    // store.
+    std::optional<models::draft::Spec> draft;
 };
 
 // Parses the artifact's own text component. Every field this family needs is required or implied by

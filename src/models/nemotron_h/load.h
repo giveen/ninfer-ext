@@ -72,7 +72,9 @@ struct ExpertResidencyRequest {
     // budget as the resident banks, one slot's bytes for one slot's worth of bank not uploaded. The
     // plan reports the count it could grant, so an over-large request costs cache rather than a
     // failed load.
-    std::int32_t cache_slots = 0;
+    // The slot-cache share of that expert budget. 256 is the measured default for a verify-shaped
+    // call; the plan clamps it to what the card can afford and reports the grant.
+    std::int32_t cache_slots = 256;
     // The non-expert device bytes, summed as described above. Zero is a valid request for "plan no
     // residency", not for "assume nothing else is resident". The expert pool is *not* part of this:
     // it is the routed experts' own device side, which the plan spends its budget on, and counting
@@ -94,6 +96,8 @@ public:
         ModelWeights weights;
         std::vector<DeclaredParameter> declarations;
         artifact::MaterializationPlan materialization;
+        // The draft's geometry and taps, when the weights carry a draft; engaged together with it.
+        std::optional<draft::Spec> draft;
     };
 
     ~LoadPlan();

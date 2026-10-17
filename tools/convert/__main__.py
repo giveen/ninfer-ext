@@ -170,10 +170,15 @@ def main(argv=None):
                 base, components=components, resource_overrides=overrides
             )
         elif is_nemotron_h(base.config):
-            if companions:
-                raise ValueError("Nemotron-H has no DFlash companions")
+            # The tower's only companion is the LiLiCorr draft, and only as `dflash2`: the MTP and
+            # Eagle3 components belong to other families.
+            if components and (set(components) - {"text", "dflash", "dflash2"}):
+                raise ValueError("Nemotron-H accepts its dflash2 LiLiCorr draft or a dflash")
             model = build_nemotron_h_model(
-                base, components=components, resource_overrides=overrides
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
             )
         else:
             model = build_model(

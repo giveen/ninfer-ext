@@ -478,10 +478,15 @@ void verify_complete(const Model& model) {
             }
         } else if (kind == BlockKind::Moe && bound.moe) {
             const MoeWeights& moe = *bound.moe;
-            for (const WeightId id :
-                 {moe.router, moe.correction_bias, moe.fc1_latent, moe.fc2_latent, moe.shared_up,
-                  moe.shared_down, moe.experts_up, moe.experts_down}) {
+            for (const WeightId id : {moe.router, moe.correction_bias, moe.shared_up,
+                                      moe.shared_down, moe.experts_up, moe.experts_down}) {
                 require(id);
+            }
+            // The latent projections exist only for a latent bank; a direct bank (`latent_size`
+            // zero) has no such parameters and must not be required to bind them.
+            if (config.moe_bank(static_cast<std::uint32_t>(layer)).latent()) {
+                require(moe.fc1_latent);
+                require(moe.fc2_latent);
             }
         } else {
             throw artifact::ArtifactError("layer " + std::to_string(layer) +
@@ -509,6 +514,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto model =
         std::unique_ptr<Model>(new Model(std::move(content.config), std::move(content.weights),
                                          std::move(backing), std::move(residency)));
+    // The draft's geometry travels with the model: the Program sizes and drives its buffers from
+    // it, and the loader is the only thing that read the artifact's `dflash2` component.
+    model->draft_ = std::move(content.draft);
     for (std::size_t index = 0; index < content.declarations.size(); ++index) {
         const DeclaredParameter& declared = content.declarations[index];
         const WeightId id{index};
@@ -569,7 +577,8 @@ namespace {
 // state-driven pass leaves the frontier the next pass starts from.
 void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor& mixer_input,
                    Scratch& scratch, Tensor& mixer_out, DeviceExecutionView execution,
-                   BlockState* state, const BlockObserver* observer, std::size_t layer) {
+                   BlockState* state, const BlockObserver* observer, std::size_t layer,
+                   MambaReplay* replay) {
     const TextConfig& config    = model.config();
     const MambaConfig& mamba    = config.mamba.value();
     const std::int32_t hidden   = static_cast<std::int32_t>(config.hidden_size);
@@ -612,6 +621,28 @@ void forward_mamba(const Model& model, const MambaWeights& weights, const Tensor
                 channels, tokens, stream);
     copy_blocks(scratch.mamba.dt, 0, heads, scratch.mamba.projection, inner + channels, width,
                 heads, tokens, stream);
+
+    if (replay != nullptr) {
+        // The two operands a state replay reads: the convolution's input and the scan's time steps.
+        // Everything else the scan consumes is a function of the convolution's output, so a replay
+        // recomputes it and lands on the state this pass reached.
+        Tensor& conv_capture = replay->conv_in[layer];
+        Tensor& dt_capture   = replay->dt[layer];
+        if (conv_capture.data == nullptr || dt_capture.data == nullptr) {
+            throw std::logic_error("nemotron_h forward: block " + std::to_string(layer) +
+                                   " has no replay capture to write");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            conv_capture.data, scratch.mamba.conv_in.data,
+            static_cast<std::size_t>(channels) * static_cast<std::size_t>(tokens) *
+                sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dt_capture.data, scratch.mamba.dt.data,
+                                   static_cast<std::size_t>(heads) * static_cast<std::size_t>(tokens) *
+                                       sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToDevice, stream));
+        replay->columns = std::max(replay->columns, tokens);
+    }
 
     // 2. The depthwise convolution over x, B and C together, with its bias and its activation
     //    fused. The activation applies to B and C as well as to x because the reference splits them
@@ -945,10 +976,71 @@ void forward_attention(const Model& model, const AttentionWeights& weights,
 
 } // namespace
 
+void mamba_replay_apply(const Model& model, std::span<BlockState> per_layer,
+                        const MambaReplay& capture, MambaReplayScratch& scratch,
+                        std::int32_t columns, DeviceExecutionView execution) {
+    const TextConfig& config = model.config();
+    if (!config.mamba.has_value()) {
+        throw std::invalid_argument("nemotron_h replay: this config has no Mamba block");
+    }
+    const MambaConfig& mamba    = *config.mamba;
+    const std::int32_t inner    = static_cast<std::int32_t>(mamba.inner_size());
+    const std::int32_t channels = static_cast<std::int32_t>(mamba.conv_channels());
+    const std::int32_t heads    = static_cast<std::int32_t>(mamba.num_heads);
+    const std::int32_t groups   = static_cast<std::int32_t>(mamba.n_groups);
+    const std::int32_t values   = static_cast<std::int32_t>(mamba.head_dim);
+    const std::int32_t state_size = static_cast<std::int32_t>(mamba.state_size);
+    const cudaStream_t stream   = execution.stream;
+    if (columns <= 0 || columns > capture.columns) {
+        throw std::invalid_argument("nemotron_h replay: " + std::to_string(columns) +
+                                    " columns were asked for and the capture holds " +
+                                    std::to_string(capture.columns));
+    }
+    if (per_layer.size() != capture.conv_in.size()) {
+        throw std::invalid_argument("nemotron_h replay: the capture and the state bind a "
+                                    "different number of blocks");
+    }
+    for (std::size_t block = 0; block < per_layer.size(); ++block) {
+        if (config.block_kind(static_cast<std::uint32_t>(block)) != BlockKind::Mamba) { continue; }
+        BlockState& state = per_layer[block];
+        if (state.conv.data == nullptr || state.recurrent.data == nullptr ||
+            capture.conv_in[block].data == nullptr || capture.dt[block].data == nullptr) {
+            throw std::invalid_argument("nemotron_h replay: block " + std::to_string(block) +
+                                        " is a Mamba block without a capture or a state");
+        }
+        const LayerWeights& weights = model.weights().text.layers[block];
+        if (!weights.mamba.has_value()) {
+            throw std::invalid_argument("nemotron_h replay: block " + std::to_string(block) +
+                                        " has no Mamba parameters");
+        }
+        const MambaWeights& w = *weights.mamba;
+        const Tensor conv_in(capture.conv_in[block].data, DType::BF16, {channels, columns});
+        const Tensor dt(capture.dt[block].data, DType::BF16, {heads, columns});
+        Tensor conv_out(scratch.conv_out.data, DType::BF16, {channels, columns});
+        const Tensor* bias = mamba.conv_bias ? &model.bound(w.conv_bias).tensor : nullptr;
+        ops::causal_conv1d_silu(conv_in, model.bound(w.conv).tensor, bias, state.conv, conv_out,
+                                stream);
+        Tensor scan_x(scratch.scan_x.data, DType::BF16, {inner, columns});
+        Tensor scan_b(scratch.scan_b.data, DType::BF16, {kScanKeyExtent * groups, columns});
+        Tensor scan_c(scratch.scan_c.data, DType::BF16, {kScanKeyExtent * groups, columns});
+        Tensor scan_out(scratch.scan_out.data, DType::BF16, {values, heads, columns});
+        copy_blocks(scan_x, 0, inner, conv_out, 0, channels, inner, columns, stream);
+        copy_grouped_rows(scan_b, conv_out, inner, channels, groups, state_size, kScanKeyExtent,
+                          columns, stream);
+        copy_grouped_rows(scan_c, conv_out, inner + groups * state_size, channels, groups,
+                          state_size, kScanKeyExtent, columns, stream);
+        ops::mamba2_scan(scan_x.view({values, heads, columns}),
+                         scan_b.view({kScanKeyExtent, groups, columns}),
+                         scan_c.view({kScanKeyExtent, groups, columns}), dt,
+                         model.tensor(w.dt_bias), model.tensor(w.a_log), model.tensor(w.d_skip),
+                         mamba.time_step_min, state.recurrent, scan_out, stream);
+    }
+}
+
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
-                   BlockState* state, const BlockObserver* observer,
-                   RoutedExpertPool* expert_pool) {
+                   BlockState* state, const BlockObserver* observer, RoutedExpertPool* expert_pool,
+                   MambaReplay* replay) {
     const TextConfig& config  = model.config();
     const std::int32_t hidden = static_cast<std::int32_t>(config.hidden_size);
     if (layer >= config.num_hidden_layers()) {
@@ -1008,7 +1100,7 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
     switch (kind) {
     case BlockKind::Mamba:
         forward_mamba(model, weights.mamba.value(), scratch.normed, scratch, hidden_out, execution,
-                      state, observer, layer);
+                      state, observer, layer, replay);
         break;
     case BlockKind::Moe:
         forward_moe(model, *bank, weights.moe.value(), scratch.normed, scratch, hidden_out,
@@ -1028,7 +1120,8 @@ void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_i
 
 void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& arena, Tensor& logits,
                    DeviceExecutionView execution, const PassState* state, HeadColumns columns,
-                   const BlockObserver* observer, RoutedExpertPool* expert_pool) {
+                   const BlockObserver* observer, RoutedExpertPool* expert_pool,
+                   MambaReplay* replay) {
     const TextConfig& config       = model.config();
     const std::int32_t hidden      = static_cast<std::int32_t>(config.hidden_size);
     const std::int32_t tokens      = token_ids.ne[0];
@@ -1103,7 +1196,8 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
     for (std::size_t layer = 0; layer < config.num_hidden_layers(); ++layer) {
         Tensor next = current.data == buffers.hidden_a.data ? buffers.hidden_b : buffers.hidden_a;
         forward_block(model, layer, current, arena, next, execution,
-                      per_layer == nullptr ? nullptr : per_layer + layer, observer, expert_pool);
+                      per_layer == nullptr ? nullptr : per_layer + layer, observer, expert_pool,
+                      replay);
         current = next;
     }
 

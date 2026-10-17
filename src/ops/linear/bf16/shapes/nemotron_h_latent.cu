@@ -146,7 +146,12 @@ void launch_bf16_latent_row(const Tensor& x, const Weight& weight, Tensor& out,
 
 template <class Geometry>
 Bf16Launch select_latent(std::int32_t tokens) {
-    if (tokens == 1) return launch_bf16_latent_row<Geometry, 1, kThreadsPerCtaNarrow>;
+    if (tokens == 1) {
+        // The narrow block exists to raise the *block* count when the output is small (1024 or
+        // 4096 rows); it costs three quarters of each warp's lanes. A wide output (the 131072-row
+        // head) already fills the device with whole warps, so the narrow geometry only loses there.
+        return launch_bf16_latent_row<Geometry, 1, kThreadsPerCtaNarrow>;
+    }
     return launch_bf16_latent_row<Geometry, 4>;
 }
 
@@ -158,6 +163,46 @@ Bf16Launch select_bf16_n1024_k4096(std::int32_t tokens) {
 
 Bf16Launch select_bf16_n4096_k1024(std::int32_t tokens) {
     return select_latent<Bf16Geometry<4096, 1024>>(tokens);
+}
+
+
+// The Lightning 30B's projections: every one of them reached the dense fallback before these,
+// because the registry keys on (N, K) and none of these widths were recorded. They are the same
+// schedule as the latent pair -- one lane owns a whole output row and walks K ascending through
+// 32-byte packs -- which is what makes them bit-identical to the fallback they displace.
+Bf16Launch select_bf16_n3712_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<3712, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k3712(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 3712>>(tokens);
+}
+Bf16Launch select_bf16_n131072_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<131072, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n10304_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<10304, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k4096(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 4096>>(tokens);
+}
+Bf16Launch select_bf16_n4096_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<4096, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n256_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<256, 2688>>(tokens);
+}
+// The DFlash companion of that model: `fc` fuses the six taps into the draft's width, and the body's
+// gate/up/down run at its 6144-wide MLP. A draft round issues 2..9 rows, which is the fallback's
+// worst case -- one lane per row with no token reuse -- so these shapes are where the row schedule
+// matters most.
+Bf16Launch select_bf16_n2688_k16128(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 16128>>(tokens);
+}
+Bf16Launch select_bf16_n6144_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<6144, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k6144(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 6144>>(tokens);
 }
 
 } // namespace ninfer::ops::detail

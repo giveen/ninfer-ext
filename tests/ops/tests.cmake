@@ -11,6 +11,7 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   residual_add_norm
+  fp32_residual_routes
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail
@@ -35,6 +36,7 @@ set(ninfer_op_tests
   cast
   causal_compact_attention
   compact_kv_rows
+  grouped_tap_apply
   prepare_ragged_prefix
   scale_columns
   sliding_causal_attention

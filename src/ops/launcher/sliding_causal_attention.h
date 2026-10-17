@@ -20,7 +20,7 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
                                      std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
                                      Tensor& out, const Tensor& workspace,
-                                     DeviceExecutionView execution);
+                                     DeviceExecutionView execution, const Tensor& sink);
 
 std::size_t sliding_causal_attention_workspace_bytes(std::int32_t head_dim,
                                                      std::int32_t query_tokens,

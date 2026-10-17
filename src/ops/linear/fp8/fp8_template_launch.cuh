@@ -15,8 +15,11 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
 void launch_fp8_a16_gemv(const Fp8A16Operands& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {}) {
     validate_fp8_operands<Schedule>(p);
-    if (p.tokens != 1 || p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane))
-        throw std::invalid_argument("FP8 GEMV requires T=1 and complete row/K tiles");
+    // K need only divide into whole lane packs: a K that is not a whole number of phases leaves one
+    // guarded tail phase, which the kernel walks without reading past the row.
+    if (p.tokens != 1 || p.rows % Schedule::kBlockRows || p.k % Schedule::kValuesPerLane)
+        throw std::invalid_argument(
+            "FP8 GEMV requires T=1, complete row tiles and whole lane packs in K");
     fp8_a16_gemv_kernel<Schedule><<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
         p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k);
     CUDA_CHECK(cudaGetLastError());

@@ -7,5 +7,6 @@
 namespace ninfer::ops::detail {
 
 void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream);
+void add_bias_fp32_launch(const Tensor& bias, Tensor& x, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

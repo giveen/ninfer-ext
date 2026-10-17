@@ -385,9 +385,11 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     activation_divisor = None
     if request.target.format == "nvfp4" and len(request.inputs) > 1:
         words = [
-            item.source.input_divisor()
+            word
             for item in request.inputs
             if item.source.input_divisor is not None
+            for word in [item.source.input_divisor()]
+            if word is not None
         ]
         if words:
             activation_divisor = min(

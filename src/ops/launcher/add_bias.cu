@@ -50,19 +50,18 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         // scalar stream's warp requests straddle an extra line; the 16-byte pack
         // stream avoids the extra L2 read sectors. Keep the scalar stream when the
         // stride is line-aligned, where it is already at the bandwidth roofline.
-        const bool full_packs = (pairs % kAddBiasPairsPerThread) == 0 &&
-                                (reinterpret_cast<std::uintptr_t>(x.data) & (alignof(uint4) - 1)) == 0;
+        const bool full_packs =
+            (pairs % kAddBiasPairsPerThread) == 0 &&
+            (reinterpret_cast<std::uintptr_t>(x.data) & (alignof(uint4) - 1)) == 0;
         const bool straddles_lines = ((static_cast<std::int64_t>(x.ne[0]) * 2) % 128) != 0;
         if (full_packs && straddles_lines) {
             add_bias_bf16x2_pack_kernel<block><<<dim3(grid_x, grid_y, 1u), block, 0, stream>>>(
-                static_cast<const __nv_bfloat162*>(bias.data),
-                static_cast<__nv_bfloat162*>(x.data), pairs,
-                static_cast<std::int32_t>(rows));
+                static_cast<const __nv_bfloat162*>(bias.data), static_cast<__nv_bfloat162*>(x.data),
+                pairs, static_cast<std::int32_t>(rows));
         } else {
             add_bias_bf16x2_kernel<block><<<dim3(grid_x, grid_y, 1u), block, 0, stream>>>(
-                static_cast<const __nv_bfloat162*>(bias.data),
-                static_cast<__nv_bfloat162*>(x.data), pairs,
-                static_cast<std::int32_t>(rows));
+                static_cast<const __nv_bfloat162*>(bias.data), static_cast<__nv_bfloat162*>(x.data),
+                pairs, static_cast<std::int32_t>(rows));
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -71,6 +70,27 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
     add_bias_kernel<<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat16*>(bias.data),
                                                 static_cast<__nv_bfloat16*>(x.data), x.ne[0], n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
+__global__ void add_bias_fp32_kernel(const float* __restrict__ bias, float* __restrict__ x,
+                                     std::int32_t d, std::int64_t n) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) { x[i] = x[i] + bias[i % d]; }
+}
+
+} // namespace
+
+void add_bias_fp32_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
+    constexpr int block  = 256;
+    const std::int64_t n = x.numel();
+    const int grid       = static_cast<int>(std::min<std::int64_t>(
+        div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
+    add_bias_fp32_kernel<<<grid, block, 0, stream>>>(static_cast<const float*>(bias.data),
+                                                     static_cast<float*>(x.data), x.ne[0], n);
     CUDA_CHECK(cudaGetLastError());
 }
 

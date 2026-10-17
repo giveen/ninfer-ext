@@ -21,8 +21,8 @@ DeviceExecutionView test_execution() {
     return {nullptr, count};
 }
 
-// One storage rounding of a weighted average of represented BF16 values, with an absolute floor so a
-// value that cancels to nothing is not judged by a relative rule.
+// One storage rounding of a weighted average of represented BF16 values, with an absolute floor so
+// a value that cancels to nothing is not judged by a relative rule.
 constexpr PointwiseCriterion sliding_causal_criterion() {
     return {/*absolute*/ 2.0e-5, /*relative*/ 4.5e-3};
 }
@@ -38,6 +38,9 @@ struct Case {
     // Queries [block_begin, block_end) form an image block: each sees keys up to the block's last
     // position. Empty when block_end == 0.
     std::int32_t block_begin = 0, block_end = 0;
+    // A non-zero scale gives every query head a sink logit, generated as an exact multiple of 1/16
+    // so the oracle and the device tensor share one number with no rounding between them.
+    float sink_scale = 0.0F;
 };
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
@@ -95,6 +98,14 @@ int run_case(const Case& c, std::uint32_t seed) {
     round_to_bf16(k);
     round_to_bf16(v);
 
+    const bool has_sink = c.sink_scale != 0.0F;
+    std::vector<float> sinks(static_cast<std::size_t>(c.query_heads), 0.0F);
+    for (std::int32_t head = 0; head < c.query_heads; ++head) {
+        sinks[static_cast<std::size_t>(head)] =
+            c.sink_scale * static_cast<float>(head % 7 - 3) / 16.0F;
+    }
+    const auto sink_bits = encode_bf16(sinks);
+
     std::vector<std::int32_t> position_q(static_cast<std::size_t>(c.query_tokens) * c.batch);
     std::vector<std::int32_t> position_k(static_cast<std::size_t>(c.key_tokens) * c.batch);
     std::vector<std::int32_t> position_high(position_q.size());
@@ -107,7 +118,7 @@ int run_case(const Case& c, std::uint32_t seed) {
                 c.first_query_position + (blocked && in_block ? c.block_end - 1 : t);
         }
         for (std::int32_t s = 0; s < c.key_tokens; ++s) {
-            const std::int32_t slot = (s + c.ring) % c.key_tokens;
+            const std::int32_t slot          = (s + c.ring) % c.key_tokens;
             position_k[s + c.key_tokens * b] = c.first_key_position + slot * c.key_step + b;
         }
     }
@@ -139,11 +150,16 @@ int run_case(const Case& c, std::uint32_t seed) {
             },
             [&](int d, int head, int token, double value) {
                 expected[index(c, d, head, token, b)] = value;
+            },
+            1,
+            [&](int head) {
+                return has_sink ? static_cast<double>(sinks[static_cast<std::size_t>(head)])
+                                : -std::numeric_limits<double>::infinity();
             });
     }
 
-    // A key no query sees stands for an unwritten cache slot, which may hold any bits: NaN there must
-    // not reach the output.
+    // A key no query sees stands for an unwritten cache slot, which may hold any bits: NaN there
+    // must not reach the output.
     for (std::int32_t b = 0; b < c.batch; ++b) {
         for (std::int32_t key = 0; key < c.key_tokens; ++key) {
             bool seen = false;
@@ -182,24 +198,28 @@ int run_case(const Case& c, std::uint32_t seed) {
     device_ph.copy_from_host(position_high.data(), device_ph.bytes());
     device_out.fill(0x7d);
 
-    Tensor q_tensor(device_q.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
+    Tensor q_tensor(device_q.data(), DType::BF16,
+                    {c.head_dim, c.query_heads, c.query_tokens, c.batch});
     Tensor k_tensor(device_k.data(), DType::BF16, {c.head_dim, c.kv_heads, c.key_tokens, c.batch});
     Tensor v_tensor(device_v.data(), DType::BF16, {c.head_dim, c.kv_heads, c.key_tokens, c.batch});
     Tensor pq_tensor(device_pq.data(), DType::I32, {c.query_tokens, c.batch});
     Tensor pk_tensor(device_pk.data(), DType::I32, {c.key_tokens, c.batch});
     const Tensor ph_tensor =
         blocked ? Tensor(device_ph.data(), DType::I32, {c.query_tokens, c.batch}) : Tensor{};
-    Tensor out_tensor(device_out.data(), DType::BF16, {c.head_dim, c.query_heads, c.query_tokens, c.batch});
+    Tensor out_tensor(device_out.data(), DType::BF16,
+                      {c.head_dim, c.query_heads, c.query_tokens, c.batch});
 
     // The same keys as two sets: the first `head` keys of every batch, then the rest as the extra
     // set, the way a pass's own keys sit beside a ring.
     const std::int32_t head  = c.key_tokens > 1 ? c.key_tokens / 3 + 1 : c.key_tokens;
     const std::int32_t extra = c.key_tokens - head;
-    const auto take = [&](const std::vector<std::uint16_t>& bits, std::int32_t from, std::int32_t n) {
+    const auto take          = [&](const std::vector<std::uint16_t>& bits, std::int32_t from,
+                                   std::int32_t n) {
         std::vector<std::uint16_t> part;
         const std::size_t row = static_cast<std::size_t>(c.head_dim) * c.kv_heads;
         for (std::int32_t b = 0; b < c.batch; ++b) {
-            const auto* base = bits.data() + (static_cast<std::size_t>(b) * c.key_tokens + from) * row;
+            const auto* base =
+                bits.data() + (static_cast<std::size_t>(b) * c.key_tokens + from) * row;
             part.insert(part.end(), base, base + static_cast<std::size_t>(n) * row);
         }
         return part;
@@ -207,7 +227,8 @@ int run_case(const Case& c, std::uint32_t seed) {
     const auto take_positions = [&](std::int32_t from, std::int32_t n) {
         std::vector<std::int32_t> part;
         for (std::int32_t b = 0; b < c.batch; ++b) {
-            const auto* base = position_k.data() + static_cast<std::size_t>(b) * c.key_tokens + from;
+            const auto* base =
+                position_k.data() + static_cast<std::size_t>(b) * c.key_tokens + from;
             part.insert(part.end(), base, base + n);
         }
         return part;
@@ -235,6 +256,13 @@ int run_case(const Case& c, std::uint32_t seed) {
     const std::size_t split_bytes = ops::sliding_causal_attention_workspace_bytes(
         geometry, c.query_tokens, c.key_tokens, c.batch);
     GuardedDeviceBuffer device_workspace(std::max<std::size_t>(split_bytes, 16));
+    GuardedDeviceBuffer device_sink(
+        std::max<std::size_t>(16, 2u * static_cast<std::size_t>(c.query_heads)));
+    if (has_sink) { device_sink.copy_from_host(sink_bits.data(), sink_bits.size() * 2); }
+    Tensor sink_tensor;
+    if (has_sink) {
+        sink_tensor = Tensor(device_sink.data(), DType::BF16, {c.query_heads, 1, 1, 1});
+    }
     int failures = 0;
     std::vector<double> got;
     const Tensor none;
@@ -249,7 +277,7 @@ int run_case(const Case& c, std::uint32_t seed) {
         if (route < 2) {
             ops::sliding_causal_attention(q_tensor, k_tensor, v_tensor, pq_tensor, ph_tensor,
                                           pk_tensor, none, none, none, geometry, c.window, 1.0F,
-                                          out_tensor, workspace, test_execution());
+                                          out_tensor, workspace, test_execution(), sink_tensor);
         } else {
             Tensor k1(device_k1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
             Tensor v1(device_v1.data(), DType::BF16, {c.head_dim, c.kv_heads, head, c.batch});
@@ -258,12 +286,14 @@ int run_case(const Case& c, std::uint32_t seed) {
             Tensor v2(device_v2.data(), DType::BF16, {c.head_dim, c.kv_heads, extra, c.batch});
             Tensor p2(device_p2.data(), DType::I32, {extra, c.batch});
             ops::sliding_causal_attention(q_tensor, k1, v1, pq_tensor, ph_tensor, p1, k2, v2, p2,
-                                          geometry, c.window, 1.0F, out_tensor, workspace, test_execution());
+                                          geometry, c.window, 1.0F, out_tensor, workspace,
+                                          test_execution(), sink_tensor);
         }
         cuda_synchronize();
-        const std::string label = std::string(c.label) +
-                                  (route == 0 ? " (one pass)" : route == 1 ? " (split)" : " (two key sets)");
-        got = from_device_bf16(device_out.data(), q_count);
+        const std::string label = std::string(c.label) + (route == 0   ? " (one pass)"
+                                                          : route == 1 ? " (split)"
+                                                                       : " (two key sets)");
+        got                     = from_device_bf16(device_out.data(), q_count);
         failures += verify_pointwise(label.c_str(), got, expected, sliding_causal_criterion());
         report_rms(label, got, expected);
     }
@@ -301,9 +331,10 @@ int main() {
 
     // Gemma 4's sliding geometry, with the window wide enough that it does not bind, so the causal
     // rule alone decides the visible set.
-    failures += run_case({"gemma sliding window 1024", 256, 32, 16, 8, 4, 1, 1000, 1005, 1, 1024},
-                         7101U);
-    // A window that does bind, plus the boundary pair: distance window-1 visible, distance window not.
+    failures +=
+        run_case({"gemma sliding window 1024", 256, 32, 16, 8, 4, 1, 1000, 1005, 1, 1024}, 7101U);
+    // A window that does bind, plus the boundary pair: distance window-1 visible, distance window
+    // not.
     failures += run_case({"narrow window", 64, 8, 4, 8, 4, 1, 0, 4, 1, 5}, 7102U);
     failures += run_case({"window boundary", 32, 4, 2, 6, 6, 1, 0, 0, 1, 3}, 7103U);
     // A gap where nothing is visible: the output must be exact zero.
@@ -315,13 +346,13 @@ int main() {
 
     // A full Gemma ring: 1152 slots in rotated order behind a 128-token pass, so the visible set
     // spans many key tiles, starts mid-ring, and some tiles are invisible to every row.
-    failures += run_case({"gemma ring pass", 256, 32, 16, 1152, 128, 1, 1000, 2024, 1, 1024, 300},
-                         7107U);
+    failures +=
+        run_case({"gemma ring pass", 256, 32, 16, 1152, 128, 1, 1000, 2024, 1, 1024, 300}, 7107U);
     // More query rows than one block, with a window that cuts through a tile.
     failures += run_case({"many rows", 64, 8, 4, 200, 70, 2, 0, 150, 1, 37, 17}, 7108U);
     // Decode over a full rotated ring, which is the case the key split serves.
-    failures += run_case({"gemma ring decode", 256, 32, 16, 1152, 1, 1, 1000, 2151, 1, 1024, 77},
-                         7109U);
+    failures +=
+        run_case({"gemma ring decode", 256, 32, 16, 1152, 1, 1, 1000, 2151, 1, 1024, 77}, 7109U);
 
     // Gemma 4 image blocks. Keys ahead of a query inside its block are visible, the window's lower
     // edge stays at each query, and the block crosses key tiles in rotated ring order. Keys past
@@ -340,10 +371,19 @@ int main() {
     // window that binds inside a 32-key tile.
     failures += run_case(
         {"gemma prefill pass", 256, 32, 16, 1664, 512, 1, 1000, 2152, 1, 1024, 300}, 7113U);
-    failures += run_case({"gemma prefill pass with image", 256, 32, 16, 1664, 512, 1, 1000, 2152,
-                          1, 1024, 300, 100, 356},
+    failures += run_case({"gemma prefill pass with image", 256, 32, 16, 1664, 512, 1, 1000, 2152, 1,
+                          1024, 300, 100, 356},
                          7114U);
     failures += run_case({"tiled two batches", 64, 8, 4, 700, 300, 2, 0, 400, 1, 45, 51}, 7115U);
+
+    // The draft's sink. The first is the draft's own geometry at a block's width, where the rows
+    // keep every block busy and the one-pass route seeds from the sink; the second is decode width,
+    // where the key split is used and the merge must fold the sink once rather than once per split.
+    failures += run_case(
+        {"draft sink, 8 rows", 128, 32, 2, 300, 8, 1, 1000, 1005, 1, 1024, 0, 0, 0, 1.0F}, 7116U);
+    failures += run_case(
+        {"draft sink, decode width", 128, 32, 2, 1152, 1, 1, 1000, 2151, 1, 1024, 0, 0, 0, 0.5F},
+        7117U);
 
     // The unbounded causal sentinel. `window == 0` must visit exactly the keys at or before the
     // query's upper bound: 8001-8064 of them here in the first case and 5001-5002 in the second,

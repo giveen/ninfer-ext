@@ -110,6 +110,10 @@ public:
         return residency_;
     }
 
+    // The speculative draft this artifact carries, when it carries one. It travels with the model
+    // so the Program can size its buffers and drive it; absent means the artifact has no draft.
+    [[nodiscard]] const std::optional<draft::Spec>& draft() const noexcept { return draft_; }
+
     // Binds one parameter. `weight` is engaged for a matrix the Ops consume; `tensor` is the
     // resident view either way, and a matrix's `tensor` is its logical `[N,K]` row-major view. A
     // quantized matrix has its planes in `weight` and no single-typed tensor, so its `tensor` stays
@@ -131,6 +135,7 @@ public:
     }
 
 private:
+    std::optional<draft::Spec> draft_;
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     // The loader's constructor: the model owns the bytes every bound view borrows, and the split
@@ -246,6 +251,39 @@ struct PassState {
     std::int32_t first_position = 0;
 };
 
+// One pass's Mamba state-transition operands, kept so a speculative round can advance its accepted
+// prefix without running the model again.
+//
+// The state transition is driven by two vectors only: the depthwise convolution's input and the
+// scan's time steps. Everything else the scan reads -- the convolution's output and the B/C/x the
+// scan regroups from it -- is a function of the convolution's input, so a replay recomputes them
+// exactly as the pass did and lands on the same state. The entries are per *block* (a block with no
+// Mamba mixer leaves its pair empty); `columns` is the width the pass ran, and a replay may consume
+// a prefix of it.
+struct MambaReplay {
+    std::vector<Tensor> conv_in; // [conv_channels, width] per block, Mamba blocks only
+    std::vector<Tensor> dt;      // [heads, width] per block
+    std::int32_t columns = 0;
+};
+
+// The replay's own scratch: the convolution's output and the three operands the scan regroups from
+// it, sized for the widest block a round can commit. One set serves every layer, because the replay
+// walks the layers one at a time.
+struct MambaReplayScratch {
+    Tensor conv_out; // [conv_channels, width]
+    Tensor scan_x;   // [inner, width]
+    Tensor scan_b;   // [128 * groups, width]
+    Tensor scan_c;   // [128 * groups, width]
+    Tensor scan_out; // [inner, width]: the scan's own readout, written and discarded
+};
+
+// Advances `per_layer`'s Mamba state by `columns` of a captured pass: the convolution and the scan,
+// nothing else. The caller restores the pre-pass state first (the round's snapshot) and hands the
+// pass's own block bindings, so the result is the state the pass itself reached at that column.
+void mamba_replay_apply(const Model& model, std::span<BlockState> per_layer,
+                        const MambaReplay& capture, MambaReplayScratch& scratch,
+                        std::int32_t columns, DeviceExecutionView execution);
+
 // Which columns of a pass the head runs over. A generation step draws the token after the pass's
 // last position, and the head costs `vocabulary` outputs per column, so a caller that only draws
 // asks for the logits of one column and sizes its buffer for one.
@@ -279,7 +317,7 @@ enum class HeadColumns : std::uint8_t {
 void forward_block(const Model& model, std::size_t layer, const Tensor& hidden_in,
                    DeviceArena& arena, Tensor& hidden_out, DeviceExecutionView execution,
                    BlockState* state = nullptr, const BlockObserver* observer = nullptr,
-                   RoutedExpertPool* experts = nullptr);
+                   RoutedExpertPool* experts = nullptr, MambaReplay* replay = nullptr);
 
 /**
  * Runs a whole text pass: the token embedding, every block in order, the final norm and the head.
@@ -302,6 +340,6 @@ void forward_model(const Model& model, const Tensor& token_ids, DeviceArena& are
                    DeviceExecutionView execution, const PassState* state = nullptr,
                    HeadColumns columns           = HeadColumns::Every,
                    const BlockObserver* observer = nullptr,
-                   RoutedExpertPool* expert_pool = nullptr);
+                   RoutedExpertPool* expert_pool = nullptr, MambaReplay* replay = nullptr);
 
 } // namespace ninfer::models::nemotron_h

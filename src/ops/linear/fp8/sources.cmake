@@ -19,6 +19,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n248320_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n256_k4096.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k4096.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/nemotron_lightning.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k8192.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n18560_k4096.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n131072_k4096.cu"

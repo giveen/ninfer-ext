@@ -15,7 +15,7 @@ import torch
 
 from .model import Model, Parameter
 from .resources import load_resources
-from .sources.logical import LogicalSource, array_source, select_rows, transpose_source
+from .sources.logical import LogicalSource, array_source, pad_matrix, select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
 
@@ -564,6 +564,7 @@ class _Builder:
         offset=0,
         rows=None,
         transpose=None,
+        pad=None,
     ):
         shape = tuple(shape)
         original = shape if source_shape is None else tuple(source_shape)
@@ -589,6 +590,10 @@ class _Builder:
                 return transpose_source(ref, transpose, shape)
             if len(original) == 2 and offset == 0:
                 ref = matrix_source(selected, selected_name, original, format)
+                # A zero-padded matrix: the declared shape is wider/taller than the source's own
+                # (a bank the engine's kernels require to be a multiple of 128).
+                if pad is not None:
+                    ref = pad_matrix(ref, pad[0], pad[1])
                 return select_rows(ref, rows) if rows is not None else ref
             if format is not None:
                 raise ValueError(f"{name}: provide an explicit encoded source mapping")
@@ -747,7 +752,11 @@ class _Builder:
             (h, intermediate),
             inputs=(prefix + ("mlp_product" if draft else "mlp/product"),),
         )
-        self.group(prefix + "mlp/gate", prefix + "mlp/up")
+        # A draft's MLP stays two matrices: an encoded (NVFP4) parent carries one divisor, so a
+        # fusable pair with two source scales cannot be one parent, and the engine reads the two
+        # projections separately anyway.
+        if not draft:
+            self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
     def moe(self, prefix, source_prefix, store, config):
         h, e = config["hidden_size"], config["num_experts"]
@@ -943,6 +952,12 @@ class _Builder:
         )
         self.add(backend + "/context_norm", store, "hidden_norm.weight", (h,))
         self.add(backend + "/final_norm", store, "norm.weight", (h,))
+        # The companion's `embed_tokens` is the tower's embedding with one row of its own: the mask
+        # token's. That row is the whole input of every proposal column, and the tower's row for the
+        # same id is an unrelated vector, so it is the one tensor the draft has to carry.
+        mask = draft["mask_token_id"]
+        self.add(backend + "/mask_embedding", store, "embed_tokens.weight", (1, h),
+                 offset=mask * h, source_shape=(target["vocab_size"], h))
         for i in range(config["num_hidden_layers"]):
             p, sp = f"{backend}/layers/{i}/", f"layers.{i}."
             self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))

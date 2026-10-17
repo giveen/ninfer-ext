@@ -10,7 +10,9 @@
 
 namespace ninfer::ops::detail {
 
-// Host entry; assumes inputs already validated by the wrapper.
+// Host entries; assume inputs already validated by the wrapper. The dtype selects the route, so
+// the wrapper dispatches on the tensor dtypes and never mixes them.
 void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream);
+void residual_add_fp32_launch(const Tensor& y, Tensor& x, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

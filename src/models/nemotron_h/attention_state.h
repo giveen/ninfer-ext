@@ -178,6 +178,24 @@ public:
     void advance(std::int32_t lane);
 
     /**
+     * Rolls the lane's frontier back to `tokens`, which is what a speculative pass needs: a verify
+     * pass appends a whole block and then commits only its accepted prefix, and a *causal* state
+     * ignores the discarded slots for free.
+     *
+     * The slots past `tokens` keep the K/V and positions the discarded columns wrote -- they are
+     * deliberately not cleared. Their positions are at or beyond `tokens`, so the Op's causal bound
+     * (`position_k <= position_q`) hides every one of them from the next pass's queries, and that
+     * pass's own `append` overwrites exactly those slots before any query runs: append writes
+     * `[filled, filled + tokens)` and queries only within it. So the two invariants the route
+     * depends on -- "slot i holds the position i" for every written slot, and "nothing past the
+     * frontier is visible" -- both hold without a scatter.
+     *
+     * Refuses a lane with a step in progress (every attention layer must have advanced first) and a
+     * frontier that is not a rewind (`tokens > filled`, or negative).
+     */
+    void rewind(std::int32_t lane, std::int32_t tokens);
+
+    /**
      * One layer's attention over the lane's whole state, for the step's `pending` tokens: exactly
      * the causal attention this model has, with the scale it has and no window.
      *

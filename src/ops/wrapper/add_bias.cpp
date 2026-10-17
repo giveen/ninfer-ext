@@ -33,8 +33,9 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 } // namespace
 
 void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
-    if (bias.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("add_bias: bias/x must be BF16");
+    const bool fp32 = bias.dtype == DType::FP32 && x.dtype == DType::FP32;
+    if (!fp32 && (bias.dtype != DType::BF16 || x.dtype != DType::BF16)) {
+        throw std::invalid_argument("add_bias: bias/x must both be BF16 or both be F32");
     }
     const std::int64_t n = checked_numel(x);
     if (bias.ne[0] != x.ne[0] || bias.ne[1] != 1 || bias.ne[2] != 1 || bias.ne[3] != 1) {
@@ -48,6 +49,10 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("add_bias: bias/x data must be non-null");
     }
     if (overlaps(bias, x)) { throw std::invalid_argument("add_bias: bias and x must not overlap"); }
+    if (fp32) {
+        detail::add_bias_fp32_launch(bias, x, stream);
+        return;
+    }
     detail::add_bias_launch(bias, x, stream);
 }
 

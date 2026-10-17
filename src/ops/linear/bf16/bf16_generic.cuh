@@ -23,6 +23,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ops/linear/bf16/bf16_gemv.cuh"
 
 #include <cmath>
 #include <cstdint>
@@ -42,28 +43,64 @@ inline constexpr int kBf16GenericTokensPerThread = 4;
 static __global__ void bf16_generic_kernel(const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* __restrict__ weight,
                                            __nv_bfloat16* __restrict__ out, const std::int32_t n,
-                                           const std::int32_t k, const std::int32_t tokens) {
+                                           const std::int32_t k, const std::int32_t tokens,
+                                           const std::int32_t per_thread) {
     const std::int64_t owner  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int32_t row    = static_cast<std::int32_t>(owner % n);
-    const std::int32_t token0 = static_cast<std::int32_t>(owner / n) * kBf16GenericTokensPerThread;
+    const std::int32_t token0 = static_cast<std::int32_t>(owner / n) * per_thread;
     if (token0 >= tokens) { return; }
 
     const __nv_bfloat16* weight_row                = weight + static_cast<std::int64_t>(row) * k;
     float accumulator[kBf16GenericTokensPerThread] = {0.0F, 0.0F, 0.0F, 0.0F};
-    for (std::int32_t column = 0; column < k; ++column) {
-        const float w = __bfloat162float(weight_row[column]);
+    // Weight loads are 32-byte packs (one memory sector per lane) rather than one BF16 element:
+    // with row-fastest threads, a scalar column read has every lane in a different sector. The
+    // accumulation is unchanged -- one FP32 accumulator per (token,row), ascending K, one BF16
+    // rounding at the store -- so this route stays bit-identical to the scalar chain.
+    const bool packed = (k % 16) == 0 && (reinterpret_cast<std::uintptr_t>(weight_row) & 0xfu) == 0;
+    if (packed) {
+        for (std::int32_t column = 0; column < k; column += 16) {
+            const Bf16GemvPack<16> pack =
+                load_bf16_weight_pack<Bf16WeightCache::Default, 16>(weight_row + column);
 #pragma unroll
-        for (int slot = 0; slot < kBf16GenericTokensPerThread; ++slot) {
-            const std::int32_t token = token0 + slot;
-            if (token < tokens) {
-                accumulator[slot] =
-                    fmaf(w, __bfloat162float(x[static_cast<std::int64_t>(token) * k + column]),
-                         accumulator[slot]);
+            for (int pair = 0; pair < 8; ++pair) {
+                const __nv_bfloat162 two =
+                    *reinterpret_cast<const __nv_bfloat162*>(&pack.words[pair]);
+                const float2 weights = __bfloat1622float2(two);
+#pragma unroll
+                for (int element = 0; element < 2; ++element) {
+                    const float w         = element == 0 ? weights.x : weights.y;
+                    const std::int32_t at = column + pair * 2 + element;
+#pragma unroll
+                    for (int slot = 0; slot < kBf16GenericTokensPerThread; ++slot) {
+                        if (slot >= per_thread) { break; }
+                        const std::int32_t token = token0 + slot;
+                        if (token < tokens) {
+                            accumulator[slot] = fmaf(
+                                w, __bfloat162float(x[static_cast<std::int64_t>(token) * k + at]),
+                                accumulator[slot]);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (std::int32_t column = 0; column < k; ++column) {
+            const float w = __bfloat162float(weight_row[column]);
+#pragma unroll
+            for (int slot = 0; slot < kBf16GenericTokensPerThread; ++slot) {
+                if (slot >= per_thread) { break; }
+                const std::int32_t token = token0 + slot;
+                if (token < tokens) {
+                    accumulator[slot] =
+                        fmaf(w, __bfloat162float(x[static_cast<std::int64_t>(token) * k + column]),
+                             accumulator[slot]);
+                }
             }
         }
     }
 #pragma unroll
     for (int slot = 0; slot < kBf16GenericTokensPerThread; ++slot) {
+        if (slot >= per_thread) { break; }
         const std::int32_t token = token0 + slot;
         if (token >= tokens) { break; }
         out[static_cast<std::int64_t>(token) * n + row] = __float2bfloat16_rn(accumulator[slot]);

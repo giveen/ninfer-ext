@@ -74,7 +74,13 @@ def nvfp4_source(store: SafetensorsSource, prefix: str, shape: tuple[int, int]) 
         return reciprocal_word(_scalar_f32(store, prefix + ".weight_scale_2"), prefix)
 
     @cache
-    def input_divisor() -> bytes:
+    def input_divisor() -> bytes | None:
+        # Calibration is optional in a companion: a matrix that was not activation-quantised
+        # carries no `input_scale`, and A16 consumers never read one. The absent case is reported
+        # as None rather than refused, which is what lets a mixed checkpoint through the shared
+        # 16-bit route.
+        if not store.has(prefix + ".input_scale"):
+            return None
         return reciprocal_word(_scalar_f32(store, prefix + ".input_scale"), prefix)
 
     def encoded(begin: int, end: int) -> EncodedRows:
@@ -179,9 +185,12 @@ def fp8_tensor_rows_source(
 
     def multiplier() -> torch.Tensor:
         info = store.describe(scale)
-        if info.dtype != "BF16" or prod(info.shape) != 1:
-            raise ValueError(f"{scale}: expected one BF16 multiplier")
-        return store.read_flat(scale).reshape(1)
+        if info.dtype not in ("BF16", "F32") or prod(info.shape) != 1:
+            raise ValueError(f"{scale}: expected one scalar multiplier (BF16 or F32)")
+        # The artifact's row scales are BF16, so a checkpoint that stores its per-tensor multiplier
+        # in F32 (Lightning 30B) is rounded once here. The E4M3 codes are untouched; this is the
+        # scale representation the target format itself uses.
+        return store.read_flat(scale).reshape(1).to(torch.bfloat16)
 
     def encoded(begin: int, end: int) -> EncodedRows:
         if not 0 <= begin < end <= n:

@@ -247,8 +247,10 @@ public:
 private:
     std::uint64_t transaction_ = 0;
     std::array<SequenceHandle, kMaximumConcurrency> rows_{};
-    // This family has no draft tokens and no speculation, so one row is one committed token.
-    std::array<TokenId, kMaximumConcurrency> tokens_{};
+    // Row r's licensed tokens start at r * row_stride_, which a speculative round widens to its
+    // accepted drafts plus the target's own token (one per row without speculation).
+    static constexpr std::size_t kMaximumDraftTokens = 15;
+    std::array<TokenId, kMaximumConcurrency * (kMaximumDraftTokens + 1)> tokens_{};
     std::array<std::int32_t, kMaximumConcurrency> counts_{};
     std::size_t row_count_    = 0;
     std::uint32_t row_stride_ = 1;
@@ -444,6 +446,11 @@ private:
     std::uint64_t next_pending_  = 1;
     std::uint64_t open_pending_  = 0;
     std::uint32_t prefill_chunk_ = 0;
+    // Speculation: the artifact carries a draft, the caller asked for it, and the load path has
+    // already checked that the two agree. `draft_tokens_` is the widest round.
+    bool speculation_                                   = false;
+    SpeculativeBackend spec_backend_                    = SpeculativeBackend::None;
+    std::int32_t draft_tokens_                          = 0;
 };
 
 } // namespace nemotron_contract

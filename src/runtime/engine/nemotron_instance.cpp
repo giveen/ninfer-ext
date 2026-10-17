@@ -194,6 +194,12 @@ NemotronProgram::NemotronProgram(const models::nemotron_h::Model& model,
       program_(model, options, device),
       lanes_(static_cast<std::size_t>(options.max_concurrency)),
       prefill_chunk_(options.prefill_chunk.value_or(models::nemotron_h::kDefaultPrefillChunk)) {
+    // Speculation runs only when the artifact carries a draft *and* the caller asked for it; the
+    // load path has already checked that the two agree.
+    speculation_ =
+        options.speculative.backend != SpeculativeBackend::None && model.draft().has_value();
+    draft_tokens_ = speculation_ ? static_cast<std::int32_t>(options.speculative.draft_tokens) : 0;
+    spec_backend_ = options.speculative.backend;
     if (prefill_chunk_ == 0) {
         throw std::invalid_argument("nemotron_h Engine Program: the prefill chunk must be positive");
     }
@@ -353,6 +359,7 @@ ContextTransactionProgress NemotronProgram::progress_context_transaction(Cancell
     // model -- the Mamba frontier and the recurrent plane of its slot zeroed, and the attention
     // positions of its K/V unwritten -- so the lane is handed to it rather than zeroed here, and
     // the request's sampler is installed on top of the greedy one `create` leaves.
+    if (speculation_ && program_.draft() == nullptr) { program_.engage_draft(execution_); }
     program_.create(static_cast<std::int32_t>(transaction.lane), execution_);
     program_.configure(static_cast<std::int32_t>(transaction.lane), translate(transaction.sampling),
                        execution_);
@@ -457,6 +464,48 @@ PendingBatch NemotronProgram::decode(std::span<const SequenceHandle> sequences,
         pending.counts_[row] = 1;
         lane->pending        = true;
     }
+    // A speculative round runs one request at a time. Its verify block and its commit belong to a
+    // single sequence, and the batch it publishes carries `accepted + 1` tokens in its one row; a
+    // batch of two or more rows keeps the plain one-token path rather than mixing strides.
+    if (speculation_ && sequences.size() == 1 && budgets[0].generated_tokens_remaining >= 2) {
+        Lane* lane = require_active_row(0);
+        const std::int32_t slots =
+            std::min(draft_tokens_,
+                     static_cast<std::int32_t>(budgets[0].generated_tokens_remaining) - 1);
+        const std::int32_t lane_index = static_cast<std::int32_t>(sequences[0].lane_);
+        const auto started            = Clock::now();
+        const models::nemotron_h::DraftRoundReport round =
+            program_.draft_round(lane_index, lane->next_input, execution_, nullptr, false, slots);
+        // The round leaves the lane exactly where a plain decode of its committed prefix would, so
+        // the draw is the target's own next token -- the round's bonus, through the request's
+        // sampler, which is what keeps its penalties and counts consistent.
+        timing.begin_wait();
+        const TokenId bonus = program_.sample(lane_index, execution_);
+        timing.end_wait();
+        timing.resume_submit();
+        const double seconds = seconds_since(started);
+        pending.rows_[0]     = sequences[0];
+        pending.row_stride_  = static_cast<std::uint32_t>(round.accepted) + 1;
+        for (std::int32_t index = 0; index < round.accepted; ++index) {
+            pending.tokens_[static_cast<std::size_t>(index)] =
+                round.committed[static_cast<std::size_t>(index) + 1];
+        }
+        pending.tokens_[static_cast<std::size_t>(round.accepted)] = bonus;
+        pending.counts_[0] = round.accepted + 1;
+        lane->pending      = true;
+        lane->speculative.backend          = spec_backend_;
+        lane->speculative.enabled          = true;
+        lane->speculative.draft_window     = static_cast<std::uint32_t>(slots);
+        lane->speculative.rounds          += 1;
+        lane->speculative.drafted_tokens  += static_cast<std::uint64_t>(slots);
+        lane->speculative.accepted_tokens += static_cast<std::uint64_t>(round.accepted);
+        lane->timings.decode_seconds += seconds;
+        pending.row_count_ = 1;
+        open_pending_      = pending.transaction_;
+        pending.timing_    = timing.finish();
+        return pending;
+    }
+
     // The round is one batched pass: the lanes share the weights' reads while each attends to its
     // own state. Both calls synchronize, and the draw reads the logits the pass left.
     const auto started = Clock::now();
@@ -644,12 +693,19 @@ EngineOptions nemotron_engine_options(EngineOptions options) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         refuse("a KV capacity below max_context (each lane reserves a full window)");
     }
+    // Speculation is the artifact's: a `dflash` companion (a plain DFlash) or a `dflash2` one
+    // (LiLiCorr) is what this family can run, and which one the artifact carries is checked at
+    // load. The backends whose drafter this family does not have are refused by name rather than
+    // zeroed, so a caller who asked for MTP hears why instead of silently decoding plainly.
+    if (options.speculative.backend == SpeculativeBackend::Mtp ||
+        options.speculative.backend == SpeculativeBackend::Eagle3) {
+        refuse("MTP or EAGLE3 speculation (this family's drafter is the artifact's DFlash "
+               "companion)");
+    }
     // Switched off rather than refused, because each is on by default for some product and Engine
-    // reports what it runs with: the context cache, speculation (this family has no drafter),
-    // Vision (no vision component) and CUDA graphs (the Program runs eager passes). A request
-    // cannot reach any of them.
+    // reports what it runs with: the context cache, Vision (no vision component) and CUDA graphs
+    // (the Program runs eager passes). A request cannot reach any of them.
     options.context_cache  = ContextCacheOptions{.enabled = false};
-    options.speculative    = SpeculativeOptions{};
     options.enable_vision  = false;
     options.use_cuda_graph = false;
     options.kv_capacity    = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -665,7 +721,7 @@ NemotronInstance::NemotronInstance(std::unique_ptr<models::nemotron_h::Model> so
                                    const EngineOptions& options, DeviceContext& device)
     : model(std::move(source)), frontend(resources, options.max_context), program(nullptr),
       capacity(options.max_context), expert_residency(model->expert_residency()) {
-    const std::size_t needed = models::nemotron_h::Program::device_bytes(model->config(), options);
+    const std::size_t needed = models::nemotron_h::Program::device_bytes(*model, options);
     std::size_t free_bytes   = 0;
     std::size_t total_bytes  = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -708,6 +764,28 @@ std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& op
     // second term would reserve are not an allocation the family makes.
     const models::nemotron_h::Config artifact_config =
         models::nemotron_h::parse_config(reader.directory());
+    // The requested backend must be the companion the artifact carries: the flavour is a property
+    // of the stored draft, not a runtime choice, and the two proposers are different mathematics.
+    if (options.speculative.backend != SpeculativeBackend::None) {
+        if (!artifact_config.draft) {
+            throw std::invalid_argument(
+                std::string("this Nemotron-H artifact carries no draft, so it cannot run --spec ") +
+                (options.speculative.backend == SpeculativeBackend::DFlash ? "dflash" : "dflash2"));
+        }
+        const models::draft::Spec::Flavor flavour  = artifact_config.draft->flavor;
+        const bool plain                          = flavour == models::draft::Spec::Flavor::Dflash;
+        const bool matches =
+            (options.speculative.backend == SpeculativeBackend::DFlash && plain) ||
+            (options.speculative.backend == SpeculativeBackend::DFlash2 && !plain);
+        if (!matches) {
+            throw std::invalid_argument(
+                std::string("this artifact's draft is a ") + (plain ? "plain DFlash" : "LiLiCorr") +
+                " companion, so it runs --spec " + (plain ? "dflash" : "dflash2") +
+                " and not --spec " +
+                std::string(options.speculative.backend == SpeculativeBackend::DFlash ? "dflash"
+                                                                                      : "dflash2"));
+        }
+    }
     models::nemotron_h::ExpertResidencyRequest residency;
     residency.automatic = options.expert_cache.mode == ExpertCacheMode::Automatic;
     residency.explicit_bytes = options.expert_cache.explicit_bytes;
@@ -716,8 +794,11 @@ std::unique_ptr<NemotronInstance> load_nemotron_instance(const EngineOptions& op
     // together, so it is taken out of the reservation here rather than counted in both places: a
     // reservation that included it would reserve it twice and leave one pool's worth of the card
     // idle, which is exactly the memory a bigger cache or one more resident bank would have used.
+    // The draft's own state is part of the reservation when speculation was asked for, because the
+    // Program allocates it at the request's first transaction and the residency plan must not have
+    // spent those bytes on resident banks.
     residency.reserve_bytes =
-        models::nemotron_h::Program::device_bytes(artifact_config.text, options) -
+        models::nemotron_h::Program::device_bytes(artifact_config, options) -
         models::nemotron_h::Program::expert_pool_device_bytes(artifact_config.text, options) +
         models::nemotron_h::kRuntimeReservationBytes +
         (options.kv_capacity.mode == KvCapacityMode::Automatic
