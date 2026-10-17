@@ -583,7 +583,7 @@ build is green. The binding of the 139 parameters is the next cell: the parser d
 it does not yet materialize it.
 
 **P2 landed and verified end to end.** The converter now emits, and the loader binds, an artifact
-carrying the draft: `out/nemotron_h_74b_nvfp4_draft.ninfer` is 891 objects in two files, and loading
+carrying the draft: `/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4_draft.ninfer` is 891 objects in two files, and loading
 it runs a 187-token prompt through the tower with all six tap blocks unchanged. `DraftWeights` walks
 the spec (five layers x 18, `fc` at `(hidden, taps*hidden)`, coefficient planes at
 `2*kernel*groups`, the head's table), `Content` carries the spec so the execution and the weights
@@ -862,7 +862,7 @@ what it was. And the Mamba state rolls back through a snapshot plus the committe
 the convolution history nor the FP32 recurrent plane can be un-advanced; the attention side needs only
 `AttentionState::rewind`, whose discarded slots causality already hides.
 
-Measured on `out/nemotron_h_74b_nvfp4_draft.ninfer`, 32 rounds on the tap test's own 187-token
+Measured on `/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4_draft.ninfer`, 32 rounds on the tap test's own 187-token
 prompt: **0.844 accepted drafts per round**, slot 0 **0.563**, per-round wall **139 ms** split
 draft **40.7** (29%), target verify **73.9** (53%), committed pass **23.7**, state rollback **0.4**.
 The reference implementation on the identical dump and round count gives **3.000** (slot 0 0.688);

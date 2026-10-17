@@ -15,7 +15,7 @@ pack -- is `check_nemotron_artifact.py`'s job, and this file only pins the decla
 is read through. It also pins this one release's structure (88 blocks, 13,824 routed experts), so a
 different Nemotron-H checkpoint needs its expectations updated here.
 
-    NINFER_NEMOTRON_ARTIFACT=out/nemotron_h_74b_nvfp4.ninfer \\
+    NINFER_NEMOTRON_ARTIFACT=/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer \\
     NINFER_NEMOTRON_SOURCE=/mnt/storage/models/nemo/74B \\
     .venv/bin/python -m pytest tests/convert/test_nemotron_h_artifact.py
 """

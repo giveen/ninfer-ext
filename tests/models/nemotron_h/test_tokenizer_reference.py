@@ -8,7 +8,7 @@ Two independent readers meet here: the C++ probe takes the tokenizer out of the 
 loader, and this file takes it out of the artifact through `tools.artifact.reader` -- the probe's own
 copy is hashed against this one, so a probe wired to another tokenizer cannot pass.
 
-    NINFER_NEMOTRON_ARTIFACT=out/nemotron_h_74b_nvfp4.ninfer \\
+    NINFER_NEMOTRON_ARTIFACT=/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer \\
     NINFER_NEMOTRON_CORPUS=/mnt/storage/tmp/flash-wikitext-00.txt \\
     python3 -m pytest tests/models/nemotron_h/test_tokenizer_reference.py
 

@@ -1,5 +1,5 @@
 {
- "source": "out/nemotron_h_74b_nvfp4.ninfer:resource/text/tokenizer.json",
+ "source": "/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer:resource/text/tokenizer.json",
  "source_sha256": "608e22c79a5d690b95531993a7fb67dc459233248bc9ee6ec7ca76f3468cacaf",
  "source_bytes": 7340299,
  "vocab_size": 131072,

@@ -23,7 +23,7 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import binding_parts
 from tools.convert.sources.safetensors import SafetensorsSource
 
-ARTIFACT = sys.argv[1] if len(sys.argv) > 1 else "out/nemotron_h_74b_nvfp4.ninfer"
+ARTIFACT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer"
 SOURCE = sys.argv[2] if len(sys.argv) > 2 else "/mnt/storage/models/nemo/74B"
 
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])

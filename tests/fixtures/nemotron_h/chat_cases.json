@@ -1,5 +1,5 @@
 {
- "source": "out/nemotron_h_74b_nvfp4.ninfer:resource/text/chat_template.jinja",
+ "source": "/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer:resource/text/chat_template.jinja",
  "source_sha256": "6521afc75afb0661e3558e7e6dee5f2d15de8be1c4dece8171935e778ea283f4",
  "tokenizer_sha256": "608e22c79a5d690b95531993a7fb67dc459233248bc9ee6ec7ca76f3468cacaf",
  "oracle": "transformers 5.14.1: PreTrainedTokenizerFast(tokenizer_object=..., chat_template=...) .apply_chat_template(tokenize=False, add_generation_prompt=True), then encode(add_special_tokens=False)",

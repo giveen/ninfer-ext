@@ -46,7 +46,7 @@ length actually seen is the point's recorded `prompt_tokens`.
 Usage
 -----
     python3 tools/bench/run_serve_decode_scaling.py \\
-      --artifact nemotron_h_74b_nvfp4=out/nemotron_h_74b_nvfp4.ninfer \\
+      --artifact nemotron_h_74b_nvfp4=/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer \\
       --corpus profiles/nsys/nemotron_p1/corpus.ids \\
       --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \\
       --lane-token-budget 262144 --pad-tokens 8192 --decode-tokens 4096 \\

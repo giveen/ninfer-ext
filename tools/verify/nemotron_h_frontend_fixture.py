@@ -15,7 +15,7 @@ depends on -- because those are the cases a reimplementation of the pattern gets
 
     python3 -m tools.verify.nemotron_h_frontend_fixture [artifact]
 
-Defaults to `out/nemotron_h_74b_nvfp4.ninfer` and writes
+Defaults to `/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer` and writes
 `tests/fixtures/nemotron_h/tokenizer_ids.json` and `tests/fixtures/nemotron_h/chat_cases.json`.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from tokenizers import Tokenizer
 
 from tools.artifact.reader import Artifact
 
-ARTIFACT = sys.argv[1] if len(sys.argv) > 1 else "out/nemotron_h_74b_nvfp4.ninfer"
+ARTIFACT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer"
 OUT_DIR = "tests/fixtures/nemotron_h"
 
 # One case per shape the split distinguishes. The comment names the branch it exercises.
