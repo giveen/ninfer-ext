@@ -43,4 +43,26 @@ void cast_fp32_to_bf16_launch(const Tensor& source, Tensor& destination, cudaStr
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+// Widening is exact, so one scalar route serves every count and alignment.
+__global__ void cast_bf16_to_fp32_scalar_kernel(const __nv_bfloat16* __restrict__ source,
+                                                float* __restrict__ destination, std::int64_t n) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        destination[i] = __bfloat162float(source[i]);
+    }
+}
+
+} // namespace
+
+void cast_bf16_to_fp32_launch(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    const std::int64_t count = source.numel();
+    cast_bf16_to_fp32_scalar_kernel<<<cast_grid(count), kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(source.data), static_cast<float*>(destination.data),
+        count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

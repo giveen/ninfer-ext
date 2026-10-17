@@ -3,6 +3,7 @@
 
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -51,9 +52,15 @@ void require_snapshot_x_shape(const Tensor& x) {
     }
 }
 
+// The weight's shape is the only evidence of its order a call carries, so the refusal states the
+// accepted flat index rather than the extents alone: the payload is tap-major, and the checkpoint's
+// own [C,1,4] flattening (c*4 + j) is refused here whenever it is bound under its own declaration.
 void require_weight_shape(const Tensor& weight, std::int32_t C) {
     if (weight.ne[0] != C || weight.ne[1] != 4 || weight.ne[2] != 1 || weight.ne[3] != 1) {
-        throw std::invalid_argument("causal_conv1d: weight must have shape [C,4]");
+        throw std::invalid_argument(
+            "causal_conv1d: weight must be a [C,4] tensor whose payload is tap-major -- the tap j "
+            "of channel c at j*C + c -- so the checkpoint's own [C,1,4] order (c*4 + j) has to be "
+            "transposed at bind time");
     }
 }
 
@@ -143,6 +150,31 @@ void require_accessible(const Tensor& tensor, const char* label) {
     if (tensor.data == nullptr) {
         throw std::invalid_argument(std::string("causal_conv1d: ") + label +
                                     " data pointer must be non-null");
+    }
+}
+
+// The optional bias is the only operand an entry may omit, and a null pointer is the bias-free op.
+// A set bias is one row per channel, so it is validated against x's channel count.
+void require_bias(const Tensor* bias, std::int32_t C) {
+    if (bias == nullptr) { return; }
+    if (bias->dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: bias must be BF16");
+    }
+    if (bias->ne[0] != C || bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: bias must have shape [C]");
+    }
+    require_accessible(*bias, "bias");
+}
+
+// The bias is read-only, so it only has to be disjoint from every operand the call reads or writes.
+template <std::size_t N>
+void require_bias_nonoverlap(const Tensor* bias, const Tensor* const (&operands)[N]) {
+    if (bias == nullptr) { return; }
+    for (const Tensor* operand : operands) {
+        if (operand->data == nullptr) { continue; }
+        if (overlaps(*bias, *operand)) {
+            throw std::invalid_argument("causal_conv1d: bias must not overlap another operand");
+        }
     }
 }
 
@@ -261,8 +293,9 @@ void require_snapshot_nonoverlap(const Tensor& x, const Tensor& weight, const Te
 
 } // namespace
 
-void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor* bias,
+                        const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
+                        cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
@@ -280,6 +313,7 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
     require_state_shape(conv_state_in, x.ne[0]);
     require_state_shape(conv_state_out, x.ne[0]);
     require_out_shape(x, out);
+    require_bias(bias, x.ne[0]);
     if (n == 0) { return; }
 
     require_non_empty_accessible(x, weight, conv_state_in, out);
@@ -287,20 +321,30 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
         throw std::invalid_argument(
             "causal_conv1d: conv_state_out must be contiguous and non-null");
     }
+    const Tensor* const neighbours[5] = {&x, &weight, &conv_state_in, &conv_state_out, &out};
+    require_bias_nonoverlap(bias, neighbours);
     require_state_alias_rule(conv_state_in, conv_state_out);
     require_packed_nonoverlap(x, weight, conv_state_in, conv_state_out, out);
     if (x.ne[1] == 1) {
-        detail::causal_conv1d_decode_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        detail::causal_conv1d_decode_launch(x, weight, bias, conv_state_in, conv_state_out, out,
+                                            stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
-        detail::causal_conv1d_smallt_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        detail::causal_conv1d_smallt_launch(x, weight, bias, conv_state_in, conv_state_out, out,
+                                            stream);
     } else {
-        detail::causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        detail::causal_conv1d_prefill_launch(x, weight, bias, conv_state_in, conv_state_out, out,
+                                             stream);
     }
 }
 
-void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                              Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              cudaStream_t stream) {
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    causal_conv1d_silu(x, weight, nullptr, conv_state_in, conv_state_out, out, stream);
+}
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor* bias,
+                              const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out0,
+                              Tensor& out1, Tensor& out2, cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_state must be BF16");
@@ -309,6 +353,7 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     require_weight_shape(weight, x.ne[0]);
     require_state_shape(conv_state_in, x.ne[0]);
     require_state_shape(conv_state_out, x.ne[0]);
+    require_bias(bias, x.ne[0]);
     const detail::CausalConvSplitGeometry geometry = resolve_split_geometry(x, out0, out1, out2);
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -331,6 +376,12 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
         require_accessible(*operand.first, operand.second);
         require_pair_aligned(*operand.first, operand.second);
     }
+    // The split entry has no scalar route, so a set bias has to satisfy the entry's alignment
+    // requirement as well.
+    if (bias != nullptr) { require_pair_aligned(*bias, "bias"); }
+    const Tensor* const neighbours[7] = {&x,    &weight, &conv_state_in, &conv_state_out,
+                                         &out0, &out1,   &out2};
+    require_bias_nonoverlap(bias, neighbours);
     require_state_alias_rule(conv_state_in, conv_state_out);
     require_split_nonoverlap(x, weight, conv_state_in, conv_state_out, out0, out1, out2);
 
@@ -338,32 +389,48 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     // threads, so it holds two CTAs per SM to T = 24 and one above that; even at its ceiling of 32
     // it beats the prefill pair, which is flat above it.
     if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
-        detail::causal_conv1d_smallt_split_launch(x, weight, conv_state_in, conv_state_out, out0,
-                                                  out1, out2, geometry, stream);
+        detail::causal_conv1d_smallt_split_launch(x, weight, bias, conv_state_in, conv_state_out,
+                                                  out0, out1, out2, geometry, stream);
     } else {
-        detail::causal_conv1d_prefill_split_launch(x, weight, conv_state_in, conv_state_out, out0,
-                                                   out1, out2, geometry, stream);
+        detail::causal_conv1d_prefill_split_launch(x, weight, bias, conv_state_in, conv_state_out,
+                                                   out0, out1, out2, geometry, stream);
+    }
+}
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                              Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                              cudaStream_t stream) {
+    causal_conv1d_silu_split(x, weight, nullptr, conv_state_in, conv_state_out, out0, out1, out2,
+                             stream);
+}
+
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor* bias,
+                        Tensor& conv_state, Tensor& out, cudaStream_t stream) {
+    const std::int64_t n = validate_common(x, weight, conv_state, out);
+    require_bias(bias, x.ne[0]);
+    if (n == 0) { return; }
+
+    require_non_empty_accessible(x, weight, conv_state, out);
+    const Tensor* const neighbours[4] = {&x, &weight, &conv_state, &out};
+    require_bias_nonoverlap(bias, neighbours);
+    require_packed_nonoverlap(x, weight, conv_state, conv_state, out);
+    if (x.ne[1] == 1) {
+        detail::causal_conv1d_decode_launch(x, weight, bias, conv_state, conv_state, out, stream);
+    } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
+        detail::causal_conv1d_smallt_launch(x, weight, bias, conv_state, conv_state, out, stream);
+    } else {
+        detail::causal_conv1d_prefill_launch(x, weight, bias, conv_state, conv_state, out, stream);
     }
 }
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
                         cudaStream_t stream) {
-    const std::int64_t n = validate_common(x, weight, conv_state, out);
-    if (n == 0) { return; }
-
-    require_non_empty_accessible(x, weight, conv_state, out);
-    require_packed_nonoverlap(x, weight, conv_state, conv_state, out);
-    if (x.ne[1] == 1) {
-        detail::causal_conv1d_decode_launch(x, weight, conv_state, conv_state, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
-        detail::causal_conv1d_smallt_launch(x, weight, conv_state, conv_state, out, stream);
-    } else {
-        detail::causal_conv1d_prefill_launch(x, weight, conv_state, conv_state, out, stream);
-    }
+    causal_conv1d_silu(x, weight, nullptr, conv_state, out, stream);
 }
 
-void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, const Tensor* bias,
+                                 Tensor& conv_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots,
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream) {
     const bool masked = valid_columns.data != nullptr;
@@ -388,6 +455,7 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     const std::int32_t batch = x.ne[2];
     require_weight_shape(weight, x.ne[0]);
     require_snapshot_state_shape(conv_states, x.ne[0], x.ne[1], batch);
+    require_bias(bias, x.ne[0]);
     if (masked) { require_selector_shape(valid_columns, batch, "valid_columns"); }
     require_selector_shape(initial_state_slots, batch, "initial_state_slots");
     require_selector_shape(snapshot_base_slots, batch, "snapshot_base_slots");
@@ -397,10 +465,22 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     if (masked) { require_metadata_accessible(valid_columns, "valid_columns"); }
     require_metadata_accessible(initial_state_slots, "initial_state_slots");
     require_metadata_accessible(snapshot_base_slots, "snapshot_base_slots");
+    const Tensor* const neighbours[7] = {
+        &x,  &weight, &conv_states, &valid_columns, &initial_state_slots, &snapshot_base_slots,
+        &out};
+    require_bias_nonoverlap(bias, neighbours);
     require_snapshot_nonoverlap(x, weight, conv_states, valid_columns, initial_state_slots,
                                 snapshot_base_slots, out);
-    detail::causal_conv1d_snapshot_launch(x, weight, conv_states, valid_columns,
+    detail::causal_conv1d_snapshot_launch(x, weight, bias, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, out, stream);
+}
+
+void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& out,
+                                 cudaStream_t stream) {
+    causal_conv1d_silu_snapshot(x, weight, nullptr, conv_states, valid_columns, initial_state_slots,
+                                snapshot_base_slots, out, stream);
 }
 
 } // namespace ninfer::ops

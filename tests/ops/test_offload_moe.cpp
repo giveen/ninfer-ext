@@ -299,15 +299,18 @@ DeviceBank upload(const HostBank& host) {
 
 struct DeviceCache {
     DeviceBuffer slot_of, owner, stamp, counters, pool;
+    ops::ExpertPoolGeometry geometry;
     ops::ExpertCacheState state;
 
     DeviceCache(std::int32_t slots, std::int32_t layers)
         : slot_of(to_device_i32(std::vector<int>(static_cast<std::size_t>(layers) * E, -1))),
           owner(to_device_i32(std::vector<int>(slots, -1))),
           stamp(to_device(std::vector<unsigned long long>(slots, 0))),
-          counters(to_device(std::vector<unsigned long long>(3, 0))),
+          counters(to_device(std::vector<unsigned long long>(4, 0))),
           pool(to_device(std::vector<std::uint8_t>(
-              static_cast<std::size_t>(slots) * ops::kExpertSlotBytes, 0))) {
+              static_cast<std::size_t>(slots) * ops::kExpertSlotBytes, 0))),
+          geometry(std::vector<ops::ExpertBankShape>(static_cast<std::size_t>(layers),
+                                                     ops::kQwen4ExpertBank)) {
         state =
             ops::ExpertCacheState{.slot_of    = static_cast<std::int32_t*>(slot_of.p),
                                   .owner      = static_cast<std::int32_t*>(owner.p),
@@ -316,6 +319,8 @@ struct DeviceCache {
                                   .statistics = static_cast<unsigned long long*>(counters.p) + 1,
                                   .slots      = slots,
                                   .layers     = layers,
+                                  .slot_entries = geometry.slot_entries(),
+                                  .pool_stride  = geometry.pool_stride(),
                                   .pool       = static_cast<std::byte*>(pool.p)};
     }
 
@@ -334,7 +339,7 @@ std::vector<int> resolve(DeviceCache& cache, const DeviceBank& bank, std::int32_
     Tensor ti(ids.p, DType::I32, {K, columns});
     Tensor ts(slots.p, DType::I32, {K, columns});
     Tensor tm(misses.p, DType::I32, {static_cast<std::int32_t>(2 * experts.size() + 1)});
-    ops::expert_cache_resolve(ti, layer, cache.state, ts, tm, nullptr);
+    ops::expert_cache_resolve(ti, cache.geometry.span(layer), cache.state, ts, tm, nullptr);
     ops::expert_cache_fetch(bank.weights, tm, static_cast<std::int32_t>(experts.size()),
                             cache.state, nullptr);
     cuda_synchronize();
@@ -507,7 +512,7 @@ int stage_case(const HostBank& host, const DeviceBank& bank) {
         staged.base[p] = static_cast<const std::byte*>(staged_bytes.p) + offset;
         offset += sizes[p] * E;
     }
-    ops::expert_cache_stage(cache.state, kLayer, static_cast<const std::int32_t*>(resident.p),
+    ops::expert_cache_stage(cache.state, cache.geometry.span(kLayer), static_cast<const std::int32_t*>(resident.p),
                             bank.weights, staged, nullptr);
     cuda_synchronize();
     const auto out = from_device<std::uint8_t>(staged_bytes,
@@ -666,7 +671,7 @@ int experts_case(const HostBank& host, const DeviceBank& bank, std::int32_t toke
         CUDA_CHECK(cudaEventCreateWithFlags(&resolved, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&fetched, cudaEventDisableTiming));
         WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
-        ops::expert_cache_resolve(tids, 0, pending_cache.state, tpending_slots, tpending_misses,
+        ops::expert_cache_resolve(tids, pending_cache.geometry.span(0), pending_cache.state, tpending_slots, tpending_misses,
                                   main);
         CUDA_CHECK(cudaEventRecord(resolved, main));
         CUDA_CHECK(cudaStreamWaitEvent(fetch, resolved));
@@ -854,6 +859,47 @@ static_assert(ninfer::ops::exl3_expert_layout(8, 8).tail_bytes == 0);
 static_assert(ninfer::ops::exl3_expert_layout(10, 9).plane_bytes[0] == 2'048'000);
 static_assert(ninfer::ops::exl3_expert_layout(8, 8).plane_offset(3) == 1'664'000);
 
+// An id beyond the resolved layer's own bank: the resolve must not write outside its own expert
+// table, must resolve the offending assignment to a slot that does not exist (-1) rather than to an
+// uninitialized one, and must count what it refused. The offload path takes the expert count from
+// the layer's descriptor, so a wrong one is a wrong expert rather than a crash -- which is why this
+// has to be checked rather than assumed, both here and in the staged Op's index path.
+int outside_case(const HostBank& host, const DeviceBank& bank) {
+    int failures = 0;
+    const auto fail = [&](const std::string& what) {
+        std::cerr << "outside: " << what << '\n';
+        ++failures;
+    };
+    DeviceCache cache(2 * K, 1);
+    std::vector<int> experts(static_cast<std::size_t>(K) * 2, 0);
+    for (std::int32_t rank = 0; rank < K; ++rank) {
+        experts[static_cast<std::size_t>(rank)]              = rank;
+        experts[static_cast<std::size_t>(K) + rank]          = rank + 1;
+    }
+    experts[0]     = E;         // one past the bank's last expert
+    experts[K + 1] = E * 4 + 7; // far past it, still inside the resolve table's own extent
+    const std::vector<int> slots = resolve(cache, bank, 0, experts);
+    if (static_cast<int>(slots.size()) != K * 2) {
+        fail("slot count");
+        return failures;
+    }
+    if (slots[0] != -1 || slots[K + 1] != -1) { fail("an id outside the bank must not resolve"); }
+    // Which in-range ids resolve and how they share the slots is the existing cache tests'
+    // subject; this case is about the guard, so it checks only that an out-of-range id cannot be
+    // mistaken for one whose slot exists.
+    // Nothing outside the bank's own entries was touched: the table's tail is still absent.
+    const std::vector<int> table = cache.table();
+    for (int id = E; id < static_cast<int>(table.size()); ++id) {
+        if (table[static_cast<std::size_t>(id)] != -1) { fail("a table entry outside the bank"); }
+    }
+    // `statistics` is counters + 1, so the refused count is the counters' fourth word.
+    const std::vector<unsigned long long> counters =
+        from_device<unsigned long long>(cache.counters, 4);
+    if (counters[3] != 2) { fail("the refused ids are not counted"); }
+    (void)host;
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -875,6 +921,7 @@ int main() {
     failures += cache_case(host, bank);
     failures += reclaim_case(host, bank);
     failures += stage_case(host, bank);
+    failures += outside_case(host, bank);
     // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
     for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);

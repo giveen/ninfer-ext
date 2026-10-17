@@ -655,7 +655,9 @@ class _Gemma4Builder(_Builder):
         # execute it. Separate objects are also what the reference engine's converter produces, and
         # each half then carries its own per-tensor scale.
 
-        if config["enable_moe_block"]:
+        # A dense config carries no `enable_moe_block` key at all: `text_config` emits it for the
+        # MoE profile alone, so its absence is the dense-only layer.
+        if config.get("enable_moe_block", False):
             self.moe(prefix, source_prefix, store, config)
 
 

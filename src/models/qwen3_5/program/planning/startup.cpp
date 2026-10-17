@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/execution/expert_pager.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/planning/kv_stream.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
@@ -344,10 +345,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     if (config.qwen4()) {
         Qwen4PersistentLayout q;
-        q.cache_layers = dimension(config.num_hidden_layers + (plan.features.mtp() ? 1U : 0U));
+        // The pool is what says how many banks the cache has and how wide each one's expert is, so
+        // every size below is the pool's rather than a second reading of the model config: a layer
+        // whose bank the model carries is addressed whether or not this run executes it, and its
+        // own expert count and width are what its slot table and slot stride use.
+        const ops::ExpertPoolGeometry& pool = *parameters.qwen4->expert_pool;
+        q.cache_layers = pool.layers();
+        const std::int32_t bank_slots       = models::execution::ExpertPager::bank_slots(pool);
         // The cache pool holds the decode-time cache (the planned slots plus the lent idle-prefill
-        // slots) followed by the staged banks. A wide idle step reclaims the lent top range and uses
-        // it as the wide prefill arena; the banks live past both, so their offset never moves.
+        // slots) followed by the staged banks. A wide idle step reclaims the lent top range and
+        // uses it as the wide prefill arena; the banks live past both, so their offset never moves.
         const std::int32_t lend_slots = plan.workspace.lend_slots;
         q.base_slots = checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots),
                                    "expert cache base slot count");
@@ -356,28 +363,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // base + lend + banks, the wide-time cache is just base, and the banks never move.
         q.bank_slot  = checked_i32(static_cast<std::uint64_t>(q.base_slots) + lend_slots,
                                    "expert cache bank slot");
-        q.slots      = checked_i32(static_cast<std::uint64_t>(q.bank_slot) + kQwen4StagedBankSlots,
+        q.slots      = checked_i32(static_cast<std::uint64_t>(q.bank_slot) + bank_slots,
                                    "expert cache slot count");
-        q.slot_of      = add_tensor(builder, DType::I32, {q.cache_layers * ops::kOffloadMoeExperts},
+        q.slot_of      = add_tensor(builder, DType::I32, {pool.slot_entries()},
                                     "expert cache slot table");
         q.owner        = add_tensor(builder, DType::I32, {q.slots}, "expert cache owners");
         q.stamp        = add_tensor(builder, DType::I64, {q.slots}, "expert cache stamps");
-        q.counters     = add_tensor(builder, DType::I64, {3}, "expert cache counters");
-        // Two staged banks (so the next layer's copy overlaps this layer's compute) overlay the last
-        // kQwen4StagedBankSlots slots; each bank also stores its layer's divisors past its experts.
-        const ops::ExpertLayout& expert_layout = parameters.qwen4->experts;
-        static_assert(kQwen4StagedBankSlots == 2 * ops::kOffloadMoeExperts,
-                      "two staged banks overlay two layers of expert slots");
-        q.pool = builder.add(checked_add(checked_mul(static_cast<std::size_t>(q.slots),
-                                                     static_cast<std::size_t>(expert_layout.slot_bytes),
+        q.counters     = add_tensor(builder, DType::I64, {4}, "expert cache counters");
+        // Two staged banks (so the next layer's copy overlaps this layer's compute) overlay the
+        // last bank_slots slots; each bank also stores its layer's divisors past its experts.
+        const auto pool_stride = static_cast<std::size_t>(pool.pool_stride());
+        q.pool = builder.add(checked_add(checked_mul(static_cast<std::size_t>(q.slots), pool_stride,
                                                      "expert cache pool bytes"),
-                                         2 * static_cast<std::size_t>(expert_layout.tail_bytes),
+                                         2 * static_cast<std::size_t>(pool.max_tail_bytes()),
                                          "expert cache pool bytes"),
                              kArenaAlign, "expert cache pool");
-        q.wide_offset = static_cast<std::size_t>(q.base_slots) *
-                        static_cast<std::size_t>(expert_layout.slot_bytes);
-        q.wide_bytes = static_cast<std::size_t>(lend_slots) *
-                       static_cast<std::size_t>(expert_layout.slot_bytes);
+        q.wide_offset = static_cast<std::size_t>(q.base_slots) * pool_stride;
+        q.wide_bytes = static_cast<std::size_t>(lend_slots) * pool_stride;
         const auto columns = static_cast<std::int32_t>((plan.draft_window + 1U) * plan.max_concurrency);
         if (config.ple && plan.speculative_backend != SpeculativeBackend::None) {
             q.ple_record = add_tensor(
@@ -589,12 +591,14 @@ WorkspacePlan qwen4_workspace_plan_for(const SequencePlanImpl& plan, std::uint32
 // expert cache's top slots and is cache again between wide steps. `lend_slots` spans the whole wide
 // arena because the permanent arena is a separate allocation.
 WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
-    const auto slot_bytes = static_cast<std::size_t>(plan.parameters->qwen4->experts.slot_bytes);
+    // The lend range is measured in cache slots, so its byte size is the pool's slot stride: the
+    // widest bank's per-expert size, which every slot of this pool holds.
+    const auto slot_bytes = static_cast<std::size_t>(plan.parameters->qwen4->expert_pool->pool_stride());
     const std::uint32_t narrow_width = std::max<std::uint32_t>(plan.prefill_chunk, 1U);
     const std::uint32_t wide_width   = std::max(plan.prefill_width, narrow_width);
     const auto slots_for = [&](std::int32_t lend_slots) {
         return checked_i32(static_cast<std::uint64_t>(plan.expert_cache_slots) + lend_slots +
-                               kQwen4StagedBankSlots,
+                models::execution::ExpertPager::bank_slots(*plan.parameters->qwen4->expert_pool),
                            "expert cache slot count");
     };
     std::int32_t slots = slots_for(0);
@@ -1395,7 +1399,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.expert_cache.mode == ExpertCacheMode::Explicit &&
             static_cast<std::int64_t>(options.expert_cache.explicit_bytes) <
-                parameters.qwen4->experts.slot_bytes) {
+                parameters.qwen4->expert_pool->pool_stride()) {
             throw std::invalid_argument("expert cache must hold at least one expert");
         }
     }
@@ -1445,12 +1449,14 @@ bool resolve_ngram_stream(const execution::Parameters& parameters, NgramResidenc
 std::uint32_t resolve_expert_cache_slots(SequencePlanningInputs inputs,
                                          const EngineOptions& options,
                                          std::uint32_t floor_pages, std::uint32_t maximum_pages) {
-    const auto& config = inputs.parameters->model.config().text;
-    const auto slot_bytes = static_cast<std::uint64_t>(inputs.parameters->qwen4->experts.slot_bytes);
+    const ops::ExpertPoolGeometry& pool = *inputs.parameters->qwen4->expert_pool;
+    // One slot holds one expert of the pool's widest bank, and the pool holds every expert the
+    //model's layers have -- its own table, not the layer count a run happens to execute.
+    const auto slot_bytes = static_cast<std::uint64_t>(pool.pool_stride());
     const std::uint64_t total =
-        static_cast<std::uint64_t>(config.num_hidden_layers + (inputs.features.mtp() ? 1U : 0U)) *
-        ops::kOffloadMoeExperts;
-    const std::uint64_t minimum = static_cast<std::uint64_t>(ops::kOffloadMoeTopK) *
+        static_cast<std::uint64_t>(pool.slot_entries());
+    const std::uint64_t minimum = static_cast<std::uint64_t>(
+            std::get<MoeConfig>(inputs.parameters->model.config().text.ffn).num_experts_per_tok) *
                                   (inputs.draft_window + 1U) * inputs.max_concurrency;
     std::uint64_t slots = 0;
     if (options.expert_cache.mode == ExpertCacheMode::Explicit) {

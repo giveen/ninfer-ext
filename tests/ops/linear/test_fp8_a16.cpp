@@ -28,9 +28,9 @@ std::vector<Invocation> a16_capacity_calls() {
 
 int run_fp8_a16() {
     const auto attn_invocations = a16_capacity_calls();
-    int failures                = run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
-                                            {14336, 5120, 811U, Comparison::Sampled, true, attn_invocations});
-    const auto gdn_invocations  = a16_capacity_calls();
+    int failures = run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                             {14336, 5120, 811U, Comparison::Sampled, true, attn_invocations});
+    const auto gdn_invocations = a16_capacity_calls();
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {16384, 5120, 817U, Comparison::Sampled, true, gdn_invocations});
     const auto mlp_invocations = a16_capacity_calls();
@@ -41,11 +41,23 @@ int run_fp8_a16() {
     const auto gemma_invocations = a16_capacity_calls();
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {8192, 5376, 825U, Comparison::Sampled, true, gemma_invocations});
-    for (const auto& [n, seed] : {std::pair{4096, 826U}, std::pair{16384, 827U},
-                                  std::pair{2048, 828U}}) {
+    for (const auto& [n, seed] :
+         {std::pair{4096, 826U}, std::pair{16384, 827U}, std::pair{2048, 828U}}) {
         const auto invocations = a16_capacity_calls();
         failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                               {n, 5376, seed, Comparison::Sampled, true, invocations});
+    }
+    // Nemotron-Lightning 30B's own widths. Its K = 2688 and K = 3712 shapes are the ones a one-row
+    // call used to send into the MMA schedule (the GEMV route was gated on K dividing by 256);
+    // they now take the GEMV route's guarded tail phase, and the T > 1 calls beside T = 1 keep the
+    // MMA routes they always had.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 5> lightning_shapes{
+        std::tuple{10304, 2688, 841U}, std::tuple{3712, 2688, 842U}, std::tuple{2688, 3712, 843U},
+        std::tuple{4096, 2688, 844U}, std::tuple{256, 2688, 845U}};
+    for (const auto& [n, k, seed] : lightning_shapes) {
+        const std::vector<Invocation> invocations{Invocation{1}, Invocation{2}, Invocation{8}};
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
     }
     // The output projections and the vocabulary head: k becomes the wide side here.
     const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 3> wide_shapes{
@@ -113,6 +125,25 @@ int run_fp8_a16() {
     failures +=
         run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
+
+    // Nemotron-H 74B's dense projections, one case per registered (n, k) pair the family's artifact
+    // declares as fp8_e4m3fn_row_bf16: the mamba mixer's in-projection (18560 x 4096) and
+    // out-projection (4096 x 8192), the attention mixer's query/output (4096 x 4096) and its
+    // key/value pair (256 x 4096), and the vocabulary head (131072 x 4096). Every one of them is
+    // registered A16-only, so the two quantized-activation invocations appended here must fall back
+    // to this route and must reserve no A8 workspace; verify_workspace_envelopes checks the same
+    // fallback's capacity for every policy and token interval.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 5> nemotron_shapes{
+        std::tuple{256, 4096, 833U}, std::tuple{4096, 4096, 834U}, std::tuple{4096, 8192, 835U},
+        std::tuple{18560, 4096, 836U}, std::tuple{131072, 4096, 837U}};
+    for (const auto& [n, k, seed] : nemotron_shapes) {
+        auto invocations = a16_capacity_calls();
+        invocations.push_back({8, CallForm::Policy, ops::LinearPolicy::AllowA8});
+        invocations.push_back({129, CallForm::Policy, ops::LinearPolicy::AllowA4});
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
+        failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
+    }
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {

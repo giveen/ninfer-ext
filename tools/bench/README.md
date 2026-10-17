@@ -230,6 +230,38 @@ Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the def
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
 
+### Decode-scaling campaign
+
+`run_serve_decode_scaling.py` answers one question for one artifact: does a decode batch of L lanes
+make one weight read serve L tokens? It runs the `decode-saturation` suite at C = 1, 2, 4 and 8,
+one fresh server per point, and reports the suite's steady `decode_tokens_per_second` (decode
+tokens over the steady interval, valid at any concurrency) as both an aggregate and a per-request
+rate, with TTFT, the window each point used, free VRAM at load and the resident-expert count.
+
+Its window rule is the reason it is not a thin wrapper: `--max-context` is one request's window and
+the attention state is allocated `capacity x lanes`, so every point gets
+`window = --lane-token-budget // C`. Holding that product constant keeps the state -- and therefore
+the routed experts' residency plan, which is computed from whatever free VRAM is left -- comparable
+across the sweep; a single `--max-context` would have multiplied the state by C and either squeezed
+the resident banks or refused to load. It also refuses a corpus with ids outside the artifact's
+vocabulary before spending a load on it, and it asserts only the engine values a family's own
+normalization forces, because the shared runner's preflight prescribes Qwen-family defaults.
+
+```bash
+python3 tools/bench/run_serve_decode_scaling.py \
+  --artifact nemotron_h_74b_nvfp4=/mnt/storage/models/nemotron-74b/nemotron_h_74b_nvfp4.ninfer \
+  --corpus profiles/nsys/nemotron_p1/corpus.ids \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --lane-token-budget 262144 --pad-tokens 8192 --decode-tokens 4096 \
+  --output profiles/bench/nemotron_decode_scaling
+```
+
+Outputs: `points/<key>.json` (the point report, same shape the concurrency runner writes),
+`scaling.json`, `scaling.csv` and `scaling.md`. `--dry-run` prints each point's window and server
+command without starting one. The measured context is the padded prompt the point records, so quote
+`prompt_tokens` rather than the `--pad-tokens` request; `--pad-tokens` converts at 3.0 chars/token
+and the real figure is what the server tokenized.
+
 ### Whole-model sweep and figures
 
 `run_bench_sweep.py` drives the runner above over every local artifact at a chain of context levels

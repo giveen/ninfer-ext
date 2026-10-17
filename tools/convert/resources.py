@@ -78,9 +78,9 @@ def normalize_tokenizer_config(tokenizer: dict, config: dict, *, family: str = "
     if config.get("add_prefix_space", True) is not False:
         config["add_prefix_space"] = False
         changed = True
-    if family != "gemma" and config.get("pad_token") != "<|endoftext|>":
-        # The Qwen pad token is the runtime's; Gemma keeps the pad its checkpoint names, because
-        # it has no <|endoftext|> in its vocabulary.
+    if family == "qwen" and config.get("pad_token") != "<|endoftext|>":
+        # The Qwen pad token is the runtime's; Gemma and Nemotron keep the pad their checkpoint
+        # names, because neither has <|endoftext|> in its vocabulary.
         config["pad_token"] = "<|endoftext|>"
         changed = True
     existing = config.get("added_tokens_decoder")
@@ -108,6 +108,72 @@ def normalize_tokenizer_config(tokenizer: dict, config: dict, *, family: str = "
 
 
 GEMMA_SPACE_MARKER = "\u2581"
+
+# The Nanotron-v2 pretokenizer the Bolt release was trained with. It is not the runtime's Qwen
+# pattern -- that one carries a contraction branch and one letter class, this one a camelCase-aware
+# word pair and no contraction branch -- and the two do not tokenize the same text identically
+# (measured: 605,563 against 605,660 ids over a 2.4 MB corpus), so the description is preserved
+# rather than rewritten.
+NEMOTRON_SPLIT_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def normalize_nemotron_tokenizer(tokenizer: dict) -> bool:
+    """Clear Hugging Face's `ignore_merges` fast path, which the runtime's BPE does not implement.
+
+    The flag short-circuits a word that is already in the vocabulary instead of merging up to it, so
+    it is a description of the encoder rather than of the text. It is inert for this vocabulary:
+    all 131,072 entries and 2.4 MB of mixed source text tokenize identically with the flag set and
+    cleared, because every entry is reachable through the merge chain. Nothing else is touched --
+    the pretokenizer above stays as the checkpoint wrote it. Returns True when the value changed.
+    """
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or model.get("ignore_merges") is not True:
+        return False
+    model["ignore_merges"] = False
+    return True
+
+
+def validate_nemotron_tokenizer(tokenizer: dict) -> None:
+    """Refuse a Nemotron resource set the runtime would refuse.
+
+    Mirrors the checks the runtime's tokenizer loader makes and pins the one description that is
+    this checkpoint's own: a byte-level BPE behind the Nanotron-v2 split, with no normalizer and no
+    byte fallback. The pipeline is not rewritten, because its semantics are part of the checkpoint;
+    the runtime family that implements this split is `TokenizerFamily::Nemotron` in
+    src/models/qwen3_5/frontend/tokenizer.h, which makes the same refusals against the same pattern.
+    """
+
+    def fail(message: str) -> None:
+        raise ValueError(f"tokenizer resources the runtime cannot load: {message}")
+
+    if tokenizer.get("normalizer") is not None:
+        fail("Nemotron tokenizer.json must declare no normalizer")
+    pre = tokenizer.get("pre_tokenizer")
+    parts = pre.get("pretokenizers") if isinstance(pre, dict) else None
+    split = parts[0] if isinstance(parts, list) and len(parts) == 2 else None
+    bytes_level = parts[1] if isinstance(parts, list) and len(parts) == 2 else None
+    if (
+        not isinstance(pre, dict)
+        or pre.get("type") != "Sequence"
+        or not isinstance(split, dict)
+        or split.get("type") != "Split"
+        or not isinstance(split.get("pattern"), dict)
+        or split["pattern"].get("Regex") != NEMOTRON_SPLIT_PATTERN
+        or split.get("behavior") != "Isolated"
+        or split.get("invert", False) is not False
+        or not isinstance(bytes_level, dict)
+        or bytes_level.get("type") != "ByteLevel"
+        or bytes_level.get("add_prefix_space", True) is not False
+        or bytes_level.get("use_regex", True) is not False
+    ):
+        fail("Nemotron tokenizer.json pre_tokenizer is not the Nanotron-v2 split over ByteLevel")
+    model = tokenizer.get("model")
+    if model.get("byte_fallback", False) is not False:
+        fail("Nemotron tokenizer.json model.byte_fallback must be false")
 
 
 def validate_gemma_tokenizer(tokenizer: dict) -> None:
@@ -195,9 +261,13 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
             fail(f"tokenizer.json model.{field} must be empty")
     if family == "gemma":
         pre = None  # checked by validate_gemma_tokenizer, which the pipeline is not rewritten for
-    elif (normalizer := tokenizer.get("normalizer")) is not None and normalizer.get("type") != "NFC":
-        fail("tokenizer.json normalizer must be NFC")
-    pre = tokenizer.get("pre_tokenizer") if family != "gemma" else None
+    elif family == "nemotron":
+        pre = None  # checked by validate_nemotron_tokenizer, which pins the checkpoint's own split
+    else:
+        normalizer = tokenizer.get("normalizer")
+        if normalizer is not None and normalizer.get("type") != "NFC":
+            fail("tokenizer.json normalizer must be NFC")
+        pre = tokenizer.get("pre_tokenizer")
     if pre is not None:
         parts = pre.get("pretokenizers")
         if pre.get("type") != "Sequence" or not isinstance(parts, list) or len(parts) != 2:
@@ -256,7 +326,7 @@ def validate_tokenizer_resources(tokenizer: dict, config: dict, generation: dict
         fail("tokenizer_config.json add_bos_token must be false")
     if config.get("add_prefix_space", True) is not False:
         fail("tokenizer_config.json add_prefix_space must be false")
-    if family != "gemma" and config.get("pad_token") != "<|endoftext|>":
+    if family == "qwen" and config.get("pad_token") != "<|endoftext|>":
         fail("tokenizer_config.json pad_token must be <|endoftext|>")
     eos = generation.get("eos_token_id")
     if type(eos) is not int and not (isinstance(eos, list) and eos and all(type(v) is int for v in eos)):
@@ -409,6 +479,12 @@ def load_resources(
             payloads[object_id] = data
     if family == "gemma":
         validate_gemma_tokenizer(parsed["tokenizer.json"])
+    elif family == "nemotron":
+        if normalize_nemotron_tokenizer(parsed["tokenizer.json"]):
+            payloads["resource/text/tokenizer.json"] = json.dumps(
+                parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        validate_nemotron_tokenizer(parsed["tokenizer.json"])
     elif normalize_tokenizer(parsed["tokenizer.json"]):
         payloads["resource/text/tokenizer.json"] = json.dumps(
             parsed["tokenizer.json"], ensure_ascii=False, separators=(",", ":")

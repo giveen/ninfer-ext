@@ -231,7 +231,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 | `--profile FILE` | load base options from a `ninfer_serve_profile` JSON file (written by `ninfer-optimizer`); options the CLI does not share are ignored and every other command-line flag overrides the profile | unset |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
-| `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only) | `auto` |
+| `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp and Nemotron-H) | `auto` |
+| `--expert-cache-slots N` | per-expert slot-cache slots beside the family's staged banks, spent out of the same expert budget as the resident banks (Nemotron-H; `0` is the structural pool) | `0` |
 | `--ngram-residency auto\|mapped\|stream` | read the Qwen4Exp n-gram table through the page cache or with batched direct I/O | `auto` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` for Qwen4Exp else `1024`; a lone request also takes the idle width, which for Qwen4Exp widens with the prompt ([serving](serving.md)) |
 | `--max-new N` | requested output-token limit | `128` |

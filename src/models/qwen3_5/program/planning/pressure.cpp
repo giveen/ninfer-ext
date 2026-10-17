@@ -2646,9 +2646,9 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const auto lease = [](const std::unique_ptr<LogicalKVPageStore>& store) noexcept {
         return store == nullptr ? 0U : store->physical_pool().reserved_pages();
     };
-    // Routed-expert cache counters live in Device memory.  This snapshot is taken on the maintenance
-    // boundary, so a short Device read and one stream wait are acceptable; a failed read leaves the
-    // fields at zero rather than failing the snapshot (this method is noexcept).
+    // Routed-expert cache counters live in Device memory.  This snapshot is taken on the
+    // maintenance boundary, so a short Device read and one stream wait are acceptable; a failed
+    // read leaves the fields at zero rather than failing the snapshot (this method is noexcept).
     struct ExpertUsage {
         std::uint64_t hits     = 0;
         std::uint64_t misses   = 0;
@@ -2658,6 +2658,7 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     } expert_usage;
     if (qwen4_experts.has_value()) {
         const ops::ExpertCacheState& cache = qwen4_experts->cache();
+        const ops::ExpertPoolGeometry& pool = qwen4_experts->pool();
         if (cache.statistics != nullptr && cache.owner != nullptr && cache.slots > 0) {
             unsigned long long counters[2] = {0, 0};
             std::vector<std::int32_t> owners(static_cast<std::size_t>(cache.slots), -1);
@@ -2671,12 +2672,11 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
                 expert_usage.misses = counters[1];
                 std::vector<std::uint32_t> per_layer(static_cast<std::size_t>(cache.layers), 0);
                 for (const std::int32_t owner : owners) {
-                    if (owner < 0) { continue; }
+                    if (owner < 0 || owner >= pool.slot_entries()) { continue; }
                     ++expert_usage.resident;
-                    const std::int32_t layer = owner / ops::kOffloadMoeExperts;
-                    if (layer >= 0 && layer < cache.layers) {
-                        ++per_layer[static_cast<std::size_t>(layer)];
-                    }
+                    // An owner is an index into the pool's expert table, so which layer it belongs // to is the pool's prefix sum rather than a division: the layers hold different
+                    // expert counts, and the boundary between two of them is not a stride.
+                        ++per_layer[static_cast<std::size_t>(pool.owner_layer(owner))];
                 }
                 if (!per_layer.empty()) {
                     const auto [lo, hi] = std::minmax_element(per_layer.begin(), per_layer.end());

@@ -50,6 +50,12 @@ enum class TokenizerFamily : std::uint8_t {
     // A `Replace` normalizer that turns a space into U+2581, newline-only word boundaries, and raw
     // UTF-8 symbols with `<0xXX>` byte fallback (Gemma).
     Gemma,
+    // No normalizer at all, the Nanotron-v2 `Split` (a camelCase-aware letter pair, one digit, a
+    // punctuation run that swallows trailing CR/LF/slash, newline runs, and a trailing-space rule),
+    // and the same GPT-2 byte-level symbols as Qwen. This is the pipeline the Nemotron-H
+    // checkpoints
+    // declare, and it is not Qwen's: the two splits disagree on real text.
+    Nemotron,
 };
 
 struct TokenizerResources {
@@ -88,7 +94,7 @@ public:
         std::size_t capacity = 1;
         while (capacity < rule_count * 2U) { capacity <<= 1U; }
         slots_.assign(capacity, BpeMergeEntry{});
-        mask_ = capacity - 1U;
+        mask_    = capacity - 1U;
         entries_ = 0;
     }
 
@@ -184,8 +190,8 @@ private:
     // Gemma's alphabet: the `<0xXX>` fallback for every byte, and the id of the U+2581 marker a
     // space is written as.
     std::array<int, 256> byte_fallback_ids_{};
-    int gemma_marker_token_                 = -1;
-    TokenizerFamily family_                 = TokenizerFamily::Qwen;
+    int gemma_marker_token_ = -1;
+    TokenizerFamily family_ = TokenizerFamily::Qwen;
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;

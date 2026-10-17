@@ -3,19 +3,25 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
 const std::array kShapes{&kFp8N14336K5120,  &kFp8N16384K5120,  &kFp8N34816K5120, &kFp8N5120K6144,
                          &kFp8N5120K17408,  &kFp8N248320K5120, &kFp8N8192K5376,  &kFp8N4096K5376,
                          &kFp8N16384K5376,  &kFp8N2048K5376,   &kFp8N5376K8192,  &kFp8N5376K16384,
-                         &kFp8N262144K5376, &kFp8N21504K5376,  &kFp8N5376K21504};
+                         &kFp8N262144K5376, &kFp8N21504K5376,  &kFp8N5376K21504, &kFp8N256K4096,
+                         &kFp8N4096K4096,   &kFp8N4096K8192,   &kFp8N18560K4096, &kFp8N131072K4096,
+                         &kFp8N10304K2688,  &kFp8N2688K4096,  &kFp8N4096K2688,
+                         &kFp8N256K2688,    &kFp8N3712K2688,  &kFp8N2688K3712,
+                         &kFp8N131072K2688};
 
 const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");
     for (const auto* shape : kShapes)
         if (shape->n == n && shape->k == k) return *shape;
-    throw std::invalid_argument("fp8 linear: unsupported shape");
+    throw std::invalid_argument("fp8 linear: unsupported shape N=" + std::to_string(n) +
+                                " K=" + std::to_string(k));
 }
 
 // The two-term route runs one fused kernel over both terms' split-K partial planes, which the

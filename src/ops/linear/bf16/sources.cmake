@@ -6,4 +6,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n262144_k5376.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/gemma4_draft.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/gemma4_vision.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/nemotron_h_latent.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/generic.cu"
 )

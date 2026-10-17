@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/offload_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -270,7 +271,7 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
 // window is zero without speculation). A capacity without that cushion settles the lease early and
 // ends generation short of the requested output.
 std::uint64_t lease_context(std::uint64_t tokens, const SpeculativeOptions& speculative) {
-    const std::uint64_t page   = 64; // kPagedKVPageSize; that header needs the CUDA runtime
+    const std::uint64_t page = 64; // kPagedKVPageSize; that header needs the CUDA runtime
     const std::uint64_t window =
         speculative.backend == SpeculativeBackend::None ? 0ULL : speculative.draft_tokens;
     const std::uint64_t covered =
@@ -290,7 +291,7 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& speculative)
     const std::uint64_t prompt =
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
     const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
-    const bool leases = has_decode() || speculative.backend != SpeculativeBackend::None;
+    const bool leases          = has_decode() || speculative.backend != SpeculativeBackend::None;
     return checked_context(leases ? lease_context(prompt + decode, speculative) : prompt,
                            "benchmark context requirement");
 }
@@ -315,7 +316,14 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: model; 4096 for Qwen4Exp, else 1024 beside\n"
         << "                              decode and 4096 alone; an explicit value fixes both)\n"
-        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16; Nemotron-H "
+           "accepts\n"
+           "                                           bf16 only and refuses the others at "
+           "startup)\n"
+        << "  --expert-cache <auto|MiB>   device cache of host-resident routed experts (default: "
+           "auto)\n"
+        << "  --expert-cache-slots <n>    per-expert slot-cache slots beside the family's staged\n"
+        << "                              banks (default: 0, the structural pool)\n"
         << "  --spec <mtp|dflash|dflash2|eagle3> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"
         << "                              DFlash/DFlash2/Eagle3 1..15\n"
@@ -372,6 +380,11 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--expert-cache") {
+            options.expert_cache = product::parse_expert_cache(value("--expert-cache"));
+        } else if (arg == "--expert-cache-slots") {
+            options.expert_cache.cache_slots =
+                parse_nonnegative(value("--expert-cache-slots"), "expert-cache-slots");
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
@@ -513,9 +526,9 @@ std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& specula
 }
 
 std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative) {
-    return checked_context(lease_context(decode_graph_prime_output_tokens(speculative),
-                                               speculative),
-                           "decode graph prime context requirement");
+    return checked_context(
+        lease_context(decode_graph_prime_output_tokens(speculative), speculative),
+        "decode graph prime context requirement");
 }
 
 Stats compute_stats(const std::vector<double>& values) {
@@ -565,7 +578,7 @@ std::vector<double> decode_engine_tok_s_series(const TestResult& result) {
     return out;
 }
 
-template <double GenerationTimings::*Field>
+template <double GenerationTimings::* Field>
 std::vector<double> timing_series(const TestResult& result) {
     std::vector<double> out;
     out.reserve(result.reps.size());
@@ -621,7 +634,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " draft_tokens=" << env.speculative.draft_tokens
         << " tree_width=" << env.speculative.tree_width
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
-        << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << " decode_path=" << decode_path_name(env.effective_use_cuda_graph, env.speculative)
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -742,8 +755,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
-        << "    \"decode_path\": \"" << decode_path_name(env.use_cuda_graph, env.speculative)
-        << "\",\n"
+        << "    \"decode_path\": \""
+        << decode_path_name(env.effective_use_cuda_graph, env.speculative) << "\",\n"
         << "    \"decode_graph_prime\": {\"primed\": "
         << (env.decode_graph_primed ? "true" : "false")
         << ", \"output_tokens\": " << env.decode_graph_prime_output_tokens << "},\n"
@@ -848,7 +861,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << ',' << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ',' << env.speculative.tree_width << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
-            << decode_path_name(env.use_cuda_graph, env.speculative) << ','
+            << decode_path_name(env.effective_use_cuda_graph, env.speculative) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes

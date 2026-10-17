@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -22,7 +23,8 @@ template <typename QueryValue, typename KeyValue, typename ValueValue, typename 
 void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int query_tokens,
                                    int key_tokens, double scale, QueryValue query_value,
                                    KeyValue key_value, ValueValue value_value, Visible visible,
-                                   Store store, int worker_limit = 1) {
+                                   Store store, int worker_limit = 1,
+                                   std::function<double(int)> sink_value = {}) {
     if (!ops::valid_attention_head_geometry(geometry) || query_tokens < 0 || key_tokens < 0 ||
         worker_limit < 1) {
         throw std::invalid_argument("invalid naive Softmax Attention geometry");
@@ -54,12 +56,21 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
             }
 
             double denominator = 0.0;
+            // The sink is one extra exponent term per query head with no value contribution: it
+            // raises the maximum and enters the denominator, exactly like an invisible key holding
+            // that logit. Absent by default, so every other Op's oracle call is unchanged.
+            const double sink =
+                sink_value ? sink_value(query_head) : -std::numeric_limits<double>::infinity();
+            maximum = std::max(maximum, sink);
             if (maximum != -std::numeric_limits<double>::infinity()) {
                 for (int key = 0; key < key_tokens; ++key) {
                     double& score = scores[static_cast<std::size_t>(key)];
                     if (score == -std::numeric_limits<double>::infinity()) continue;
                     score = std::exp(score - maximum);
                     denominator += score;
+                }
+                if (sink != -std::numeric_limits<double>::infinity()) {
+                    denominator += std::exp(sink - maximum);
                 }
             }
             // Visit each contiguous value row once. Each output still sums keys in ascending

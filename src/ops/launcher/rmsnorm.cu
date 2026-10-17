@@ -165,7 +165,7 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
 
     if (weightless) {
         launch_rmsnorm<RmsEpilogue::Weightless>(x, weight, nullptr, out, d, rows, eps, aligned2,
-                                               multiprocessor_count, stream);
+                                                multiprocessor_count, stream);
     } else if (z != nullptr && sigmoid_gate) {
         launch_rmsnorm<RmsEpilogue::GatedSigmoid>(x, weight, z, out, d, rows, eps, aligned2,
                                                   multiprocessor_count, stream);
@@ -179,6 +179,51 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
         launch_rmsnorm<RmsEpilogue::Plain>(x, weight, nullptr, out, d, rows, eps, aligned2,
                                            multiprocessor_count, stream);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
+// One block per row: the row's sum of squares reduces in shared memory, then the row writes
+// out[i] = x[i] * rsqrt(sum/d + eps) * gain[i]. FP32 arithmetic end to end, BF16 or unit gain.
+__global__ void rmsnorm_fp32_kernel(const float* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ weight,
+                                    float* __restrict__ out, std::int32_t d, float eps) {
+    __shared__ float partial[256];
+    const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
+    const float* row_in    = x + static_cast<std::int64_t>(row) * d;
+    float* row_out         = out + static_cast<std::int64_t>(row) * d;
+    float sum              = 0.0F;
+    for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < d; i += blockDim.x) {
+        const float v = row_in[i];
+        sum += v * v;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int offset = static_cast<int>(blockDim.x) / 2; offset > 0; offset >>= 1) {
+        if (static_cast<int>(threadIdx.x) < offset) {
+            partial[threadIdx.x] += partial[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / static_cast<float>(d) + eps);
+    for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < d; i += blockDim.x) {
+        const float gain = weight != nullptr ? __bfloat162float(weight[i]) : 1.0F;
+        row_out[i]       = row_in[i] * inv * gain;
+    }
+}
+
+} // namespace
+
+void rmsnorm_fp32_launch(const Tensor& x, const Tensor* weight, float eps, Tensor& out,
+                         cudaStream_t stream) {
+    constexpr int kBlock    = 256;
+    const std::int32_t d    = x.ne[0];
+    const unsigned int grid = static_cast<unsigned int>(x.numel() / d);
+    rmsnorm_fp32_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const float*>(x.data),
+        weight != nullptr ? static_cast<const __nv_bfloat16*>(weight->data) : nullptr,
+        static_cast<float*>(out.data), d, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -46,4 +46,52 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void residual_add_fp32_vec4_kernel(const float4* __restrict__ y, float4* __restrict__ x,
+                                              std::int64_t packs) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= packs) { return; }
+    const float4 a = y[i];
+    float4 b       = x[i];
+    b.x += a.x;
+    b.y += a.y;
+    b.z += a.z;
+    b.w += a.w;
+    x[i] = b;
+}
+
+__global__ void residual_add_fp32_scalar_kernel(const float* __restrict__ y, float* __restrict__ x,
+                                                std::int64_t n) {
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += stride) {
+        x[i] = x[i] + y[i];
+    }
+}
+
+} // namespace
+
+void residual_add_fp32_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
+    const std::int64_t n   = x.numel();
+    constexpr int kBlock   = 256;
+    constexpr int kMaxGrid = 4096;
+    const auto y_addr      = reinterpret_cast<std::uintptr_t>(y.data);
+    const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
+    if (((y_addr | x_addr) & (alignof(float4) - 1)) == 0 && (n % 4) == 0) {
+        const std::int64_t packs = n / 4;
+        const int grid           = static_cast<int>(std::min<std::int64_t>(
+            kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));
+        residual_add_fp32_vec4_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const float4*>(y.data), static_cast<float4*>(x.data), packs);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const int grid = static_cast<int>(std::min<std::int64_t>(
+        kMaxGrid, std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock)))));
+    residual_add_fp32_scalar_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const float*>(y.data),
+                                                                 static_cast<float*>(x.data), n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

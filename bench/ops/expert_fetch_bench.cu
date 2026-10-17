@@ -214,6 +214,7 @@ int main(int argc, char** argv) {
     ops::ExpertCacheState cache;
     cache.pool  = static_cast<std::byte*>(pool);
     cache.slots = kSlots;
+    cache.pool_stride = plan.slot_bytes;
 
     static const char* const kBankNames[] = {"cudaMallocHost", "cudaHostRegister",
                                              "PinnedHostBuffer Default", "PinnedHostBuffer Huge"};

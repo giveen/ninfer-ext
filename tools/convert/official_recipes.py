@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .methods import (
     cast_direct,
     fp8_row_maxabs,
@@ -15,7 +17,7 @@ from .methods import (
 from .sources.compressed_tensors import compressed_matrix_source
 from .sources.exl3 import exl3_matrix_source
 from .sources.logical import select_rows
-from .sources.modelopt import nvfp4_source
+from .sources.modelopt import fp8_tensor_rows_source, nvfp4_source
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -741,7 +743,107 @@ def gemma4_26b_a4b_qat(model, recipe, sources):
             recipe.group(pair)
 
 
+def nemotron_h_74b_nvfp4(model, recipe, sources):
+    """Nemotron 3.5 Bolt 74B A9B from the BF16 checkpoint, in NVIDIA's own per-tensor assignment.
+
+    The routed and shared experts are NVFP4 -- E2M1 codes, E4M3 per-16-block scales, one FP32
+    divisor per bank -- quantized from full precision with ModelOpt's weight-MSE scale sweep. That
+    is **W4A16**: a full-precision source carries no calibrated activation divisor, and the engine
+    refuses an A4 use without one, so the banks report `A16Only` exactly as the released
+    `W4A16_NVFP4` Lightning checkpoint does. The Mamba mixer projections, the attention projections
+    and the head are the engine's FP8 W8A8 route (row-scaled, which is finer than the recipe's
+    per-tensor scale); the latent projections, the router, the embeddings, the norms and the Mamba
+    per-head vectors stay BF16, and the four scalars the scan and the router read stay FP32.
+
+    Each layer's `up` and `down` banks become one parent each, so an expert is a fixed row range of
+    its bank: the MoE Op reads expert `e`'s rows in place, and a host-offload cache addresses them as
+    a few contiguous spans.
+    """
+    if "block_configs" not in model.config:
+        raise ValueError("this official recipe requires Nemotron-H mathematics")
+    fp8_roles = ("/attention/", "/mamba/in_projection", "/mamba/out_projection")
+    for name, parameter in model.parameters.items():
+        if name.startswith("dflash2/"):
+            # The speculative draft is stored exactly as its checkpoint holds it -- BF16 after the
+            # ModelOpt decode. It is about 3% of a round and half the size of a single expert bank,
+            # so a fresh FP8/FP4 sweep here would be a second lossy rounding for no measured gain;
+            # the tower's role rules must not reach into it either (a quantized *bias* is not even
+            # representable at the declared shape).
+            continue
+        if "/moe/experts/" in name or "/moe/shared/" in name:
+            recipe.assign(
+                name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
+            )
+            continue
+        if name == "text/output_head" or any(role in name for role in fp8_roles):
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
+def nemotron_lightning_30b(model, recipe, sources):
+    """Lightning 30B from NVIDIA's already-quantised ModelOpt checkpoint, codes preserved.
+
+    Unlike `nemotron_h_74b_nvfp4` (a BF16 source quantised by the recipe), this checkpoint stores
+    the codes: the routed experts as E2M1 planes with E4M3 per-16-block scales and one FP32 bank
+    divisor (`weight_scale_2`), and the Mamba mixer projections as per-tensor-scaled E4M3. Both are
+    carried through with `import_encoded`, which requires the source's own format to equal the
+    target's -- `matrix_source` resolves `modelopt_nvfp4` / `modelopt_fp8` from the stored
+    companions, so no explicit source is needed here.
+
+    The mixer projections' `input_scale` is deliberately not carried: the engine's route is A16,
+    which is more accurate than the checkpoint's own A8 and needs no activation divisor. The 72
+    excluded modules (embeddings, `mixer.conv1d`, `mixer.gate`, `mixer.k_proj`, norms, router, the
+    attention projections) stay BF16, as the checkpoint stores them.
+    """
+    if "block_configs" not in model.config:
+        raise ValueError("this official recipe requires Nemotron-H mathematics")
+    # The companion's two projections whose widths this engine registers as NVFP4 keep the codes
+    # the checkpoint stores: a draft round reads them once per round and they are its largest
+    # single term, so decoding them to BF16 (which the rest of the companion gets) would double it.
+    companion = sources.get("dflash")
+    for name in model.parameters:
+        if name == "dflash/feature_projection" or name.endswith(
+                ("/mlp/down", "/mlp/gate", "/mlp/up")
+        ):
+            if not name.startswith("dflash/"):
+                continue
+            recipe.assign(name, format="nvfp4", method=import_encoded,
+                          source=model.source(name, companion),
+                          activation_policy="A16Only")
+    fp8_roles = ("/attention/", "/mamba/in_projection", "/mamba/out_projection",
+                 "/moe/shared/", "text/output_head")
+    for name in model.parameters:
+        if name.startswith("dflash/") or name.startswith("dflash2/"):
+            # The speculative companion is stored exactly as its checkpoint holds it. The role
+            # rules below name substrings ("/attention/") that also appear inside the draft, and a
+            # draft norm given a matrix format is not representable -- so the companion is skipped
+            # wholesale, as the 74B recipe skips its own.
+            continue
+        if "/moe/experts/" in name:
+            # Only the routed banks go NVFP4: they are 18 GiB and the dedicated MoE Op reads them.
+            # The shared expert and the head are ordinary linears whose shapes the NVFP4 route
+            # registry does not carry (and a generic fallback is deliberately absent), so they stay
+            # BF16 -- exact, and the dense route covers the shape.
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse,
+                          activation_policy="A16Only")
+            continue
+        if any(role == name or role in name for role in fp8_roles):
+            # W8A16 at the 30B's widths: the checkpoint scales its two mamba mixer projections per
+            # tensor with an A8 activation model, and re-encoding them (plus the attention, shared
+            # expert and head from their BF16 values) onto the engine's row-scaled FP8 route is what
+            # makes the dense read half the size. `A16Only` is what the route implements.
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="A16Only")
+            continue
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
 RECIPES = {
+    "nemotron_h_74b_nvfp4": nemotron_h_74b_nvfp4,
+    "nemotron_lightning_30b": nemotron_lightning_30b,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

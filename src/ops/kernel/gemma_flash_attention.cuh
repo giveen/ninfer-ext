@@ -1,6 +1,7 @@
 #pragma once
 
-// Implements: include/ninfer/ops/sliding_causal_attention.h, include/ninfer/ops/causal_compact_attention.h
+// Implements: include/ninfer/ops/sliding_causal_attention.h,
+// include/ninfer/ops/causal_compact_attention.h
 //
 // Tensor-core attention for Gemma 4's two attention Ops. Passes with many query rows take the tiled
 // kernel at the end of this file; the kernel described here serves the rest. A block owns 16 query
@@ -45,9 +46,9 @@ inline constexpr int kFlashThreads = kFlashWarps * 32;
 inline constexpr int kFlashPad     = 8; // BF16 elements of row padding against bank conflicts
 
 struct FlashAttentionParams {
-    const __nv_bfloat16* q;   // [q_width, Hq, T, B]
-    const __nv_bfloat16* k;   // key row (kvh, key, b) at k + (kvh + Hkv * (key + S * b)) * k_stride
-    const __nv_bfloat16* v;   // value row likewise with v_stride; the compact rows serve as both
+    const __nv_bfloat16* q; // [q_width, Hq, T, B]
+    const __nv_bfloat16* k; // key row (kvh, key, b) at k + (kvh + Hkv * (key + S * b)) * k_stride
+    const __nv_bfloat16* v; // value row likewise with v_stride; the compact rows serve as both
     const std::int32_t* position_q; // [T, B]
     // The latest key position each query may see, [T, B]; null means its own position (causal).
     const std::int32_t* position_q_high;
@@ -63,34 +64,38 @@ struct FlashAttentionParams {
     std::int32_t k_stride;
     std::int32_t v_stride;
     float scale;
-    bool indexed_keys;      // key k holds position k; keys past the latest query are invisible
-    std::int32_t splits;    // key splits per row tile; 1 writes `out` directly
-    float* partial_out;     // [splits, rows, V] unnormalized, when splits > 1
-    float* partial_stats;   // [splits, rows, 2] running max and sum
+    bool indexed_keys;    // key k holds position k; keys past the latest query are invisible
+    std::int32_t splits;  // key splits per row tile; 1 writes `out` directly
+    float* partial_out;   // [splits, rows, V] unnormalized, when splits > 1
+    float* partial_stats; // [splits, rows, 2] running max and sum
     // A second key set, scanned after the first with the same strides and visibility: a pass's own
     // keys beside a cache that does not hold them yet. extra_tokens == 0 means none.
     const __nv_bfloat16* extra_k;
     const __nv_bfloat16* extra_v;
     const std::int32_t* extra_position; // [extra_tokens, B]
     std::int32_t extra_tokens;
+    // One extra exponent term per query head with no value, added unscaled after the score's scale.
+    // Null means none.
+    const __nv_bfloat16* sink; // [Hq]
 };
 
 // Partial rows are numbered (batch, kv head, row tile, row) so the combine needs no geometry beyond
 // the row count.
-__host__ __device__ inline std::int64_t flash_partial_rows(std::int64_t row_tiles, std::int32_t kv_heads,
-                                                           std::int32_t batch) {
+__host__ __device__ inline std::int64_t
+flash_partial_rows(std::int64_t row_tiles, std::int32_t kv_heads, std::int32_t batch) {
     return row_tiles * kFlashRows * kv_heads * batch;
 }
 
-template <int QK, int V, bool kCompact> struct FlashLayout {
-    static constexpr int kQStride = QK + kFlashPad;
-    static constexpr int kVStride = V + kFlashPad;
-    static constexpr int kPStride = kFlashKeys + kFlashPad;
-    static constexpr int kQBytes  = kFlashRows * kQStride * 2;
-    static constexpr int kKBytes  = kFlashKeys * kQStride * 2;
-    static constexpr int kVBytes  = kCompact ? 0 : kFlashKeys * kVStride * 2;
-    static constexpr int kPBytes  = 2 * kFlashRows * kPStride * 2;
-    static constexpr int kSBytes  = kFlashRows * (kFlashKeys + 1) * 4;
+template <int QK, int V, bool kCompact>
+struct FlashLayout {
+    static constexpr int kQStride    = QK + kFlashPad;
+    static constexpr int kVStride    = V + kFlashPad;
+    static constexpr int kPStride    = kFlashKeys + kFlashPad;
+    static constexpr int kQBytes     = kFlashRows * kQStride * 2;
+    static constexpr int kKBytes     = kFlashKeys * kQStride * 2;
+    static constexpr int kVBytes     = kCompact ? 0 : kFlashKeys * kVStride * 2;
+    static constexpr int kPBytes     = 2 * kFlashRows * kPStride * 2;
+    static constexpr int kSBytes     = kFlashRows * (kFlashKeys + 1) * 4;
     static constexpr int kStatsBytes = 3 * kFlashRows * 4 + (2 * kFlashRows + kFlashKeys) * 4;
     static constexpr int kBytes = kQBytes + kKBytes + kVBytes + kPBytes + kSBytes + kStatsBytes;
 };
@@ -154,24 +159,28 @@ __device__ __forceinline__ void flash_copy16(__nv_bfloat16* dst, const __nv_bflo
 }
 
 template <int QK, int V, bool kCompact>
-__launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(FlashAttentionParams p) {
+__launch_bounds__(kFlashThreads) __global__
+    void gemma_flash_attention_kernel(FlashAttentionParams p) {
     using Layout = FlashLayout<QK, V, kCompact>;
     static_assert(QK % 16 == 0 && V % (kFlashWarps * 8) == 0, "MMA tiling");
     extern __shared__ __align__(16) unsigned char shared[];
     auto* qs = reinterpret_cast<__nv_bfloat16*>(shared);
     auto* ks = reinterpret_cast<__nv_bfloat16*>(shared + Layout::kQBytes);
-    auto* vs = kCompact ? ks : reinterpret_cast<__nv_bfloat16*>(shared + Layout::kQBytes + Layout::kKBytes);
-    auto* ph = reinterpret_cast<__nv_bfloat16*>(shared + Layout::kQBytes + Layout::kKBytes + Layout::kVBytes);
+    auto* vs = kCompact
+                   ? ks
+                   : reinterpret_cast<__nv_bfloat16*>(shared + Layout::kQBytes + Layout::kKBytes);
+    auto* ph = reinterpret_cast<__nv_bfloat16*>(shared + Layout::kQBytes + Layout::kKBytes +
+                                                Layout::kVBytes);
     auto* pl = ph + kFlashRows * Layout::kPStride;
-    auto* ss = reinterpret_cast<float*>(shared + Layout::kQBytes + Layout::kKBytes + Layout::kVBytes +
-                                        Layout::kPBytes);
-    float* row_max   = ss + kFlashRows * (kFlashKeys + 1);
-    float* row_sum   = row_max + kFlashRows;
-    float* row_alpha = row_sum + kFlashRows;
-    auto* qpos       = reinterpret_cast<std::int32_t*>(row_alpha + kFlashRows);
+    auto* ss = reinterpret_cast<float*>(shared + Layout::kQBytes + Layout::kKBytes +
+                                        Layout::kVBytes + Layout::kPBytes);
+    float* row_max      = ss + kFlashRows * (kFlashKeys + 1);
+    float* row_sum      = row_max + kFlashRows;
+    float* row_alpha    = row_sum + kFlashRows;
+    auto* qpos          = reinterpret_cast<std::int32_t*>(row_alpha + kFlashRows);
     std::int32_t* qhigh = qpos + kFlashRows;
     std::int32_t* kpos  = qhigh + kFlashRows;
-    const int vstride  = kCompact ? Layout::kQStride : Layout::kVStride;
+    const int vstride   = kCompact ? Layout::kQStride : Layout::kVStride;
 
     const int thread = static_cast<int>(threadIdx.x);
     const int warp   = thread >> 5;
@@ -179,13 +188,13 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     const int g      = lane >> 2;
     const int t      = lane & 3;
 
-    const std::int32_t group  = p.query_heads / p.kv_heads;
-    const std::int32_t kvh    = static_cast<std::int32_t>(blockIdx.y);
-    const std::int32_t b      = static_cast<std::int32_t>(blockIdx.z);
-    const std::int32_t split  = static_cast<std::int32_t>(blockIdx.x) % p.splits;
-    const std::int64_t tile   = static_cast<std::int64_t>(blockIdx.x) / p.splits;
-    const std::int64_t first  = tile * kFlashRows;
-    const std::int64_t rows   = static_cast<std::int64_t>(p.query_tokens) * group;
+    const std::int32_t group = p.query_heads / p.kv_heads;
+    const std::int32_t kvh   = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t b     = static_cast<std::int32_t>(blockIdx.z);
+    const std::int32_t split = static_cast<std::int32_t>(blockIdx.x) % p.splits;
+    const std::int64_t tile  = static_cast<std::int64_t>(blockIdx.x) / p.splits;
+    const std::int64_t first = tile * kFlashRows;
+    const std::int64_t rows  = static_cast<std::int64_t>(p.query_tokens) * group;
 
     // Queries: row r is the flat (token, head-in-group) pair first + r.
     for (int r = warp; r < kFlashRows; r += kFlashWarps) {
@@ -227,8 +236,18 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         }
     }
     if (thread < kFlashRows) {
-        row_max[thread] = -CUDART_INF_F;
-        row_sum[thread] = 0.0F;
+        // A sink is one exponent term with no value: seeding the running max and sum with it is the
+        // reference's `den = sum exp(w - m) + exp(sink - m)` exactly, and it costs one add. Row r
+        // is the flat (token, head-in-group) pair, so its sink is that head's.
+        const std::int64_t flat = first + thread;
+        float sink              = -CUDART_INF_F;
+        // Seeded only when this kernel is the whole reduction. With splits the partials are summed
+        // by the merge, which folds the sink once; seeding here too would count it per split.
+        if (p.sink != nullptr && p.splits == 1 && flat < rows) {
+            sink = __bfloat162float(p.sink[kvh * group + static_cast<std::int32_t>(flat % group)]);
+        }
+        row_max[thread] = sink;
+        row_sum[thread] = sink == -CUDART_INF_F ? 0.0F : 1.0F;
     }
     __syncthreads();
     std::int32_t query_low = INT_MAX, query_high = INT_MIN;
@@ -245,9 +264,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     for (int n = 0; n < kTiles; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0F;
 
     std::int32_t key_end = p.key_tokens;
-    if (p.indexed_keys) {
-        key_end = query_high == INT_MIN ? 0 : min(p.key_tokens, query_high + 1);
-    }
+    if (p.indexed_keys) { key_end = query_high == INT_MIN ? 0 : min(p.key_tokens, query_high + 1); }
     const std::int32_t main_tiles = (key_end + kFlashKeys - 1) / kFlashKeys;
     const std::int32_t key_tiles  = main_tiles + (p.extra_tokens + kFlashKeys - 1) / kFlashKeys;
     const std::int32_t per_split  = (key_tiles + p.splits - 1) / p.splits;
@@ -255,10 +272,10 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
     const std::int32_t tile_end   = min(key_tiles, tile_begin + per_split);
     for (std::int32_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
         // The tile's key set: the main keys, then the extra ones.
-        const bool extra                 = tile_index >= main_tiles;
-        const std::int32_t base          = (extra ? tile_index - main_tiles : tile_index) * kFlashKeys;
-        const std::int32_t keys          = extra ? p.extra_tokens : p.key_tokens;
-        const __nv_bfloat16* key_rows    = extra ? p.extra_k : p.k;
+        const bool extra              = tile_index >= main_tiles;
+        const std::int32_t base       = (extra ? tile_index - main_tiles : tile_index) * kFlashKeys;
+        const std::int32_t keys       = extra ? p.extra_tokens : p.key_tokens;
+        const __nv_bfloat16* key_rows = extra ? p.extra_k : p.k;
         const __nv_bfloat16* value_rows  = extra ? p.extra_v : p.v;
         const std::int32_t* key_position = extra ? p.extra_position : p.position_k;
         // Positions first: a tile no row can see is skipped before its keys move.
@@ -269,15 +286,14 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             if (key < keys) position = key_position[key + static_cast<std::int64_t>(keys) * b];
             kpos[thread] = position;
             seen = key < keys && query_high != INT_MIN && position <= query_high &&
-                   (p.window == 0 ||
-                    static_cast<std::int64_t>(query_low) - position < p.window);
+                   (p.window == 0 || static_cast<std::int64_t>(query_low) - position < p.window);
         }
         if (!__syncthreads_or(seen)) continue;
 
         // The whole tile is issued at once as 16-byte asynchronous copies, so its loads overlap
         // instead of costing a memory latency per row. A key no row can see is zero-filled rather
-        // than loaded: an unwritten cache slot may hold any bits, and a masked NaN value would still
-        // poison the P*V product.
+        // than loaded: an unwritten cache slot may hold any bits, and a masked NaN value would
+        // still poison the P*V product.
         const auto copied = [&](int r) {
             const std::int32_t position = kpos[r];
             return base + r < keys && position <= query_high &&
@@ -303,7 +319,8 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
                 const int c     = at % kVChunks;
                 const bool copy = copied(r);
                 flash_copy16(vs + r * vstride + c * 8,
-                             copy ? value_rows + key_row(r) * p.v_stride + c * 8 : value_rows, copy);
+                             copy ? value_rows + key_row(r) * p.v_stride + c * 8 : value_rows,
+                             copy);
             }
         }
         asm volatile("cp.async.commit_group;\n");
@@ -312,7 +329,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
 
         // S: warp w scores keys [8w, 8w + 8) for all sixteen rows.
         {
-            float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+            float acc[4]              = {0.0F, 0.0F, 0.0F, 0.0F};
             const __nv_bfloat16* krow = ks + (warp * 8 + g) * Layout::kQStride;
 #pragma unroll 4
             for (int kk = 0; kk < QK; kk += 16) {
@@ -341,10 +358,10 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             const float high   = fmaxf(old, flash_warp_max(s));
             const bool empty   = high == -CUDART_INF_F;
             const float weight = empty || s == -CUDART_INF_F ? 0.0F : __expf(s - high);
-            const float alpha  = empty || old == -CUDART_INF_F ? (empty ? 1.0F : 0.0F)
-                                                              : __expf(old - high);
-            const float total  = flash_warp_sum(weight);
-            const __nv_bfloat16 head = __float2bfloat16_rn(weight);
+            const float alpha =
+                empty || old == -CUDART_INF_F ? (empty ? 1.0F : 0.0F) : __expf(old - high);
+            const float total               = flash_warp_sum(weight);
+            const __nv_bfloat16 head        = __float2bfloat16_rn(weight);
             ph[r * Layout::kPStride + lane] = head;
             pl[r * Layout::kPStride + lane] = __float2bfloat16_rn(weight - __bfloat162float(head));
             __syncwarp();
@@ -369,20 +386,23 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
             }
 #pragma unroll
             for (int kk = 0; kk < kFlashKeys; kk += 16) {
-                const std::uint32_t ah[4] = {flash_pair(ph + g * Layout::kPStride + kk + 2 * t),
-                                             flash_pair(ph + (g + 8) * Layout::kPStride + kk + 2 * t),
-                                             flash_pair(ph + g * Layout::kPStride + kk + 2 * t + 8),
-                                             flash_pair(ph + (g + 8) * Layout::kPStride + kk + 2 * t + 8)};
-                const std::uint32_t al[4] = {flash_pair(pl + g * Layout::kPStride + kk + 2 * t),
-                                             flash_pair(pl + (g + 8) * Layout::kPStride + kk + 2 * t),
-                                             flash_pair(pl + g * Layout::kPStride + kk + 2 * t + 8),
-                                             flash_pair(pl + (g + 8) * Layout::kPStride + kk + 2 * t + 8)};
+                const std::uint32_t ah[4] = {
+                    flash_pair(ph + g * Layout::kPStride + kk + 2 * t),
+                    flash_pair(ph + (g + 8) * Layout::kPStride + kk + 2 * t),
+                    flash_pair(ph + g * Layout::kPStride + kk + 2 * t + 8),
+                    flash_pair(ph + (g + 8) * Layout::kPStride + kk + 2 * t + 8)};
+                const std::uint32_t al[4] = {
+                    flash_pair(pl + g * Layout::kPStride + kk + 2 * t),
+                    flash_pair(pl + (g + 8) * Layout::kPStride + kk + 2 * t),
+                    flash_pair(pl + g * Layout::kPStride + kk + 2 * t + 8),
+                    flash_pair(pl + (g + 8) * Layout::kPStride + kk + 2 * t + 8)};
                 const __nv_bfloat16* v0 = vs + (kk + 2 * t) * vstride;
 #pragma unroll
                 for (int n = 0; n < kTiles; ++n) {
-                    const int col         = warp * kColumns + n * 8 + g;
+                    const int col          = warp * kColumns + n * 8 + g;
                     const std::uint32_t b0 = flash_pack(v0[col], v0[vstride + col]);
-                    const std::uint32_t b1 = flash_pack(v0[8 * vstride + col], v0[9 * vstride + col]);
+                    const std::uint32_t b1 =
+                        flash_pack(v0[8 * vstride + col], v0[9 * vstride + col]);
                     flash_mma(o[n], ah, b0, b1);
                     flash_mma(o[n], al, b0, b1);
                 }
@@ -404,7 +424,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         for (int half = 0; half < 2; ++half) {
             const int r = g + 8 * half;
             if (first + r >= rows) continue;
-            float* dst  = p.partial_out + (base_row + r) * V;
+            float* dst = p.partial_out + (base_row + r) * V;
 #pragma unroll
             for (int n = 0; n < kTiles; ++n) {
                 const int col = warp * kColumns + n * 8 + 2 * t;
@@ -429,11 +449,10 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
         const std::int32_t head  = kvh * group + static_cast<std::int32_t>(flat % group);
         const float total        = row_sum[r];
         const float inverse      = total > 0.0F ? 1.0F / total : 0.0F;
-        __nv_bfloat16* dst =
-            p.out + (static_cast<std::int64_t>(head) +
-                     static_cast<std::int64_t>(p.query_heads) *
-                         (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
-                        V;
+        __nv_bfloat16* dst = p.out + (static_cast<std::int64_t>(head) +
+                                      static_cast<std::int64_t>(p.query_heads) *
+                                          (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
+                                         V;
 #pragma unroll
         for (int n = 0; n < kTiles; ++n) {
             const int col = warp * kColumns + n * 8 + 2 * t;
@@ -444,7 +463,7 @@ __launch_bounds__(kFlashThreads) __global__ void gemma_flash_attention_kernel(Fl
 }
 
 // The most key splits a row tile takes; the combine's weights live in one warp's two lanes each.
-inline constexpr int kFlashMaxSplits = 64;
+inline constexpr int kFlashMaxSplits      = 64;
 inline constexpr int kFlashCombineThreads = 256;
 
 // Merges the splits of every partial row: out = sum_s O_s e^(m_s - M) / sum_s l_s e^(m_s - M).
@@ -467,9 +486,9 @@ __launch_bounds__(kFlashCombineThreads) __global__
     const std::int32_t group = p.query_heads / p.kv_heads;
     const std::int64_t r     = row % kFlashRows;
     const std::int64_t tile  = (row / kFlashRows) % row_tiles;
-    const std::int32_t kvh   = static_cast<std::int32_t>((row / kFlashRows / row_tiles) % p.kv_heads);
-    const std::int32_t b     = static_cast<std::int32_t>(row / kFlashRows / row_tiles / p.kv_heads);
-    const std::int64_t flat  = tile * kFlashRows + r;
+    const std::int32_t kvh = static_cast<std::int32_t>((row / kFlashRows / row_tiles) % p.kv_heads);
+    const std::int32_t b   = static_cast<std::int32_t>(row / kFlashRows / row_tiles / p.kv_heads);
+    const std::int64_t flat = tile * kFlashRows + r;
     if (flat >= static_cast<std::int64_t>(p.query_tokens) * group) return;
     const int thread = static_cast<int>(threadIdx.x);
 
@@ -485,7 +504,13 @@ __launch_bounds__(kFlashCombineThreads) __global__
                 l[i] = p.partial_stats[(s * total + row) * 2 + 1];
             }
         }
-        const float high = flash_warp_max(fmaxf(m[0], m[1]));
+        // The sink is one term belonging to the row rather than to any split, so it raises the
+        // merge's maximum before the split weights are formed and enters the denominator once.
+        const float sink_value =
+            p.sink != nullptr
+                ? __bfloat162float(p.sink[kvh * group + static_cast<std::int32_t>(flat % group)])
+                : -CUDART_INF_F;
+        const float high = flash_warp_max(fmaxf(fmaxf(m[0], m[1]), sink_value));
         float sum        = 0.0F;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -493,6 +518,7 @@ __launch_bounds__(kFlashCombineThreads) __global__
             if (thread + 32 * i < p.splits) weight[thread + 32 * i] = w;
             sum += l[i] * w;
         }
+        if (thread == 0 && sink_value != -CUDART_INF_F) { sum += __expf(sink_value - high); }
         sum = flash_warp_sum(sum);
         if (thread == 0) inverse_sum = sum > 0.0F ? 1.0F / sum : 0.0F;
     }
@@ -505,7 +531,8 @@ __launch_bounds__(kFlashCombineThreads) __global__
     for (int s = split0; s < p.splits; s += kGroups) {
         const float w = weight[s];
         if (w == 0.0F) continue;
-        const float4 o = reinterpret_cast<const float4*>(p.partial_out + (s * total + row) * V)[column];
+        const float4 o =
+            reinterpret_cast<const float4*>(p.partial_out + (s * total + row) * V)[column];
         value.x += o.x * w;
         value.y += o.y * w;
         value.z += o.z * w;
@@ -526,12 +553,11 @@ __launch_bounds__(kFlashCombineThreads) __global__
     }
     const std::int32_t token = static_cast<std::int32_t>(flat / group);
     const std::int32_t head  = kvh * group + static_cast<std::int32_t>(flat % group);
-    __nv_bfloat16* dst =
-        p.out + (static_cast<std::int64_t>(head) +
-                 static_cast<std::int64_t>(p.query_heads) *
-                     (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
-                    V;
-    const float scale = inverse_sum;
+    __nv_bfloat16* dst = p.out + (static_cast<std::int64_t>(head) +
+                                  static_cast<std::int64_t>(p.query_heads) *
+                                      (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
+                                     V;
+    const float scale  = inverse_sum;
     *reinterpret_cast<__nv_bfloat162*>(dst + 4 * column) =
         __floats2bfloat162_rn(value.x * scale, value.y * scale);
     *reinterpret_cast<__nv_bfloat162*>(dst + 4 * column + 2) =
@@ -559,10 +585,12 @@ __launch_bounds__(kFlashCombineThreads) __global__
 // block can see is skipped, and a key the block cannot see is zero-filled instead of copied, for
 // the same reason as above: an unwritten cache slot may hold NaN.
 
-template <int Cols> struct FlashTile {
-    static constexpr int kChunks  = Cols / 8;
+template <int Cols>
+struct FlashTile {
+    static constexpr int kChunks   = Cols / 8;
     static constexpr bool kSwizzle = kChunks % 8 == 0;
-    static constexpr int kStride  = kSwizzle ? Cols : Cols + kFlashPad;
+    static constexpr int kStride   = kSwizzle ? Cols : Cols + kFlashPad;
+
     // Element offset of the 16-byte chunk holding column `col` (a multiple of 8) of row `row`.
     __device__ static __forceinline__ int offset(int row, int col) {
         const int chunk = col >> 3;
@@ -570,7 +598,8 @@ template <int Cols> struct FlashTile {
     }
 };
 
-template <int QK, int V, bool kCompact> struct FlashTiledConfig {
+template <int QK, int V, bool kCompact>
+struct FlashTiledConfig {
     static constexpr int kColWarps   = V > 256 ? 2 : 1;
     static constexpr int kRowWarps   = kColWarps == 2 ? 2 : 4;
     static constexpr int kWarps      = kRowWarps * kColWarps;
@@ -583,9 +612,9 @@ template <int QK, int V, bool kCompact> struct FlashTiledConfig {
     static constexpr int kValueTiles = kVPerWarp / 8;
     static_assert(kQKPerWarp % 16 == 0 && kVPerWarp % 16 == 0, "MMA tiling");
     static_assert(!kCompact || V <= QK, "a compact row carries its value first");
-    using QTile = FlashTile<QK>;
-    using KTile = FlashTile<QK>;
-    using VTile = FlashTile<kCompact ? QK : V>;
+    using QTile                      = FlashTile<QK>;
+    using KTile                      = FlashTile<QK>;
+    using VTile                      = FlashTile<kCompact ? QK : V>;
     static constexpr int kQBytes     = kRows * QTile::kStride * 2;
     static constexpr int kKBytes     = kKeys * KTile::kStride * 2;
     static constexpr int kVBytes     = kCompact ? 0 : kKeys * VTile::kStride * 2;
@@ -624,10 +653,10 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
     using KTile = typename C::KTile;
     using VTile = typename C::VTile;
     extern __shared__ __align__(16) unsigned char shared[];
-    auto* qs        = reinterpret_cast<__nv_bfloat16*>(shared);
-    auto* stages    = shared + C::kQBytes;
-    auto* exchange  = reinterpret_cast<float*>(stages + 2 * C::kStageBytes);
-    auto* kpos      = reinterpret_cast<std::int32_t*>(stages + 2 * C::kStageBytes + C::kExchangeBytes);
+    auto* qs       = reinterpret_cast<__nv_bfloat16*>(shared);
+    auto* stages   = shared + C::kQBytes;
+    auto* exchange = reinterpret_cast<float*>(stages + 2 * C::kStageBytes);
+    auto* kpos = reinterpret_cast<std::int32_t*>(stages + 2 * C::kStageBytes + C::kExchangeBytes);
     std::int32_t* qpos  = kpos + 3 * C::kKeys;
     std::int32_t* qhigh = qpos + C::kRows;
 
@@ -694,10 +723,9 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
             qpos[r] = qhigh[r] = INT_MIN;
             continue;
         }
-        const std::int64_t at =
-            flat / group + static_cast<std::int64_t>(p.query_tokens) * b;
-        qpos[r]  = p.position_q[at];
-        qhigh[r] = p.position_q_high ? p.position_q_high[at] : qpos[r];
+        const std::int64_t at = flat / group + static_cast<std::int64_t>(p.query_tokens) * b;
+        qpos[r]               = p.position_q[at];
+        qhigh[r]              = p.position_q_high ? p.position_q_high[at] : qpos[r];
     }
     __syncthreads();
     std::int32_t query_low = INT_MAX, query_high = INT_MIN;
@@ -706,11 +734,11 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         query_low  = min(query_low, qpos[r]);
         query_high = max(query_high, qhigh[r]);
     }
-    const int row0           = rg * 16 + g;
-    const std::int32_t qp0   = qpos[row0];
-    const std::int32_t qh0   = qhigh[row0];
-    const std::int32_t qp1   = qpos[row0 + 8];
-    const std::int32_t qh1   = qhigh[row0 + 8];
+    const int row0         = rg * 16 + g;
+    const std::int32_t qp0 = qpos[row0];
+    const std::int32_t qh0 = qhigh[row0];
+    const std::int32_t qp1 = qpos[row0 + 8];
+    const std::int32_t qh1 = qhigh[row0 + 8];
     // A key the block cannot see is neither scored by any row nor copied.
     const auto block_sees = [&](std::int32_t position) {
         return query_high != INT_MIN && position <= query_high &&
@@ -720,7 +748,7 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
     std::int32_t key_end = p.key_tokens;
     if (p.indexed_keys) key_end = query_high == INT_MIN ? 0 : min(p.key_tokens, query_high + 1);
     const std::int32_t main_tiles = (key_end + C::kKeys - 1) / C::kKeys;
-    const std::int32_t tiles = main_tiles + (p.extra_tokens + C::kKeys - 1) / C::kKeys;
+    const std::int32_t tiles      = main_tiles + (p.extra_tokens + C::kKeys - 1) / C::kKeys;
 
     struct KeyTile {
         const __nv_bfloat16* k;
@@ -729,10 +757,12 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         std::int32_t keys;
         std::int32_t base;
     };
+
     const auto key_tile = [&](std::int32_t index) {
         const bool extra = index >= main_tiles;
         return KeyTile{extra ? p.extra_k : p.k, extra ? p.extra_v : p.v,
-                       extra ? p.extra_position : p.position_k, extra ? p.extra_tokens : p.key_tokens,
+                       extra ? p.extra_position : p.position_k,
+                       extra ? p.extra_tokens : p.key_tokens,
                        (extra ? index - main_tiles : index) * C::kKeys};
     };
     // The first tile at or after `index` the block can see, its key positions left in `slot`.
@@ -743,7 +773,8 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
             if (thread < C::kKeys) {
                 const std::int32_t key = kt.base + thread;
                 std::int32_t position  = INT_MAX;
-                if (key < kt.keys) position = kt.position[key + static_cast<std::int64_t>(kt.keys) * b];
+                if (key < kt.keys)
+                    position = kt.position[key + static_cast<std::int64_t>(kt.keys) * b];
                 kpos[slot * C::kKeys + thread] = position;
                 seen                           = key < kt.keys && block_sees(position);
             }
@@ -752,22 +783,23 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         return tiles;
     };
     const auto issue = [&](std::int32_t index, int stage, int slot) {
-        const KeyTile kt = key_tile(index);
-        auto* ks         = reinterpret_cast<__nv_bfloat16*>(stages + stage * C::kStageBytes);
+        const KeyTile kt       = key_tile(index);
+        auto* ks               = reinterpret_cast<__nv_bfloat16*>(stages + stage * C::kStageBytes);
         constexpr int kKChunks = QK / 8;
         for (int at = thread; at < C::kKeys * kKChunks; at += C::kThreads) {
             const int r            = at / kKChunks;
             const int c            = at % kKChunks;
             const std::int32_t key = kt.base + r;
             const bool copy        = key < kt.keys && block_sees(kpos[slot * C::kKeys + r]);
-            const std::int64_t row = static_cast<std::int64_t>(kvh) +
-                                     static_cast<std::int64_t>(p.kv_heads) *
-                                         (key + static_cast<std::int64_t>(kt.keys) * b);
-            flash_copy16(ks + KTile::offset(r, c * 8), copy ? kt.k + row * p.k_stride + c * 8 : kt.k,
-                         copy);
+            const std::int64_t row =
+                static_cast<std::int64_t>(kvh) + static_cast<std::int64_t>(p.kv_heads) *
+                                                     (key + static_cast<std::int64_t>(kt.keys) * b);
+            flash_copy16(ks + KTile::offset(r, c * 8),
+                         copy ? kt.k + row * p.k_stride + c * 8 : kt.k, copy);
         }
         if constexpr (!kCompact) {
-            auto* vs = reinterpret_cast<__nv_bfloat16*>(stages + stage * C::kStageBytes + C::kKBytes);
+            auto* vs =
+                reinterpret_cast<__nv_bfloat16*>(stages + stage * C::kStageBytes + C::kKBytes);
             constexpr int kVChunks = V / 8;
             for (int at = thread; at < C::kKeys * kVChunks; at += C::kThreads) {
                 const int r            = at / kVChunks;
@@ -789,8 +821,8 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
     float max0 = -CUDART_INF_F, max1 = -CUDART_INF_F;
     float sum0 = 0.0F, sum1 = 0.0F; // this thread's columns only, reduced over the quad at the end
 
-    int processed     = 0;
-    std::int32_t cur  = next_visible(0, 0);
+    int processed    = 0;
+    std::int32_t cur = next_visible(0, 0);
     if (cur < tiles) issue(cur, 0, 0);
     asm volatile("cp.async.commit_group;\n");
     while (cur < tiles) {
@@ -806,7 +838,7 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         const auto* ks  = reinterpret_cast<const __nv_bfloat16*>(stages + stage * C::kStageBytes);
         const auto* vs  = kCompact ? ks
                                    : reinterpret_cast<const __nv_bfloat16*>(
-                                        stages + stage * C::kStageBytes + C::kKBytes);
+                                         stages + stage * C::kStageBytes + C::kKBytes);
         const std::int32_t* tile_pos = kpos + slot * C::kKeys;
 
         // S over this warp's share of the QK dims.
@@ -848,10 +880,11 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const std::int32_t key_position = tile_pos[n * 8 + 2 * t + (e & 1)];
-                const bool upper = e >= 2;
-                const std::int32_t qp = upper ? qp1 : qp0;
-                const bool ok = qp != INT_MIN && flash_visible(qp, upper ? qh1 : qh0, key_position, p.window);
-                s[n][e]       = ok ? s[n][e] * p.scale : -CUDART_INF_F;
+                const bool upper                = e >= 2;
+                const std::int32_t qp           = upper ? qp1 : qp0;
+                const bool ok =
+                    qp != INT_MIN && flash_visible(qp, upper ? qh1 : qh0, key_position, p.window);
+                s[n][e] = ok ? s[n][e] * p.scale : -CUDART_INF_F;
             }
             tile_max0 = fmaxf(tile_max0, fmaxf(s[n][0], s[n][1]));
             tile_max1 = fmaxf(tile_max1, fmaxf(s[n][2], s[n][3]));
@@ -863,14 +896,14 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         }
         const float high0  = fmaxf(max0, tile_max0);
         const float high1  = fmaxf(max1, tile_max1);
-        const float alpha0 = high0 == -CUDART_INF_F ? 1.0F
+        const float alpha0 = high0 == -CUDART_INF_F  ? 1.0F
                              : max0 == -CUDART_INF_F ? 0.0F
                                                      : __expf(max0 - high0);
-        const float alpha1 = high1 == -CUDART_INF_F ? 1.0F
+        const float alpha1 = high1 == -CUDART_INF_F  ? 1.0F
                              : max1 == -CUDART_INF_F ? 0.0F
                                                      : __expf(max1 - high1);
-        max0 = high0;
-        max1 = high1;
+        max0               = high0;
+        max1               = high1;
         float part0 = 0.0F, part1 = 0.0F;
 #pragma unroll
         for (int n = 0; n < C::kKeyTiles; ++n) {
@@ -906,8 +939,8 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
                 const __nv_bfloat16 h0 = __float2bfloat16_rn(w[2 * i]);
                 const __nv_bfloat16 h1 = __float2bfloat16_rn(w[2 * i + 1]);
                 ah[i]                  = flash_pack(h0, h1);
-                al[i] = flash_pack_float(w[2 * i] - __bfloat162float(h0),
-                                         w[2 * i + 1] - __bfloat162float(h1));
+                al[i]                  = flash_pack_float(w[2 * i] - __bfloat162float(h0),
+                                                          w[2 * i + 1] - __bfloat162float(h1));
             }
 #pragma unroll
             for (int vp = 0; vp < C::kValueTiles / 2; ++vp) {
@@ -940,11 +973,10 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         const std::int32_t head  = kvh * group + static_cast<std::int32_t>(flat % group);
         const float total        = half == 0 ? sum0 : sum1;
         const float inverse      = total > 0.0F ? 1.0F / total : 0.0F;
-        __nv_bfloat16* dst =
-            p.out + (static_cast<std::int64_t>(head) +
-                     static_cast<std::int64_t>(p.query_heads) *
-                         (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
-                        V;
+        __nv_bfloat16* dst = p.out + (static_cast<std::int64_t>(head) +
+                                      static_cast<std::int64_t>(p.query_heads) *
+                                          (token + static_cast<std::int64_t>(p.query_tokens) * b)) *
+                                         V;
 #pragma unroll
         for (int n = 0; n < C::kValueTiles; ++n) {
             const int col = cw * C::kVPerWarp + n * 8 + 2 * t;

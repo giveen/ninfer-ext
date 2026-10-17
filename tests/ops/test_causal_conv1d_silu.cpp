@@ -83,6 +83,15 @@ std::vector<float> make_state(std::int32_t C, std::uint32_t seed) {
     return state;
 }
 
+// The biased entries' extra operand. Its magnitude is what makes the biased cases decisive: with
+// the bias inside the activation the output moves by far more than the criterion, so the same
+// output cannot be confused with an activation followed by a bias add.
+std::vector<float> make_bias(std::int32_t C, std::uint32_t seed) {
+    std::vector<float> bias = make_values(static_cast<std::size_t>(C), seed, -2.0F, 2.0F);
+    for (const std::int32_t c : {0, C / 2, C - 1}) { bias[static_cast<std::size_t>(c)] = 4.0F; }
+    return bias;
+}
+
 struct OracleResult {
     std::vector<double> output;
     std::vector<float> final_state;
@@ -91,10 +100,12 @@ struct OracleResult {
 
 // The one Op oracle: evaluate the complete convolution and SiLU in FP64 over the logical BF16
 // inputs, and separately apply the specified width-3 state transition. It has no production
-// staging, accumulator, route, or output-rounding behavior.
+// staging, accumulator, route, or output-rounding behavior. A non-null bias is added to the
+// convolution sum before the activation, which is the biased entries' ideal.
 OracleResult causal_conv_oracle(const std::vector<float>& x, const std::vector<float>& weight,
                                 const std::vector<float>& initial_state, std::int32_t C,
-                                std::int32_t T, bool record_snapshots) {
+                                std::int32_t T, bool record_snapshots,
+                                const std::vector<float>* bias = nullptr) {
     OracleResult result;
     result.output.resize(static_cast<std::size_t>(C) * static_cast<std::size_t>(T));
     result.final_state = initial_state;
@@ -113,6 +124,9 @@ OracleResult causal_conv_oracle(const std::vector<float>& x, const std::vector<f
             sum += static_cast<double>(weight[offset(c, 1, C)]) * x1;
             sum += static_cast<double>(weight[offset(c, 2, C)]) * x2;
             sum += static_cast<double>(weight[offset(c, 3, C)]) * x3;
+            if (bias != nullptr) {
+                sum += static_cast<double>((*bias)[static_cast<std::size_t>(c)]);
+            }
             result.output[offset(c, t, C)] = sum / (1.0 + std::exp(-sum));
         }
 
@@ -217,6 +231,62 @@ int packed_rejection_case(std::int32_t T) {
     return failures;
 }
 
+// The biased entry validates one operand the bias-free entry does not have. One case per rule.
+int bias_rejection_case() {
+    constexpr std::int32_t C = 10240;
+    constexpr std::int32_t T = 1;
+    const std::size_t n      = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    GuardedDeviceBuffer x(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(static_cast<std::size_t>(C) * 4 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer bias(static_cast<std::size_t>(C) * sizeof(std::uint16_t));
+
+    const Tensor tx(x.data(), DType::BF16, {C, T});
+    const Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor ts(state.data(), DType::BF16, {C, 3});
+    Tensor tout(out.data(), DType::BF16, {C, T});
+    Tensor tbias(bias.data(), DType::BF16, {C});
+
+    auto is_rejected = [&](const Tensor* bias_arg) {
+        try {
+            ops::causal_conv1d_silu(tx, tw, bias_arg, ts, tout, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    Tensor short_bias(bias.data(), DType::BF16, {C - 1});
+    Tensor wrong_dtype(bias.data(), DType::FP32, {C});
+    Tensor rank_two(bias.data(), DType::BF16, {C, 2});
+    Tensor over_out(out.data(), DType::BF16, {C});
+    Tensor over_state(state.data(), DType::BF16, {C});
+    Tensor null_bias(nullptr, DType::BF16, {C});
+
+    int failures         = 0;
+    auto expect_rejected = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cout << "FAIL causal_conv1d_silu biased accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    if (is_rejected(&tbias)) {
+        std::cout << "FAIL causal_conv1d_silu biased rejected a valid [C] bias\n";
+        ++failures;
+    }
+    if (is_rejected(nullptr)) {
+        std::cout << "FAIL causal_conv1d_silu biased rejected a null bias\n";
+        ++failures;
+    }
+    expect_rejected(is_rejected(&short_bias), "a bias with fewer rows than channels");
+    expect_rejected(is_rejected(&wrong_dtype), "an FP32 bias");
+    expect_rejected(is_rejected(&rank_two), "a rank-2 bias");
+    expect_rejected(is_rejected(&over_out), "a bias overlapping the output");
+    expect_rejected(is_rejected(&over_state), "a bias overlapping the state");
+    expect_rejected(is_rejected(&null_bias), "a bias with a null data pointer");
+    return failures;
+}
+
 // The entry promises that a bad argument is rejected the same way whatever the column count.
 // One case per rejected class, on both sides of the route bound.
 int split_rejection_case(std::int32_t T) {
@@ -265,7 +335,7 @@ int split_rejection_case(std::int32_t T) {
     // same storage, and this is neither.
     Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
 
-    int failures = 0;
+    int failures         = 0;
     auto expect_rejected = [&](bool rejected, const char* what) {
         if (!rejected) {
             std::cout << "FAIL causal_conv1d_silu_split T=" << T << " accepted " << what << "\n";
@@ -298,14 +368,17 @@ int split_rejection_case(std::int32_t T) {
 // One registered geometry, one column count, one state form. `offset_pairs` shifts every
 // destination by one BF16 pair, which the contract admits and the arena never produces.
 int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int32_t value_dim,
-               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed) {
+               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed,
+               const std::vector<float>* bias = nullptr) {
     const LogicalInput input       = make_input(C, T, seed);
     const std::vector<float> state = make_state(C, seed + 2U);
-    const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
+    const OracleResult oracle = causal_conv_oracle(input.x, input.weight, state, C, T, false, bias);
     const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
     const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
     const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
     const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
+    std::vector<std::uint16_t> bias_bits;
+    if (bias != nullptr) { bias_bits = bf16_bits(*bias); }
 
     const std::size_t pad     = offset_pairs ? 2U * sizeof(std::uint16_t) : 0U;
     const std::size_t q_bytes = static_cast<std::size_t>(q_dim) * T * sizeof(std::uint16_t);
@@ -316,6 +389,12 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state_out(state_bits.size() * sizeof(std::uint16_t));
+    std::unique_ptr<GuardedDeviceBuffer> bias_buffer;
+    if (bias != nullptr) {
+        bias_buffer =
+            std::make_unique<GuardedDeviceBuffer>(bias_bits.size() * sizeof(std::uint16_t));
+        bias_buffer->copy_from_host(bias_bits.data(), bias_buffer->bytes());
+    }
     GuardedDeviceBuffer q(q_bytes + pad);
     GuardedDeviceBuffer k(k_bytes + pad);
     GuardedDeviceBuffer v(v_bytes + pad);
@@ -348,16 +427,18 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     Tensor tw(weight.data(), DType::BF16, {C, 4});
     Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
     Tensor ts_out((alias_state ? state_in : state_out).data(), DType::BF16, {C, 3});
+    Tensor tbias(bias_buffer == nullptr ? nullptr : bias_buffer->data(), DType::BF16, {C});
     Tensor tq(at(q), DType::BF16, {q_dim, T});
     Tensor tk(at(k), DType::BF16, {k_dim, T});
     Tensor tv(at(v), DType::BF16, {value_dim, T});
 
-    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
+    ops::causal_conv1d_silu_split(tx, tw, bias_buffer == nullptr ? nullptr : &tbias, ts_in, ts_out,
+                                  tq, tk, tv, nullptr);
     cuda_synchronize();
 
-    const std::string tag     = "causal_conv1d_silu_split C=" + std::to_string(C) +
-                                " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
-                                (offset_pairs ? " offset" : "");
+    const std::string tag = "causal_conv1d_silu_split C=" + std::to_string(C) +
+                            " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
+                            (offset_pairs ? " offset" : "") + (bias == nullptr ? "" : " biased");
     const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
     const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
     const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
@@ -376,6 +457,10 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
         verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(), final_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (bias_buffer != nullptr) {
+        failures += verify_bits(tag + " bias preserved", bias_buffer->data(), bias_bits);
+        failures += verify_buffer_guards(tag + " bias", *bias_buffer);
+    }
     if (!alias_state) {
         failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
     }
@@ -430,7 +515,7 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
 
     const std::string tag = "causal_conv1d_silu C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " " + call_name(call);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " final state",
@@ -447,6 +532,334 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
         failures += verify_buffer_guards(tag + " state output", *state_out);
     }
     failures += verify_buffer_guards(tag + " output", output);
+    return failures;
+}
+
+// The weight's element order. `weight` is tap-major -- the tap j of channel c at the flat index
+// j*C + c -- while the checkpoint's own `[C,1,4]` parameter flattens to c*4 + j, so a parameter
+// bound as it is stored is shape-valid and wrong. An oracle that reads the payload through one flat
+// index cannot see the order by itself, so this case builds *both* readings of one buffer:
+// `tap_major` as the contract states it, and `channel_major` at c*4 + j, which is what a kernel
+// following the wrong order would be handed. It is the case that fails if the order flips: the two
+// references must be separated by far more than the criterion -- otherwise the case would prove
+// nothing -- and the Op must reproduce the tap-major one and disagree with the other. The weight
+// makes that separation by construction: every channel carries four distinct taps (c + 1, c + 9, c
+// + 17, c + 25, each over 64), while the channel-major reading hands channel c the tap-0 values of
+// channels 4c..4c+3. An all-equal weight, or one symmetric in c and j (w(c,j) == w(j,c)), gives the
+// same number under both readings and could not distinguish them.
+//
+// The weight and the inputs are scaled so the convolution sums stay within about two. That is not
+// incidental: the criterion's per-element limit is 1e-3 + 3.7e-3 * max|reference|, and a BF16
+// output is stored to half an ulp, so a sum of about 130 (half an ulp 0.5 against a limit of 0.48)
+// would fail on output storage rounding rather than on the order.
+int weight_layout_point(std::int32_t C, std::int32_t T, StateCall call) {
+    const std::size_t channels = static_cast<std::size_t>(C);
+    std::vector<float> x(static_cast<std::size_t>(C) * static_cast<std::size_t>(T));
+    std::vector<float> state(static_cast<std::size_t>(C) * 3U);
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            x[offset(c, t, C)] = 0.25F + 0.0625F * static_cast<float>((c + 3 * t) % 7);
+        }
+    }
+    for (std::int32_t s = 0; s < 3; ++s) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            state[offset(c, s, C)] = 0.125F + 0.0625F * static_cast<float>((c + s) % 3);
+        }
+    }
+
+    const auto tap_value = [](std::int32_t c, std::int32_t j) {
+        return static_cast<float>(c + 1 + 8 * j) * 0.015625F;
+    };
+    std::vector<float> tap_major(channels * 4U);
+    std::vector<float> channel_major(channels * 4U);
+    for (std::int32_t j = 0; j < 4; ++j) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            tap_major[offset(c, j, C)] = tap_value(c, j);
+            channel_major[static_cast<std::size_t>(c) * 4U + static_cast<std::size_t>(j)] =
+                tap_value(c, j);
+        }
+    }
+
+    // The same oracle reads whichever buffer it is given through the tap-major index, so the second
+    // reference is the ideal of the transposed logical weight.
+    const OracleResult tap_ideal  = causal_conv_oracle(x, tap_major, state, C, T, false);
+    const OracleResult flip_ideal = causal_conv_oracle(x, channel_major, state, C, T, false);
+
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(tap_major);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+
+    GuardedDeviceBuffer x_buffer(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight_buffer(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in_buffer(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out_buffer(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x_buffer.copy_from_host(x_bits.data(), x_buffer.bytes());
+    weight_buffer.copy_from_host(weight_bits.data(), weight_buffer.bytes());
+    state_in_buffer.copy_from_host(state_bits.data(), state_in_buffer.bytes());
+    state_out_buffer.fill(0x5a);
+    output.fill(kOutputPoison);
+
+    const Tensor tx(x_buffer.data(), DType::BF16, {C, T});
+    const Tensor tw(weight_buffer.data(), DType::BF16, {C, 4});
+    Tensor ts_in(state_in_buffer.data(), DType::BF16, {C, 3});
+    Tensor ts_out(state_out_buffer.data(), DType::BF16, {C, 3});
+    Tensor tout(output.data(), DType::BF16, {C, T});
+    if (call == StateCall::InPlaceEntry) {
+        ops::causal_conv1d_silu(tx, tw, ts_in, tout, nullptr);
+    } else {
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string tag         = "causal_conv1d_silu weight order C=" + std::to_string(C) +
+                                    " T=" + std::to_string(T) + " " + call_name(call);
+    const std::vector<double> got = from_device_bf16(output.data(), x_bits.size());
+    const auto count              = static_cast<std::int64_t>(tap_ideal.output.size());
+    int failures                  = 0;
+    failures += verify_output(tag + " output", got, tap_ideal.output);
+
+    // Only a separated pair of references makes a flip a criterion failure rather than a
+    // coincidence, so the separation is asserted here rather than assumed of the generated weight.
+    if (reduction_passes(
+            compute_reduction_stats(tap_ideal.output.data(), flip_ideal.output.data(), count),
+            count, kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " the two weight orders are not separated\n";
+        ++failures;
+    }
+    if (reduction_passes(compute_reduction_stats(got.data(), flip_ideal.output.data(), count),
+                         count, kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " output matches the channel-major reading of the weight\n";
+        ++failures;
+    }
+    failures += verify_bits(tag + " weight preserved", weight_buffer.data(), weight_bits);
+    failures += verify_buffer_guards(tag + " weight", weight_buffer);
+    return failures;
+}
+
+// The checkpoint's own declaration of that payload is the one wrong binding a shape can detect, and
+// only because C != 4 makes the declarations different tensors. A payload in the checkpoint's order
+// inside a tensor that already declares [C,4] carries no shape evidence, which is what the flat
+// index in the header is for.
+int weight_layout_refusal_case() {
+    constexpr std::int32_t C = 8;
+    constexpr std::int32_t T = 5;
+    const std::size_t n      = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    GuardedDeviceBuffer x(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(static_cast<std::size_t>(C) * 4U * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state(static_cast<std::size_t>(C) * 3U * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out(n * sizeof(std::uint16_t));
+    x.fill(0);
+    weight.fill(0);
+    state.fill(0);
+    out.fill(0);
+
+    const Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor ts(state.data(), DType::BF16, {C, 3});
+    Tensor tout(out.data(), DType::BF16, {C, T});
+    const Tensor tw(weight.data(), DType::BF16, {C, 4});
+    // The checkpoint's parameter shape, and its flattened form: both put the tap axis first.
+    const Tensor checkpoint_declaration(weight.data(), DType::BF16, {4, 1, C});
+    const Tensor flattened_declaration(weight.data(), DType::BF16, {4, C});
+
+    auto is_rejected = [&](const Tensor& weight_arg) {
+        try {
+            ops::causal_conv1d_silu(tx, weight_arg, ts, tout, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    int failures         = 0;
+    auto expect_rejected = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cout << "FAIL causal_conv1d_silu accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    if (is_rejected(tw)) {
+        std::cout << "FAIL causal_conv1d_silu rejected the tap-major [C,4] weight\n";
+        ++failures;
+    }
+    expect_rejected(is_rejected(checkpoint_declaration), "the checkpoint's [C,1,4] declaration");
+    expect_rejected(is_rejected(flattened_declaration), "a flattened [4,C] declaration");
+    return failures;
+}
+
+int weight_layout_case() {
+    int failures = weight_layout_refusal_case();
+    // T = 1 selects the decode kernels, T = 5 the small-T one and T = 33 the prefill pair kernel:
+    // the three sites that index the weight by tap. The two state forms cover both decode kernels.
+    for (const StateCall call : {StateCall::InPlaceEntry, StateCall::DistinctEntry}) {
+        for (const std::int32_t T : {1, 5, 33}) { failures += weight_layout_point(8, T, call); }
+    }
+    return failures;
+}
+
+// The biased op must reproduce SiLU(conv + bias) and must not reproduce SiLU(conv) + bias. The
+// second property is compared against the criterion rather than asserted by eye: the two references
+// are orders of magnitude further apart than the criterion, so an op that activated before adding
+// the bias would pass the folded comparison and fail the biased one.
+int biased_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed) {
+    const LogicalInput input       = make_input(C, T, seed);
+    const std::vector<float> state = make_state(C, seed + 2U);
+    const std::vector<float> bias  = make_bias(C, seed + 3U);
+    const OracleResult biased =
+        causal_conv_oracle(input.x, input.weight, state, C, T, false, &bias);
+    const OracleResult unbiased = causal_conv_oracle(input.x, input.weight, state, C, T, false);
+
+    std::vector<double> folded(unbiased.output.size());
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            folded[offset(c, t, C)] = unbiased.output[offset(c, t, C)] +
+                                      static_cast<double>(bias[static_cast<std::size_t>(c)]);
+        }
+    }
+
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+    const std::vector<std::uint16_t> bias_bits   = bf16_bits(bias);
+    const std::vector<std::uint16_t> final_bits  = bf16_bits(biased.final_state);
+
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer bias_buffer(bias_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
+    std::unique_ptr<GuardedDeviceBuffer> state_out;
+    if (call == StateCall::DistinctEntry) {
+        state_out =
+            std::make_unique<GuardedDeviceBuffer>(state_bits.size() * sizeof(std::uint16_t));
+        state_out->fill(0x5a);
+    }
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    bias_buffer.copy_from_host(bias_bits.data(), bias_buffer.bytes());
+    state_in.copy_from_host(state_bits.data(), state_in.bytes());
+    output.fill(kOutputPoison);
+
+    Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tbias(bias_buffer.data(), DType::BF16, {C});
+    Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
+    Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {C, 3});
+    Tensor tout(output.data(), DType::BF16, {C, T});
+
+    if (call == StateCall::InPlaceEntry) {
+        ops::causal_conv1d_silu(tx, tw, &tbias, ts_in, tout, nullptr);
+    } else if (call == StateCall::DistinctEntry) {
+        ops::causal_conv1d_silu(tx, tw, &tbias, ts_in, ts_out, tout, nullptr);
+    } else {
+        ops::causal_conv1d_silu(tx, tw, &tbias, ts_in, ts_in, tout, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string tag         = "causal_conv1d_silu biased C=" + std::to_string(C) +
+                                    " T=" + std::to_string(T) + " " + call_name(call);
+    const std::vector<double> got = from_device_bf16(output.data(), x_bits.size());
+    const auto count              = static_cast<std::int64_t>(folded.size());
+    int failures                  = 0;
+    failures += verify_output(tag + " output", got, biased.output);
+
+    // A decisive comparison needs the two references further apart than the criterion, which the
+    // generated bias guarantees.
+    if (reduction_passes(compute_reduction_stats(biased.output.data(), folded.data(), count), count,
+                         kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " folded reference is not separated from the biased one\n";
+        ++failures;
+    }
+    // SilU(conv) + bias: what an op that activated before adding the bias would have produced.
+    if (reduction_passes(compute_reduction_stats(got.data(), folded.data(), count), count,
+                         kCausalConvA16Criterion)) {
+        std::cout << "FAIL " << tag << " output matches SiLU(conv) + bias\n";
+        ++failures;
+    }
+
+    failures += verify_bits(tag + " final state",
+                            state_out == nullptr ? state_in.data() : state_out->data(), final_bits);
+    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    failures += verify_bits(tag + " bias preserved", bias_buffer.data(), bias_bits);
+    if (call == StateCall::DistinctEntry) {
+        failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
+    }
+    failures += verify_buffer_guards(tag + " x", x);
+    failures += verify_buffer_guards(tag + " weight", weight);
+    failures += verify_buffer_guards(tag + " bias", bias_buffer);
+    failures += verify_buffer_guards(tag + " state input", state_in);
+    if (state_out != nullptr) {
+        failures += verify_buffer_guards(tag + " state output", *state_out);
+    }
+    failures += verify_buffer_guards(tag + " output", output);
+    return failures;
+}
+
+// A null bias is the bias-free op, and a zero bias adds nothing to the accumulator, so both have
+// to reproduce the bias-free entry byte for byte rather than merely inside the criterion.
+int null_bias_case(std::int32_t C, std::int32_t T, std::uint32_t seed) {
+    const LogicalInput input       = make_input(C, T, seed);
+    const std::vector<float> state = make_state(C, seed + 2U);
+    const std::vector<float> zero_bias(static_cast<std::size_t>(C), 0.0F);
+
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+    const std::vector<std::uint16_t> zero_bits   = bf16_bits(zero_bias);
+
+    struct Bits {
+        std::vector<std::uint16_t> output;
+        std::vector<std::uint16_t> state;
+    };
+
+    int failures = 0;
+    auto run     = [&](const Tensor* bias, bool bias_free, const char* label) {
+        GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer state_buffer(state_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+        x.copy_from_host(x_bits.data(), x.bytes());
+        weight.copy_from_host(weight_bits.data(), weight.bytes());
+        state_buffer.copy_from_host(state_bits.data(), state_buffer.bytes());
+        output.fill(kOutputPoison);
+
+        Tensor tx(x.data(), DType::BF16, {C, T});
+        Tensor tw(weight.data(), DType::BF16, {C, 4});
+        Tensor ts(state_buffer.data(), DType::BF16, {C, 3});
+        Tensor tout(output.data(), DType::BF16, {C, T});
+        if (bias_free) {
+            ops::causal_conv1d_silu(tx, tw, ts, tout, nullptr);
+        } else {
+            ops::causal_conv1d_silu(tx, tw, bias, ts, tout, nullptr);
+        }
+        cuda_synchronize();
+
+        failures += verify_buffer_guards(std::string("null bias ") + label + " x", x);
+        failures += verify_buffer_guards(std::string("null bias ") + label + " output", output);
+        Bits bits;
+        bits.output = from_device<std::uint16_t>(output.data(), x_bits.size());
+        bits.state  = from_device<std::uint16_t>(state_buffer.data(), state_bits.size());
+        return bits;
+    };
+
+    GuardedDeviceBuffer zero_buffer(zero_bits.size() * sizeof(std::uint16_t));
+    zero_buffer.copy_from_host(zero_bits.data(), zero_buffer.bytes());
+    Tensor tzero(zero_buffer.data(), DType::BF16, {C});
+
+    const Bits reference = run(nullptr, true, "bias-free");
+    const Bits null_bias = run(nullptr, false, "null");
+    const Bits zero_run  = run(&tzero, false, "zero");
+
+    const std::string tag =
+        "causal_conv1d_silu null bias C=" + std::to_string(C) + " T=" + std::to_string(T);
+    failures += verify_exact((tag + " output").c_str(), null_bias.output, reference.output);
+    failures += verify_exact((tag + " state").c_str(), null_bias.state, reference.state);
+    failures +=
+        verify_exact((tag + " zero-bias output").c_str(), zero_run.output, reference.output);
+    failures += verify_exact((tag + " zero-bias state").c_str(), zero_run.state, reference.state);
+    failures += verify_exact(
+        (tag + " bias-free state").c_str(), reference.state,
+        bf16_bits(causal_conv_oracle(input.x, input.weight, state, C, T, false).final_state));
     return failures;
 }
 
@@ -499,7 +912,7 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
 
     const std::string tag = "causal_conv1d_silu continuation C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " read_slot=" + std::to_string(read_slot);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -513,7 +926,8 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
 }
 
 int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32_t initial_slot,
-                  std::int32_t snapshot_base_slot, std::uint32_t seed) {
+                  std::int32_t snapshot_base_slot, std::uint32_t seed,
+                  const std::vector<float>* bias = nullptr) {
     const LogicalInput input        = make_input(C, T, seed);
     const std::size_t slot_elements = static_cast<std::size_t>(C) * 3U;
     std::vector<float> states(slot_elements * static_cast<std::size_t>(slots));
@@ -527,7 +941,7 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
         states.begin() + static_cast<std::size_t>(initial_slot) * slot_elements;
     const std::vector<float> selected_state(selected_begin, selected_begin + slot_elements);
     const OracleResult oracle =
-        causal_conv_oracle(input.x, input.weight, selected_state, C, T, true);
+        causal_conv_oracle(input.x, input.weight, selected_state, C, T, true, bias);
 
     std::vector<float> expected_states = states;
     std::copy(oracle.snapshots.begin(), oracle.snapshots.end(),
@@ -538,12 +952,20 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     const std::vector<std::uint16_t> weight_bits   = bf16_bits(input.weight);
     const std::vector<std::uint16_t> state_bits    = bf16_bits(states);
     const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
-    const std::int32_t initial_slot_host           = initial_slot;
-    const std::int32_t snapshot_base_slot_host     = snapshot_base_slot;
+    std::vector<std::uint16_t> bias_bits;
+    if (bias != nullptr) { bias_bits = bf16_bits(*bias); }
+    const std::int32_t initial_slot_host       = initial_slot;
+    const std::int32_t snapshot_base_slot_host = snapshot_base_slot;
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
+    std::unique_ptr<GuardedDeviceBuffer> bias_buffer;
+    if (bias != nullptr) {
+        bias_buffer =
+            std::make_unique<GuardedDeviceBuffer>(bias_bits.size() * sizeof(std::uint16_t));
+        bias_buffer->copy_from_host(bias_bits.data(), bias_buffer->bytes());
+    }
     GuardedDeviceBuffer slot(sizeof(std::int32_t));
     GuardedDeviceBuffer snapshot_base(sizeof(std::int32_t));
     GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
@@ -556,24 +978,29 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
 
     Tensor tx(x.data(), DType::BF16, {C, T});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tbias(bias_buffer == nullptr ? nullptr : bias_buffer->data(), DType::BF16, {C});
     Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
     Tensor tslot(slot.data(), DType::I32, {1});
     Tensor tsnapshot_base(snapshot_base.data(), DType::I32, {1});
     Tensor tout(output.data(), DType::BF16, {C, T});
-    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, Tensor{}, tslot, tsnapshot_base, tout,
-                                     nullptr);
+    ops::causal_conv1d_silu_snapshot(tx, tw, bias_buffer == nullptr ? nullptr : &tbias, tstate,
+                                     Tensor{}, tslot, tsnapshot_base, tout, nullptr);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu snapshot C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " slots=" + std::to_string(slots) +
                             " initial_slot=" + std::to_string(initial_slot) +
-                            " snapshot_base_slot=" + std::to_string(snapshot_base_slot);
-    int failures = 0;
+                            " snapshot_base_slot=" + std::to_string(snapshot_base_slot) +
+                            (bias == nullptr ? "" : " biased");
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (bias_buffer != nullptr) {
+        failures += verify_bits(tag + " bias preserved", bias_buffer->data(), bias_bits);
+    }
     failures += verify_exact((tag + " initial slot preserved").c_str(),
                              from_device<std::int32_t>(slot.data(), 1),
                              std::vector<std::int32_t>{initial_slot});
@@ -583,6 +1010,7 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     failures += verify_buffer_guards(tag + " x", x);
     failures += verify_buffer_guards(tag + " weight", weight);
     failures += verify_buffer_guards(tag + " states", state);
+    if (bias_buffer != nullptr) { failures += verify_buffer_guards(tag + " bias", *bias_buffer); }
     failures += verify_buffer_guards(tag + " initial slot", slot);
     failures += verify_buffer_guards(tag + " snapshot base slot", snapshot_base);
     failures += verify_buffer_guards(tag + " output", output);
@@ -666,7 +1094,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
                             " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                             (masked ? " masked" : " dense");
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -722,6 +1150,10 @@ int main() {
     constexpr std::int32_t kQwen35Channels = 8192;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
 
+    // The weight's element order, at the routes that index it, plus the two declarations of the
+    // checkpoint's own order a shape can refuse.
+    failures += weight_layout_case();
+
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not
     // hard-wired to physical slots [0,T); selected source slots may overlap the destination range.
@@ -768,11 +1200,39 @@ int main() {
                                7200U + static_cast<std::uint32_t>(T));
     }
 
+    // The biased entries. The bias is added to the convolution sum before the fused activation, so
+    // every case here is compared with SiLU(conv + bias) and separately required to disagree with
+    // SiLU(conv) + bias over the same inputs. T = 1, 2, 17, and 65 select the decode, small-T, and
+    // prefill routes of the state-threading entries.
+    for (const std::int32_t T : {1, 2, 17, 65}) {
+        failures += biased_case(kQwen27Channels, T, StateCall::InPlaceEntry,
+                                8000U + static_cast<std::uint32_t>(T));
+    }
+    failures += biased_case(kQwen27Channels, 1, StateCall::DistinctEntry, 8101U);
+    failures += biased_case(kQwen27Channels, 17, StateCall::DistinctEntryExactAlias, 8117U);
+    failures += biased_case(kQwen35Channels, 65, StateCall::DistinctEntry, 8265U);
+
+    // A null bias is the bias-free op and a zero bias adds nothing, so both must reproduce the
+    // bias-free entry byte for byte. T = 1 and T = 17 cover the decode and small-T routes.
+    failures += null_bias_case(kQwen27Channels, 1, 8201U);
+    failures += null_bias_case(kQwen27Channels, 17, 8217U);
+    failures += null_bias_case(kQwen35Channels, 2, 8252U);
+
+    // The biased split and snapshot entries, one case per route each.
+    const std::vector<float> split_bias = make_bias(kQwen27Channels, 8300U);
+    failures += split_case(kQwen27Channels, 2048, 2048, 6144, 16, false, false, 8316U, &split_bias);
+    failures += split_case(kQwen27Channels, 2048, 2048, 6144, 33, false, false, 8333U, &split_bias);
+    const std::vector<float> snapshot_bias = make_bias(kQwen27Channels, 8400U);
+    failures += snapshot_case(kQwen27Channels, 1, 4, 0, 1, 8401U, &snapshot_bias);
+    failures += snapshot_case(kQwen27Channels, 17, 20, 16, 1, 8417U, &snapshot_bias);
+    failures += snapshot_case(kQwen27Channels, 40, 44, 40, 1, 8440U, &snapshot_bias);
+
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);
     failures += split_rejection_case(128);
     failures += packed_rejection_case(16);
     failures += packed_rejection_case(128);
+    failures += bias_rejection_case();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

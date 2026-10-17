@@ -8,4 +8,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/recurrent.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/chunked/prepare.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/chunked/recurrence.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/mamba2_scan/mamba2_scan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/mamba2_scan/recurrent.cu"
 )

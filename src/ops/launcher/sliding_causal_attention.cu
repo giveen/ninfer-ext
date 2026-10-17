@@ -16,7 +16,7 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
                                      std::int32_t head_dim, std::int32_t query_heads,
                                      std::int32_t kv_heads, std::uint32_t window, float scale,
                                      Tensor& out, const Tensor& workspace,
-                                     DeviceExecutionView execution) {
+                                     DeviceExecutionView execution, const Tensor& sink) {
     const std::int32_t query_tokens = q.ne[2];
     const std::int32_t key_tokens   = k.ne[2];
     const std::int32_t batch        = q.ne[3];
@@ -26,22 +26,24 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
     require_flash_alignment(v.data, head_dim, "sliding_causal_attention");
 
     FlashAttentionParams params{};
-    params.q            = static_cast<const __nv_bfloat16*>(q.data);
-    params.k            = static_cast<const __nv_bfloat16*>(k.data);
-    params.v            = static_cast<const __nv_bfloat16*>(v.data);
-    params.position_q   = static_cast<const std::int32_t*>(position_q.data);
+    params.q               = static_cast<const __nv_bfloat16*>(q.data);
+    params.k               = static_cast<const __nv_bfloat16*>(k.data);
+    params.v               = static_cast<const __nv_bfloat16*>(v.data);
+    params.position_q      = static_cast<const std::int32_t*>(position_q.data);
     params.position_q_high = static_cast<const std::int32_t*>(position_q_high.data);
-    params.position_k   = static_cast<const std::int32_t*>(position_k.data);
-    params.out          = static_cast<__nv_bfloat16*>(out.data);
-    params.query_heads  = query_heads;
-    params.kv_heads     = kv_heads;
-    params.query_tokens = query_tokens;
-    params.key_tokens   = key_tokens;
-    params.window       = static_cast<std::int32_t>(window);
-    params.q_width      = head_dim;
-    params.k_stride     = head_dim;
-    params.v_stride     = head_dim;
-    params.scale        = scale;
+    params.position_k      = static_cast<const std::int32_t*>(position_k.data);
+    params.out             = static_cast<__nv_bfloat16*>(out.data);
+    params.query_heads     = query_heads;
+    params.kv_heads        = kv_heads;
+    params.query_tokens    = query_tokens;
+    params.key_tokens      = key_tokens;
+    params.window          = static_cast<std::int32_t>(window);
+    params.q_width         = head_dim;
+    params.k_stride        = head_dim;
+    params.v_stride        = head_dim;
+    params.scale           = scale;
+    // Null when the caller has none, which is every block that does not carry a sink.
+    params.sink = static_cast<const __nv_bfloat16*>(sink.data);
     if (position_extra.data != nullptr && position_extra.ne[0] > 0) {
         require_flash_alignment(k_extra.data, head_dim, "sliding_causal_attention");
         require_flash_alignment(v_extra.data, head_dim, "sliding_causal_attention");
@@ -51,10 +53,18 @@ void sliding_causal_attention_launch(const Tensor& q, const Tensor& k, const Ten
         params.extra_tokens   = position_extra.ne[0];
     }
     switch (head_dim) {
-    case 32: launch_gemma_flash_attention<32, 32, false>(params, batch, workspace, execution); break;
-    case 64: launch_gemma_flash_attention<64, 64, false>(params, batch, workspace, execution); break;
-    case 128: launch_gemma_flash_attention<128, 128, false>(params, batch, workspace, execution); break;
-    case 256: launch_gemma_flash_attention<256, 256, false>(params, batch, workspace, execution); break;
+    case 32:
+        launch_gemma_flash_attention<32, 32, false>(params, batch, workspace, execution);
+        break;
+    case 64:
+        launch_gemma_flash_attention<64, 64, false>(params, batch, workspace, execution);
+        break;
+    case 128:
+        launch_gemma_flash_attention<128, 128, false>(params, batch, workspace, execution);
+        break;
+    case 256:
+        launch_gemma_flash_attention<256, 256, false>(params, batch, workspace, execution);
+        break;
     default:
         throw std::invalid_argument(
             "sliding_causal_attention: head_dim must be 32, 64, 128 or 256");

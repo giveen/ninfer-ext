@@ -37,9 +37,24 @@ int run_nvfp4_a16() {
     // uses; the fused 43008-row parent stays registered for the recipe that fuses them.
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {21504, 5376, 712U, Comparison::Sampled, true, invocations});
+    // The Lightning 30B DFlash companion: its tap fusion and its MLP down projection, preserved as
+    // the ModelOpt NVFP4 the checkpoint stores. A draft round runs them at 2-9 rows.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2688, 16128, 715U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2688, 6144, 716U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {6144, 2688, 717U, Comparison::Sampled, true, invocations});
+    // Nemotron-H 74B's shared expert, bound as an unfused up matrix and down matrix at the
+    // checkpoint's own widths: 5376 intermediate rows into the 4096-wide hidden, and back.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5376, 4096, 713U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {4096, 5376, 714U, Comparison::Sampled, true, invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{43008, 5376},
-                        std::pair{5376, 21504}, std::pair{21504, 5376}}) {
+                        std::pair{5376, 21504}, std::pair{21504, 5376}, std::pair{5376, 4096},
+                        std::pair{4096, 5376}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;

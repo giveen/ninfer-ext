@@ -31,4 +31,29 @@ namespace ninfer::ops {
  */
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
 
+/**
+ * Op: cast_bf16_to_fp32
+ *
+ * Math / indexing:
+ *   destination[i] = widen_to_fp32(source[i]) for every logical element i (bit-exact; every BF16
+ *   value is exactly representable in FP32).
+ *
+ * Logical shapes:
+ *   Source and destination have identical shapes and contiguous element order.
+ *
+ * Supported domain:
+ *   Source is BF16 and destination is FP32; both contiguous.
+ *
+ * Numeric:
+ *   Exact. No rounding is performed in this direction.
+ *
+ * Effects:
+ *   Writes the full destination. Source and destination must not alias. A dtype, shape, contiguity,
+ *   null-data, or aliasing violation throws `std::invalid_argument`.
+ *
+ * Workspace:
+ *   None.
+ */
+void cast_bf16_to_fp32(const Tensor& source, Tensor& destination, cudaStream_t stream);
+
 } // namespace ninfer::ops

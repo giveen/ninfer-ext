@@ -25,6 +25,18 @@ constexpr std::array kShapes{
     ShapeEntry{1152, 768, select_bf16_n1152_k768},
     ShapeEntry{5376, 1152, select_bf16_n5376_k1152},
     ShapeEntry{2816, 1152, select_bf16_n2816_k1152},
+    ShapeEntry{1024, 4096, select_bf16_n1024_k4096},
+    ShapeEntry{4096, 1024, select_bf16_n4096_k1024},
+    ShapeEntry{3712, 2688, select_bf16_n3712_k2688},
+    ShapeEntry{2688, 3712, select_bf16_n2688_k3712},
+    ShapeEntry{131072, 2688, select_bf16_n131072_k2688},
+    ShapeEntry{10304, 2688, select_bf16_n10304_k2688},
+    ShapeEntry{2688, 4096, select_bf16_n2688_k4096},
+    ShapeEntry{4096, 2688, select_bf16_n4096_k2688},
+    ShapeEntry{256, 2688, select_bf16_n256_k2688},
+    ShapeEntry{2688, 16128, select_bf16_n2688_k16128},
+    ShapeEntry{6144, 2688, select_bf16_n6144_k2688},
+    ShapeEntry{2688, 6144, select_bf16_n2688_k6144},
 };
 } // namespace
 
@@ -33,7 +45,11 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("bf16 linear: unsupported shape");
+    // No registered kernel covers this problem. The dense fallback is consulted *after* the whole
+    // registry, so every problem that had a route keeps exactly that route; what changes is that a
+    // problem no model has registered yet computes instead of throwing. It carries no performance
+    // claim: a shape a model actually runs is expected to get its own kernel here.
+    return &bf16_generic_launch;
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

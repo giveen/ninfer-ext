@@ -113,6 +113,20 @@ bool is_number(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_lowercase_letter(std::int32_t codepoint) noexcept {
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LL;
+}
+
+bool is_uppercase_letter(std::int32_t codepoint) noexcept {
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_LU:
+    case UTF8PROC_CATEGORY_LT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool is_whitespace(std::int32_t codepoint) noexcept {
     if (is_ascii_whitespace(codepoint)) { return true; }
     switch (utf8proc_category(codepoint)) {

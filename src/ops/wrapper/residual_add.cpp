@@ -35,8 +35,9 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 } // namespace
 
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
-    if (y.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("residual_add: y/x must be BF16");
+    const bool fp32 = y.dtype == DType::FP32 && x.dtype == DType::FP32;
+    if (!fp32 && (y.dtype != DType::BF16 || x.dtype != DType::BF16)) {
+        throw std::invalid_argument("residual_add: y/x must both be BF16 or both be F32");
     }
     for (int d = 0; d < 4; ++d) {
         if (y.ne[d] != x.ne[d]) {
@@ -51,6 +52,10 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("residual_add: y/x data must be non-null");
     }
 
+    if (fp32) {
+        detail::residual_add_fp32_launch(y, x, stream);
+        return;
+    }
     detail::residual_add_launch(y, x, stream); // single variant -> direct dispatch
 }
 

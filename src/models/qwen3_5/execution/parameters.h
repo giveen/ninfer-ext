@@ -186,7 +186,13 @@ struct Qwen4BlockParameters {
 };
 
 struct Qwen4Parameters {
-    ops::ExpertLayout experts; // the one layout every layer's routed-expert bank uses
+    // The pool the one expert cache places routed experts in: one bank per cache layer, in layer
+    // order and ended by the MTP block's bank when the model has one. Qwen4Exp's banks are uniform
+    // — the constructor refuses a checkpoint whose banks differ — so this family's pool is the
+    // uniform case of `ExpertPoolGeometry`, and every per-layer number the cache needs (expert
+    // count, expert width, staged size) comes from here rather than from a second layout.
+    std::optional<
+    ops::ExpertPoolGeometry> expert_pool;
     HyperConnectionParameters head;
     std::vector<Qwen4BlockParameters> layers;
 };

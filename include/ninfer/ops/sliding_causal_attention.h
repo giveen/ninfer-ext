@@ -44,14 +44,19 @@ namespace ninfer::ops {
  * Softmax over exactly the visible set. The BF16 output is promoted for comparison and storage
  * rounding belongs to the Op criterion. q/k/v/positions are unchanged and every output element is
  * written. All tensors are contiguous and must not overlap except that k may alias v.
+ *
+ * `sink` (BF16 [Hq], null or empty for none) is one extra exponent term per query head with no
+ * value, added *unscaled* after the score's `scale`: the denominator gains `exp(sink[h] - m)`,
+ * which is the attention sink a draft like LiLiCorr carries and an ordinary block does not. It
+ * enters the running state at initialization, so it costs one add per row and nothing when absent.
  */
 void sliding_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& position_q, const Tensor& position_q_high,
                               const Tensor& position_k, const Tensor& k_extra,
                               const Tensor& v_extra, const Tensor& position_extra,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              Tensor& out, const Tensor& workspace,
-                              DeviceExecutionView execution);
+                              Tensor& out, const Tensor& workspace, DeviceExecutionView execution,
+                              const Tensor& sink = Tensor{});
 
 // Workspace bytes the key split needs for these extents (`key_tokens` counts both key sets); zero
 // when the route does not split.

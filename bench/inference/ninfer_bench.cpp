@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
+        engine_options.expert_cache  = options.expert_cache;
         engine_options.context_cache.enabled = false;
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;
@@ -179,6 +180,10 @@ int main(int argc, char** argv) {
                   << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
         ninfer::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
+        // The Engine reports its effective options, and a family that switches CUDA graphs off
+        // makes them differ from what was asked for: the reported decode path must be the one that
+        // ran, not the one requested.
+        env.effective_use_cuda_graph = engine.options().use_cuda_graph;
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
         env.prefill_chunk = env.memory.prefill_chunk;

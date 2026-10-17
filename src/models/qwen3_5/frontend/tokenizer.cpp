@@ -32,9 +32,18 @@ constexpr std::string_view kGemmaSpaceMarker = "\xe2\x96\x81";
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
+// The Nanotron-v2 pretokenizer the Nemotron-H checkpoints were trained with, byte for byte as
+// `tools/convert/resources.py` NEMOTRON_SPLIT_PATTERN pins it. It is not the Qwen pattern: no
+// contraction branch, one camelCase-aware letter pair instead of one letter class, and a
+// punctuation run whose class admits combining marks and whose tail swallows `/` as well as CR/LF.
+constexpr std::string_view kNemotronSplitPattern =
+    R"nemotron([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)nemotron";
+
 void validate_pipeline(const Json& root, const Json& model, TokenizerFamily family) {
-    const char* family_name = family == TokenizerFamily::Gemma ? "Gemma" : "Qwen";
-    const auto require = [family_name](bool valid, const char* field) {
+    const char* family_name = family == TokenizerFamily::Gemma      ? "Gemma"
+                              : family == TokenizerFamily::Nemotron ? "Nemotron"
+                                                                    : "Qwen";
+    const auto require      = [family_name](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
                                         " is not supported by the " + family_name +
@@ -66,6 +75,29 @@ void validate_pipeline(const Json& root, const Json& model, TokenizerFamily fami
                         pre.value("invert", Json(false)) == false,
                     "pre_tokenizer");
         }
+    } else if (family == TokenizerFamily::Nemotron) {
+        // This checkpoint's own Nanotron-v2 pipeline, pinned rather than rewritten: no normalizer
+        // at all, the split above, and the same ByteLevel step the Qwen family declares. The split
+        // is part of the checkpoint -- a runtime that implements a different one would tokenize the
+        // text differently from the model that produced it -- so the refusal mirrors
+        // `validate_nemotron_tokenizer` in tools/convert/resources.py.
+        require(!root.contains("normalizer") || root["normalizer"].is_null(), "normalizer");
+        require(root.contains("pre_tokenizer"), "pre_tokenizer");
+        const auto& pre = root["pre_tokenizer"];
+        const auto& parts =
+            pre.is_object() && pre.contains("pretokenizers") ? pre["pretokenizers"] : Json();
+        require(type(pre, "Sequence") && parts.is_array() && parts.size() == 2, "pre_tokenizer");
+        const auto& split = parts[0];
+        const auto& bytes = parts[1];
+        require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
+                    split["pattern"].value("Regex", std::string{}) == kNemotronSplitPattern &&
+                    split.value("behavior", std::string{}) == "Isolated" &&
+                    split.value("invert", Json(false)) == false,
+                "pre_tokenizer.Split");
+        require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
+                    bytes.value("use_regex", Json(true)) == false,
+                "pre_tokenizer.ByteLevel");
+        require(model.value("byte_fallback", Json(false)) == false, "model.byte_fallback");
     } else if (root.contains("normalizer")) {
         require(type(root["normalizer"], "NFC"), "normalizer");
     }
@@ -510,9 +542,10 @@ std::unordered_map<std::uint32_t, char> build_byte_level_decoder() {
 }
 
 // Qwen's pipeline requires NFC. Gemma's normalizer only rewrites a space to the U+2581 marker,
-// which the symbol builder applies, so its text is used exactly as it arrives.
+// which the symbol builder applies, and Nemotron declares no normalizer at all, so both use the
+// text exactly as it arrives.
 std::string normalize_for_family(std::string_view text, TokenizerFamily family) {
-    return family == TokenizerFamily::Gemma ? std::string(text) : uni::normalize_nfc(text);
+    return family == TokenizerFamily::Qwen ? uni::normalize_nfc(text) : std::string(text);
 }
 
 std::string decode_byte_level_token(std::string_view token, int id) {
@@ -588,6 +621,32 @@ bool is_non_space_non_letter_mark_number(std::int32_t codepoint) noexcept {
            !uni::is_mark(codepoint) && !uni::is_number(codepoint);
 }
 
+// Nanotron-v2's punctuation class: `[^\s\p{L}\p{N}]`. It has no `\p{M}`, so a combining mark that
+// no letter branch claimed starts a punctuation run rather than a word.
+bool is_non_space_non_letter_number(std::int32_t codepoint) noexcept {
+    return !uni::is_whitespace(codepoint) && !uni::is_letter(codepoint) &&
+           !uni::is_number(codepoint);
+}
+
+// Nanotron-v2's optional one-codepoint prefix `[^\r\n\p{L}\p{N}]`. A space is eligible, which is
+// how " word" becomes one token run.
+bool is_nemotron_prefix(std::int32_t codepoint) noexcept {
+    return !is_newline(codepoint) && !uni::is_letter(codepoint) && !uni::is_number(codepoint);
+}
+
+// The two letter classes of the camelCase pair, `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and
+// `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`. They overlap on Lm/Lo/M, which is why the pair is a greedy match
+// with backtracking rather than two disjoint classes.
+bool is_nemotron_upper_class(std::int32_t codepoint) noexcept {
+    return uni::is_mark(codepoint) ||
+           (uni::is_letter(codepoint) && !uni::is_lowercase_letter(codepoint));
+}
+
+bool is_nemotron_lower_class(std::int32_t codepoint) noexcept {
+    return uni::is_mark(codepoint) ||
+           (uni::is_letter(codepoint) && !uni::is_uppercase_letter(codepoint));
+}
+
 bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_view suffix) {
     if (offset + suffix.size() > text.size()) { return false; }
     for (std::size_t i = 0; i < suffix.size(); ++i) {
@@ -600,6 +659,29 @@ bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_vie
 
 uni::CodepointSpan qwen_codepoint_at(std::string_view text, std::size_t offset) {
     return uni::utf8_codepoint_at(text, offset, "Tokenizer::encode input");
+}
+
+// The whitespace tail both split patterns share, `\s*[\r\n]+|\s+(?!\S)|\s+`. A whitespace run that
+// holds a newline ends at the last of them, because `\s*[\r\n]+` is the earlier alternative; a run
+// that reaches the end of the text is the whole run; and otherwise the last codepoint is left to
+// the word that follows, which is what `\s+(?!\S)` leaves behind for ` ?` and the letter classes to
+// take.
+std::size_t whitespace_word_end(std::string_view text, std::size_t begin) {
+    std::size_t end              = begin;
+    std::size_t last_begin       = begin;
+    std::size_t last_newline_end = std::string_view::npos;
+    std::size_t count            = 0;
+    while (end < text.size()) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+        if (!uni::is_whitespace(value.value)) { break; }
+        last_begin = end;
+        end += value.length;
+        ++count;
+        if (is_newline(value.value)) { last_newline_end = end; }
+    }
+    if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+    if (end == text.size()) { return end; }
+    return count >= 2 ? last_begin : end;
 }
 
 std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
@@ -645,23 +727,98 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
         return end;
     }
 
-    if (uni::is_whitespace(cp)) {
-        std::size_t end              = begin;
-        std::size_t last_begin       = begin;
-        std::size_t last_newline_end = std::string_view::npos;
-        std::size_t count            = 0;
+    if (uni::is_whitespace(cp)) { return whitespace_word_end(text, begin); }
+
+    return after_first;
+}
+
+// One letter alternative of the Nanotron-v2 split, at `from` (already past the optional prefix):
+// `U* L+` first, then `U+ L*`, where `U` is [Lu Lt Lm Lo M] and `L` is [Ll Lm Lo M]. Both are
+// greedy, so the match is the longest run the alternatives allow from here -- and because a greedy
+// `U*` can swallow the start of the `L` run (Lm/Lo/M belong to both classes) the backtracking a
+// regex engine performs is reproduced by walking the run's end back one codepoint at a time.
+// Returns npos when neither alternative matches at `from`.
+std::size_t nemotron_letter_alternative_end(std::string_view text, std::size_t from) {
+    // Past the end there is nothing for either alternative to match, which is what an optional
+    // prefix at the very end of the text leaves behind.
+    if (from >= text.size()) { return std::string_view::npos; }
+    std::size_t upper_end = from;
+    while (upper_end < text.size()) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, upper_end);
+        if (!is_nemotron_upper_class(value.value)) { break; }
+        upper_end += value.length;
+    }
+
+    const auto lower_run_end = [&](std::size_t start) {
+        std::size_t end = start;
         while (end < text.size()) {
             const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-            if (!uni::is_whitespace(value.value)) { break; }
-            last_begin = end;
+            if (!is_nemotron_lower_class(value.value)) { break; }
             end += value.length;
-            ++count;
-            if (is_newline(value.value)) { last_newline_end = end; }
         }
-        if (last_newline_end != std::string_view::npos) { return last_newline_end; }
-        if (end == text.size()) { return end; }
-        return count >= 2 ? last_begin : end;
+        return end;
+    };
+
+    // Greedy `U*` then `L+`: the run ends where the first `L` run after it does.
+    if (upper_end < text.size() &&
+        is_nemotron_lower_class(qwen_codepoint_at(text, upper_end).value)) {
+        return lower_run_end(upper_end);
     }
+    // Otherwise `U*` is handed back one codepoint at a time; the first position that can open an
+    // `L` run wins, and that is the last such position inside the run.
+    std::size_t candidate = std::string_view::npos;
+    for (std::size_t at = from; at < upper_end; at += qwen_codepoint_at(text, at).length) {
+        if (is_nemotron_lower_class(qwen_codepoint_at(text, at).value)) { candidate = at; }
+    }
+    if (candidate != std::string_view::npos) { return lower_run_end(candidate); }
+    // `U+ L*`: the greedy `U+` run stands and `L*` may be empty.
+    if (is_nemotron_upper_class(qwen_codepoint_at(text, from).value)) {
+        return lower_run_end(upper_end);
+    }
+    return std::string_view::npos;
+}
+
+std::size_t nemotron_word_end(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+    const std::size_t after_first  = begin + first.length;
+    const std::int32_t cp          = first.value;
+
+    // The two letter alternatives, each preceded by the optional one-codepoint prefix, which is
+    // greedy and therefore tried first.
+    if (is_nemotron_prefix(cp)) {
+        const std::size_t end = nemotron_letter_alternative_end(text, after_first);
+        if (end != std::string_view::npos) { return end; }
+    }
+    if (const std::size_t end = nemotron_letter_alternative_end(text, begin);
+        end != std::string_view::npos) {
+        return end;
+    }
+
+    if (uni::is_number(cp)) { return after_first; }
+
+    // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`: the optional space is greedy here too, and the run swallows any
+    // trailing CR, LF or slash.
+    const auto punctuation_run_end = [&](std::size_t from) -> std::optional<std::size_t> {
+        std::size_t end = from;
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!is_non_space_non_letter_number(value.value)) { break; }
+            end += value.length;
+        }
+        if (end == from) { return std::nullopt; }
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (value.value != '\r' && value.value != '\n' && value.value != '/') { break; }
+            end += value.length;
+        }
+        return end;
+    };
+    if (cp == ' ') {
+        if (const auto end = punctuation_run_end(after_first)) { return *end; }
+    }
+    if (const auto end = punctuation_run_end(begin)) { return *end; }
+
+    if (uni::is_whitespace(cp)) { return whitespace_word_end(text, begin); }
 
     return after_first;
 }
@@ -755,7 +912,8 @@ std::size_t gemma_word_end(std::string_view text, std::size_t begin) {
 void build_word_symbols(std::string_view text, std::size_t begin, std::size_t end,
                         const SymbolContext& context, std::vector<BpeSymbol>& symbols) {
     symbols.clear();
-    if (context.family == TokenizerFamily::Qwen) {
+    if (context.family != TokenizerFamily::Gemma) {
+        // Qwen's and Nemotron's alphabets are both one GPT-2 byte-level symbol per source byte.
         for (std::size_t at = begin; at < end; ++at) {
             const int token = (*context.byte_token_ids)[static_cast<unsigned char>(text[at])];
             if (token < 0) {
@@ -801,9 +959,10 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
 
     std::vector<BpeSymbol> symbols;
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = context.family == TokenizerFamily::Gemma
-                                    ? gemma_word_end(normalized, begin)
-                                    : qwen_word_end(normalized, begin);
+        const std::size_t end =
+            context.family == TokenizerFamily::Gemma      ? gemma_word_end(normalized, begin)
+            : context.family == TokenizerFamily::Nemotron ? nemotron_word_end(normalized, begin)
+                                                          : qwen_word_end(normalized, begin);
         build_word_symbols(normalized, begin, end, context, symbols);
         std::vector<BpeNode> nodes(symbols.size());
         for (std::size_t index = 0; index < symbols.size(); ++index) {
@@ -1053,6 +1212,21 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
     BoundaryEncodedText encoded = encode_with_boundaries(text, {}, options);
     return std::move(encoded.input_ids);
+}
+
+std::size_t tokenizer_word_end(std::string_view text, std::size_t begin, TokenizerFamily family) {
+    if (begin >= text.size()) {
+        throw std::out_of_range("tokenizer word end offset exceeds the text");
+    }
+    switch (family) {
+    case TokenizerFamily::Gemma:
+        return gemma_word_end(text, begin);
+    case TokenizerFamily::Nemotron:
+        return nemotron_word_end(text, begin);
+    case TokenizerFamily::Qwen:
+        return qwen_word_end(text, begin);
+    }
+    throw std::invalid_argument("tokenizer family is invalid");
 }
 
 BoundaryEncodedText Tokenizer::encode_with_boundaries(

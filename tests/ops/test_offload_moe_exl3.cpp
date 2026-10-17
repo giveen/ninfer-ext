@@ -275,6 +275,8 @@ std::vector<std::uint16_t> run_cached(const DeviceBank& bank, const std::vector<
     cache.statistics = static_cast<unsigned long long*>(counters.p) + 1;
     cache.slots      = slots;
     cache.layers     = 1;
+    cache.slot_entries = E;
+    cache.pool_stride  = bank.weights.layout.slot_bytes;
     cache.pool       = static_cast<std::byte*>(pool.p);
 
     cudaStream_t main = nullptr, fetch = nullptr;
@@ -289,7 +291,7 @@ std::vector<std::uint16_t> run_cached(const DeviceBank& bank, const std::vector<
         Tensor t_ids(d_ids.p, DType::I32, {static_cast<std::int32_t>(want.size()), 1});
         Tensor t_slots(slot_ids.p, DType::I32, {static_cast<std::int32_t>(want.size()), 1});
         Tensor t_misses(misses.p, DType::I32, {static_cast<std::int32_t>(2 * want.size() + 1)});
-        ops::expert_cache_resolve(t_ids, 0, cache, t_slots, t_misses, main);
+        ops::expert_cache_resolve(t_ids, ops::ExpertBankSpan{0, E}, cache, t_slots, t_misses, main);
         CUDA_CHECK(cudaEventRecord(resolved, main));
         CUDA_CHECK(cudaStreamWaitEvent(fetch, resolved));
         ops::expert_cache_fetch(bank.weights, t_misses, static_cast<std::int32_t>(want.size()), cache,
@@ -324,7 +326,7 @@ std::vector<std::uint16_t> run_cached(const DeviceBank& bank, const std::vector<
     GuardedDeviceBuffer out(static_cast<std::size_t>(H) * tokens * 2);
     Tensor ty(out.data(), DType::BF16, {H, tokens});
     WorkspaceArena workspace(ops::moe_experts_workspace_bytes(tokens, slots, bank.weights.layout));
-    ops::expert_cache_resolve(tids, 0, cache, tslots, tmisses, main);
+    ops::expert_cache_resolve(tids, ops::ExpertBankSpan{0, E}, cache, tslots, tmisses, main);
     CUDA_CHECK(cudaEventRecord(resolved, main));
     CUDA_CHECK(cudaStreamWaitEvent(fetch, resolved));
     ops::expert_cache_fetch(bank.weights, tmisses, static_cast<std::int32_t>(ids.size()), cache, fetch);

@@ -5,7 +5,7 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/calibration.h"
 #include "models/qwen3_5/execution/linear.h"
-#include "models/qwen3_5/execution/qwen4_expert_pager.h"
+#include "models/execution/expert_pager.h"
 #include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -446,7 +446,7 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
                             std::int32_t cache_layer, Tensor& y) {
     cudaStream_t s            = ctx_.stream;
     const int T               = x.ne[1];
-    Qwen4ExpertPager& experts = *qwen4_runtime().experts;
+    models::execution::ExpertPager& experts = *qwen4_runtime().experts;
 
     auto scope = work_.scope();
     auto roots = workspace::qwen4_moe(work_, config_, T, experts.cache().slots);

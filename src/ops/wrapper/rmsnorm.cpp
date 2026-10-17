@@ -59,9 +59,12 @@ namespace {
 void rmsnorm_impl(const Tensor& x, const Tensor* weight, float eps, bool unit_offset,
                   const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
                   cudaStream_t stream, bool sigmoid_gate = false) {
-    if (x.dtype != DType::BF16 || (weight != nullptr && weight->dtype != DType::BF16) ||
-        out.dtype != DType::BF16 || (z != nullptr && z->dtype != DType::BF16)) {
-        throw std::invalid_argument("rmsnorm: x/weight/z/out must be BF16");
+    const bool fp32 = x.dtype == DType::FP32 && out.dtype == DType::FP32 &&
+                      (weight == nullptr || weight->dtype == DType::BF16);
+    if (!fp32 && (x.dtype != DType::BF16 || (weight != nullptr && weight->dtype != DType::BF16) ||
+                  out.dtype != DType::BF16 || (z != nullptr && z->dtype != DType::BF16))) {
+        throw std::invalid_argument(
+            "rmsnorm: x/weight/z/out must be BF16, or F32 with a BF16 gain");
     }
     if (!(eps > 0.0f) || !std::isfinite(eps)) {
         throw std::invalid_argument("rmsnorm: eps must be positive and finite");
@@ -91,8 +94,8 @@ void rmsnorm_impl(const Tensor& x, const Tensor* weight, float eps, bool unit_of
         !out.is_contiguous() || (z != nullptr && !z->is_contiguous())) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out must be contiguous");
     }
-    if (x.data == nullptr || out.data == nullptr || (weight != nullptr && weight->data == nullptr) ||
-        (z != nullptr && z->data == nullptr)) {
+    if (x.data == nullptr || out.data == nullptr ||
+        (weight != nullptr && weight->data == nullptr) || (z != nullptr && z->data == nullptr)) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
     if (overlaps(x, out) ||
@@ -104,6 +107,13 @@ void rmsnorm_impl(const Tensor& x, const Tensor* weight, float eps, bool unit_of
 
     // The weightless epilogue never reads the weight, so the launch passes an unread placeholder
     // instead of a caller-visible one.
+    if (fp32) {
+        if (z != nullptr || unit_offset || sigmoid_gate) {
+            throw std::invalid_argument("rmsnorm: the F32 route supports the plain epilogue only");
+        }
+        detail::rmsnorm_fp32_launch(x, weight, eps, out, stream);
+        return;
+    }
     const Tensor placeholder(nullptr, DType::BF16, {x.ne[0]});
     detail::rmsnorm_launch(x, weight == nullptr ? placeholder : *weight, eps, unit_offset, z, out,
                            multiprocessor_count, stream, sigmoid_gate, weight == nullptr);
@@ -125,17 +135,17 @@ void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("gated_rmsnorm: positive multiprocessor count required");
     }
-    rmsnorm_impl(x, &weight, eps, false, &z, out, execution.multiprocessor_count,
-                 execution.stream);
+    rmsnorm_impl(x, &weight, eps, false, &z, out, execution.multiprocessor_count, execution.stream);
 }
 
 void gated_rmsnorm_sigmoid(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                            Tensor& out, DeviceExecutionView execution) {
     if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument("gated_rmsnorm_sigmoid: positive multiprocessor count required");
+        throw std::invalid_argument(
+            "gated_rmsnorm_sigmoid: positive multiprocessor count required");
     }
-    rmsnorm_impl(x, &weight, eps, false, &z, out, execution.multiprocessor_count,
-                 execution.stream, true);
+    rmsnorm_impl(x, &weight, eps, false, &z, out, execution.multiprocessor_count, execution.stream,
+                 true);
 }
 
 } // namespace ninfer::ops

@@ -1,7 +1,9 @@
 #pragma once
 
 // ninfer::ops - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
-// SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
+// SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation. A null bias
+// pointer is the bias-free op: the guarded term adds no arithmetic, so that route is unchanged.
+// A set bias is a contiguous [C] row added to the accumulator before the activation.
 
 #include "ops/common/math.cuh"
 
@@ -72,6 +74,7 @@ struct CausalConvSplitOutput3 {
 
 template <class Output>
 __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                             const __nv_bfloat16* bias,
                                              const __nv_bfloat16* conv_state, Output out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
@@ -97,14 +100,17 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(x1);
     acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(x2);
     acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x3);
+    // The depthwise bias enters after the four taps and before the activation, so a null bias adds
+    // no arithmetic at all and leaves the bias-free route unchanged.
+    if (bias != nullptr) { acc += __bfloat162float(bias[c]); }
     *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 }
 
 template <class Output>
-__global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
-                                                   const __nv_bfloat16* weight,
-                                                   const __nv_bfloat16* conv_state, Output out,
-                                                   std::int32_t C, std::int32_t T) {
+__global__ void
+causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                   const __nv_bfloat16* bias, const __nv_bfloat16* conv_state,
+                                   Output out, std::int32_t C, std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
     const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
@@ -132,6 +138,11 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
+    if (bias != nullptr) {
+        const __nv_bfloat162 bias_pair = reinterpret_cast<const __nv_bfloat162*>(bias)[p];
+        acc0 += __low2float(bias_pair);
+        acc1 += __high2float(bias_pair);
+    }
     *out.column(p).at(t) = __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 
@@ -178,6 +189,7 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
 // the exact-alias state form safe without a second kernel.
 template <class Output>
 __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                            const __nv_bfloat16* bias,
                                             const __nv_bfloat16* conv_state_in,
                                             __nv_bfloat16* conv_state_out, Output out,
                                             std::int32_t C, std::int32_t T) {
@@ -220,6 +232,7 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
+    if (bias != nullptr) { acc += __bfloat162float(bias[c64]); }
     *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 
     if (t == 0) {
@@ -232,8 +245,8 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
 }
 
 __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                            __nv_bfloat16* conv_state, __nv_bfloat16* out,
-                                            std::int32_t C) {
+                                            const __nv_bfloat16* bias, __nv_bfloat16* conv_state,
+                                            __nv_bfloat16* out, std::int32_t C) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -251,6 +264,7 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
+        if (bias != nullptr) { acc += __bfloat162float(bias[c]); }
         out[c]                  = __float2bfloat16_rn(silu(acc));
         conv_state[c]           = s1;
         conv_state[C64 + c]     = s2;
@@ -260,8 +274,8 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
 
 __global__ void causal_conv1d_decode_distinct_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
-    __nv_bfloat16* __restrict__ out, std::int32_t C) {
+    const __nv_bfloat16* __restrict__ bias, const __nv_bfloat16* __restrict__ conv_state_in,
+    __nv_bfloat16* __restrict__ conv_state_out, __nv_bfloat16* __restrict__ out, std::int32_t C) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -279,6 +293,7 @@ __global__ void causal_conv1d_decode_distinct_kernel(
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
+        if (bias != nullptr) { acc += __bfloat162float(bias[c]); }
         out[c]                      = __float2bfloat16_rn(silu(acc));
         conv_state_out[c]           = s1;
         conv_state_out[C64 + c]     = s2;
@@ -288,7 +303,8 @@ __global__ void causal_conv1d_decode_distinct_kernel(
 
 __global__ void causal_conv1d_snapshot_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-    __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
+    const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ conv_states,
+    const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ out,
     std::int32_t C, std::int64_t slot_stride) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -310,6 +326,7 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
+        if (bias != nullptr) { acc += __bfloat162float(bias[c]); }
         out[c] = __float2bfloat16_rn(silu(acc));
         __nv_bfloat16* snapshot =
             conv_states + static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
@@ -321,7 +338,8 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
 
 __global__ void
 causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                       __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
+                                       const __nv_bfloat16* bias, __nv_bfloat16* conv_states,
+                                       const std::int32_t* initial_slot,
                                        const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
                                        std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -348,6 +366,7 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
         acc += w2 * __bfloat162float(s2);
         acc += w3 * __bfloat162float(x0);
 
+        if (bias != nullptr) { acc += __bfloat162float(bias[c64]); }
         out[out_idx] = __float2bfloat16_rn(silu(acc));
         s0           = s1;
         s1           = s2;
@@ -366,10 +385,10 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
 // for masked B=1 widths outside the parallel small-W domain.
 template <bool Masked>
 __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
-    const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
-    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
-    std::int64_t slot_stride) {
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* conv_states, const std::int32_t* valid_columns,
+    const std::int32_t* initial_state_slots, const std::int32_t* snapshot_base_slots,
+    __nv_bfloat16* out, std::int32_t C, std::int32_t width, std::int64_t slot_stride) {
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64   = static_cast<std::int64_t>(C);
@@ -400,6 +419,7 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
         acc += w1 * __bfloat162float(s1);
         acc += w2 * __bfloat162float(s2);
         acc += w3 * __bfloat162float(x0);
+        if (bias != nullptr) { acc += __bfloat162float(bias[c64]); }
         out[out_idx] = __float2bfloat16_rn(silu(acc));
         s0           = s1;
         s1           = s2;
@@ -419,7 +439,8 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
 // overwritten by this call.
 __global__ void
 causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                     __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
+                                     const __nv_bfloat16* bias, __nv_bfloat16* conv_states,
+                                     const std::int32_t* initial_slot,
                                      const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
                                      std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
@@ -463,6 +484,7 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
+    if (bias != nullptr) { acc += __bfloat162float(bias[c64]); }
     out[out_idx] = __float2bfloat16_rn(silu(acc));
 
     __nv_bfloat16* snapshot =
@@ -476,10 +498,10 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
 
 template <bool Masked>
 __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
-    const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
-    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
-    std::int64_t slot_stride) {
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* conv_states, const std::int32_t* valid_columns,
+    const std::int32_t* initial_state_slots, const std::int32_t* snapshot_base_slots,
+    __nv_bfloat16* out, std::int32_t C, std::int32_t width, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 
@@ -529,6 +551,7 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
+    if (bias != nullptr) { acc += __bfloat162float(bias[c64]); }
     out[out_idx] = __float2bfloat16_rn(silu(acc));
 
     __nv_bfloat16* snapshot =

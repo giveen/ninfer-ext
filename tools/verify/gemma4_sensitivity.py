@@ -15,6 +15,12 @@ What a candidate simulates: the weight's exact decoded values, rounded to BF16 f
 engine multiplies the exact decoded value; the extra BF16 rounding is far below every format's own
 error except Q8's, where it is comparable). `nvfp4_a4` also quantizes the projection inputs to NVFP4
 with a per-call divisor, which approximates the W4A4 route, whose divisor is calibrated offline.
+
+Two `mlp_gu`/`mlp_down` candidates extend that to the W8A8 route: `q6_i8` quantizes the projection
+inputs to INT8 per token against a Q6 weight, and `q6_i8r256` additionally rotates both operands in
+K-blocks of 256 first (the ConvRot/QuaRot mechanism, see `tools/verify/rotation.py`). Their difference
+is the A8-attributable drift, with and without the rotation.
+
 Attention runs with FP32 scores and softmax, so the reference is slightly more exact than HF's BF16.
 
 Run with an interpreter that has torch with CUDA and `tokenizers`, from the repository root:
@@ -41,6 +47,7 @@ from safetensors import safe_open
 
 from tools.artifact.formats import get_format
 from tools.convert.quantization import groupwise, nvfp4
+from tools.verify.rotation import quantize_activation, rotate_k, weight_rotation_name
 
 CKPT = Path("/mnt/storage/models/gemma/full-31b")
 CORPUS = Path("eval/corpora/perplexity-1m/data")
@@ -72,15 +79,18 @@ GROUPS = {
     "mlp_down": ("down_proj",),
 }
 WEIGHT_FORMATS = ("fp8", "q8", "q6", "q5", "q4", "nvfp4")
+A8_FORMATS = ("q6_i8", "q6_i8r256", "q6_r256")
 GROUP_FORMATS = {
     "attn_qkv": WEIGHT_FORMATS,
     "attn_o": WEIGHT_FORMATS,
-    "mlp_gu": WEIGHT_FORMATS + ("nvfp4_a4",),
-    "mlp_down": WEIGHT_FORMATS + ("nvfp4_a4",),
+    "mlp_gu": WEIGHT_FORMATS + ("nvfp4_a4",) + A8_FORMATS,
+    "mlp_down": WEIGHT_FORMATS + ("nvfp4_a4",) + A8_FORMATS,
 }
-# Stored bits per weight, scales included, for the byte budget.
+# Stored bits per weight, scales included, for the byte budget. The A8 candidates store the same
+# weight bytes as their base format: A8 changes the activation, not the payload.
 BITS = {"bf16": 16.0, "fp8": 8.0, "q8": 8.5, "q6": 6.25, "q5": 5.25, "q4": 4.25,
-        "nvfp4": 4.5, "nvfp4_a4": 4.5}
+        "nvfp4": 4.5, "nvfp4_a4": 4.5, "q6_i8": 6.25, "q6_i8r256": 6.25, "q6_r256": 6.25,
+        "q5_r256": 5.25}
 GROUPWISE = {"q8": "q8_g32_fp16", "q6": "q6_g64_fp16", "q5": "q5_g64_fp16", "q4": "q4_g64_fp16"}
 
 
@@ -163,6 +173,25 @@ def fake_weight(w: torch.Tensor, fmt: str) -> torch.Tensor:
     return torch.cat([encode(w[r:r + rows]) for r in range(0, w.shape[0], rows)])
 
 
+def parse_candidate(fmt: str) -> tuple[str, bool, str | None]:
+    """`q6` -> (q6, False, None); `nvfp4_a4` -> (nvfp4, True, None);
+    `q6_i8` -> (q6, False, "i8"); `q6_i8r256` -> (q6, False, "i8r256"); `q6_r256` -> (q6, False,
+    "r256"), which rotates both operands but quantizes only the weight."""
+    if fmt == "nvfp4_a4":
+        return "nvfp4", True, None
+    weight, sep, act = fmt.partition("_")
+    return (weight, False, act) if sep else (fmt, False, None)
+
+
+def candidate_weight(w: torch.Tensor, fmt: str) -> torch.Tensor:
+    """The decoded weight a candidate stores. A rotated activation pairs with a weight rotated before
+    its encoder (the pair preserves the product), so the rotation happens on the FP32 values, not on
+    the codes."""
+    weight, _, act = parse_candidate(fmt)
+    name = weight_rotation_name(act) if act else None
+    return fake_weight(rotate_k(w, name) if name else w, weight)
+
+
 def fake_nvfp4_activation(x: torch.Tensor) -> torch.Tensor:
     """NVFP4 activations: E4M3 per-16 block scales under one per-call FP32 divisor."""
     shape = x.shape
@@ -221,17 +250,25 @@ def mask(length: int, sliding: bool) -> torch.Tensor:
     return _MASK[key]
 
 
-def linear(x: torch.Tensor, w: torch.Tensor, a4: bool) -> torch.Tensor:
-    return F.linear(fake_nvfp4_activation(x) if a4 else x, w.to(x.dtype))
+def linear(x: torch.Tensor, w: torch.Tensor, a4: bool, act_q: str | None = None) -> torch.Tensor:
+    if act_q is not None:
+        x = quantize_activation(x, act_q).to(x.dtype)
+    elif a4:
+        x = fake_nvfp4_activation(x)
+    return F.linear(x, w.to(x.dtype))
 
 
 def layer_forward(index: int, w: dict[str, torch.Tensor], h: torch.Tensor,
-                  override: dict[str, torch.Tensor] | None = None, a4: bool = False) -> torch.Tensor:
+                  override: dict[str, torch.Tensor] | None = None, a4: bool = False,
+                  act_q: str | None = None) -> torch.Tensor:
     """One decoder layer over h [S, L, H] BF16. `override` replaces projection weights by name;
-    `a4` quantizes the inputs of the overridden MLP projections."""
+    `a4` quantizes the inputs of the overridden MLP projections to NVFP4, `act_q` instead applies a
+    per-token INT8 quantization (`i8`), or the same after a K-block rotation (`i8r256`), which pairs
+    with the rotated weights a rotated candidate stores."""
     override = override or {}
     get = lambda name: override.get(name, projection(w, name))
     a4_of = lambda name: a4 and name in override
+    act_of = lambda name: act_q if name in override else None
     full = TYPES[index] == "full_attention"
     g = GLOBAL if full else SLIDING
     s, length, _ = h.shape
@@ -260,11 +297,11 @@ def layer_forward(index: int, w: dict[str, torch.Tensor], h: torch.Tensor,
     h = h + rmsnorm(linear(attended, get("o_proj"), False), w["post_attention_layernorm.weight"])
 
     x = rmsnorm(h, w["pre_feedforward_layernorm.weight"])
-    gate = linear(x, get("gate_proj"), a4_of("gate_proj"))
-    up = linear(x, get("up_proj"), a4_of("up_proj"))
+    gate = linear(x, get("gate_proj"), a4_of("gate_proj"), act_of("gate_proj"))
+    up = linear(x, get("up_proj"), a4_of("up_proj"), act_of("up_proj"))
     product = (F.gelu(gate.float(), approximate="tanh") * up.float()).to(ACT)
     del gate, up
-    h = h + rmsnorm(linear(product, get("down_proj"), a4_of("down_proj")),
+    h = h + rmsnorm(linear(product, get("down_proj"), a4_of("down_proj"), act_of("down_proj")),
                     w["post_feedforward_layernorm.weight"])
     return (h * w["layer_scalar"].to(ACT)).to(ACT)
 
@@ -419,18 +456,19 @@ def main():
             for index in range(LAYERS):
                 w = ckpt.layer(index)
                 chosen = layout.get("layers", {}).get(str(index), {})
-                override, a4 = {}, False
+                override, a4, act_q = {}, False, None
                 for group, fmt in chosen.items():
                     names = [n for n in GROUPS[group] if projection(w, n) is not None]
-                    base = "nvfp4" if fmt == "nvfp4_a4" else fmt
-                    a4 = a4 or fmt == "nvfp4_a4"
+                    _, fmt_a4, fmt_act = parse_candidate(fmt)
+                    a4 = a4 or fmt_a4
+                    act_q = fmt_act or act_q
                     for n in names:
-                        override[n] = fake_weight(projection(w, n), base)
+                        override[n] = candidate_weight(projection(w, n), fmt)
                     total_bits += group_bytes(w, group) * BITS[fmt]
                 for group in GROUPS:
                     if group not in chosen:
                         total_bits += group_bytes(w, group) * 16.0
-                h = layer_forward(index, w, h, override, a4=a4)
+                h = layer_forward(index, w, h, override, a4=a4, act_q=act_q)
                 del w, override
             head_fmt = layout.get("head", "bf16")
             head_weight = fake_weight(table, head_fmt).to(ACT) if head_fmt != "bf16" else None
@@ -450,9 +488,9 @@ def main():
             else:
                 w = ckpt.layer(layer)
                 names = [n for n in GROUPS[group] if projection(w, n) is not None]
-                base = "nvfp4" if fmt == "nvfp4_a4" else fmt
-                override = {n: fake_weight(projection(w, n), base) for n in names}
-                h = layer_forward(layer, w, inputs[layer].to(DEV), override, a4=(fmt == "nvfp4_a4"))
+                _, a4, act_q = parse_candidate(fmt)
+                override = {n: candidate_weight(projection(w, n), fmt) for n in names}
+                h = layer_forward(layer, w, inputs[layer].to(DEV), override, a4=a4, act_q=act_q)
                 del w, override
                 first = layer + 1
             for later in range(first, LAYERS):
@@ -499,16 +537,12 @@ def main():
         candidates, states = [], []
         for group, group_formats in GROUP_FORMATS.items():
             names = [n for n in GROUPS[group] if projection(w, n) is not None]
-            cache: dict[str, dict[str, torch.Tensor]] = {}
             for f in group_formats:
-                base = "nvfp4" if f == "nvfp4_a4" else f
-                if base not in cache:
-                    cache.clear()  # nvfp4_a4 follows nvfp4, so one cached format is enough
-                    cache[base] = {n: fake_weight(projection(w, n), base) for n in names}
-                states.append(layer_forward(index, w, h_in, cache[base], a4=(f == "nvfp4_a4")))
+                _, a4, act_q = parse_candidate(f)
+                override = {n: candidate_weight(projection(w, n), f) for n in names}
+                states.append(layer_forward(index, w, h_in, override, a4=a4, act_q=act_q))
                 candidates.append(dict(layer=index, group=group, format=f,
                                        params=group_bytes(w, group)))
-            del cache
         del w, h_in
         for later in range(index + 1, LAYERS):
             lw = ckpt.layer(later)

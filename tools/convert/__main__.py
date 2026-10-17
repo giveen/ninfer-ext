@@ -14,6 +14,7 @@ from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from .gemma4 import build_model as build_gemma4_model, is_gemma4
+from .nemotron_h import build_model as build_nemotron_h_model, is_nemotron_h
 from .qwen4_exp import build_model as build_qwen4_exp_model, is_qwen4_exp
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -167,6 +168,17 @@ def main(argv=None):
                 raise ValueError("Qwen4Exp has no DFlash companions")
             model = build_qwen4_exp_model(
                 base, components=components, resource_overrides=overrides
+            )
+        elif is_nemotron_h(base.config):
+            # The tower's only companion is the LiLiCorr draft, and only as `dflash2`: the MTP and
+            # Eagle3 components belong to other families.
+            if components and (set(components) - {"text", "dflash", "dflash2"}):
+                raise ValueError("Nemotron-H accepts its dflash2 LiLiCorr draft or a dflash")
+            model = build_nemotron_h_model(
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
             )
         else:
             model = build_model(

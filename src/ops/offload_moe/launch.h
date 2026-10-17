@@ -81,11 +81,11 @@ void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tens
                       Tensor& weights, Tensor& shared_gate, cudaStream_t stream);
 void moe_route_share_padding_launch(Tensor& ids, const Tensor& valid_columns, std::int32_t width,
                                     cudaStream_t stream);
-void expert_cache_resolve_launch(const Tensor& ids, std::int32_t layer,
+void expert_cache_resolve_launch(const Tensor& ids, ExpertBankSpan bank,
                                  const ExpertCacheState& cache, Tensor& slot_ids, Tensor& misses,
                                  cudaStream_t stream);
-void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer,
-                               const std::int32_t* resident, const ExpertWeights& bank,
+void expert_cache_stage_launch(const ExpertCacheState& cache, ExpertBankSpan bank,
+                               const std::int32_t* resident, const ExpertWeights& weights,
                                const ExpertWeights& staged, cudaStream_t stream);
 
 void expert_cache_reclaim_launch(const ExpertCacheState& cache, std::int32_t first_slot,

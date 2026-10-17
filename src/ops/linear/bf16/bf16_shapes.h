@@ -23,5 +23,33 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n1152_k768(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n5376_k1152(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n2816_k1152(std::int32_t tokens);
+// The Nemotron-H latent round trip: the two projections that bracket a MoE bank's routed experts,
+// at the hidden width and the latent width. Both are GEMV-shaped -- 1024 and 4096 rows against K of
+// 4096 and 1024 -- and both keep the dense fallback's accumulation order rather than a warp-reduced
+// one (see the shape file), so they are bit-identical to the route they displace.
+[[nodiscard]] Bf16Launch select_bf16_n1024_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k1024(std::int32_t tokens);
+
+// The Lightning 30B's projections (mamba in/out, attention q/k/v/o, the shared expert and the
+// head), all at hidden width 2688. Same schedule as the latent pair.
+[[nodiscard]] Bf16Launch select_bf16_n3712_k2688(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2688_k3712(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n131072_k2688(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n10304_k2688(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2688_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k2688(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n256_k2688(std::int32_t tokens);
+
+// The Lightning 30B's DFlash companion: the tap fusion, the body's MLPs and their down projection.
+// Same schedule as the rows above; they are what a draft round reads at 2-9 rows.
+[[nodiscard]] Bf16Launch select_bf16_n2688_k16128(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n6144_k2688(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2688_k6144(std::int32_t tokens);
+
+// The dense fallback for a problem no registered shape matches. Two of Nemotron-H's widths, the
+// latent projections, left it for their own routes above; every other BF16 problem in the family
+// still lands here, as does anything else nobody has written a kernel for (see bf16_generic.cuh).
+// N, K and T are read from the call, so one route serves every shape.
+void bf16_generic_launch(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

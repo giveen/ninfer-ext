@@ -64,12 +64,18 @@ struct DFlashFeatureSink {
 class VisionPrefillSession;
 class PleGather;
 
-class Qwen4ExpertPager;
+} // namespace ninfer::models::qwen3_5::execution
+
+namespace ninfer::models::execution {
+class ExpertPager;
+} // namespace ninfer::models::execution
+
+namespace ninfer::models::qwen3_5::execution {
 
 // Program-owned mutable resources of the Qwen4Exp route. The expert pager and PLE state are
 // performance or recurrent side state; the Program allocates them once and binds them here.
 struct Qwen4Runtime {
-    Qwen4ExpertPager* experts = nullptr;
+    models::execution::ExpertPager* experts = nullptr;
     Tensor ple_states; // BF16 [history * residual, StateImage slots]
     Tensor ple_record; // BF16 [residual, record_width, rows] speculative conv inputs, or empty
     Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch

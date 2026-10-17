@@ -1,0 +1,208 @@
+// The Nemotron-H latent round trip: `fc1_latent` [1024, 4096] and `fc2_latent` [4096, 1024], the
+// two projections that bracket a MoE bank's routed experts, at the model's hidden width (4096) and
+// its latent width (1024). Both used to reach the dense fallback (bf16_generic.cuh), which is 253
+// us for the 8 MB of weights either one reads: at one token it is four blocks of 256 threads, one
+// scalar BF16 load per FMA.
+//
+// The parallelism to take is over output rows, which is the shape's own axis: the more blocks the
+// scheduler can place on distinct SMs, the more outstanding sector requests the partition can hold,
+// and at one token that is the only lever there is. That is why the single-token route's blocks are
+// a quarter warp (`kThreadsPerCtaNarrow` below, measured) and the wide route's are a whole one, and
+// why either way each lane loads a 32-byte pack, a whole sector, so the fallback's over-fetch (one
+// 2-byte element per lane, every lane in a different sector) disappears.
+//
+// What is deliberately *not* taken from the gemv and SIMT schedules beside this file is their
+// reduction. Both hand one row's K axis to the lanes of a warp and sum the lane partials with
+// `warp_reduce_sum`, which reassociates. This family's forward walk holds the dense fallback's own
+// arithmetic as its reference -- one FP32 accumulator per output element, K ascending, one BF16
+// rounding at the store -- so a warp-reduced row disagrees with the route it replaces wherever a
+// partial sum lands the other side of a BF16 rounding boundary: host-measured on these two shapes,
+// ~0.05% and ~0.02% of output elements move by one BF16 ulp. Instead every lane owns a whole row
+// and walks it in ascending order through `accumulate_bf16_packs<..., 1>`: with a single
+// accumulator chain, gemv.cuh's own accumulate loop writes `accumulators[0]` in ascending column
+// order, which is exactly the fallback's `fmaf(w, x, acc)` chain. The rest of what this file takes
+// from the same header -- `Bf16GemvPack<16>`, `load_bf16_pack`, `load_bf16_weight_pack` -- is what
+// moves 32 bytes per instruction instead of two.
+//
+// `TokensPerThread` is the per-token choice: a weight pack is loaded once and reused across the
+// batch, which is what keeps a wide pass from re-reading the matrix per token. It does not touch
+// the order -- every (token, row) keeps its own single accumulator and its own ascending K walk --
+// so both routes are bit-identical to the fallback and to each other. One token per thread is the
+// route that asks for the device's SMs at single-token decode, where there are only `N` output
+// elements to go around; four is worth it as soon as there is a second token to share a weight pack
+// with.
+
+#include "core/device.h"
+#include "ops/linear/bf16/bf16_config.h"
+#include "ops/linear/bf16/bf16_gemv.cuh"
+#include "ops/linear/bf16/bf16_launch.h"
+#include "ops/linear/bf16/bf16_shapes.h"
+
+#include <cstdint>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+namespace ninfer::ops::detail {
+namespace {
+
+// One 16-wide pack is 32 bytes: one lane covers a whole memory sector per weight load, and
+// `Bf16GemvPack<16>` is the widest pack gemv.cuh's loaders know.
+constexpr int kValuesPerStep = 16;
+
+// One warp per block is the wide route's geometry. Its whole point is that the 1024 or 4096 output
+// rows it has to spread over the device become 1024 or 4096 *lanes*, and the more blocks the
+// scheduler can place on distinct SMs, the more outstanding sector requests the partition can hold.
+// A block wider than a warp would trade that for occupancy this kernel cannot use: it is one
+// dependent FMA chain per lane, so there is nothing to switch to.
+constexpr int kThreadsPerCta = 32;
+
+// The single-token route's blocks are a quarter warp, measured rather than reasoned: at one token
+// there is one row per lane and no second token to amortize anything over, so the only way to raise
+// the request count is more blocks, and a block of 8 threads puts four times as many of them on the
+// device at the cost of three quarters of each warp's lanes sitting idle through a chain they were
+// never given. On the two shapes below, cold, best of 30 with a 256 MiB flush, median-free
+// lower-bound in µs (cta 32 -> cta 8): (1024, 4096) 45.0 -> 40.9 (186 -> 205 GB/s) and (4096, 1024)
+// 17.5 -> 16.4 (480 -> 513 GB/s), reproduced over three separate runs (40.93/40.93/40.96 and
+// 16.38/16.38/16.38). 8 divides both output widths, so no row's chain changes and every sweep
+// variant stayed bit-identical to the fallback.
+//
+// It is deliberately *not* used for the multi-token route: at T = 128 with `TokensPerThread = 4`
+// the block count is already 1024 or 4096, so the extra blocks buy nothing and the idle lanes are
+// pure loss - the same sweep measures (1024, 4096) 137.2 -> 184.3 µs and (4096, 1024) 118.8 ->
+// 149.5 µs when the wide route is given blocks of 8 instead of 32.
+constexpr int kThreadsPerCtaNarrow = 8;
+
+// The two schedule knobs are template parameters rather than literals so a development sweep can
+// instantiate the candidates around them with one compilation; production selects the defaults and
+// nothing else. `ThreadsPerCta` is how many output rows a block covers, which is the device's share
+// of the work at a fixed row count, and `Unroll` is how many 32-byte steps are in flight per lane
+// before the FMA chain consumes them.
+constexpr int kUnrollSteps = 8;
+
+// One lane owns one output row of `TokensPerThread` consecutive tokens and walks K ascending with a
+// single FP32 accumulator per (token, row). The tail token group reads the last token again rather
+// than predicating the inner loop: the repeated chain is computed and discarded, where a guard
+// would sit in the body of every step.
+template <class Geometry, int TokensPerThread, int ThreadsPerCta = kThreadsPerCta,
+          int Unroll = kUnrollSteps>
+__global__ __launch_bounds__(ThreadsPerCta) void bf16_latent_row_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out, const std::int32_t tokens) {
+    static_assert((Geometry::kInputRows % kValuesPerStep) == 0);
+    static_assert((Geometry::kOutputRows % ThreadsPerCta) == 0);
+    constexpr int kSteps = Geometry::kInputRows / kValuesPerStep;
+
+    const std::int32_t row    = static_cast<std::int32_t>(blockIdx.y) * ThreadsPerCta + threadIdx.x;
+    const std::int32_t token0 = static_cast<std::int32_t>(blockIdx.x) * TokensPerThread;
+    const std::int32_t last   = tokens - 1;
+
+    const __nv_bfloat16* token_base[TokensPerThread];
+#pragma unroll
+    for (int slot = 0; slot < TokensPerThread; ++slot) {
+        token_base[slot] =
+            x + static_cast<std::int64_t>(min(token0 + slot, last)) * Geometry::kInputRows;
+    }
+    const __nv_bfloat16* weight_row =
+        weight + static_cast<std::int64_t>(row) * Geometry::kInputRows;
+
+    float accumulator[TokensPerThread][1] = {};
+#pragma unroll(Unroll)
+    for (int step = 0; step < kSteps; ++step) {
+        const int offset = step * kValuesPerStep;
+        const Bf16GemvPack<kValuesPerStep> weight_pack =
+            load_bf16_weight_pack<Bf16WeightCache::Default, kValuesPerStep>(weight_row + offset);
+#pragma unroll
+        for (int slot = 0; slot < TokensPerThread; ++slot) {
+            const Bf16GemvPack<kValuesPerStep> activation_pack =
+                load_bf16_pack<kValuesPerStep>(token_base[slot] + offset);
+            accumulate_bf16_packs<kValuesPerStep, 1>(weight_pack, activation_pack,
+                                                     accumulator[slot]);
+        }
+    }
+
+#pragma unroll
+    for (int slot = 0; slot < TokensPerThread; ++slot) {
+        const std::int32_t token = token0 + slot;
+        if (token < tokens) {
+            out[static_cast<std::int64_t>(token) * Geometry::kOutputRows + row] =
+                __float2bfloat16_rn(accumulator[slot][0]);
+        }
+    }
+}
+
+template <class Geometry, int TokensPerThread, int ThreadsPerCta = kThreadsPerCta>
+void launch_bf16_latent_row(const Tensor& x, const Weight& weight, Tensor& out,
+                            cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    const dim3 grid((tokens + TokensPerThread - 1) / TokensPerThread,
+                    Geometry::kOutputRows / ThreadsPerCta);
+    bf16_latent_row_kernel<Geometry, TokensPerThread, ThreadsPerCta>
+        <<<grid, ThreadsPerCta, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                             static_cast<const __nv_bfloat16*>(weight.qdata),
+                                             static_cast<__nv_bfloat16*>(out.data), tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry>
+Bf16Launch select_latent(std::int32_t tokens) {
+    if (tokens == 1) {
+        // The narrow block exists to raise the *block* count when the output is small (1024 or
+        // 4096 rows); it costs three quarters of each warp's lanes. A wide output (the 131072-row
+        // head) already fills the device with whole warps, so the narrow geometry only loses there.
+        return launch_bf16_latent_row<Geometry, 1, kThreadsPerCtaNarrow>;
+    }
+    return launch_bf16_latent_row<Geometry, 4>;
+}
+
+} // namespace
+
+Bf16Launch select_bf16_n1024_k4096(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<1024, 4096>>(tokens);
+}
+
+Bf16Launch select_bf16_n4096_k1024(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<4096, 1024>>(tokens);
+}
+
+
+// The Lightning 30B's projections: every one of them reached the dense fallback before these,
+// because the registry keys on (N, K) and none of these widths were recorded. They are the same
+// schedule as the latent pair -- one lane owns a whole output row and walks K ascending through
+// 32-byte packs -- which is what makes them bit-identical to the fallback they displace.
+Bf16Launch select_bf16_n3712_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<3712, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k3712(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 3712>>(tokens);
+}
+Bf16Launch select_bf16_n131072_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<131072, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n10304_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<10304, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k4096(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 4096>>(tokens);
+}
+Bf16Launch select_bf16_n4096_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<4096, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n256_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<256, 2688>>(tokens);
+}
+// The DFlash companion of that model: `fc` fuses the six taps into the draft's width, and the body's
+// gate/up/down run at its 6144-wide MLP. A draft round issues 2..9 rows, which is the fallback's
+// worst case -- one lane per row with no token reuse -- so these shapes are where the row schedule
+// matters most.
+Bf16Launch select_bf16_n2688_k16128(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 16128>>(tokens);
+}
+Bf16Launch select_bf16_n6144_k2688(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<6144, 2688>>(tokens);
+}
+Bf16Launch select_bf16_n2688_k6144(std::int32_t tokens) {
+    return select_latent<Bf16Geometry<2688, 6144>>(tokens);
+}
+
+} // namespace ninfer::ops::detail

@@ -70,6 +70,16 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
 }
 
+// Slot-cache slots. Zero is a value here rather than an error: it is the structural pool, which is
+// the default and the size every recorded number was taken with.
+std::int32_t parse_expert_cache_slots(const char* text) {
+    const std::uint64_t value = parse_u64(text, "expert-cache-slots");
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(std::string("invalid expert-cache-slots: ") + text);
+    }
+    return static_cast<std::int32_t>(value);
+}
+
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "none") { return ReasoningEffort::None; }
     if (text == "minimal") { return ReasoningEffort::Minimal; }
@@ -84,15 +94,43 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 // Flags a `ninfer_serve_profile` may carry that the one-shot CLI also understands. Serve-only
 // options (concurrency, prefix caching, host tiers) are dropped when a profile is loaded here.
 constexpr std::string_view kCliProfileFlags[] = {
-    "prompt",           "messages",         "chat-template",      "max-new",
-    "max-context",      "kv-capacity",      "expert-cache",       "ngram-residency",
-    "prefill-chunk",    "device",           "kv-dtype",           "spec",
-    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "draft-tree",
-    "lookup-drafts",    "lookup-min-match", "raw-output",         "print-token-ids",
-    "no-thinking",      "thinking-budget",  "reasoning-effort",   "vision",
-    "no-cuda-graph",    "stop-token-id",    "stop",               "reasoning-stop",
-    "temperature",      "top-p",            "top-k",              "min-p",
-    "presence-penalty", "frequency-penalty", "seed",             "greedy",
+    "prompt",
+    "messages",
+    "chat-template",
+    "max-new",
+    "max-context",
+    "kv-capacity",
+    "expert-cache",
+    "expert-cache-slots",
+    "ngram-residency",
+    "prefill-chunk",
+    "device",
+    "kv-dtype",
+    "spec",
+    "draft-tokens",
+    "lm-head-draft",
+    "fixed-draft",
+    "draft-tree",
+    "lookup-drafts",
+    "lookup-min-match",
+    "raw-output",
+    "print-token-ids",
+    "no-thinking",
+    "thinking-budget",
+    "reasoning-effort",
+    "vision",
+    "no-cuda-graph",
+    "stop-token-id",
+    "stop",
+    "reasoning-stop",
+    "temperature",
+    "top-p",
+    "top-k",
+    "min-p",
+    "presence-penalty",
+    "frequency-penalty",
+    "seed",
+    "greedy",
     "log-level",
 };
 
@@ -120,7 +158,8 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--profile FILE]\n"
-           "       [--device N] [--expert-cache auto|MiB] [--ngram-residency auto|mapped|stream]\n"
+           "       [--device N] [--expert-cache auto|MiB] [--expert-cache-slots N]\n"
+           "       [--ngram-residency auto|mapped|stream]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec "
            "mtp|dflash|dflash2|eagle3 --draft-tokens N]\n"
            "       [--lm-head-draft] [--fixed-draft] [--draft-tree N]\n"
@@ -151,8 +190,17 @@ std::string usage_text(const char* argv0) {
            "commit more than the MTP drafts; always uses every proposal (measurement).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
-           "--expert-cache sizes the device cache of host-resident routed experts (Qwen4Exp);\n"
-           "auto gives it the device memory left after the KV floor.\n"
+           "--expert-cache sizes the device cache of host-resident routed experts; auto gives it\n"
+           "           the device memory left after the lane states, the pass's workspace and the\n"
+           "           K/V floor, which the cache never takes from. 0 keeps every expert in host\n"
+           "           memory and reads them in place.\n"
+           "--expert-cache-slots sizes the per-expert slot cache a family that gathers routed\n"
+           "           experts keeps, in slots; the two whole-bank staging buffers are added to "
+           "it\n"
+           "           and are its floor. It is taken out of the same device budget as the "
+           "resident\n"
+           "           banks, one slot's bytes for one slot's worth of bank not uploaded, so a\n"
+           "           larger cache is fewer banks. 0 -- the default -- is the structural pool.\n"
            "--ngram-residency reads the Qwen4Exp n-gram table through the page cache (mapped) or\n"
            "with batched direct I/O (stream); auto maps it when free host memory covers it.\n"
            "--kv-capacity auto leaves " +
@@ -202,7 +250,7 @@ Options parse_options(int argc, char** argv) {
         const std::string_view arg(args[i]);
         // Profile arguments are expanded first, so everything before this offset came from it.
         const bool from_profile = i < 2 + profile_args.size();
-        const auto value = [&](std::string_view flag) -> const char* {
+        const auto value        = [&](std::string_view flag) -> const char* {
             if (++i >= args.size()) {
                 throw std::invalid_argument(std::string(flag) + " needs a value");
             }
@@ -236,6 +284,8 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--expert-cache") {
             options.expert_cache = product::parse_expert_cache(value(arg));
+        } else if (arg == "--expert-cache-slots") {
+            options.expert_cache.cache_slots = parse_expert_cache_slots(value(arg));
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = product::parse_ngram_residency(value(arg));
         } else if (arg == "--prefill-chunk") {

@@ -59,6 +59,35 @@ def array_source(values: torch.Tensor, label: str) -> LogicalSource:
     )
 
 
+def pad_matrix(source: LogicalSource, rows: int, columns: int) -> LogicalSource:
+    """`source` (2-D) zero-padded to `rows` x `columns`, keeping its top-left corner.
+
+    Exact, not an approximation: the extra entries are exactly zero, so a bank whose width the
+    engine's kernels require to be a multiple of 128 can carry a narrower real matrix without
+    changing any sum (a zero row's activation is zero; a zero column contributes nothing).
+    """
+    real_rows, real_columns = source.shape
+    if rows < real_rows or columns < real_columns:
+        raise ValueError(
+            f"{source.label}: cannot pad {source.shape} down to ({rows}, {columns})"
+        )
+    cached: torch.Tensor | None = None
+
+    def full() -> torch.Tensor:
+        nonlocal cached
+        if cached is None:
+            base = source.values().reshape(real_rows, real_columns)
+            padded = torch.zeros((rows, columns), dtype=base.dtype)
+            padded[:real_rows, :real_columns] = base
+            cached = padded.reshape(-1)
+        return cached
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        return full()[begin:end]
+
+    return LogicalSource((rows, columns), f"padded({source.label})", read)
+
+
 def transpose_source(
     source: LogicalSource, axes: tuple[int, ...], shape: tuple[int, ...]
 ) -> LogicalSource:

@@ -1,20 +1,27 @@
 set(ninfer_op_tests
   add_bias
+  expert_pool_geometry
   gelu
   gelu_mul
   gemma_moe_router
   gemma_moe_experts
+  nemotron_h_moe_router
+  nemotron_h_moe_experts
+  relu2
   silu_mul
   residual_add
   residual_add_norm
+  fp32_residual_routes
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail
+  gated_group_rmsnorm
   gated_rmsnorm
   l2norm
   mul_scalar
   gated_delta_net
   kimi_delta_attention
+  mamba2_scan
   causal_conv1d_silu
   layer_norm
   embedding
@@ -29,6 +36,7 @@ set(ninfer_op_tests
   cast
   causal_compact_attention
   compact_kv_rows
+  grouped_tap_apply
   prepare_ragged_prefix
   scale_columns
   sliding_causal_attention
@@ -47,6 +55,13 @@ foreach(op IN LISTS ninfer_op_tests)
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
     LIBRARIES ninfer_ops)
 endforeach()
+
+# The plane-addressed route of the same Op: the registered-format (block-scaled NVFP4) entry point
+# the offload path stages a bank into, with the staged and in-place placements required to agree
+# bit for bit.
+ninfer_add_op_test(ninfer_nemotron_h_moe_experts_planes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nemotron_h_moe_experts_planes.cpp"
+  LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"

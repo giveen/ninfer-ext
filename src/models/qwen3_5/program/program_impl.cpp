@@ -303,6 +303,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         Tensor owner     = layout.owner.bind(backing);
         Tensor stamp     = layout.stamp.bind(backing);
         Tensor counters  = layout.counters.bind(backing);
+        const ops::ExpertPoolGeometry& pool = *parameters.qwen4->expert_pool;
         const ops::ExpertCacheState cache{
             .slot_of    = static_cast<std::int32_t*>(slot_of.data),
             .owner      = static_cast<std::int32_t*>(owner.data),
@@ -311,14 +312,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             .statistics = static_cast<unsigned long long*>(counters.data) + 1,
             .slots      = layout.slots,
             .layers     = layout.cache_layers,
+            .slot_entries = pool.slot_entries(),
+            .pool_stride  = pool.pool_stride(),
             .pool       = static_cast<std::byte*>(layout.pool.bind(backing).data)};
         CUDA_CHECK(cudaMemsetAsync(slot_of.data, 0xFF, slot_of.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(owner.data, 0xFF, owner.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(stamp.data, 0, stamp.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(counters.data, 0, counters.bytes(), device.stream));
-        static_assert(execution::Qwen4ExpertPager::kBankSlots == kQwen4StagedBankSlots,
-                      "the planned pool tail must be exactly the pager's bank slots");
-        qwen4_experts.emplace(parameters.qwen4->experts, cache, kQwen4StagedColumns,
+        // The resolve ids are the routed op's `[top-k,T]`, so the pager's column capacity is the
+        // top-k the op fixed.
+        qwen4_experts.emplace(pool, cache, kQwen4StagedColumns, ops::kOffloadMoeTopK,
                               layout.bank_slot, layout.base_slots);
         if (layout.wide_bytes != 0) {
             auto* pool_base = static_cast<std::byte*>(layout.pool.bind(backing).data);
@@ -497,7 +500,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             execution::output_logits(parameters, hidden, logits, work, device.stream);
             std::size_t logits_entries = 0;
             if (logits_sink) {
-                // One staging buffer sized for a full tile, so a smaller later flush never reallocates.
+                // One staging buffer sized for a full tile, so a smaller later flush never
+                // reallocates.
                 logits_entries = vocab * static_cast<std::size_t>(columns);
                 if (!score_logits_host ||
                     score_logits_host->size() < vocab * kCausalScoreTile * sizeof(std::uint16_t)) {
@@ -650,7 +654,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         const std::int32_t slots = qwen4_experts->cache().slots;
         out.expert_cache_slots   = static_cast<std::uint32_t>(slots);
         out.expert_cache_bytes   = static_cast<std::size_t>(slots) *
-                                 static_cast<std::size_t>(parameters.qwen4->experts.slot_bytes);
+                                 static_cast<std::size_t>(parameters.qwen4->expert_pool->pool_stride());
         if (ple_gather) {
             out.ngram_residency =
                 ple_gather->streamed() ? NgramResidency::Stream : NgramResidency::Mapped;

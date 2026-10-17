@@ -215,12 +215,14 @@ __device__ __forceinline__ std::uint32_t eviction_key(unsigned long long stamp,
 
 __global__ void __launch_bounds__(kResolveThreads)
     expert_cache_resolve_kernel(const std::int32_t* __restrict__ ids, std::int32_t assignments,
-                                std::int32_t layer, ExpertCacheState cache,
+                                ExpertBankSpan bank, ExpertCacheState cache,
                                 std::int32_t* __restrict__ slot_ids,
                                 std::int32_t* __restrict__ misses) {
-    __shared__ int used[E];
-    __shared__ int slot_for[E];
-    __shared__ int miss_expert[E];
+    // One entry per expert of the resolved bank, so the tables cover the widest bank the cache
+    // accepts; a narrower layer's entries past its own count stay untouched.
+    __shared__ int used[kMaxBankExperts];
+    __shared__ int slot_for[kMaxBankExperts];
+    __shared__ int miss_expert[kMaxBankExperts];
     __shared__ int scratch[32];
     __shared__ unsigned long long now_s;
     __shared__ std::uint32_t prefix_s;
@@ -229,17 +231,42 @@ __global__ void __launch_bounds__(kResolveThreads)
     __shared__ int miss_count_s;
     __shared__ int emitted_s;
     __shared__ int ties_s;
+    __shared__ int outside_s;
     const int tid = static_cast<int>(threadIdx.x);
-    if (tid == 0) { now_s = atomicAdd(cache.clock, 1ULL) + 1ULL; }
-    for (int e = tid; e < E; e += blockDim.x) { used[e] = 0; }
+    if (tid == 0) {
+        now_s     = atomicAdd(cache.clock, 1ULL) + 1ULL;
+        outside_s = 0;
+    }
+    for (int e = tid; e < bank.experts; e += blockDim.x) {
+        used[e]     = 0;
+        slot_for[e] = -1;
+    }
     __syncthreads();
-    for (int i = tid; i < assignments; i += blockDim.x) { used[ids[i]] = 1; }
+    // An id outside the resolved layer's own bank has no entry, so it is counted and left to
+    // resolve to -1 rather than written into a table that covers only `bank.experts` entries. The
+    // offload path takes the expert count from the layer's descriptor; this guard keeps a wrong one
+    // from corrupting the shared tables or handing a consumer a slot that does not exist. The count
+    // lands in `statistics[2]` so a caller can refuse rather than run on.
+    int outside = 0;
+    for (int i = tid; i < assignments; i += blockDim.x) {
+        const int id = ids[i];
+        if (id >= 0 && id < bank.experts) {
+            used[id] = 1;
+        } else {
+            ++outside;
+        }
+    }
+    // One block-wide count, so the counter is the call's and not one thread's slice of it.
+    if (outside > 0) { atomicAdd(&outside_s, outside); }
     __syncthreads();
+    if (tid == 0 && outside_s > 0) {
+        atomicAdd(&cache.statistics[2], static_cast<unsigned long long>(outside_s));
+    }
     const unsigned long long now = now_s;
     // Hits refresh their stamp; misses are listed in ascending expert order.
     int miss = 0;
-    if (tid < E && used[tid]) {
-        const int slot = cache.slot_of[layer * E + tid];
+    if (tid < bank.experts && used[tid]) {
+        const int slot = cache.slot_of[bank.first_expert + tid];
         if (slot >= 0) {
             cache.stamp[slot] = now;
             slot_for[tid]     = slot;
@@ -254,7 +281,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         miss_count_s = miss_total;
         atomicAdd(&cache.statistics[1], static_cast<unsigned long long>(miss_total));
     }
-    int hit  = tid < E && used[tid] && !miss ? 1 : 0;
+    int hit  = tid < bank.experts && used[tid] && !miss ? 1 : 0;
     int hits = 0;
     (void)block_exclusive_scan(hit, scratch, hits);
     if (tid == 0) { atomicAdd(&cache.statistics[0], static_cast<unsigned long long>(hits)); }
@@ -333,12 +360,12 @@ __global__ void __launch_bounds__(kResolveThreads)
                     const int expert = miss_expert[j];
                     const int old    = cache.owner[s];
                     if (old >= 0) { cache.slot_of[old] = -1; }
-                    cache.owner[s]                    = layer * E + expert;
-                    cache.slot_of[layer * E + expert] = s;
-                    cache.stamp[s]                    = now;
-                    slot_for[expert]                  = s;
-                    misses[1 + 2 * j]                 = s;
-                    misses[2 + 2 * j]                 = expert;
+                    cache.owner[s]                            = bank.first_expert + expert;
+                    cache.slot_of[bank.first_expert + expert] = s;
+                    cache.stamp[s]                            = now;
+                    slot_for[expert]                          = s;
+                    misses[1 + 2 * j]                         = s;
+                    misses[2 + 2 * j]                         = expert;
                 }
             }
             __syncthreads();
@@ -351,7 +378,10 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
     __syncthreads();
     if (tid == 0) { misses[0] = min(need_total, emitted_s); }
-    for (int i = tid; i < assignments; i += blockDim.x) { slot_ids[i] = slot_for[ids[i]]; }
+    for (int i = tid; i < assignments; i += blockDim.x) {
+        const int id = ids[i];
+        slot_ids[i]  = (id >= 0 && id < bank.experts) ? slot_for[id] : -1;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -365,8 +395,10 @@ constexpr int kFetchCtas   = 64;
 
 __global__ void __launch_bounds__(256)
     expert_cache_fetch_kernel(ExpertWeights bank, const std::int32_t* __restrict__ misses,
-                              std::int32_t max_misses, std::byte* pool) {
-    // The layout's planes are 16-byte multiples; the slot is its planes back to back.
+                              std::int32_t max_misses, ExpertCacheState cache) {
+    // The layout's planes are 16-byte multiples; the slot is its planes back to back. `per_expert`
+    // is the bank's own expert, while the slot the copy lands in is the pool's, which is the widest
+    // bank's size: a narrower layer fills a shorter run at the front of its slot.
     const ExpertLayout& layout        = bank.layout;
     const std::int64_t per_expert     = layout.slot_bytes / 16;
     const std::int64_t total  = static_cast<std::int64_t>(min(misses[0], max_misses)) * per_expert;
@@ -385,7 +417,7 @@ __global__ void __launch_bounds__(256)
         const std::int64_t slot   = misses[1 + 2 * j];
         const std::int64_t expert = misses[2 + 2 * j];
         const auto* src = reinterpret_cast<const uint4*>(bank.base[p] + expert * bank.stride[p]);
-        auto* dst       = reinterpret_cast<uint4*>(pool + slot * layout.slot_bytes) + offset;
+        auto* dst       = reinterpret_cast<uint4*>(cache.pool + slot * cache.pool_stride) + offset;
         dst[v]          = src[v];
     }
 }
@@ -402,20 +434,22 @@ __global__ void __launch_bounds__(256)
 }
 
 // CTA (e, chunk) copies chunk `chunk` of each plane of expert e into the staged bank when the
-// snapshot marked e resident: from its slot if the device still holds it, else from the bank.
+// snapshot marked e resident: from its slot if the device still holds it, else from the bank. The
+// layer's entry base and expert count come from its span, so a pool whose layers differ addresses
+// each layer's own experts and slots.
 __global__ void __launch_bounds__(256)
-    expert_cache_stage_kernel(ExpertCacheState cache, std::int32_t layer,
-                              const std::int32_t* __restrict__ resident, ExpertWeights bank,
+    expert_cache_stage_kernel(ExpertCacheState cache, ExpertBankSpan bank,
+                              const std::int32_t* __restrict__ resident, ExpertWeights weights,
                               ExpertWeights staged) {
     const int expert = static_cast<int>(blockIdx.x);
-    const std::int64_t entry = static_cast<std::int64_t>(layer) * E + expert;
+    const std::int64_t entry = static_cast<std::int64_t>(bank.first_expert) + expert;
     if (resident[entry] < 0) { return; }
     const std::int32_t slot    = cache.slot_of[entry];
-    const ExpertLayout& layout = bank.layout;
+    const ExpertLayout& layout = weights.layout;
     std::int64_t plane_offset  = 0;
     for (int p = 0; p < layout.planes; ++p) {
-        const std::byte* from = slot >= 0 ? cache.pool + slot * layout.slot_bytes + plane_offset
-                                          : bank.base[p] + expert * bank.stride[p];
+        const std::byte* from = slot >= 0 ? cache.pool + slot * cache.pool_stride + plane_offset
+                                          : weights.base[p] + expert * weights.stride[p];
         const auto* src          = reinterpret_cast<const uint4*>(from);
         auto* dst                = reinterpret_cast<uint4*>(
             const_cast<std::byte*>(staged.base[p]) + expert * staged.stride[p]);
@@ -899,20 +933,19 @@ void moe_route_share_padding_launch(Tensor& ids, const Tensor& valid_columns, st
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_cache_resolve_launch(const Tensor& ids, std::int32_t layer,
+void expert_cache_resolve_launch(const Tensor& ids, ExpertBankSpan bank,
                                  const ExpertCacheState& cache, Tensor& slot_ids, Tensor& misses,
                                  cudaStream_t stream) {
     expert_cache_resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), static_cast<std::int32_t>(ids.numel()), layer,
+        static_cast<const std::int32_t*>(ids.data), static_cast<std::int32_t>(ids.numel()), bank,
         cache, static_cast<std::int32_t*>(slot_ids.data), static_cast<std::int32_t*>(misses.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_cache_stage_launch(const ExpertCacheState& cache, std::int32_t layer,
-                               const std::int32_t* resident, const ExpertWeights& bank,
+void expert_cache_stage_launch(const ExpertCacheState& cache, ExpertBankSpan bank,
+                               const std::int32_t* resident, const ExpertWeights& weights,
                                const ExpertWeights& staged, cudaStream_t stream) {
-    expert_cache_stage_kernel<<<dim3(E, kFetchChunks), 256, 0, stream>>>(cache, layer, resident,
-                                                                          bank, staged);
+    expert_cache_stage_kernel<<<dim3(bank.experts, kFetchChunks), 256, 0, stream>>>(cache, bank, resident, weights, staged);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -927,7 +960,7 @@ void expert_cache_fetch_launch(const ExpertWeights& bank, const Tensor& misses,
                                std::int32_t max_misses, const ExpertCacheState& cache,
                                cudaStream_t stream) {
     expert_cache_fetch_kernel<<<kFetchCtas, 256, 0, stream>>>(
-        bank, static_cast<const std::int32_t*>(misses.data), max_misses, cache.pool);
+        bank, static_cast<const std::int32_t*>(misses.data), max_misses, cache);
     CUDA_CHECK(cudaGetLastError());
 }
 

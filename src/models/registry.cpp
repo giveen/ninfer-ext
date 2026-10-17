@@ -18,6 +18,13 @@ Architecture resolve_architecture(std::string_view architecture, std::string_vie
     if (architecture == "Gemma4ForCausalLM" && model_type == "gemma4_text") {
         return Architecture::Gemma4;
     }
+    // The checkpoint's own config names the outer vision-language model
+    // (`NemotronH_Omni_Reasoning_V3`) and its language part separately; the language part is what
+    // this engine implements, and it declares itself `NemotronHPuzzleForCausalLM` /
+    // `nemotron_h_puzzle`.
+    if (architecture == "NemotronHPuzzleForCausalLM" && model_type == "nemotron_h_puzzle") {
+        return Architecture::NemotronHPuzzle;
+    }
     throw std::invalid_argument("unsupported architecture/config pair " +
                                 std::string(architecture) + "/" + std::string(model_type));
 }
@@ -32,6 +39,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen4ExpForCausalLM";
     case Architecture::Gemma4:
         return "Gemma4ForCausalLM";
+    case Architecture::NemotronHPuzzle:
+        return "NemotronHPuzzleForCausalLM";
     }
     return {};
 }
