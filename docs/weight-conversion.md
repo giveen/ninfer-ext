@@ -61,6 +61,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_27b_quasar_nvfp4` | Every Text linear imported NVFP4 (QUASAR QAT), GDN a/b decoded to BF16, FP8 embedding/head | `quantized`; `--model` is the same checkpoint |
 | `qwen3_8_flash_next_nvfp4` | Imported NVFP4 routed experts (MTP bank re-encoded from block FP8), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | None; `--model` is the ModelOpt NVFP4 checkpoint |
 | `qwen3_8_flash_next_bf16` | Every Text/MTP projection at full BF16 precision, experts in the NVFP4 recipe's per-layer banks, FP8 n-gram table (the EXL3 expert quantizer's input) | None |
 | `qwen3_8_flash_next_exl3` | EXL3 routed experts from `ninfer-quantize` (one bank per layer with an input-scale set per expert), 4-bit (`q4_g32_fp16_rows`) n-gram table, Q6 projections, Q8 token embedding, Q6 output head | `quantized` |
@@ -134,6 +135,23 @@ python3 -m tools.convert \
   --proposal \
   --name qwen3.8-27b \
   --out models/qwen3_8_27b_nvfp4.ninfer
+```
+
+[QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
+stores all 496 Text linears as compressed-tensors NVFP4 and keeps the embedding, head, MTP and
+Vision unquantized, so the one checkpoint is both the main and the `quantized` source:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-QUASAR-NVFP4 \
+  --recipe qwen3_8_27b_quasar_nvfp4 \
+  --source quantized=/path/to/Qwen3.8-27B-QUASAR-NVFP4 \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --proposal \
+  --name qwen3.8-27b-quasar \
+  --out models/qwen3_8_27b_quasar_nvfp4.ninfer
 ```
 
 MTP and Vision use the main source. DFlash, DFlash2 and EAGLE3 use the corresponding named source,

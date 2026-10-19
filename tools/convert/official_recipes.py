@@ -308,6 +308,38 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+def qwen3_8_27b_quasar_nvfp4(model, recipe, sources):
+    """Qwen3.8-27B from the QUASAR QAT checkpoint: every Text linear imported as stored NVFP4.
+
+    The checkpoint is its own main source: embedding, LM head, norms, MTP and Vision are
+    unquantized there. GDN a/b are stored NVFP4 too but have no NVFP4 route, so they stay
+    separate and decoded to their logical values, as `qwen3_6_27b_nvfp4` keeps them.
+    """
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    quantized = sources["quantized"]
+    for name in ("text/token_embedding", "text/output_head"):
+        recipe.assign(name, format=FP8, method=fp8_row_maxabs)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if not parameter.projection:
+            recipe.assign(name, source=model.source(name, quantized))
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            recipe.assign(name, source=model.source(name, quantized))
+            continue
+        recipe.assign(
+            name,
+            format="nvfp4",
+            method=import_encoded,
+            source=model.source(name, quantized, "nvfp4"),
+            activation_policy="AllowA4",
+        )
+
+
 _MOE_EXPERT_SOURCE = {
     "gate": "gate_proj",
     "up": "up_proj",
@@ -851,6 +883,7 @@ RECIPES = {
     "qwen3_8_27b_exl3": qwen3_8_27b_exl3,
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
+    "qwen3_8_27b_quasar_nvfp4": qwen3_8_27b_quasar_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_6_35b_a3b_nvfp4": qwen3_6_35b_a3b_nvfp4,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
