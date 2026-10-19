@@ -3,9 +3,20 @@
 
 #include <cuda_runtime.h>
 
+#if defined(_WIN32)
+// windows.h defines min and max as macros; the headers above are already parsed, and this keeps a
+// later include or call site from silently losing std::min/std::max.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -30,8 +41,28 @@ bool active() { return trace.failure != Failure::None; }
 
 } // namespace
 
-// Link-time wrappers affect only this test executable. The production path has no fault hooks.
+// The wrappers affect only this test executable. The production path has no fault hooks.
+//
+// POSIX redirects the runtime calls at link time: --wrap makes the linker bind every reference to
+// cudaMalloc to __wrap_cudaMalloc and define __real_cudaMalloc for the original. MSVC has no
+// equivalent, and /alternatename cannot stand in: it maps only a symbol that nothing defines, while
+// the runtime arrives through an import library that does define these. Windows therefore
+// redirects them at run time instead, through the executable's import address table, which every
+// call to the runtime reaches -- whether the compiler emitted a direct call to the import thunk or
+// an indirect call through the import slot -- so replacing the slot's value catches all of them and
+// the value it held is the function the wrapper calls through.
 extern "C" {
+#if defined(_WIN32)
+cudaError_t(CUDARTAPI* __real_cudaMalloc)(void**, std::size_t)                      = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaMallocHost)(void**, std::size_t)                  = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaFree)(void*)                                      = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaFreeHost)(void*)                                  = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaEventCreateWithFlags)(cudaEvent_t*, unsigned int) = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaEventRecord)(cudaEvent_t, cudaStream_t)           = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaMemcpyAsync)(void*, const void*, std::size_t, cudaMemcpyKind,
+                                               cudaStream_t)                        = nullptr;
+cudaError_t(CUDARTAPI* __real_cudaStreamSynchronize)(cudaStream_t)                  = nullptr;
+#else
 cudaError_t CUDARTAPI __real_cudaMalloc(void**, std::size_t);
 cudaError_t CUDARTAPI __real_cudaMallocHost(void**, std::size_t);
 cudaError_t CUDARTAPI __real_cudaFree(void*);
@@ -41,6 +72,7 @@ cudaError_t CUDARTAPI __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
 cudaError_t CUDARTAPI __real_cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind,
                                              cudaStream_t);
 cudaError_t CUDARTAPI __real_cudaStreamSynchronize(cudaStream_t);
+#endif
 
 cudaError_t CUDARTAPI __wrap_cudaMalloc(void** pointer, std::size_t bytes) {
     const auto status = __real_cudaMalloc(pointer, bytes);
@@ -103,11 +135,85 @@ cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
 }
 }
 
+#if defined(_WIN32)
+namespace {
+
+// Replace one CUDA runtime function this executable imports, returning the address the slot held.
+// The entry is matched by function name rather than by DLL name because the runtime library carries
+// its toolkit version in that name.
+template <class Function>
+Function interpose_import(const char* name, Function replacement) {
+    auto* base = reinterpret_cast<std::byte*>(::GetModuleHandleW(nullptr));
+    if (base == nullptr) { return nullptr; }
+    const auto* dos     = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt      = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const auto* descriptor =
+        reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + imports.VirtualAddress);
+    for (; descriptor->Name != 0; ++descriptor) {
+        auto* slot        = reinterpret_cast<Function*>(base + descriptor->FirstThunk);
+        const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA*>(
+            base + (descriptor->OriginalFirstThunk != 0 ? descriptor->OriginalFirstThunk
+                                                        : descriptor->FirstThunk));
+        for (; thunk->u1.Function != 0; ++thunk, ++slot) {
+            if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) { continue; }
+            const auto* entry =
+                reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + thunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(entry->Name), name) != 0) { continue; }
+            DWORD previous = 0;
+            if (::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &previous) == 0) {
+                return nullptr;
+            }
+            const Function real = *slot;
+            *slot               = replacement;
+            DWORD restored      = 0;
+            (void)::VirtualProtect(slot, sizeof(void*), previous, &restored);
+            return real;
+        }
+    }
+    return nullptr;
+}
+
+// Interpose once, before the first allocation. A second attempt would find the wrapper in the slot
+// and hand it back as the function to call through, which is why the result is cached.
+void interpose_cuda_runtime() {
+    static const bool installed = [] {
+        const auto install = [](const char* name, auto wrapper, auto& real) {
+            real = interpose_import(name, wrapper);
+            if (real == nullptr) {
+                // Either this executable imports nothing under that name -- a statically linked
+                // runtime has no import table entry to redirect -- or the slot is not writable.
+                // Both leave the fault injection inoperative, so the test must not continue as if
+                // the wrapper were in place.
+                throw std::runtime_error(std::string("cannot interpose the imported ") + name);
+            }
+        };
+        install("cudaMalloc", __wrap_cudaMalloc, __real_cudaMalloc);
+        install("cudaMallocHost", __wrap_cudaMallocHost, __real_cudaMallocHost);
+        install("cudaFree", __wrap_cudaFree, __real_cudaFree);
+        install("cudaFreeHost", __wrap_cudaFreeHost, __real_cudaFreeHost);
+        install("cudaEventCreateWithFlags", __wrap_cudaEventCreateWithFlags,
+                __real_cudaEventCreateWithFlags);
+        install("cudaEventRecord", __wrap_cudaEventRecord, __real_cudaEventRecord);
+        install("cudaMemcpyAsync", __wrap_cudaMemcpyAsync, __real_cudaMemcpyAsync);
+        install("cudaStreamSynchronize", __wrap_cudaStreamSynchronize,
+                __real_cudaStreamSynchronize);
+        return true;
+    }();
+    (void)installed;
+}
+
+} // namespace
+#endif
+
 namespace ninfer::test {
 
 void materialization_cuda_errors(DeviceContext& device) {
     using namespace artifact;
     using namespace artifact_fixture;
+#if defined(_WIN32)
+    interpose_cuda_runtime();
+#endif
     Fixture fixture;
     fixture.write();
     for (const auto failure : {Failure::EventCreation, Failure::EventRecord}) {

@@ -1218,7 +1218,7 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
     dispatch_storage(kv.storage, [&]<KvCacheStorage Storage>() {
         constexpr int kShared =
             sizeof(mma_attention::Shared<Storage != KvCacheStorage::BFloat16>);
-        static const bool configured = [] {
+        static const bool configured = [=] {
             CUDA_CHECK(cudaFuncSetAttribute(qsa_attention_mma_kernel<Storage>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, kShared));
             return true;

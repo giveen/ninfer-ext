@@ -311,10 +311,20 @@ int test_successor_binds_over_time_wait() {
 int main() {
     int failures = test_sse_transport() + test_sse_response_headers() +
                    test_prompt_json_member_order() + test_schema_number_precision();
+    if (failures != 0) { return 1; }
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
     failures += test_successor_binds_over_time_wait();
-#endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
+#else
+    // The two cases above assert POSIX listener semantics: an accepted socket inherits SO_KEEPALIVE
+    // and the keepalive timers, TCP_USER_TIMEOUT bounds a stalled connection, and SO_REUSEADDR
+    // still refuses a port that a TIME_WAIT connection occupies. Winsock has no TCP_USER_TIMEOUT at
+    // all, and its SO_REUSEADDR deliberately permits binding an address another socket is using, so
+    // the cases cannot be asserted as written and must not be reported as having passed.
+    std::cout << "SKIP: the socket option and TIME_WAIT cases are POSIX-only; Winsock has no "
+                 "TCP_USER_TIMEOUT and its SO_REUSEADDR allows rebinding an occupied address\n";
+    return 77;
+#endif
 }

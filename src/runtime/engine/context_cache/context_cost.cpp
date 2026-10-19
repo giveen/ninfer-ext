@@ -1,5 +1,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 
+#include "runtime/contract/uint128.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -11,7 +13,12 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
+// Windows declares the process id in <process.h> as _getpid; POSIX keeps getpid in <unistd.h>.
+#if defined(_WIN32)
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -22,7 +29,6 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -34,8 +40,11 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
                : left + right;
 }
 
+// Both products below exceed 64 bits before they are reduced, so they are formed in the contract's
+// UInt128: unsigned __int128 on Linux, and an exact two-word replacement on MSVC, which has no
+// 128-bit integer type. The reductions and the overflow thresholds are unchanged.
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
+    const UInt128 product = static_cast<UInt128>(left) * right;
     return product > std::numeric_limits<std::uint64_t>::max()
                ? std::numeric_limits<std::uint64_t>::max()
                : static_cast<std::uint64_t>(product);
@@ -43,8 +52,9 @@ std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexce
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
+    const UInt128 product        = static_cast<UInt128>(coefficient) * units;
+    const UInt128 maximum_scaled =
+        static_cast<UInt128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
     if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
     return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
 }
@@ -364,8 +374,14 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     (void)parse_context_cost_presets(serialized, "generated context-cost presets");
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
+    // Windows exposes the process id as _getpid; POSIX keeps getpid. Both return an int.
+#if defined(_WIN32)
+    const int process_id = ::_getpid();
+#else
+    const int process_id = ::getpid();
+#endif
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+    temporary += ".tmp." + std::to_string(static_cast<long long>(process_id)) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

@@ -1,17 +1,15 @@
 #include "models/qwen3_5/execution/ple_rows.h"
 
+#include "core/host_memory.h"
 #include "core/host_worker_pool.h"
-
-#include <fcntl.h>
-#include <unistd.h>
+#include "core/native_file.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -24,46 +22,50 @@ constexpr std::size_t kPagesPerTask = 8;
 
 struct PleRowReader::File {
     std::filesystem::path path;
-    int fd = -1;
+    core::NativeFileHandle handle = core::invalid_native_file_handle();
     // Declared end of this volume, from the segments that live in it. A read that reaches
     // end-of-file before this offset means the volume is truncated or corrupt.
     std::uint64_t extent = 0;
 
     explicit File(std::filesystem::path p) : path(std::move(p)) {
-        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd < 0) {
+        try {
+            handle = core::open_read_only(path, /*unbuffered=*/true);
+        } catch (const std::system_error& error) {
             throw std::runtime_error(
-                path.string() + ": cannot open for direct n-gram reads: " + std::strerror(errno));
+                path.string() + ": cannot open for direct n-gram reads: " + error.code().message());
         }
     }
 
-    ~File() {
-        if (fd >= 0) { ::close(fd); }
-    }
+    ~File() { core::close_file(handle); }
 
     void read_page(std::uint64_t offset, std::byte* destination) const {
         std::size_t done = 0;
         while (done < kPage) {
-            const ssize_t n =
-                ::pread(fd, destination + done, kPage - done, static_cast<off_t>(offset + done));
-            if (n < 0 && errno == EINTR) { continue; }
-            if (n < 0) {
+            const std::size_t want = kPage - done;
+            std::size_t n          = 0;
+            try {
+                n = core::read_at(handle, offset + done,
+                                  std::span<std::byte>(destination + done, want));
+            } catch (const std::system_error& error) {
                 throw std::runtime_error(path.string() +
-                                         ": direct n-gram read failed: " + std::strerror(errno));
+                                         ": direct n-gram read failed: " + error.code().message());
             }
-            if (n == 0) {
-                // Only the tail of the page past the volume's declared extent may be short. A zero
-                // read inside that extent means the volume is truncated or corrupt, so reject it
-                // instead of fabricating zeros.
-                if (offset + done >= extent) {
-                std::memset(destination + done, 0, kPage - done);
-                return;
-                }
-                throw std::runtime_error(path.string() +
-                                         ": direct n-gram read hit a hole inside the volume");
-            }
-            done += static_cast<std::size_t>(n);
+            done += n;
+            // A short read puts the file's end at `offset + done`, and an unbuffered request has to
+            // be a whole device block starting on a block boundary, so the rest of this page can no
+            // longer be asked for: leave the loop and let the extent decide what that end means.
+            if (n < want) { break; }
         }
+        if (done == kPage) { return; }
+        // Only the tail of the page past the volume's declared extent may be short. A zero
+        // read inside that extent means the volume is truncated or corrupt, so reject it
+        // instead of fabricating zeros.
+        if (offset + done >= extent) {
+            std::memset(destination + done, 0, kPage - done);
+            return;
+        }
+        throw std::runtime_error(path.string() +
+                                 ": direct n-gram read hit a hole inside the volume");
     }
 };
 
@@ -88,7 +90,7 @@ PleRowReader::PleRowReader(std::span<const artifact::MappedObjectSegment> segmen
 
 PleRowReader::~PleRowReader() {
     workers_.reset();
-    std::free(staging_);
+    core::aligned_host_free(staging_);
 }
 
 PleRowReader::Page PleRowReader::page_of(std::uint64_t object_offset, std::uint32_t bytes,
@@ -115,9 +117,10 @@ void PleRowReader::reserve(std::size_t pages) {
     if (pages <= staging_pages_) { return; }
     // Allocate before releasing the old block: a failed allocation leaves the previously read
     // pages (and the pointers data() handed out) intact instead of freeing them under the caller.
-    std::byte* const grown       = static_cast<std::byte*>(std::aligned_alloc(kPage, pages * kPage));
+    std::byte* const grown =
+        static_cast<std::byte*>(core::aligned_host_alloc(pages * kPage, kPage));
     if (grown == nullptr) { throw std::bad_alloc(); }
-    std::free(staging_);
+    core::aligned_host_free(staging_);
     staging_       = grown;
     staging_pages_ = pages;
 }

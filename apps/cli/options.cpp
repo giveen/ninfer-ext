@@ -249,7 +249,7 @@ Options parse_options(int argc, char** argv) {
     }
     std::vector<std::string> args;
     args.emplace_back(argv[0] == nullptr ? "" : argv[0]);
-    args.push_back(options.artifact_path);
+    args.push_back(options.artifact_path.string());
     args.insert(args.end(), profile_args.begin(), profile_args.end());
     args.insert(args.end(), cli_args.begin(), cli_args.end());
 

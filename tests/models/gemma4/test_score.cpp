@@ -19,6 +19,8 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/gemma_instance.h"
 
+#include "test_platform.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -180,7 +182,8 @@ int main() {
             };
             const std::vector<float> through_sink = program.causal_score(ids, first, sink,
                                                                         device.execution_view());
-            std::ofstream dump("/tmp/gemma_sink.f32", std::ios::binary);
+            std::ofstream dump(ninfer::test::dump_directory() / "gemma_sink.f32",
+                               std::ios::binary);
             dump.write(reinterpret_cast<const char*>(rows.data()),
                        static_cast<std::streamsize>(rows.size() * sizeof(float)));
             std::cout << "  sink rows: " << rows.size() << " values for " << through_sink.size()
@@ -270,7 +273,8 @@ int main() {
                       << logprobs.size() << " positions\n";
         }
 
-        std::ofstream output("/tmp/gemma_score.out.f32", std::ios::binary);
+        std::ofstream output(ninfer::test::dump_directory() / "gemma_score.out.f32",
+                             std::ios::binary);
         output.write(reinterpret_cast<const char*>(logprobs.data()),
                      static_cast<std::streamsize>(logprobs.size() * sizeof(float)));
         return 0;

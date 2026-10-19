@@ -89,7 +89,8 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN,
                     (tokens + M256N128S3::kBlockM - 1) / M256N128S3::kBlockM);
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
-        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output, tokens);
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(tma_descriptor_words(descriptors),
+                                                               alpha, output, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 

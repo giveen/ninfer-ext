@@ -6,6 +6,15 @@
 
 #include <spdlog/logger.h>
 
+#if defined(_WIN32)
+// The console control handler needs the Win32 types, and windows.h defines min and max as
+// macros: the standard-library headers this file includes afterwards must not see them.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -68,6 +77,26 @@ void handle_signal(int) {
     if (server != nullptr) { server->stop(); }
 }
 
+#if defined(_WIN32)
+// Closing the console, logging off, and shutting down are the only stop requests a Windows console
+// delivers; SIGTERM is never raised for them. They take the same path as the signal handler, which
+// Linux reaches through SIGTERM. Windows waits about 5 s for this handler to return before it
+// terminates the process, so it only asks the server to stop: requests still generating when the
+// console goes away die with the process. Ctrl+C and Ctrl+Break are left to the CRT, which raises
+// the SIGINT the handler above already catches.
+BOOL WINAPI handle_console_event(DWORD event) {
+    switch (event) {
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        handle_signal(0);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -126,7 +155,13 @@ int main(int argc, char** argv) {
 
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);
+#if defined(_WIN32)
+        // A Windows console never raises SIGTERM: the stop requests it does deliver arrive as
+        // console control events, which handle_console_event maps onto the same shutdown.
+        ::SetConsoleCtrlHandler(handle_console_event, TRUE);
+#else
         std::signal(SIGTERM, handle_signal);
+#endif
 
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),

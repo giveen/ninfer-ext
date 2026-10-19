@@ -28,6 +28,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Gate a built tree before trusting a link from it | [`verify/check_ops_archive.py`](verify/check_ops_archive.py) |
 | Simulate suffix/n-gram drafter designs on token ledgers | [`spec_sim/ngram.py`](spec_sim/ngram.py); see [§9.4](../docs/maintainer/lookup-drafter.md#94-pool-design-evaluation) |
+| Check host translation units against the Windows API locally | [`verify/win32_syntax_check.py`](verify/win32_syntax_check.py); [Windows port](../docs/maintainer/windows-port.md) |
 
 ## Standalone HBM probe
 

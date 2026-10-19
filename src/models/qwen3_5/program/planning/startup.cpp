@@ -29,6 +29,13 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#if defined(_WIN32)
+// windows.h defines min and max as macros, and this file calls std::min and std::max.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 #include <algorithm>
 #include <fstream>
 #include <initializer_list>
@@ -1422,6 +1429,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 // Free host memory the kernel can hand out without swapping (MemAvailable), or 0 if unknown.
 std::uint64_t available_host_bytes() {
+#if defined(_WIN32)
+    // Windows has no /proc. Physical memory the process can still draw on is the same quantity:
+    // GlobalMemoryStatusEx reports it system-wide, and a failed call leaves the answer unknown.
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (::GlobalMemoryStatusEx(&status) != 0) { return status.ullAvailPhys; }
+    return 0;
+#else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     std::uint64_t value = 0;
@@ -1431,6 +1446,7 @@ std::uint64_t available_host_bytes() {
         if (key == "MemAvailable:") { return value * 1024ULL; }
     }
     return 0;
+#endif
 }
 
 // Qwen4Exp n-gram table: map it when the host can keep it in the page cache next to everything

@@ -9,6 +9,7 @@ add_library(ninfer_core STATIC
   paged_kv_cache.cpp
   linear_attention_state.cpp
   layout.cpp
+  native_file.cpp
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp

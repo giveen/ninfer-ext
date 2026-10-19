@@ -8,6 +8,8 @@
 #include "models/gemma4/forward.h"
 #include "models/gemma4/load.h"
 
+#include "test_platform.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -138,8 +140,9 @@ int main() {
             outputs.insert(outputs.end(), produced.begin(), produced.end());
         }
 
-        if (!write_f32("/tmp/gemma_layer.in.f32", inputs) ||
-            !write_f32("/tmp/gemma_layer.out.f32", outputs)) {
+        const std::filesystem::path dumps = ninfer::test::dump_directory();
+        if (!write_f32((dumps / "gemma_layer.in.f32").string(), inputs) ||
+            !write_f32((dumps / "gemma_layer.out.f32").string(), outputs)) {
             std::cerr << "gemma4 layer: could not write the dump\n";
             return 1;
         }
@@ -176,7 +179,7 @@ int main() {
             CUDA_CHECK(cudaMemcpy(produced.data(), logits,
                                   produced.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
             // Written as per-column rows, one target per column, so the comparison is positional.
-            std::ofstream dump("/tmp/gemma_head_only.f32", std::ios::binary);
+            std::ofstream dump(dumps / "gemma_head_only.f32", std::ios::binary);
             for (std::size_t column = 0; column < static_cast<std::size_t>(tokens); ++column) {
                 for (std::size_t id = 0; id < vocabulary; ++id) {
                     const float value =
@@ -185,7 +188,7 @@ int main() {
                 }
             }
             std::cout << "gemma4 layer: head-only over " << tokens << " tokens, wrote "
-                      << "/tmp/gemma_head_only.f32\n";
+                      << (dumps / "gemma_head_only.f32").string() << '\n';
             return 0;
         }
 
@@ -202,7 +205,7 @@ int main() {
             std::vector<std::uint16_t> produced(vocabulary);
             CUDA_CHECK(cudaMemcpy(produced.data(), logits, vocabulary * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost));
-            if (!write_f32("/tmp/gemma_head.out.f32", produced)) {
+            if (!write_f32((dumps / "gemma_head.out.f32").string(), produced)) {
                 std::cerr << "gemma4 layer: could not write the head dump\n";
                 return 1;
             }
@@ -210,7 +213,8 @@ int main() {
         }
         std::cout << "gemma4 layer: layer " << layer << ", "
                   << (config.sliding_attention(layer) ? "sliding" : "global") << ", " << tokens
-                  << " tokens, wrote /tmp/gemma_layer.in.f32 and /tmp/gemma_layer.out.f32\n";
+                  << " tokens, wrote " << (dumps / "gemma_layer.in.f32").string() << " and "
+                  << (dumps / "gemma_layer.out.f32").string() << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "gemma4 layer: " << error.what() << '\n';

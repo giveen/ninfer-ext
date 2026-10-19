@@ -2,6 +2,8 @@
 
 #include "core/host_kv_arena.h"
 
+#include "test_platform.h"
+
 #include <nlohmann/json.hpp>
 
 #include <array>
@@ -12,8 +14,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-
-#include <unistd.h>
 
 namespace {
 
@@ -274,9 +274,7 @@ void test_schema_validation() {
 
 void test_resolution_and_atomic_upserts() {
     const std::filesystem::path directory =
-        std::filesystem::temp_directory_path() /
-        ("ninfer-context-cost-test-" + std::to_string(static_cast<long long>(::getpid())));
-    std::filesystem::create_directories(directory);
+        ninfer::test::temporary_directory("ninfer-context-cost-test");
     const std::filesystem::path path = directory / "presets.json";
     try {
         const ninfer::runtime::ContextCostIdentity compiled_identity{

@@ -1,0 +1,10 @@
+{
+  "name": "ninfer",
+  "version-string": "0.0.0",
+  "description": "Dependencies for the Windows build. On the maintainer platform FFmpeg and libcurl come from the system packages; Windows has neither, so vcpkg supplies both from the pinned baseline. FFmpeg's default features cover the four libraries the engine links (avformat, avcodec, avutil, swscale).",
+  "builtin-baseline": "c76c06644034521fb761a39f8f52d8e87d1103d5",
+  "dependencies": [
+    "ffmpeg",
+    "curl"
+  ]
+}

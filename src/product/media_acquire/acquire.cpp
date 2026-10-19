@@ -2,9 +2,17 @@
 
 #include <curl/curl.h>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
+#if defined(_WIN32)
+// getaddrinfo and inet_ntop are Winsock calls. curl's own headers already include these on
+// Windows, but this file calls them directly, and the include has to come before anything that
+// pulls in windows.h: the legacy winsock.h it would bring along conflicts with winsock2.h.
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+#else
+#    include <arpa/inet.h>
+#    include <netdb.h>
+#    include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -144,6 +152,18 @@ UrlParts parse_url(std::string_view value) {
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
+#if defined(_WIN32)
+    // getaddrinfo and inet_ntop are Winsock calls, and Winsock refuses every one of them with
+    // WSANOTINITIALISED until WSAStartup has succeeded. libcurl and cpp-httplib each start it for
+    // their own transfers, but this file is also reachable from the CLI, where neither has run.
+    // One process-wide initialisation is correct and sufficient: Winsock is reference-counted per
+    // process, and this call site is the only user in this translation unit.
+    static std::once_flag winsock_once;
+    std::call_once(winsock_once, [] {
+        WSADATA data{};
+        (void)::WSAStartup(MAKEWORD(2, 2), &data);
+    });
+#endif
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;

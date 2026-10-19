@@ -87,11 +87,19 @@ struct ReductionStats {
     double reference_at_maximum       = 0.0;
 };
 
+// Accumulation type of the reduction oracle, named so the chosen precision is explicit rather than
+// implied by `long double`. On x86-64 Linux long double is 80-bit extended precision; MSVC maps
+// long double to 64-bit double, so the Windows build accumulates these two sums in double. Both
+// sums add non-negative terms, so they cannot cancel and the narrower type costs only rounding in
+// the last few ulps of an accumulator: no registered ReductionCriterion tolerance is calibrated
+// anywhere near that margin.
+using OracleReal = long double;
+
 inline ReductionStats compute_reduction_stats(const double* actual, const double* reference,
                                               std::int64_t count) {
     ReductionStats stats;
-    long double squared_error     = 0.0L;
-    long double squared_reference = 0.0L;
+    OracleReal squared_error     = 0.0L;
+    OracleReal squared_reference = 0.0L;
     for (std::int64_t index = 0; index < count; ++index) {
         const double got      = actual[index];
         const double expected = reference[index];
@@ -102,8 +110,8 @@ inline ReductionStats compute_reduction_stats(const double* actual, const double
 
         const double error          = got - expected;
         const double absolute_error = std::abs(error);
-        squared_error += static_cast<long double>(error) * error;
-        squared_reference += static_cast<long double>(expected) * expected;
+        squared_error += static_cast<OracleReal>(error) * error;
+        squared_reference += static_cast<OracleReal>(expected) * expected;
         stats.maximum_absolute_reference =
             std::max(stats.maximum_absolute_reference, std::abs(expected));
         if (absolute_error > stats.maximum_absolute_error) {
@@ -117,9 +125,9 @@ inline ReductionStats compute_reduction_stats(const double* actual, const double
                         std::max(std::sqrt(static_cast<double>(squared_reference)), 1.0e-30);
     if (count > 0) {
         stats.root_mean_squared_error =
-            std::sqrt(static_cast<double>(squared_error / static_cast<long double>(count)));
+            std::sqrt(static_cast<double>(squared_error / static_cast<OracleReal>(count)));
         stats.reference_root_mean_square =
-            std::sqrt(static_cast<double>(squared_reference / static_cast<long double>(count)));
+            std::sqrt(static_cast<double>(squared_reference / static_cast<OracleReal>(count)));
     }
     return stats;
 }

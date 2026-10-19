@@ -407,12 +407,14 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
-    if (pairs > std::numeric_limits<std::uint64_t>::max()) {
+    // Both factors are 32-bit, so each product is exact in 64 bits and only their sum can exceed
+    // uint64; a 128-bit type is unnecessary here and MSVC has none.
+    const std::uint64_t linear     = static_cast<std::uint64_t>(prefix) * suffix;
+    const std::uint64_t triangular = static_cast<std::uint64_t>(suffix) * (suffix + 1ULL) / 2U;
+    if (triangular > std::numeric_limits<std::uint64_t>::max() - linear) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
-    return static_cast<std::uint64_t>(pairs);
+    return linear + triangular;
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

@@ -1,0 +1,99 @@
+name: Windows report
+description: Report the outcome of running the Windows build of ninfer-serve on your machine.
+title: "[windows] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Windows port compiles in CI but has never been run on Windows hardware, so this report is
+        what closes the gap. [docs/maintainer/windows-port.md](https://github.com/giveen/ninfer-ext/blob/master/docs/maintainer/windows-port.md)
+        lists the four questions that matter; the first one is answered entirely by `ninfer-probe`,
+        which needs no model artifact.
+
+        Every field below is one of the facts a report needs. If a command failed, paste what it
+        printed rather than a summary of it.
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What happened
+      options:
+        - Built and served a model (text)
+        - Built and served a model with vision or media input
+        - Built, and ninfer-probe ran, but serving a model did not work
+        - Built, but ninfer-probe did not work
+        - Did not build
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: ninfer-probe output
+      description: Run `ninfer-probe` from the extracted package and paste its whole output. It needs no model artifact.
+      render: text
+      placeholder: |
+        ninfer-probe: host-pointer-for-registered-memory diagnostic
+        compiler: MSVC _MSC_VER=...
+        ...
+        host-pointer-for-registered-memory: SUPPORTED
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "`winver`, for example: Windows 11 24H2 (build 26100.1742)"
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA driver version
+      description: From `nvidia-smi`, for example 581.15. The driver's WDDM behavior is one of the open questions.
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and free host RAM
+      description: The engine supports sm_120a only (RTX 5090); the Flash-Next model also needs about 65 GiB of host RAM.
+    validations:
+      required: true
+
+  - type: textarea
+    id: serve
+    attributes:
+      label: What you ran and what it produced
+      description: |
+        The exact command line, the model artifact, and the result. A streaming request is worth
+        trying explicitly: the mechanism that detects a dead streaming peer differs on Windows.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: performance
+    attributes:
+      label: Throughput, if you measured it
+      description: |
+        Optional, but valuable: Windows has no TCC mode for this class of card, so per-launch overhead
+        may cost throughput, and there is no Windows baseline yet. State the model, the token counts
+        and whether the number is prefill or decode.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test suite result
+      description: |
+        Optional: `ctest --preset fast` from the build tree, or the summary line if it ran. Failures
+        with their output are more useful than a pass count.
+      render: text
+    validations:
+      required: false
