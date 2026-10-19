@@ -4,14 +4,24 @@
 #include "ops/offload_moe/cpu_nvfp4.h"
 
 #include <cuda_runtime.h>
-#include <sched.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#else
+#    include <sched.h>
+#endif
 
 namespace ninfer::models::execution {
 namespace {
@@ -33,7 +43,9 @@ constexpr auto kTeamSpinWindow = std::chrono::microseconds(100);
 
 constexpr std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 
-void pause() noexcept { __builtin_ia32_pause(); }
+// x86 PAUSE: yields the pipeline to the sibling hyperthread while spinning, and keeps the spin
+// from retiring as fast as the loop body alone would.
+void pause() noexcept { _mm_pause(); }
 
 std::uint32_t load_volatile(const std::uint32_t* p) noexcept {
     return *reinterpret_cast<const volatile std::uint32_t*>(p);
@@ -82,12 +94,24 @@ bool host_readable(const void* p) {
 // CPUs this process may run on, or 0 when the query fails. A team that fills the allowance would
 // leave the Program's own threads (the main decode thread included) no core between phases, which
 // measured as a 40-60% decode loss on a 16-thread allowance with a 16-thread team.
+#if defined(_WIN32)
+int allowed_cpus() noexcept {
+    // The process affinity mask is the same allowance on Windows. A mask spanning more than one
+    // processor group is not representable in DWORD_PTR; that is beyond the parts this targets,
+    // and a failed query keeps the caller on its conservative path.
+    DWORD_PTR process_mask = 0;
+    DWORD_PTR system_mask  = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == 0) { return 0; }
+    return static_cast<int>(std::popcount(static_cast<unsigned long long>(process_mask)));
+}
+#else
 int allowed_cpus() noexcept {
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) != 0) { return 0; }
     return CPU_COUNT(&set);
 }
+#endif
 
 } // namespace
 

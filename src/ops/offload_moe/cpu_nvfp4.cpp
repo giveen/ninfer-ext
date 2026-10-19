@@ -4,6 +4,11 @@
 #include <cmath>
 #include <stdexcept>
 
+#if defined(_MSC_VER)
+#    include <immintrin.h>
+#    include <intrin.h>
+#endif
+
 namespace ninfer::ops::cpu {
 
 namespace avx2 {
@@ -23,12 +28,34 @@ struct Isa {
 };
 
 Isa detect() noexcept {
+#if defined(_MSC_VER)
+    // GCC/Clang answer this from their own builtins; MSVC needs the leaves and the XCR0 state
+    // checked directly. FMA, F16C and AVX2 are only usable when the OS saves the YMM state, which
+    // is why OSXSAVE and XCR0 gate them.
+    int regs[4] = {};
+    __cpuidex(regs, 1, 0);
+    const bool osxsave            = (regs[2] & (1 << 27)) != 0;
+    const bool avx                = (regs[2] & (1 << 28)) != 0;
+    const bool fma                = (regs[2] & (1 << 12)) != 0;
+    const bool f16c               = (regs[2] & (1 << 29)) != 0;
+    const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0ULL;
+    const bool ymm_state          = (xcr0 & 0x6ULL) == 0x6ULL;
+    __cpuidex(regs, 7, 0);
+    const bool avx2    = (regs[1] & (1 << 5)) != 0;
+    const bool avxvnni = (regs[0] & (1 << 4)) != 0;
+
+    Isa isa;
+    isa.supported = avx && ymm_state && avx2 && fma && f16c;
+    isa.vnni      = isa.supported && avxvnni;
+    return isa;
+#else
     __builtin_cpu_init();
     Isa isa;
     isa.supported = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
                     __builtin_cpu_supports("f16c");
     isa.vnni = isa.supported && __builtin_cpu_supports("avxvnni");
     return isa;
+#endif
 }
 
 const Isa& isa() noexcept {
