@@ -76,17 +76,20 @@ void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
     // appends, and a fresh rebuild segments at it. The incremental chunk count measures the whole
     // tail from one anchor, so the boundary is taken in two steps: advance to the boundary (where
     // the tail still starts at the old anchor), re-anchor the work there, then advance to the span
-    // end. Anchoring first would leave the replaced tail measured from a frontier it does not
-    // reach, which the helper rejects.
+    // end from the boundary. Anchoring first would leave the replaced tail measured from a
+    // frontier it does not reach, which the helper rejects; advancing the second step from the
+    // sequence frontier would instead present the boundary's work as the old anchor's.
+    std::uint32_t previous = sequence.execution_frontier;
     if (minted_boundary && *minted_boundary <= frontier) {
         runtime_support::advance_segmented_rebuild_work(
-            sequence.rebuild_work, sequence.rebuild_tail_begin, sequence.execution_frontier,
+            sequence.rebuild_work, sequence.rebuild_tail_begin, previous,
             *minted_boundary, prefill_chunk);
         runtime_support::include_rebuild_boundary(sequence.rebuild_tail_begin, *minted_boundary,
                                                   frontier);
+        previous = *minted_boundary;
     }
     runtime_support::advance_segmented_rebuild_work(
-        sequence.rebuild_work, sequence.rebuild_tail_begin, sequence.execution_frontier, frontier,
+        sequence.rebuild_work, sequence.rebuild_tail_begin, previous, frontier,
         prefill_chunk);
 }
 

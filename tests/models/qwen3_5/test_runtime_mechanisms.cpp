@@ -6,6 +6,7 @@
 
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/program/context_work.h"
 
 #include <algorithm>
 #include <array>
@@ -441,6 +442,25 @@ void test_rebuild_work_prompt_frontier_boundary() {
            "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
+void test_rebuild_work_split_span() {
+    constexpr std::uint32_t prefill_chunk = 8;
+    q36::detail::SequenceState sequence;
+    sequence.execution_frontier = 40;
+    sequence.rebuild_tail_begin = 0;
+    sequence.rebuild_work       = ninfer::runtime::make_prefill_work(0, 40, 0, 0, prefill_chunk);
+    // A 40 -> 52 span that records an execution boundary at 43 (a continued assistant turn's
+    // split) must end anchored at the boundary with the chunks of a rebuild segmented there:
+    // 6 chunks for the 43-token head plus 2 for the 9-token tail beyond it.
+    q36::detail::advance_rebuild_work(sequence, 52, prefill_chunk, 43);
+    const ninfer::runtime::PrefillWork whole =
+        ninfer::runtime::make_prefill_work(0, 52, 0, 0, prefill_chunk);
+    expect(sequence.rebuild_tail_begin == 43,
+           "split-span progress did not re-anchor the rebuild tail at its boundary");
+    expect(sequence.rebuild_work.tokens == 52 && sequence.rebuild_work.chunks == 8 &&
+               sequence.rebuild_work.attention_pairs == whole.attention_pairs,
+           "split-span rebuild work did not match a rebuild segmented at the boundary");
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +470,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_rebuild_work_split_span();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
