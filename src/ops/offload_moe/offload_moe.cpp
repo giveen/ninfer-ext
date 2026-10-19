@@ -71,7 +71,7 @@ ChunkLayout chunk_layout(std::int32_t columns, std::int32_t slots, bool exl3) {
         cursor += align(bytes);
         return at;
     };
-    out.counts        = take(static_cast<std::size_t>(std::max(slots, 1)) * 4);
+    out.counts        = take((static_cast<std::size_t>(std::max(slots, 1)) + 1) * 4);
     out.sorted_assign = take(assignments * 4);
     out.sorted_slot   = take(assignments * 4);
     out.jobs          = take(assignments * 4);
@@ -224,8 +224,10 @@ void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int3
 }
 
 void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCacheState& cache,
-                          Tensor& slot_ids, Tensor& misses, cudaStream_t stream) {
+                          Tensor& slot_ids, Tensor& misses, cudaStream_t stream,
+                          float admit_share) {
     constexpr const char* op = "expert_cache_resolve";
+    require(admit_share >= 0.0F && admit_share <= 1.0F, op, "admit share must be in [0, 1]");
     // The rank count is the caller's own -- `ids.ne[0]` -- and only the column count is shared
     // with the slot-id tensor, because a resolve is a per-assignment call whichever family makes
     // it.
@@ -242,7 +244,27 @@ void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCa
     require(cache.slot_of && cache.owner && cache.stamp && cache.clock && cache.statistics &&
                 cache.pool,
             op, "cache state is incomplete");
-    detail::expert_cache_resolve_launch(ids, bank, cache, slot_ids, misses, stream);
+    detail::expert_cache_resolve_launch(ids, bank, cache, slot_ids, misses, admit_share, stream);
+}
+
+void moe_host_publish(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
+                      const Tensor& weights, std::int32_t layer, const MoeHostRing& ring,
+                      cudaStream_t stream) {
+    constexpr const char* op = "moe_host_publish";
+    require_dense(x, DType::BF16, op, "x");
+    const auto columns = static_cast<std::int32_t>(x.ne[1]);
+    require(x.ne[0] == kOffloadMoeHidden, op, "x must be [2560,T]");
+    require(columns <= ring.max_columns, op, "the ring holds at most max_columns columns");
+    require_routed(expert_ids, DType::I32, columns, op, "expert ids");
+    require_routed(slot_ids, DType::I32, columns, op, "slot ids");
+    require_routed(weights, DType::FP32, columns, op, "weights");
+    require(ring.header && ring.jobs && ring.x && ring.rows && ring.doorbell && ring.answered &&
+                ring.sequence && ring.ticket,
+            op, "host ring is incomplete");
+    require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
+                reinterpret_cast<std::uintptr_t>(ring.x) % 16 == 0,
+            op, "x and the ring's x must be 16-byte aligned");
+    detail::moe_host_publish_launch(x, expert_ids, slot_ids, weights, layer, ring, stream);
 }
 
 void expert_cache_fetch(const ExpertWeights& bank, const Tensor& misses, std::int32_t max_misses,
@@ -324,8 +346,15 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
                  Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending,
-                 const MoeActivationTap* tap) {
+                 const MoeActivationTap* tap, const MoeHostRing* host) {
     constexpr const char* op = "moe_experts";
+    if (host != nullptr) {
+        require(host->rows != nullptr && host->answered != nullptr && host->ticket != nullptr, op,
+                "a host share needs the ring's rows, answer word and ticket");
+        require(x.ne[1] <= host->max_columns, op, "a host share holds at most max_columns columns");
+        require(weights_source.layout.format == ExpertFormat::Nvfp4, op,
+                "a host share serves NVFP4 experts");
+    }
     if (pending != nullptr) {
         require(pending->misses != nullptr && pending->fetched != nullptr, op,
                 "pending fetch needs a miss list and an event");
@@ -402,6 +431,11 @@ void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_i
         if (pending != nullptr) {
             c.misses  = static_cast<const std::int32_t*>(pending->misses->data);
             c.fetched = pending->fetched;
+        }
+        if (host != nullptr) {
+            c.host_rows     = host->rows + static_cast<std::int64_t>(begin) * kOffloadMoeHidden;
+            c.host_answered = host->answered;
+            c.host_ticket   = host->ticket;
         }
         detail::moe_experts_chunk_launch(c, stream);
         if (tap != nullptr && *tap) {

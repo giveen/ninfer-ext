@@ -68,6 +68,7 @@ class PleGather;
 
 namespace ninfer::models::execution {
 class ExpertPager;
+class HostExpertLane;
 } // namespace ninfer::models::execution
 
 namespace ninfer::models::qwen3_5::execution {
@@ -76,6 +77,9 @@ namespace ninfer::models::qwen3_5::execution {
 // performance or recurrent side state; the Program allocates them once and binds them here.
 struct Qwen4Runtime {
     models::execution::ExpertPager* experts = nullptr;
+    // Decode miss split: the host lane and the share of a narrow call's misses it computes.
+    models::execution::HostExpertLane* host_lane = nullptr;
+    float host_share                             = 1.0F;
     Tensor ple_states; // BF16 [history * residual, StateImage slots]
     Tensor ple_record; // BF16 [residual, record_width, rows] speculative conv inputs, or empty
     Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch

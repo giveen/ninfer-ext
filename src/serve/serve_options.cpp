@@ -72,6 +72,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--profile FILE] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--expert-cache auto|MiB] "
+           "[--host-experts N] [--host-expert-share F] "
            "[--ngram-residency auto|mapped|stream] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -121,6 +122,10 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --expert-cache sizes the device cache of host-resident routed experts "
            "(Qwen4Exp); auto gives it the device memory left after the KV floor\n"
+           "       --host-experts N computes a share of each narrow call's expert-cache misses on "
+           "N host threads beside the PCIe fetch (Qwen4Exp NVFP4 only; 0 fetches every miss); "
+           "--host-expert-share F is that fraction (default 0.5), and host experts round "
+           "activations to 8 bits, so decode output then depends on what the cache held\n"
            "       --ngram-residency reads the Qwen4Exp n-gram table through the page cache "
            "(mapped) or with batched direct I/O (stream); auto maps it when host memory allows\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
@@ -238,6 +243,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--expert-cache") {
             options.expert_cache = product::parse_expert_cache(require_value("--expert-cache"));
+        } else if (arg == "--host-experts") {
+            options.host_experts.threads = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-experts"), "host-experts"));
+        } else if (arg == "--host-expert-share") {
+            options.host_experts.share = parse_float_in(require_value("--host-expert-share"),
+                                                        "host-expert-share", 0.0F, 1.0F);
         } else if (arg == "--ngram-residency") {
             options.ngram_residency =
                 product::parse_ngram_residency(require_value("--ngram-residency"));

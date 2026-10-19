@@ -102,6 +102,8 @@ constexpr std::string_view kCliProfileFlags[] = {
     "kv-capacity",
     "expert-cache",
     "expert-cache-slots",
+    "host-experts",
+    "host-expert-share",
     "ngram-residency",
     "prefill-chunk",
     "device",
@@ -159,6 +161,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--profile FILE]\n"
            "       [--device N] [--expert-cache auto|MiB] [--expert-cache-slots N]\n"
+           "       [--host-experts N] [--host-expert-share F]\n"
            "       [--ngram-residency auto|mapped|stream]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec "
            "mtp|dflash|dflash2|eagle3 --draft-tokens N]\n"
@@ -201,6 +204,14 @@ std::string usage_text(const char* argv0) {
            "resident\n"
            "           banks, one slot's bytes for one slot's worth of bank not uploaded, so a\n"
            "           larger cache is fewer banks. 0 -- the default -- is the structural pool.\n"
+           "--host-experts N computes a share of each narrow call's expert-cache misses on N\n"
+           "           host threads while the rest are fetched over PCIe (Qwen4Exp NVFP4 only;\n"
+           "           0 -- the default -- fetches every miss). Pin the process to the efficiency\n"
+           "           cores of a hybrid CPU; the threads read the pinned bank in place.\n"
+           "--host-expert-share F is the fraction of a narrow call's misses the host threads\n"
+           "           compute (default 0.5; 0 computes all of them on the host). Host experts\n"
+           "           round activations to 8 bits, so decode output then depends on which\n"
+           "           experts the cache held.\n"
            "--ngram-residency reads the Qwen4Exp n-gram table through the page cache (mapped) or\n"
            "with batched direct I/O (stream); auto maps it when free host memory covers it.\n"
            "--kv-capacity auto leaves " +
@@ -286,6 +297,10 @@ Options parse_options(int argc, char** argv) {
             options.expert_cache = product::parse_expert_cache(value(arg));
         } else if (arg == "--expert-cache-slots") {
             options.expert_cache.cache_slots = parse_expert_cache_slots(value(arg));
+        } else if (arg == "--host-experts") {
+            options.host_experts.threads = parse_u32(value(arg), "host-experts", true);
+        } else if (arg == "--host-expert-share") {
+            options.host_experts.share = parse_float(value(arg), "host-expert-share", 0.0F, 1.0F);
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = product::parse_ngram_residency(value(arg));
         } else if (arg == "--prefill-chunk") {

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/execution/host_expert_lane.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include "ninfer/ops/ple.h"
@@ -328,6 +329,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             wide_workspace.emplace(DeviceSpan{pool_base + layout.wide_offset, layout.wide_bytes});
         }
         runtime.experts = &*qwen4_experts;
+        // Decode miss split: NVFP4 banks only (EXL3 has no host kernels), and never for scoring.
+        const auto& main_bank = parameters.qwen4->layers.front().moe.bank;
+        if (plan.host_experts.threads > 0 && !causal_scoring &&
+            main_bank.layout.format == ops::ExpertFormat::Nvfp4) {
+            std::vector<ops::ExpertWeights> banks;
+            banks.reserve(static_cast<std::size_t>(pool.layers()));
+            for (const auto& block : parameters.qwen4->layers) { banks.push_back(block.moe.bank); }
+            if (parameters.qwen4_mtp) { banks.push_back(parameters.qwen4_mtp->layer.moe.bank); }
+            const auto columns = static_cast<std::int32_t>(std::min<std::uint32_t>(
+                plan.host_experts.max_columns,
+                static_cast<std::uint32_t>(qwen4_experts->max_resolve_columns())));
+            host_lane          = std::make_unique<models::execution::HostExpertLane>(
+                std::move(banks), columns, static_cast<std::int32_t>(plan.host_experts.threads));
+            runtime.host_lane  = host_lane.get();
+            runtime.host_share = plan.host_experts.share;
+        }
         const auto& config = parameters.model.config().text;
         if (config.ple) {
             const auto& block = parameters.qwen4->layers.at(config.ple->layer);

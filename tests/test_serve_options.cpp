@@ -438,6 +438,17 @@ int main() {
                       "--expert-cache MiB did not select an explicit cache");
     failures += check(serve_usage_text("ninfer-serve").contains("--expert-cache"),
                       "serve help omits --expert-cache");
+    const ServeOptions split = parse(
+        {"ninfer-serve", "model.ninfer", "--host-experts", "12", "--host-expert-share", "0.25"});
+    failures += check(split.host_experts.threads == 12 && split.host_experts.share == 0.25F,
+                      "--host-experts/--host-expert-share did not parse");
+    failures += check(serve_usage_text("ninfer-serve").contains("--host-experts"),
+                      "serve help omits --host-experts");
+    bool bad_share_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-expert-share", "1.5"});
+    } catch (const std::invalid_argument&) { bad_share_rejected = true; }
+    failures += check(bad_share_rejected, "--host-expert-share accepted a value above one");
     failures += check(parse({"ninfer-serve", "model.ninfer"}).ngram_residency ==
                               ninfer::NgramResidency::Automatic &&
                           parse({"ninfer-serve", "model.ninfer", "--ngram-residency", "stream"})

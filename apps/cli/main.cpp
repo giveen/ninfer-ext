@@ -328,6 +328,7 @@ int main(int argc, char** argv) {
         engine_options.max_context        = cli.max_context;
         engine_options.kv_capacity        = cli.kv_capacity;
         engine_options.expert_cache       = cli.expert_cache;
+        engine_options.host_experts       = cli.host_experts;
         engine_options.ngram_residency    = cli.ngram_residency;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;

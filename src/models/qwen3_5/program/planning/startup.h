@@ -165,6 +165,7 @@ struct SequencePlanningInputs {
     std::uint32_t expert_cache_slots = 0;     // Qwen4Exp only
     bool ngram_stream                = false; // Qwen4Exp only: resolved n-gram residency
     bool kv_stream                   = false;
+    HostExpertOptions host_experts;           // Qwen4Exp NVFP4 only
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -200,6 +201,7 @@ struct SequencePlanImpl {
     std::uint32_t expert_cache_slots = 0;
     bool ngram_stream                = false;
     bool kv_stream                   = false;
+    HostExpertOptions host_experts;
     // MTP rounds of several requests run as ordinary rounds plus an MTP KV append.
     bool plain_mtp_batches = false;
     PersistentLayout persistent;

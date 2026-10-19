@@ -33,6 +33,7 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(max_context);
     ExpertCachePolicy expert_cache;
+    HostExpertOptions host_experts;
     NgramResidency ngram_residency = NgramResidency::Automatic;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;

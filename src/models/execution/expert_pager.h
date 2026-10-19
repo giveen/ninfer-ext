@@ -108,11 +108,13 @@ public:
      * on the pager's stream. The returned event completes that copy: work on `stream` may read the
      * resident slots at once and must wait on the event before reading a listed slot (and before
      * the next resolve reuses `misses`). `misses` is scratch of at least `2*(10*T)+1` words. T must
-     * not exceed `max_resolve_columns`.
+     * not exceed `max_resolve_columns`. `admit_share` below 1 admits only that share of the call's
+     * misses (see `ops::expert_cache_resolve`); the others resolve to -1 for a host lane.
      */
     [[nodiscard]] cudaEvent_t resolve(const Tensor& ids, std::int32_t layer,
                                       const ops::ExpertWeights& bank, Tensor& slot_ids,
-                                      Tensor& misses, cudaStream_t stream);
+                                      Tensor& misses, cudaStream_t stream,
+                                      float admit_share = 1.0F);
 
     // Slot-pool addressing of the cache for experts whose divisors come from `bank`.
     [[nodiscard]] ops::ExpertWeights slot_weights(const ops::ExpertWeights& bank) const {

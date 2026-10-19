@@ -3,6 +3,12 @@ ninfer_add_test(ninfer_gemma4_config_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../gemma4/test_config.cpp"
   LIBRARIES ninfer_model_loading)
 
+# The decode miss split's host lane: a published call computed on the host team from a bank in
+# registered memory and merged by moe_experts, against an FP64 oracle. No artifact.
+ninfer_add_op_test(ninfer_host_expert_lane_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_expert_lane.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # The 26B's quantized sliding ring: the codec's own oracle at the model's geometry, plus the append
 # round trip. No artifact, so it runs everywhere a device does.
 ninfer_add_op_test(ninfer_gemma4_kv_quant_test
