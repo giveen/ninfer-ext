@@ -1222,8 +1222,9 @@ int main() {
     // call), and every miss to the host (share 0).
     failures += host_split_case(host, bank, 8, 0xD00U, 0.5F);
     failures += host_split_case(host, bank, 2, 0xD01U, 0.0F);
-    // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
-    for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
+    // Up to 64 columns take the decode GEMV route (its 1, 2, 4 and 8-token variants); 80 columns
+    // take the tiled route.
+    for (const std::int32_t tokens : {1, 2, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
     }
     // Concentrated routing: 12 experts serve every column, so jobs hold up to 64 tokens and the
