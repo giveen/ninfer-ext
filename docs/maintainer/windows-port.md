@@ -30,6 +30,30 @@ Device code is compiled below the host standard. nvcc's own `--std` accepts at m
 `/std:c++latest`. That split is safe only while no `.cu` includes a C++23 library header. Keep it that
 way: the failure mode is a missing header inside a device unit, which reads like a toolchain problem.
 
+The toolchain additions below are compile flags and definitions rather than source changes, and they
+are set once in the root `CMakeLists.txt`:
+
+| Flag / definition | Why |
+|---|---|
+| `/Zc:preprocessor` (and `-Xcompiler` for CUDA) | CUDA 13.3's bundled CCCL refuses MSVC's traditional preprocessor (`#error` in `cuda/std/__cccl/preprocessor.h`). |
+| `/utf-8` (and `-Xcompiler` for CUDA) | spdlog's bundled fmt asserts that Unicode support needs it (`C2338`). |
+| `NOMINMAX`, `WIN32_LEAN_AND_MEAN` | `<windows.h>` defines `min`/`max` as macros; spdlog pulls it in, after which every `std::min`, `std::max` and `std::numeric_limits<T>::max()` in the unit is parsed as a macro call (`C2589`, `C2059`, and a long tail of syntax errors). |
+| `UTF8PROC_STATIC` | `utf8proc.h` defaults to `__declspec(dllimport)` on Windows, but this tree compiles its implementation into `ninfer_text` (`C2491`). |
+
+### TMA descriptors travel as words, not as the aggregate
+
+`CUtensorMap` carries a 128-byte alignment requirement, and MSVC's ABI rejects a by-value parameter
+that asks for more than 16 (`C2719`), so `__global__` functions could not take their TMA descriptor
+aggregate by value even with `__grid_constant__`. `src/ops/common/tma.cuh` passes the same bytes as an
+8-aligned `std::uint64_t` array and the kernel reinterprets them.
+
+That relies on one measured property: kernel parameter space starts 128-byte aligned and lays the
+first parameter at offset 0, so a descriptor that stays the kernel's **first** parameter is aligned
+for `cp.async.bulk.tensor` whatever its declared alignment (measured on sm_120a: align-8 first
+parameter at `…380`, the same parameter behind an `int` at `…388`). Moving a descriptor after another
+parameter would break it, and the TMA instruction faults rather than returning a wrong answer. The
+NVFP4 and FP8 linear oracle tests run this path on hardware on every Linux build.
+
 ## The platform seam
 
 Two primitives appear in several places each and fail *silently* when they are wrong, so they live in

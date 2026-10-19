@@ -76,7 +76,7 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     nvfp4_w4a4_tma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, kSharedBytes, stream>>>(
-        descriptors, alpha, epilogue, output, tokens);
+        tma_descriptor_words(descriptors), alpha, epilogue, output, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 

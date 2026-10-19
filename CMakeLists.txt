@@ -42,6 +42,21 @@ set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "")
 set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "")
 if(MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>)
+  # CUDA 13.3's bundled CCCL refuses MSVC's traditional preprocessor outright (C1189 in
+  # cuda/std/__cccl/preprocessor.h), and spdlog's bundled fmt asserts on a non-UTF-8 source
+  # charset (C2338). Both are compiler flags, so the host pass of a .cu carries them through
+  # nvcc's -Xcompiler.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+                      $<$<COMPILE_LANGUAGE:C>:/utf-8>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  # <windows.h> defines min and max as function-like macros unless NOMINMAX is set before it, and
+  # spdlog pulls it in on Windows through its console sinks. Every std::min/std::max and
+  # std::numeric_limits<T>::max() in the units that reach it would then be parsed as a macro call.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # utf8proc.h defaults to __declspec(dllimport) on Windows; the copy in this tree is compiled
+  # into ninfer_text, so its definitions must not be treated as an import library's.
+  add_compile_definitions(UTF8PROC_STATIC)
 else()
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-std=c++23>)
 endif()

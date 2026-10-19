@@ -47,11 +47,12 @@ __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
         kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
+                                                                      Nvfp4W4a4TmaDescriptorWords
+                                                                          descriptor_words,
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output,
                                                                   int token_count) {
+    const Nvfp4W4a4TmaDescriptors& descriptors = tma_descriptors(descriptor_words);
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);

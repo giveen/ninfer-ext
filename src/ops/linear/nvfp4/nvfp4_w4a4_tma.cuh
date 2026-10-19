@@ -3,6 +3,7 @@
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/tma.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
@@ -22,6 +23,9 @@ struct alignas(128) Nvfp4W4a4TmaDescriptors {
     CUtensorMap a_scales;
     CUtensorMap b_scales;
 };
+
+// What the kernel actually receives (see ops/common/tma.cuh for why it is not the aggregate).
+using Nvfp4W4a4TmaDescriptorWords = TmaDescriptorWords<Nvfp4W4a4TmaDescriptors>;
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
@@ -184,9 +188,10 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
-    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+    const __grid_constant__ Nvfp4W4a4TmaDescriptorWords descriptor_words, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
     int token_count) {
+    const Nvfp4W4a4TmaDescriptors& descriptors = tma_descriptors(descriptor_words);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");

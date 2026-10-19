@@ -3,6 +3,7 @@
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/common/tma.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
@@ -22,6 +23,9 @@ struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation_lo;
     CUtensorMap weight;
 };
+
+// What the kernel actually receives; see ops/common/tma.cuh for why it is not the aggregate.
+using Fp8TmaDescriptorWords = TmaDescriptorWords<Fp8TmaDescriptors>;
 
 struct Fp8TmaSplitKPlan {
     int full_tiles = 0;
@@ -109,9 +113,10 @@ template <class Schedule, bool FullTokens, class Output, class Epilogue, bool Sp
           class RowPolicy = Fp8IdentityRows, int Terms = 1>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
-    const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands, Output output,
-    Epilogue epilogue, RowPolicy row_policy, int token_offset, int count, Fp8TmaSplitKPlan plan,
-    float* partials) {
+    const __grid_constant__ Fp8TmaDescriptorWords descriptor_words, Fp8A8Operands operands,
+    Output output, Epilogue epilogue, RowPolicy row_policy, int token_offset, int count,
+    Fp8TmaSplitKPlan plan, float* partials) {
+    const Fp8TmaDescriptors& descriptors = tma_descriptors(descriptor_words);
     static_assert(Terms == 1 || Terms == 2);
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
@@ -350,8 +355,9 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
                 fp8_tma_scratch_bytes<Schedule, Epilogue, Terms> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
-            kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
-                descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
+            kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(tma_descriptor_words(descriptors),
+                                                                  p, output, epilogue, row_policy,
+                                                                  offset, count, plan, partials);
             CUDA_CHECK(cudaGetLastError());
             if constexpr (Split) {
                 fp8_a8_tma_split_k_reduce<Schedule, Output, Epilogue, RowPolicy, Terms>

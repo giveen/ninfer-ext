@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <tuple>
@@ -361,7 +362,10 @@ class Result {
 #ifdef __GNUC__
 #define XGRAMMAR_UNREACHABLE() __builtin_unreachable()
 #else
-#define XGRAMMAR_UNREACHABLE()
+// MSVC has no unreachable builtin. std::abort is [[noreturn]], which is what the compiler needs to
+// see at the end of a value-returning lambda (grammar_compiler.cc's Compute would otherwise be
+// diagnosed as falling off the end: C4716).
+#define XGRAMMAR_UNREACHABLE() std::abort()
 #endif
 
 /*!
