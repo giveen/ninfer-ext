@@ -735,7 +735,7 @@ class _Builder:
         self.group(*roles[2:])
         self.group(prefix + "gdn/a_projection", prefix + "gdn/b_projection")
 
-    def dense(self, prefix, source_prefix, store, h, intermediate, *, draft=False):
+    def dense(self, prefix, source_prefix, store, h, intermediate, *, draft=False, paired=True):
         stem_input = prefix + ("mlp_input" if draft else "ffn_input")
         for role in ("gate", "up"):
             self.add(
@@ -752,10 +752,10 @@ class _Builder:
             (h, intermediate),
             inputs=(prefix + ("mlp_product" if draft else "mlp/product"),),
         )
-        # A draft's MLP stays two matrices: an encoded (NVFP4) parent carries one divisor, so a
-        # fusable pair with two source scales cannot be one parent, and the engine reads the two
-        # projections separately anyway.
-        if not draft:
+        # Qwen3.5 reads gate/up as one parent, drafts included. Nemotron-H's NVFP4 drafts keep two
+        # matrices: an encoded parent carries one divisor, so a pair with two source scales cannot
+        # be one parent, and that engine reads the two projections separately anyway.
+        if paired:
             self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
     def moe(self, prefix, source_prefix, store, config):
@@ -939,7 +939,7 @@ class _Builder:
                 inputs=inputs,
             )
 
-    def draft(self, store, config, target, backend):
+    def draft(self, store, config, target, backend, *, mask_embedding=False, paired_mlp=True):
         h, d = target["hidden_size"], config["head_dim"]
         q, k = config["num_attention_heads"] * d, config["num_key_value_heads"] * d
         draft = config["dflash_config"]
@@ -952,12 +952,14 @@ class _Builder:
         )
         self.add(backend + "/context_norm", store, "hidden_norm.weight", (h,))
         self.add(backend + "/final_norm", store, "norm.weight", (h,))
-        # The companion's `embed_tokens` is the tower's embedding with one row of its own: the mask
-        # token's. That row is the whole input of every proposal column, and the tower's row for the
-        # same id is an unrelated vector, so it is the one tensor the draft has to carry.
-        mask = draft["mask_token_id"]
-        self.add(backend + "/mask_embedding", store, "embed_tokens.weight", (1, h),
-                 offset=mask * h, source_shape=(target["vocab_size"], h))
+        # Nemotron-H's companion `embed_tokens` is the tower's embedding with one row of its own: the
+        # mask token's. That row is the whole input of every proposal column, and the tower's row
+        # for the same id is an unrelated vector, so it is the one tensor that draft has to carry.
+        # Qwen3.5 drafts embed the mask through the tower and ship no embedding.
+        if mask_embedding:
+            mask = draft["mask_token_id"]
+            self.add(backend + "/mask_embedding", store, "embed_tokens.weight", (1, h),
+                     offset=mask * h, source_shape=(target["vocab_size"], h))
         for i in range(config["num_hidden_layers"]):
             p, sp = f"{backend}/layers/{i}/", f"layers.{i}."
             self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))
@@ -1002,7 +1004,7 @@ class _Builder:
                 (h, q),
                 inputs=(p + "attention_output",),
             )
-            self.dense(p, sp, store, h, config["intermediate_size"], draft=True)
+            self.dense(p, sp, store, h, config["intermediate_size"], draft=True, paired=paired_mlp)
             if backend == "dflash2":
                 taps, groups = draft["conv_kernel_size"], h // draft["conv_group_size"]
                 for branch in ("attention_conv", "mlp_conv"):

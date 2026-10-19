@@ -692,7 +692,7 @@ class _LilicorrBuilder(_NemotronBuilder):
                      (draft["num_attention_heads"],))
             self.add(layer + "attention/output", store, source + "self_attn.o_proj.weight",
                      (h, query), inputs=(layer + "attention_output",))
-            self.dense(layer, source, store, h, draft["intermediate_size"], draft=True)
+            self.dense(layer, source, store, h, draft["intermediate_size"], draft=True, paired=False)
             for branch in ("attention_conv", "mlp_conv"):
                 # The checkpoint stores the base kernel as `[side, tap, channel]`; the artifact
                 # carries it flat over the tap and channel axes, which is the order the convolution
@@ -832,7 +832,8 @@ def build_model(
     model = Model(records, resources=resources, token_count=count, special_token_ids=special)
     builder = _LilicorrBuilder(model)
     if "dflash" in selected:
-        builder.draft(companions["dflash"], dflash_config, config, "dflash")
+        builder.draft(companions["dflash"], dflash_config, config, "dflash", mask_embedding=True,
+                      paired_mlp=False)
     h, vocabulary = config["hidden_size"], config["vocab_size"]
     # The Omni wrapper nests the tower under `language_model.`; the flat `NemotronHForCausalLM`
     # layout (Lightning 30B) stores `backbone.*` and a top-level `lm_head`.
