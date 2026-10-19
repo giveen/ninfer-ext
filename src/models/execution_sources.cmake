@@ -4,4 +4,5 @@
 # it is the same code for both -- every per-layer number it needs comes from the pool's own
 # `ExpertPoolGeometry`.
 target_sources(ninfer_model_runtime PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/execution/expert_pager.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/execution/expert_pager.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/host_expert_lane.cpp")

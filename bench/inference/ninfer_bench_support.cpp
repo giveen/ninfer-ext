@@ -324,6 +324,10 @@ std::string usage_text(std::string_view program) {
            "auto)\n"
         << "  --expert-cache-slots <n>    per-expert slot-cache slots beside the family's staged\n"
         << "                              banks (default: 0, the structural pool)\n"
+        << "  --host-experts <n>          host threads computing a share of each narrow call's\n"
+        << "                              expert-cache misses (default: 0, fetch every miss)\n"
+        << "  --host-expert-share <f>     fraction of those misses the host computes (default: "
+           "0.5)\n"
         << "  --spec <mtp|dflash|dflash2|eagle3> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..7 (largest draft length; adaptive below it);\n"
         << "                              DFlash/DFlash2/Eagle3 1..15\n"
@@ -385,6 +389,19 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--expert-cache-slots") {
             options.expert_cache.cache_slots =
                 parse_nonnegative(value("--expert-cache-slots"), "expert-cache-slots");
+        } else if (arg == "--host-experts") {
+            options.host_experts.threads = static_cast<std::uint32_t>(
+                parse_nonnegative(value("--host-experts"), "host-experts"));
+        } else if (arg == "--host-expert-share") {
+            const std::string text = value("--host-expert-share");
+            double share           = 0.0;
+            const char* end        = text.data() + text.size();
+            const auto result      = std::from_chars(text.data(), end, share);
+            if (result.ec != std::errc() || result.ptr != end || !(share >= 0.0) ||
+                !(share <= 1.0)) {
+                throw std::invalid_argument("invalid host-expert-share: " + text);
+            }
+            options.host_experts.share = static_cast<float>(share);
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {

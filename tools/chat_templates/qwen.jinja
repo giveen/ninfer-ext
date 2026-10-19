@@ -3,7 +3,7 @@ SPDX-License-Identifier: Apache-2.0
 Derived from froggeric/Qwen-Fixed-Chat-Templates chat_template.jinja (v22.5, Apache-2.0),
 itself derived from the official Qwen 3.5/3.6/3.8 chat_template.jinja. One template serves all
 Qwen3_5ForCausalLM / Qwen3_5MoeForCausalLM models.
-NInfer changes: support final-assistant continuation (continue_final_message) and accept
+NInfer changes: support final-assistant continuation (continue_final_message) with exact content and accept
 tool-result histories whose original user turn was removed.
 #}
 {%- set template_version = "qwen-froggeric-v22.5-ninfer" %}
@@ -254,7 +254,11 @@ tool-result histories whose original user turn was removed.
 {%- set ns2 = namespace(prev_role='', consecutive_failures=0) %}
 {%- for message in _msgs %}
     {%- set is_system = (message.role == "system" or message.role == "developer") %}
-    {%- set content = render_content(message.content, true, is_system) | trim %}
+    {%- set continuing = message.role == 'assistant' and loop.last and continue_final_message is defined and continue_final_message %}
+    {%- set content = render_content(message.content, true, is_system) %}
+    {%- if not continuing %}
+        {%- set content = content | trim %}
+    {%- endif %}
     {%- if is_system or message.role == 'user' %}
         {%- if '<|think_off|>' in content %}{%- set content = content.split('<|think_off|>') | join('') | trim %}{%- endif %}
         {%- if '<|think_on|>' in content %}{%- set content = content.split('<|think_on|>') | join('') | trim %}{%- endif %}
@@ -273,7 +277,6 @@ tool-result histories whose original user turn was removed.
         {%- set ns2.consecutive_failures = 0 %}
         {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
     {%- elif message.role == 'assistant' %}
-        {%- set continuing = continue_final_message is defined and continue_final_message and loop.last %}
         {%- set reasoning_content = '' %}
         {%- set _explicit_reasoning = '' %}
         {%- if message.reasoning_content is defined and message.reasoning_content is not none %}

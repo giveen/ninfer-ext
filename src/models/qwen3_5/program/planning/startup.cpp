@@ -1249,6 +1249,18 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.speculative.backend != SpeculativeBackend::Eagle3) {
         throw std::invalid_argument("draft-tree widths above 1 require the EAGLE3 backend");
     }
+    if (!(options.host_experts.share >= 0.0F && options.host_experts.share <= 1.0F)) {
+        throw std::invalid_argument("host_experts.share must be in [0, 1]");
+    }
+    if (options.host_experts.threads > 0) {
+        if (!parameters.qwen4) {
+            throw std::invalid_argument("host_experts requires Qwen4Exp NVFP4 routed experts");
+        }
+        if (parameters.qwen4->layers.front().moe.bank.layout.format != ops::ExpertFormat::Nvfp4) {
+            throw std::invalid_argument(
+                "host_experts requires NVFP4 routed experts (the EXL3 bank has no host kernels)");
+        }
+    }
     if (!parameters.model.config().text.attention ||
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
@@ -1532,6 +1544,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->expert_cache_slots  = inputs.expert_cache_slots;
     impl->ngram_stream        = inputs.ngram_stream;
     impl->kv_stream           = inputs.kv_stream;
+    impl->host_experts         = inputs.host_experts;
     impl->plain_mtp_batches =
         inputs.speculative_backend == SpeculativeBackend::Mtp && !inputs.causal_scoring &&
         inputs.max_concurrency > 1 &&
@@ -1744,6 +1757,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache       = options.context_cache,
         .kv_stream           = options.kv_stream,
+        .host_experts         = options.host_experts,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Streaming bounds each request's Device residency by its window instead of max_context.

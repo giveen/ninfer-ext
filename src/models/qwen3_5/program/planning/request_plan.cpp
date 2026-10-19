@@ -598,7 +598,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
              (shared_source != nullptr && shared_source->backend_frontier >= plan->reuse_base - 1));
         if (plan->reuse != ReusePath::Root && !append_ready && !checkpoint_ready) {
-            throw std::logic_error("published MTP checkpoint is not materializable");
+            // A published checkpoint is a reuse opportunity, not a Program invariant. One whose
+            // draft state cannot bridge the reuse frontier cannot seed a draft, so reject the
+            // candidate: admission then picks another prefix or the root instead of failing the
+            // request (which used to surface as an HTTP 500 on the first request after a
+            // continuation was published without materializable MTP state).
+            return std::nullopt;
         }
     }
 
@@ -612,7 +617,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
          (shared_source != nullptr &&
           (!shared_source->kv || (backend_kv_cache() && !shared_source->kv->backend) ||
            shared_source->frontier < plan->reuse_base)))) {
-        throw std::logic_error("published DFlash checkpoint is not materializable");
+        // The same candidate rejection as the MTP block above: a published checkpoint that cannot
+        // materialize its draft context is skipped, not a request failure.
+        return std::nullopt;
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;

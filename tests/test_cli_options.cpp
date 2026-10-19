@@ -91,6 +91,19 @@ int main() {
                                        "--ngram-residency", "pinned"});
                       }),
                       "--ngram-residency accepted an unknown mode");
+    const ninfer::cli::Options split =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--host-experts", "12",
+               "--host-expert-share", "0.25"});
+    failures += check(split.host_experts.threads == 12 && split.host_experts.share == 0.25F,
+                      "--host-experts/--host-expert-share did not parse");
+    failures +=
+        check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hi"}).host_experts.threads == 0,
+              "omitted --host-experts is not off");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hi",
+                                       "--host-expert-share", "1.5"});
+                      }),
+                      "--host-expert-share accepted a value above one");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

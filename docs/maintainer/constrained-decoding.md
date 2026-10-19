@@ -120,6 +120,13 @@ Semantics that follow from that path:
   cache key rather than being normalized away;
 - string, bounded-number, array-length and enum constraints become part of the same automaton as a
   hand-written grammar, so `pattern` and `minLength` can apply together;
+- a pure string length bound is a counted repetition of JSON-encoded Unicode scalars with the
+  closing quote in the same rule. The compiler lowers the repeated body to a byte DFA and
+  precomputes, per token, the repeat budget it needs as a dense bitmap or sparse set, including
+  partial UTF-8 and escape states; the dynamic count stays in parser history and rolls back with it.
+  Different upper bounds share the body, so rules and mask buckets do not grow with the bound.
+  Tokens that leave the string and consume the following grammar keep exact matching, and
+  combinations with `pattern` or a tool end marker still use the intersection automaton;
 - the vendor does not fetch external documents: document-local `$ref`/`$defs` resolve, remote ones
   are refused.
 

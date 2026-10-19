@@ -32,6 +32,7 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     ExpertCachePolicy expert_cache;
+    HostExpertOptions host_experts;
     NgramResidency ngram_residency = NgramResidency::Automatic;
     SpeculativeOptions speculative;
     bool enable_vision  = false;

@@ -330,9 +330,16 @@ void moe_route_share_padding(Tensor& ids, const Tensor& valid_columns, std::int3
  * span in the pool (`ExpertPoolGeometry::span`), which is what places its experts and what an
  * `owner` records. The cache must hold at least K*T slots. Every slot touched by this call is
  * protected from eviction within it.
+ *
+ * `admit_share` in [0, 1] limits how many of the call's m missed experts enter the cache:
+ * round(admit_share * m) of them are given slots and listed in `misses`; the others resolve to -1
+ * and leave the cache unchanged, for a host lane to compute (`moe_host_publish`). Which misses are
+ * admitted rotates through the call's ascending miss list with the cache clock, so no expert id is
+ * favoured over time. At 1 every miss is admitted.
  */
 void expert_cache_resolve(const Tensor& ids, ExpertBankSpan bank, const ExpertCacheState& cache,
-                          Tensor& slot_ids, Tensor& misses, cudaStream_t stream);
+                          Tensor& slot_ids, Tensor& misses, cudaStream_t stream,
+                          float admit_share = 1.0F);
 
 /**
  * Copy every missing expert listed in `misses` from its bank into its slot. The bank planes must
@@ -390,6 +397,56 @@ struct MoeExpertsPending {
     cudaEvent_t fetched;
 };
 
+/** One assignment a host lane computes: expert `expert` of the call's layer for column `column`. */
+struct MoeHostJob {
+    std::int32_t expert;
+    std::int32_t column;
+    float weight; // the assignment's routing weight
+    std::int32_t rank;
+};
+
+/** What a published call asks of the host lane. */
+struct MoeHostHeader {
+    std::uint32_t sequence;
+    std::int32_t layer; // the cache layer whose bank the jobs read
+    std::int32_t columns;
+    std::int32_t jobs;
+};
+
+/**
+ * The mapped-memory channel between cache-route calls and a host expert lane. The Host words are
+ * mapped pinned memory, read and written by both sides; `sequence` and `ticket` are device words.
+ *
+ * `moe_host_publish` lists a call's unresolved assignments (slot -1, valid expert id) in `jobs`,
+ * copies the call's input columns to `x`, and, when there is at least one job, takes the next
+ * sequence number, writes `header` and then rings `doorbell` with that number; `ticket` holds it
+ * (zero when there is no job). The lane answers by writing, for every column t,
+ *
+ *   rows[:,t] = sum over the call's jobs of column t of weight * expert(x_t)     (FP32 [2560,T])
+ *
+ * and then storing the sequence number to `answered`. `moe_experts` with this ring waits on it.
+ */
+struct MoeHostRing {
+    MoeHostHeader* header             = nullptr;
+    MoeHostJob* jobs                  = nullptr; // [10 * max_columns]
+    std::uint16_t* x                  = nullptr; // BF16 [2560, max_columns]
+    const float* rows                 = nullptr; // FP32 [2560, max_columns]
+    std::uint32_t* doorbell           = nullptr;
+    const std::uint32_t* answered     = nullptr;
+    std::uint32_t* sequence           = nullptr; // device
+    std::uint32_t* ticket             = nullptr; // device
+    std::int32_t max_columns          = 0;
+};
+
+/**
+ * Publish the assignments of one cache-route call that resolved to no slot (see the ring). `ids`
+ * and `slot_ids` are I32 `[10,T]`, `weights` FP32 `[10,T]`, `x` BF16 `[2560,T]` with T at most
+ * `ring.max_columns`. Graph-capturable: the sequence number comes from the device word.
+ */
+void moe_host_publish(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
+                      const Tensor& weights, std::int32_t layer, const MoeHostRing& ring,
+                      cudaStream_t stream);
+
 /**
  * Offline-calibration tap. After each token chunk of moe_experts, `tap` receives the BF16 SwiGLU
  * intermediates `act` [640, 10*columns] (assignment a = column*10 + k is column a) and the chunk's
@@ -415,13 +472,18 @@ using MoeActivationTap =
  * With `pending`, the slots listed in `pending->misses` (an expert_cache_resolve miss list) may
  * still be filling: the other assignments run first, then `stream` waits on `pending->fetched`
  * before the listed slots are read. The result is identical to a call made after the fetch.
+ *
+ * Assignments whose slot id is -1 are not computed here. With `host` (published for this call by
+ * `moe_host_publish`), the merge waits for the lane's answer and adds its FP32 rows before the one
+ * BF16 rounding of y; the lane's experts round differently (see the lane), so with a host share the
+ * result depends on which experts the cache held.
  */
 
 void moe_experts(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
                  const Tensor& weights, const Tensor& shared_gate, const Tensor& shared,
                  const ExpertWeights& weights_source, std::int32_t slots, WorkspaceArena& workspace,
                  Tensor& y, cudaStream_t stream, const MoeExpertsPending* pending = nullptr,
-                 const MoeActivationTap* tap = nullptr);
+                 const MoeActivationTap* tap = nullptr, const MoeHostRing* host = nullptr);
 
 [[nodiscard]] std::size_t moe_experts_a4_workspace_bytes(std::int32_t tokens);
 

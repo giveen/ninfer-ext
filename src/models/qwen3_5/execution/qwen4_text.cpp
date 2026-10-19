@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/calibration.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/execution/expert_pager.h"
+#include "models/execution/host_expert_lane.h"
 #include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -446,7 +447,13 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
                             std::int32_t cache_layer, Tensor& y) {
     cudaStream_t s            = ctx_.stream;
     const int T               = x.ne[1];
-    models::execution::ExpertPager& experts = *qwen4_runtime().experts;
+    const auto& runtime                          = qwen4_runtime();
+    models::execution::ExpertPager& experts = *runtime.experts;
+    models::execution::HostExpertLane* host_lane = runtime.host_lane;
+    // The lane serves one narrow call at a time: a wider pass, or a full fetch share, keeps every
+    // miss on the PCIe path and needs no publication.
+    const bool host_split =
+        host_lane != nullptr && runtime.host_share < 1.0F && T <= host_lane->ring().max_columns;
 
     auto scope = work_.scope();
     auto roots = workspace::qwen4_moe(work_, config_, T, experts.cache().slots);
@@ -515,14 +522,21 @@ void TextContext::qwen4_moe(const OffloadMoeParameters& p, const Tensor& x,
         Tensor ids               = roots.ids.slice(1, begin, count);
         Tensor slot_ids          = roots.slot_ids.slice(1, begin, count);
         Tensor misses            = roots.misses.slice(0, 0, 2 * count * ops::kOffloadMoeTopK + 1);
-        // Cache-resident experts run while the misses are fetched.
+        // Cache-resident experts run while the misses are fetched. With a host share, only the
+        // admitted share of the misses is fetched; the rest resolve to -1 and go to the lane.
+        const float admit_share = host_split ? runtime.host_share : 1.0F;
         const ops::MoeExpertsPending pending{
-            &misses, experts.resolve(ids, cache_layer, p.bank, slot_ids, misses, s)};
+            &misses, experts.resolve(ids, cache_layer, p.bank, slot_ids, misses, s, admit_share)};
+        const ops::MoeHostRing* ring = host_split ? &host_lane->ring() : nullptr;
+        Tensor x_slice               = x.slice(1, begin, count);
+        Tensor w_slice               = roots.weights.slice(1, begin, count);
+        if (ring != nullptr) {
+            ops::moe_host_publish(x_slice, ids, slot_ids, w_slice, cache_layer, *ring, s);
+        }
         Tensor y_slice = y.slice(1, begin, count);
-        ops::moe_experts(
-            x.slice(1, begin, count), ids, slot_ids, roots.weights.slice(1, begin, count),
+        ops::moe_experts(x_slice, ids, slot_ids, w_slice,
             roots.shared_gate.slice(0, begin, count), roots.shared.slice(1, begin, count), slots,
-            slot_count, work_, y_slice, s, &pending);
+            slot_count, work_, y_slice, s, &pending, nullptr, ring);
     }
 }
 

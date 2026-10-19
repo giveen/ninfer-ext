@@ -36,6 +36,11 @@ struct MoeChunk {
     void* xr;                   // EXL3 prefill: [assignments][2][H] FP16 rotated inputs
     const std::int32_t* misses; // resolve miss list still being fetched, or null
     cudaEvent_t fetched;        // completes the fetch of `misses`
+    // Host share (null without one): the lane's FP32 rows for this chunk's columns, its answer
+    // word and the call's ticket.
+    const float* host_rows;
+    const std::uint32_t* host_answered;
+    const std::uint32_t* host_ticket;
 };
 
 // EXL3 passes of at most this many columns use the decode kernels (K-split, 8-row tiles); wider
@@ -83,7 +88,10 @@ void moe_route_share_padding_launch(Tensor& ids, const Tensor& valid_columns, st
                                     cudaStream_t stream);
 void expert_cache_resolve_launch(const Tensor& ids, ExpertBankSpan bank,
                                  const ExpertCacheState& cache, Tensor& slot_ids, Tensor& misses,
-                                 cudaStream_t stream);
+                                 float admit_share, cudaStream_t stream);
+void moe_host_publish_launch(const Tensor& x, const Tensor& expert_ids, const Tensor& slot_ids,
+                             const Tensor& weights, std::int32_t layer, const MoeHostRing& ring,
+                             cudaStream_t stream);
 void expert_cache_stage_launch(const ExpertCacheState& cache, ExpertBankSpan bank,
                                const std::int32_t* resident, const ExpertWeights& weights,
                                const ExpertWeights& staged, cudaStream_t stream);

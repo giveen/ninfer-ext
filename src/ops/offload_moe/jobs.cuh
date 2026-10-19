@@ -33,8 +33,8 @@ struct JobFilter {
     }
 };
 
-// First assignment and slot of this CTA's job; count 0 when the CTA has no job or `filter` skips
-// it.
+// First assignment and slot of this CTA's job; count 0 when the CTA has no job, the job's
+// assignments resolved to no slot (-1: a host lane computes them), or `filter` skips it.
 __device__ __forceinline__ JobView job_head(const std::int32_t* jobs, const std::int32_t* job_count,
                                             const std::int32_t* sorted_slot, JobFilter filter) {
     JobView view{-1, 0, -1, -1};
@@ -42,7 +42,7 @@ __device__ __forceinline__ JobView job_head(const std::int32_t* jobs, const std:
     if (job >= *job_count) { return view; }
     view.begin = jobs[job];
     view.slot  = sorted_slot[view.begin];
-    if (!filter.admits(view.slot)) { return view; }
+    if (view.slot < 0 || !filter.admits(view.slot)) { return view; }
     view.count = 1;
     return view;
 }

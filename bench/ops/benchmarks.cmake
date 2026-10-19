@@ -61,6 +61,8 @@ ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_D
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sparse_moe_bench.cu")
 ninfer_add_op_bench(ninfer_offload_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/offload_moe_bench.cu")
 ninfer_add_op_bench(ninfer_expert_fetch_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/expert_fetch_bench.cu")
+ninfer_add_op_bench(ninfer_cpu_expert_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu_expert_bench.cpp")
+ninfer_add_op_bench(ninfer_host_handshake_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/host_handshake_bench.cu")
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

@@ -9,7 +9,12 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
 - **Experts on the Host.** Routed experts stay NVFP4 (or [EXL3](#flash-next-exl3)) in pinned Host
   memory. Each MoE layer resolves its top-10 experts against an LRU device expert cache inside the
   decode CUDA Graph and copies misses over PCIe. `--expert-cache` sizes that cache; `auto` gives it
-  the device memory left after the KV floor.
+  the device memory left after the KV floor. A narrow decode call can split its misses:
+  `--host-experts N` computes `--host-expert-share` (default 0.5) of them on N host threads from the
+  pinned bank while the admitted rest cross PCIe, and the merge waits for the host rows inside the
+  graph. Those experts quantize activations to Q8_0, so with a share decode output depends on which
+  experts the cache held; a team larger than the process's CPU allowance minus two is clamped to
+  that.
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
   a double-buffered staging bank, copying experts already in the cache device-to-device instead.
   Staged experts run on a W4A4 tensor-core route when the artifact stores the layer's NVFP4 input
@@ -102,15 +107,28 @@ machine (RTX 5090, i9-285K, MTP K=3, fp8 KV, `--expert-cache auto`):
   investigated.
 - Next-layer expert prefetch (the next router applied to this layer's input, fetching its predicted
   misses early) cost 4–8% decode here and is not in the tree.
-- Computing the cache-missed routed experts on the host instead of fetching them (a host lane beside
-  the resident experts' device work, `--host-expert-lane`) measured **34.35 tok/s against 81.73** for
-  the fetch path in one session, and is not in the tree. The reason is arithmetic, not the kernel: an
-  expert is 4.9 M weights in 2.76 MB, 1.8 MACs per byte, so the 50 GB/s fetch delivers about
-  90 GMAC/s while eight cores without AVX-512 deliver 24–48 GMAC/s of decode-limited work on 4-bit
-  codes. A scalar host kernel ran 11.09 tok/s; an AVX2 kernel with a table-decoded E4M3 block scale,
-  checked against the FP64 oracle by the offload-MoE op test, reached 34.35, which is this box's
-  ceiling. `bench/ops/expert_fetch_bench.cu` measures the pieces: SM-issued reads reach 35 GB/s from
-  the pinned 2 MiB-page bank while the copy engine moves the same bytes at 47 GB/s.
+- **Host miss split** (`--host-experts N --host-expert-share F`). A narrow call resolves its misses
+  with only a share admitted to the cache; the rest are published to a host thread team that
+  computes them from the pinned bank while the admitted misses cross PCIe, and the combine waits for
+  its rows inside the graph. Measured 2026-10-18, plain C=1 decode (`ninfer_bench -pg 2048,128`,
+  E-cores, one session): **86.0–87.5 tok/s without the split against 91.9 with 14 threads at share
+  0.5** (+5–7%); 12 threads reached 91.0 and 4 threads 90.2. On the reasoning-shaped `-pg 300,1024`
+  it is **95.1–95.3 against 97.8** (+2.6%), though one of four runs there measured 80.6 — the gain
+  depends on CPU headroom, because the team competes with the process's own threads. With
+  `--spec mtp --draft-tokens 3` it is
+  **142.2 against 164.9** at the same 96% acceptance (+16%), because a verify round's wider call has
+  more misses to divide. Prefill is unchanged: the split applies only to calls at most `max_columns`
+  (16) wide. Computing *every* miss on the host (share 0) remains slower than fetching — 34.35
+  against 81.73 tok/s in the 2026-10-02 session — because the arithmetic, not the kernel, is the
+  limit: an expert is 4.9M weights in 2.76 MB (1.8 MACs per byte), so the 36–47 GB/s fetch delivers
+  about 90 GMAC/s while 16 E-cores reach 54–62 GB/s. The split divides the work until neither side is
+  a layer's bottleneck. Host experts round activations to Q8_0 (about 1% relative rms against the
+  exact weights), so with a share the decode output depends on what the cache held — the one
+  accepted placement dependence. A team that fills the CPU allowance loses 40–60% (16 threads on a
+  16-CPU allowance measured 52.4 against 87.7) because the Program's own threads lose a core; the
+  lane clamps to allowance minus two and warns. `bench/ops/expert_fetch_bench.cu` measures the fetch
+  pieces: SM-issued reads reach 35 GB/s from the pinned 2 MiB-page bank while the copy engine moves
+  the same bytes at 47 GB/s.
 - Frequency-protected cache admission (LFRU, scoring slots `freq / (age + 1)` instead of by age)
   cost 3.9–4.0% **more** misses than the LRU key and is not in the tree: 32,862 and 32,907 misses
   under LRU against 34,132 (per-expert counts) and 34,173 (sticky frame counts), on one
@@ -258,8 +276,10 @@ per-miss grid fell to 20–28 GB/s (+13% at C=1, +37% at C=8); staging banks tha
 between long chunks (+6%/+22%); decode expert GEMVs that reduce only a job's live tokens and issue
 weight loads before the lookup finishes (+13%/+10%); single-column projection splits as views instead
 of device copies (−218 graph copy nodes per decode token, +2.5% at C=1); pinned weights and Host KV
-on prefaulted 2 MiB pages (+16% prefill, +11%/+32%); and cache-route expert fetches on the pager's own
-stream (+6.5% decode after a 2,048-token prompt, +3%/+18%).
+on prefaulted 2 MiB pages (+16% prefill, +11%/+32%); cache-route expert fetches on the pager's own
+stream (+6.5% decode after a 2,048-token prompt, +3%/+18%); and a decode miss split that computes a
+share of narrow calls' expert misses on host threads beside the PCIe fetch (+5–7% plain and +16% MTP
+at C=1).
 
 The comparison engine used during development, FreeToken with `--moe-backend offload`, measured
 about 1,900 tok/s prefill and 77–79 tok/s single-request decode on the same machine (4k context).

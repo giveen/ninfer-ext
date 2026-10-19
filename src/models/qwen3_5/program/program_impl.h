@@ -731,6 +731,9 @@ public:
                                                       std::span<const TokenId> drafts);
     Tensor token_counts;
     std::optional<models::execution::ExpertPager> qwen4_experts;
+    // Host side of the decode miss split (HostExpertOptions), when enabled. Destroyed before the
+    // pager and the banks it reads, and only after the device work that publishes to it drains.
+    std::unique_ptr<models::execution::HostExpertLane> host_lane;
     std::optional<execution::Qwen4Runtime> qwen4_runtime;
     std::unique_ptr<execution::PleGather> ple_gather;
     std::optional<PinnedHostBuffer> ple_host;

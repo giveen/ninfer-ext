@@ -211,6 +211,22 @@ class ChatTemplates(unittest.TestCase):
                         enable_thinking=False,
                     ).endswith("<|im_start|>assistant\nprefix </think> text")
                 )
+                content = "  def f():\n    "
+                self.assertEqual(
+                    self.render(
+                        version,
+                        [message("user", "code"), message("assistant", content)],
+                        continue_final_message=True,
+                        enable_thinking=False,
+                    ),
+                    "<|im_start|>user\ncode<|im_end|>\n<|im_start|>assistant\n" + content,
+                )
+                closed = [message("user", "code"), message("assistant", content)]
+                self.assertTrue(
+                    self.render(version, closed, enable_thinking=False).endswith(
+                        "\ndef f():<|im_end|>\n"
+                    )
+                )
 
     def test_cpp_matches_independent_renderer(self):
         contexts = [
@@ -254,6 +270,15 @@ class ChatTemplates(unittest.TestCase):
             ),
             dict(
                 messages=[message("user", "first"), message("assistant", "prefix")],
+                add_generation_prompt=False,
+                continue_final_message=True,
+                enable_thinking=False,
+            ),
+            dict(
+                messages=[
+                    message("user", "code"),
+                    message("assistant", "  def f():\n    "),
+                ],
                 add_generation_prompt=False,
                 continue_final_message=True,
                 enable_thinking=False,

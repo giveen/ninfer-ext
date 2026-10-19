@@ -111,6 +111,10 @@ x, inj = HC_mlp(R);   R = R + inj ⊗ SparseMoE(x)
 - SwiGLU experts whose fused `gate_up_proj` rows are gate first, then up;
 - the shared expert scaled by `sigmoid(shared_expert_gate · x)`.
 
+Execution may compute a share of a narrow call's missing experts on host threads (`--host-experts`);
+those experts quantize activations to Q8_0, so their result depends on what the expert cache held
+when the call ran. This is the one accepted placement dependence in decode.
+
 ## Qwen Sparse Attention
 
 The attention projections are unchanged from Qwen3.5:

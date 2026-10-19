@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -900,6 +901,301 @@ int outside_case(const HostBank& host, const DeviceBank& bank) {
     return failures;
 }
 
+// ---- host split (decode miss split) ---------------------------------------------------------
+
+constexpr std::size_t ring_align256(std::size_t v) { return (v + 255) / 256 * 256; }
+
+// The mapped channel of a host lane, laid out exactly as HostExpertLane lays it out.
+struct TestHostRing {
+    void* mapped       = nullptr;
+    void* device_words = nullptr;
+    ops::MoeHostRing ring{};
+
+    ops::MoeHostHeader* header_host = nullptr;
+    std::uint32_t* doorbell_host    = nullptr;
+    std::uint32_t* answered_host    = nullptr;
+    ops::MoeHostJob* jobs_host      = nullptr;
+    std::uint16_t* x_host           = nullptr;
+    float* rows_host                = nullptr;
+
+    explicit TestHostRing(std::int32_t columns) {
+        const std::size_t assignments = static_cast<std::size_t>(columns) * K;
+        const std::size_t off_jobs    = 256;
+        const std::size_t off_x = ring_align256(off_jobs + assignments * sizeof(ops::MoeHostJob));
+        const std::size_t off_rows =
+            ring_align256(off_x + static_cast<std::size_t>(columns) * H * sizeof(std::uint16_t));
+        const std::size_t bytes =
+            ring_align256(off_rows + static_cast<std::size_t>(columns) * H * sizeof(float));
+        cuda_check(cudaHostAlloc(&mapped, bytes, cudaHostAllocMapped), "ring allocation");
+        std::memset(mapped, 0, bytes);
+        void* view = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&view, mapped, 0), "ring device view");
+        cuda_check(cudaMalloc(&device_words, 256), "ring device words");
+        cuda_check(cudaMemset(device_words, 0, 256), "ring device words");
+        auto* host_base   = static_cast<std::byte*>(mapped);
+        auto* device_base = static_cast<std::byte*>(view);
+        ring.header       = reinterpret_cast<ops::MoeHostHeader*>(device_base);
+        ring.doorbell     = reinterpret_cast<std::uint32_t*>(device_base + 64);
+        ring.answered     = reinterpret_cast<const std::uint32_t*>(device_base + 128);
+        ring.jobs         = reinterpret_cast<ops::MoeHostJob*>(device_base + off_jobs);
+        ring.x            = reinterpret_cast<std::uint16_t*>(device_base + off_x);
+        ring.rows         = reinterpret_cast<const float*>(device_base + off_rows);
+        ring.sequence     = static_cast<std::uint32_t*>(device_words);
+        ring.ticket       = static_cast<std::uint32_t*>(device_words) + 1;
+        ring.max_columns  = columns;
+        header_host       = reinterpret_cast<ops::MoeHostHeader*>(host_base);
+        doorbell_host     = reinterpret_cast<std::uint32_t*>(host_base + 64);
+        answered_host     = reinterpret_cast<std::uint32_t*>(host_base + 128);
+        jobs_host         = reinterpret_cast<ops::MoeHostJob*>(host_base + off_jobs);
+        x_host            = reinterpret_cast<std::uint16_t*>(host_base + off_x);
+        rows_host         = reinterpret_cast<float*>(host_base + off_rows);
+    }
+
+    ~TestHostRing() {
+        if (device_words != nullptr) { (void)cudaFree(device_words); }
+        if (mapped != nullptr) { (void)cudaFreeHost(mapped); }
+    }
+
+    TestHostRing(const TestHostRing&)            = delete;
+    TestHostRing& operator=(const TestHostRing&) = delete;
+};
+
+// One expert's FP64 output for column `t` of `x` ([H, tokens]).
+std::vector<double> expert_output(const HostBank& bank, int e, const std::vector<float>& x,
+                                  std::int32_t tokens, std::int32_t t) {
+    std::vector<double> out(H, 0.0), act(I);
+    const float* xt = x.data() + static_cast<std::size_t>(t) * H;
+    const std::uint8_t* gu_codes =
+        bank.planes[0].data() + static_cast<std::size_t>(e) * ops::kExpertGateUpCodeBytes;
+    const std::uint8_t* gu_scales =
+        bank.planes[1].data() + static_cast<std::size_t>(e) * ops::kExpertGateUpScaleBytes;
+    const std::uint8_t* d_codes =
+        bank.planes[2].data() + static_cast<std::size_t>(e) * ops::kExpertDownCodeBytes;
+    const std::uint8_t* d_scales =
+        bank.planes[3].data() + static_cast<std::size_t>(e) * ops::kExpertDownScaleBytes;
+    for (std::int32_t r = 0; r < I; ++r) {
+        double g = 0.0, u = 0.0;
+        for (std::int32_t h = 0; h < H; ++h) {
+            g += decode(gu_codes, gu_scales, H, r, h, bank.gate_up_divisors[2 * e]) * xt[h];
+            u += decode(gu_codes, gu_scales, H, I + r, h, bank.gate_up_divisors[2 * e + 1]) * xt[h];
+        }
+        act[r] = g * sigmoid(g) * u;
+    }
+    for (std::int32_t h = 0; h < H; ++h) {
+        double sum = 0.0;
+        for (std::int32_t r = 0; r < I; ++r) {
+            sum += decode(d_codes, d_scales, I, h, r, bank.down_divisors[e]) * act[r];
+        }
+        out[h] = sum;
+    }
+    return out;
+}
+
+// A resolve admitting only part of its misses, then a publish and a merge with a host answer:
+// the -1 assignments reach the ring, the admitted experts enter the cache, and the merged output
+// matches the FP64 oracle over every assignment.
+int host_split_case(const HostBank& host, const DeviceBank& bank, std::int32_t tokens,
+                    std::uint32_t seed, float share) {
+    const auto x      = random_bf16(static_cast<std::size_t>(H) * tokens, seed, -0.05F, 0.05F);
+    const auto shared = random_bf16(static_cast<std::size_t>(H) * tokens, seed + 1U, -4.0F, 4.0F);
+    std::vector<int> ids(static_cast<std::size_t>(K) * tokens);
+    std::vector<float> weights(ids.size()), shared_gate(tokens);
+    std::uint32_t state = seed | 1U;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::set<int> chosen;
+        float total = 0.0F;
+        for (std::int32_t k = 0; k < K; ++k) {
+            int e;
+            do { e = static_cast<int>(next(state) % E); } while (!chosen.insert(e).second);
+            ids[t * K + k]     = e;
+            weights[t * K + k] = 0.1F + static_cast<float>(next(state) % 100) / 100.0F;
+            total += weights[t * K + k];
+        }
+        for (std::int32_t k = 0; k < K; ++k) { weights[t * K + k] /= total; }
+        shared_gate[t] = static_cast<float>(next(state) % 1000) / 1000.0F;
+    }
+    const std::string label =
+        "moe_experts host split T=" + std::to_string(tokens) + " share=" + std::to_string(share);
+    const std::vector<double> reference =
+        expert_oracle(host, x, ids, weights, shared_gate, shared, tokens);
+
+    DeviceBuffer dx      = to_device(bits(x));
+    DeviceBuffer dshared = to_device(bits(shared));
+    DeviceBuffer dids    = to_device_i32(ids);
+    DeviceBuffer dw      = to_device(weights);
+    DeviceBuffer dsg     = to_device(shared_gate);
+    Tensor tx(dx.p, DType::BF16, {H, tokens});
+    Tensor tshared(dshared.p, DType::BF16, {H, tokens});
+    Tensor tids(dids.p, DType::I32, {K, tokens});
+    Tensor tw(dw.p, DType::FP32, {K, tokens});
+    Tensor tsg(dsg.p, DType::FP32, {tokens});
+
+    const std::int32_t slots = 10 * tokens + 20;
+    DeviceCache cache(slots, 1);
+    // Warm one column so the call mixes hits and misses.
+    (void)resolve(cache, bank, 0, std::vector<int>(ids.begin(), ids.begin() + K));
+    const std::vector<int> resident_before = cache.table();
+    std::set<int> resident;
+    for (int e = 0; e < E; ++e) {
+        if (resident_before[static_cast<std::size_t>(e)] >= 0) { resident.insert(e); }
+    }
+    std::vector<int> missing;
+    for (const int e : std::set<int>(ids.begin(), ids.end())) {
+        if (!resident.count(e)) { missing.push_back(e); }
+    }
+    const int miss_count = static_cast<int>(missing.size());
+    const int need       = std::min(miss_count, static_cast<int>(share * miss_count + 0.5F));
+    if (miss_count < 2 || need >= miss_count) {
+        std::cerr << label << ": the case needs hits, admitted misses and host misses; got "
+                  << miss_count << " misses, " << need << " admitted\n";
+        return 1;
+    }
+
+    DeviceBuffer dslots = to_device_i32(std::vector<int>(ids.size(), -7));
+    DeviceBuffer dmiss  = to_device_i32(std::vector<int>(2 * ids.size() + 1, -9));
+    Tensor tslots(dslots.p, DType::I32, {K, tokens});
+    Tensor tmiss(dmiss.p, DType::I32, {static_cast<std::int32_t>(2 * ids.size() + 1)});
+    ops::expert_cache_resolve(tids, cache.geometry.span(0), cache.state, tslots, tmiss, nullptr,
+                              share);
+    cuda_synchronize();
+    int failures                     = 0;
+    const std::vector<int> got_slots = from_device<int>(dslots, ids.size());
+    const std::vector<int> listed    = from_device<int>(dmiss, 2 * ids.size() + 1);
+    if (listed[0] != need) {
+        std::cerr << label << ": resolve listed " << listed[0] << " admitted misses, expected "
+                  << need << '\n';
+        ++failures;
+    }
+    std::set<int> admitted;
+    std::vector<int> admitted_ranks;
+    for (int j = 0; j < std::min(listed[0], need); ++j) {
+        const int expert = listed[2 + 2 * j];
+        admitted.insert(expert);
+        const auto it = std::find(missing.begin(), missing.end(), expert);
+        if (it == missing.end()) {
+            std::cerr << label << ": admitted expert " << expert << " was not missing\n";
+            ++failures;
+        } else {
+            admitted_ranks.push_back(static_cast<int>(it - missing.begin()));
+        }
+    }
+    // The admitted run is contiguous in the ascending miss list, rotated by the cache clock.
+    std::sort(admitted_ranks.begin(), admitted_ranks.end());
+    for (std::size_t i = 1; i < admitted_ranks.size(); ++i) {
+        const int step = admitted_ranks[i] - admitted_ranks[i - 1];
+        if (step != 1 && !(i == admitted_ranks.size() - 1 && admitted_ranks.front() == 0 &&
+                           admitted_ranks.back() == miss_count - 1)) {
+            std::cerr << label << ": admitted misses are not a rotated run ("
+                      << admitted_ranks[i - 1] << " then " << admitted_ranks[i] << " of "
+                      << miss_count << ")\n";
+            ++failures;
+            break;
+        }
+    }
+    // A slot id is set exactly for an expert that was resident or was admitted.
+    std::map<std::pair<int, int>, int> host_assignments;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t k = 0; k < K; ++k) {
+            const int e     = ids[t * K + k];
+            const bool cold = !resident.count(e) && !admitted.count(e);
+            if (cold != (got_slots[t * K + k] < 0)) {
+                std::cerr << label << ": assignment (" << k << ',' << t << ") expert " << e
+                          << " has slot " << got_slots[t * K + k] << '\n';
+                ++failures;
+            }
+            if (cold) { host_assignments[{static_cast<int>(t), static_cast<int>(k)}] = e; }
+        }
+    }
+    const std::vector<int> table_after = cache.table();
+    for (int e = 0; e < E; ++e) {
+        const bool should = resident.count(e) || admitted.count(e);
+        if (should != (table_after[static_cast<std::size_t>(e)] >= 0)) {
+            std::cerr << label << ": expert " << e << " residency is " << table_after[e] << '\n';
+            ++failures;
+        }
+    }
+
+    ops::expert_cache_fetch(bank.weights, tmiss, static_cast<std::int32_t>(ids.size()), cache.state,
+                            nullptr);
+    cuda_synchronize();
+    if (host_assignments.empty()) {
+        std::cerr << label << ": no host assignment reached the ring\n";
+        return failures + 1;
+    }
+
+    TestHostRing ring(tokens);
+    ops::moe_host_publish(tx, tids, tslots, tw, 0, ring.ring, nullptr);
+    cuda_synchronize();
+    const ops::MoeHostHeader header = *ring.header_host;
+    const std::uint32_t ticket      = from_device<std::uint32_t>(ring.ring.ticket, 1).front();
+    if (ticket == 0 || header.sequence != ticket || *ring.doorbell_host != ticket) {
+        std::cerr << label << ": publish ticket " << ticket << ", header sequence "
+                  << header.sequence << ", doorbell " << *ring.doorbell_host << '\n';
+        ++failures;
+    }
+    if (header.layer != 0 || header.columns != tokens ||
+        header.jobs != static_cast<std::int32_t>(host_assignments.size())) {
+        std::cerr << label << ": header (" << header.layer << ", " << header.columns << ", "
+                  << header.jobs << ") does not match the call\n";
+        ++failures;
+    }
+    const std::vector<std::uint16_t> x_bits = bits(x);
+    if (std::memcmp(ring.x_host, x_bits.data(),
+                    static_cast<std::size_t>(H) * tokens * sizeof(std::uint16_t)) != 0) {
+        std::cerr << label << ": published x differs from the call's input\n";
+        ++failures;
+    }
+    for (std::int32_t j = 0; j < header.jobs; ++j) {
+        const ops::MoeHostJob& job = ring.jobs_host[j];
+        const auto it              = host_assignments.find({job.column, job.rank});
+        if (it == host_assignments.end() || it->second != job.expert ||
+            job.weight != weights[static_cast<std::size_t>(job.column) * K + job.rank]) {
+            std::cerr << label << ": job " << j << " (expert " << job.expert << ", column "
+                      << job.column << ", rank " << job.rank << ") is not a host assignment\n";
+            ++failures;
+        } else {
+            host_assignments.erase(it);
+        }
+    }
+    if (!host_assignments.empty()) {
+        std::cerr << label << ": " << host_assignments.size()
+                  << " host assignments were not published\n";
+        ++failures;
+    }
+
+    // The fake lane's answer: every job's expert in FP64, weighted into its column.
+    std::vector<double> rows(static_cast<std::size_t>(H) * tokens, 0.0);
+    for (std::int32_t j = 0; j < header.jobs; ++j) {
+        const ops::MoeHostJob& job    = ring.jobs_host[j];
+        const std::vector<double> out = expert_output(host, job.expert, x, tokens, job.column);
+        for (std::int32_t h = 0; h < H; ++h) {
+            rows[static_cast<std::size_t>(job.column) * H + h] +=
+                static_cast<double>(job.weight) * out[static_cast<std::size_t>(h)];
+        }
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        ring.rows_host[i] = static_cast<float>(rows[i]);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    *reinterpret_cast<volatile std::uint32_t*>(ring.answered_host) = ticket;
+
+    GuardedDeviceBuffer out(static_cast<std::size_t>(H) * tokens * 2);
+    Tensor ty(out.data(), DType::BF16, {H, tokens});
+    {
+        WorkspaceArena workspace(
+            ops::moe_experts_workspace_bytes(tokens, slots, ops::nvfp4_expert_layout()));
+        ops::moe_experts(tx, tids, tslots, tw, tsg, tshared,
+                         ops::expert_cache_weights(cache.state, bank.weights), slots, workspace, ty,
+                         nullptr, nullptr, nullptr, &ring.ring);
+        cuda_synchronize();
+    }
+    failures +=
+        verify_reduction(label, from_device_bf16(out.data(), static_cast<std::size_t>(H) * tokens),
+                         reference, kExpertOutput);
+    failures += out.verify_guards(label);
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -922,8 +1218,13 @@ int main() {
     failures += reclaim_case(host, bank);
     failures += stage_case(host, bank);
     failures += outside_case(host, bank);
-    // Up to 64 columns take the decode GEMV route; 80 columns take the tiled route.
-    for (const std::int32_t tokens : {1, 3, 16, 64, 80}) {
+    // Decode miss split: half the misses to the host (with a hit and an admitted miss in the same
+    // call), and every miss to the host (share 0).
+    failures += host_split_case(host, bank, 8, 0xD00U, 0.5F);
+    failures += host_split_case(host, bank, 2, 0xD01U, 0.0F);
+    // Up to 64 columns take the decode GEMV route (its 1, 2, 4 and 8-token variants); 80 columns
+    // take the tiled route.
+    for (const std::int32_t tokens : {1, 2, 3, 16, 64, 80}) {
         failures += experts_case(host, bank, tokens, 0x900U + tokens);
     }
     // Concentrated routing: 12 experts serve every column, so jobs hold up to 64 tokens and the

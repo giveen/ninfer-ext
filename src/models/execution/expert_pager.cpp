@@ -215,13 +215,13 @@ std::int32_t ExpertPager::max_resolve_columns() const noexcept {
 
 cudaEvent_t ExpertPager::resolve(const Tensor& ids, std::int32_t layer,
                                  const ops::ExpertWeights& bank, Tensor& slot_ids, Tensor& misses,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, float admit_share) {
     const auto columns = static_cast<std::int32_t>(ids.ne[1]);
     if (columns > max_resolve_columns()) {
         throw std::logic_error("expert cache resolve exceeds the cache's column capacity");
     }
     const ops::ExpertBankSpan span = pool_.span(layer);
-    ops::expert_cache_resolve(ids, span, cache_, slot_ids, misses, stream);
+    ops::expert_cache_resolve(ids, span, cache_, slot_ids, misses, stream, admit_share);
     // The fetch writes only the slots it lists, which resident-slot work on `stream` never reads.
     CUDA_CHECK(cudaEventRecord(resolved_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(stream_, resolved_));
