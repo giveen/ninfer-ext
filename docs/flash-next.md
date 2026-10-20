@@ -28,6 +28,16 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   waiting the idle step widens up to 16,384 as memory allows, borrowing the expert cache's top slots
   for its arena and returning them afterwards, so a long prompt streams each layer fewer times at no
   decode cost.
+- **Short prompts and the expert cache.** The staged route does not consult the cache: it re-streams
+  whole layers, while the cache route fetches only misses. Measured on the development RTX 5090 with
+  the bench repeating one prompt, so the cache is warm after the first repetition: a 128-token piece
+  runs at 396 tok/s on the cache route against 101 staged, and 384 tokens at 202 against 303; a
+  `--host-experts 14 --host-expert-share 0.5` split of the cache route's misses is another 6–7 %
+  slower at both widths, because too few misses remain for the host team to earn its keep. The same
+  warm cache makes a staged 2,048-token piece read 2,210 tok/s against 1,606 cold, since its fill
+  copies resident experts device-to-device. The 103-column staging threshold predates these
+  measurements; whether the cache route should serve very short prompts in real traffic needs a
+  cold-cache, varied-prompt run, which this bench cannot produce.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,
