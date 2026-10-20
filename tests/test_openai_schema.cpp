@@ -405,6 +405,14 @@ int test_tools() {
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
 
+    body          = base_request();
+    body["tools"] = Json::array({function_tool(std::string(71, 'a'))});
+    failures += check(api_error([&] { (void)parse(body); }).status == 0,
+                      "tool names up to 128 characters are accepted");
+    body["tools"] = Json::array({function_tool(std::string(129, 'a'))});
+    failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                      "tool names beyond 128 characters are rejected");
+
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;

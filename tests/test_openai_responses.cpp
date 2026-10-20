@@ -786,12 +786,26 @@ int test_namespace_tools() {
     oversized["tool_choice"] = "auto";
     oversized["tools"] =
         Json::array({Json{{"type", "namespace"},
-                          {"name", std::string(60, 'n')},
+                          {"name", std::string(124, 'n')},
                           {"tools", Json::array({Json{{"type", "function"}, {"name", "tool"}}})}}});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(oversized, limits());
                       }) == "invalid_tool_name",
                       "flattened identities must fit the Engine tool-name contract");
+
+    Json long_name           = body;
+    long_name["tool_choice"] = "auto";
+    long_name["tools"] =
+        Json::array({Json{{"type", "function"}, {"name", std::string(71, 'n')}}});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(long_name, limits());
+                      }).status == 0,
+                      "function names up to 128 characters are accepted");
+    long_name["tools"][0]["name"] = std::string(129, 'n');
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(long_name, limits());
+                      }).status == 400,
+                      "function names beyond 128 characters are rejected");
     return failures;
 }
 
