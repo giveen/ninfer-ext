@@ -16,7 +16,12 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   experts the cache held; a team larger than the process's CPU allowance minus two is clamped to
   that.
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
-  a double-buffered staging bank, copying experts already in the cache device-to-device instead.
+  a double-buffered staging bank, copying experts already in the cache device-to-device instead. The
+  next layer's fill starts on the pager's own stream while the current layer runs. Measured on the
+  development RTX 5090 (pp2048/pp8192, 3 repetitions): removing that overlap costs 1.18x at 2,048
+  and 1.77x at 8,192 tokens (8,192: 5,857 -> 3,308 tok/s). With it a chunk streams about 68 GB —
+  48 layers of roughly 1.4 GB — at about 49 GB/s, so the host link sets the chunk time and compute
+  is fully hidden; further prefill gains have to remove bytes, not overlap.
   Staged experts run on a W4A4 tensor-core route when the artifact stores the layer's NVFP4 input
   divisors, and on the same route's SIMT A16 branch otherwise. Between long chunks the staging banks serve as
   1024 more cache slots. The prefill chunk beside decode defaults to 4,096 tokens; with no decode
