@@ -72,11 +72,13 @@ ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
 
 ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
                                         const ninfer::bench::BenchTest& test,
-                                        const std::vector<ninfer::TokenId>& corpus) {
+                                        const std::vector<ninfer::TokenId>& corpus,
+                                        std::size_t prompt_offset = 0) {
     const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
                                   ? ninfer::bench::kDecodeSeedTokens
                                   : test.n_prompt;
-    auto prompt = engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false);
+    auto prompt = engine.prepare_tokens(
+        ninfer::bench::prompt_slice(corpus, prompt_tokens, prompt_offset), false);
     ninfer::GenerationResult generated =
         engine.generate(std::move(prompt), benchmark_request(test));
 
@@ -202,8 +204,21 @@ int main(int argc, char** argv) {
             ninfer::bench::TestResult result;
             result.test = test;
             engine.reset_memory_peaks();
+            const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
+                                          ? ninfer::bench::kDecodeSeedTokens
+                                          : test.n_prompt;
+            const std::size_t span =
+                corpus.size() - static_cast<std::size_t>(prompt_tokens);
+            std::size_t offset = 0;
+            const auto next_offset = [&] {
+                const std::size_t current = offset;
+                if (options.vary_prompts && span > 0) {
+                    offset = (offset + static_cast<std::size_t>(prompt_tokens)) % (span + 1);
+                }
+                return current;
+            };
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
-                (void)run_repetition(engine, test, corpus);
+                (void)run_repetition(engine, test, corpus, next_offset());
             }
             result.reps.reserve(static_cast<std::size_t>(options.repetitions));
             if (options.profile_measured) {
@@ -211,7 +226,7 @@ int main(int argc, char** argv) {
                 require_cuda(cudaProfilerStart(), "cudaProfilerStart");
             }
             for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-                result.reps.push_back(run_repetition(engine, test, corpus));
+                result.reps.push_back(run_repetition(engine, test, corpus, next_offset()));
             }
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");

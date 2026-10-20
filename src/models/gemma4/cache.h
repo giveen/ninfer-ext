@@ -21,8 +21,10 @@
 //
 // A sliding ring may instead be kept quantized (`--kv-dtype`): `keys`/`values` are then absent and
 // the ring's rows live in the format's code and scale planes, which the model encodes on write and
-// decodes into BF16 scratch before it attends (see `ops/dense_kv_ring.h`). The global layers are
-// BF16 whatever the sliding ring is, because no codec covers their 640-wide rows.
+// decodes into BF16 scratch before it attends (see `ops/dense_kv_ring.h`). FP8 also quantizes the
+// global layers' 640-wide compact rows as one code plane plus one FP16 scale per (position, KV
+// head); the attention decodes each staged tile with `causal_compact_attention_codes`. The other
+// formats leave the global rows BF16, because no codec of theirs covers a 640-wide row.
 
 #include "core/tensor.h"
 #include "models/gemma4/config.h"
@@ -50,7 +52,7 @@ public:
     KvCache& operator=(KvCache&&) noexcept;
 
     // Allocates the layers' storage lazily, as each layer is first used. A storage other than
-    // BF16 quantizes the sliding rings only, as `kSlidingKvStorage` admits.
+    // BF16 quantizes the sliding rings; FP8 also quantizes the global compact rows.
     void configure(const TextConfig& config, std::int32_t capacity, std::int32_t ring_slack = 0,
                    KvCacheStorage storage = KvCacheStorage::BFloat16);
 
@@ -76,6 +78,15 @@ public:
     // Throws like `sliding_attention` when `layer` is not one of `layer_types`'.
     [[nodiscard]] bool quantized(std::size_t layer) const {
         return storage_ != KvCacheStorage::BFloat16 && config_.sliding_attention(layer);
+    }
+
+    // Whether `layer` is a global layer whose compact rows are stored as FP8 codes.
+    [[nodiscard]] bool coded_global(std::size_t layer) const {
+        return global_fp8_ && !config_.sliding_attention(layer);
+    }
+
+    // Whether the global layers' compact rows are FP8-coded rather than BF16.
+    [[nodiscard]] bool global_quantized() const noexcept { return global_fp8_;
     }
 
     // Forgets every token: all slots become unwritten, keeping the allocation.
@@ -147,6 +158,8 @@ private:
     std::int32_t stale_end_  = 0;
     std::size_t bytes_       = 0;
     KvCacheStorage storage_  = KvCacheStorage::BFloat16;
+    // FP8 storage also codes the global layers' compact rows; the other formats leave them BF16.
+    bool global_fp8_ = false;
 };
 
 } // namespace ninfer::models::gemma4

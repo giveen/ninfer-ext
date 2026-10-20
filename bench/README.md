@@ -28,7 +28,10 @@ Python interpreter; a benchmark-only configuration does not require one.
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
-`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
+`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition.
+`--vary-prompts` slides that slice through the corpus by the prompt's own length on every warmup
+and measured repetition, so a test measures different prompts (and an expert cache warmed by other
+prompts) instead of one repeated prompt. It does not
 have a private prefill/decode loop and does not call model implementation interfaces.
 
 The matrix contains three independently measured test kinds:
@@ -50,7 +53,7 @@ decode graph before warmups and measured repetitions.
 
 ```text
 ninfer_bench --weights <artifact.ninfer>
-          [--corpus <ids-path>]
+          [--corpus <ids-path>] [--vary-prompts]
           [-p, --n-prompt <list>]
           [-n, --n-gen <list>]
           [-pg, --prompt-gen <P,G;P,G...>]

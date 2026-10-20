@@ -80,22 +80,33 @@ int main() {
             }
         }
 
-        // The sliding ring is the window plus the slack, so a wider capacity may only add the five
-        // global layers' rows. Every storage must add the same amount: a quantized storage that
-        // scaled with capacity would add more.
+        // The sliding ring is the window plus the slack, so a wider capacity may only add the
+        // global layers' rows: BF16 rows for the storages without a global codec, and one E4M3 code
+        // plus a row scale for FP8. A quantized storage that scaled with capacity differently would
+        // be a sizing regression.
         const std::int32_t wider = 32768;
-        const std::size_t global_rows =
-            static_cast<std::size_t>(wider - capacity) * config.global_layers *
+        const std::size_t tokens =
+            static_cast<std::size_t>(wider - capacity) * config.global_layers;
+        const std::size_t width =
                 (config.global.shared.head_dim + 2 * config.global.rope_angles) *
+                                  config.global.shared.num_key_value_heads;
+        const std::size_t global_bf16 = tokens * width * sizeof(std::uint16_t) +
+                                        static_cast<std::size_t>(wider - capacity) *
+                                            config.global_layers * sizeof(std::int32_t);
+        const std::size_t global_fp8 =
+            tokens * width +
+            tokens *
                 config.global.shared.num_key_value_heads * sizeof(std::uint16_t) +
             static_cast<std::size_t>(wider - capacity) * config.global_layers *
                 sizeof(std::int32_t);
         for (const Storage& entry : kStorages) {
             const std::size_t grown = KvCache::device_bytes(config, wider, 0, entry.storage) -
                                       KvCache::device_bytes(config, capacity, 0, entry.storage);
-            if (grown != global_rows) {
+            const std::size_t expected =
+                entry.storage == KvCacheStorage::Fp8E4M3Row256 ? global_fp8 : global_bf16;
+            if (grown != expected) {
                 std::cerr << "  " << entry.name << " grew by " << grown << " B over a capacity of "
-                          << capacity << " where only the global layers' " << global_rows
+                          << capacity << " where only the global layers' " << expected
                           << " B may grow\n";
                 ++failures;
             }

@@ -32,13 +32,9 @@ void require_positions(const Tensor& tensor, const char* role, std::int32_t toke
     }
 }
 
-} // namespace
-
-void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& position_q,
-                              const Tensor& position_k, AttentionHeadGeometry geometry,
-                              std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
-                              bool indexed_keys, Tensor& out, const Tensor& workspace,
-                              DeviceExecutionView execution) {
+void validate_geometry(
+                              std::int32_t rotary_dim, std::int32_t rope_angles,
+                       AttentionHeadGeometry geometry, float scale) {
     if (!valid_attention_head_geometry(geometry)) {
         throw std::invalid_argument("causal_compact_attention: invalid head geometry");
     }
@@ -59,17 +55,54 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
     if (!(scale > 0.0F) || !std::isfinite(scale)) {
         throw std::invalid_argument("causal_compact_attention: scale must be positive and finite");
     }
+}
+
+void launch(const Tensor& q, const Tensor* kv, const Tensor* key_codes, const Tensor* key_scales,
+            const Tensor& position_q, const Tensor& position_k, AttentionHeadGeometry geometry,
+            std::int32_t rotary_dim, std::int32_t rope_angles, float scale, bool indexed_keys,
+            Tensor& out, const Tensor& workspace, DeviceExecutionView execution) {
+    validate_geometry(rotary_dim, rope_angles, geometry, scale);
     require_bf16(q, "q");
-    require_bf16(kv, "kv");
     require_bf16(out, "out");
 
+    const bool coded                 = key_codes != nullptr;
     const std::int32_t query_tokens = q.ne[2];
-    const std::int32_t key_tokens   = kv.ne[2];
     const std::int32_t batch        = q.ne[3];
     const std::int32_t compact_width = rotary_dim + 2 * rope_angles;
+    std::int32_t key_tokens          = 0;
+    if (coded) {
+        if (key_codes->dtype != DType::FP8_E4M3FN || key_codes->ne[0] != compact_width ||
+            key_codes->ne[1] != geometry.kv_heads || key_codes->ne[3] != batch ||
+            key_codes->ne[2] <= 0) {
+            throw std::invalid_argument(
+                "causal_compact_attention_codes: codes must be FP8_E4M3FN [width,Hkv,S,B]");
+        }
+        if (key_scales->dtype != DType::FP16 || key_scales->ne[0] != geometry.kv_heads ||
+            key_scales->ne[1] != key_codes->ne[2] || key_scales->ne[2] != batch ||
+            key_scales->ne[3] != 1) {
+            throw std::invalid_argument(
+                "causal_compact_attention_codes: scales must be FP16 [Hkv,S,B]");
+        }
+        if (key_codes->data == nullptr || key_scales->data == nullptr ||
+            !key_codes->is_contiguous() || !key_scales->is_contiguous()) {
+            throw std::invalid_argument(
+                "causal_compact_attention_codes: codes and scales must be non-null and contiguous");
+        }
+        key_tokens = key_codes->ne[2];
+    } else {
+        require_bf16(*kv, "kv");
+        key_tokens = kv->ne[2];
+        if (kv->ne[0] != compact_width || kv->ne[1] != geometry.kv_heads || kv->ne[3] != batch) {
+            throw std::invalid_argument(
+                "causal_compact_attention: q/out must be [rd,Hq,T,B] and kv [rd+2*angles,Hkv,S,B]");
+        }
+        if (kv->data == nullptr || !kv->is_contiguous()) {
+            throw std::invalid_argument(
+                "causal_compact_attention: kv data must be non-null and contiguous");
+        }
+    }
     if (q.ne[0] != rotary_dim || out.ne[0] != rotary_dim || q.ne[1] != geometry.query_heads ||
-        out.ne[1] != geometry.query_heads || out.ne[2] != query_tokens || out.ne[3] != batch ||
-        kv.ne[0] != compact_width || kv.ne[1] != geometry.kv_heads || kv.ne[3] != batch) {
+        out.ne[1] != geometry.query_heads || out.ne[2] != query_tokens || out.ne[3] != batch) {
         throw std::invalid_argument(
             "causal_compact_attention: q/out must be [rd,Hq,T,B] and kv [rd+2*angles,Hkv,S,B]");
     }
@@ -78,7 +111,7 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
     }
     require_positions(position_q, "position_q", query_tokens, batch);
     require_positions(position_k, "position_k", key_tokens, batch);
-    const Tensor* tensors[] = {&q, &kv, &position_q, &position_k, &out};
+    const Tensor* tensors[] = {&q, &position_q, &position_k, &out};
     for (const Tensor* tensor : tensors) {
         if (!tensor->is_contiguous()) {
             throw std::invalid_argument(
@@ -90,8 +123,30 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
         }
     }
 
-    detail::causal_compact_attention_launch(q, kv, position_q, position_k, rotary_dim, rope_angles,
-                                            geometry.query_heads, geometry.kv_heads, scale,
+    detail::causal_compact_attention_launch(q, kv == nullptr ? Tensor{} : *kv, position_q, position_k, key_codes, key_scales, rotary_dim, rope_angles,
+                                            geometry.query_heads, geometry.kv_heads,
+                                            scale, indexed_keys, out, workspace, execution);
+}
+
+} // namespace
+
+void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& position_q,
+                              const Tensor& position_k, AttentionHeadGeometry geometry,
+                              std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
+                              bool indexed_keys, Tensor& out, const Tensor& workspace,
+                              DeviceExecutionView execution) {
+    launch(q, &kv, nullptr, nullptr, position_q, position_k, geometry, rotary_dim, rope_angles,
+           scale, indexed_keys, out, workspace, execution);
+}
+
+void causal_compact_attention_codes(const Tensor& q, const Tensor& key_codes,
+                                    const Tensor& key_scales, const Tensor& position_q,
+                                    const Tensor& position_k, AttentionHeadGeometry geometry,
+                                    std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
+                                    bool indexed_keys, Tensor& out, const Tensor& workspace,
+                                    DeviceExecutionView execution) {
+    launch(q, nullptr, &key_codes, &key_scales, position_q, position_k, geometry, rotary_dim,
+           rope_angles, scale,
                                             indexed_keys, out, workspace, execution);
 }
 

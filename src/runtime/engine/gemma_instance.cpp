@@ -783,9 +783,11 @@ EngineOptions gemma_engine_options(EngineOptions options) {
         if (speculative.tree_width != 1) refuse("draft trees");
     }
     // The four quantized formats are the D256 codecs, and this model's sliding rings are 256 wide,
-    // so all four are wired for them; the five global layers stay BF16 whatever this says, because
-    // their 640-wide rows have no codec. Each format is qualified at this model's geometry by
-    // `tests/models/gemma4/test_kv_quant.cpp` and against the documented scoring protocol, and a
+    // so all four are wired for them. FP8 also codes the five global layers' 640-wide compact rows
+    // (one E4M3 plane and one FP16 scale per position and KV head); int8, NVFP4 and k8v4 leave
+    // those rows BF16 because no codec of theirs covers the width. Each format is qualified at this
+    // model's geometry by `tests/models/gemma4/test_kv_quant.cpp`, and the global planes by
+    // `tests/ops/test_causal_compact_attention.cpp`, against the documented scoring protocol; a
     // storage this model has not been wired for is refused by name rather than run as if it had
     // been asked for.
     if (options.kv_cache != KvCacheStorage::BFloat16 &&

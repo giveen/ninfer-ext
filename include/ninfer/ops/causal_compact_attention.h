@@ -48,6 +48,22 @@ void causal_compact_attention(const Tensor& q, const Tensor& kv, const Tensor& p
                               bool indexed_keys, Tensor& out, const Tensor& workspace,
                               DeviceExecutionView execution);
 
+/**
+ * The same Op over rows stored as the row-scaled FP8 planes `compact_kv_rows_quantize` writes.
+ *
+ * `key_codes` is contiguous FP8_E4M3FN [rd + 2*rope_angles, Hkv, S, B] and `key_scales` contiguous
+ * FP16 [Hkv, S, B], one represented scale per (key, KV head). Each staged key tile is the code's
+ * E4M3 value times its row scale, rounded once to BF16; the arithmetic, visibility, indexed-keys
+ * statement and oracle are those of the BF16 Op over those represented values. Codes and scales
+ * take the place of `kv`; the value side is the same compact row, as in the BF16 form.
+ */
+void causal_compact_attention_codes(const Tensor& q, const Tensor& key_codes,
+                                    const Tensor& key_scales, const Tensor& position_q,
+                              const Tensor& position_k, AttentionHeadGeometry geometry,
+                              std::int32_t rotary_dim, std::int32_t rope_angles, float scale,
+                              bool indexed_keys, Tensor& out, const Tensor& workspace,
+                              DeviceExecutionView execution);
+
 // Workspace bytes the key split needs for these extents; zero when the route does not split.
 [[nodiscard]]
 

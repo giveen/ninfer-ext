@@ -4,6 +4,7 @@
 #include "models/gemma4/cache.h"
 #include "ninfer/ops/causal_compact_attention.h"
 #include "ninfer/ops/compact_kv_rows.h"
+#include "ninfer/ops/compact_kv_rows_quantize.h"
 #include "ninfer/ops/dense_kv_ring.h"
 #include "ninfer/ops/gelu_mul.h"
 #include "ninfer/ops/gemma_moe_experts.h"
@@ -789,21 +790,31 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
         KvCache& cache                     = *segment.cache;
         const std::int32_t n               = segment.tokens;
         const std::int32_t column          = segment.column;
-        Tensor cache_rows                  = cache.keys(layer);
+        const bool coded                   = cache.coded_global(layer);
+        Tensor cache_rows                  = coded ? Tensor{} : cache.keys(layer);
+        Tensor cache_codes                 = coded ? cache.key_codes(layer) : Tensor{};
+        Tensor cache_scales                = coded ? cache.key_scales(layer) : Tensor{};
         Tensor cache_pos                   = cache.positions(layer);
         const std::int32_t capacity        = cache.capacity();
         const Tensor segment_positions     = indices.positions.slice(0, column, n);
-        write_cache_rows(
-            Tensor(column_data(compact, compact_column, column), DType::BF16, {width * hkv, n}),
+        const Tensor compact_batch =
+            Tensor(column_data(compact, compact_column, column), DType::BF16, {width * hkv, n});
+        if (coded) {
+            // The compact rows are encoded straight into the FP8 planes; the position plane still
+            // names each row's slot so the Op can make unwritten slots invisible.
+            ops::compact_kv_rows_quantize(compact_batch, segment_positions, cache_codes,
+                                          cache_scales, stream);
+            write_cache_positions(segment_positions, segment_positions, n, cache_pos, stream);
+        } else {
+            write_cache_rows(compact_batch,
             segment_positions, segment_positions, n,
             Tensor(cache_rows.data, DType::BF16, {width * hkv, capacity}), cache_pos, stream);
+        }
 
         const ops::AttentionHeadGeometry heads{d, hq, hkv};
         Tensor q_batch(column_data(q_normed, q_column, column), DType::BF16, {d, hq, n, 1});
         // The Op is handed the whole capacity: with `indexed_keys` it stops at the latest query's
         // position on the device, so the launches do not depend on how much of the cache is filled.
-        Tensor kv_batch(static_cast<std::uint8_t*>(cache_rows.data), DType::BF16,
-                        {width, hkv, capacity, 1});
         Tensor attended_batch(column_data(attended, q_column, column), DType::BF16, {d, hq, n, 1});
         Tensor position_q = segment_positions.view({n, 1});
         Tensor position_k(static_cast<std::uint8_t*>(cache_pos.data), DType::I32, {capacity, 1});
@@ -812,9 +823,21 @@ void forward_global_layer(const Model& model, std::size_t layer, const Tensor& h
         Tensor workspace;
         if (split > 0) workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
         // Rows sit at their own positions, which is what `indexed_keys` states.
+        if (coded) {
+            Tensor codes_batch(static_cast<std::uint8_t*>(cache_codes.data), DType::FP8_E4M3FN,
+                               {width, hkv, capacity, 1});
+            Tensor scales_batch(static_cast<std::uint8_t*>(cache_scales.data), DType::FP16,
+                                {hkv, capacity, 1, 1});
+            ops::causal_compact_attention_codes(q_batch, codes_batch, scales_batch, position_q,
+                                                position_k, heads, d, pairs, config.attention_scale,
+                                                true, attended_batch, workspace, execution);
+        } else {
+            Tensor kv_batch(static_cast<std::uint8_t*>(cache_rows.data), DType::BF16,
+                            {width, hkv, capacity, 1});
         ops::causal_compact_attention(q_batch, kv_batch, position_q, position_k, heads, d, pairs,
                                       config.attention_scale, true, attended_batch, workspace,
                                       execution);
+        }
     }
     ops::linear(attended, to_weight(weights.attention.output), projected, stream);
     ops::residual_add_norm(projected, model.tensor(weights.post_attention_norm), eps, residual,
@@ -998,18 +1021,30 @@ void forward_draft(const Model& model, const Tensor& input, std::span<const Draf
                 const std::size_t source    = draft.target_global_layer;
                 const std::int32_t width    = d + 2 * pairs;
                 const std::int32_t position = lanes[column].position;
-                const Tensor rows           = cache.keys(source);
+                const bool coded           = cache.coded_global(source);
                 const Tensor row_pos        = cache.positions(source);
-                const Tensor kv(rows.data, DType::BF16, {width, hkv, position, 1});
                 const Tensor p_rows(row_pos.data, DType::I32, {position, 1});
                 const std::size_t split =
                     ops::causal_compact_attention_workspace_bytes(heads, d, 1, position, 1);
                 Tensor workspace;
                 if (split > 0)
                     workspace = arena.alloc(DType::U8, {static_cast<std::int32_t>(split)});
+                if (coded) {
+                    const Tensor codes  = cache.key_codes(source);
+                    const Tensor scales = cache.key_scales(source);
+                    const Tensor code_batch(codes.data, DType::FP8_E4M3FN,
+                                            {width, hkv, position, 1});
+                    const Tensor scale_batch(scales.data, DType::FP16, {hkv, position, 1, 1});
+                    ops::causal_compact_attention_codes(
+                        q_lane, code_batch, scale_batch, visible_position(column), p_rows, heads, d,
+                        pairs, target.attention_scale, true, out, workspace, execution);
+                } else {
+                    const Tensor rows = cache.keys(source);
+                    const Tensor kv(rows.data, DType::BF16, {width, hkv, position, 1});
                 ops::causal_compact_attention(q_lane, kv, visible_position(column), p_rows, heads,
                                               d, pairs, target.attention_scale, true, out,
                                               workspace, execution);
+                }
             }
         }
         ops::linear(attended, to_weight(layer.output), projected, stream);

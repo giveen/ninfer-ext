@@ -31,7 +31,10 @@
 // dims in stored order], q' . row is exactly the Op's score, while the value is the row's first R
 // entries, so one tile serves QK^T and PV.
 
+#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include <climits>
@@ -49,6 +52,11 @@ struct FlashAttentionParams {
     const __nv_bfloat16* q; // [q_width, Hq, T, B]
     const __nv_bfloat16* k; // key row (kvh, key, b) at k + (kvh + Hkv * (key + S * b)) * k_stride
     const __nv_bfloat16* v; // value row likewise with v_stride; the compact rows serve as both
+    // Row-scaled FP8 codes of the main compact key set, null when `k` holds BF16 rows. A staged
+    // value is its E4M3 code times the row's FP16 scale; `k_stride` is then the code row's byte
+    // stride and `k_scale` is indexed by the same (kvh, key, b) row.
+    const std::uint8_t* k_code;
+    const __half* k_scale;
     const std::int32_t* position_q; // [T, B]
     // The latest key position each query may see, [T, B]; null means its own position (causal).
     const std::int32_t* position_q_high;
@@ -156,6 +164,31 @@ __device__ __forceinline__ void flash_copy16(__nv_bfloat16* dst, const __nv_bflo
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                  :
                  : "r"(address), "l"(src), "r"(copy ? 16 : 0));
+}
+
+// One 8-byte asynchronous copy from global to shared, or 8 zero bytes when `copy` is false. The
+// coded tile stages its codes with this and converts them when the tile is consumed, so the global
+// load keeps overlapping the previous tile's compute.
+__device__ __forceinline__ void flash_copy8(std::uint8_t* dst, const std::uint8_t* src, bool copy) {
+    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"
+                 :
+                 : "r"(address), "l"(src), "r"(copy ? 8 : 0));
+}
+
+// Eight E4M3 codes of one row as BF16, each code times the row scale rounded once: the coded
+// counterpart of flash_copy16, which stores the same eight values from BF16 bytes.
+__device__ __forceinline__ void flash_decode8(const std::uint8_t* src, __nv_bfloat16* dst,
+                                              float scale) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(src);
+    const auto pair = [&](std::uint32_t word, int half) {
+        const auto bits    = static_cast<std::uint16_t>(word >> (16 * half));
+        const float2 value = __half22float2(kv_cache_fp8_code2_to_half2(bits));
+        return flash_pack(__float2bfloat16_rn(value.x * scale),
+                          __float2bfloat16_rn(value.y * scale));
+    };
+    *reinterpret_cast<uint4*>(dst) =
+        make_uint4(pair(raw.x, 0), pair(raw.x, 1), pair(raw.y, 0), pair(raw.y, 1));
 }
 
 template <int QK, int V, bool kCompact>
@@ -305,12 +338,28 @@ __launch_bounds__(kFlashThreads) __global__
                        (base + r + static_cast<std::int64_t>(keys) * b);
         };
         constexpr int kKChunks = QK / 8;
+        const bool coded       = p.k_code != nullptr && !extra;
+        if (coded) {
+            for (int at = thread; at < kFlashKeys * kKChunks; at += kFlashThreads) {
+                const int r        = at / kKChunks;
+                const int c        = at % kKChunks;
+                __nv_bfloat16* dst = ks + r * Layout::kQStride + c * 8;
+                if (copied(r)) {
+                    const std::int64_t row = key_row(r);
+                    flash_decode8(p.k_code + row * p.k_stride + c * 8, dst,
+                                  __half2float(p.k_scale[row]));
+                } else {
+                    *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                }
+            }
+        } else {
         for (int at = thread; at < kFlashKeys * kKChunks; at += kFlashThreads) {
             const int r     = at / kKChunks;
             const int c     = at % kKChunks;
             const bool copy = copied(r);
             flash_copy16(ks + r * Layout::kQStride + c * 8,
                          copy ? key_rows + key_row(r) * p.k_stride + c * 8 : key_rows, copy);
+            }
         }
         if constexpr (!kCompact) {
             constexpr int kVChunks = V / 8;
@@ -652,6 +701,12 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
     using QTile = typename C::QTile;
     using KTile = typename C::KTile;
     using VTile = typename C::VTile;
+    // A coded tile stages its raw E4M3 rows in two alternated buffers and converts the consumed
+    // stage into one BF16 tile. The three buffers fit inside the two BF16 stages the layout
+    // reserves.
+    constexpr int kCodeStage = kCompact ? C::kKeys * QK : 0;
+    static_assert(!kCompact || 2 * kCodeStage + C::kKBytes <= 2 * C::kStageBytes,
+                  "coded stages must fit the tiled kernel's stage region");
     extern __shared__ __align__(16) unsigned char shared[];
     auto* qs       = reinterpret_cast<__nv_bfloat16*>(shared);
     auto* stages   = shared + C::kQBytes;
@@ -786,6 +841,8 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
         const KeyTile kt       = key_tile(index);
         auto* ks               = reinterpret_cast<__nv_bfloat16*>(stages + stage * C::kStageBytes);
         constexpr int kKChunks = QK / 8;
+        const bool coded       = kCompact && p.k_code != nullptr && index < main_tiles;
+        auto* codes_dst        = reinterpret_cast<std::uint8_t*>(stages + stage * kCodeStage);
         for (int at = thread; at < C::kKeys * kKChunks; at += C::kThreads) {
             const int r            = at / kKChunks;
             const int c            = at % kKChunks;
@@ -794,8 +851,13 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
             const std::int64_t row =
                 static_cast<std::int64_t>(kvh) + static_cast<std::int64_t>(p.kv_heads) *
                                                      (key + static_cast<std::int64_t>(kt.keys) * b);
-            flash_copy16(ks + KTile::offset(r, c * 8),
-                         copy ? kt.k + row * p.k_stride + c * 8 : kt.k, copy);
+            if (coded) {
+                flash_copy8(codes_dst + r * QK + c * 8,
+                            copy ? p.k_code + row * p.k_stride + c * 8 : p.k_code, copy);
+            } else {
+                flash_copy16(ks + KTile::offset(r, c * 8),
+                             copy ? kt.k + row * p.k_stride + c * 8 : kt.k, copy);
+            }
         }
         if constexpr (!kCompact) {
             auto* vs =
@@ -835,7 +897,31 @@ __launch_bounds__(FlashTiledConfig<QK, V, kCompact>::kThreads, 1) __global__
 
         const int stage = processed & 1;
         const int slot  = processed % 3;
-        const auto* ks  = reinterpret_cast<const __nv_bfloat16*>(stages + stage * C::kStageBytes);
+        const __nv_bfloat16* ks =
+            reinterpret_cast<const __nv_bfloat16*>(stages + stage * C::kStageBytes);
+        if constexpr (kCompact) {
+            if (p.k_code != nullptr) {
+                // Convert the consumed stage's codes into the one BF16 tile. The next stage's
+                // codes are already in flight, so the global load keeps overlapping this tile's
+                // compute; only the conversion is new work.
+                const KeyTile kt = key_tile(cur);
+                auto* bf         = reinterpret_cast<__nv_bfloat16*>(stages + 2 * kCodeStage);
+                const auto* cs = reinterpret_cast<const std::uint8_t*>(stages + stage * kCodeStage);
+                constexpr int kKChunks = QK / 8;
+                for (int at = thread; at < C::kKeys * kKChunks; at += C::kThreads) {
+                    const int r            = at / kKChunks;
+                    const int c            = at % kKChunks;
+                    const std::int32_t key = kt.base + r;
+                    const std::int64_t row = static_cast<std::int64_t>(kvh) +
+                                             static_cast<std::int64_t>(p.kv_heads) *
+                                                 (key + static_cast<std::int64_t>(kt.keys) * b);
+                    const float scale      = key < kt.keys ? __half2float(p.k_scale[row]) : 0.0F;
+                    flash_decode8(cs + r * QK + c * 8, bf + KTile::offset(r, c * 8), scale);
+                }
+                __syncthreads();
+                ks = bf;
+            }
+        }
         const auto* vs  = kCompact ? ks
                                    : reinterpret_cast<const __nv_bfloat16*>(
                                          stages + stage * C::kStageBytes + C::kKBytes);

@@ -33,7 +33,7 @@ KvCache::~KvCache() { release_owned(); }
 KvCache::KvCache(KvCache&& other) noexcept
     : config_(other.config_), layers_(std::move(other.layers_)), owned_(std::move(other.owned_)),
       capacity_(other.capacity_), ring_slack_(other.ring_slack_), stale_end_(other.stale_end_),
-      bytes_(other.bytes_), storage_(other.storage_) {
+      bytes_(other.bytes_), storage_(other.storage_), global_fp8_(other.global_fp8_) {
     other.layers_.clear();
     other.owned_.clear();
     other.bytes_ = 0;
@@ -50,6 +50,7 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
         stale_end_  = other.stale_end_;
         bytes_      = other.bytes_;
         storage_    = other.storage_;
+        global_fp8_ = other.global_fp8_;
         other.layers_.clear();
         other.owned_.clear();
         other.bytes_ = 0;
@@ -62,8 +63,7 @@ void KvCache::configure(const TextConfig& config, std::int32_t capacity, std::in
     if (capacity < 1) throw std::invalid_argument("KvCache: capacity must be positive");
     if (ring_slack < 0) throw std::invalid_argument("KvCache: ring slack must not be negative");
     if (storage != KvCacheStorage::BFloat16) {
-        // The quantized storages are the D256 codecs, and they cover the sliding rings only: no
-        // codec takes the global layers' 640-wide rows, which stay BF16.
+        // The quantized storages are the D256 codecs, and they cover the sliding rings.
         try {
             (void)paged_kv_storage_layout(storage,
                                           static_cast<std::int32_t>(config.sliding.head_dim));
@@ -71,10 +71,20 @@ void KvCache::configure(const TextConfig& config, std::int32_t capacity, std::in
             throw std::invalid_argument("KvCache: unsupported sliding KV-cache storage");
         }
     }
+    // FP8 is the one storage with a codec for the global layers' compact rows; it is registered for
+    // the 640-value row of an R = 512 head with 64 rotated pairs.
+    const bool global_fp8 = storage == KvCacheStorage::Fp8E4M3Row256;
+    const std::int32_t global_width =
+        static_cast<std::int32_t>(config.global.shared.head_dim) + 2 * config.global.rope_angles;
+    if (global_fp8 && global_width != 640) {
+        throw std::invalid_argument(
+            "KvCache: the FP8 global codec is registered for 640-wide compact rows only");
+    }
     config_     = config;
     capacity_   = capacity;
     ring_slack_ = ring_slack;
     storage_    = storage;
+    global_fp8_ = global_fp8;
     stale_end_  = 0;
     layers_.assign(config.num_hidden_layers, Layer{});
     release_owned();
@@ -114,6 +124,13 @@ void KvCache::ensure(std::size_t layer) {
     };
 
     const bool quantized = !global && storage_ != KvCacheStorage::BFloat16;
+    if (global && global_fp8_) {
+        // One E4M3 code per compact-row value and one FP16 scale per (position, KV head), cleared
+        // so that an unwritten slot decodes to zero rather than to whatever the allocation held;
+        // the position plane makes such a slot invisible before any row of it is read.
+        entry.key_codes  = allocate(DType::FP8_E4M3FN, {width, heads, tokens}, true);
+        entry.key_scales = allocate(DType::FP16, {heads, tokens}, true);
+    } else
     if (quantized) {
         // The quantized ring's planes, cleared so that a slot no token has written decodes to zero
         // rather than to whatever the allocation held. The planes' schema is the storage's own
@@ -169,6 +186,9 @@ std::size_t KvCache::device_bytes(const TextConfig& config, std::int32_t capacit
             const PagedKVStorageLayout layout =
                 paged_kv_storage_layout(storage, static_cast<std::int32_t>(head_dim));
             total += (layout.key.physical_bytes() + layout.value.physical_bytes()) * heads * tokens;
+        } else if (global && storage == KvCacheStorage::Fp8E4M3Row256) {
+            total += width * heads * tokens;                 // E4M3 codes
+            total += heads * tokens * sizeof(std::uint16_t); // one scale per row
         } else {
             total += width * heads * tokens * sizeof(std::uint16_t);
             if (!global) total += head_dim * heads * tokens * sizeof(std::uint16_t);
@@ -200,11 +220,13 @@ const Tensor& existing_plane(const Tensor& tensor, bool quantized) {
 } // namespace
 
 Tensor KvCache::key_codes(std::size_t layer) const {
-    return existing_plane(layers_.at(layer).key_codes, quantized(layer));
+    const bool coded = quantized(layer) || coded_global(layer);
+    return existing_plane(layers_.at(layer).key_codes, coded);
 }
 
 Tensor KvCache::key_scales(std::size_t layer) const {
-    return existing_plane(layers_.at(layer).key_scales, quantized(layer));
+    const bool coded = quantized(layer) || coded_global(layer);
+    return existing_plane(layers_.at(layer).key_scales, coded);
 }
 
 Tensor KvCache::value_codes(std::size_t layer) const {
@@ -216,12 +238,14 @@ Tensor KvCache::value_scales(std::size_t layer) const {
 }
 
 Tensor KvCache::keys(std::size_t layer) const {
-    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
+    if (quantized(layer) || coded_global(layer)) { throw std::logic_error("KvCache: the layer's rows are quantized");
+    }
     return existing(layers_.at(layer).keys, layers_.at(layer).allocated);
 }
 
 Tensor KvCache::values(std::size_t layer) const {
-    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
+    if (quantized(layer) || coded_global(layer)) { throw std::logic_error("KvCache: the layer's rows are quantized");
+    }
     return existing(layers_.at(layer).values, layers_.at(layer).allocated);
 }
 
@@ -252,19 +276,22 @@ void KvCache::forget_stale(std::size_t layer, std::int32_t from, cudaStream_t st
 
 Tensor KvCache::keys(std::size_t layer) {
     ensure(layer);
-    if (quantized(layer)) throw std::logic_error("KvCache: the layer's ring is quantized");
+    if (quantized(layer) || coded_global(layer)) { throw std::logic_error("KvCache: the layer's rows are quantized");
+    }
     return layers_[layer].keys;
 }
 
 Tensor KvCache::key_codes(std::size_t layer) {
     ensure(layer);
-    if (!quantized(layer)) throw std::logic_error("KvCache: the layer's ring is not quantized");
+    if (!quantized(layer) && !coded_global(layer)) { throw std::logic_error("KvCache: the layer's rows are not quantized");
+    }
     return layers_[layer].key_codes;
 }
 
 Tensor KvCache::key_scales(std::size_t layer) {
     ensure(layer);
-    if (!quantized(layer)) throw std::logic_error("KvCache: the layer's ring is not quantized");
+    if (!quantized(layer) && !coded_global(layer)) { throw std::logic_error("KvCache: the layer's rows are not quantized");
+    }
     return layers_[layer].key_scales;
 }
 

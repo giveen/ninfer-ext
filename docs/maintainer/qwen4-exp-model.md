@@ -115,6 +115,17 @@ Execution may compute a share of a narrow call's missing experts on host threads
 those experts quantize activations to Q8_0, so their result depends on what the expert cache held
 when the call ran. This is the one accepted placement dependence in decode.
 
+Making placement invisible would need both sides to run the same arithmetic, and they do not. The
+device's narrow route (`moe_gate_up_gemv_kernel`/`moe_down_gemv_kernel`) reads BF16 activations,
+forms each 16-value group as a 16-step `fmaf` chain on weights decoded from E2M1 and the group's
+E4M3 scale, reduces a lane's share with `warp_sum`, then multiplies the weight divisor. The host
+route (`ops/offload_moe/cpu_nvfp4.*`) quantizes activations to Q8_0 (per-32 int8 codes and FP32
+scales), forms each 16-value group as an exact int32 dot of E2M1 against int8, and accumulates in
+FP32 vectors. Reproducing the device's serial `fmaf` chains on the CPU costs more than the split
+wins (measured +5-7 % at C=1, +16 % with MTP); making the device adopt the CPU's Q8_0/int32 route
+would change every narrow decode call, which is a quality decision rather than a property of the
+split. Recorded so the exactness question is not reopened without that decision.
+
 ## Qwen Sparse Attention
 
 The attention projections are unchanged from Qwen3.5:

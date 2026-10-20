@@ -58,6 +58,9 @@ struct BenchOptions {
     std::vector<std::pair<int, int>> prompt_gen;
     int repetitions = kDefaultRepetitions;
     int warmup      = kDefaultWarmup;
+    // Slide the prompt through the corpus by its own length on every repetition, so a test
+    // measures different prompts (and a cache warmed by other prompts) instead of one repeated one.
+    bool vary_prompts = false;
     std::optional<std::uint32_t> max_context;
     std::optional<std::uint32_t> prefill_chunk; // empty: model default
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
@@ -133,7 +136,8 @@ std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt,
+                                  std::size_t offset = 0);
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative);

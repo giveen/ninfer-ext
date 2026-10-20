@@ -16,13 +16,38 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   experts the cache held; a team larger than the process's CPU allowance minus two is clamped to
   that.
 - **Prefill streams whole layers.** Chunks of 103 tokens or more stream a whole expert layer through
-  a double-buffered staging bank, copying experts already in the cache device-to-device instead.
+  a double-buffered staging bank, copying experts already in the cache device-to-device instead. The
+  next layer's fill starts on the pager's own stream while the current layer runs. Measured on the
+  development RTX 5090 (pp2048/pp8192, 3 repetitions): removing that overlap costs 1.18x at 2,048
+  and 1.77x at 8,192 tokens (8,192: 5,857 -> 3,308 tok/s). With it a chunk streams about 68 GB —
+  48 layers of roughly 1.4 GB — at about 49 GB/s, so the host link sets the chunk time and compute
+  is fully hidden; further prefill gains have to remove bytes, not overlap.
   Staged experts run on a W4A4 tensor-core route when the artifact stores the layer's NVFP4 input
   divisors, and on the same route's SIMT A16 branch otherwise. Between long chunks the staging banks serve as
   1024 more cache slots. The prefill chunk beside decode defaults to 4,096 tokens; with no decode
   waiting the idle step widens up to 16,384 as memory allows, borrowing the expert cache's top slots
   for its arena and returning them afterwards, so a long prompt streams each layer fewer times at no
   decode cost.
+- **Short prompts and the expert cache.** The staged route does not consult the cache: it re-streams
+  whole layers, while the cache route fetches only misses. A repeated identical prompt makes the
+  cache perfect and flatters the cache route, so the bench's `--vary-prompts` slides the prompt
+  through the corpus on every repetition. With no decode prime (so the first repetition is cold),
+  4 repetitions per width on the development RTX 5090 read:
+
+  | tokens | staged (tok/s per rep) | cache route (tok/s per rep) |
+  |---:|---|---|
+  | 128 | 137 / 137 / 111 / 112 | 239 / 205 / 110 / 129 |
+  | 256 | 275 / 274 / 225 / 227 | 186 / 162 / 150 / 149 |
+  | 384 | 411 / 412 / 338 / 380 | 172 / 166 / 157 / 152 |
+
+  The cache route wins only on the first prompts, whose expert sets overlap what the previous test
+  left resident, and loses by 1.5–2.4x once the prompt moves. Below the 103-column threshold the
+  cache route is the only route and is far better than a whole-layer fill would be at 64 tokens
+  (330 tok/s warm). The staged route also benefits from a warm cache: a 384-token piece reads 411
+  tok/s warm against 303 cold, because its fill copies resident experts device-to-device. The
+  threshold stands. A `--host-experts` split of the cache route's misses was 6–7 % slower on the
+  repeated-prompt arm; it was not re-run on varied prompts because that route already loses at
+  256/384 tokens.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,
