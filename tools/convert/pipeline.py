@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 from pathlib import Path
 import time
@@ -24,6 +25,52 @@ def _json_default(value):
     raise TypeError(f"conversion report cannot serialize {type(value).__name__}")
 
 
+def _produce(writer: ArtifactWriter, job: WeightJob) -> None:
+    try:
+        job.prepared.produce(TensorOutput(writer, job.spec.id))
+    except Exception as error:
+        label = ", ".join(job.parameters[:4])
+        raise ValueError(
+            f"{label} [{job.method_name}/{job.spec.format}]: {error}"
+        ) from error
+
+
+def _produce_weights(
+    writer: ArtifactWriter,
+    jobs: tuple[WeightJob, ...],
+    workers: int,
+    progress: Callable[[int, int, WeightJob], None] | None,
+) -> None:
+    """Produce every declared weight object, optionally from several CPU worker threads.
+
+    Each job owns one object and writes only its own pre-planned byte range, so the artifact
+    layout is independent of completion order. Publication order is irrelevant to the bytes;
+    the progress callback still runs in declaration order because it is called at submission.
+    """
+    if workers == 1:
+        for index, job in enumerate(jobs):
+            if progress is not None:
+                progress(index, len(jobs), job)
+            _produce(writer, job)
+        return
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="ninfer-convert"
+    ) as pool:
+        pending: dict = {}
+        next_index = 0
+        while next_index < len(jobs) or pending:
+            while next_index < len(jobs) and len(pending) < workers * 2:
+                index = next_index
+                if progress is not None:
+                    progress(index, len(jobs), jobs[index])
+                pending[pool.submit(_produce, writer, jobs[index])] = index
+                next_index += 1
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future)
+                future.result()
+
+
 def convert(
     model: Model,
     recipe: Recipe,
@@ -33,6 +80,7 @@ def convert(
     provenance: dict | None = None,
     device: str = "cuda",
     rows_per_chunk: int = 512,
+    workers: int = 1,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     progress: Callable[[int, int, WeightJob], None] | None = None,
 ) -> dict:
@@ -42,7 +90,13 @@ def convert(
         raise FileExistsError(
             f"conversion output already exists: {path} or {report_path}"
         )
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
     chosen_device = torch.device(device)
+    # Independent weight objects convert concurrently only on the CPU. A CUDA conversion shares
+    # one device stream and one encoder workspace, so it stays single-threaded.
+    if workers > 1 and chosen_device.type != "cpu":
+        raise ValueError("parallel conversion requires --device cpu")
     if chosen_device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA conversion requested but CUDA is unavailable")
     start = time.perf_counter()
@@ -66,6 +120,7 @@ def convert(
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "rows_per_chunk": rows_per_chunk,
+        "workers": workers,
         "provenance": provenance,
         "preparation_seconds": preparation_seconds,
         "parameters": len(model.parameters),
@@ -99,16 +154,7 @@ def convert(
     ) as writer:
         for object_id, data in model.resources.items():
             writer.write_object(object_id, data)
-        for index, job in enumerate(prepared.weights):
-            if progress is not None:
-                progress(index, len(prepared.weights), job)
-            try:
-                job.prepared.produce(TensorOutput(writer, job.spec.id))
-            except Exception as error:
-                label = ", ".join(job.parameters[:4])
-                raise ValueError(
-                    f"{label} [{job.method_name}/{job.spec.format}]: {error}"
-                ) from error
+        _produce_weights(writer, prepared.weights, workers, progress)
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()

@@ -9,6 +9,7 @@ from math import prod
 import os
 from pathlib import Path
 import struct
+import threading
 
 import torch
 
@@ -47,6 +48,7 @@ class SafetensorsSource:
         self.config = (
             json.loads(config_path.read_text()) if config_path.is_file() else {}
         )
+        self._lock = threading.Lock()
         self._headers: dict[Path, dict[str, TensorInfo]] = {}
         self._fds: OrderedDict[Path, int] = OrderedDict()
         self.bytes_read = 0
@@ -89,30 +91,31 @@ class SafetensorsSource:
                     raise FileNotFoundError(self.path)
 
     def _header(self, file: Path) -> dict[str, TensorInfo]:
-        if file in self._headers:
-            return self._headers[file]
-        with file.open("rb") as stream:
-            prefix = stream.read(8)
-            if len(prefix) != 8:
-                raise ValueError(f"{file}: truncated safetensors header")
-            length = struct.unpack("<Q", prefix)[0]
-            file_bytes = os.fstat(stream.fileno()).st_size
-            if length > file_bytes - 8:
-                raise ValueError(f"{file}: safetensors header exceeds file")
-            data = json.loads(stream.read(length))
-        result = {}
-        for name, item in data.items():
-            if name == "__metadata__":
-                continue
-            begin, end = item["data_offsets"]
-            dims = tuple(item["shape"])
-            if not 0 <= begin <= end <= file_bytes - length - 8:
-                raise ValueError(f"{file}/{name}: invalid source range")
-            result[name] = TensorInfo(
-                file, dims, item["dtype"], 8 + length + begin, end - begin
-            )
-        self._headers[file] = result
-        return result
+        with self._lock:
+            if file in self._headers:
+                return self._headers[file]
+            with file.open("rb") as stream:
+                prefix = stream.read(8)
+                if len(prefix) != 8:
+                    raise ValueError(f"{file}: truncated safetensors header")
+                length = struct.unpack("<Q", prefix)[0]
+                file_bytes = os.fstat(stream.fileno()).st_size
+                if length > file_bytes - 8:
+                    raise ValueError(f"{file}: safetensors header exceeds file")
+                data = json.loads(stream.read(length))
+            result = {}
+            for name, item in data.items():
+                if name == "__metadata__":
+                    continue
+                begin, end = item["data_offsets"]
+                dims = tuple(item["shape"])
+                if not 0 <= begin <= end <= file_bytes - length - 8:
+                    raise ValueError(f"{file}/{name}: invalid source range")
+                result[name] = TensorInfo(
+                    file, dims, item["dtype"], 8 + length + begin, end - begin
+                )
+            self._headers[file] = result
+            return result
 
     def has(self, name: str) -> bool:
         return name in self.weight_map
@@ -125,6 +128,8 @@ class SafetensorsSource:
             raise ValueError(f"{self.path}: missing source tensor {name!r}") from error
 
     def _file(self, path: Path) -> int:
+        # Caller holds `_lock`: eviction may close an fd another worker would otherwise be
+        # reading through, and the LRU order is shared state.
         if path in self._fds:
             self._fds.move_to_end(path)
             return self._fds[path]
@@ -157,20 +162,22 @@ class SafetensorsSource:
         if begin == end:
             return torch.empty(0, dtype=dtype)
         count = (end - begin) * word_bytes
-        fd = self._file(info.file)
-        offset = info.offset + begin * word_bytes
-        raw = os.pread(fd, count, offset)
-        if len(raw) != count:
-            raise ValueError(f"{name}: short source read")
-        self.bytes_read += count
-        discard_cached_pages(fd, offset, count)
+        with self._lock:
+            fd = self._file(info.file)
+            offset = info.offset + begin * word_bytes
+            raw = os.pread(fd, count, offset)
+            if len(raw) != count:
+                raise ValueError(f"{name}: short source read")
+            self.bytes_read += count
+            discard_cached_pages(fd, offset, count)
         return torch.frombuffer(bytearray(raw), dtype=dtype)
 
     def close(self) -> None:
-        while self._fds:
-            _, fd = self._fds.popitem()
-            discard_cached_pages(fd)
-            os.close(fd)
+        with self._lock:
+            while self._fds:
+                _, fd = self._fds.popitem()
+                discard_cached_pages(fd)
+                os.close(fd)
 
     def __enter__(self) -> SafetensorsSource:
         return self

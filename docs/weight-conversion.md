@@ -555,6 +555,24 @@ codes/scales; the method should not duplicate that byte-layout logic. Direct out
 `output.write_values`. Keep source blocks and temporary device tensors bounded to the method's
 working set. `--rows-per-chunk` defaults to 512; custom methods own how they use it.
 
+### Parallel CPU conversion
+
+`--workers N` converts independent weight objects on N CPU worker threads. It requires
+`--device cpu`; CUDA conversion stays single-threaded because it shares one device stream and
+encoder workspace. The default `--workers 1` is the existing serial path.
+
+Each worker owns one object and writes only that object's pre-planned byte range, so completion
+order does not affect the layout. The artifact writer and the safetensors header/FD caches are
+locked, at most `2N` objects are in flight, and progress lines keep declaration order. Object
+payloads are byte-identical to a serial run; the artifact id (a random UUID) and the conversion
+report's timings/worker count differ as usual.
+
+On the 24-thread development CPU, a synthetic 1.25 GiB BF16 to Q6 (`grouped_absmax`) conversion
+took 12.23 s serial, 6.07 s with two workers, and 4.82 s with eight (2.54x), with identical object
+digests in every arm. Quantization-bound conversions scale; one dominated by source or output I/O
+(for example a direct BF16 cast) will not. Peak memory grows with the worker count times the
+method's per-chunk working set (`--rows-per-chunk`), not with the model size.
+
 ## Resources, files and inspection
 
 ### Attach an existing DFlash2 component

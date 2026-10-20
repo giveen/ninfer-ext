@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 import os
 import tempfile
+import threading
 from typing import Iterable, Sequence
 from uuid import uuid4
 
@@ -122,6 +123,7 @@ class ArtifactWriter:
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     ) -> None:
         self.path = Path(path)
+        self._lock = threading.Lock()
         self.objects = plan_objects(specs)
         self.by_id = {obj.id: obj for obj in self.objects}
         description = {
@@ -208,25 +210,29 @@ class ArtifactWriter:
     ) -> None:
         if not self._fds or self._finished or self._failed:
             raise ArtifactError("writer is closed or has failed")
-        try:
-            obj = self.by_id[object_id]
-        except KeyError as error:
-            raise ArtifactError(f"unknown output object {object_id!r}") from error
-        integer(offset, f"{object_id} relative offset")
-        view = memoryview(data).cast("B")
-        end = integer(offset + len(view), f"{object_id} output end")
-        if end > obj.bytes:
-            raise ArtifactError(
-                f"{object_id}: output [{offset},{end}) exceeds {obj.bytes} bytes"
-            )
-        if not view:
-            return
-        try:
-            self._coverage[object_id].add(offset, end, object_id)
-            self._write_range(obj.offset + offset, view)
-        except BaseException:
-            self._failed = True
-            raise
+        # Parallel CPU conversion produces independent objects concurrently. Their byte ranges
+        # are disjoint and planned before conversion starts, so serializing the write keeps
+        # coverage accounting and the writeback ledger single-owner without changing layout.
+        with self._lock:
+            try:
+                obj = self.by_id[object_id]
+            except KeyError as error:
+                raise ArtifactError(f"unknown output object {object_id!r}") from error
+            integer(offset, f"{object_id} relative offset")
+            view = memoryview(data).cast("B")
+            end = integer(offset + len(view), f"{object_id} output end")
+            if end > obj.bytes:
+                raise ArtifactError(
+                    f"{object_id}: output [{offset},{end}) exceeds {obj.bytes} bytes"
+                )
+            if not view:
+                return
+            try:
+                self._coverage[object_id].add(offset, end, object_id)
+                self._write_range(obj.offset + offset, view)
+            except BaseException:
+                self._failed = True
+                raise
 
     def write_zeros(self, object_id: str, offset: int, length: int) -> None:
         integer(length, f"{object_id} zero length")
