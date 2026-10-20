@@ -273,14 +273,19 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
   rejected: with the slack, the older row a rejected draft replaced is invisible to every later
   query, and the rejected rows themselves are recorded as stale and forgotten before a wide pass
   could see them (a narrow one overwrites them first). Global layers keep one compact row per token at
-  its position, up to the lane's capacity. Unwritten slots carry position 2^30, which both attention
+  its position, up to the lane's capacity. With `--kv-dtype fp8` those rows are stored as one E4M3
+  code plane plus one FP16 scale per (position, KV head), written by `compact_kv_rows_quantize`; the
+  other formats leave the global rows BF16, because no codec of theirs covers a 640-value row.
+  Unwritten slots carry position 2^30, which both attention
   Ops treat as invisible; the Ops also never load a key no row of the tile can see, so an unwritten
   or stale slot's bits cannot reach the output.
 - **Attention Ops**: `sliding_causal_attention` (D 256, 32/16 heads, window, scale 1.0, optional
   second key set) and `causal_compact_attention` over the 640-value compact rows share one
   tensor-core flash kernel family (`gemma_flash_attention.cuh`): BF16 m16n8k16 MMA with FP32
   accumulation, key tiles skipped by position before they load, and an online Softmax with P carried
-  as a BF16 hi + lo pair. A pass with few rows (decode, MTP verification, short prefill tails) takes
+  as a BF16 hi + lo pair. A coded compact cache (`--kv-dtype fp8`) hands its planes to
+  `causal_compact_attention_codes`, whose tile loader forms code × row scale in registers and stores
+  the same BF16 tile the BF16 route copies; the arithmetic after staging is unchanged. A pass with few rows (decode, MTP verification, short prefill tails) takes
   16 query rows per block with a key split and a combine kernel. From eight row tiles per KV head
   (512 rows for the sliding geometry, 256 for the global one) a pass takes the tiled kernel instead:
   each warp keeps 16 rows' S, Softmax state and P in registers, a block holds 64 rows (32 for the
@@ -312,7 +317,9 @@ desktop session), so it is a quality candidate (plan P4), not a serving configur
 - **Refused options**: speculative backends other than MTP (and MTP's optimized proposal head,
   prompt-lookup drafts and draft trees), KV streaming, and an explicit KV capacity below
   `max_context`. Every `--kv-dtype` the engine exposes is wired: the four quantized formats
-  quantize the 25 sliding rings and the five global layers stay BF16 (plan §7). Video, images in
+  quantize the 25 sliding rings, and FP8 also codes the five global layers' compact rows (one E4M3
+  plane plus one FP16 scale per position and KV head, read by `causal_compact_attention_codes`);
+  int8, NVFP4 and k8v4 leave the global rows BF16 (plan §7). Video, images in
   tool results and images in causal scoring are refused per request. `ninfer-perplexity` defaults
   to FP8 KV, which this model now accepts; the documented scoring numbers below are the BF16 ones,
   so a comparison against them wants `--kv-dtype bf16`.
@@ -460,6 +467,30 @@ At C=8 an MTP server does not start, before and after this change: the KV alloca
 device memory at max context 2048 and also at 1024. Plain decode at C=8 and max context 1024 was
 level across the change (288.1 against 290.4 tok/s, one run each).
 
+**Coded global KV (FP8).** `--kv-dtype fp8` also stores the five global layers' compact rows
+(`compact_kv_rows_quantize`, read by `causal_compact_attention_codes`). Measured on M1, one lane,
+context 16,384 / stride 8,192 on the quick corpus (273,341 scored tokens), and decode of 128 tokens
+after a short prompt at an 8K window:
+
+| KV | mean NLL | PPL | score rate | decode |
+|---|---:|---:|---:|---:|
+| BF16 | 6.1316 | 460.16 | 479.5 tok/s | 55.0 tok/s |
+| int8 rings, BF16 globals | 6.1300 | 459.42 | 465.4 tok/s | 52.9 tok/s |
+| FP8 rings and globals | 6.1531 | 470.18 | 425.8 tok/s | 52.8 tok/s |
+
+The int8 control isolates the new rows: they cost **+0.023 NLL (+0.38 %)** against the ring-only
+run, while the ring codec alone is neutral here. Decode's 4 % loss is the rings' decode-to-scratch
+(FP8 and int8 rings measure the same); the coded global rows add no measurable decode cost at short
+context because attention is 3.6 % of a token. Scoring pays 8.5 % over the int8 control: the tiled
+route stages codes with synchronous loads where the BF16 route uses `cp.async`, so the saved global
+bytes do not pay for the lost overlap at prefill widths. Staging codes asynchronously into a code
+buffer and converting between the wait and the MMA is the upgrade path.
+
+Capacity, one lane: at 131,072 tokens the FP8 cache starts with 4.34 GiB free against 0.87 GiB for
+BF16 (the global rows halve, 6.7 to 3.35 GiB, and the rings shrink too); 262,144 was refused by
+`cudaMalloc` under both formats on a desktop session, so the doubling is measured at 131K rather
+than demonstrated at the model's native 262K.
+
 ## 12a. MTP speculation
 
 The official assistant (`google/gemma-4-31B-it-assistant`, `Gemma4AssistantForCausalLM`) is four
@@ -517,7 +548,12 @@ every draft, so the format moves only acceptance and step cost. Against BF16, tw
 of adaptive MTP over the five prompts, greedy and sampled, ran 4.3% faster on average with Q6 (best
 +8.5%, worst -1.9% on sampled code) and 3.9% with Q8 (worst -2.2% on sampled story); acceptance fell
 on prose (greedy story 33-34% to 28-31%) and held elsewhere. The table above was measured with the
-BF16 drafter. Greedy MTP output can differ from plain greedy output after a
+BF16 drafter. Q6 is also the smallest format with registered routes for this drafter: FP8 stores a
+byte per weight where Q6 stores about 0.81, so an FP8 drafter would be larger, and the NVFP4
+registry is the Qwen4 MLP geometries, not the drafter's 1024x10752 pre-projection, 16384x1024
+attention or 262144x1024 tied head. An NVFP4 drafter therefore starts with three geometry entries
+and their op oracle, and can save at most part of the 0.7-1.1 ms a draft step already costs.
+Greedy MTP output can differ from plain greedy output after a
 few hundred tokens because verify passes and single-token passes round differently; the check above
 compares each against one fresh pass instead.
 
@@ -690,8 +726,8 @@ table and this one should not be differenced across sessions.
 | Global decode attention at long context | one key tile in flight per block, one block per SM (68 KB shared): 25% of DRAM peak at 8K | tried and dropped (2026-10-11): 16-key tiles through three cp.async stages (88 KB), scoring split over two halves of the dims, took the global kernel from 86.2 to 67.2 us under ncu's base clocks at 8K, but the bench was level at 8K and 32K and 1.1-1.5% slower after a 64K prompt. Per-tile fixed costs (a position round trip and four barriers) double with 16-key tiles; a next attempt should keep 32-key tiles, e.g. 8 query rows instead of 16 in shared memory to fit two stages |
 | Fewer decode kernels | a decode token is ~1,370 kernels; graphs removed the host side of the launch cost (section 12) but not the per-kernel latency | fusing the per-sublayer norm, residual add and layer scalar; a first attempt failed the numerics (section 15) |
 | Output constraints | refused | token-mask consumption in the Program |
-| Quantized KV on the global layers | the five global layers stay BF16, so a quantized run still keeps 5 of 30 layers' KV at two bytes an element | step 2 of plan §7: D512 rows with two KV heads, K = V, 640 stored values, which no existing codec covers |
-| Quantized KV elsewhere | wired: `--kv-dtype int8|fp8|nvfp4|k8v4` quantize the 25 sliding rings (plan §7 step 1), each qualified by `ninfer_gemma4_kv_quant_test` and scored below | wider formats, a finer NVFP4 block, or a codec for the global rows |
+| Quantized KV on the global layers | **done for FP8**: the compact rows are one E4M3 code plane plus a FP16 scale per (position, KV head), read by `causal_compact_attention_codes`; int8, NVFP4 and k8v4 still leave the 5 global layers at BF16 | plan §7 step 2; a wider-row codec for the other three formats is not registered |
+| Quantized KV elsewhere | wired: `--kv-dtype int8|fp8|nvfp4|k8v4` quantize the 25 sliding rings (plan §7 step 1), each qualified by `ninfer_gemma4_kv_quant_test` and scored below | wider formats or a finer NVFP4 block; the global rows' FP8 codec is the row above |
 | Image preprocessing off the request thread | a 19 MP JPEG costs about 200 ms of single-threaded decode and resize before prefill | Qwen's media worker pool and cache, shared |
 | JPEG decoding as Pillow does it | FFmpeg upsamples 4:2:0 chroma by nearest neighbour; the tower amplifies the difference (12b) | an interpolating chroma path in the shared decoder, checked for Qwen too |
 | MTP at eight lanes, a cheaper drafter step | an MTP server with eight lanes fails its KV allocation at max context 1024 and 2048; drafting is 3-7 ms of a 7-draft round | the device budget of eight MTP lanes. The single-token drafter routes are now profiled and tuned (12c): the two that matter were 1.13x and 1.14x off their best registered route, and the rest were already there |
@@ -974,7 +1010,8 @@ and 0.995134, so Q8 is measurably the better choice here. Preprocessing is check
 `ninfer_gemma4_image_processor_test` against the processor's own resize rule over 22 sizes and
 `ninfer_gemma4_vision_test` encodes the patches. The product surface is `--vision`, which enables
 media and loads the fixed vision allocations. The 26B inherits the family's refused options (§13),
-now including quantized KV for the sliding rings (plan §7 step 1, all four formats) while the five
-global layers stay BF16; `ninfer-perplexity` defaults to FP8 KV, so a comparison against the BF16
-numbers below wants `--kv-dtype bf16`.
+now including quantized KV for the sliding rings (plan §7 step 1, all four formats), and FP8 also
+codes the five global layers' compact rows; int8, NVFP4 and k8v4 leave those rows BF16.
+`ninfer-perplexity` defaults to FP8 KV, so a comparison against the BF16 numbers below wants
+`--kv-dtype bf16`.
 

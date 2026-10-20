@@ -27,8 +27,13 @@ About 24.4 GiB.
 | Layout KLD vs the BF16 checkpoint | 0.419 (4 x 2048 calibration tokens) |
 | Causal perplexity (BF16 KV) | 14.53 (mean NLL 2.676) |
 
-Limits: **BF16 KV only** — no int8, FP8 or NVFP4 KV path, so `ninfer-perplexity` needs
-`--kv-dtype bf16`; no prefix reuse and no constrained output; `top_k` is capped at 20. Concurrent
+KV: `--kv-dtype` quantizes the 25 sliding rings (int8/FP8/NVFP4/k8v4), and FP8 also stores the
+five global layers' compact rows as E4M3 with one FP16 scale per position and KV head. Measured,
+one lane: 131,072 tokens starts with 4.34 GiB free under FP8 against 0.87 GiB under BF16;
+262,144 was refused by `cudaMalloc` on a desktop session. Against an int8-ring control the FP8
+global rows cost 0.38% NLL and about 8% scoring throughput; decode's 4% loss is the rings'
+decode-to-scratch, and the global rows add no measurable decode cost at short context. No prefix
+reuse and no constrained output; `top_k` is capped at 20. Concurrent
 requests decode together in one pass, and with MTP they draft and verify together (eight MTP lanes do
 not fit device memory yet). The artifact is published; the [model card](../model-cards/) has the full
 layout comparison.

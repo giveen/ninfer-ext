@@ -13,8 +13,12 @@
 
 namespace ninfer::ops::detail {
 
+// `key_codes`/`key_scales` are null for BF16 rows; when set, `kv` is ignored and the compact rows
+// are decoded from the planes as code * scale.
+
 void causal_compact_attention_launch(const Tensor& q, const Tensor& kv, const Tensor& position_q,
-                                     const Tensor& position_k, std::int32_t rotary_dim,
+                                     const Tensor& position_k, const Tensor* key_codes,
+                                     const Tensor* key_scales, std::int32_t rotary_dim,
                                      std::int32_t rope_angles, std::int32_t query_heads,
                                      std::int32_t kv_heads, float scale, bool indexed_keys,
                                      Tensor& out, const Tensor& workspace,

@@ -11,22 +11,30 @@
 namespace ninfer::ops::detail {
 
 void causal_compact_attention_launch(const Tensor& q, const Tensor& kv, const Tensor& position_q,
-                                     const Tensor& position_k, std::int32_t rotary_dim,
+                                     const Tensor& position_k, const Tensor* key_codes,
+                                     const Tensor* key_scales, std::int32_t rotary_dim,
                                      std::int32_t rope_angles, std::int32_t query_heads,
                                      std::int32_t kv_heads, float scale, bool indexed_keys,
                                      Tensor& out, const Tensor& workspace,
                                      DeviceExecutionView execution) {
+    const bool coded                = key_codes != nullptr;
     const std::int32_t query_tokens = q.ne[2];
-    const std::int32_t key_tokens   = kv.ne[2];
+    const std::int32_t key_tokens   = coded ? key_codes->ne[2] : kv.ne[2];
     const std::int32_t batch        = q.ne[3];
     if (query_tokens <= 0 || key_tokens <= 0 || batch <= 0) { return; }
     const std::int32_t width = rotary_dim + 2 * rope_angles;
+    if (coded) {
+        require_flash_alignment(key_codes->data, width, "causal_compact_attention_codes");
+    } else {
     require_flash_alignment(kv.data, width, "causal_compact_attention");
+    }
 
     FlashAttentionParams params{};
     params.q            = static_cast<const __nv_bfloat16*>(q.data);
-    params.k            = static_cast<const __nv_bfloat16*>(kv.data);
-    params.v            = static_cast<const __nv_bfloat16*>(kv.data);
+    params.k            = coded ? nullptr : static_cast<const __nv_bfloat16*>(kv.data);
+    params.v            = coded ? nullptr : static_cast<const __nv_bfloat16*>(kv.data);
+    params.k_code       = coded ? static_cast<const std::uint8_t*>(key_codes->data) : nullptr;
+    params.k_scale      = coded ? static_cast<const __half*>(key_scales->data) : nullptr;
     params.position_q   = static_cast<const std::int32_t*>(position_q.data);
     params.position_k   = static_cast<const std::int32_t*>(position_k.data);
     params.out          = static_cast<__nv_bfloat16*>(out.data);
