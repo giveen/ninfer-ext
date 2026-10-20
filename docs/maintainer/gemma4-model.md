@@ -476,15 +476,17 @@ after a short prompt at an 8K window:
 |---|---:|---:|---:|---:|
 | BF16 | 6.1316 | 460.16 | 479.5 tok/s | 55.0 tok/s |
 | int8 rings, BF16 globals | 6.1300 | 459.42 | 465.4 tok/s | 52.9 tok/s |
-| FP8 rings and globals | 6.1531 | 470.18 | 425.8 tok/s | 52.8 tok/s |
+| FP8 rings and globals | 6.1531 | 470.18 | 440.9 tok/s | 52.8 tok/s |
 
 The int8 control isolates the new rows: they cost **+0.023 NLL (+0.38 %)** against the ring-only
 run, while the ring codec alone is neutral here. Decode's 4 % loss is the rings' decode-to-scratch
 (FP8 and int8 rings measure the same); the coded global rows add no measurable decode cost at short
-context because attention is 3.6 % of a token. Scoring pays 8.5 % over the int8 control: the tiled
-route stages codes with synchronous loads where the BF16 route uses `cp.async`, so the saved global
-bytes do not pay for the lost overlap at prefill widths. Staging codes asynchronously into a code
-buffer and converting between the wait and the MMA is the upgrade path.
+context because attention is 3.6 % of a token. Scoring pays 5.3 % over the int8 control. The first
+version staged codes with synchronous loads and paid 8.5 %; staging them with `cp.async` and
+converting the consumed stage into the BF16 tile recovered 3.5 points (425.8 -> 440.9) at identical
+NLL. The residual is the per-tile code-to-BF16 conversion and the code staging's shared round trip;
+a register-prefetched loader, or an FP8 QK^T over the codes (V still needs BF16), are the next
+levers, each with a precision or complexity cost.
 
 Capacity, one lane: at 131,072 tokens the FP8 cache starts with 4.34 GiB free against 0.87 GiB for
 BF16 (the global rows halve, 6.7 to 3.35 GiB, and the rings shrink too); 262,144 was refused by
