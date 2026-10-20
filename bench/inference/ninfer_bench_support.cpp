@@ -305,6 +305,7 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
+        << "  --vary-prompts              slide the prompt through the corpus per repetition\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -363,6 +364,8 @@ BenchOptions parse_args(int argc, char** argv) {
         if (arg == "--weights") {
             options.artifact_path = value("--weights");
             saw_artifact          = true;
+        } else if (arg == "--vary-prompts") {
+            options.vary_prompts = true;
         } else if (arg == "--corpus") {
             options.corpus_path = value("--corpus");
         } else if (arg == "-p" || arg == "--n-prompt") {
@@ -521,11 +524,15 @@ std::vector<TokenId> load_corpus_ids(const std::string& path) {
     return ids;
 }
 
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt) {
-    if (n_prompt <= 0 || static_cast<std::size_t>(n_prompt) > corpus.size()) {
-        throw std::invalid_argument("invalid prompt slice length: " + std::to_string(n_prompt));
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt,
+                                  std::size_t offset) {
+    if (n_prompt <= 0 || static_cast<std::size_t>(n_prompt) > corpus.size() ||
+        offset > corpus.size() - static_cast<std::size_t>(n_prompt)) {
+        throw std::invalid_argument("invalid prompt slice: " + std::to_string(n_prompt) +
+                                    " at offset " + std::to_string(offset));
     }
-    return {corpus.begin(), corpus.begin() + n_prompt};
+    return {corpus.begin() + static_cast<std::ptrdiff_t>(offset),
+            corpus.begin() + static_cast<std::ptrdiff_t>(offset) + n_prompt};
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative) {
