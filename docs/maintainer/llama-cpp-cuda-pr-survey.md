@@ -573,6 +573,141 @@ Two claims from the cluster evaluations do **not** survive any of this: the spar
 "bound <= 4-7% of prefill". The launch census from the graph-splits evaluation *is* confirmed to the
 digit (3,927 ms kernels, 1,438 ms copies, 99.9% of 5,370 ms).
 
+### Final composition after the four prefill changes (2026-10-21, RTX 5090, `nsys`)
+
+Same prompt and flags as the table below, after the pooled-key grouping, the n-gram read-ahead, the
+attention widening and the MTP bank's route: wall **10.36 s**, kernels **10.30 s** (47,447
+launches), host->device 216 GB in 4.35 s (hidden), against 12.98 s / 12.87 s at the start.
+
+| kernel group | before | after |
+|---|---:|---:|
+| dense projections (`q8_a16_mma`) | 3.01 s | 3.08 s |
+| routed experts, `nvfp4_w4a4_mma` | 2.32 s | 2.49 s |
+| QSA select/score | 2.68 s | **1.13 s** |
+| QSA attention | 1.33 s | **1.01 s** |
+| hyper-connection | 0.72 s | 0.77 s |
+| router + A4 route plan | 0.63 s | 0.66 s |
+| expert cache/fetch | 0.42 s | 0.46 s |
+| GDN + conv | 0.34 s | 0.34 s |
+| norms/rope/elementwise | 0.27 s | 0.30 s |
+| routed experts, SIMT A16 (the MTP bank) | 1.10 s | **0.03 s** |
+
+Wall-clock, two requests per process (the second one warm), same settings: **12.76 -> 9.89 s**
+(5,057 -> 6,525 tok/s) warm, 16.68 -> 11.55 s with a cold page cache, and `--ngram-residency
+stream` 18.89 -> 11.43 s.
+
+### Where the remaining 10.3 s of device time sits, and why `program_submit` is not a host lever
+
+NVTX phase ranges over the same capture: `prefill.layer.gdn` **6.19 s** (360 instances),
+`prefill.layer.full` **3.77 s** (120) - the QSA layers - and `mtp.forward` 0.42 s. Per instance that is
+17.2 ms for a GDN layer and 31.4 ms for a QSA one at 16,384 tokens; the QSA layer adds 9.4 ms of
+selection and 8.4 ms of attention to the same MoE and dense work.
+
+`program_submit` reading 9.7 s is an accounting artifact of being *device*-bound, not a host cost: the
+kernels are 10.30 s of a 10.36 s wall, and running the same prompt with `NINFER_CUDA_SYNC=blocking`
+leaves `program_submit` at 9.75 s while `device_wait` falls from 1.35 s to 0.43 s. The Program's
+submit phase spans the device's execution because each chunk's submission is interleaved with it, so
+what is left of the host is ~0.25 s. Earlier notes in this section that named the host as the lever
+were wrong; the n-gram gather was a real cost, but only off the page cache.
+
+Two levers were priced and both need a numerics decision rather than more tuning:
+
+- **Dense projections (3.08 s, 30%).** The Q8-A16 kernel is at 80% of the bf16 peak where it can be
+  measured (`ninfer_linear_bench`: 209 TFLOP/s at [2560,6144]x16384 against a 262.7 peak), so what is
+  left is the activation precision. Two routes were priced, and the measurement changed which one to
+  build:
+
+  | route at [14336,5120]x8192 (compiled FP8 shapes) | time | vs A16 |
+  |---|---:|---:|
+  | FP8 A16 | 5,496.8 us | 1.0x |
+  | FP8 two-term A8 (`AllowA8Pair`) | 2,954.2 us | 1.86x |
+  | FP8 A8 (`AllowA8`, TMA/split-K) | 1,427.5 us | **3.85x** |
+
+  So the existing FP8 A8 kernel already reaches 843 TFLOP/s on a dense shape - four times what the
+  Q8-A16 route does - and no hand-written Q8-A8 kernel would match it: the Q4-A8 precedent in
+  `w4a8-prefill.md` lands at 325 TFLOP/s, i.e. 1.6-1.7x. What the FP8 path needs instead is
+  mechanical: `fp8_dispatch` resolves against 27 compiled shapes (`fp8_shapes.h`) covering the 27B,
+  35B and Nemotron geometries, so Qwen4Exp's ten dense (N,K) pairs need instances, then the dense
+  weights need to be stored FP8 (`fp8_row_maxabs` + `AllowA8`, both already in the converter), which
+  means re-emitting the artifact and re-running the quality gate - the card publishes 3.518 PPL for
+  the current Q8 artifact, and FP8 weights carry a per-row scale where Q8 carries a group-32 one.
+  A Q8-A8 kernel, by contrast, would reuse the Q8 instance list and needs no artifact change.
+- **QSA score (1.13 s, 11%)** is shuffle-bound, not traffic-bound: four query columns per CTA
+  (dividing the pooled-key traffic by four) measured *slower* (38.2 ms against 33.5 ms for a
+  16,384-column chunk at 65,536 tokens), and removing the 32-lane butterfly by ablation gives
+  34.1 -> 18.7 ms. So the 20 shuffles of four bit-identical butterflies are ~45% of the step, and an
+  eight-lane-per-head reduction (five shuffles) would buy ~25-30% while changing the summation order,
+  i.e. which blocks win a near tie.
+
+**The routed experts (2.49 s, 24%) are DRAM-bound, and the schedule is not the lever.** `ncu` on the
+`nvfp4_w4a4_mma` kernel reports 70-78% of DRAM throughput against 20-28% compute, and the op bench is
+flat at ~100 TFLOP/s from T=1024 to 16,384 (`ninfer_offload_moe_bench --format nvfp4 --a4`): a job is
+one 64-token tile of one expert, so at Qwen4Exp's assignment density (K=10 of E=512, i.e. 320
+assignments per expert in a 16,384-token chunk) every expert's 2.8 MB of weights is read five times
+per chunk. Two ways to reuse them were measured and neither works as-is: 128- and 256-column job
+tiles (a bigger `kA4JobColumns` with a matching `BlockM`) spill the tail of each expert's assignments
+into half-empty tiles and run 2-4x slower, and warp-shape/stage knobs that looked 8% better in the
+bench did not reproduce in the engine (2.477 -> 2.481 s over the same 6,174 launches) - a re-measure
+then showed that bench's own baseline moving 7% between sessions, so that sweep had compared across
+machine states, not candidates. What matches the DRAM bound is a CTA that sweeps several token tiles
+of one expert against a single staged weight read; that is a redesign of the route.
+
+Still open: that redesign, and the BF16 KV attention profile (77,792 B of shared, one CTA per SM).
+
+### Post-Oct-9 composition (2026-10-21, RTX 5090, `nsys`)
+
+A 64,512-token prompt (NIAH fixture), one request, `--max-context 65536 --kv-capacity auto --kv-dtype
+fp8 --expert-cache auto --ngram-residency mapped --spec mtp`, idle prefill chunk 16,384, expert cache
+8,093 slots. Wall **12.98 s**, kernels **12.87 s** (47,258 launches), host->device **215 GB in 74,150
+copies = 4.09 s**, which the kernels hide. The machine had other users, so read the ratios, not the
+absolute rate; the A/B below is what attributes the change.
+
+| kernel group | time | share |
+|---|---:|---:|
+| dense projections (`q8_a16_mma`) | 3.01 s | 23.4% |
+| QSA select/score | 2.68 s | 20.8% |
+| routed experts, `nvfp4_w4a4_mma` (48 text layers) | 2.32 s | 18.0% |
+| QSA attention | 1.33 s | 10.3% |
+| routed experts, SIMT A16 (`mtp/layers/0` only) | 1.10 s | 8.6% |
+| hyper-connection | 0.72 s | 5.6% |
+| router + A4 route plan | 0.63 s | 4.9% |
+| expert cache/fetch | 0.42 s | 3.2% |
+| GDN + conv | 0.34 s | 2.6% |
+| norms/rope/elementwise | 0.27 s | 2.1% |
+
+The score step was then given four blocks per warp iteration (`perf(sparse-attention): keep four
+pooled-key loads in flight`): back-to-back captures of the same prompt give kernels **13.30 s ->
+11.48 s** and the score step **2.52 s -> 0.86 s**, selection bit-identical; nothing else in the
+table moved by more than run noise.
+
+That pair also shows the shape of the remaining problem. The wall followed only 0.45 s of the 1.82 s
+the GPU gave back (15.51 s -> 15.06 s, `device_wait` 1.48 s of it, `program_submit` 14.21 s ->
+13.77 s): on that machine the host was at ~98% duty and the device had 11.48 s of work for a 15 s
+prompt, so prefill is `max(host submission, device)`.
+
+The host's largest single cost was then measured rather than inferred: `perf` samples one prefill and
+puts 92% of the prompt's CPU time under `PleGather::decode_row` (self time in the scalar E4M3->BF16
+loop plus page-fault frames). Note what that number is and is not: it is *threaded* CPU time - the
+gather fans out over up to 16 workers - so its wall share is small when the table is in the page
+cache (~9 ms per 16,384-token chunk, 0.3% of the prompt) and large when it is not. Gathering the next
+chunk a chunk ahead (`PleReadAhead`, see the model reference) fixed exactly that: 12.51 -> 10.86 s
+warm, 16.63 -> 12.53 s with the page cache evicted, 18.89 -> 12.41 s under `--ngram-residency
+stream`. What remains of `program_submit` (~9.7 s against a 9.7-11.5 s device) is not this gather and
+has not been attributed yet.
+
+Two of those were then taken: the QSA attention kernel staged every quantized tile's codes in
+shared memory (32,768 B of a 78,016 B block, on a part with 100 KB per SM = one CTA per SM), and
+widening straight from the paged codes leaves 45,248 B and two CTAs: attention 1.445 -> 1.027 s and
+kernels 12.215 -> 11.725 s on the same prompt. The Q8-A16 dense route turned out to be at 80% of the
+bf16 peak already (`ninfer_linear_bench`: 209 TFLOP/s at [2560,6144]x16384, 199 at [1280,2560], 154
+at [10240,320] against a 262.7 TFLOP/s peak), so the 3.25 s dense slice is the shape mix of the
+fused `gdn_input_proj`/`attn_input_proj`/`hyper_connection` ops, and beating it needs an
+int8-activation Q8 route rather than a retile - a numerics decision (`w4a8-prefill.md` measures that
+step at 1.6-1.7x on the Q4 route).
+
+What is left, in order: the host path, the dense projections' activation precision, and the MTP
+bank's missing A4 divisor.
+
 ### The staged route's SIMT branch runs at ~5.4 TFLOP/s (measured)
 
 The Sep 24 export's 47.6% is the *staged* expert route (`moe_gate_up_kernel` + `moe_down_kernel`), and
@@ -614,21 +749,43 @@ else                                     ops::moe_experts(...);     // SIMT A16,
 
 `moe_experts_a4` quantizes the activation to NVFP4 with the bank's per-layer input divisors and runs
 gate/up and down on `mxf4nvf4` (`include/ninfer/ops/offload_moe.h:271-276`; landed as `ff6c6213` and
-`a960ee36`, both 2026-09-24). The divisor is zero for this artifact because `OffloadMoeParameters`
-fills it only when *every* expert of the layer is `AllowA4` with an identical divisor per projection
-(`src/models/qwen3_5/execution/parameters.cpp:440-471`). The recipe does grant `AllowA4`
-(`tools/convert/official_recipes.py:428-435`), but the artifact was converted from a full-precision
-source (`/mnt/storage/models/qwen3.8/flash/source`, 131 shards, no ModelOpt encoding) with
-`nvfp4_absmax`, which yields no calibrated input scale, so there is no divisor to store. The divisor
-is metadata, never weight data - A16 does not read it (`src/ops/weight_input.cpp:92-93`).
+`a960ee36`, both 2026-09-24). `OffloadMoeParameters` fills the divisor only when *every* expert of
+the layer is `AllowA4` with an identical divisor per projection
+(`src/models/qwen3_5/execution/parameters.cpp:440-471`). The recipe grants `AllowA4`
+(`tools/convert/official_recipes.py:428-435`). The divisor is metadata, never weight data - A16 does
+not read it (`src/ops/weight_input.cpp:92-93`).
 
-So the fix is not a kernel. Two ways to fill it, both with the machinery already present:
+**Correction (2026-10-21): this section described the 2026-09-24 artifact, and the shipped
+`qwen3_8_flash_next_nvfp4.ninfer` is not it.** That file's conversion report names
+`/mnt/storage/models/qwen3.8/flash/ninfer-flash` as its source, and every one of its 75,264 text
+expert uses carries `AllowA4` plus an `activation_input_divisor` auxiliary whose value is common to
+the layer and projection (verified by reading the artifact: 48 layers x 3 projections, one value
+each) - so all 48 text layers run the `mxf4nvf4` route, and an in-engine profile of a 64,512-token
+prefill shows the `nvfp4_w4a4_mma_kernel` launches, not the SIMT pair. What the artifact does *not*
+carry is a divisor for `mtp/layers/0` (1,536 uses, `AllowA4` and no auxiliary), so that one bank
+falls to the SIMT A16 route: 1.10 s of the 12.87 s of prefill kernel time measured on 2026-10-21,
+against 2.32 s for the other 48 layers together. The rest of this section (the SIMT branch's rate,
+the cuBLAS reference, the W4A4 measurement) still stands as the qualification of both routes.
+
+**Solved for the MTP bank without new metadata (2026-10-21).** What that block was missing turned
+out to be two things, and neither needed a calibrated value. It carries no *activation* divisor, and
+the divisor cancels exactly - the quantiser multiplies by it and the MMA epilogue by its reciprocal -
+so the model now sets 1.0 for a bank that permits A4 and stores none: it only chooses which E4M3 bin
+the per-16 group scale rounds into, and 1.0 puts a group whose maximum is O(1) at full mantissa
+precision. The block's *weight* divisors were also one value for a whole stacked matrix
+(`divisor_rows` 655,360) rather than one per expert, and `moe_experts_a4` rejected anything that was
+not 640/2560 rows - although its epilogue addresses the table by output row and `row / 655360` is
+simply 0. Relaxing that check to `divisor_rows > 0` moved the bank onto `mxf4nvf4`: the SIMT pair
+(0.806 + 0.316 s) disappears from a 64,512-token prefill and kernels fall 11.725 -> 10.287 s, with
+the greedy completion token-identical and draft acceptance unchanged (353/474).
+
+What would still be left for a *calibrated* placement is the older, optional route:
 - convert from `nvidia/Qwen3.8-Flash-Next-NVFP4` (ModelOpt 0.46, 119.6 GB, tags `ModelOpt`/`FP4`),
-  whose 73,728 expert `input_scale` tensors (512 experts x 48 layers x 3 projections) are the
-  calibrated divisors, reduced to one value per layer and projection - the A4 route quantizes the
-  activation once for the whole layer, which is why `parameters.cpp` demands a common value - through
-  the converter's `auxiliary_overrides` (`tools/convert/methods.py:405-410`); or
-- calibrate the layer-level activation scales on the current A16 artifact and write them in.
+  whose 73,728 expert `input_scale` tensors are the calibrated divisors, reduced to one value per
+  layer and projection - the A4 route quantizes the activation once for the whole layer, which is why
+  `parameters.cpp` demands a common value - through the converter's `auxiliary_overrides`
+  (`tools/convert/methods.py:405-410`); or
+- calibrate the layer-level activation scales on the current artifact and write them in.
 
 Precedent: the 35B-A3B artifact ships 30,720 expert uses with `AllowA4` *and* divisors, so W4A4
 experts are accepted practice in this tree; what Qwen4Exp lacks is the stored value.

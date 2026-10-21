@@ -21,6 +21,7 @@
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/ple_gather.h"
+#include "models/qwen3_5/execution/ple_read_ahead.h"
 #include "models/execution/expert_pager.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -737,6 +738,9 @@ public:
     std::optional<execution::Qwen4Runtime> qwen4_runtime;
     std::unique_ptr<execution::PleGather> ple_gather;
     std::optional<PinnedHostBuffer> ple_host;
+    // The read-ahead's two planes, in one allocation: it gathers the next chunk while the device
+    // runs the current one (see execution/ple_read_ahead.h).
+    std::unique_ptr<execution::PleReadAhead> ple_read_ahead;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;

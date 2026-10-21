@@ -8,6 +8,7 @@
 #include "models/execution/expert_pager.h"
 #include "models/execution/host_expert_lane.h"
 #include "models/qwen3_5/execution/ple_gather.h"
+#include "models/qwen3_5/execution/ple_read_ahead.h"
 #include "models/qwen3_5/execution/qwen4_workspace.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -873,15 +874,42 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
             if (runtime.ple_gather == nullptr || runtime.ple_host == nullptr) {
                 throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
             }
-            const std::uint32_t width = runtime.ple_gather->width();
-            std::vector<std::int32_t> tokens(history.begin(), history.end());
-            runtime.ple_gather->gather(
-                tokens, text_prefill != nullptr || multimodal != nullptr ? prompt_t0 : 0,
-                static_cast<std::size_t>(len),
-                std::span<std::uint16_t>(runtime.ple_host, static_cast<std::size_t>(width) * len));
+            const std::uint32_t width  = runtime.ple_gather->width();
+            const std::size_t first    = text_prefill != nullptr || multimodal != nullptr
+                                             ? static_cast<std::size_t>(prompt_t0)
+                                             : 0;
+            const std::size_t count = static_cast<std::size_t>(len);
+            std::uint16_t* rows     = nullptr;
+            if (runtime.ple_read_ahead != nullptr) {
+                rows = runtime.ple_read_ahead->take(static_cast<std::uint32_t>(first), len);
+            }
+            if (rows == nullptr) {
+                std::vector<std::int32_t> tokens(history.begin(), history.end());
+                runtime.ple_gather->gather(
+                    tokens, first, count,
+                    std::span<std::uint16_t>(runtime.ple_host,
+                                             static_cast<std::size_t>(width) * count));
+                rows = runtime.ple_host;
+            }
             ple_embedding = roots.ple;
-            CUDA_CHECK(cudaMemcpyAsync(ple_embedding.data, runtime.ple_host, ple_embedding.bytes(),
+            CUDA_CHECK(cudaMemcpyAsync(ple_embedding.data, rows, ple_embedding.bytes(),
                                        cudaMemcpyHostToDevice, s));
+            if (runtime.ple_read_ahead != nullptr) {
+                runtime.ple_read_ahead->record_copy(s);
+                // The next chunk's rows, gathered while the device runs this one. Chunks are
+                // equal-sized up to a short tail, and a template split can shift them by a token, so
+                // the window is the engine's widest chunk rather than this chunk's own width: a
+                // window one row shorter than the next chunk would miss and fall back on the
+                // synchronous gather.
+                const std::size_t next      = first + count;
+                const std::size_t remaining = history.size() > next ? history.size() - next : 0;
+                const std::size_t next_count = std::min(
+                    remaining, static_cast<std::size_t>(runtime.ple_read_ahead->capacity()));
+                if (next_count != 0) {
+                    runtime.ple_read_ahead->start(history, static_cast<std::uint32_t>(next),
+                                                  static_cast<std::uint32_t>(next_count));
+                }
+            }
         }
         {
             ScopedBinding<const Tensor*> cache_binding(active_cache_positions_, &positions);

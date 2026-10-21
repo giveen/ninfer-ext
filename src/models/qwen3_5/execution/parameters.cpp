@@ -587,6 +587,19 @@ Parameters::Parameters(const Model& source) : model(source) {
             if (qwen4_mtp->layer.moe.bank.layout != experts) {
                 throw std::invalid_argument("mtp: routed experts use a different bank layout");
             }
+            // This artifact's MTP experts are AllowA4 but carry no calibrated activation divisor
+            // (the block was re-encoded from block FP8), which left that one bank of the 49 on the
+            // SIMT A16 route: 1.10 s of a 64,512-token prefill's 12.87 s of kernel time, against
+            // 2.32 s for the other 48 layers together. The divisor cancels exactly - the quantiser
+            // multiplies by it and the MMA epilogue by 1/divisor - so it only sets which E4M3 bin the
+            // per-16 group scale rounds into, and 1.0 places a group whose maximum is O(1) at full
+            // mantissa precision. A calibrated value would halve that rounding at best; the E2M1
+            // four-bit codes dominate the error either way.
+            {
+                ops::ExpertWeights& bank = qwen4_mtp->layer.moe.bank;
+                if (bank.gate_up_input_divisor <= 0.0F) { bank.gate_up_input_divisor = 1.0F; }
+                if (bank.down_input_divisor <= 0.0F) { bank.down_input_divisor = 1.0F; }
+            }
         }
         // One bank per cache layer: every MoE layer, then the MTP block when the model has one. The
         // model's own bank is the shape -- its layout and the expert count the loader bound -- so

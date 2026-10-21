@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -189,6 +190,10 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         out.size() < static_cast<std::size_t>(width_) * count) {
         throw std::invalid_argument("PLE gather range is invalid");
     }
+    // The streamed reader rewrites its staging on every call, so only a streamed gather serializes;
+    // a mapped gather touches nothing shared and may run beside another one.
+    std::unique_lock<std::mutex> stream_lock(reader_mutex_, std::defer_lock);
+    if (reader_) { stream_lock.lock(); }
     const std::uint32_t heads = config_.heads();
     std::vector<std::uint64_t> rows(count * heads);
     for (std::size_t i = 0; i < count; ++i) {

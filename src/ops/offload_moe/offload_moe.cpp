@@ -472,10 +472,13 @@ void moe_experts_a4(const Tensor& x, const Tensor& expert_ids, const Tensor& wei
                 staged.stride[2] == kExpertDownCodeBytes &&
                 staged.stride[3] == kExpertDownScaleBytes,
             op, "the staged bank must use the plane layout");
+    // A divisor table may be per expert matrix (I rows for gate/up, H for down) or coarser; the
+    // epilogue addresses it by output row, so any granularity that divides the bank's rows works. A
+    // coarser one is what a bank re-encoded from block FP8 carries (one divisor for a whole stacked
+    // matrix), and refusing it kept the model's MTP block on the SIMT A16 route.
     require(staged.gate_up_divisors != nullptr && staged.down_divisors != nullptr &&
-                staged.gate_up_divisor_rows == kOffloadMoeIntermediate &&
-                staged.down_divisor_rows == kOffloadMoeHidden,
-            op, "one weight divisor per expert gate, up and down is required");
+                staged.gate_up_divisor_rows > 0 && staged.down_divisor_rows > 0,
+            op, "expert weight divisors must address the bank's output rows");
     require(staged.gate_up_input_divisor > 0.0F && staged.down_input_divisor > 0.0F, op,
             "A4 activation divisors must be positive");
     const std::int32_t chunk = std::min(columns, kChunkColumns);

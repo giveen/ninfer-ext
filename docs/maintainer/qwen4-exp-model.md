@@ -111,6 +111,16 @@ x, inj = HC_mlp(R);   R = R + inj ⊗ SparseMoE(x)
 - SwiGLU experts whose fused `gate_up_proj` rows are gate first, then up;
 - the shared expert scaled by `sigmoid(shared_expert_gate · x)`.
 
+Wide calls route a text layer's experts through `moe_experts_a4` (W4A4 on `mxf4nvf4`): the artifact
+stores one activation divisor per layer and projection, common to its 512 experts, so the chunk's
+activation is quantised once. The MTP block's bank carries no such divisor - it was re-encoded from
+block FP8 - and its *weight* divisors are one value for a whole stacked matrix rather than one per
+expert; the route now accepts both (1.0 for the missing activation divisor, row-addressed weight
+divisors) instead of leaving that one bank of 49 on the SIMT A16 route, which cost 1.12 s of a
+64,512-token prefill. The MTP layer is the drafter, so its arithmetic cannot change an output token:
+speculative verification against the target keeps the emitted stream exact, and only acceptance is
+at stake (measured unchanged, 353/474).
+
 Execution may compute a share of a narrow call's missing experts on host threads (`--host-experts`);
 those experts quantize activations to Q8_0, so their result depends on what the expert cache held
 when the call ran. This is the one accepted placement dependence in decode.
@@ -158,14 +168,35 @@ equals dense causal attention; beyond that, decode attention cost stays constant
   is qualified against the oracle with an explicit near-tie allowance.
 - **Dtypes:** upstream stores raw keys and pooled means in the activation dtype. That is a private
   staging choice, not a semantic boundary.
-- **Select cost:** the score step walks one warp per block in a serial loop, so its parallelism is
-  the CTA count, which the pass splitter sets as a *product* (`columns * splits`) rather than as a
+- **Attention cost:** one CTA per (column, KV head, split), four warps, a 16-row query tile
+  against gathered 32-key tiles with FP32 online softmax. The quantized profiles used to stage each
+  tile's codes in shared memory before widening them to FP16: 32,768 B of a 78,016 B block, on a part
+  with **100 KB of shared per SM**, so the kernel ran one CTA per SM (four warps, 8% occupancy) and
+  measured 1.2 TFLOP/s at the 64k end. Widening straight from the paged codes into the FP16 tile
+  leaves 45,248 B and two CTAs per SM (registers allow two: 173 per thread at 128 threads). That is
+  28.9 → 19.2 ms for a 16,384-column chunk at 65,536 tokens (`bench/ops/ninfer_qsa_select_bench
+  --attention --kv fp8`) and 1.445 → 1.027 s of a 64,512-token prefill's kernel time. The absent-key
+  path widens from zero bytes so a partial selection still produces zeros; the BF16 cache profile
+  keeps its double-buffered K/V tiles (77,792 B) and therefore one CTA.
+- **Select cost:** the score step gives each warp one block per iteration. Its parallelism is the
+  CTA count, which the pass splitter sets as a *product* (`columns * splits`) rather than as a
   per-column split. Measured on the RTX 5090 with `qwen3_8_flash_next_nvfp4.ninfer` and a
   51,250-token prompt, the old 256-CTA target left each warp ~1.5k dependent block iterations and
   the kernel moved only ~3 GB/s of key traffic. Targeting 8,192 CTAs moved prefill from 4.45k to
   4.81k tok/s and TTFT from 11.53 s to 10.68 s (−7.4%), decode from 121.0 to 123.7 tok/s; 2,048
   CTAs land within 1% of 8,192, so the value is not critical. The split only partitions the block
   loop and each block's score is computed the same way, so the selection is bit-identical.
+  A warp that scores one block per iteration leaves a single dependent 512-byte pooled-key load in
+  flight, so the split alone could not fix the stall: at the 64k end of a Qwen3.8-Flash-Next prompt
+  the step ran at 2.7 TFLOP/s. Scoring `kScoreGroup` (4) blocks per iteration keeps that many
+  loads in flight and reads one 16-byte vector per lane per block; the per-head lane partials and
+  the `warp_sum` order are unchanged, so scores and selection stay bit-identical
+  (`bench/ops/qsa_select_bench.cu` prints a checksum of the selection: 34.1 ms against 88.0 ms for
+  a 16,384-column chunk at 65,536 tokens, 7.0 against 2.7 TFLOP/s). End to end that took a
+  64,512-token prefill from 13.78/14.46 s to 12.07/12.02 s (ABAB, one session).
+  Remaining headroom is the 512-byte-per-pair pooled-key read: a query tile in the CTA (many
+  columns per staged key) would divide that traffic by the tile width, which the instruction floor
+  (~20 shuffles per pair) then makes the limit.
 
 ## PLE n-gram embedding
 
@@ -193,6 +224,31 @@ The rows use these constants:
 
 The table has `320,001,536 × 160` rows, split in the checkpoint into 128 shards of 2,500,012 rows.
 The 16 gathered rows are concatenated, 2-gram heads first, into the 2560-wide embedding `E`.
+
+**Gather cost and prefill read-ahead.** The rows are gathered on the Host: `PleGather` hashes each
+token's 2-gram and 3-gram contexts, reads the 16 rows from the file-mapped table and decodes them
+FP8 → BF16. It is O(tokens) work, and a profile of a 64,512-token prefill put 92 % of the prompt's
+CPU samples under `PleGather::decode_row` — half self time in the scalar E4M3→BF16 loop, the rest
+page-fault frames on a table that does not stay resident beside the weights. Its *wall* cost depends
+on where the pages are: ~9 ms for a 16,384-token chunk with the table in the page cache, and seconds
+per chunk with it evicted or read with `--ngram-residency stream` (O_DIRECT).
+
+`PleReadAhead` (one worker thread and one extra pinned plane) gathers the *next* chunk while the
+device runs the current one, so that wall cost leaves the critical path. The window is the engine's
+widest chunk rather than the current chunk's length, because a template split can shift the chunk
+boundaries by a token and a one-row-short window would miss. The worker waits for the event of the
+device copy that read the plane before it overwrites it, and a mapped gather is reentrant, so a
+decode round's gather may run beside it (a streamed gather serializes on the reader). Measured on a
+64,512-token prompt with `--max-context 65536 --kv-dtype fp8 --expert-cache auto --spec mtp`:
+
+| configuration | before | with the read-ahead |
+|---|---:|---:|
+| `--ngram-residency mapped`, page cache warm | 12.51-12.73 s | **10.86 s** |
+| `--ngram-residency mapped`, page cache evicted | 16.63 s | **12.53 s** |
+| `--ngram-residency stream` (O_DIRECT) | 18.89 s | **12.41 s** |
+
+A 7,680-token prompt is unchanged (1.34 s against 1.36 s) and its completion is token-identical, as
+it must be: the read-ahead changes who gathers the rows, not what they are.
 
 **Injection.** With `R` the wide residual entering the block:
 

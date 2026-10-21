@@ -356,9 +356,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (layout.ple_input) { runtime.ple_input = layout.ple_input->bind(backing); }
             const std::size_t columns = std::max<std::size_t>(
                 prefill_width, static_cast<std::size_t>(draft_window + 1U) * max_concurrency);
-            ple_host.emplace(columns * ple_gather->width() * sizeof(std::uint16_t));
+            // Plane 0 stages a chunk's (or a decode round's) rows right before the upload; plane 1
+            // belongs to the read-ahead, which gathers the *next* chunk while the device runs this
+            // one.
+            ple_host.emplace(2 * columns * ple_gather->width() * sizeof(std::uint16_t));
             runtime.ple_gather = ple_gather.get();
             runtime.ple_host   = static_cast<std::uint16_t*>(ple_host->data());
+            ple_read_ahead     = std::make_unique<execution::PleReadAhead>(
+                *ple_gather,
+                static_cast<std::uint16_t*>(ple_host->data()) + columns * ple_gather->width(),
+                ple_gather->width(), static_cast<std::int64_t>(columns));
+            runtime.ple_read_ahead = ple_read_ahead.get();
         }
         qwen4_runtime = runtime;
     }
