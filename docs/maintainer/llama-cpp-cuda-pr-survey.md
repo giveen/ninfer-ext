@@ -613,8 +613,25 @@ were wrong; the n-gram gather was a real cost, but only off the page cache.
 Two levers were priced and both need a numerics decision rather than more tuning:
 
 - **Dense projections (3.08 s, 30%).** The Q8-A16 kernel is at 80% of the bf16 peak where it can be
-  measured; the way down is an int8-activation Q8 route, which changes prefill activation precision
-  on every dense projection (`w4a8-prefill.md` measures that step at 1.6-1.7x on the Q4 route).
+  measured (`ninfer_linear_bench`: 209 TFLOP/s at [2560,6144]x16384 against a 262.7 peak), so what is
+  left is the activation precision. Two routes were priced, and the measurement changed which one to
+  build:
+
+  | route at [14336,5120]x8192 (compiled FP8 shapes) | time | vs A16 |
+  |---|---:|---:|
+  | FP8 A16 | 5,496.8 us | 1.0x |
+  | FP8 two-term A8 (`AllowA8Pair`) | 2,954.2 us | 1.86x |
+  | FP8 A8 (`AllowA8`, TMA/split-K) | 1,427.5 us | **3.85x** |
+
+  So the existing FP8 A8 kernel already reaches 843 TFLOP/s on a dense shape - four times what the
+  Q8-A16 route does - and no hand-written Q8-A8 kernel would match it: the Q4-A8 precedent in
+  `w4a8-prefill.md` lands at 325 TFLOP/s, i.e. 1.6-1.7x. What the FP8 path needs instead is
+  mechanical: `fp8_dispatch` resolves against 27 compiled shapes (`fp8_shapes.h`) covering the 27B,
+  35B and Nemotron geometries, so Qwen4Exp's ten dense (N,K) pairs need instances, then the dense
+  weights need to be stored FP8 (`fp8_row_maxabs` + `AllowA8`, both already in the converter), which
+  means re-emitting the artifact and re-running the quality gate - the card publishes 3.518 PPL for
+  the current Q8 artifact, and FP8 weights carry a per-row scale where Q8 carries a group-32 one.
+  A Q8-A8 kernel, by contrast, would reuse the Q8 instance list and needs no artifact change.
 - **QSA score (1.13 s, 11%)** is shuffle-bound, not traffic-bound: four query columns per CTA
   (dividing the pooled-key traffic by four) measured *slower* (38.2 ms against 33.5 ms for a
   16,384-column chunk at 65,536 tokens), and removing the 32-lane butterfly by ablation gives
