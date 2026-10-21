@@ -622,8 +622,20 @@ Two levers were priced and both need a numerics decision rather than more tuning
   eight-lane-per-head reduction (five shuffles) would buy ~25-30% while changing the summation order,
   i.e. which blocks win a near tie.
 
-Still open besides those: the BF16 KV attention profile (77,792 B of shared, one CTA per SM), and the
-routed experts at 122 TFLOP/s (2.49 s) against the dense nvfp4 route's 935.
+**The routed experts (2.49 s, 24%) are DRAM-bound, and the schedule is not the lever.** `ncu` on the
+`nvfp4_w4a4_mma` kernel reports 70-78% of DRAM throughput against 20-28% compute, and the op bench is
+flat at ~100 TFLOP/s from T=1024 to 16,384 (`ninfer_offload_moe_bench --format nvfp4 --a4`): a job is
+one 64-token tile of one expert, so at Qwen4Exp's assignment density (K=10 of E=512, i.e. 320
+assignments per expert in a 16,384-token chunk) every expert's 2.8 MB of weights is read five times
+per chunk. Two ways to reuse them were measured and neither works as-is: 128- and 256-column job
+tiles (a bigger `kA4JobColumns` with a matching `BlockM`) spill the tail of each expert's assignments
+into half-empty tiles and run 2-4x slower, and warp-shape/stage knobs that looked 8% better in the
+bench did not reproduce in the engine (2.477 -> 2.481 s over the same 6,174 launches) - a re-measure
+then showed that bench's own baseline moving 7% between sessions, so that sweep had compared across
+machine states, not candidates. What matches the DRAM bound is a CTA that sweeps several token tiles
+of one expert against a single staged weight read; that is a redesign of the route.
+
+Still open: that redesign, and the BF16 KV attention profile (77,792 B of shared, one CTA per SM).
 
 ### Post-Oct-9 composition (2026-10-21, RTX 5090, `nsys`)
 
