@@ -50,9 +50,21 @@ MTP speculative decoding (`--spec mtp`).
 |---|---|
 | Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | **3.518** |
 | Prefill, 262,144-token budget, FP8 KV, `--ngram-residency stream`, single request | **1,090 / 3,666 / 3,498 / 2,908 / 2,218** tok/s at 1.5k / 8k / 64k / 128k / 256k tokens |
-| Decode (greedy, MTP K=3) | **81 tok/s** |
+| Decode (greedy, MTP K=3), first request after load | **97 tok/s** |
+| Decode (greedy, MTP K=3), steady state, warm expert cache | **138–141 tok/s** |
 | Peak host RSS (`--ngram-residency stream`) | **~65 GiB** |
 | Artifact size | **119 GB**, 4 sharded files |
+
+Decode is set by what the expert cache already holds, so both ends of the warm-up are reported and
+both name their configuration. The steady-state figure is the median of five timed requests after
+one warmup on one server, 512 reasoning tokens each, greedy, `--max-context 32768 --kv-capacity
+32768 --kv-dtype fp8 --host-experts 16 --host-expert-share 0.5 --spec mtp --draft-tokens 3`; on
+2026-10-21 the first, second and third request read **97.2 / 133.6 / 137.6** tok/s as the cache
+filled, and the [LocalMaxxing record](https://www.localmaxxing.com/en/runs/cmvfjyuh70199rf011u8mvio2/qwen3-8-flash-next-nvfp4-rtx-5090-140-9-tps)
+carries the same configuration at 140.9 (median of five, range 133.4–147.9). The 81 tok/s this card
+previously quoted was measured with its default serve command — 229,376-token context and no host
+miss split — where the KV floor leaves a smaller expert cache; treat it as a different operating
+point, not as the steady state of this one.
 
 Prefill is fastest at medium prompts: a short prompt is dominated by the fixed per-chunk expert
 streaming, and a long one by the QSA selection. It also depends on how the n-gram table is read:

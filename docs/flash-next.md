@@ -218,6 +218,15 @@ so more fetches overlap. The single-request MTP point is unresolved: master's tw
 and 74.1 tok/s and `fc305acd`'s 77.5 and 86.9, a spread larger than the difference. Throughput
 still levels off from C=4, where the expert cache misses most.
 
+Every one of those figures is also a function of what the expert cache already holds, and the spread
+is big enough to explain the unresolved single-request point: one server started with
+`--max-context 32768 --kv-capacity 32768 --kv-dtype fp8 --expert-cache auto --host-experts 16
+--host-expert-share 0.5 --spec mtp --draft-tokens 3` read **97.2 / 133.6 / 137.6** tok/s on its
+first, second and third 512-token reasoning request (2026-10-21, 78% draft acceptance, unchanged
+flags), and the median of five warm requests was 140.9. A cold process and a warm one differ by
+about 1.4x at the same flags, so measure the cache state before attributing a single-request decode
+difference to a code change.
+
 Measured at `fc305acd` with the same 512-token essays (one run each), plus one 241,003-token prompt
 (79 of this repository's documentation files concatenated, with a question about the first one):
 
