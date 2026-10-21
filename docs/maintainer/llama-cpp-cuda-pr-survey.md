@@ -573,6 +573,36 @@ Two claims from the cluster evaluations do **not** survive any of this: the spar
 "bound <= 4-7% of prefill". The launch census from the graph-splits evaluation *is* confirmed to the
 digit (3,927 ms kernels, 1,438 ms copies, 99.9% of 5,370 ms).
 
+### Post-Oct-9 composition (2026-10-21, RTX 5090, `nsys`)
+
+A 64,512-token prompt (NIAH fixture), one request, `--max-context 65536 --kv-capacity auto --kv-dtype
+fp8 --expert-cache auto --ngram-residency mapped --spec mtp`, idle prefill chunk 16,384, expert cache
+8,093 slots. Wall **12.98 s**, kernels **12.87 s** (47,258 launches), host->device **215 GB in 74,150
+copies = 4.09 s**, which the kernels hide. The machine had other users, so read the ratios, not the
+absolute rate; the A/B below is what attributes the change.
+
+| kernel group | time | share |
+|---|---:|---:|
+| dense projections (`q8_a16_mma`) | 3.01 s | 23.4% |
+| QSA select/score | 2.68 s | 20.8% |
+| routed experts, `nvfp4_w4a4_mma` (48 text layers) | 2.32 s | 18.0% |
+| QSA attention | 1.33 s | 10.3% |
+| routed experts, SIMT A16 (`mtp/layers/0` only) | 1.10 s | 8.6% |
+| hyper-connection | 0.72 s | 5.6% |
+| router + A4 route plan | 0.63 s | 4.9% |
+| expert cache/fetch | 0.42 s | 3.2% |
+| GDN + conv | 0.34 s | 2.6% |
+| norms/rope/elementwise | 0.27 s | 2.1% |
+
+The score step was then given four blocks per warp iteration (`perf(sparse-attention): keep four
+pooled-key loads in flight`): 2.68 s -> **1.17 s**, prefill 13.78/14.46 s -> 12.07/12.02 s (ABAB),
+selection bit-identical. What is left, in order: the dense projections run at 134 TFLOP/s where
+cuBLAS bf16 measures 237-257 on this GPU (`w4a8-prefill.md`), the MTP bank has no A4 divisor, and the
+QSA attention kernel asks for 78,016 B of dynamic shared per CTA - **1 CTA per SM**, 4 warps, on a
+part with 100 KB of shared per SM (`cudaDevAttrMaxSharedMemoryPerMultiprocessor` = 102,400 on
+sm_120), which is why it measures 1.2 TFLOP/s at the 64k end (`bench/ops/qsa_select_bench.cu
+--attention`). Two CTAs need <= 50 KB: the FP8 code staging alone is 32,768 B of the 78,016.
+
 ### The staged route's SIMT branch runs at ~5.4 TFLOP/s (measured)
 
 The Sep 24 export's 47.6% is the *staged* expert route (`moe_gate_up_kernel` + `moe_down_kernel`), and
