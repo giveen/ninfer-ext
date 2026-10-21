@@ -614,12 +614,18 @@ warm, 16.63 -> 12.53 s with the page cache evicted, 18.89 -> 12.41 s under `--ng
 stream`. What remains of `program_submit` (~9.7 s against a 9.7-11.5 s device) is not this gather and
 has not been attributed yet.
 
-What is left, in order: that host path, the dense projections (134 TFLOP/s where cuBLAS bf16
-measures 237-257 on this GPU, `w4a8-prefill.md`), the MTP bank's missing A4 divisor, and the QSA
-attention kernel, which asks for 78,016 B of dynamic shared per CTA - **1 CTA per SM**, 4 warps, on
-a part with 100 KB of shared per SM (`cudaDevAttrMaxSharedMemoryPerMultiprocessor` = 102,400 on
-sm_120), which is why it measures 1.2 TFLOP/s at the 64k end (`bench/ops/qsa_select_bench.cu
---attention`). Two CTAs need <= 50 KB: the FP8 code staging alone is 32,768 B of the 78,016.
+Two of those were then taken: the QSA attention kernel staged every quantized tile's codes in
+shared memory (32,768 B of a 78,016 B block, on a part with 100 KB per SM = one CTA per SM), and
+widening straight from the paged codes leaves 45,248 B and two CTAs: attention 1.445 -> 1.027 s and
+kernels 12.215 -> 11.725 s on the same prompt. The Q8-A16 dense route turned out to be at 80% of the
+bf16 peak already (`ninfer_linear_bench`: 209 TFLOP/s at [2560,6144]x16384, 199 at [1280,2560], 154
+at [10240,320] against a 262.7 TFLOP/s peak), so the 3.25 s dense slice is the shape mix of the
+fused `gdn_input_proj`/`attn_input_proj`/`hyper_connection` ops, and beating it needs an
+int8-activation Q8 route rather than a retile - a numerics decision (`w4a8-prefill.md` measures that
+step at 1.6-1.7x on the Q4 route).
+
+What is left, in order: the host path, the dense projections' activation precision, and the MTP
+bank's missing A4 divisor.
 
 ### The staged route's SIMT branch runs at ~5.4 TFLOP/s (measured)
 

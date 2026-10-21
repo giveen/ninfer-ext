@@ -158,6 +158,16 @@ equals dense causal attention; beyond that, decode attention cost stays constant
   is qualified against the oracle with an explicit near-tie allowance.
 - **Dtypes:** upstream stores raw keys and pooled means in the activation dtype. That is a private
   staging choice, not a semantic boundary.
+- **Attention cost:** one CTA per (column, KV head, split), four warps, a 16-row query tile
+  against gathered 32-key tiles with FP32 online softmax. The quantized profiles used to stage each
+  tile's codes in shared memory before widening them to FP16: 32,768 B of a 78,016 B block, on a part
+  with **100 KB of shared per SM**, so the kernel ran one CTA per SM (four warps, 8% occupancy) and
+  measured 1.2 TFLOP/s at the 64k end. Widening straight from the paged codes into the FP16 tile
+  leaves 45,248 B and two CTAs per SM (registers allow two: 173 per thread at 128 threads). That is
+  28.9 → 19.2 ms for a 16,384-column chunk at 65,536 tokens (`bench/ops/ninfer_qsa_select_bench
+  --attention --kv fp8`) and 1.445 → 1.027 s of a 64,512-token prefill's kernel time. The absent-key
+  path widens from zero bytes so a partial selection still produces zeros; the BF16 cache profile
+  keeps its double-buffered K/V tiles (77,792 B) and therefore one CTA.
 - **Select cost:** the score step gives each warp one block per iteration. Its parallelism is the
   CTA count, which the pass splitter sets as a *product* (`columns * splits`) rather than as a
   per-column split. Measured on the RTX 5090 with `qwen3_8_flash_next_nvfp4.ninfer` and a

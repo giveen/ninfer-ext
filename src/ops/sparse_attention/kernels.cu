@@ -642,7 +642,6 @@ struct Shared {
     alignas(16) std::uint8_t q[kRows * kRowBytes];
     alignas(16) std::uint8_t k[kTiles][kTileBytes];
     alignas(16) std::uint8_t v[kTiles][kTileBytes];
-    alignas(16) std::uint8_t codes[Fp8 ? 2 : 1][2][Fp8 ? kKeys * kHeadDim : 16]; // [buf][K|V]
     KeyRow rows[Fp8 ? 2 : 1][kKeys];
     alignas(16) __half p[kRows * kPStride];
     float s[kRows * kKeys];
@@ -660,12 +659,14 @@ __device__ __forceinline__ unsigned pack_half2(float a, float b) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-// Widens the staged codes of one plane (`codes` [kKeys][256 bytes], row j at j * 256) into the
-// swizzled FP16 tile `target`. `rows` locate the keys (row -1 when absent); group scales are read
-// from the scale plane (`scales` on the Device, `host_scales` for Host pages), and a row-scaled
-// plane widens unscaled.
+// Widens one plane's codes into the swizzled FP16 tile `target`, reading each key's row straight
+// from its page (there is no staged code buffer: 32 KB of it was the difference between one CTA and
+// two on a part with 100 KB of shared per SM). `rows` locate the keys (row -1 when absent, widened
+// from zero bytes); group scales are read from the scale plane (`scales` on the Device,
+// `host_scales` for Host pages), and a row-scaled plane widens unscaled.
 template <Codec C>
-__device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyRow* rows,
+__device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const std::byte* host_codes,
+                                           const KeyRow* rows, std::int32_t row_bytes,
                                            const void* scales, const std::byte* host_scales,
                                            std::int32_t page_rows, std::uint8_t* target, int tid) {
     if constexpr (C == Codec::Nvfp4G16) {
@@ -678,21 +679,32 @@ __device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyR
                                                                  scales, host_scales, key,
                                                                  page_rows, kKVCacheNvfp4Groups)
                                                            : nullptr;
+            std::uint8_t absent[16] = {};
+            const std::uint8_t* row =
+                key.row >= 0 ? key_row_data<std::uint8_t>(codes, host_codes, key, page_rows,
+                                                          row_bytes)
+                             : absent;
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int group        = 2 * chunk + half;
                 const std::uint8_t s   = key.row >= 0 ? key_scales[group] : std::uint8_t{0};
                 const auto wide =
-                    kv_cache_nvfp4_dequant_f16x16(&codes[j * kHeadDim + chunk * 16 + half * 8], s);
+                    kv_cache_nvfp4_dequant_f16x16(row + chunk * 16 + half * 8, s);
                 *reinterpret_cast<int4*>(&target[swizzle(j, 2 * group)])     = wide.lo;
                 *reinterpret_cast<int4*>(&target[swizzle(j, 2 * group + 1)]) = wide.hi;
             }
         }
     } else {
         for (int item = tid; item < kKeys * 16; item += kThreads) {
-            const int j       = item / 16;
-            const int chunk   = item % 16;
-            const uint4 bytes = *reinterpret_cast<const uint4*>(&codes[j * kHeadDim + chunk * 16]);
+            const int j     = item / 16;
+            const int chunk = item % 16;
+            const KeyRow row_key = rows[j];
+            uint4 bytes          = make_uint4(0, 0, 0, 0);
+            if (row_key.row >= 0) {
+                const std::uint8_t* row = key_row_data<std::uint8_t>(codes, host_codes, row_key,
+                                                                     page_rows, row_bytes);
+                bytes = *reinterpret_cast<const uint4*>(row + chunk * 16);
+            }
             uint4 wide[2];
             auto* halves = reinterpret_cast<__half2*>(wide);
             if constexpr (C == Codec::Fp8Row) {
@@ -700,11 +712,10 @@ __device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyR
 #pragma unroll
                 for (int i = 0; i < 8; ++i) { halves[i] = kv_cache_fp8_code2_to_half2(pairs[i]); }
             } else {
-                const KeyRow key = rows[j];
-                const __half s   = key.row >= 0
-                                       ? key_row_data<__half>(scales, host_scales, key, page_rows,
-                                                              kKVCacheInt8Groups)[chunk / 4]
-                                       : __float2half_rn(0.0F);
+                const __half s =
+                    row_key.row >= 0 ? key_row_data<__half>(scales, host_scales, row_key, page_rows,
+                                                            kKVCacheInt8Groups)[chunk / 4]
+                                     : __float2half_rn(0.0F);
                 const __half2 s2  = __halves2half2(s, s);
                 const auto* ints  = reinterpret_cast<const std::int8_t*>(&bytes);
 #pragma unroll
@@ -790,32 +801,15 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                 cp_async_zfill<16, Cache::cg>(&sh.v[buf][offset], v_src + chunk * 8, bytes);
             }
         } else {
-            // Each row's codes in 16-byte chunks, unswizzled; the widening pass swizzles.
+            // A quantized profile stages only the keys' pages: `widen_tile` reads each row straight
+            // from its page when the tile is widened, which is what keeps this CTA's shared memory
+            // under two per SM.
             if (tid < kKeys) { sh.rows[buf][tid] = key_row(base, tid); }
-            const auto plane = [&](std::uint8_t* dst, const void* pages,
-                                   const std::byte* host_pages, int row_bytes) {
-                const auto* codes = static_cast<const std::uint8_t*>(pages);
-                const int chunks  = row_bytes / 16;
-#pragma unroll 4
-                for (int item = tid; item < kKeys * chunks; item += kThreads) {
-                    const int j      = item / chunks;
-                    const int chunk  = item - j * chunks;
-                    const KeyRow key = key_row(base, j);
-                    const std::uint8_t* src =
-                        key.row >= 0 ? key_row_data<std::uint8_t>(pages, host_pages, key,
-                                                                  page_rows, row_bytes)
-                                     : codes;
-                    cp_async_zfill<16, Cache::cg>(&dst[j * kHeadDim + chunk * 16],
-                                                  src + chunk * 16, key.row >= 0 ? 16 : 0);
-                }
-            };
-            plane(sh.codes[buf][0], k_pages, host.k, code_bytes(codecs.k));
-            plane(sh.codes[buf][1], v_pages, host.v, code_bytes(codecs.v));
         }
     };
 
     if (first < count) { stage(0, first); }
-    cp_commit();
+    if constexpr (!Fp8) { cp_commit(); }
 
     // The query group, rows past the group zero.
     if constexpr (!Fp8) {
@@ -876,20 +870,25 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
     for (int base = first; base < count; base += kKeys, buf ^= 1) {
         if (base + kKeys < count) {
             stage(buf ^ 1, base + kKeys);
-            cp_commit();
-            cp_wait<1>();
-        } else {
+            if constexpr (!Fp8) {
+                cp_commit();
+                cp_wait<1>();
+            }
+        } else if constexpr (!Fp8) {
             cp_wait<0>();
         }
         __syncthreads();
         const int tile = Fp8 ? 0 : buf;
 
         if constexpr (Fp8) {
-            // Widen this tile's codes to FP16 (swizzled) and read the keys' row scales.
-            widen_tile<codecs.k>(sh.codes[buf][0], sh.rows[buf], k_scales, host.k_scale, page_rows,
-                                 sh.k[0], tid);
-            widen_tile<codecs.v>(sh.codes[buf][1], sh.rows[buf], v_scales, host.v_scale, page_rows,
-                                 sh.v[0], tid);
+            // Widen this tile's codes to FP16 (swizzled) straight from their pages and read the
+            // keys' row scales.
+            widen_tile<codecs.k>(static_cast<const std::uint8_t*>(k_pages), host.k, sh.rows[buf],
+                                 code_bytes(codecs.k), k_scales, host.k_scale, page_rows, sh.k[0],
+                                 tid);
+            widen_tile<codecs.v>(static_cast<const std::uint8_t*>(v_pages), host.v, sh.rows[buf],
+                                 code_bytes(codecs.v), v_scales, host.v_scale, page_rows, sh.v[0],
+                                 tid);
             if (tid < kKeys) {
                 const KeyRow key = sh.rows[buf][tid];
                 if constexpr (kKeyRowScale) {
