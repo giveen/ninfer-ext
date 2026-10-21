@@ -595,11 +595,22 @@ absolute rate; the A/B below is what attributes the change.
 | norms/rope/elementwise | 0.27 s | 2.1% |
 
 The score step was then given four blocks per warp iteration (`perf(sparse-attention): keep four
-pooled-key loads in flight`): 2.68 s -> **1.17 s**, prefill 13.78/14.46 s -> 12.07/12.02 s (ABAB),
-selection bit-identical. What is left, in order: the dense projections run at 134 TFLOP/s where
-cuBLAS bf16 measures 237-257 on this GPU (`w4a8-prefill.md`), the MTP bank has no A4 divisor, and the
-QSA attention kernel asks for 78,016 B of dynamic shared per CTA - **1 CTA per SM**, 4 warps, on a
-part with 100 KB of shared per SM (`cudaDevAttrMaxSharedMemoryPerMultiprocessor` = 102,400 on
+pooled-key loads in flight`): back-to-back captures of the same prompt give kernels **13.30 s ->
+11.48 s** and the score step **2.52 s -> 0.86 s**, selection bit-identical; nothing else in the
+table moved by more than run noise.
+
+That pair also shows the shape of the remaining problem. The wall followed only 0.45 s of the 1.82 s
+the GPU gave back (15.51 s -> 15.06 s, `device_wait` 1.48 s of it, `program_submit` 14.21 s ->
+13.77 s): on that machine the *host* was the limiter, and the device had 11.48 s of work for a 15 s
+prompt. An earlier, quieter pair moved 1.7-2.4 s of wall for the same kernel delta. So prefill here
+is `max(host submission, device)`, and past ~11 s of device work the host path is what to fix -
+which is also why basalt's prompt engine runs the n-gram gather for the *next* chunk on a thread
+ahead of the current one.
+
+What is left, in order: that host path, the dense projections (134 TFLOP/s where cuBLAS bf16
+measures 237-257 on this GPU, `w4a8-prefill.md`), the MTP bank's missing A4 divisor, and the QSA
+attention kernel, which asks for 78,016 B of dynamic shared per CTA - **1 CTA per SM**, 4 warps, on
+a part with 100 KB of shared per SM (`cudaDevAttrMaxSharedMemoryPerMultiprocessor` = 102,400 on
 sm_120), which is why it measures 1.2 TFLOP/s at the 64k end (`bench/ops/qsa_select_bench.cu
 --attention`). Two CTAs need <= 50 KB: the FP8 code staging alone is 32,768 B of the 78,016.
 
