@@ -596,8 +596,34 @@ Wall-clock, two requests per process (the second one warm), same settings: **12.
 (5,057 -> 6,525 tok/s) warm, 16.68 -> 11.55 s with a cold page cache, and `--ngram-residency
 stream` 18.89 -> 11.43 s.
 
-Remaining, in order: the dense projections' activation precision, the ~9.7 s of `program_submit` that
-is still unattributed, and the BF16 KV attention profile (still 77,792 B of shared, one CTA per SM).
+### Where the remaining 10.3 s of device time sits, and why `program_submit` is not a host lever
+
+NVTX phase ranges over the same capture: `prefill.layer.gdn` **6.19 s** (360 instances),
+`prefill.layer.full` **3.77 s** (120) - the QSA layers - and `mtp.forward` 0.42 s. Per instance that is
+17.2 ms for a GDN layer and 31.4 ms for a QSA one at 16,384 tokens; the QSA layer adds 9.4 ms of
+selection and 8.4 ms of attention to the same MoE and dense work.
+
+`program_submit` reading 9.7 s is an accounting artifact of being *device*-bound, not a host cost: the
+kernels are 10.30 s of a 10.36 s wall, and running the same prompt with `NINFER_CUDA_SYNC=blocking`
+leaves `program_submit` at 9.75 s while `device_wait` falls from 1.35 s to 0.43 s. The Program's
+submit phase spans the device's execution because each chunk's submission is interleaved with it, so
+what is left of the host is ~0.25 s. Earlier notes in this section that named the host as the lever
+were wrong; the n-gram gather was a real cost, but only off the page cache.
+
+Two levers were priced and both need a numerics decision rather than more tuning:
+
+- **Dense projections (3.08 s, 30%).** The Q8-A16 kernel is at 80% of the bf16 peak where it can be
+  measured; the way down is an int8-activation Q8 route, which changes prefill activation precision
+  on every dense projection (`w4a8-prefill.md` measures that step at 1.6-1.7x on the Q4 route).
+- **QSA score (1.13 s, 11%)** is shuffle-bound, not traffic-bound: four query columns per CTA
+  (dividing the pooled-key traffic by four) measured *slower* (38.2 ms against 33.5 ms for a
+  16,384-column chunk at 65,536 tokens), and removing the 32-lane butterfly by ablation gives
+  34.1 -> 18.7 ms. So the 20 shuffles of four bit-identical butterflies are ~45% of the step, and an
+  eight-lane-per-head reduction (five shuffles) would buy ~25-30% while changing the summation order,
+  i.e. which blocks win a near tie.
+
+Still open besides those: the BF16 KV attention profile (77,792 B of shared, one CTA per SM), and the
+routed experts at 122 TFLOP/s (2.49 s) against the dense nvfp4 route's 935.
 
 ### Post-Oct-9 composition (2026-10-21, RTX 5090, `nsys`)
 
