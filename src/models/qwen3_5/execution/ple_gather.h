@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -28,9 +29,10 @@ public:
 
     // BF16 `[width, count]` embedding columns of `tokens[first, first + count)`. Tokens before
     // `first` (and EOS before the sequence start) form each n-gram context, and an EOS closes
-    // every window it falls into. `out` holds `width * count` BF16 words. Not thread-safe: a
-    // streamed gather reuses this gather's reader staging, so two calls on one instance must not
-    // overlap.
+    // every window it falls into. `out` holds `width * count` BF16 words. A mapped gather is
+    // reentrant; two calls may overlap (the prefill read-ahead gathers the next chunk while a
+    // decode round gathers its column). A streamed gather reuses this gather's reader staging, so
+    // those calls serialize on `reader_mutex_`.
     void gather(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count,
                 std::span<std::uint16_t> out);
 
@@ -45,6 +47,7 @@ private:
 
     PleTable table_;
     PleConfig config_;
+    std::mutex reader_mutex_; // streamed gathers only
     std::uint32_t width_     = 0;
     std::uint32_t row_width_ = 0;
     std::array<float, 256> e4m3_{};

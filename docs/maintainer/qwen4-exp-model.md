@@ -205,6 +205,31 @@ The rows use these constants:
 The table has `320,001,536 × 160` rows, split in the checkpoint into 128 shards of 2,500,012 rows.
 The 16 gathered rows are concatenated, 2-gram heads first, into the 2560-wide embedding `E`.
 
+**Gather cost and prefill read-ahead.** The rows are gathered on the Host: `PleGather` hashes each
+token's 2-gram and 3-gram contexts, reads the 16 rows from the file-mapped table and decodes them
+FP8 → BF16. It is O(tokens) work, and a profile of a 64,512-token prefill put 92 % of the prompt's
+CPU samples under `PleGather::decode_row` — half self time in the scalar E4M3→BF16 loop, the rest
+page-fault frames on a table that does not stay resident beside the weights. Its *wall* cost depends
+on where the pages are: ~9 ms for a 16,384-token chunk with the table in the page cache, and seconds
+per chunk with it evicted or read with `--ngram-residency stream` (O_DIRECT).
+
+`PleReadAhead` (one worker thread and one extra pinned plane) gathers the *next* chunk while the
+device runs the current one, so that wall cost leaves the critical path. The window is the engine's
+widest chunk rather than the current chunk's length, because a template split can shift the chunk
+boundaries by a token and a one-row-short window would miss. The worker waits for the event of the
+device copy that read the plane before it overwrites it, and a mapped gather is reentrant, so a
+decode round's gather may run beside it (a streamed gather serializes on the reader). Measured on a
+64,512-token prompt with `--max-context 65536 --kv-dtype fp8 --expert-cache auto --spec mtp`:
+
+| configuration | before | with the read-ahead |
+|---|---:|---:|
+| `--ngram-residency mapped`, page cache warm | 12.51-12.73 s | **10.86 s** |
+| `--ngram-residency mapped`, page cache evicted | 16.63 s | **12.53 s** |
+| `--ngram-residency stream` (O_DIRECT) | 18.89 s | **12.41 s** |
+
+A 7,680-token prompt is unchanged (1.34 s against 1.36 s) and its completion is token-identical, as
+it must be: the read-ahead changes who gathers the rows, not what they are.
+
 **Injection.** With `R` the wide residual entering the block:
 
 ```text

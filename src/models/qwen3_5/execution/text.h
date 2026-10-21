@@ -72,6 +72,10 @@ class HostExpertLane;
 } // namespace ninfer::models::execution
 
 namespace ninfer::models::qwen3_5::execution {
+class PleReadAhead;
+}
+
+namespace ninfer::models::qwen3_5::execution {
 
 // Program-owned mutable resources of the Qwen4Exp route. The expert pager and PLE state are
 // performance or recurrent side state; the Program allocates them once and binds them here.
@@ -85,6 +89,9 @@ struct Qwen4Runtime {
     Tensor ple_input;  // BF16 [ple_width, columns] decode-round embedding written before launch
     PleGather* ple_gather       = nullptr;
     std::uint16_t* ple_host     = nullptr; // pinned BF16 [ple_width, prefill_chunk]
+    // Prefill read-ahead over two more pinned planes: the next chunk's rows are gathered while the
+    // device runs the current one, so the O(tokens) host gather leaves the critical path.
+    PleReadAhead* ple_read_ahead = nullptr;
 };
 
 class TextContext {

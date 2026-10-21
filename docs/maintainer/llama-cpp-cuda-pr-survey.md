@@ -601,11 +601,18 @@ table moved by more than run noise.
 
 That pair also shows the shape of the remaining problem. The wall followed only 0.45 s of the 1.82 s
 the GPU gave back (15.51 s -> 15.06 s, `device_wait` 1.48 s of it, `program_submit` 14.21 s ->
-13.77 s): on that machine the *host* was the limiter, and the device had 11.48 s of work for a 15 s
-prompt. An earlier, quieter pair moved 1.7-2.4 s of wall for the same kernel delta. So prefill here
-is `max(host submission, device)`, and past ~11 s of device work the host path is what to fix -
-which is also why basalt's prompt engine runs the n-gram gather for the *next* chunk on a thread
-ahead of the current one.
+13.77 s): on that machine the host was at ~98% duty and the device had 11.48 s of work for a 15 s
+prompt, so prefill is `max(host submission, device)`.
+
+The host's largest single cost was then measured rather than inferred: `perf` samples one prefill and
+puts 92% of the prompt's CPU time under `PleGather::decode_row` (self time in the scalar E4M3->BF16
+loop plus page-fault frames). Note what that number is and is not: it is *threaded* CPU time - the
+gather fans out over up to 16 workers - so its wall share is small when the table is in the page
+cache (~9 ms per 16,384-token chunk, 0.3% of the prompt) and large when it is not. Gathering the next
+chunk a chunk ahead (`PleReadAhead`, see the model reference) fixed exactly that: 12.51 -> 10.86 s
+warm, 16.63 -> 12.53 s with the page cache evicted, 18.89 -> 12.41 s under `--ngram-residency
+stream`. What remains of `program_submit` (~9.7 s against a 9.7-11.5 s device) is not this gather and
+has not been attributed yet.
 
 What is left, in order: that host path, the dense projections (134 TFLOP/s where cuBLAS bf16
 measures 237-257 on this GPU, `w4a8-prefill.md`), the MTP bank's missing A4 divisor, and the QSA

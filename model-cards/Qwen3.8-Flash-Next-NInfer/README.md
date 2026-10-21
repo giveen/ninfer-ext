@@ -76,6 +76,12 @@ the 177.7 and 170.7 rows above it are `--tp 2` on two cards. The 81 tok/s this c
 quoted was the 229,376-token-context command, where the KV floor leaves a smaller expert cache;
 treat it as a different operating point.
 
+Since 2026-10-21 the n-gram rows of the next chunk are gathered while the device runs the current
+one, which removes the table read from the prompt's critical path: a 64,512-token prompt with
+`--ngram-residency stream` read 12.41 s (**5,200 tok/s**) against the 3,498 tok/s in the `stream`
+row above, and `mapped` with an evicted page cache 12.53 s against 16.63 s. The other depths above
+predate that change.
+
 Prefill is fastest at medium prompts: a short prompt is dominated by the fixed per-chunk expert
 streaming, and a long one by the QSA selection. It also depends on how the n-gram table is read:
 with it mapped through the page cache (`--ngram-residency mapped`, the default when host memory
