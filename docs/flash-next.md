@@ -227,6 +227,14 @@ flags), and the median of five warm requests was 140.9. A cold process and a war
 about 1.4x at the same flags, so measure the cache state before attributing a single-request decode
 difference to a code change.
 
+The cache also survives conversational interleaving without a pinning policy. Three 9.4k-token
+sessions replayed round-robin for four turns each (`--request-log-jsonl` for attribution) held an
+expert-cache hit rate of **0.84–0.86** through all sixteen requests, against 0.80 on the first cold
+one; turns 2–4 decoded at 131–155 tok/s, at or above the 120–126 tok/s of the same session run
+alone. The one slower session (96–126 tok/s) also generated three times as many new tokens per turn,
+which is a content effect, not residency: a policy that protects one conversation's experts while
+another's prefill streams would have nothing to recover here.
+
 Measured at `fc305acd` with the same 512-token essays (one run each), plus one 241,003-token prompt
 (79 of this repository's documentation files concatenated, with a question about the first one):
 
