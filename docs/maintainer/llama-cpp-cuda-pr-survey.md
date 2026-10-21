@@ -614,15 +614,26 @@ else                                     ops::moe_experts(...);     // SIMT A16,
 
 `moe_experts_a4` quantizes the activation to NVFP4 with the bank's per-layer input divisors and runs
 gate/up and down on `mxf4nvf4` (`include/ninfer/ops/offload_moe.h:271-276`; landed as `ff6c6213` and
-`a960ee36`, both 2026-09-24). The divisor is zero for this artifact because `OffloadMoeParameters`
-fills it only when *every* expert of the layer is `AllowA4` with an identical divisor per projection
-(`src/models/qwen3_5/execution/parameters.cpp:440-471`). The recipe does grant `AllowA4`
-(`tools/convert/official_recipes.py:428-435`), but the artifact was converted from a full-precision
-source (`/mnt/storage/models/qwen3.8/flash/source`, 131 shards, no ModelOpt encoding) with
-`nvfp4_absmax`, which yields no calibrated input scale, so there is no divisor to store. The divisor
-is metadata, never weight data - A16 does not read it (`src/ops/weight_input.cpp:92-93`).
+`a960ee36`, both 2026-09-24). `OffloadMoeParameters` fills the divisor only when *every* expert of
+the layer is `AllowA4` with an identical divisor per projection
+(`src/models/qwen3_5/execution/parameters.cpp:440-471`). The recipe grants `AllowA4`
+(`tools/convert/official_recipes.py:428-435`). The divisor is metadata, never weight data - A16 does
+not read it (`src/ops/weight_input.cpp:92-93`).
 
-So the fix is not a kernel. Two ways to fill it, both with the machinery already present:
+**Correction (2026-10-21): this section described the 2026-09-24 artifact, and the shipped
+`qwen3_8_flash_next_nvfp4.ninfer` is not it.** That file's conversion report names
+`/mnt/storage/models/qwen3.8/flash/ninfer-flash` as its source, and every one of its 75,264 text
+expert uses carries `AllowA4` plus an `activation_input_divisor` auxiliary whose value is common to
+the layer and projection (verified by reading the artifact: 48 layers x 3 projections, one value
+each) - so all 48 text layers run the `mxf4nvf4` route, and an in-engine profile of a 64,512-token
+prefill shows the `nvfp4_w4a4_mma_kernel` launches, not the SIMT pair. What the artifact does *not*
+carry is a divisor for `mtp/layers/0` (1,536 uses, `AllowA4` and no auxiliary), so that one bank
+falls to the SIMT A16 route: 1.10 s of the 12.87 s of prefill kernel time measured on 2026-10-21,
+against 2.32 s for the other 48 layers together. The rest of this section (the SIMT branch's rate,
+the cuBLAS reference, the W4A4 measurement) still stands as the qualification of both routes.
+
+For the MTP bank the fix is still not a kernel. Two ways to fill it, both with the machinery already
+present:
 - convert from `nvidia/Qwen3.8-Flash-Next-NVFP4` (ModelOpt 0.46, 119.6 GB, tags `ModelOpt`/`FP4`),
   whose 73,728 expert `input_scale` tensors (512 experts x 48 layers x 3 projections) are the
   calibrated divisors, reduced to one value per layer and projection - the A4 route quantizes the

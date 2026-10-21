@@ -32,6 +32,8 @@ constexpr int kHeadDim      = 256;
 constexpr int kIndexDim     = kQsaIndexKeyDim;
 constexpr int kRecord       = kQsaIndexRecordWords;
 constexpr int kMaxIndexHead = 8;
+// The model's indexer width: the pooled-key score path is specialised for it.
+constexpr int kModelIndexHeads = 4;
 
 __device__ __forceinline__ std::int64_t record_offset(std::int32_t physical_page,
                                                       std::int32_t page_offset) {
@@ -257,6 +259,8 @@ __device__ __forceinline__ std::int32_t read_position(const __nv_bfloat16* recor
 // traffic; the target is set for a few CTAs per SM on this card instead.
 constexpr std::int32_t kScoreTargetCtas = 8192;
 constexpr std::int32_t kMinScoreBlocks  = 32;
+// Pooled-key blocks one warp scores per iteration, so that many loads stay in flight.
+constexpr std::int32_t kScoreGroup = 4;
 
 // Visible tokens of this CTA's query column (zero for an invalid column) and its blocks.
 struct SelectColumn {
@@ -348,7 +352,7 @@ __global__ void __launch_bounds__(256) qsa_pool_keys_kernel(SelectArgs a, float*
 // Block scores of the columns that must choose among their blocks. CTA (x, y) scores blocks
 // [y * split_blocks, (y + 1) * split_blocks) of pass column x into its scores row.
 __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32_t split_blocks) {
-    __shared__ float query[kMaxIndexHead * kIndexDim];
+    __shared__ alignas(16) float query[kMaxIndexHead * kIndexDim];
 
     const KernelGeometry& g  = a.geometry;
     const int tid            = static_cast<int>(threadIdx.x);
@@ -400,7 +404,54 @@ __global__ void __launch_bounds__(256) qsa_score_kernel(SelectArgs a, std::int32
     float* scores     = a.scores + static_cast<std::int64_t>(blockIdx.x) * a.max_blocks;
     const float scale = rsqrtf(static_cast<float>(di));
     const int per     = di / 32;
-    for (int b = first + warp; b < last; b += blockDim.x / 32) {
+    const int stride  = static_cast<int>(blockDim.x) >> 5;
+    if (a.pooled != nullptr && g.index_heads == kModelIndexHeads && per == 4) {
+        // Pooled keys at the model's 4x128 indexer. A warp that walks one block at a time leaves a
+        // single dependent 512-byte load in flight and stalls on it: at a 64k-visibility pass the
+        // score step measured ~2.7 TFLOP/s. A group of kScoreGroup blocks keeps that many loads
+        // in flight and reads one 16-byte vector per lane per block. Every block's score sums the
+        // same per-head lane partials in the same order (warp_sum), so the scores - and with them
+        // the selection - are bit-identical to the one-block loop.
+        float4 qh[kModelIndexHeads];
+        for (int h = 0; h < kModelIndexHeads; ++h) {
+            qh[h] = *reinterpret_cast<const float4*>(query + h * di + lane_id * 4);
+        }
+        const float* const pooled_base =
+            a.pooled + static_cast<std::int64_t>(lane) * a.max_blocks * di + lane_id * 4;
+        const auto score = [&](const float4& key) {
+            float total = 0.0F;
+            for (int h = 0; h < kModelIndexHeads; ++h) {
+                float dot = qh[h].x * key.x;
+                dot       = fmaf(qh[h].y, key.y, dot);
+                dot       = fmaf(qh[h].z, key.z, dot);
+                dot       = fmaf(qh[h].w, key.w, dot);
+                total += fmaxf(warp_sum(dot), 0.0F);
+            }
+            return total;
+        };
+        int b = first + warp;
+        for (; b + (kScoreGroup - 1) * stride < last; b += kScoreGroup * stride) {
+            float4 key[kScoreGroup];
+#pragma unroll
+            for (int u = 0; u < kScoreGroup; ++u) {
+                key[u] = *reinterpret_cast<const float4*>(
+                    pooled_base + static_cast<std::int64_t>(b + u * stride) * di);
+            }
+#pragma unroll
+            for (int u = 0; u < kScoreGroup; ++u) {
+                const float value = score(key[u]);
+                if (lane_id == 0) { scores[b + u * stride] = value * scale; }
+            }
+        }
+        for (; b < last; b += stride) {
+            const float4 key = *reinterpret_cast<const float4*>(
+                pooled_base + static_cast<std::int64_t>(b) * di);
+            const float value = score(key);
+            if (lane_id == 0) { scores[b] = value * scale; }
+        }
+        return;
+    }
+    for (int b = first + warp; b < last; b += stride) {
         float key[8];
         if (a.pooled != nullptr) {
             // The pooled block key was computed once for this call; read this lane's features.

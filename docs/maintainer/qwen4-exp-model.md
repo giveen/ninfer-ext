@@ -158,14 +158,25 @@ equals dense causal attention; beyond that, decode attention cost stays constant
   is qualified against the oracle with an explicit near-tie allowance.
 - **Dtypes:** upstream stores raw keys and pooled means in the activation dtype. That is a private
   staging choice, not a semantic boundary.
-- **Select cost:** the score step walks one warp per block in a serial loop, so its parallelism is
-  the CTA count, which the pass splitter sets as a *product* (`columns * splits`) rather than as a
+- **Select cost:** the score step gives each warp one block per iteration. Its parallelism is the
+  CTA count, which the pass splitter sets as a *product* (`columns * splits`) rather than as a
   per-column split. Measured on the RTX 5090 with `qwen3_8_flash_next_nvfp4.ninfer` and a
   51,250-token prompt, the old 256-CTA target left each warp ~1.5k dependent block iterations and
   the kernel moved only ~3 GB/s of key traffic. Targeting 8,192 CTAs moved prefill from 4.45k to
   4.81k tok/s and TTFT from 11.53 s to 10.68 s (−7.4%), decode from 121.0 to 123.7 tok/s; 2,048
   CTAs land within 1% of 8,192, so the value is not critical. The split only partitions the block
   loop and each block's score is computed the same way, so the selection is bit-identical.
+  A warp that scores one block per iteration leaves a single dependent 512-byte pooled-key load in
+  flight, so the split alone could not fix the stall: at the 64k end of a Qwen3.8-Flash-Next prompt
+  the step ran at 2.7 TFLOP/s. Scoring `kScoreGroup` (4) blocks per iteration keeps that many
+  loads in flight and reads one 16-byte vector per lane per block; the per-head lane partials and
+  the `warp_sum` order are unchanged, so scores and selection stay bit-identical
+  (`bench/ops/qsa_select_bench.cu` prints a checksum of the selection: 34.1 ms against 88.0 ms for
+  a 16,384-column chunk at 65,536 tokens, 7.0 against 2.7 TFLOP/s). End to end that took a
+  64,512-token prefill from 13.78/14.46 s to 12.07/12.02 s (ABAB, one session).
+  Remaining headroom is the 512-byte-per-pair pooled-key read: a query tile in the CTA (many
+  columns per staged key) would divide that traffic by the tile width, which the instruction floor
+  (~20 shuffles per pair) then makes the limit.
 
 ## PLE n-gram embedding
 

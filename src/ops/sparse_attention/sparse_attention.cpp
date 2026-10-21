@@ -3,6 +3,8 @@
 
 #include "ops/sparse_attention/launch.h"
 
+#include "core/checked_math.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -81,9 +83,13 @@ std::size_t qsa_select_workspace_bytes(const QsaGeometry& geometry, std::uint32_
         throw std::invalid_argument("qsa_select_workspace_bytes: invalid geometry");
     }
     const std::size_t blocks = max_visible_keys / static_cast<std::uint32_t>(geometry.ratio) + 1;
-    std::size_t bytes        = blocks * sizeof(float) *
-                                   static_cast<std::size_t>(detail::qsa_select_pass_columns(columns)) +
-                               256;
+    // The score rows, then the pooled keys on a 16-byte boundary: the score kernel reads a pooled
+    // key as one 16-byte vector per lane.
+    const std::size_t score_bytes = align_up(blocks * sizeof(float) *
+                                                 static_cast<std::size_t>(
+                                                     detail::qsa_select_pass_columns(columns)),
+                                             std::size_t{16}, "qsa select score bytes");
+    std::size_t bytes             = score_bytes + 256;
     if (lanes == 1) {
         // Pooled block keys [1, blocks, index_dim], computed once per call.
         bytes += blocks * sizeof(float) * static_cast<std::size_t>(geometry.index_dim);
@@ -133,11 +139,13 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
     float* pooled = nullptr;
     if (lanes == 1) {
         // The pooled block keys follow the per-column score rows in the same allocation.
-        const std::size_t scores_bytes =
+        // `qsa_select_workspace_bytes` reserves the same 16-byte boundary before the pooled keys.
+        const std::size_t scores_bytes = align_up(
             static_cast<std::size_t>(max_blocks) *
-            static_cast<std::size_t>(
-                detail::qsa_select_pass_columns(static_cast<std::int32_t>(columns))) *
-            sizeof(float);
+                static_cast<std::size_t>(
+                    detail::qsa_select_pass_columns(static_cast<std::int32_t>(columns))) *
+                sizeof(float),
+            std::size_t{16}, "qsa select score bytes");
         pooled = reinterpret_cast<float*>(static_cast<std::byte*>(scratch.data) + scores_bytes);
     }
     detail::qsa_select_launch(index_query, query_rope_positions, cache_positions, valid_columns,
