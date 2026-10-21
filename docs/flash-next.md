@@ -46,8 +46,12 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   (330 tok/s warm). The staged route also benefits from a warm cache: a 384-token piece reads 411
   tok/s warm against 303 cold, because its fill copies resident experts device-to-device. The
   threshold stands. A `--host-experts` split of the cache route's misses was 6–7 % slower on the
-  repeated-prompt arm; it was not re-run on varied prompts because that route already loses at
-  256/384 tokens.
+  repeated-prompt arm; on the serve path it is worse than that: `--host-experts 16
+  --host-expert-share 0.5` read **100.3 / 118.1 / 128.4 / 104.6** and **110.4 / 121.7 / 122.4 /
+  114.9** tok/s against **139.3 / 141.2 / 140.3 / 147.0** and **146.6 / 148.0 / 144.7 / 146.7**
+  without it, on 512-token requests at a 32k context (2026-10-21). `--host-expert-share` is the
+  fraction fetched and admitted, so splitting it also throttles cache admission and leaves decode
+  dependent on what the cache held; `1.0` turns the host path off entirely.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,
@@ -221,7 +225,8 @@ still levels off from C=4, where the expert cache misses most.
 Every one of those figures is also a function of what the expert cache already holds, and the spread
 is big enough to explain the unresolved single-request point: one server started with
 `--max-context 32768 --kv-capacity 32768 --kv-dtype fp8 --expert-cache auto --host-experts 16
---host-expert-share 0.5 --spec mtp --draft-tokens 3` read **97.2 / 133.6 / 137.6** tok/s on its
+--host-expert-share 0.5 --spec mtp --draft-tokens 3` (a host split; see the cache bullet above)
+read **97.2 / 133.6 / 137.6** tok/s on its
 first, second and third 512-token reasoning request (2026-10-21, 78% draft acceptance, unchanged
 flags), and the median of five warm requests was 140.9. A cold process and a warm one differ by
 about 1.4x at the same flags, so measure the cache state before attributing a single-request decode

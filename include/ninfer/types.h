@@ -128,9 +128,11 @@ struct ExpertCachePolicy {
 // Qwen4Exp NVFP4: compute part of each narrow call's expert-cache misses on host threads while the
 // rest are fetched over PCIe. `threads` is the host team (0 keeps every miss on the fetch path); a
 // team larger than the process's allowed CPUs minus two is clamped to that, with a warning, so the
-// Program's own threads keep a core. `share` is the fraction of a call's misses the host computes;
-// calls wider than `max_columns` fetch every miss. Host experts quantize their activations to
-// Q8_0, so with a host share decode output depends on what the cache held.
+// Program's own threads keep a core. `share` is the fraction of a call's misses fetched over PCIe
+// and admitted to the expert cache; the rest are computed on the host team. At 1.0 the host path is
+// off, calls wider than `max_columns` always fetch every miss, and a split below 1 also throttles
+// admission, so the cache fills more slowly. Host experts quantize their activations to Q8_0, so
+// with a host share decode output depends on what the cache held.
 struct HostExpertOptions {
     std::uint32_t threads     = 0;
     float share               = 0.5F;
