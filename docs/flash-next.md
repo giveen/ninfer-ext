@@ -235,6 +235,23 @@ alone. The one slower session (96–126 tok/s) also generated three times as man
 which is a content effect, not residency: a policy that protects one conversation's experts while
 another's prefill streams would have nothing to recover here.
 
+### Draft shortlist
+
+The MTP draft step projects through the same 248,320 × 2,560 output head as verification: 331 us at
+T=1..3 (`ninfer_linear_bench`), three such calls per round. An artifact can carry `text/draft_head`
+— the output head's retained rows, copied as encoded bytes — and `text/draft_head_ids`; the draft
+then projects through those rows and maps its argmax back through the table. Verification still
+runs the full head, so a token outside the list can be accepted, it just cannot be proposed.
+
+`tools/draft_vocab/build.py` ranks ids by corpus frequency and `tools/draft_vocab/attach.py` writes
+the object. The Q6 route is a fixed shape table, so the row count must be a registered shape;
+16,384 is the servable one — 32.8 MB against the full head's 496 MB, and it covers 98.81% of
+held-out tokens on this repository's sources (32,768 ids cover 99.79% but have no registered
+shape). Warm, 128-token greedy requests at a 32k context, alternating arms: **161.4 / 167.2 tok/s**
+without against **165.8 / 168.9** with the shortlist (+1.9% mean), accepted-token counts within one
+in both arms. The 331 us call predicts 4.6% of a round, so the draft head is partly overlapped
+already; the shortlist removes the part that is on the critical path.
+
 Measured at `fc305acd` with the same 512-token essays (one run each), plus one 241,003-token prompt
 (79 of this repository's documentation files concatenated, with a question about the first one):
 

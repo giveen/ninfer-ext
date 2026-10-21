@@ -191,8 +191,7 @@ struct Qwen4Parameters {
     // — the constructor refuses a checkpoint whose banks differ — so this family's pool is the
     // uniform case of `ExpertPoolGeometry`, and every per-layer number the cache needs (expert
     // count, expert width, staged size) comes from here rather than from a second layout.
-    std::optional<
-    ops::ExpertPoolGeometry> expert_pool;
+    std::optional<ops::ExpertPoolGeometry> expert_pool;
     HyperConnectionParameters head;
     std::vector<Qwen4BlockParameters> layers;
 };
@@ -202,6 +201,9 @@ struct Qwen4MtpParameters {
     LinearParameters embedding_projection, hidden_projection;
     HyperConnectionParameters head;
     Qwen4BlockParameters layer;
+    // Optional shortlist head for the draft step: `head` holds the shortlisted rows and `token_ids`
+    // maps a row back to a global token id (FP32, exact over the public vocabulary).
+    std::optional<ProposalParameters> draft_head;
 };
 
 // Cold native preparation for the fixed model implementation. This owner is stable before

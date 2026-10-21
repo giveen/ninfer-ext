@@ -166,6 +166,9 @@ struct Qwen4MtpWeights {
     WeightId embedding_norm, hidden_norm, embedding_projection, hidden_projection;
     HyperConnectionWeights head;
     Qwen4BlockWeights layer;
+    // Optional shortlist head: the output head's shortlisted rows, which the draft projects through
+    // instead of the full vocabulary. Its ids map each head row back to a global token id.
+    std::optional<ProposalWeights> draft_head;
 };
 
 // Handles refer to the frozen model's weight array. No artifact ID lookup is needed in execution.
