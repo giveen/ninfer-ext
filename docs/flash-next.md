@@ -46,8 +46,19 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   (330 tok/s warm). The staged route also benefits from a warm cache: a 384-token piece reads 411
   tok/s warm against 303 cold, because its fill copies resident experts device-to-device. The
   threshold stands. A `--host-experts` split of the cache route's misses was 6–7 % slower on the
-  repeated-prompt arm; it was not re-run on varied prompts because that route already loses at
-  256/384 tokens.
+  repeated-prompt arm; on the serve path it is worse than that: `--host-experts 16
+  --host-expert-share 0.5` read **100.3 / 118.1 / 128.4 / 104.6** and **110.4 / 121.7 / 122.4 /
+  114.9** tok/s against **139.3 / 141.2 / 140.3 / 147.0** and **146.6 / 148.0 / 144.7 / 146.7**
+  without it, on 512-token requests at a 32k context (2026-10-21). `--host-expert-share` is the
+  fraction fetched and admitted, so splitting it also throttles cache admission and leaves decode
+  dependent on what the cache held; `1.0` turns the host path off entirely. CPU pinning decides
+  that comparison: with the whole process on the 16 E-cores (`taskset -c 8-23`, lane 14 of 16
+  threads), the same split read a **140.4** median over ten requests against **140.1** for the
+  no-split control pinned the same way, while the split unpinned read **123.9** and **131.7**
+  medians in two runs (2026-10-21). The penalty is host-thread contention with the decode thread,
+  not the host work: a split run without a pin moves the lane across P-cores too, and the same
+  binary on the new shortlist artifact reads 139-140 either way. Keep the split only behind such
+  a pin, where it is neutral rather than a gain.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,
@@ -218,6 +229,41 @@ so more fetches overlap. The single-request MTP point is unresolved: master's tw
 and 74.1 tok/s and `fc305acd`'s 77.5 and 86.9, a spread larger than the difference. Throughput
 still levels off from C=4, where the expert cache misses most.
 
+Every one of those figures is also a function of what the expert cache already holds, and the spread
+is big enough to explain the unresolved single-request point: one server started with
+`--max-context 32768 --kv-capacity 32768 --kv-dtype fp8 --expert-cache auto --host-experts 16
+--host-expert-share 0.5 --spec mtp --draft-tokens 3` (a host split; see the cache bullet above)
+read **97.2 / 133.6 / 137.6** tok/s on its
+first, second and third 512-token reasoning request (2026-10-21, 78% draft acceptance, unchanged
+flags), and the median of five warm requests was 140.9. A cold process and a warm one differ by
+about 1.4x at the same flags, so measure the cache state before attributing a single-request decode
+difference to a code change.
+
+The cache also survives conversational interleaving without a pinning policy. Three 9.4k-token
+sessions replayed round-robin for four turns each (`--request-log-jsonl` for attribution) held an
+expert-cache hit rate of **0.84–0.86** through all sixteen requests, against 0.80 on the first cold
+one; turns 2–4 decoded at 131–155 tok/s, at or above the 120–126 tok/s of the same session run
+alone. The one slower session (96–126 tok/s) also generated three times as many new tokens per turn,
+which is a content effect, not residency: a policy that protects one conversation's experts while
+another's prefill streams would have nothing to recover here.
+
+### Draft shortlist
+
+The MTP draft step projects through the same 248,320 × 2,560 output head as verification: 331 us at
+T=1..3 (`ninfer_linear_bench`), three such calls per round. An artifact can carry `text/draft_head`
+— the output head's retained rows, copied as encoded bytes — and `text/draft_head_ids`; the draft
+then projects through those rows and maps its argmax back through the table. Verification still
+runs the full head, so a token outside the list can be accepted, it just cannot be proposed.
+
+`tools/draft_vocab/build.py` ranks ids by corpus frequency and `tools/draft_vocab/attach.py` writes
+the object. The Q6 route is a fixed shape table, so the row count must be a registered shape;
+16,384 is the servable one — 32.8 MB against the full head's 496 MB, and it covers 98.81% of
+held-out tokens on this repository's sources (32,768 ids cover 99.79% but have no registered
+shape). Warm, 128-token greedy requests at a 32k context, alternating arms: **161.4 / 167.2 tok/s**
+without against **165.8 / 168.9** with the shortlist (+1.9% mean), accepted-token counts within one
+in both arms. The 331 us call predicts 4.6% of a round, so the draft head is partly overlapped
+already; the shortlist removes the part that is on the critical path.
+
 Measured at `fc305acd` with the same 512-token essays (one run each), plus one 241,003-token prompt
 (79 of this repository's documentation files concatenated, with a question about the first one):
 
@@ -231,8 +277,10 @@ C=1 and C=8 are aggregate decode tok/s. The KV pool is shared by every request i
 request can use the whole window, or several can split it. Leave `--kv-capacity` explicit at full
 context: `auto` reserves more KV than one full-length request needs, and that memory comes out of
 the expert cache, so C=8 decoded 19% slower and unevenly (its slowest request ran at 16.5 tok/s
-against a mean of 31.9). Prefill slows as the prompt grows: about 1,000 tok/s averaged over the
-241k-token prompt, against about 2,200 at 2,048 tokens.
+against a mean of 31.9). At HEAD (2026-10-21) the same 256k window read a 5,183 tok/s prefill
+median at 32k tokens, 2,953 at 255k, and decode of 113 tok/s at 7k falling to 80 at 255k; the
+same lengths under a 32k pool decode at 135-140 with the same prefill, so the full-window pool
+costs about a quarter of decode throughput at every length, not only near the end.
 
 The QSA block selection was the long-context bottleneck: it re-pooled, re-normalized and re-RoPE'd
 each block's index keys once per query column, so a 256-column pass repeated that work 256 times.

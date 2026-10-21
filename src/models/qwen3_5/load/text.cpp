@@ -161,6 +161,21 @@ Qwen4MtpWeights bind_qwen4_mtp(Bindings& b, const TextConfig& config) {
     out.hidden_projection = b.parameter("mtp/hidden_projection", {h, h}, {"mtp/hidden_input"});
     out.head              = bind_hyper_connection(b, config, "mtp/hc_head/", false);
     out.layer = bind_qwen4_block(b, config, "mtp/layers/0/", MixerKind::FullAttention, false);
+    if (b.binder.contains("text/draft_head")) {
+        const auto& directory = b.binder.reader().directory();
+        const auto ids        = directory.bindings.find("text/draft_head_ids");
+        if (ids == directory.bindings.end()) {
+            throw std::invalid_argument("text/draft_head needs text/draft_head_ids");
+        }
+        ProposalWeights head;
+        head.rows = static_cast<std::uint32_t>(ids->second.elements);
+        if (head.rows == 0 || head.rows > config.vocab_size) {
+            throw std::invalid_argument("text/draft_head_ids has no usable row count");
+        }
+        head.head      = b.parameter("text/draft_head", {head.rows, h}, {"mtp/final_hidden"});
+        head.token_ids = b.direct("text/draft_head_ids", {head.rows}, QType::INT32);
+        out.draft_head = std::move(head);
+    }
     return out;
 }
 

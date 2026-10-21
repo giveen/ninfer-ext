@@ -571,10 +571,18 @@ Parameters::Parameters(const Model& source) : model(source) {
         if (w.qwen4_mtp) {
             qwen4_mtp = with_context("mtp", [&] {
                 const auto& m = *w.qwen4_mtp;
-                return Qwen4MtpParameters{
+                Qwen4MtpParameters out{
                     prepare.tensor(m.embedding_norm),       prepare.tensor(m.hidden_norm),
                     prepare.linear(m.embedding_projection), prepare.linear(m.hidden_projection),
                     prepare.hyper_connection(m.head),       prepare.qwen4_block(m.layer)};
+                if (m.draft_head) {
+                    ProposalParameters head;
+                    head.rows      = m.draft_head->rows;
+                    head.head      = prepare.linear(m.draft_head->head);
+                    head.token_ids = prepare.tensor(*m.draft_head->token_ids);
+                    out.draft_head = std::move(head);
+                }
+                return out;
             });
             if (qwen4_mtp->layer.moe.bank.layout != experts) {
                 throw std::invalid_argument("mtp: routed experts use a different bank layout");

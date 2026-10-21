@@ -50,9 +50,31 @@ MTP speculative decoding (`--spec mtp`).
 |---|---|
 | Causal perplexity (`ninfer-ppl-1m-v1`, quick, fp8 KV) | **3.518** |
 | Prefill, 262,144-token budget, FP8 KV, `--ngram-residency stream`, single request | **1,090 / 3,666 / 3,498 / 2,908 / 2,218** tok/s at 1.5k / 8k / 64k / 128k / 256k tokens |
-| Decode (greedy, MTP K=3) | **81 tok/s** |
+| Decode (greedy, MTP K=3), first request after load | **139 tok/s** |
+| Decode (greedy, MTP K=3), steady state, warm expert cache | **145–148 tok/s** |
 | Peak host RSS (`--ngram-residency stream`) | **~65 GiB** |
 | Artifact size | **119 GB**, 4 sharded files |
+
+Decode is set by what the expert cache already holds, so both ends of the warm-up are reported and
+both name their configuration. The steady-state figure is 512 reasoning tokens per request, greedy,
+`--max-context 32768 --kv-capacity 32768 --kv-dtype fp8 --expert-cache auto --spec mtp
+--draft-tokens 3`: two servers read **139.3 / 141.2 / 140.3 / 147.0** and **146.6 / 148.0 / 144.7 /
+146.7** tok/s across four requests each, so the warm band is **145–148**.
+
+A host miss split (`--host-experts 16 --host-expert-share 0.5`, which this card recommended until
+2026-10-21) read **100.3 / 118.1 / 128.4 / 104.6** and **110.4 / 121.7 / 122.4 / 114.9** tok/s on the
+same workload — about 20 % slower *unpinned*. `taskset -c 8-23` changes that: the same split
+reads a 140.4 median over ten requests against 140.1 for the pinned no-split control, so the cost
+was thread contention with the decode thread and a pinned split is neutral — it still buys no
+tokens. `--host-expert-share` is the fraction of a call's misses fetched
+and admitted to the cache, so a split also leaves the cache filling more slowly and makes decode
+depend on what it held, because the host shares are computed with 8-bit activations. The
+[LocalMaxxing run of this configuration](https://www.localmaxxing.com/en/runs/cmvi9sjh703iyrf019c244dx7)
+is a verified run at **140.6 tok/s** on their canonical reasoning prompt (512 greedy tokens,
+32k context, median of five); an earlier entry there at 140.9 predates the split's removal, and
+the 177.7 and 170.7 rows above it are `--tp 2` on two cards. The 81 tok/s this card previously
+quoted was the 229,376-token-context command, where the KV floor leaves a smaller expert cache;
+treat it as a different operating point.
 
 Prefill is fastest at medium prompts: a short prompt is dominated by the fixed per-chunk expert
 streaming, and a long one by the QSA selection. It also depends on how the n-gram table is read:

@@ -18,6 +18,7 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/gather_ids.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"
@@ -652,7 +653,21 @@ void TextContext::qwen4_logits(const HyperConnectionParameters& head, const Tens
 }
 
 void TextContext::qwen4_proposal(const Tensor& hidden, Tensor& logits, Tensor& tokens) {
-    const int T   = hidden.ne[1];
+    const int T = hidden.ne[1];
+    if (const auto& draft = parameters_.qwen4_mtp->draft_head) {
+        // The shortlist head projects the same hidden columns through the output head's retained
+        // rows only; the argmax picks a row, and the table maps that row back to its token id.
+        auto scope          = work_.scope();
+        const int rows      = static_cast<int>(draft->rows);
+        Tensor x            = work_.alloc(DType::BF16, {dimension(config_.hidden_size), T});
+        qwen4_hc_mix(qwen4_mtp_->head, hidden, x, nullptr);
+        Tensor short_logits = work_.alloc(DType::BF16, {rows, T});
+        project(x, draft->head, short_logits, work_, ctx_.stream);
+        Tensor local = work_.alloc(DType::I32, {T});
+        ops::argmax(short_logits, local, rows, ctx_.stream);
+        ops::gather_ids(local, *draft->token_ids, tokens, T, rows, ctx_.stream);
+        return;
+    }
     Tensor window = logits.slice(1, 0, T);
     qwen4_logits(qwen4_mtp_->head, hidden, window);
     ops::argmax(window, tokens, dimension(parameters_.model.resources().public_token_count),
