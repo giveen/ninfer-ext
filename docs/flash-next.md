@@ -51,7 +51,14 @@ ninfer-ext runs it through the same Engine, CLI and HTTP server as every other m
   114.9** tok/s against **139.3 / 141.2 / 140.3 / 147.0** and **146.6 / 148.0 / 144.7 / 146.7**
   without it, on 512-token requests at a 32k context (2026-10-21). `--host-expert-share` is the
   fraction fetched and admitted, so splitting it also throttles cache admission and leaves decode
-  dependent on what the cache held; `1.0` turns the host path off entirely.
+  dependent on what the cache held; `1.0` turns the host path off entirely. CPU pinning decides
+  that comparison: with the whole process on the 16 E-cores (`taskset -c 8-23`, lane 14 of 16
+  threads), the same split read a **140.4** median over ten requests against **140.1** for the
+  no-split control pinned the same way, while the split unpinned read **123.9** and **131.7**
+  medians in two runs (2026-10-21). The penalty is host-thread contention with the decode thread,
+  not the host work: a split run without a pin moves the lane across P-cores too, and the same
+  binary on the new shortlist artifact reads 139-140 either way. Keep the split only behind such
+  a pin, where it is neutral rather than a gain.
 - **N-gram table off the device.** The table is file-mapped through the page cache, or streamed from
   NVMe with batched direct I/O (`--ngram-residency`).
 - **Full feature set.** Qwen Sparse Attention with every KV-cache profile (`bf16`, `int8`, `fp8`,
