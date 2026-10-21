@@ -111,6 +111,16 @@ x, inj = HC_mlp(R);   R = R + inj ⊗ SparseMoE(x)
 - SwiGLU experts whose fused `gate_up_proj` rows are gate first, then up;
 - the shared expert scaled by `sigmoid(shared_expert_gate · x)`.
 
+Wide calls route a text layer's experts through `moe_experts_a4` (W4A4 on `mxf4nvf4`): the artifact
+stores one activation divisor per layer and projection, common to its 512 experts, so the chunk's
+activation is quantised once. The MTP block's bank carries no such divisor - it was re-encoded from
+block FP8 - and its *weight* divisors are one value for a whole stacked matrix rather than one per
+expert; the route now accepts both (1.0 for the missing activation divisor, row-addressed weight
+divisors) instead of leaving that one bank of 49 on the SIMT A16 route, which cost 1.12 s of a
+64,512-token prefill. The MTP layer is the drafter, so its arithmetic cannot change an output token:
+speculative verification against the target keeps the emitted stream exact, and only acceptance is
+at stake (measured unchanged, 353/474).
+
 Execution may compute a share of a narrow call's missing experts on host threads (`--host-experts`);
 those experts quantize activations to Q8_0, so their result depends on what the expert cache held
 when the call ran. This is the one accepted placement dependence in decode.

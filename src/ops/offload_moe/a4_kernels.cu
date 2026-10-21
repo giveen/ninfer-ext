@@ -120,8 +120,9 @@ struct PackedTokens {
     }
 };
 
-// Each stacked source matrix carries its own weight divisor: gate and up of an expert (I rows
-// each) and down of an expert (H rows).
+// Each stacked source matrix carries its own weight divisors, addressed by output row: a bank whose
+// divisors are per expert matrix uses I (gate/up) or H (down) rows, and a bank that stores one
+// divisor for the whole matrix (the MTP block, re-encoded from block FP8) resolves every row to it.
 struct DivisorEpilogue {
     const float* __restrict__ divisors;
     int divisor_rows;

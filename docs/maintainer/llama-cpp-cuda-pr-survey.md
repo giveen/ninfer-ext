@@ -686,14 +686,25 @@ falls to the SIMT A16 route: 1.10 s of the 12.87 s of prefill kernel time measur
 against 2.32 s for the other 48 layers together. The rest of this section (the SIMT branch's rate,
 the cuBLAS reference, the W4A4 measurement) still stands as the qualification of both routes.
 
-For the MTP bank the fix is still not a kernel. Two ways to fill it, both with the machinery already
-present:
+**Solved for the MTP bank without new metadata (2026-10-21).** What that block was missing turned
+out to be two things, and neither needed a calibrated value. It carries no *activation* divisor, and
+the divisor cancels exactly - the quantiser multiplies by it and the MMA epilogue by its reciprocal -
+so the model now sets 1.0 for a bank that permits A4 and stores none: it only chooses which E4M3 bin
+the per-16 group scale rounds into, and 1.0 puts a group whose maximum is O(1) at full mantissa
+precision. The block's *weight* divisors were also one value for a whole stacked matrix
+(`divisor_rows` 655,360) rather than one per expert, and `moe_experts_a4` rejected anything that was
+not 640/2560 rows - although its epilogue addresses the table by output row and `row / 655360` is
+simply 0. Relaxing that check to `divisor_rows > 0` moved the bank onto `mxf4nvf4`: the SIMT pair
+(0.806 + 0.316 s) disappears from a 64,512-token prefill and kernels fall 11.725 -> 10.287 s, with
+the greedy completion token-identical and draft acceptance unchanged (353/474).
+
+What would still be left for a *calibrated* placement is the older, optional route:
 - convert from `nvidia/Qwen3.8-Flash-Next-NVFP4` (ModelOpt 0.46, 119.6 GB, tags `ModelOpt`/`FP4`),
-  whose 73,728 expert `input_scale` tensors (512 experts x 48 layers x 3 projections) are the
-  calibrated divisors, reduced to one value per layer and projection - the A4 route quantizes the
-  activation once for the whole layer, which is why `parameters.cpp` demands a common value - through
-  the converter's `auxiliary_overrides` (`tools/convert/methods.py:405-410`); or
-- calibrate the layer-level activation scales on the current A16 artifact and write them in.
+  whose 73,728 expert `input_scale` tensors are the calibrated divisors, reduced to one value per
+  layer and projection - the A4 route quantizes the activation once for the whole layer, which is why
+  `parameters.cpp` demands a common value - through the converter's `auxiliary_overrides`
+  (`tools/convert/methods.py:405-410`); or
+- calibrate the layer-level activation scales on the current artifact and write them in.
 
 Precedent: the 35B-A3B artifact ships 30,720 expert uses with `AllowA4` *and* divisors, so W4A4
 experts are accepted practice in this tree; what Qwen4Exp lacks is the stored value.
