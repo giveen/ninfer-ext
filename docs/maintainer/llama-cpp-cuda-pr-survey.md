@@ -573,6 +573,32 @@ Two claims from the cluster evaluations do **not** survive any of this: the spar
 "bound <= 4-7% of prefill". The launch census from the graph-splits evaluation *is* confirmed to the
 digit (3,927 ms kernels, 1,438 ms copies, 99.9% of 5,370 ms).
 
+### Final composition after the four prefill changes (2026-10-21, RTX 5090, `nsys`)
+
+Same prompt and flags as the table below, after the pooled-key grouping, the n-gram read-ahead, the
+attention widening and the MTP bank's route: wall **10.36 s**, kernels **10.30 s** (47,447
+launches), host->device 216 GB in 4.35 s (hidden), against 12.98 s / 12.87 s at the start.
+
+| kernel group | before | after |
+|---|---:|---:|
+| dense projections (`q8_a16_mma`) | 3.01 s | 3.08 s |
+| routed experts, `nvfp4_w4a4_mma` | 2.32 s | 2.49 s |
+| QSA select/score | 2.68 s | **1.13 s** |
+| QSA attention | 1.33 s | **1.01 s** |
+| hyper-connection | 0.72 s | 0.77 s |
+| router + A4 route plan | 0.63 s | 0.66 s |
+| expert cache/fetch | 0.42 s | 0.46 s |
+| GDN + conv | 0.34 s | 0.34 s |
+| norms/rope/elementwise | 0.27 s | 0.30 s |
+| routed experts, SIMT A16 (the MTP bank) | 1.10 s | **0.03 s** |
+
+Wall-clock, two requests per process (the second one warm), same settings: **12.76 -> 9.89 s**
+(5,057 -> 6,525 tok/s) warm, 16.68 -> 11.55 s with a cold page cache, and `--ngram-residency
+stream` 18.89 -> 11.43 s.
+
+Remaining, in order: the dense projections' activation precision, the ~9.7 s of `program_submit` that
+is still unattributed, and the BF16 KV attention profile (still 77,792 B of shared, one CTA per SM).
+
 ### Post-Oct-9 composition (2026-10-21, RTX 5090, `nsys`)
 
 A 64,512-token prompt (NIAH fixture), one request, `--max-context 65536 --kv-capacity auto --kv-dtype
