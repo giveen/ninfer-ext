@@ -63,7 +63,10 @@ both name their configuration. The steady-state figure is 512 reasoning tokens p
 
 A host miss split (`--host-experts 16 --host-expert-share 0.5`, which this card recommended until
 2026-10-21) read **100.3 / 118.1 / 128.4 / 104.6** and **110.4 / 121.7 / 122.4 / 114.9** tok/s on the
-same workload — about 20 % slower. `--host-expert-share` is the fraction of a call's misses fetched
+same workload — about 20 % slower *unpinned*. `taskset -c 8-23` changes that: the same split
+reads a 140.4 median over ten requests against 140.1 for the pinned no-split control, so the cost
+was thread contention with the decode thread and a pinned split is neutral — it still buys no
+tokens. `--host-expert-share` is the fraction of a call's misses fetched
 and admitted to the cache, so a split also leaves the cache filling more slowly and makes decode
 depend on what it held, because the host shares are computed with 8-bit activations. The
 [LocalMaxxing run of this configuration](https://www.localmaxxing.com/en/runs/cmvi9sjh703iyrf019c244dx7)
