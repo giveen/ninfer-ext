@@ -277,8 +277,10 @@ C=1 and C=8 are aggregate decode tok/s. The KV pool is shared by every request i
 request can use the whole window, or several can split it. Leave `--kv-capacity` explicit at full
 context: `auto` reserves more KV than one full-length request needs, and that memory comes out of
 the expert cache, so C=8 decoded 19% slower and unevenly (its slowest request ran at 16.5 tok/s
-against a mean of 31.9). Prefill slows as the prompt grows: about 1,000 tok/s averaged over the
-241k-token prompt, against about 2,200 at 2,048 tokens.
+against a mean of 31.9). At HEAD (2026-10-21) the same 256k window read a 5,183 tok/s prefill
+median at 32k tokens, 2,953 at 255k, and decode of 113 tok/s at 7k falling to 80 at 255k; the
+same lengths under a 32k pool decode at 135-140 with the same prefill, so the full-window pool
+costs about a quarter of decode throughput at every length, not only near the end.
 
 The QSA block selection was the long-context bottleneck: it re-pooled, re-normalized and re-RoPE'd
 each block's index keys once per query column, so a 256-column pass repeated that work 256 times.
