@@ -161,6 +161,10 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         throw std::invalid_argument("fp8 A8 second term requires its scale plane");
     }
     switch (weight.k) {
+    case Fp8Activation2560Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation2560Geometry>(x, workspace, stream);
+        if (residual) { launch_residual_exact<Fp8Activation2560Geometry>(x, workspace, stream); }
+        return;
     case Fp8Activation5120Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation5120Geometry>(x, workspace, stream);
         if (residual) { launch_residual_exact<Fp8Activation5120Geometry>(x, workspace, stream); }

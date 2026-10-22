@@ -188,6 +188,16 @@ int run_fp8_a8() {
                           {5120, 6144, 881U, Comparison::Sampled, true, pair_invocations});
     failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
                           {5120, 17408, 883U, Comparison::Sampled, true, pair_invocations});
+    // Qwen3.8-Flash-Next's dense projections: 74% of that model's dense prefill FLOPs. Their
+    // `uses_a8` gate admits the pair route only above kFp8A8PairMinTokens, so the invocations below
+    // it must fall back to A16 and the ones above it must land at the A16 floor.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 4> qwen4_dense_shapes{
+        std::tuple{16384, 2560, 901U}, std::tuple{13312, 2560, 903U},
+        std::tuple{2560, 6144, 905U}, std::tuple{1280, 2560, 907U}};
+    for (const auto& [n, k, seed] : qwen4_dense_shapes) {
+        failures += run_shape("FP8_A8Pair", ActivationCompute::A8Pair, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, pair_invocations});
+    }
 
     struct Problem {
         std::int32_t rows;

@@ -14,7 +14,8 @@ const std::array kShapes{&kFp8N14336K5120,  &kFp8N16384K5120,  &kFp8N34816K5120,
                          &kFp8N4096K4096,   &kFp8N4096K8192,   &kFp8N18560K4096, &kFp8N131072K4096,
                          &kFp8N10304K2688,  &kFp8N2688K4096,  &kFp8N4096K2688,
                          &kFp8N256K2688,    &kFp8N3712K2688,  &kFp8N2688K3712,
-                         &kFp8N131072K2688};
+                         &kFp8N131072K2688, &kFp8N16384K2560, &kFp8N13312K2560, &kFp8N2560K6144,
+                         &kFp8N1280K2560};
 
 const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");

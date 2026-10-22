@@ -14,6 +14,9 @@ from tools.convert.methods import (
 )
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
+    _qwen4_dense_a8,
+    fp8_row_maxabs,
+    qwen3_8_flash_next_nvfp4_dense_a8,
     RECIPES,
     gemma4_26b_a4b_base,
     gemma4_26b_a4b_qat,
@@ -93,6 +96,9 @@ def _flash_next_model(*, encoded: bool = False) -> Model:
     add("text/layers/0/moe/experts/up", (4, 4), ("x",))
     add("text/layers/0/moe/experts/down", (4, 4), ("p",))
     add("text/layers/0/moe/shared/gate", (4, 4), ("x",))
+    # A dense projection whose shape has a compiled FP8 two-term route (src/ops/linear/fp8/shapes/
+    # n1280_k2560.cu). Small enough to materialise in a unit test.
+    add("text/layers/0/gdn/in_proj", (1280, 2560), ("x",))
     # The n-gram table is a value source: it has no inputs, so it is not a "projection" and a
     # recipe that only visits projections would leave all 51 B parameters at BF16.
     add("text/layers/1/ple/table", (4, 4), ())
@@ -113,7 +119,37 @@ def _method(model: Model, function, name: str):
 def test_flash_next_recipes_are_registered() -> None:
     # Exercising it needs a full Qwen4Exp sparse-MoE model, so this pins the wiring.
     assert RECIPES["qwen3_8_flash_next_nvfp4"] is qwen3_8_flash_next_nvfp4
+    assert RECIPES["qwen3_8_flash_next_nvfp4_dense_a8"] is qwen3_8_flash_next_nvfp4_dense_a8
     assert RECIPES["qwen3_8_flash_next_exl3"] is qwen3_8_flash_next_exl3
+
+
+def test_flash_next_dense_a8_shape_set_matches_the_compiled_fp8_shapes() -> None:
+    # The set names the projections src/ops/linear/fp8/shapes/ has an FP8 (and two-term) route for.
+    # A shape outside it must keep Q8, because no FP8 route resolves for that geometry.
+    for shape in ((16384, 2560), (13312, 2560), (2560, 6144), (1280, 2560)):
+        assert _qwen4_dense_a8(shape), f"{shape} should take the FP8 two-term route"
+    for shape in ((324, 10240), (10240, 320), (2560, 640), (640, 2560), (96, 2560), (4, 4)):
+        assert not _qwen4_dense_a8(shape), f"{shape} has no FP8 route"
+
+
+def test_flash_next_dense_a8_recipe_grants_the_pair_route_only_where_fp8_exists() -> None:
+    model = _flash_next_model()
+    supported = "text/layers/0/gdn/in_proj"
+    unsupported = "text/layers/0/moe/shared/gate"  # (4, 4): no FP8 route resolves
+
+    recipe = Recipe(model)
+    qwen3_8_flash_next_nvfp4_dense_a8(model, recipe, {})
+    assert recipe.selections[supported][0].format == "fp8_e4m3fn_row_bf16"
+    assert recipe.selections[supported][0].method is fp8_row_maxabs
+    assert recipe.policies[(supported, "x")] == "AllowA8Pair"
+    # A shape without a compiled FP8 route keeps Q8 and the default (A16) activation policy.
+    assert recipe.selections[unsupported][0].format == "q8_g32_fp16"
+    assert recipe.policies[(unsupported, "x")] == "A16Only"
+
+    shipped = Recipe(model)
+    qwen3_8_flash_next_nvfp4(model, shipped, {})
+    assert shipped.selections[supported][0].format == "q8_g32_fp16"
+    assert shipped.policies[(supported, "x")] == "A16Only"
 
 
 def test_flash_next_nvfp4_quantizes_a_full_precision_source() -> None:

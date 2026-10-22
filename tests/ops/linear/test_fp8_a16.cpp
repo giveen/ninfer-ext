@@ -59,6 +59,17 @@ int run_fp8_a16() {
         failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                               {n, k, seed, Comparison::Sampled, true, invocations});
     }
+    // Qwen3.8-Flash-Next's dense projections at k = 2560 and k = 6144. Their quantized-activation
+    // policy admits only the paired prefill widths, so these A16 ladders are the decode route and
+    // the fallback both routes share below the pair gate.
+    const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 4> qwen4_dense_shapes{
+        std::tuple{16384, 2560, 891U}, std::tuple{13312, 2560, 893U},
+        std::tuple{2560, 6144, 895U}, std::tuple{1280, 2560, 897U}};
+    for (const auto& [n, k, seed] : qwen4_dense_shapes) {
+        const auto invocations = a16_capacity_calls();
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed, Comparison::Sampled, true, invocations});
+    }
     // The output projections and the vocabulary head: k becomes the wide side here.
     const std::array<std::tuple<std::int32_t, std::int32_t, std::uint32_t>, 3> wide_shapes{
         std::tuple{5376, 8192, 829U}, std::tuple{5376, 16384, 830U},

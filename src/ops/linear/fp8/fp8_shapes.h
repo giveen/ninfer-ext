@@ -14,6 +14,13 @@ struct Fp8LinearShape {
     std::size_t (*partial_capacity_bytes)(std::int32_t max_tokens) = nullptr;
 };
 
+// Qwen3.8-Flash-Next (Qwen4Exp) dense projections: the GDN input projection and the QSA query
+// projection at k = 2560, the two output projections at k = 6144 and the shared expert gate/up.
+// Their only quantized-activation route is the two-term pair, admitted above kFp8A8PairMinTokens.
+extern const Fp8LinearShape kFp8N16384K2560;
+extern const Fp8LinearShape kFp8N13312K2560;
+extern const Fp8LinearShape kFp8N2560K6144;
+extern const Fp8LinearShape kFp8N1280K2560;
 extern const Fp8LinearShape kFp8N14336K5120;
 extern const Fp8LinearShape kFp8N16384K5120;
 extern const Fp8LinearShape kFp8N8192K5376;

@@ -426,7 +426,23 @@ def qwen3_6_35b_a3b_nvfp4(model, recipe, sources):
             recipe.group(names)
 
 
-def qwen3_8_flash_next_nvfp4(model, recipe, sources):
+# Qwen4Exp dense projections with a compiled FP8 A8 route: the shape list in
+# src/ops/linear/fp8/shapes/ and the two-term activation route both exist for these (n, k) pairs.
+# They carry 74% of the model's dense prefill FLOPs at a 16,384-token chunk. The hyper-connection
+# stems (n=324, k=10240 and n=10240, k=320), the indexer projection (n=640) and the shared-expert
+# down projection (k=640) keep Q8: their shapes divide neither the FP8 row tile nor the GEMV's
+# 32 x ValuesPerLane, so no FP8 route resolves for them.
+QWEN4_DENSE_A8_SHAPES = frozenset(
+    {(16384, 2560), (13312, 2560), (2560, 6144), (1280, 2560)}
+)
+
+
+def _qwen4_dense_a8(shape) -> bool:
+    """Whether this projection shape has a compiled FP8 two-term route."""
+    return len(shape) >= 2 and (int(shape[0]), int(shape[1])) in QWEN4_DENSE_A8_SHAPES
+
+
+def _flash_next_nvfp4_text(model, recipe, sources, *, dense_a8: bool):
     """Qwen3.8-Flash-Next (Qwen4Exp) with one NVFP4 block-scaled route for every routed expert.
 
     An encoded source (ModelOpt) keeps its NVFP4 codes, block scales and divisors; a full-precision
@@ -466,12 +482,34 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
                 activation_policy="AllowA4",
             )
             continue
-        _assign(recipe, name, Q8)
+        if dense_a8 and _qwen4_dense_a8(parameter.shape):
+            # FP8 weights on the two-term activation route: the pair kernel carries the activation
+            # as two E4M3 terms, so the result lands at the A16 floor (the FP8 A8-pair test asserts
+            # that) while the op runs 1.5-1.9x faster at a prefill width.
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs,
+                          activation_policy="AllowA8Pair")
+        else:
+            _assign(recipe, name, Q8)
     # Each layer's gate/up and down banks become one parent so an expert is a fixed row range of
     # its bank, addressed by the expert cache as a few contiguous spans.
     for names in model.packing_groups:
         if all("/moe/experts/" in name for name in names):
             recipe.group(names)
+
+
+def qwen3_8_flash_next_nvfp4(model, recipe, sources):
+    """The shipped route: Q8 dense projections (A16 activations)."""
+    _flash_next_nvfp4_text(model, recipe, sources, dense_a8=False)
+
+
+def qwen3_8_flash_next_nvfp4_dense_a8(model, recipe, sources):
+    """Q8 everywhere except the dense projections that have a compiled FP8 two-term route.
+
+    Those become FP8 with `AllowA8Pair`, which prefill runs ~1.8x faster (the shapes carry 74% of
+    the model's dense prefill FLOPs). Decode widths are unaffected: the pair route is admitted only
+    above kFp8A8PairMinTokens, so every narrower call keeps the A16 ladder.
+    """
+    _flash_next_nvfp4_text(model, recipe, sources, dense_a8=True)
 
 
 def qwen3_8_flash_next_exl3(model, recipe, sources):
@@ -887,6 +925,7 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_6_35b_a3b_nvfp4": qwen3_6_35b_a3b_nvfp4,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_nvfp4_dense_a8": qwen3_8_flash_next_nvfp4_dense_a8,
     "qwen3_8_flash_next_bf16": qwen3_8_flash_next_bf16,
     "qwen3_8_flash_next_exl3": qwen3_8_flash_next_exl3,
     "gemma4_31b_base": gemma4_31b_base,

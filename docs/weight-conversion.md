@@ -63,6 +63,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_quasar_nvfp4` | Every Text linear imported NVFP4 (QUASAR QAT), GDN a/b decoded to BF16, FP8 embedding/head | `quantized`; `--model` is the same checkpoint |
 | `qwen3_8_flash_next_nvfp4` | Imported NVFP4 routed experts (MTP bank re-encoded from block FP8), FP8 n-gram table, Q8 projections, Q8/Q6 vocabulary weights | None; `--model` is the ModelOpt NVFP4 checkpoint |
+| `qwen3_8_flash_next_nvfp4_dense_a8` | The shipped NVFP4 route except the dense projections that have a compiled FP8 two-term route (`[16384,2560]`, `[13312,2560]`, `[2560,6144]`, `[1280,2560]` - 74% of the model's dense prefill FLOPs): those become FP8 with `AllowA8Pair`, which prefill runs 1.5-1.9x faster while the pair kernel keeps the activation error at the A16 floor. Every other shape, and every call at or below `kFp8A8PairMinTokens`, keeps the Q8 A16 route | None; `--model` is the same checkpoint |
 | `qwen3_8_flash_next_bf16` | Every Text/MTP projection at full BF16 precision, experts in the NVFP4 recipe's per-layer banks, FP8 n-gram table (the EXL3 expert quantizer's input) | None |
 | `qwen3_8_flash_next_exl3` | EXL3 routed experts from `ninfer-quantize` (one bank per layer with an input-scale set per expert), 4-bit (`q4_g32_fp16_rows`) n-gram table, Q6 projections, Q8 token embedding, Q6 output head | `quantized` |
 
