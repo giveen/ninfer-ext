@@ -21,6 +21,31 @@
 > cross-engine harness, not `ninfer_bench`, so these numbers are not comparable with the tool-based
 > tables further down.
 
+## Recommended instead
+
+Both alternatives below belong to the same NInfer lineage, both are actively developed, and both
+measured faster here on this model, this box, this test and comparable tuning effort. If you came for
+Qwen3.8-Flash-Next at long context, use one of them:
+
+- **[basalt](https://github.com/jesdga95/basalt)** - the pick for one 32 GB card at long context.
+  Fastest of the three on both axes at every depth measured (prefill 8.1k-9.2k tok/s, decode
+  176-265 tok/s greedy), and the most complete packaging: one `.basalt` file carries the weights,
+  tokenizer, chat template, MTP drafter, expert profile and vision projector, so there is no sidecar
+  to keep in step. The adaptive expert tier that follows routing, `basalt-probe` deriving suggested
+  flags from the machine's own measured rates, a parity test per kernel and a PPL/KLD quality gate
+  against Q8_0 are the kind of work that never shows up in a throughput table, and they are why it is
+  the one worth building on.
+- **[capy-flash](https://github.com/ValerioDolci/capy-flash)** - the pick for two 16 GB consumer
+  cards. It tensor-parallelises this 125B model over PCIe without peer-to-peer, partitions the expert
+  cache between the cards and computes the misses on the CPU, then gets the agent work right: idle
+  conversations move to RAM and hand their VRAM back to the expert cache, a continued conversation
+  keeps the experts its next answer needs, and the prefix cache spans turns. Its quality reporting is
+  the most careful of the three - the same prompts, paired, against NVIDIA's NVFP4 checkpoint served
+  by vLLM on a GB300 (GSM8K 0.9750 vs 0.9810, MMLU-Pro 0.8413 vs 0.8452) - and its installer checks the
+  machine and verifies every download before writing a byte.
+
+Thanks to both maintainers for carrying this work forward.
+
 <img src="screenshots/nx.jpeg" alt="ninfer-ext" width="440">
 
 ninfer-ext is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch
