@@ -438,8 +438,33 @@ QWEN4_DENSE_A8_SHAPES = frozenset(
 
 
 def _qwen4_dense_a8(shape) -> bool:
-    """Whether this projection shape has a compiled FP8 two-term route."""
+    """Whether this stored shape has a compiled FP8 two-term route."""
     return len(shape) >= 2 and (int(shape[0]), int(shape[1])) in QWEN4_DENSE_A8_SHAPES
+
+
+def _qwen4_dense_a8_parameters(model) -> set:
+    """Parameters whose packing group has a compiled FP8 two-term route.
+
+    The converter packs a group - query/key/value/z, gate/up - into one object and one object holds
+    one format, so the shape the compiled set has to match is the group's summed rows. The members
+    need not be equal: a GDN group stacks query/key (2048 rows each) with value/z (6144 each) and
+    only their sum, 16384, is the stored shape. A parameter's own shape (a 2048-row GDN query, a
+    640-row shared gate) matches nothing.
+    """
+    grouped = {name for names in model.packing_groups for name in names}
+    eligible = set()
+    for names in model.packing_groups:
+        shapes = [model.parameters[name].shape for name in names]
+        if not shapes or len({shape[-1] for shape in shapes}) != 1:
+            continue
+        if _qwen4_dense_a8((sum(shape[0] for shape in shapes), shapes[0][-1])):
+            eligible.update(names)
+    # An unpacked projection (a layer's output projection) is its own stored object, so its own
+    # shape is the stored shape.
+    for name, parameter in model.parameters.items():
+        if name not in grouped and _qwen4_dense_a8(parameter.shape):
+            eligible.add(name)
+    return eligible
 
 
 def _flash_next_nvfp4_text(model, recipe, sources, *, dense_a8: bool):
@@ -458,6 +483,7 @@ def _flash_next_nvfp4_text(model, recipe, sources, *, dense_a8: bool):
     _optional(model, recipe)
     _assign(recipe, "text/token_embedding", Q8)
     _assign(recipe, "text/output_head", Q6)
+    a8_groups = _qwen4_dense_a8_parameters(model) if dense_a8 else set()
     for name, parameter in model.parameters.items():
         if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
             continue
@@ -482,7 +508,7 @@ def _flash_next_nvfp4_text(model, recipe, sources, *, dense_a8: bool):
                 activation_policy="AllowA4",
             )
             continue
-        if dense_a8 and _qwen4_dense_a8(parameter.shape):
+        if name in a8_groups:
             # FP8 weights on the two-term activation route: the pair kernel carries the activation
             # as two E4M3 terms, so the result lands at the A16 floor (the FP8 A8-pair test asserts
             # that) while the op runs 1.5-1.9x faster at a prefill width.

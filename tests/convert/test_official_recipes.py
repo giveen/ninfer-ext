@@ -15,6 +15,7 @@ from tools.convert.methods import (
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     _qwen4_dense_a8,
+    _qwen4_dense_a8_parameters,
     fp8_row_maxabs,
     qwen3_8_flash_next_nvfp4_dense_a8,
     RECIPES,
@@ -96,9 +97,17 @@ def _flash_next_model(*, encoded: bool = False) -> Model:
     add("text/layers/0/moe/experts/up", (4, 4), ("x",))
     add("text/layers/0/moe/experts/down", (4, 4), ("p",))
     add("text/layers/0/moe/shared/gate", (4, 4), ("x",))
-    # A dense projection whose shape has a compiled FP8 two-term route (src/ops/linear/fp8/shapes/
-    # n1280_k2560.cu). Small enough to materialise in a unit test.
-    add("text/layers/0/gdn/in_proj", (1280, 2560), ("x",))
+    # A dense group whose packed shape has a compiled FP8 two-term route
+    # (src/ops/linear/fp8/shapes/n1280_k2560.cu): four 320-row projections pack into 1280 x 2560.
+    # Small enough to materialise in a unit test.
+    # The real grouping stacks unequal members (query/key 2048 rows each, value/z 6144 each), so the
+    # fixture does too: 160 + 160 + 480 + 480 = 1280 rows.
+    for role, rows in (("query", 160), ("key", 160), ("value", 480), ("z", 480)):
+        add(f"text/layers/0/gdn/{role}", (rows, 2560), ("x",))
+    # An unpacked projection whose own shape is compiled: 1280 x 2560, stored as its own object.
+    add("text/layers/0/gdn/output", (1280, 2560), ("x",))
+    model.packing_groups.append(tuple(f"text/layers/0/gdn/{role}"
+                                      for role in ("query", "key", "value", "z")))
     # The n-gram table is a value source: it has no inputs, so it is not a "projection" and a
     # recipe that only visits projections would leave all 51 B parameters at BF16.
     add("text/layers/1/ple/table", (4, 4), ())
@@ -123,6 +132,15 @@ def test_flash_next_recipes_are_registered() -> None:
     assert RECIPES["qwen3_8_flash_next_exl3"] is qwen3_8_flash_next_exl3
 
 
+def test_flash_next_dense_a8_group_shapes_are_the_compiled_ones() -> None:
+    # The set is matched against a packing group's summed rows, which is what the converter stores.
+    model = _flash_next_model()
+    groups = _qwen4_dense_a8_parameters(model)
+    assert groups == {f"text/layers/0/gdn/{role}" for role in ("query", "key", "value", "z")} | {
+        "text/layers/0/gdn/output"
+    }
+
+
 def test_flash_next_dense_a8_shape_set_matches_the_compiled_fp8_shapes() -> None:
     # The set names the projections src/ops/linear/fp8/shapes/ has an FP8 (and two-term) route for.
     # A shape outside it must keep Q8, because no FP8 route resolves for that geometry.
@@ -134,12 +152,16 @@ def test_flash_next_dense_a8_shape_set_matches_the_compiled_fp8_shapes() -> None
 
 def test_flash_next_dense_a8_recipe_grants_the_pair_route_only_where_fp8_exists() -> None:
     model = _flash_next_model()
-    supported = "text/layers/0/gdn/in_proj"
+    supported = "text/layers/0/gdn/query"
     unsupported = "text/layers/0/moe/shared/gate"  # (4, 4): no FP8 route resolves
 
     recipe = Recipe(model)
     qwen3_8_flash_next_nvfp4_dense_a8(model, recipe, {})
-    assert recipe.selections[supported][0].format == "fp8_e4m3fn_row_bf16"
+    for role in ("query", "key", "value", "z"):
+        name = f"text/layers/0/gdn/{role}"
+        assert recipe.selections[name][0].format == "fp8_e4m3fn_row_bf16"
+        assert recipe.selections[name][0].method is fp8_row_maxabs
+        assert recipe.policies[(name, "x")] == "AllowA8Pair"
     assert recipe.selections[supported][0].method is fp8_row_maxabs
     assert recipe.policies[(supported, "x")] == "AllowA8Pair"
     # A shape without a compiled FP8 route keeps Q8 and the default (A16) activation policy.
