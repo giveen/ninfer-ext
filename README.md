@@ -1,5 +1,26 @@
 # ninfer-ext
 
+![Qwen3.8-Flash-Next NVFP4 at a 262,144-token context: prefill and decode against depth for basalt, capy-flash and ninfer-ext, greedy and sampled](screenshots/qwen3.8-flash-next_engine_comparison_2026-10-22.png)
+
+> **Retired for now (2026-10-22).** No further development is planned on ninfer-ext for the time
+> being. The repository, its artifacts and its docs stay as they are, and the tree still builds and
+> serves everything documented below; it is simply not being worked on.
+>
+> The chart above is where this project stands on the workload it was built for. On one RTX 5090,
+> Qwen3.8-Flash-Next NVFP4 at the full 262,144-token context, two engines of the same lineage measured
+> faster at every depth in both greedy and sampled decoding. Prefill: 8.1k-9.2k tok/s for basalt and
+> 6.8k-8.0k for capy-flash against 4.2k-6.3k here. Decode, greedy: 176-265 and 138-198 tok/s against
+> 73-106; sampling lowers all three (146-242, 130-178, 57-99) and changes no ordering. The difference is
+> the [expert strategy](docs/flash-next.md): ninfer-ext copies every expert-cache miss over PCIe and
+> computes it on the GPU, while the other two compute misses on the CPU cores, which on this host wins
+> by a wide margin.
+>
+> Conditions: one RTX 5090 at a 475 W power limit (driver 615.71, CUDA 13.3), 262,144-token context,
+> 256 output tokens per request, MTP speculation on, INT8 KV, one request at a time, a cold unique
+> prompt per point, fastest tuned configuration of each engine. Measured with an external
+> cross-engine harness, not `ninfer_bench`, so these numbers are not comparable with the tool-based
+> tables further down.
+
 <img src="screenshots/nx.jpeg" alt="ninfer-ext" width="440">
 
 ninfer-ext is an extended fork of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch
